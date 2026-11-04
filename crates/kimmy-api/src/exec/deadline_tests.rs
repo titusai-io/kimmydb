@@ -5,6 +5,7 @@
 //! "Passed" here is a request whose deadline is `Instant::now()` (`as_a_request`), so the
 //! path under test reads no time left and its first check fails.
 
+use kimmy_core::Epoch;
 use std::time::{Duration, Instant};
 
 use bson::doc;
@@ -565,7 +566,11 @@ fn violations_is_cut_at_a_passed_deadline_and_runs_with_time_left() {
     let meta = state.engine.get_collection("app", "people").unwrap();
     state.engine.insert(&meta, doc! { "_id": "local", "email": "clash@x" }).unwrap();
     let remote = OplogEntry {
-        stamp: Stamp::new(Hlc::new(kimmy_storage::physical_now_ms(), 0), NodeId::generate()),
+        stamp: Stamp::new(
+            Hlc::new(kimmy_storage::physical_now_ms(), 0),
+            NodeId::generate(),
+            Epoch::ZERO,
+        ),
         kind: OpKind::Insert,
         collection: meta.id,
         doc_id: Some(DocId::String("remote".into())),

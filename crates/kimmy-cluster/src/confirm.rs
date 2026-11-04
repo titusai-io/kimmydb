@@ -1007,6 +1007,7 @@ mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use kimmy_core::{CollectionId, Hlc, IndexField, OpKind};
     use tokio::net::TcpListener;
 
@@ -1315,7 +1316,7 @@ mod tests {
     // --- pure resolution: T3, T4 (fallback), T5, T16, T25, and T17 ---
 
     fn stamp(hlc: u64, node: u8) -> Stamp {
-        Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([node; 16]))
+        Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO)
     }
 
     fn entry(at: Stamp, kind: OpKind) -> OplogEntry {

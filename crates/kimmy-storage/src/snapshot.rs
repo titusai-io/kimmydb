@@ -95,6 +95,7 @@
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
 
+use kimmy_core::Epoch;
 use std::fmt;
 
 use kimmy_core::{
@@ -150,12 +151,15 @@ pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
 
 /// What a document on a page costs beyond its body and its `_id` as it
 /// crosses ([`id_wire_len`]): its collection and stamp, the `_id`'s variant, the
-/// field names and their framing, a bound and not a measure.
-pub(crate) const DOCUMENT_OVERHEAD: usize = 160;
+/// field names and their framing, a bound and not a measure. The stamp's epoch
+/// field (a 36-character hex string, 48 bytes in a BSON frame) is in it: 160
+/// before the epoch existed.
+pub(crate) const DOCUMENT_OVERHEAD: usize = 208;
 
 /// What a tombstone on a page costs beyond its key (sent as bytes), likewise;
-/// 138 measured at the widest collection id and stamp.
-pub(crate) const TOMBSTONE_OVERHEAD: usize = 160;
+/// 138 measured at the widest collection id and stamp before the stamp's epoch
+/// (48 bytes in a BSON frame) was added to it.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 208;
 
 /// What the cursor a page cuts costs beyond its key as it crosses: its
 /// collection and its framing, a bound.
@@ -2477,7 +2481,7 @@ impl Engine {
         // that never buries a write the real drop keeps.
         let stamp = carried
             .filter(|dropped| dropped.hlc == floor)
-            .unwrap_or_else(|| Stamp::new(floor, NodeId::from_bytes([0; 16])));
+            .unwrap_or_else(|| Stamp::new(floor, NodeId::from_bytes([0; 16]), Epoch::ZERO));
         if crate::late_drop::owes_a_sweep(&standing, floor) {
             return self.sweep_after_an_ignored_drop(&standing, stamp);
         }
@@ -3127,6 +3131,7 @@ pub enum ServeVerdict {
 mod tests {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -3531,6 +3536,7 @@ mod tests {
         let above = Stamp::new(
             Hlc::new(changed.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         let landing = std::sync::Arc::clone(&b);
         let (restored, ()) = crate::sync::race_hooks::race(
@@ -4001,7 +4007,13 @@ mod tests {
         b.create_collection("shop", "orders").unwrap();
         b.create_index("shop", "orders", vec![field("item")], false, Some("by_item".into()))
             .unwrap();
-        restamp_index(&b, "shop", "orders", "by_item", Stamp::new(Hlc::new(1, 0), node(1)));
+        restamp_index(
+            &b,
+            "shop",
+            "orders",
+            "by_item",
+            Stamp::new(Hlc::new(1, 0), node(1), Epoch::ZERO),
+        );
 
         let (c, _dc) = engine();
         c.create_collection("shop", "orders").unwrap();
@@ -4015,7 +4027,7 @@ mod tests {
             "shop",
             "orders",
             "by_item",
-            Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1)),
+            Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1), Epoch::ZERO),
         );
 
         let page = a.snapshot_page(None, None).unwrap();
@@ -4865,7 +4877,7 @@ mod tests {
     fn at_its_own_floor(b: &Engine, wall: u64) -> (CollectionMeta, Stamp, OplogEntry) {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(wall, 0);
-        let dropped = Stamp::new(tie, low);
+        let dropped = Stamp::new(tie, low, Epoch::ZERO);
 
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
@@ -4879,13 +4891,20 @@ mod tests {
         let drop = OplogEntry { stamp: dropped, ..of(OpKind::DropCollection) };
 
         b.record_collection_drop(ca.id, dropped).unwrap();
-        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create.clone() }]).unwrap();
+        b.apply_batch(&[OplogEntry {
+            stamp: Stamp::new(tie, high, Epoch::ZERO),
+            ..create.clone()
+        }])
+        .unwrap();
         assert!(
             b.get_collection("shop", "orders").is_err(),
             "a creation in the drop's own Hlc is history (ADR-236)"
         );
-        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie.successor(), high), ..create }])
-            .unwrap();
+        b.apply_batch(&[OplogEntry {
+            stamp: Stamp::new(tie.successor(), high, Epoch::ZERO),
+            ..create
+        }])
+        .unwrap();
         let mut legacy = b.get_collection("shop", "orders").unwrap();
         legacy.created = tie;
         let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
@@ -4964,15 +4983,18 @@ mod tests {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(1, 0);
         let id = CollectionId::derive("shop", "orders");
-        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        b.record_collection_drop(id, Stamp::new(tie, low, Epoch::ZERO)).unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         assert_eq!(cb.incarnation_floor, Some(tie));
-        assert!(Stamp::new(tie, high) > Stamp::new(tie, low), "the tombstone cannot turn it away");
+        assert!(
+            Stamp::new(tie, high, Epoch::ZERO) > Stamp::new(tie, low, Epoch::ZERO),
+            "the tombstone cannot turn it away"
+        );
 
         let document = |wall: u64, key: i64| SnapshotDoc {
             collection: id,
             id: DocId::Int64(key),
-            stamp: Stamp::new(Hlc::new(wall, 0), high),
+            stamp: Stamp::new(Hlc::new(wall, 0), high, Epoch::ZERO),
             body: Some(bson::serialize_to_vec(&doc! { "_id": key }).unwrap()),
         };
         let page = SnapshotPage {
@@ -5461,7 +5483,11 @@ mod tests {
             documents: vec![SnapshotDoc {
                 collection: cb.id,
                 id: DocId::Int64(424_242),
-                stamp: Stamp::new(a.version_vector().unwrap().get(a.node_id()), a.node_id()),
+                stamp: Stamp::new(
+                    a.version_vector().unwrap().get(a.node_id()),
+                    a.node_id(),
+                    Epoch::ZERO,
+                ),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 424_242, "v": 2 }).unwrap()),
             }],
             next: None,
@@ -5943,7 +5969,7 @@ mod tests {
         // A denial of the very collection the receiver holds, at a stamp above
         // its incarnation -- which on the whole-database route would take it.
         page.dropped_collections =
-            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()))];
+            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO))];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
             .unwrap();
@@ -5983,8 +6009,8 @@ mod tests {
              shows the denial is not a stale echo of something the sender dropped"
         );
         page.dropped_collections = vec![
-            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
-            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
+            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO)),
+            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO)),
         ];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6292,7 +6318,7 @@ mod tests {
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
             key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
-            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
+            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -6453,6 +6479,7 @@ mod tests {
         let ahead = Stamp::new(
             Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
             NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
         );
         a.witness_processed(&ahead).unwrap();
         a.create_collection("shop", "orders").unwrap();
@@ -6465,8 +6492,8 @@ mod tests {
         let floor = cb.incarnation_floor.expect("the fixture must restore a floor");
 
         let below = crate::physical_now_ms();
-        let document = Stamp::new(Hlc::new(below, 0), c.node_id());
-        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id());
+        let document = Stamp::new(Hlc::new(below, 0), c.node_id(), Epoch::ZERO);
+        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id(), Epoch::ZERO);
         assert!(delete.hlc < floor, "premise: both sit below the floor");
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
@@ -6513,16 +6540,17 @@ mod tests {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(1, 0);
         let id = CollectionId::derive("shop", "orders");
-        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        b.record_collection_drop(id, Stamp::new(tie, low, Epoch::ZERO)).unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         assert_eq!(cb.incarnation_floor, Some(tie));
-        let delete = Stamp::new(tie, high);
-        assert!(delete > Stamp::new(tie, low), "the tombstone cannot turn it away");
+        let delete = Stamp::new(tie, high, Epoch::ZERO);
+        assert!(delete > Stamp::new(tie, low, Epoch::ZERO), "the tombstone cannot turn it away");
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
-            let record = kimmy_core::DocRecord::live(Stamp::new(Hlc::new(0, 5), low), body);
+            let record =
+                kimmy_core::DocRecord::live(Stamp::new(Hlc::new(0, 5), low, Epoch::ZERO), body);
             crate::live_count::put_record(
                 &txn,
                 &mut docs,
@@ -7467,8 +7495,11 @@ mod tests {
         assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
         let (b, _db) = engine();
         let mut page = a.snapshot_page(None, None).unwrap();
-        let far =
-            Stamp::new(Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0), a.node_id());
+        let far = Stamp::new(
+            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            a.node_id(),
+            Epoch::ZERO,
+        );
         page.deleted_documents[0].stamp = far;
         page.versions.insert(far.node, far.hlc);
 
@@ -7527,7 +7558,8 @@ mod tests {
         // another origin meets a newer tombstone and is history, as for any entry.
         let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
         let tombstone = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
-        let older = Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]));
+        let older =
+            Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]), Epoch::ZERO);
 
         b.apply_batch(&[forged_at(older, OpKind::Delete, &cb, None)]).unwrap();
 
@@ -7544,6 +7576,7 @@ mod tests {
         let far = Stamp::new(
             Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
             NodeId::from_bytes([6; 16]),
+            Epoch::ZERO,
         );
         let key = crate::docs::doc_key(&DocId::Int64(2)).unwrap();
         let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
@@ -7595,7 +7628,7 @@ mod tests {
     fn a_live_write_below_a_bare_or_appended_tombstone_still_loses() {
         let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
         let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
-        let older = Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node);
+        let older = Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node, Epoch::ZERO);
         let write = OplogEntry {
             stamp: older,
             kind: OpKind::Insert,
@@ -7667,6 +7700,7 @@ mod tests {
             let stamp = Stamp::new(
                 Hlc::new(crate::engine::physical_now_ms() + 10_000, 0),
                 NodeId::from_bytes([9; 16]),
+                Epoch::ZERO,
             );
             let record = kimmy_core::DocRecord::tombstone(stamp);
             let mut docs = txn.open_table(tables::DOCS).unwrap();
@@ -8094,7 +8128,8 @@ mod tests {
         page.documents.clear();
         page.deleted_documents.clear();
         let held = b.get_collection("shop", "orders").unwrap();
-        let newer = Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id());
+        let newer =
+            Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id(), Epoch::ZERO);
         for state in &mut page.collections {
             if state.name == "orders" {
                 state.vector = Some(kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
@@ -8673,7 +8708,7 @@ mod tests {
         let hlc = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
         let x = NodeId::from_bytes([1; 16]);
         let y = NodeId::from_bytes([2; 16]);
-        (Stamp::new(hlc, x), Stamp::new(hlc, y))
+        (Stamp::new(hlc, x, Epoch::ZERO), Stamp::new(hlc, y, Epoch::ZERO))
     }
 
     #[test]
@@ -8980,6 +9015,7 @@ mod tests {
         let newer = Stamp::new(
             held.vector_changed.unwrap().hlc.successor(),
             held.vector_changed.unwrap().node,
+            Epoch::ZERO,
         );
         for state in &mut page.collections {
             if state.name == "orders" {
@@ -9004,8 +9040,8 @@ mod tests {
         let (a, _da, b, _db) = both_hold_a_configuration();
         let held = b.get_collection("shop", "orders").unwrap();
         let first = held.vector_changed.unwrap();
-        let second = Stamp::new(first.hlc.successor(), first.node);
-        let third = Stamp::new(second.hlc.successor(), first.node);
+        let second = Stamp::new(first.hlc.successor(), first.node, Epoch::ZERO);
+        let third = Stamp::new(second.hlc.successor(), first.node, Epoch::ZERO);
         let page_at = |stamp: Stamp, config: kimmy_core::VectorConfig| {
             let mut page = a.snapshot_page(None, None).unwrap();
             page.collections.retain(|state| state.name == "orders");

@@ -32,6 +32,7 @@
 //! streams already handle that (`ResumeTokenExpired`, surfaced as HTTP 410), so
 //! it is a contract, not a surprise.
 
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, Hlc, OpKind};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
@@ -316,7 +317,7 @@ impl Engine {
                     None => None,
                 };
                 if previous.is_none_or(|p| highest > p) {
-                    let marker = kimmy_core::Stamp::new(highest, self.node_id());
+                    let marker = kimmy_core::Stamp::new(highest, self.node_id(), Epoch::ZERO);
                     meta.insert(
                         tables::META_OPLOG_COLLECTED_THROUGH,
                         codec::oplog_key(&marker).as_slice(),
@@ -324,7 +325,7 @@ impl Engine {
                 }
 
                 for (node, hlc) in per_origin.iter() {
-                    let stamp = kimmy_core::Stamp::new(hlc, node);
+                    let stamp = kimmy_core::Stamp::new(hlc, node, Epoch::ZERO);
                     crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stamp)?;
                 }
             }

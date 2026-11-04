@@ -866,6 +866,7 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -965,7 +966,7 @@ mod tests {
     /// did not.
     fn populated_vector() -> VersionVector {
         let mut v = VersionVector::new();
-        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate()));
+        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate(), Epoch::ZERO));
         v
     }
 
@@ -1081,10 +1082,15 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
-                refused: vec![kimmy_core::Stamp::new(Hlc::new(3, 1), NodeId::from_bytes([7; 16]))],
+                refused: vec![kimmy_core::Stamp::new(
+                    Hlc::new(3, 1),
+                    NodeId::from_bytes([7; 16]),
+                    Epoch::ZERO,
+                )],
                 stopped_at: Some(kimmy_core::Stamp::new(
                     Hlc::new(4, 0),
                     NodeId::from_bytes([8; 16]),
+                    Epoch::ZERO,
                 )),
             },
             Message::Fault("nope".into()),
@@ -1521,7 +1527,7 @@ mod tests {
     #[tokio::test]
     async fn a_snapshot_page_needs_its_lists_and_reads_an_absent_horizon_as_none() {
         let node = NodeId::from_bytes([3; 16]);
-        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node);
+        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node, Epoch::ZERO);
         let mut versions = VersionVector::new();
         versions.insert(node, Hlc::new(900, 0));
         let page = SnapshotPage {

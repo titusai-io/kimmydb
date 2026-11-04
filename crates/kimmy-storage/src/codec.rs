@@ -12,7 +12,7 @@
 //! debugging is worth more than the bytes.
 
 use kimmy_core::{
-    DocId, DocRecord, HLC_ENCODED_LEN, Hlc, NodeId, OpKind, OplogEntry, Stamp, ids::CollectionId,
+    DocId, DocRecord, HLC_ENCODED_LEN, Hlc, OpKind, OplogEntry, Stamp, ids::CollectionId,
 };
 
 use crate::error::{Result, StorageError};
@@ -20,7 +20,8 @@ use crate::error::{Result, StorageError};
 /// Bumped only for incompatible layout changes.
 pub const FORMAT_VERSION: u8 = 1;
 
-pub(crate) const STAMP_LEN: usize = HLC_ENCODED_LEN + 16;
+/// A stamp's stored width: `hlc ‖ node ‖ epoch`, 44 bytes ([`Stamp::KEY_LEN`]).
+pub(crate) const STAMP_LEN: usize = Stamp::KEY_LEN;
 /// Sentinel length meaning "this optional field is absent".
 const NONE_LEN: u32 = u32::MAX;
 
@@ -33,17 +34,13 @@ fn corrupt(what: &str) -> StorageError {
 // ---------------------------------------------------------------------------
 
 fn put_stamp(stamp: &Stamp, out: &mut Vec<u8>) {
-    out.extend_from_slice(&stamp.hlc.to_bytes());
-    out.extend_from_slice(&stamp.node.to_bytes());
+    out.extend_from_slice(&stamp.to_key_bytes());
 }
 
 fn take_stamp(input: &mut &[u8]) -> Result<Stamp> {
     let bytes = take(input, STAMP_LEN)?;
-    let mut hlc = [0u8; HLC_ENCODED_LEN];
-    hlc.copy_from_slice(&bytes[..HLC_ENCODED_LEN]);
-    let mut node = [0u8; 16];
-    node.copy_from_slice(&bytes[HLC_ENCODED_LEN..]);
-    Ok(Stamp::new(Hlc::from_bytes(hlc), NodeId::from_bytes(node)))
+    let key: [u8; STAMP_LEN] = bytes.try_into().expect("STAMP_LEN bytes");
+    Ok(Stamp::from_key_bytes(key))
 }
 
 fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
@@ -305,14 +302,11 @@ pub fn decode_oplog_entry(mut input: &[u8]) -> Result<OplogEntry> {
     Ok(OplogEntry { stamp, kind, collection, doc_id, body })
 }
 
-/// The oplog's primary key: `(hlc, node)` encoded so that `memcmp` yields the
+/// The oplog's primary key: `(hlc, node, epoch)` encoded so that `memcmp` yields the
 /// total write order. Scanning the oplog forwards is therefore just a redb
 /// range scan.
 pub fn oplog_key(stamp: &Stamp) -> [u8; STAMP_LEN] {
-    let mut key = [0u8; STAMP_LEN];
-    key[..HLC_ENCODED_LEN].copy_from_slice(&stamp.hlc.to_bytes());
-    key[HLC_ENCODED_LEN..].copy_from_slice(&stamp.node.to_bytes());
-    key
+    stamp.to_key_bytes()
 }
 
 /// The lowest possible oplog key at or after `hlc`.
@@ -330,11 +324,12 @@ pub fn decode_oplog_key(key: &[u8]) -> Result<Stamp> {
 #[cfg(test)]
 mod tests {
     use kimmy_core::ids::CollectionId;
+    use kimmy_core::{Epoch, NodeId};
 
     use super::*;
 
     fn stamp(ms: u64, n: u8) -> Stamp {
-        Stamp::new(Hlc::new(ms, 3), NodeId::from_bytes([n; 16]))
+        Stamp::new(Hlc::new(ms, 3), NodeId::from_bytes([n; 16]), Epoch::ZERO)
     }
 
     #[test]
@@ -469,8 +464,8 @@ mod tests {
         let hlc = Hlc::new(500, 2);
         let bound = oplog_key_lower_bound(hlc);
         // Node id 0 is the smallest possible, so the bound must not exceed it.
-        assert!(bound <= oplog_key(&Stamp::new(hlc, NodeId::from_bytes([0; 16]))));
-        assert!(bound < oplog_key(&Stamp::new(hlc, NodeId::from_bytes([255; 16]))));
+        assert!(bound <= oplog_key(&Stamp::new(hlc, NodeId::from_bytes([0; 16]), Epoch::ZERO)));
+        assert!(bound < oplog_key(&Stamp::new(hlc, NodeId::from_bytes([255; 16]), Epoch::ZERO)));
     }
 
     #[test]

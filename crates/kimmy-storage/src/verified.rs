@@ -209,6 +209,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use std::path::{Path, PathBuf};
 
     use bson::doc;
@@ -600,7 +601,7 @@ mod tests {
 
     fn remote(coll: &CollectionMeta, origin: NodeId, wall: u64, id: &str) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -782,7 +783,7 @@ mod tests {
                     self.engine().absorb_version_vector(&granted).unwrap();
                 }
                 Op::Orphan { origin, wall } => {
-                    let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin]);
+                    let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin], Epoch::ZERO);
                     let db = self.engine().db();
                     let txn = db.begin_write().unwrap();
                     txn.open_table(tables::OPLOG_HELD)

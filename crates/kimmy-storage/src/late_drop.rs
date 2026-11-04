@@ -825,6 +825,7 @@ fn read_collection(
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{DocId, Hlc, NodeId, Stamp};
 
     use super::*;
@@ -927,7 +928,7 @@ mod tests {
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2, 5]), vec![2, 5]);
         let id = CollectionId::derive("shop", "orders");
         let dropped = *b.collection_tombstones().unwrap().get(&id).unwrap();
-        let dropped = Stamp::new(dropped, a.node_id());
+        let dropped = Stamp::new(dropped, a.node_id(), Epoch::ZERO);
         assert!(!owes_a_sweep(&b.get_collection("shop", "orders").unwrap(), dropped.hlc));
         assert_eq!(
             b.sweep_late_drop("shop", "orders", dropped).unwrap(),
@@ -1137,7 +1138,7 @@ mod tests {
             Engine::put_collection_meta(&txn, &meta).unwrap();
             txn.commit().unwrap();
         }
-        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node);
+        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node, Epoch::ZERO);
         {
             let key = crate::docs::doc_key(&DocId::Int64(1_000_000)).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1_000_000i64 }).unwrap();
@@ -1260,8 +1261,8 @@ mod tests {
         let shadow =
             b.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
         let node = NodeId::from_bytes([7; 16]);
-        let dropped = Stamp::new(Hlc::new(parent.created.wall_ms - 10, 0), node);
-        let straggler = Stamp::new(Hlc::new(parent.created.wall_ms - 20, 0), node);
+        let dropped = Stamp::new(Hlc::new(parent.created.wall_ms - 10, 0), node, Epoch::ZERO);
+        let straggler = Stamp::new(Hlc::new(parent.created.wall_ms - 20, 0), node, Epoch::ZERO);
         {
             let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
@@ -1348,8 +1349,8 @@ mod tests {
         // What the old rule left: a document of the life before, below a drop
         // this member holds, in a life created after it, and no floor.
         let node = NodeId::from_bytes([7; 16]);
-        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node);
-        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node);
+        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node, Epoch::ZERO);
+        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node, Epoch::ZERO);
         {
             let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
@@ -1391,8 +1392,8 @@ mod tests {
         let id = CollectionId::derive("shop", "orders");
         let on_b = b.create_collection("shop", "orders").unwrap();
         let node = NodeId::from_bytes([7; 16]);
-        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node);
-        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node);
+        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node, Epoch::ZERO);
+        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node, Epoch::ZERO);
         let padding = "x".repeat(pad);
         let txn = b.begin_write(WriterHolder::Replication).unwrap();
         let mut docs = txn.open_table(tables::DOCS).unwrap();
@@ -1519,8 +1520,8 @@ mod tests {
         b.insert(&on_b, doc! { "_id": 2i64, "x": 6 }).unwrap();
         let id = CollectionId::derive("shop", "orders");
         let node = NodeId::from_bytes([7; 16]);
-        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node);
-        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node);
+        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node, Epoch::ZERO);
+        let straggler = Stamp::new(Hlc::new(on_b.created.wall_ms - 20, 0), node, Epoch::ZERO);
         let coll = b.get_collection("shop", "orders").unwrap();
         let entry = kimmy_core::OplogEntry {
             stamp: straggler,
@@ -1551,7 +1552,7 @@ mod tests {
         let (b, _dir, id, dropped) = a_store_holding_stragglers(3, 0);
         {
             let node = NodeId::from_bytes([7; 16]);
-            let straggler = Stamp::new(Hlc::new(dropped.hlc.wall_ms - 10, 0), node);
+            let straggler = Stamp::new(Hlc::new(dropped.hlc.wall_ms - 10, 0), node, Epoch::ZERO);
             let txn = b.begin_write(WriterHolder::Replication).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
             // A live record whose body is not a document.
@@ -1654,7 +1655,7 @@ mod tests {
         let id = CollectionId::derive("shop", "orders");
         let on_b = b.create_collection("shop", "orders").unwrap();
         let node = NodeId::from_bytes([7; 16]);
-        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node);
+        let dropped = Stamp::new(Hlc::new(on_b.created.wall_ms - 10, 0), node, Epoch::ZERO);
         let put = |n: i64, stamp: Stamp| {
             let key = crate::docs::doc_key(&DocId::Int64(n)).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": n }).unwrap();
@@ -1671,8 +1672,8 @@ mod tests {
             drop(docs);
             txn.commit().unwrap();
         };
-        put(1, Stamp::new(dropped.hlc, NodeId::from_bytes([9; 16])));
-        put(2, Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), node));
+        put(1, Stamp::new(dropped.hlc, NodeId::from_bytes([9; 16]), Epoch::ZERO));
+        put(2, Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), node, Epoch::ZERO));
         b.record_collection_drop(id, dropped).unwrap();
         assert_eq!(b.sweep_late_drop("shop", "orders", dropped).unwrap(), 1);
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
@@ -1758,7 +1759,7 @@ mod tests {
     fn a_definition_tied_at_the_drop_is_swept_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.create_index("shop", "orders", by_from(), false, Some("tied".into())).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.indexes[0].created = Some(above));
         let id = b.get_collection("shop", "orders").unwrap().id;
@@ -1782,7 +1783,7 @@ mod tests {
     fn a_vector_configuration_tied_at_the_drop_is_turned_off_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.configure_vectors("shop", "orders", byo_config()).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.vector_changed = Some(above));
         pull(&b, &a);
@@ -1804,7 +1805,11 @@ mod tests {
         };
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.set_validator("shop", "orders", Some(validator())).unwrap();
-        let before = Stamp::new(Hlc::new(dropped.hlc.wall_ms - 1, 0), NodeId::from_bytes([1; 16]));
+        let before = Stamp::new(
+            Hlc::new(dropped.hlc.wall_ms - 1, 0),
+            NodeId::from_bytes([1; 16]),
+            Epoch::ZERO,
+        );
         edit_meta(&b, |meta| meta.validator_changed = Some(before));
         pull(&b, &a);
         let standing = b.get_collection("shop", "orders").unwrap();
@@ -1839,7 +1844,11 @@ mod tests {
                 multikey: false,
                 expire_after_secs: None,
                 partial_filter: None,
-                created: Some(Stamp::new(Hlc::new(dropped.hlc.wall_ms - 1, 0), a.node_id())),
+                created: Some(Stamp::new(
+                    Hlc::new(dropped.hlc.wall_ms - 1, 0),
+                    a.node_id(),
+                    Epoch::ZERO,
+                )),
             },
         };
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2064,8 +2073,11 @@ mod tests {
         assert_eq!(e.count_repair_replay_from(&orders).unwrap(), orders.created, "nothing lower");
 
         let below = Hlc::new(orders.created.wall_ms.saturating_sub(10), 0);
-        e.record_collection_drop(orders.id, Stamp::new(below, NodeId::from_bytes([7; 16])))
-            .unwrap();
+        e.record_collection_drop(
+            orders.id,
+            Stamp::new(below, NodeId::from_bytes([7; 16]), Epoch::ZERO),
+        )
+        .unwrap();
         assert_eq!(e.count_repair_replay_from(&orders).unwrap(), below, "the tombstone, owed");
 
         let mut floored = orders.clone();
@@ -2088,7 +2100,7 @@ mod tests {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         let b = std::sync::Arc::new(b);
         b.configure_vectors("shop", "orders", byo_config()).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         edit_meta(&b, |meta| meta.vector_changed = Some(above));
         let competing = std::sync::Arc::clone(&b);
         let ((), made) = crate::sync::race_hooks::race(
@@ -2133,7 +2145,7 @@ mod tests {
         let (d, _dd) = engine();
         let base = crate::engine::physical_now_ms() + 3_600_000;
         let at = |e: &Engine, t: u64| {
-            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id()));
+            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id(), Epoch::ZERO));
         };
         let scoped = |into: &Engine, from: &Engine, id| {
             let mut progress = crate::SnapshotProgress::of_collection(id);
@@ -2184,7 +2196,8 @@ mod tests {
         let docs: Vec<bson::Document> = (0..50_000i64).map(|i| doc! { "_id": i, "k": i }).collect();
         d.insert_many(&orders, docs).unwrap();
         let base = crate::engine::physical_now_ms() + 3_600_000;
-        let dropped = Stamp::new(Hlc::new(base + 150, 0), NodeId::from_bytes([0x01; 16]));
+        let dropped =
+            Stamp::new(Hlc::new(base + 150, 0), NodeId::from_bytes([0x01; 16]), Epoch::ZERO);
         // A newer life whose creation this member stored without witnessing it: `created`
         // above the drop, no floor, and the clock below both.
         edit_meta(&d, |meta| {

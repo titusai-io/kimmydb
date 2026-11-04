@@ -10,6 +10,7 @@
 //! Public API only.
 
 use bson::doc;
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, DocId, Hlc, Stamp};
 use kimmy_storage::{Engine, PeerWindow, SnapshotProgress, SyncOutcome, WalkScope};
 
@@ -66,9 +67,9 @@ fn setup() -> (Engine, Engine, std::path::PathBuf, tempfile::TempDir) {
     let items = b.create_collection("shop", "items").unwrap();
     b.insert(&orders, doc! { "_id": 0i64, "n": 0i64 }).unwrap();
     pull_all(&d, &b);
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 120, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 120, 0), b.node_id(), Epoch::ZERO));
     b.insert(&orders, doc! { "_id": 1i64, "n": 1i64 }).unwrap();
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 190, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 190, 0), b.node_id(), Epoch::ZERO));
     b.insert(&items, doc! { "_id": 101i64, "u": 1i64 }).unwrap();
     scoped(&d, &b, items.id);
     (b, d, d_path, dir)
@@ -338,13 +339,13 @@ fn a_restore_judges_each_entry_against_its_own_origins_position() {
     pull_all(&d, &c);
     // B far ahead, and D holds B there.
     let b_orders = b.get_collection("shop", "orders").unwrap();
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 500, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 500, 0), b.node_id(), Epoch::ZERO));
     b.insert(&b_orders, doc! { "_id": 900i64 }).unwrap();
     pull_all(&d, &b);
     // C writes once at t+50 and never again, then `items` at t+100; B takes both.
-    c.advance_clock_past(&Stamp::new(Hlc::new(t + 50, 0), c.node_id()));
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 50, 0), c.node_id(), Epoch::ZERO));
     c.insert(&orders, doc! { "_id": 1i64, "once": true }).unwrap();
-    c.advance_clock_past(&Stamp::new(Hlc::new(t + 100, 0), c.node_id()));
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 100, 0), c.node_id(), Epoch::ZERO));
     c.insert(&items, doc! { "_id": 101i64 }).unwrap();
     pull_all(&b, &c);
     // D takes `items` from B by a scoped page: C's row at t+100, held.

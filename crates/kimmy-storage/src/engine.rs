@@ -1,5 +1,6 @@
 //! The storage engine.
 
+use kimmy_core::Epoch;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3147,7 +3148,7 @@ impl Engine {
     ) -> Result<bool> {
         let mut raised = false;
         for (node, hlc) in granted.iter() {
-            let stamp = Stamp::new(hlc, node);
+            let stamp = Stamp::new(hlc, node, Epoch::ZERO);
             // What this raises the servable vector over, and has no entries for,
             // is a hole in what this node can serve (ADR-224): recorded before
             // the raise, in the same transaction, from the vector as it stood.
@@ -3640,7 +3641,7 @@ impl Engine {
         seen: &kimmy_core::VersionVector,
     ) -> Result<()> {
         for (node, hlc) in seen.iter() {
-            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
+            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node, Epoch::ZERO))?;
         }
         Ok(())
     }
@@ -3803,7 +3804,7 @@ impl Engine {
     /// Mint the next stamp for a local write.
     pub(crate) fn next_stamp(&self) -> Stamp {
         let hlc = self.clock.lock().tick(physical_now_ms());
-        Stamp::new(hlc, self.node_id)
+        Stamp::new(hlc, self.node_id, Epoch::ZERO)
     }
 
     /// The last time the clock handed out, for a test that a path mints
@@ -4674,7 +4675,7 @@ impl Engine {
             // ADR-233's witnesses and its restart rule pass it.
             let stamp = match (mint(), incarnation_floor) {
                 (stamp, Some(floor)) if stamp.hlc <= floor => {
-                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id)))
+                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id, Epoch::ZERO)))
                 }
                 (stamp, _) => stamp,
             };
@@ -5058,7 +5059,9 @@ impl Engine {
         // life comes back here by entries over the acknowledged drop.
         let stamp = match replicated {
             Some(stamp) => stamp,
-            None => self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id))),
+            None => {
+                self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id, Epoch::ZERO)))
+            }
         };
         // The purge that follows removes every record of the life, and the life can hold a
         // tombstone stamped **after** the drop (a delete of a write made after it): that is
@@ -5919,6 +5922,7 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     #[test]
     fn a_meter_a_panic_unwinds_through_is_put_back() {
         // A thread that survives a panic inside a metered call must not go
@@ -6807,7 +6811,7 @@ mod tests {
     #[test]
     fn stamps_are_strictly_increasing() {
         let (engine, _dir) = engine();
-        let mut previous = Stamp::new(Hlc::ZERO, engine.node_id());
+        let mut previous = Stamp::new(Hlc::ZERO, engine.node_id(), Epoch::ZERO);
         for _ in 0..1000 {
             let next = engine.next_stamp();
             assert!(next > previous, "{next:?} did not exceed {previous:?}");
@@ -8604,6 +8608,7 @@ mod tests {
 #[cfg(test)]
 mod clearing {
     use bson::doc;
+    use kimmy_core::Epoch;
     use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
     fn file(path: &std::path::Path) -> u64 {
@@ -8734,6 +8739,7 @@ mod clearing {
             let kept = crate::codec::oplog_key(&kimmy_core::Stamp::new(
                 kimmy_core::Hlc::new(1_000, 0),
                 stranger,
+                Epoch::ZERO,
             ));
             {
                 let txn = p.db().begin_write().unwrap();

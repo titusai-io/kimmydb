@@ -5,6 +5,7 @@
 //! the signature a receiver has to verify, the headers it reads, whether the
 //! egress policy lets it out at all — only exists on the wire.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1246,7 +1247,7 @@ fn foreign(
     n: i64,
 ) -> kimmy_core::OplogEntry {
     kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), origin),
+        stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(kimmy_core::DocId::Int64(n)),

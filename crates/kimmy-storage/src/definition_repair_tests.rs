@@ -4,6 +4,7 @@
 //! sender's first scoped page, and applies it.
 
 use bson::doc;
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, Hlc};
 
 use crate::{DefinitionRestore, Engine, IndexField, SnapshotApplied, SnapshotProgress};
@@ -368,7 +369,7 @@ fn a_page_whose_sender_dropped_the_collection_ends_the_pull_abandoned() {
     let (a, b, _d) = pair();
     let mut progress = SnapshotProgress::of_collection_definitions(orders(), BIG);
     let mut page = a.snapshot_page(None, progress.scope()).unwrap();
-    page.dropped = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), a.node_id()));
+    page.dropped = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), a.node_id(), Epoch::ZERO));
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert!(done.sender_dropped);
     assert_eq!(done.definitions, DefinitionRestore::default());
@@ -401,8 +402,11 @@ fn a_vector_configuration_and_the_pages_drops_are_not_applied() {
         assert!(page.collections[0].vector.is_some(), "premise: the page carries the vectors");
         // The page says the sender dropped the index it also carries, at a stamp above its
         // creation: under the `All` route that would remove it again.
-        let above =
-            kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a_node());
+        let above = kimmy_core::Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 60_000, 0),
+            a_node(),
+            Epoch::ZERO,
+        );
         page.dropped_indexes.push((orders(), id, above));
     });
     assert_eq!(done.definitions.built, 1);
@@ -573,7 +577,7 @@ fn a_rival_older_than_the_pages_definition_is_not_superseded() {
             repair_with(&b, &a, BIG, move |page| {
                 for state in &mut page.collections {
                     for index in &mut state.indexes {
-                        index.created = Some(kimmy_core::Stamp::new(ahead, node));
+                        index.created = Some(kimmy_core::Stamp::new(ahead, node, Epoch::ZERO));
                     }
                 }
                 page.tombstone_horizon = Some(Hlc::ZERO);
@@ -776,7 +780,7 @@ fn an_index_before_a_tombstone_is_history(tombstone_of: CollectionId) {
     later();
     index(&a, "v", "old");
     later();
-    let at = kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms(), 0), a_node());
+    let at = kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms(), 0), a_node(), Epoch::ZERO);
     b.record_collection_drop(tombstone_of, at).unwrap();
     later();
     index(&a, "w", "fresh");
@@ -812,7 +816,11 @@ fn a_tombstone_recorded_between_the_check_and_the_build_makes_the_index_history(
         crate::sync::race_hooks::Race::DefinitionRepair,
         move || {
             later();
-            let at = kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms(), 0), a_node());
+            let at = kimmy_core::Stamp::new(
+                Hlc::new(crate::physical_now_ms(), 0),
+                a_node(),
+                Epoch::ZERO,
+            );
             competing.record_collection_drop(orders(), at).unwrap();
         },
         || repair(&b, &a, BIG),

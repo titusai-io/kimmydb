@@ -2,6 +2,7 @@
 //! the two commits, the vector shadow and the database's guard, one test per
 //! clause of the design.
 
+use kimmy_core::Epoch;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -570,7 +571,11 @@ fn a_replicated_index_in_the_drops_hlc_between_two_sweep_chunks_is_history() {
                 let held = d.collection_dropped_at(CollectionId::derive("shop", "orders"));
                 let dropped = held.unwrap().expect("the tombstone is recorded first");
                 let mut tied = create[0].clone();
-                tied.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+                tied.stamp = Stamp::new(
+                    dropped.hlc,
+                    kimmy_core::NodeId::from_bytes([0xff; 16]),
+                    Epoch::ZERO,
+                );
                 d.apply_batch(std::slice::from_ref(&tied)).unwrap();
             },
         );
@@ -845,7 +850,7 @@ fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     reaches(&d, a.node_id(), carried.hlc, "a record from a snapshot page");
     // The tombstones a sweep writes with no entry behind them: at the drop's stamp.
     let drop_at = Hlc::new(carried.hlc.wall_ms + 50, 0);
-    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id());
+    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id(), Epoch::ZERO);
     let sweeper = d.get_collection("shop", "orders").unwrap();
     let mut newer = sweeper.clone();
     newer.created = Hlc::new(drop_at.wall_ms + 1, 0);
@@ -1275,7 +1280,7 @@ fn a_straggler_in_the_floor_s_own_hlc_is_refused_while_a_floor_burial_sweeps() {
         .expect("the straggler's entry");
     let mut low = [0u8; 16];
     low[15] = 1;
-    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low));
+    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low), Epoch::ZERO);
     assert!(straggler.stamp < dropped, "premise: the real tombstone refuses it");
     let d = Arc::new(d);
     let on_d = Arc::clone(&d);

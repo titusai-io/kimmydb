@@ -120,6 +120,7 @@ impl FromIterator<(NodeId, Hlc)> for VersionVector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Epoch;
 
     fn node() -> NodeId {
         NodeId::generate()
@@ -134,8 +135,8 @@ mod tests {
     fn observing_keeps_the_maximum() {
         let n = node();
         let mut v = VersionVector::new();
-        v.observe(Stamp::new(Hlc::new(10, 0), n));
-        v.observe(Stamp::new(Hlc::new(5, 0), n));
+        v.observe(Stamp::new(Hlc::new(10, 0), n, Epoch::ZERO));
+        v.observe(Stamp::new(Hlc::new(5, 0), n, Epoch::ZERO));
         assert_eq!(v.get(n), Hlc::new(10, 0), "an older stamp must not lower the mark");
     }
 
@@ -160,9 +161,9 @@ mod tests {
     fn a_vector_that_covers_another_needs_nothing() {
         let n = node();
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(10, 0), n));
+        mine.observe(Stamp::new(Hlc::new(10, 0), n, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(7, 0), n));
+        theirs.observe(Stamp::new(Hlc::new(7, 0), n, Epoch::ZERO));
 
         assert_eq!(mine.behind(&theirs), None);
         assert!(mine.covers(&theirs));
@@ -179,13 +180,13 @@ mod tests {
         let stuck = node();
         let busy = node();
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(1_000_000, 0), busy));
+        mine.observe(Stamp::new(Hlc::new(1_000_000, 0), busy, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(50, 0), stuck));
-        theirs.observe(Stamp::new(Hlc::new(2_000_000, 0), busy));
+        theirs.observe(Stamp::new(Hlc::new(50, 0), stuck, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(2_000_000, 0), busy, Epoch::ZERO));
 
         assert_eq!(mine.behind(&theirs), Some(Hlc::ZERO), "pinned at the unseen origin's floor");
-        mine.observe(Stamp::new(Hlc::new(5_000_000, 0), busy));
+        mine.observe(Stamp::new(Hlc::new(5_000_000, 0), busy, Epoch::ZERO));
         assert_eq!(mine.behind(&theirs), Some(Hlc::ZERO), "and no progress elsewhere moves it");
     }
 
@@ -193,9 +194,9 @@ mod tests {
     fn being_behind_reports_where_to_resume_from() {
         let n = node();
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(4, 0), n));
+        mine.observe(Stamp::new(Hlc::new(4, 0), n, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(9, 0), n));
+        theirs.observe(Stamp::new(Hlc::new(9, 0), n, Epoch::ZERO));
 
         assert_eq!(mine.behind(&theirs), Some(Hlc::new(4, 0)));
     }
@@ -205,7 +206,7 @@ mod tests {
         // Otherwise a peer joining a running cluster would silently skip
         // everything written before it arrived.
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(9, 0), node()));
+        theirs.observe(Stamp::new(Hlc::new(9, 0), node(), Epoch::ZERO));
 
         assert_eq!(VersionVector::new().behind(&theirs), Some(Hlc::ZERO));
     }
@@ -217,12 +218,12 @@ mod tests {
         // whatever the further-behind node was missing.
         let (a, b) = (node(), node());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(100, 0), a));
-        mine.observe(Stamp::new(Hlc::new(3, 0), b));
+        mine.observe(Stamp::new(Hlc::new(100, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(3, 0), b, Epoch::ZERO));
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(200, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(50, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(200, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(50, 0), b, Epoch::ZERO));
 
         assert_eq!(mine.behind(&theirs), Some(Hlc::new(3, 0)));
     }
@@ -233,12 +234,12 @@ mod tests {
         // back to a point we have already covered.
         let (a, b) = (node(), node());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(5, 0), a));
-        mine.observe(Stamp::new(Hlc::new(40, 0), b));
+        mine.observe(Stamp::new(Hlc::new(5, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(40, 0), b, Epoch::ZERO));
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(1, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(90, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(1, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(90, 0), b, Epoch::ZERO));
 
         assert_eq!(mine.behind(&theirs), Some(Hlc::new(40, 0)));
     }
@@ -249,9 +250,9 @@ mod tests {
         // which is what makes a single exchange converge in both directions.
         let (a, b) = (node(), node());
         let mut x = VersionVector::new();
-        x.observe(Stamp::new(Hlc::new(10, 0), a));
+        x.observe(Stamp::new(Hlc::new(10, 0), a, Epoch::ZERO));
         let mut y = VersionVector::new();
-        y.observe(Stamp::new(Hlc::new(10, 0), b));
+        y.observe(Stamp::new(Hlc::new(10, 0), b, Epoch::ZERO));
 
         assert!(x.behind(&y).is_some());
         assert!(y.behind(&x).is_some());
@@ -261,12 +262,12 @@ mod tests {
     fn merging_takes_the_higher_of_each_entry() {
         let (a, b) = (node(), node());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(10, 0), a));
-        mine.observe(Stamp::new(Hlc::new(99, 0), b));
+        mine.observe(Stamp::new(Hlc::new(10, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(99, 0), b, Epoch::ZERO));
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(50, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(7, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(50, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(7, 0), b, Epoch::ZERO));
 
         mine.merge(&theirs);
 
@@ -280,10 +281,10 @@ mod tests {
         // would claim the receiver had forgotten its own writes.
         let (mine_node, theirs_node) = (node(), node());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(5, 0), mine_node));
+        mine.observe(Stamp::new(Hlc::new(5, 0), mine_node, Epoch::ZERO));
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(80, 0), theirs_node));
+        theirs.observe(Stamp::new(Hlc::new(80, 0), theirs_node, Epoch::ZERO));
 
         mine.merge(&theirs);
 
@@ -294,7 +295,7 @@ mod tests {
     #[test]
     fn a_vector_round_trips_through_json() {
         let mut v = VersionVector::new();
-        v.observe(Stamp::new(Hlc::new(3, 1), node()));
+        v.observe(Stamp::new(Hlc::new(3, 1), node(), Epoch::ZERO));
         let text = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<VersionVector>(&text).unwrap(), v);
     }
@@ -306,8 +307,8 @@ mod tests {
         // about whether it is a human-readable format. An *empty* vector round
         // trips under any encoding, which is why this one is deliberately not.
         let mut v = VersionVector::new();
-        v.observe(Stamp::new(Hlc::new(3, 1), node()));
-        v.observe(Stamp::new(Hlc::new(90, 0), node()));
+        v.observe(Stamp::new(Hlc::new(3, 1), node(), Epoch::ZERO));
+        v.observe(Stamp::new(Hlc::new(90, 0), node(), Epoch::ZERO));
 
         let bytes = bson::serialize_to_vec(&v).unwrap();
         assert_eq!(bson::deserialize_from_slice::<VersionVector>(&bytes).unwrap(), v);

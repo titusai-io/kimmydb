@@ -877,6 +877,7 @@ fn scan_until(
 mod tests {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
 
     /// A spec built from closures, so each test states only what it varies.
     struct TestSpec<M, C, A> {
@@ -2382,6 +2383,7 @@ mod tests {
                 stamp: Stamp::new(
                     kimmy_core::Hlc::new(u64::MAX >> 20, i as u16),
                     kimmy_core::NodeId::from_bytes([9; 16]),
+                    Epoch::ZERO,
                 ),
                 kind: OpKind::Insert,
                 collection: coll.id,
@@ -2875,7 +2877,7 @@ mod tests {
         let (engine, coll, _dir) = engine();
         engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid"}).unwrap();
         let current = engine.document_stamp(&coll, &DocId::Int64(1)).unwrap().unwrap();
-        let stale = Stamp::new(kimmy_core::Hlc::new(1, 0), current.node);
+        let stale = Stamp::new(kimmy_core::Hlc::new(1, 0), current.node, Epoch::ZERO);
 
         let mut spec = Operators::new(doc! {"$set": {"status": "paid"}});
         spec.expected = Some(stale);

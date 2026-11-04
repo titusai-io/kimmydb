@@ -29,6 +29,7 @@
 //! - `put_vectors` — replace-all per document, so it does more than an insert.
 //! - `replace` and `delete` — the other two mutations.
 
+use kimmy_core::Epoch;
 use std::hint::black_box;
 
 use bson::{Document, doc};
@@ -449,7 +450,7 @@ fn batch_apply(c: &mut Criterion) {
 /// A replicated insert of document `id`, stamped at `wall` from `origin`.
 fn entry(origin: NodeId, wall: u64, collection: kimmy_core::CollectionId, id: i64) -> OplogEntry {
     OplogEntry {
-        stamp: Stamp::new(Hlc::new(wall, 0), origin),
+        stamp: Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
         kind: OpKind::Insert,
         collection,
         doc_id: Some(DocId::Int64(id)),

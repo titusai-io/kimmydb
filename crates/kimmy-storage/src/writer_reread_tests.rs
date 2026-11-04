@@ -9,6 +9,7 @@
 //! recorded in the window between the two (a hook, or the scan and the removal
 //! made two calls), and the older one must not win.
 
+use kimmy_core::Epoch;
 use std::cell::RefCell;
 
 use kimmy_core::{CollectionId, Hlc, IndexField, IndexMeta, Stamp};
@@ -34,7 +35,7 @@ fn engine() -> (Engine, tempfile::TempDir) {
 
 /// Strictly later than `stamp`, from the same node.
 fn after(stamp: Stamp) -> Stamp {
-    Stamp::new(Hlc::new(stamp.hlc.wall_ms + 10, 0), stamp.node)
+    Stamp::new(Hlc::new(stamp.hlc.wall_ms + 10, 0), stamp.node, Epoch::ZERO)
 }
 
 /// A cutoff past every stamp written now.
@@ -99,7 +100,7 @@ fn an_older_drop_does_not_replace_one_recorded_between_its_check_and_its_writer(
     let (engine, _dir) = engine();
     let engine = std::sync::Arc::new(engine);
     let coll = engine.create_collection("shop", "orders").unwrap();
-    let base = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), engine.node_id());
+    let base = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), engine.node_id(), Epoch::ZERO);
     let (older, newer) = (after(base), after(after(base)));
 
     // Nothing is held, so the outside check lets `older` through; the newer
@@ -127,7 +128,7 @@ fn a_batch_of_drops_does_not_replace_a_newer_one_it_holds() {
 
     // The callers filter first; the writer's check is what holds if they did
     // not, or if the table moved since.
-    let older = Stamp::new(Hlc::new(stamp.hlc.wall_ms - 5, 0), stamp.node);
+    let older = Stamp::new(Hlc::new(stamp.hlc.wall_ms - 5, 0), stamp.node, Epoch::ZERO);
     engine.record_collection_drops(&[(stale, older), (fresh, after(before))]).unwrap();
 
     assert_eq!(engine.collection_dropped_at(stale).unwrap(), Some(newer), "the older one lost");

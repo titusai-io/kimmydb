@@ -671,6 +671,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::index_meta::IndexField;
 
     use super::*;
@@ -957,7 +958,11 @@ mod tests {
 
     /// Move `engine`'s clock to `base + t` before a local step.
     fn at(engine: &Engine, base: u64, t: u64) {
-        engine.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), engine.node_id()));
+        engine.advance_clock_past(&Stamp::new(
+            Hlc::new(base + t, 0),
+            engine.node_id(),
+            Epoch::ZERO,
+        ));
     }
 
     /// One pull as the transport asks it: from what `into` has witnessed.
@@ -1150,7 +1155,11 @@ mod tests {
             let coll = engine.create_collection("shop", "orders").unwrap();
             engine.insert(&coll, doc! { "_id": 1 }).unwrap();
             let target = latest(&engine);
-            engine.advance_clock_past(&Stamp::new(Hlc::new(ahead, 0), engine.node_id()));
+            engine.advance_clock_past(&Stamp::new(
+                Hlc::new(ahead, 0),
+                engine.node_id(),
+                Epoch::ZERO,
+            ));
             engine.insert(&coll, doc! { "_id": 2 }).unwrap();
             engine.insert(&coll, doc! { "_id": 3 }).unwrap();
             let discarded = latest(&engine);

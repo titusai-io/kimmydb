@@ -17,6 +17,7 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
+use kimmy_core::Epoch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1087,7 +1088,11 @@ impl Engine {
         let Some(highest) = witnessed.iter().map(|(_, hlc)| hlc).max() else {
             return Ok(Vec::new());
         };
-        let upper = crate::codec::oplog_key(&Stamp::new(highest, NodeId::from_bytes([0xFF; 16])));
+        let upper = crate::codec::oplog_key(&Stamp::new(
+            highest,
+            NodeId::from_bytes([0xFF; 16]),
+            Epoch::ZERO,
+        ));
         let txn = self.db().begin_read()?;
         // Read for a pull this node makes, which no client asked for: it ends
         // at the signal.
@@ -1369,8 +1374,14 @@ impl Engine {
                 (None, false, Some(p)) => WindowEnd::Through(p),
                 (None, false, None) => match entries.last() {
                     Some(last) if last.stamp.hlc <= scanned_to => WindowEnd::Through(last.stamp),
-                    Some(last) => WindowEnd::Through(Stamp::new(scanned_to, last.stamp.node)),
-                    None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+                    Some(last) => {
+                        WindowEnd::Through(Stamp::new(scanned_to, last.stamp.node, Epoch::ZERO))
+                    }
+                    None => WindowEnd::Before(Stamp::new(
+                        Hlc::ZERO,
+                        NodeId::from_bytes([0; 16]),
+                        Epoch::ZERO,
+                    )),
                 },
             };
             witnessed.merge(&coverage_up_to(theirs, end));
@@ -3352,6 +3363,7 @@ mod tests {
     use super::*;
     use bson::doc;
     use kimmy_core::DocId;
+    use kimmy_core::Epoch;
 
     const BATCH: usize = 1024;
     const DAY: u64 = 24 * 60 * 60;
@@ -3472,7 +3484,7 @@ mod tests {
     /// `coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node`
     /// pins on its own.
     fn window_end(wall: u64) -> Stamp {
-        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]))
+        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO)
     }
 
     #[test]
@@ -3527,7 +3539,7 @@ mod tests {
 
     fn entry_from(node: kimmy_core::NodeId, hlc: Hlc) -> OplogEntry {
         OplogEntry {
-            stamp: kimmy_core::Stamp::new(hlc, node),
+            stamp: kimmy_core::Stamp::new(hlc, node, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId::derive("db", "c"),
             doc_id: Some(DocId::String("x".into())),
@@ -3585,7 +3597,11 @@ mod tests {
         // (3) A records a violation: its newest own stamp, never shipped, and
         // stamped after everything C wrote.
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(9_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(9_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -3651,7 +3667,11 @@ mod tests {
         // mints its own `UniqueViolation` entry for it, which it will never
         // ship to a peer (ADR-029).
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(just_above(a), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                just_above(a),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -3810,7 +3830,11 @@ mod tests {
         // A's newest own stamp: minted now, so it sits after every entry above
         // and more than one window of shippable entries lies under it.
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(just_above(&a), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                just_above(&a),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -4040,6 +4064,7 @@ mod tests {
     }
 
     mod props {
+        use kimmy_core::Epoch;
         use proptest::prelude::*;
 
         use super::*;
@@ -4079,7 +4104,7 @@ mod tests {
                     if *collides {
                         let id = format!("r{i}");
                         let entry = OplogEntry {
-                            stamp: kimmy_core::Stamp::new(just_above(&a), origin),
+                            stamp: kimmy_core::Stamp::new(just_above(&a), origin, Epoch::ZERO),
                             kind: OpKind::Insert,
                             collection: ca.id,
                             doc_id: Some(DocId::String(id.clone())),
@@ -4143,9 +4168,9 @@ mod tests {
 
         let origin = NodeId::generate();
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(10_000, 0), origin));
+        mine.observe(Stamp::new(Hlc::new(10_000, 0), origin, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin));
+        theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin, Epoch::ZERO));
 
         // The peer holds newer, and the newest we have is 12 s old.
         assert_eq!(lag_behind_ms(&mine, &theirs, 22_000), 12_000, "12 s behind the clock");
@@ -4168,9 +4193,9 @@ mod tests {
         let first = Hlc::new(1_000_000, 0);
         let last = Hlc::new(1_000_300, 0);
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(first, origin));
+        mine.observe(Stamp::new(first, origin, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(last, origin));
+        theirs.observe(Stamp::new(last, origin, Epoch::ZERO));
         let now = first.wall_ms + 30_000;
 
         let span = last.wall_ms - first.wall_ms;
@@ -4184,11 +4209,11 @@ mod tests {
 
         let (a, b) = (NodeId::generate(), NodeId::generate());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(1_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(8_000, 0), b));
+        mine.observe(Stamp::new(Hlc::new(1_000, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(8_000, 0), b, Epoch::ZERO));
         let mut theirs = mine.clone();
-        theirs.observe(Stamp::new(Hlc::new(2_000, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(9_000, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(2_000, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(9_000, 0), b, Epoch::ZERO));
 
         // An alert cares how far behind the worst origin is; summing origins
         // would report a cluster-wide write burst as one enormous lag. At
@@ -4198,7 +4223,7 @@ mod tests {
         // An origin the peer is level on does not count, whatever its age:
         // catch up on `a` and only `b` is left.
         let mut level = mine.clone();
-        level.observe(Stamp::new(Hlc::new(2_000, 0), a));
+        level.observe(Stamp::new(Hlc::new(2_000, 0), a, Epoch::ZERO));
         assert_eq!(lag_behind_ms(&level, &theirs, 10_000), 2_000);
     }
 
@@ -4288,7 +4313,7 @@ mod tests {
         use kimmy_core::{NodeId, Stamp};
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(1_786_000_000_000, 0), NodeId::generate()));
+        theirs.observe(Stamp::new(Hlc::new(1_786_000_000_000, 0), NodeId::generate(), Epoch::ZERO));
 
         // The peer's vector holds only the *newest* stamp per origin, so an
         // origin this node has never seen has no honest gap to report —
@@ -4462,7 +4487,7 @@ mod tests {
         // replacement.
         for hlc in [ca_old.created, dropped_at] {
             let entry = OplogEntry {
-                stamp: kimmy_core::Stamp::new(hlc, kimmy_core::NodeId::generate()),
+                stamp: kimmy_core::Stamp::new(hlc, kimmy_core::NodeId::generate(), Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: ca_new.id,
                 doc_id: Some(DocId::String("ghost".into())),
@@ -4483,6 +4508,7 @@ mod tests {
                 stamp: kimmy_core::Stamp::new(
                     Hlc::new(dropped_at.wall_ms + offset, 0),
                     kimmy_core::NodeId::generate(),
+                    Epoch::ZERO,
                 ),
                 kind: OpKind::Insert,
                 collection: ca_new.id,
@@ -4509,7 +4535,11 @@ mod tests {
         a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
 
         let entry = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(9_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(9_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -5026,7 +5056,7 @@ mod tests {
 
         let origin = kimmy_core::NodeId::generate();
         let remote = |ms: u64, id: &str, email: &str| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: cb.id,
             doc_id: Some(DocId::String(id.into())),
@@ -5065,7 +5095,11 @@ mod tests {
         let (b, _db) = engine();
 
         let orphan = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(1_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId::derive("shop", "never-heard-of"),
             doc_id: Some(DocId::Int64(1)),
@@ -6339,8 +6373,11 @@ mod tests {
         // And a drop stamped between the two creations — which is exactly
         // what anti-entropy delivers on heal — now resolves the same way on
         // each of them.
-        let between =
-            Stamp::new(Hlc::new(first.hlc.wall_ms + 1, 0), kimmy_core::NodeId::from_bytes([9; 16]));
+        let between = Stamp::new(
+            Hlc::new(first.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
+        );
         assert!(between > first && between < second, "the fixture's drop sits between them");
         let drop = crate::engine::ddl_entry(
             between,
@@ -6414,8 +6451,8 @@ mod tests {
         // to every member that pulls from it, for ever. ADR-123's rule for a
         // refusal, and ADR-132's for a loser.
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = create_index_entry(
             id,
@@ -6600,7 +6637,7 @@ mod tests {
         // filter -- `create_index_inner` parses for every origin. That is the
         // case: the entry comes from a build whose parser accepted it.
         let node = kimmy_core::NodeId::from_bytes([7; 16]);
-        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node, Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let mut index = definition("by_shape", vec![field("size")], false, Some(stamp));
         let filter = doc! {"size": {"$sameShapeAs": 5}};
@@ -6637,7 +6674,7 @@ mod tests {
         // as a request refusal: skipped and counted, not a failed round. No
         // released build stores one, so the entry is built by hand.
         let node = kimmy_core::NodeId::from_bytes([7; 16]);
-        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node, Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let mut index = definition("by_pattern", vec![field("size")], false, Some(stamp));
         let filter = doc! {"size": bson::Bson::RegularExpression(bson::Regex {
@@ -6676,8 +6713,8 @@ mod tests {
         // later stamp wins, on whichever member the entries reach in
         // whichever order (ADR-132).
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = definition("by_email", vec![field("email")], false, Some(earlier));
         let winner = definition("by_email", vec![field("email")], true, Some(later));
@@ -6712,8 +6749,8 @@ mod tests {
         // anti-entropy produces routinely — otherwise the two definitions
         // would trade places on every round for ever.
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = create_index_entry(
             id,
@@ -6811,7 +6848,7 @@ mod tests {
             "shop",
             "orders",
             "probe",
-            Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]))),
+            Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO)),
         );
         let held = b.get_collection("shop", "orders").unwrap().index("probe").unwrap().id;
         let before = crate::index::scan_range(
@@ -7404,14 +7441,14 @@ mod tests {
         let c = NodeId::from_bytes([3; 16]);
 
         let mut mine = VersionVector::default();
-        mine.observe(Stamp::new(Hlc::new(100_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(90_000, 0), b));
-        mine.observe(Stamp::new(Hlc::new(50_000, 0), c));
+        mine.observe(Stamp::new(Hlc::new(100_000, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(90_000, 0), b, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(50_000, 0), c, Epoch::ZERO));
 
         // The peer last saw `a` at 10s, `b` at 90s (level), never `c`.
         let mut theirs = VersionVector::default();
-        theirs.observe(Stamp::new(Hlc::new(10_000, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(90_000, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(10_000, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(90_000, 0), b, Epoch::ZERO));
 
         let now = 100_000;
         assert_eq!(
@@ -7678,12 +7715,13 @@ mod tests {
         theirs.insert(last, Hlc::new(5_000, 0));
         theirs.insert(later, Hlc::new(5_000, 0));
 
-        let through = coverage_up_to(&theirs, WindowEnd::Through(Stamp::new(at, last)));
+        let through =
+            coverage_up_to(&theirs, WindowEnd::Through(Stamp::new(at, last, Epoch::ZERO)));
         assert_eq!(through.get(early), at, "an earlier node's entry at the stamp was examined");
         assert_eq!(through.get(last), at, "the entry itself was delivered");
         assert_eq!(through.get(later), at.predecessor(), "a later node's tie was not examined");
 
-        let before = coverage_up_to(&theirs, WindowEnd::Before(Stamp::new(at, last)));
+        let before = coverage_up_to(&theirs, WindowEnd::Before(Stamp::new(at, last, Epoch::ZERO)));
         assert_eq!(before.get(early), at);
         assert_eq!(before.get(last), at.predecessor(), "the entry itself was not taken");
         assert_eq!(before.get(later), at.predecessor());
@@ -8303,7 +8341,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateCollection)
             .cloned()
             .expect("the creation's entry");
-        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        let below =
+            Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO);
         assert!(below < create.stamp, "premise: the drop sorts below the creation");
         let landing = Arc::clone(&b);
         let id = create.collection;
@@ -8331,7 +8370,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateCollection)
             .cloned()
             .expect("the creation's entry");
-        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        let below =
+            Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO);
         b.record_collection_drop(create.collection, below).unwrap();
         b.apply_batch(std::slice::from_ref(&create)).unwrap();
         assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
@@ -8353,7 +8393,7 @@ mod tests {
             .collection_dropped_at(CollectionId::derive("shop", &shadow))
             .unwrap()
             .expect("the shadow's drop");
-        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         let entry = crate::engine::ddl_entry(
             tied,
             OpKind::ConfigureVectors,
@@ -8391,6 +8431,7 @@ mod tests {
         let covering = Stamp::new(
             Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         let landing = Arc::clone(&b);
         let (applied, ()) = race_hooks::race(
@@ -8432,6 +8473,7 @@ mod tests {
         let at = Stamp::new(
             Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         b.record_collection_drop(index.collection, at).unwrap();
         let holds = |e: &Engine| {
@@ -8467,7 +8509,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateIndex)
             .cloned()
             .expect("the index's entry");
-        index.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        index.stamp =
+            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
         let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
         assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
@@ -8745,7 +8788,7 @@ mod tests {
         engine
             .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
             .unwrap();
-        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (settled, created) = race_hooks::race(
             race_hooks::Race::IndexCreation,
@@ -8797,8 +8840,10 @@ mod tests {
         let coll = engine.get_collection("shop", "orders").unwrap();
         let held_at = coll.index("by_a").unwrap().created;
         let index_id = coll.index("by_a").unwrap().id;
-        let arriving = Stamp::new(Hlc::new(u64::MAX / 4, 0), NodeId::from_bytes([9; 16]));
-        let dropped_at = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let arriving =
+            Stamp::new(Hlc::new(u64::MAX / 4, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
+        let dropped_at =
+            Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (outcome, ()) = race_hooks::race(
             race_hooks::Race::IndexCreation,
@@ -8878,7 +8923,7 @@ mod tests {
         // under a tombstone newer than it, which the members that applied the
         // two the other way round do not hold.
         let (engine, _dir) = collection_with_documents();
-        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (dropped, created) = race_hooks::race(
             race_hooks::Race::IndexDrop,
@@ -10210,6 +10255,7 @@ mod budget_tests {
     use super::*;
     use crate::watch::ExamineBudget;
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{CollectionId, DocId, NodeId};
 
     /// A budget with no time: every window ends at the first row past its
@@ -10229,7 +10275,7 @@ mod budget_tests {
     fn insert(collection: CollectionId, node: NodeId, hlc: Hlc) -> OplogEntry {
         let id = format!("{}-{}-{}", node, hlc.wall_ms, hlc.counter);
         OplogEntry {
-            stamp: Stamp::new(hlc, node),
+            stamp: Stamp::new(hlc, node, Epoch::ZERO),
             kind: OpKind::Insert,
             collection,
             doc_id: Some(DocId::String(id.clone())),
@@ -10384,7 +10430,7 @@ mod budget_tests {
         let before = insert(held.id, a, Hlc::new(base, 0));
         let stop = insert(lacked, b, Hlc::new(base + 1, 0));
         let after = insert(held.id, a, Hlc::new(base + 2, 0));
-        let p = Stamp::new(Hlc::new(base + 3, 0), c);
+        let p = Stamp::new(Hlc::new(base + 3, 0), c, Epoch::ZERO);
         let theirs: VersionVector =
             [(a, after.stamp.hlc), (b, stop.stamp.hlc), (c, p.hlc)].into_iter().collect();
         let window = PeerWindow {
@@ -10403,7 +10449,7 @@ mod budget_tests {
         assert_eq!(outcome.applied, 1, "only the entry before the stop");
         let witnessed = requester.witnessed_vector().unwrap();
         for node in [a, b, c] {
-            let reached = Stamp::new(witnessed.get(node), node);
+            let reached = Stamp::new(witnessed.get(node), node, Epoch::ZERO);
             assert!(reached < stop.stamp, "{node} is covered to {reached:?}, past the stop");
         }
         assert!(witnessed.get(a) >= before.stamp.hlc, "the entry before the stop is covered");

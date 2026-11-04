@@ -6,6 +6,7 @@
 //!
 //! Naming: `revc_` prefix, so the review's tests run as one filter.
 
+use kimmy_core::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bson::doc;
@@ -434,7 +435,7 @@ fn revc_clock_skew_cannot_make_a_collected_delete_young() {
     s.create_collection("shop", "orders").unwrap();
     pull(&r, &s);
     let hour = 3_600_000;
-    let fast = Stamp::new(Hlc::new(now() + hour, 0), s.node_id());
+    let fast = Stamp::new(Hlc::new(now() + hour, 0), s.node_id(), Epoch::ZERO);
     s.apply_batch(&[insert_entry(orders(), 7, fast)]).unwrap();
     pull(&r, &s);
     assert!(live(&r, 7), "premise");
@@ -452,7 +453,7 @@ fn revc_clock_skew_cannot_make_a_collected_delete_young() {
     // still stamped after what this member has seen.
     let (r2, _r2d) = engine();
     pull(&r2, &s);
-    let early = Stamp::new(Hlc::new(now() - hour, 0), s.node_id());
+    let early = Stamp::new(Hlc::new(now() - hour, 0), s.node_id(), Epoch::ZERO);
     s.apply_batch(&[insert_entry(orders(), 8, early)]).unwrap();
     r2.apply_batch(&[insert_entry(orders(), 8, early)]).unwrap();
     assert!(r2.delete(&r2.get_collection("shop", "orders").unwrap(), &DocId::Int64(8)).unwrap());

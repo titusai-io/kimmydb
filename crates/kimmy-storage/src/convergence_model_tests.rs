@@ -47,6 +47,7 @@
 //! whether or not the writer had heard of it: ADR-236) must be on every member with
 //! that stamp.
 //!
+use kimmy_core::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -617,7 +618,11 @@ impl Cluster {
     /// Move member `m`'s clock to `t` before a local step.
     fn clock(&self, m: usize, t: u32) {
         let e = self.e(m);
-        e.advance_clock_past(&Stamp::new(Hlc::new(self.base + u64::from(t), 0), e.node_id()));
+        e.advance_clock_past(&Stamp::new(
+            Hlc::new(self.base + u64::from(t), 0),
+            e.node_id(),
+            Epoch::ZERO,
+        ));
     }
 
     fn tombstones(&self, m: usize) -> Res<BTreeMap<CollectionId, Stamp>> {

@@ -26,6 +26,7 @@
 //! Its own binary, with a counting `#[global_allocator]`, for the reason
 //! `count_allocations.rs` gives.
 
+use kimmy_core::Epoch;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,7 +77,9 @@ const PINNED: Hlc = Hlc::new(1 << 44, 0);
 /// `violations` unique violations spread evenly among them, closed.
 fn build(path: &std::path::Path, documents: usize, violations: usize) {
     let engine = Engine::open(path).unwrap();
-    engine.witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]))).unwrap();
+    engine
+        .witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]), Epoch::ZERO))
+        .unwrap();
     engine.create_collection("app", "docs").unwrap();
     let field = IndexField { path: "email".into(), descending: false };
     engine.create_index("app", "docs", vec![field], true, None).unwrap();
@@ -100,6 +103,7 @@ fn build(path: &std::path::Path, documents: usize, violations: usize) {
                 stamp: Stamp::new(
                     Hlc::new(9_000 + made as u64, 0),
                     NodeId::from_bytes([made as u8 + 1; 16]),
+                    Epoch::ZERO,
                 ),
                 kind: OpKind::Insert,
                 collection: coll.id,

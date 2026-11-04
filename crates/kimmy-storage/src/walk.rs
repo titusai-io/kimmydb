@@ -433,6 +433,7 @@ mod tests {
     use super::*;
     use crate::StopReason;
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::Hlc;
     use redb::ReadableDatabase;
 
@@ -628,6 +629,7 @@ mod tests {
                 stamp: kimmy_core::Stamp::new(
                     Hlc::new(u64::MAX >> 20, 0),
                     kimmy_core::NodeId::from_bytes([9; 16]),
+                    Epoch::ZERO,
                 ),
                 kind: kimmy_core::OpKind::Insert,
                 collection: orders.id,
@@ -641,7 +643,8 @@ mod tests {
                 .unwrap();
             // As a definition from a peer builds, over documents it cannot key: a
             // local create over them is refused (ADR-258).
-            let created = kimmy_core::Stamp::new(Hlc::new(5, 0), kimmy_core::NodeId::generate());
+            let created =
+                kimmy_core::Stamp::new(Hlc::new(5, 0), kimmy_core::NodeId::generate(), Epoch::ZERO);
             engine
                 .create_index_inner(
                     "shop",
@@ -661,7 +664,8 @@ mod tests {
             {
                 let mut held = txn.open_table(crate::tables::OPLOG_HELD).unwrap();
                 for wall_ms in 1..=10 {
-                    let stamp = kimmy_core::Stamp::new(Hlc::new(wall_ms, 0), HELD_ORIGIN);
+                    let stamp =
+                        kimmy_core::Stamp::new(Hlc::new(wall_ms, 0), HELD_ORIGIN, Epoch::ZERO);
                     held.insert(crate::codec::oplog_key(&stamp).as_slice(), ()).unwrap();
                 }
             }

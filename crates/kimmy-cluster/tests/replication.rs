@@ -5,6 +5,7 @@
 //! reach: that the wire carries the types faithfully, that the handshake
 //! actually gates access, and that a listener survives a peer misbehaving.
 
+use kimmy_core::Epoch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1264,6 +1265,7 @@ fn entry_stamped(collection: kimmy_core::CollectionId, wall_ms: u64) -> kimmy_co
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(wall_ms, 0),
             kimmy_core::NodeId::generate(),
+            Epoch::ZERO,
         ),
         kind: kimmy_core::OpKind::Insert,
         collection,
@@ -1581,7 +1583,8 @@ async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds()
     // B's newest write of its own, read by its stamp: `newest` scans the first
     // two batches of the oplog, and A's writes sit between them and this.
     let b_id = b.engine.node_id();
-    let stamp = kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id);
+    let stamp =
+        kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id, Epoch::ZERO);
     let entry = b.engine.oplog_entry(&stamp).unwrap().expect("B's schema change");
     assert_eq!(entry.kind, kimmy_core::OpKind::CreateIndex);
 
@@ -1880,7 +1883,7 @@ async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stam
     let o = kimmy_core::NodeId::from_bytes([2; 16]);
     let base = kimmy_storage::physical_now_ms() + 1_000;
     let entry = |origin: kimmy_core::NodeId, wall: u64, id: String| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection: ca.id,
         doc_id: Some(DocId::String(id.clone())),
@@ -1957,7 +1960,7 @@ async fn a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_
     let entry = |i: u64| {
         let wall = if i <= 10 { now - 2 * DAY_SECS * 1_000 + i } else { now + i };
         kimmy_core::OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), x),
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), x, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String(format!("x{i}"))),
@@ -3503,7 +3506,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -4131,7 +4134,11 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
     // B's definition, stamped older than anything A can mint — pinned to a
     // fixed stamp rather than left to the clock, so which side wins is a
     // fact of the fixture and not of how fast the test ran.
-    let ancient = kimmy_core::Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]));
+    let ancient = kimmy_core::Stamp::new(
+        Hlc::new(1, 0),
+        kimmy_core::NodeId::from_bytes([0; 16]),
+        Epoch::ZERO,
+    );
     source.engine.create_collection("shop", "orders").unwrap();
     source
         .engine
@@ -7408,7 +7415,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -7528,7 +7535,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -7645,7 +7652,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -8047,7 +8054,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -8213,7 +8220,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
     let origin = kimmy_core::NodeId::generate();
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -8821,7 +8828,7 @@ async fn the_replay_moves_the_clock_past_the_lost_writes() {
     // A write this member made an hour ahead of the clock it will restart with.
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.engine.node_id()),
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.engine.node_id(), Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection: meta.id,
         doc_id: Some(DocId::String("99".into())),
@@ -9408,7 +9415,7 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
     let me = scenario.restored.engine.node_id();
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me),
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection: peer_only.id,
         doc_id: Some(DocId::String("lost".into())),

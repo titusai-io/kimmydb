@@ -11,6 +11,7 @@
 //! change streams work here at all — the log exists whether or not the node is
 //! part of a cluster, rather than being a byproduct of replication.
 
+use crate::Epoch;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -206,7 +207,7 @@ impl ResumeToken {
     }
 
     pub fn to_stamp(&self) -> Stamp {
-        Stamp::new(self.hlc, self.node)
+        Stamp::new(self.hlc, self.node, Epoch::ZERO)
     }
 
     /// The exclusive lower bound for a `resume_after` scan.
@@ -323,6 +324,7 @@ impl TryFrom<String> for ResumeToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Epoch;
 
     fn token() -> ResumeToken {
         ResumeToken::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16]))
@@ -361,7 +363,7 @@ mod tests {
         delivered.insert(NodeId::from_bytes([3; 16]), Hlc::new(1_700_000_000_500, 1));
         delivered.insert(NodeId::from_bytes([9; 16]), Hlc::new(1_700_000_000_000, 42));
         ResumeToken::issued(
-            Stamp::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16])),
+            Stamp::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16]), Epoch::ZERO),
             NodeId::from_bytes([5; 16]),
             delivered,
         )
@@ -400,7 +402,7 @@ mod tests {
         // And a process's own position is still read back from where it is
         // stored: the form is the vector worker's, not a client's.
         let position = ResumeToken::decode(&old).unwrap();
-        assert_eq!(position.to_stamp(), Stamp::new(hlc, node));
+        assert_eq!(position.to_stamp(), Stamp::new(hlc, node, Epoch::ZERO));
         assert_eq!(position.issued, None);
         assert_eq!(position.encode(), old);
     }

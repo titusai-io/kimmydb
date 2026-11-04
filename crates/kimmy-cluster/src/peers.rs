@@ -3043,6 +3043,7 @@ mod count_finding_tests;
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     /// A confirmed count divergence replays from the lowest of the life's floor, its
     /// `created` and the tombstone held for its id; a collection not held is a snapshot.
     #[test]
@@ -3056,7 +3057,7 @@ mod tests {
         engine
             .record_database_tombstone_for_test(
                 orders.id,
-                Stamp::new(below, NodeId::from_bytes([7; 16])),
+                Stamp::new(below, NodeId::from_bytes([7; 16]), Epoch::ZERO),
             )
             .unwrap();
         assert_eq!(super::repair_for(&engine, orders.id), Repair::Replay { from: below });

@@ -18,6 +18,7 @@
 //! or not the node has ever seen one. That is the reason change streams here do
 //! not require a replica set.
 
+use kimmy_core::Epoch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -667,18 +668,19 @@ impl Engine {
     /// above: the client has seen that event.
     fn stamp_beyond_the_horizon(&self, stamp: &Stamp) -> Result<bool> {
         let witnessed = self.witnessed_vector()?;
-        if self
-            .oplog_collected()?
-            .iter()
-            .any(|(origin, hlc)| Stamp::new(hlc.min(witnessed.get(origin)), origin) > *stamp)
-        {
+        if self.oplog_collected()?.iter().any(|(origin, hlc)| {
+            Stamp::new(hlc.min(witnessed.get(origin)), origin, Epoch::ZERO) > *stamp
+        }) {
             return Ok(true);
         }
         // A span held only as a snapshot's state is as unservable as one retention took:
         // the oplog's first key can sit below it (the snapshot's documents are entries at
         // their own old stamps), and the events inside it, a delete of a document this
         // member never held among them, are not here to send.
-        Ok(self.state_held()?.iter().any(|(origin, hlc)| Stamp::new(hlc, origin) > *stamp))
+        Ok(self
+            .state_held()?
+            .iter()
+            .any(|(origin, hlc)| Stamp::new(hlc, origin, Epoch::ZERO) > *stamp))
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -1750,6 +1752,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::OpKind;
 
     use super::*;
@@ -1806,7 +1809,7 @@ mod tests {
             {
                 let mut held = txn.open_table(tables::OPLOG_HELD).unwrap();
                 for wall_ms in 1..=4 {
-                    let stamp = Stamp::new(Hlc::new(wall_ms, 0), peer);
+                    let stamp = Stamp::new(Hlc::new(wall_ms, 0), peer, Epoch::ZERO);
                     held.insert(codec::oplog_key(&stamp).as_slice(), ()).unwrap();
                 }
             }
@@ -2127,7 +2130,8 @@ mod tests {
     async fn a_drop_in_the_lifes_own_hlc_ends_a_stream_on_it() {
         let (engine, coll, _dir) = setup();
         let mut stream = engine.watch(WatchScope::Collection(coll.id), Default::default()).unwrap();
-        let tied = Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let tied =
+            Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         let drop = crate::engine::ddl_entry(
             tied,
             OpKind::DropCollection,
@@ -2473,7 +2477,7 @@ mod tests {
     /// A remote entry stamped *behind* the local tail, as replication produces.
     fn remote_entry(coll: &CollectionMeta, id: &str, wall_ms: u64) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(wall_ms, 0), kimmy_core::NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(wall_ms, 0), kimmy_core::NodeId::generate(), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -2666,7 +2670,7 @@ mod tests {
 
     /// A stamp `ms` milliseconds past `stamp`, from the same node.
     fn later_by(stamp: Stamp, ms: u64) -> Stamp {
-        Stamp::new(Hlc::new(stamp.hlc.wall_ms + ms, 0), stamp.node)
+        Stamp::new(Hlc::new(stamp.hlc.wall_ms + ms, 0), stamp.node, Epoch::ZERO)
     }
 
     /// Drop `app.docs`, collect the drop's oplog entry while keeping its
@@ -2743,7 +2747,7 @@ mod tests {
         // older than everything retained here refused the open outright.
         let (engine, coll, _dir) = setup();
         let first = newest_stamp(&engine);
-        let before = Stamp::new(Hlc::new(first.hlc.wall_ms - 1_000, 0), first.node);
+        let before = Stamp::new(Hlc::new(first.hlc.wall_ms - 1_000, 0), first.node, Epoch::ZERO);
         engine.record_collection_drop(coll.id, before).unwrap();
         engine.insert(&coll, doc! { "_id": 99i64 }).unwrap();
 
@@ -3109,7 +3113,7 @@ mod tests {
         assert!(refused(&engine), "premise: refused while the first retained entry is above it");
 
         let old = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO),
             kind: OpKind::Delete,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -3141,9 +3145,10 @@ mod tests {
             )
             .unwrap();
         let newest = first_retained_stamp(&engine);
-        let above_the_collected = Stamp::new(newest.hlc.predecessor(), engine.node_id());
+        let above_the_collected =
+            Stamp::new(newest.hlc.predecessor(), engine.node_id(), Epoch::ZERO);
         let old = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO),
             kind: OpKind::Delete,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -3174,12 +3179,13 @@ mod tests {
         let (engine, coll, _dir) = setup();
         engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
         let held = newest_stamp(&engine);
-        let stranger = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let stranger =
+            Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let txn = engine.begin_write(crate::engine::WriterHolder::Replication).unwrap();
         crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stranger).unwrap();
         txn.commit().unwrap();
 
-        let token = Stamp::new(held.hlc.predecessor(), held.node);
+        let token = Stamp::new(held.hlc.predecessor(), held.node, Epoch::ZERO);
         assert!(
             engine
                 .watch(
@@ -3287,7 +3293,7 @@ mod tests {
             a_client_that_saw_y_and_a_member_to_resume_on(false);
         let top = p.state_held().unwrap();
         let (origin, hlc) = top.iter().next().expect("a hole");
-        let above = Stamp::new(hlc.successor(), origin);
+        let above = Stamp::new(hlc.successor(), origin, Epoch::ZERO);
         let delivered = resumed_with(&p, ResumeToken::from_stamp(above)).await;
         assert!(delivered.is_ok(), "nothing above this token is held only as state: {delivered:?}");
     }
@@ -3339,7 +3345,7 @@ mod tests {
             )
             .unwrap();
         let late = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO),
             kind: OpKind::Delete,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -3400,7 +3406,7 @@ mod tests {
             )
             .unwrap();
         let late = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO),
             kind: OpKind::Delete,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -4205,8 +4211,11 @@ mod tests {
         // The drop's entry arrives after the collection's own, as it does on a
         // member that learned of a database's drop late.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let sentinel =
-            Stamp::new(Hlc::new(late.created.wall_ms - 1, 0), NodeId::from_bytes([7; 16]));
+        let sentinel = Stamp::new(
+            Hlc::new(late.created.wall_ms - 1, 0),
+            NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
+        );
         engine.record_collection_drop(late.id, sentinel).unwrap();
         let drop = crate::engine::ddl_entry(
             sentinel,
@@ -4219,7 +4228,8 @@ mod tests {
         // before its own, arrive after it: another collection's creation, and
         // an entry of this collection that is no creation. Neither is the
         // creation, and taking one would put it after the sentinel.
-        let neighbour = |node: u8| Stamp::new(late.created, NodeId::from_bytes([node; 16]));
+        let neighbour =
+            |node: u8| Stamp::new(late.created, NodeId::from_bytes([node; 16]), Epoch::ZERO);
         let other = crate::engine::ddl_entry(
             neighbour(0),
             OpKind::CreateCollection,
@@ -4269,8 +4279,11 @@ mod tests {
 
         // The same where only the tombstone is held, as after a snapshot.
         let y = CollectionId::derive("app", "y");
-        let dropped_at =
-            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+        let dropped_at = Stamp::new(
+            Hlc::new(crate::physical_now_ms(), 0),
+            NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
+        );
         engine.record_collection_drop(y, dropped_at).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let y = engine.create_collection("app", "y").unwrap();
@@ -4289,8 +4302,11 @@ mod tests {
     fn a_tokenless_open_without_the_entries_that_place_it_is_placed_by_stamps() {
         let (engine, _coll, _dir) = setup();
         an_old_oplog(&engine, 4_000);
-        let dropped_at =
-            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+        let dropped_at = Stamp::new(
+            Hlc::new(crate::physical_now_ms(), 0),
+            NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
+        );
         let y = CollectionId::derive("app", "y");
         let z = CollectionId::derive("app", "z");
         engine.record_collection_drop(y, dropped_at).unwrap();
@@ -4369,6 +4385,7 @@ mod tests {
     /// between the walk and the seek against today's walk, over stores built
     /// by every writer of the oplog, the arrival index and the vectors.
     mod first_arrival {
+        use kimmy_core::Epoch;
         use proptest::prelude::*;
         use redb::ReadableTableMetadata;
 
@@ -4494,7 +4511,7 @@ mod tests {
             fn remote(&mut self, origin: usize, wall: u64, position: Position) {
                 let id = self.id();
                 let entry = OplogEntry {
-                    stamp: Stamp::new(Hlc::new(wall, 0), self.origins[origin]),
+                    stamp: Stamp::new(Hlc::new(wall, 0), self.origins[origin], Epoch::ZERO),
                     kind: OpKind::Insert,
                     collection: self.coll.id,
                     doc_id: Some(kimmy_core::DocId::String(id.clone())),
@@ -4555,7 +4572,8 @@ mod tests {
                         self.engine().absorb_version_vector(&granted).unwrap();
                     }
                     Op::Orphan { origin, wall } => {
-                        let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin]);
+                        let stamp =
+                            Stamp::new(Hlc::new(wall, 7), self.origins[origin], Epoch::ZERO);
                         let db = self.engine().db();
                         let txn = db.begin_write().unwrap();
                         txn.open_table(tables::OPLOG_HELD)
@@ -4799,7 +4817,7 @@ mod tests {
             // entry is in the oplog and the index, above `V`, and not held.
             let stranger = NodeId::generate();
             let entry = OplogEntry {
-                stamp: Stamp::new(Hlc::new(5, 0), stranger),
+                stamp: Stamp::new(Hlc::new(5, 0), stranger, Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: store.coll.id,
                 doc_id: Some(kimmy_core::DocId::String("stray".into())),

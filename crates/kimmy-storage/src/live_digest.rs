@@ -27,6 +27,7 @@
 //! shared mark would let a build that keeps the counts and not the digests keep
 //! it current.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeMap;
 
 use kimmy_core::{Hlc, NodeId, Stamp};
@@ -80,10 +81,10 @@ impl DigestRow {
     /// Merge `other`'s highest stamps into this row's.
     fn raise_from(&mut self, other: &DigestRow) {
         for (node, hlc) in &other.maxw {
-            raise(&mut self.maxw, &Stamp::new(*hlc, *node));
+            raise(&mut self.maxw, &Stamp::new(*hlc, *node, Epoch::ZERO));
         }
         for (node, hlc) in &other.bare_max {
-            raise(&mut self.bare_max, &Stamp::new(*hlc, *node));
+            raise(&mut self.bare_max, &Stamp::new(*hlc, *node, Epoch::ZERO));
         }
     }
 
@@ -321,13 +322,14 @@ pub(crate) fn fold_walked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
 
     fn k(bytes: &[u8]) -> Vec<u8> {
         bytes.to_vec()
     }
 
     fn stamp(wall: u64, node: u8) -> Stamp {
-        Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]))
+        Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO)
     }
 
     #[test]
@@ -354,7 +356,10 @@ mod tests {
         assert_ne!(base, term(&k(b"j"), &stamp(5, 1)));
         assert_ne!(base, term(&k(b"k"), &stamp(6, 1)));
         assert_ne!(base, term(&k(b"k"), &stamp(5, 2)));
-        assert_ne!(base, term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]))));
+        assert_ne!(
+            base,
+            term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]), Epoch::ZERO))
+        );
         assert_eq!(base, term(&k(b"k"), &stamp(5, 1)));
         // The stamp is fixed width and last: moving a byte between the key
         // and the stamp cannot give the same input.

@@ -65,6 +65,7 @@
 //! applied over a held one whose stamp a history says is dead is counted
 //! (`spread_over_held`), not judged: the design's rows one to three are ordinary LWW.
 
+use kimmy_core::Epoch;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -1049,7 +1050,7 @@ impl Cluster {
         if target.max(e.clock_last().wall_ms) <= now + 2 {
             self.overrun = true;
         }
-        e.advance_clock_past(&Stamp::new(Hlc::new(target, 0), e.node_id()));
+        e.advance_clock_past(&Stamp::new(Hlc::new(target, 0), e.node_id(), Epoch::ZERO));
     }
 
     fn start(&mut self, m: usize, kill: Option<u8>) -> Res<()> {

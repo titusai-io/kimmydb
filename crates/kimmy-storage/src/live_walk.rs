@@ -35,6 +35,7 @@
 //! (`live_count`'s rebuild). Anything else discards the cursor and walks from
 //! the start, so a crash mid-walk costs a restart, as the design accepts.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::time::Instant;
@@ -371,10 +372,10 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                 };
                 row.digest ^= delta.digest;
                 for (node, hlc) in &delta.maxw {
-                    row.raise_maxw(&kimmy_core::Stamp::new(*hlc, *node));
+                    row.raise_maxw(&kimmy_core::Stamp::new(*hlc, *node, Epoch::ZERO));
                 }
                 for (node, hlc) in &delta.bare_max {
-                    row.raise_bare(&kimmy_core::Stamp::new(*hlc, *node));
+                    row.raise_bare(&kimmy_core::Stamp::new(*hlc, *node, Epoch::ZERO));
                 }
                 table.insert(*id, row.encode().as_slice())?;
             }

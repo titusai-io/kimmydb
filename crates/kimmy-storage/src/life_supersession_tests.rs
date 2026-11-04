@@ -10,6 +10,7 @@
 //! not a life ended.
 
 use bson::doc;
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, DocId, Hlc, OpKind, Stamp};
 
 use crate::{Engine, SnapshotProgress, WalkScope};
@@ -593,7 +594,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     c.insert(&on_c, doc! { "_id": 2 }).unwrap();
     let mut page = c.snapshot_page(None, None).unwrap();
     assert!(page.next.is_none(), "premise: one page");
-    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id());
+    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id(), Epoch::ZERO);
     for (id, stamp) in page.dropped_collections.iter_mut() {
         if *id == orders_id() {
             *stamp = other;
@@ -608,7 +609,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
     assert_eq!(
         b.collection_dropped_at(orders_id()).unwrap(),
-        Some(Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0; 16]))),
+        Some(Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO)),
         "the burial took a tombstone of another drop"
     );
 }

@@ -3,6 +3,7 @@
 //! batch and is never swallowed.
 
 use bson::{doc, spec::BinarySubtype};
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, IndexField, OpKind, Stamp, VectorConfig};
 
 use crate::definition_digest::{DefinitionKey, index_hash, vector_hash};
@@ -161,7 +162,11 @@ fn a_refused_drop_of_an_index_this_member_holds_leaves_a_drop_hint_with_the_held
     b.create_collection("shop", "orders").unwrap();
     b.create_index("shop", "orders", field("a"), false, Some("held".into())).unwrap();
     let held = index_hash(b.get_collection("shop", "orders").unwrap().index("held").unwrap());
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     b.note_refused_index_drop("shop", "orders", "held", stamp).unwrap();
     // Nothing held, nothing to explain: no hint for a drop of an index not here.
     b.note_refused_index_drop("shop", "orders", "absent", stamp).unwrap();
@@ -283,7 +288,11 @@ fn hints_are_cleared_with_the_purge_and_with_the_drop_of_their_index() {
     let orders = b.create_collection("shop", "orders").unwrap();
     let items = b.create_collection("shop", "items").unwrap();
     b.create_index("shop", "orders", field("a"), false, Some("a_1".into())).unwrap();
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     for (collection, name) in [(orders.id, "a_1"), (orders.id, "other"), (items.id, "x")] {
         b.record_refusal_hint(&crate::RefusalHint::new(
             collection,
@@ -311,7 +320,11 @@ fn hints_are_cleared_with_the_purge_and_with_the_drop_of_their_index() {
 fn a_hint_is_a_meta_row_and_so_a_backup_carries_it() {
     let (b, dir) = engine();
     let orders = b.create_collection("shop", "orders").unwrap();
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     b.record_refusal_hint(&crate::RefusalHint::new(orders.id, HintKind::Index, "x", stamp, 7))
         .unwrap();
     let _ = &dir;
@@ -361,7 +374,7 @@ fn an_older_refusal_never_replaces_a_newer_one() {
     let (b, _db) = engine();
     let orders = b.create_collection("shop", "orders").unwrap();
     let node = kimmy_core::NodeId::from_bytes([5; 16]);
-    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node);
+    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node, Epoch::ZERO);
     let hint = |wall: u64, hash: u128| {
         crate::RefusalHint::new(orders.id, HintKind::Index, "x", at(wall), hash)
     };
@@ -379,7 +392,11 @@ fn an_older_refusal_never_replaces_a_newer_one() {
 #[test]
 fn a_collections_hint_range_does_not_reach_a_neighbour_whose_id_begins_the_same() {
     let (b, _db) = engine();
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     let (short, long) = (CollectionId(1), CollectionId(10));
     for id in [short, long] {
         b.record_refusal_hint(&crate::RefusalHint::new(id, HintKind::Index, "x", stamp, 1))
@@ -400,7 +417,11 @@ fn the_burial_clears_the_hints_of_the_collections_shadow() {
     let orders = b.create_collection("shop", "orders").unwrap();
     b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
     let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"));
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     b.record_refusal_hint(&crate::RefusalHint::new(shadow, HintKind::Index, "x", stamp, 1))
         .unwrap();
     assert_eq!(b.refusal_hints(shadow).unwrap().len(), 1, "premise");
@@ -419,7 +440,7 @@ fn an_identical_hint_is_no_commit_and_a_different_one_is() {
     let (b, _db) = engine();
     let orders = b.create_collection("shop", "orders").unwrap();
     let node = kimmy_core::NodeId::from_bytes([5; 16]);
-    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node);
+    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node, Epoch::ZERO);
     let hint = |wall: u64, hash: u128| {
         crate::RefusalHint::new(orders.id, HintKind::Index, "x", at(wall), hash)
     };
@@ -446,7 +467,11 @@ fn a_refusal_met_again_commits_its_hint_once_at_every_writer() {
     b.create_collection("shop", "orders").unwrap();
     b.create_index("shop", "orders", field("held"), false, Some("held".into())).unwrap();
     b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     let index = b.get_collection("shop", "orders").unwrap().index("held").unwrap().clone();
     let id = CollectionId::derive("shop", "orders");
     type Note = Box<dyn Fn(&Engine) -> crate::Result<()>>;
@@ -510,7 +535,11 @@ fn a_re_delivered_refused_entry_rewrites_no_hint() {
 // -- A hint is mended with the definition it was about ---------------------------------
 
 fn both_shapes(e: &Engine, id: CollectionId, kind: HintKind, names: &[&str]) {
-    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let stamp = Stamp::new(
+        kimmy_core::Hlc::new(900, 0),
+        kimmy_core::NodeId::from_bytes([5; 16]),
+        Epoch::ZERO,
+    );
     for name in names {
         e.record_refusal_hint(&crate::RefusalHint::new(id, kind, *name, stamp, 7)).unwrap();
     }

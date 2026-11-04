@@ -7,6 +7,7 @@
 //! rests on: the entries, `scanned_to`, `exhausted`, `passed_through`, and the
 //! count of entries examined and not served.
 
+use kimmy_core::Epoch;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -42,7 +43,7 @@ struct Row {
 }
 
 fn stamp_of(row: &Row) -> Stamp {
-    Stamp::new(at(row.at), node(row.origin))
+    Stamp::new(at(row.at), node(row.origin), Epoch::ZERO)
 }
 
 fn entry_of(row: &Row) -> OplogEntry {
@@ -270,7 +271,7 @@ fn stamps_that_tie_at_from_are_all_read_at_a_row_budget_boundary() {
     let (_, keys) = both(&engine, &ask);
     let keys = keys.unwrap();
     let stamps: Vec<_> = keys.window.entries.iter().map(|e| e.stamp).collect();
-    assert_eq!(stamps, (0..3).map(|o| Stamp::new(at(6), node(o))).collect::<Vec<_>>());
+    assert_eq!(stamps, (0..3).map(|o| Stamp::new(at(6), node(o), Epoch::ZERO)).collect::<Vec<_>>());
 }
 
 /// A corrupt body is met, or not, in the same place by both walks: a row the
@@ -502,7 +503,7 @@ fn the_verification_walk_repairs_a_pair_the_counts_cannot_see_before_it_records(
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
             let key = codec::oplog_key(&stamp_of(&rows[20]));
             assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
-            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
             by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
         }
         txn.commit().unwrap();
@@ -691,7 +692,7 @@ fn damaged_store(
         let lost_seq = by_stamp.remove(lost.as_slice()).unwrap().unwrap().value();
         assert!(arrival.remove(lost_seq).unwrap().is_some());
         // A position for an entry the oplog does not hold, beyond the end.
-        let gone = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+        let gone = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
         arrival.insert(5_003u64, gone.as_slice()).unwrap();
         by_stamp.insert(gone.as_slice(), 5_003u64).unwrap();
         // A second position naming a stamp that has one.
@@ -785,7 +786,7 @@ async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
         let local = engine.read_arrival_from(0, 100).unwrap().pop().unwrap().stamp;
         // Relayed after the local writes, stamped long before them.
         let relayed = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), node(2)),
+            stamp: Stamp::new(Hlc::new(1_000, 0), node(2), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -798,7 +799,7 @@ async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
         {
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
             assert!(by_stamp.remove(codec::oplog_key(&victim).as_slice()).unwrap().is_some());
-            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
             by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
         }
         txn.commit().unwrap();
@@ -851,7 +852,7 @@ fn no_record_is_written_until_the_repair_has_committed() {
                 let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
                 let key = codec::oplog_key(&stamp_of(&rows[10]));
                 assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
-                let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+                let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
                 by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
             }
             txn.commit().unwrap();
