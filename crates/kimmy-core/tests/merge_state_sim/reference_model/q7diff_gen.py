@@ -45,8 +45,8 @@ assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
 assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
 assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
 assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
-# the harness runs the model as the Rust side is today: no absorbed cell yet, no implicit map marker yet
-M.ABSORBED = False
+# the harness runs the model as the Rust side is today: the absorbed counter cell (Q6, ABSORBED on), no implicit map marker yet
+M.ABSORBED = True
 M.NO_IMPLICIT_MARKER = True
 
 
@@ -115,6 +115,10 @@ def k_stamp(s):
 
 def k_opt(g):
     return (0,) if g is None else (1, k_stamp(g))
+
+
+class NoV1(Exception):
+    """The version 1 form cannot spell a state that has an absorbed pair (`V1CannotHold`)."""
 
 
 class Enc:
@@ -190,16 +194,6 @@ class Enc:
             self.opt_stamp(k[2])
             self.i128(m[k])
 
-    def obs_stamped(self, m):
-        """A register's `obs`: for each counted slot its stamp and total when the base saw it."""
-        self.ln(len(m))
-        for k in sorted(m, key=lambda k: (k_stamp(k[0]), k_wid(k[1]), k_opt(k[2]))):
-            self.stamp(k[0])
-            self.wid(k[1])
-            self.opt_stamp(k[2])
-            self.stamp(m[k][0])
-            self.i128(m[k][1])
-
     def gen(self, g):
         if g is None:
             self.u8(0)
@@ -224,6 +218,8 @@ class Enc:
             self.value(v)
 
     def state(self, st):
+        if st.absorbed:
+            raise NoV1()
         self.ln(len(st.lives))
         for L in sorted(st.lives, key=k_stamp):
             seen, order, kind = st.lives[L]
@@ -249,7 +245,8 @@ class Enc:
             self.s(k[1])
             self.stamp(r[0])
             self.value(r[1])
-            self.obs_stamped(r[2])
+            assert not r[2], "a register with an obs entry and no absorbed pair"
+            self.ln(0)            # the register's obs place, always empty now
             self.gen(r[3])
             self.u8(1 if len(r) > 4 and r[4] == "soi" else 0)
         self.ln(len(st.slots))
@@ -310,9 +307,14 @@ class EncCompact:
         out.append(v)
         self.raw(out)
 
-    def total(self, v):
-        """A counter total: zigzag, then a varint."""
+    def payload(self, v):
+        """The payload of an integer total: the zigzag as a varint."""
         self.vi((v << 1) if v >= 0 else (((-v) << 1) - 1))
+
+    def total(self, v):
+        """A typed total (a generation's seen entry, a lost total): the type byte (0, Int64), then the payload."""
+        self.u8(0)
+        self.payload(v)
 
     def i64(self, v):
         self.raw(v.to_bytes(8, "big", signed=True))
@@ -386,14 +388,6 @@ class EncCompact:
             self.obs_key(k)
             self.total(m[k])
 
-    def obs_stamped(self, m):
-        """A register's `obs`: for each counted slot its stamp and total when the base saw it."""
-        self.vi(len(m))
-        for k in sorted(m, key=self.obs_order):
-            self.obs_key(k)
-            self.stamp(m[k][0])
-            self.total(m[k][1])
-
     def loss_value(self, key, v):
         kind, p, st = key
         if kind == "insertLost" and p == "_":
@@ -444,7 +438,7 @@ class EncCompact:
             if stamp != life:
                 self.stamp(stamp)
             self.value(r[1])
-            self.obs_stamped(r[2])
+            assert not r[2] or st.absorbed, "an obs entry and no absorbed store"
             if gen is not None:
                 if gen[0] != stamp:
                     self.stamp(gen[0])
@@ -457,7 +451,13 @@ class EncCompact:
             self.wid(k[2])
             self.opt_stamp(k[3])
             self.stamp(sl[0])
-            self.total(sl[1])
+            # the flag byte: bit 0 an absorbed pair follows; the types (bits 1-4) are Int64 = 0 here
+            pair = st.absorbed.get(k)
+            self.u8(1 if pair is not None else 0)
+            self.payload(sl[1])
+            if pair is not None:
+                self.stamp(pair[0])
+                self.payload(pair[1])
         self.vv(st.vv)
         self.vi(len(st.losses))
         for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):
@@ -682,9 +682,13 @@ def unjv(v):
 def snap(ms, log):
     out = []
     for m in ms:
-        b = Enc(log).state(m.state)
         cb = EncCompact(log).state(m.state)
-        out.append({"h": hash128(b), "len": len(b), "ch": hash128(cb), "clen": len(cb),
+        try:
+            b = Enc(log).state(m.state)
+            h, ln = hash128(b), len(b)
+        except NoV1:
+            h = ln = None          # a state with an absorbed pair has no version 1 spelling
+        out.append({"h": h, "len": ln, "ch": hash128(cb), "clen": len(cb),
                     "v": jdoc(m.state.visible()),
                     "hid": {p: str(h) for p, h in m.state.hidden_all().items()}})
     return out
@@ -762,7 +766,7 @@ def run_script(sc, dump_canon=False):
             break
     fin = {"after": snap(ms, log)}
     if dump_canon:
-        fin["canon"] = [Enc(log).state(m.state).hex() for m in ms]
+        fin["canon"] = [Enc(log).state(m.state).hex() if not m.state.absorbed else None for m in ms]
     want, alive, dels = M.oracle(log)
     must = M.loss_oracle(log, alive, dels)
     have = sorted(ms[0].state.losses, key=lambda k: (KIND[k[0]], k[1], k_stamp(k[2])))
@@ -818,7 +822,7 @@ def plant(which):
             obs = win[2] if win is not None else {}
             total, seen = (base if base is not None else 0), base is not None
             for k in sorted(self.counted(p), key=repr):
-                o = obs.get(k[0:1] + k[2:])
+                o = self.eff_obs(obs, k)
                 d = self.slots[k][1] - (o[1] if o else 0)
                 if d:
                     total += d
@@ -836,9 +840,12 @@ def golden():
     out = {}
 
     def h(name, st, log):
-        b = Enc(log).state(st)
         cb = EncCompact(log).state(st)
-        out[name] = [hash128(b), len(b)]
+        if st.absorbed:
+            out[name] = None          # no version 1 spelling: the state has absorbed pairs
+        else:
+            b = Enc(log).state(st)
+            out[name] = [hash128(b), len(b)]
         out[name + "-compact"] = [hash128(cb), len(cb)]
 
     h("empty", M.State(), {})

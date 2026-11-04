@@ -144,23 +144,22 @@ pub(super) fn state(j: &J) -> MergeState {
                 .collect(),
         );
     }
-    // The model's registers carry the `obs` map of the stage-A format (r[4]); the Rust cell keeps what a
-    // base write had counted as the ABSORBED pair of each slot instead: the highest `(stamp, total)` any
-    // register observed of it (the model with ABSORBED on folds every `obs` into `absorbed`).
+    // The counter cell: the model's absorbed store, keyed by slot, is each slot's absorbed pair.
     type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
-    let mut absorbed: BTreeMap<SlotKey, (MStamp, Num)> = BTreeMap::new();
+    let absorbed: BTreeMap<SlotKey, (MStamp, Num)> = j["absorbed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                (stamp(&a[0]), path(&a[1]), writer(&a[2]), stamp_opt(&a[3])),
+                (stamp(&a[4]), num(&a[5])),
+            )
+        })
+        .collect();
     for r in j["regs"].as_array().unwrap() {
-        let p = path(&r[1]);
-        for e in r[4].as_array().unwrap() {
-            let (l, w, g) = obs_key(&J::Array(e.as_array().unwrap()[..3].to_vec()));
-            let seen = (stamp(&e[3]), num(&e[4]));
-            let slot = absorbed.entry((l, p.clone(), w, g)).or_insert(seen);
-            if seen.0 > slot.0 {
-                *slot = seen;
-            }
-        }
-        let generation = (!r[5].is_null()).then(|| {
-            let g = &r[5];
+        let generation = (!r[4].is_null()).then(|| {
+            let g = &r[4];
             let vv = g["vv"]
                 .as_array()
                 .unwrap()
@@ -176,7 +175,7 @@ pub(super) fn state(j: &J) -> MergeState {
             Gen::start(stamp(&g["stamp"]), &vv, seen)
         });
         let reg =
-            Reg::new(stamp(&r[2]), value(&r[3]), generation, r[6].as_bool().unwrap()).unwrap();
+            Reg::new(stamp(&r[2]), value(&r[3]), generation, r[5].as_bool().unwrap()).unwrap();
         s.regs.insert((stamp(&r[0]), path(&r[1])), reg);
     }
     for sl in j["slots"].as_array().unwrap() {
@@ -184,6 +183,10 @@ pub(super) fn state(j: &J) -> MergeState {
         let absorbed = absorbed.get(&key).copied();
         s.slots.insert(key, Slot { stamp: stamp(&sl[4]), total: num(&sl[5]), absorbed });
     }
+    assert!(
+        absorbed.keys().all(|k| s.slots.contains_key(k)),
+        "the model's absorbed store names a slot the state does not hold"
+    );
     s.vv = j["vv"]
         .as_array()
         .unwrap()
@@ -1893,16 +1896,18 @@ fn the_read_equals_the_models_on_random_states() {
     }
     assert_eq!(chosen_for.len(), 5, "every mutant has a state: {chosen_for:?}");
     assert_eq!((states.len(), j["pool"].as_u64()), (79, Some(2094)));
-    assert!(two_lives >= 20 && maps >= 100, "{two_lives} {maps}");
+    // The states are the ABSORBED-on runs' (the fixture was regenerated for the counter cell): 19 of the 79 hold two
+    // alive lives (the floor on the ABSORBED-off runs' states was 20 of 79), and 171 maps are compared. Pinned.
+    assert_eq!((two_lives, maps), (19, 171));
 }
 
-/// O1-6 of the O1 review. The clamp reads the winner's `obs` only, which is the model with ABSORBED
-/// off: the Rust counter cell has no `absorbed` yet. On the model's random states with ABSORBED on, the
-/// order (and the values) differ from the Rust's on a few: 23 of the 2,094 distinct states of the
-/// fixture's runs; the four smallest are kept (the first is the review's seed 155 family). The Rust
-/// gives the ABSORBED-off document on all of them, which this test pins.
+/// O1-6 of the O1 review, flipped by the counter cell. On the model's random states with ABSORBED on, the order
+/// (and the values) differ from the ABSORBED-off model's on a few: 23 of the 2,094 distinct states of the fixture's
+/// runs; the four smallest are kept (the first is the review's seed 155 family). The Rust gives the ABSORBED-ON
+/// document on all of them (the model's absorbed store is loaded as the slots' pairs) and not the off one, which
+/// is what the Q6 rule changes.
 #[test]
-fn the_read_gives_the_absorbed_off_document_where_the_q6_rule_would_differ() {
+fn the_read_equals_the_model_with_absorbed_on_and_not_the_off_document() {
     let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
     let o = JoinOptions::default();
     let kept = j["absorbed"].as_array().unwrap();
@@ -1910,21 +1915,23 @@ fn the_read_gives_the_absorbed_off_document_where_the_q6_rule_would_differ() {
     for (k, e) in kept.iter().enumerate() {
         let s = state(&e["state"]);
         let got = flatten(&s.ordered_document(&o).unwrap());
-        assert_eq!(got, expected_flat(&e["expected_off"]), "kept state {k}, seed {}", e["seed"]);
-        assert_ne!(expected_flat(&e["expected_on"]), got, "the Q6 rule makes a difference here");
+        assert_eq!(got, expected_flat(&e["expected_on"]), "kept state {k}, seed {}", e["seed"]);
+        assert_ne!(expected_flat(&e["expected_off"]), got, "the Q6 rule makes a difference here");
     }
 }
 
-/// The same states against the model with ABSORBED ON (the A2 design's Q6 rule): the Rust differs, as
-/// it must until the counter cell lands (per-slot `absorbed`, the slot layout the manager has not frozen).
-/// Pinned so that the counter-cell step must flip this test, not rediscover the divergence.
+/// The same states against the model with ABSORBED ON (the A2 design's Q6 rule), the test the counter-cell step
+/// had to flip (it was `#[ignore]`d as a known divergence): the Rust equals the model, state by state.
 #[test]
-#[ignore = "known divergence: the Rust counter cell has no `absorbed` (Q6); the counter-cell step flips this"]
 fn the_read_equals_the_model_with_absorbed_on() {
     let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
     let o = JoinOptions::default();
     for (k, e) in j["absorbed"].as_array().unwrap().iter().enumerate() {
         let s = state(&e["state"]);
+        assert!(
+            s.slots.values().any(|x| x.absorbed.is_some()),
+            "kept state {k}: the case is about the absorbed store"
+        );
         let got = flatten(&s.ordered_document(&o).unwrap());
         assert_eq!(got, expected_flat(&e["expected_on"]), "kept state {k}, seed {}", e["seed"]);
     }

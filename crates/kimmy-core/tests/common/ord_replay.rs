@@ -288,6 +288,35 @@ pub fn replay(opts: &JoinOptions) -> Found {
     f
 }
 
+/// The scripts that differ between the model with ABSORBED off and with it on (the flip's evidence), as
+/// `(kind, seed, first differing step, whether the digest of that step differs)`. A step index past the last step
+/// is the final digest after the full sync. Every script of the fixture is the ABSORBED-on model's; the `off`
+/// record is what the ABSORBED-off model made of the same seed.
+pub fn off_differences() -> Vec<(String, u64, usize, bool)> {
+    let all: J = serde_json::from_str(SCRIPTS).unwrap();
+    all["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|sc| sc.get("off").is_some())
+        .map(|sc| {
+            let off = &sc["off"];
+            let i = off["step"].as_u64().unwrap() as usize;
+            let steps = sc["steps"].as_array().unwrap();
+            let differs = match (steps.get(i), off["off_step"].as_object()) {
+                (Some(on), Some(off_step)) => {
+                    on["d"] != off_step["d"]
+                        || on["res"] != off_step["res"]
+                        || on["op"] != off_step["op"]
+                }
+                (None, _) => off["off_final"] != sc["final"],
+                (Some(_), None) => true,
+            };
+            (sc["kind"].as_str().unwrap().to_string(), sc["seed"].as_u64().unwrap(), i, differs)
+        })
+        .collect()
+}
+
 /// How many upserts of the scripts name a nested path (the incremented path, or a creation or `$set` field): the shape the Rust
 /// fix of O2-2 and the model's A2.3 fix are compared on.
 pub fn nested_upserts() -> usize {

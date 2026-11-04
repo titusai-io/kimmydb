@@ -1,5 +1,5 @@
 //! The ORDER differential: random scripts of local writes and receives, run on the A2.1 Python model
-//! (`tests/data/gen_ord_differential.py`, model6.py 865808753a5f9a4b, ABSORBED off, no implicit markers,
+//! (`tests/data/gen_ord_differential.py`, model6.py 72da18ebbf3bb383, ABSORBED on, no implicit markers,
 //! retention 10^9), replayed here through `Writer`s. After EVERY step the acting member's ordered document
 //! and order state must be the model's, and the step must give the stamp the model gave, or none: a
 //! refusal or a no-op is part of what is compared.
@@ -47,6 +47,43 @@ fn the_writers_order_state_and_ordered_document_equal_the_models_after_every_ste
     );
     // the upserts of nested paths (A2.3 and eb40bbcf name their ancestors): drawn, and compared like every other step
     assert_eq!(ord_replay::nested_upserts(), 94);
+    // THE FLIP'S EVIDENCE. The scripts are the model's with ABSORBED on, which the writers equal. Run with ABSORBED off, the
+    // model makes another script of these seeds: in 7 of the 300 the digest of an operation (or its result) differs at the
+    // step given, in 5 more only the digest after the full sync differs (step 30). The seeds are pinned.
+    let d = ord_replay::off_differences();
+    assert!(
+        d.iter().all(|x| x.3),
+        "every recorded script differs from the ABSORBED-off model: {d:?}"
+    );
+    let (in_step, at_sync): (Vec<_>, Vec<_>) = d.iter().partition(|x| x.2 < 30);
+    let key = |v: &[&(String, u64, usize, bool)]| {
+        v.iter().map(|x| (x.0.clone(), x.1, x.2)).collect::<Vec<_>>()
+    };
+    let want = |v: &[(&str, u64, usize)]| {
+        v.iter().map(|(k, s, i)| (k.to_string(), *s, *i)).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        key(&in_step),
+        want(&[
+            ("flat", 40, 20),
+            ("flat", 80, 22),
+            ("flat", 132, 16),
+            ("flat", 138, 11),
+            ("flat", 143, 28),
+            ("nested", 1083, 9),
+            ("nested", 1141, 26),
+        ])
+    );
+    assert_eq!(
+        key(&at_sync),
+        want(&[
+            ("flat", 48, 30),
+            ("flat", 70, 30),
+            ("flat", 78, 30),
+            ("nested", 1022, 30),
+            ("nested", 1126, 30),
+        ])
+    );
     assert!(f.ordered_docs > 7000 && f.ord_keys > 30_000, "{} {}", f.ordered_docs, f.ord_keys);
 }
 

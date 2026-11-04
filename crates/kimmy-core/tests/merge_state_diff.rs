@@ -33,8 +33,10 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit
-//! marker, as the Rust side is today. A write that only reorders the fields is a write in the model and in the writer.
+//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit
+//! marker, as the Rust side is today. THE (h, len) COLUMNS: a state with an absorbed pair has no version 1 spelling, so the model's `h`
+//! and `len` are null for it and the Rust side must answer `V1CannotHold` for exactly those states (both directions); for every other
+//! state `h` and `len` are compared exactly, and the compact `ch` and `clen` for all of them. A write that only reorders the fields is a write in the model and in the writer.
 //! The replay compares the bytes and hashes of states WITHOUT their order state (`fingerprint::without_ords`: the
 //! generator's encoders write an empty order section); the order state meets the model in `merge_state_ord_diff`.
 
@@ -47,6 +49,7 @@ mod oracle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
@@ -154,14 +157,32 @@ impl Mem {
     }
 }
 
+/// The states the replay compared, and how many of them have no version 1 spelling (an absorbed pair).
+static STATES: AtomicUsize = AtomicUsize::new(0);
+static NO_V1: AtomicUsize = AtomicUsize::new(0);
+
 fn snap(ms: &[Mem]) -> Vec<J> {
     ms.iter()
         .map(|m| {
             let st = fingerprint::without_ords(&m.w.state);
-            let cb = st.try_canonical_bytes().expect("version 1 spells the differential's states");
+            // THE (h, len) RULE. Version 1 cannot spell a state with an absorbed pair (`V1CannotHold`), and
+            // the model's v1 column is null for exactly those states: the two are compared as part of the
+            // snapshot, so `V1CannotHold` happens exactly when the model state has an absorbed store, in both
+            // directions. The compact columns are compared for every state.
+            let has_pair = st.slots.values().any(|s| s.absorbed.is_some());
+            let v1 = st.try_canonical_bytes();
+            assert_eq!(
+                v1.is_err(),
+                has_pair,
+                "the differential's states are Int64 counters: version 1 refuses a state exactly for its pair"
+            );
+            STATES.fetch_add(1, Ordering::Relaxed);
+            if has_pair {
+                NO_V1.fetch_add(1, Ordering::Relaxed);
+            }
             json!({
-                "h": hex(&st.try_state_hash().expect("version 1 spells the differential's states")),
-                "len": cb.len(),
+                "h": v1.as_ref().map_or(J::Null, |_| json!(hex(&st.try_state_hash().unwrap()))),
+                "len": v1.as_ref().map_or(J::Null, |cb| json!(cb.len())),
                 "ch": hex(&st.compact_hash()),
                 "clen": st.compact_bytes().len(),
                 "v": jdoc(&m.w.visible()),
@@ -380,14 +401,8 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     }
     // final full-mesh sync
     for _ in 0..12 {
-        let before: Vec<Vec<u8>> = ms
-            .iter()
-            .map(|m| {
-                fingerprint::without_ords(&m.w.state)
-                    .try_canonical_bytes()
-                    .expect("version 1 spells the differential's states")
-            })
-            .collect();
+        let before: Vec<Vec<u8>> =
+            ms.iter().map(|m| fingerprint::without_ords(&m.w.state).compact_bytes()).collect();
         for r in 0..nm {
             for s in 0..nm {
                 if r != s {
@@ -400,11 +415,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
         }
         if ms
             .iter()
-            .map(|m| {
-                fingerprint::without_ords(&m.w.state)
-                    .try_canonical_bytes()
-                    .expect("version 1 spells the differential's states")
-            })
+            .map(|m| fingerprint::without_ords(&m.w.state).compact_bytes())
             .collect::<Vec<_>>()
             == before
         {
@@ -650,6 +661,11 @@ fn differential_against_the_python_model() {
         v.fails.len()
     );
     println!("differential fingerprint ({n} scripts): {:#018x}", v.fp);
+    let (states, no_v1) = (STATES.load(Ordering::Relaxed), NO_V1.load(Ordering::Relaxed));
+    println!(
+        "(h, len): {states} member-step states compared, {no_v1} without a version 1 spelling (an absorbed pair), {} exact on version 1",
+        states - no_v1
+    );
     if n == 300 {
         assert_eq!(v.fp, PINNED_300, "a state or a read changed");
     }
