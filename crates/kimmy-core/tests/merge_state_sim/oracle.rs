@@ -188,8 +188,10 @@ fn gen_counts(gi: Option<MStamp>, g_w: Option<MStamp>) -> bool {
 
 /// Returns (flat per-path values or None, alive lives, deletes). The value of a path, in
 /// words: the winning base (the highest-stamped register write in an alive
-/// life), plus every increment that the winner's writer had not seen, except
-/// the increments the winner's generation overwrote (an increment made in an
+/// life), plus every increment that NO base write on the path had seen (a base write is a
+/// register write at the path in an alive life, its `$setOnInsert` creation cells suppressed
+/// as the read side suppresses them; an increment is seen by it when it is in its causal
+/// past), except the increments the winner's generation overwrote (an increment made in an
 /// OLDER generation than the winner's, and not seen by the starter of the
 /// winner's generation). Increments made in a NEWER generation are kept even
 /// when its starter lost.
@@ -239,10 +241,14 @@ fn flat_oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp
             Some(Value::Int64(i)) => Some(i128::from(*i)),
             _ => None,
         };
-        let empty = BTreeSet::new();
-        let wctx = win.map_or(&empty, |w| w.1);
-        let extra: Vec<i64> =
-            counted.filter(|(st, _, _)| !wctx.contains(st)).map(|(_, _, m)| m.n.unwrap()).collect();
+        // what any base write on the path had seen: the causal pasts of all of them (the winner's
+        // included), not the winner's alone. Structural: the log's contexts, never the model's.
+        let seen_by_a_base: BTreeSet<MStamp> =
+            regs.iter().flat_map(|(_, ctx, _)| ctx.iter().copied()).collect();
+        let extra: Vec<i64> = counted
+            .filter(|(st, _, _)| !seen_by_a_base.contains(st))
+            .map(|(_, _, m)| m.n.unwrap())
+            .collect();
         if base.is_none() && extra.is_empty() {
             continue;
         }
