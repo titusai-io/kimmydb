@@ -9,7 +9,7 @@ use kimmy_core::merge_state::Value;
 
 use crate::grade::grade;
 use crate::oracle::Log;
-use crate::sim::{Cfg, Node, fix_key, fixpoint, p, pull};
+use crate::sim::{Cfg, Ent, Node, fix_key, fixpoint, p, pull};
 
 fn x_of(n: &Node) -> Value {
     n.visible().and_then(|d| d.get(&p("x")).cloned()).expect("x is visible")
@@ -261,4 +261,233 @@ pub fn scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
         ));
     }
     out
+}
+
+// ---- Q3: a collected life must not come back (probes_q3.py of the model) -------------------
+
+/// What a Q3 script found: A's document right after the pull that could bring a collected life back,
+/// every member's document after the fixpoint, how many entries A was handed by that pull, and what
+/// the oracle says of the finished run.
+pub struct Q3Out {
+    pub a_after: Option<BTreeMap<kimmy_core::merge_state::Path, Value>>,
+    pub finals: Vec<Option<BTreeMap<kimmy_core::merge_state::Path, Value>>>,
+    pub delivered: usize,
+    pub graded: Vec<String>,
+}
+
+impl Q3Out {
+    /// Did the collected life (`old`) come back at A?
+    pub fn resurrected(&self) -> bool {
+        self.a_after.as_ref().is_some_and(|d| d.contains_key(&p("old")))
+    }
+
+    /// Clean: no `old` at A, `y` written, every member alike, and the oracle finds nothing.
+    pub fn clean(&self) -> bool {
+        let y = self.a_after.as_ref().and_then(|d| d.get(&p("y")));
+        !self.resurrected()
+            && y == Some(&Value::Int64(1))
+            && self.finals.iter().all(|f| *f == self.finals[0])
+            && self.finals[0].as_ref().is_some_and(|d| !d.contains_key(&p("old")))
+            && self.graded.is_empty()
+    }
+}
+
+/// The retention of the Q3 scripts (R = 10), with the flags of the configuration under test.
+fn q3_cfg(cfg: &Cfg) -> Cfg {
+    let mut c = Cfg::new(10);
+    c.flags = cfg.flags;
+    c
+}
+
+fn q3_old_life_collected(a: &Node) {
+    assert!(
+        !a.visible().is_some_and(|d| d.contains_key(&p("old"))),
+        "setup: the old life is collected"
+    );
+}
+
+/// The review's case: R = 10, A inserts {x, old}, deletes, re-inserts, writes 15 times, fixpoint; B takes a
+/// backup and restores at once and writes y; A pulls from B. B's pulls for its new epoch start at the
+/// epoch's start HLC (the start-HLC rule) or at 0 (a replay of B's whole oplog); the covered-entry skip
+/// then only witnesses what A holds. Either rule alone keeps the life dead; with both off it comes back.
+pub fn q3_restore(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms[1].backup();
+    ms[1].restore();
+    ms[1].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 1, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// An idle origin (the review's M1: no restore at all). C inserts and is silent; A kills and re-creates the
+/// document twice and writes 15 times; the fixpoint collects life 1 everywhere. C then writes y and A pulls
+/// from C: the threshold is A's witnessed C, one old write, so C re-serves every entry it appended above
+/// it, among them life 1's insert. The start-HLC rule cannot help (C's epoch is a first epoch): only the
+/// covered-entry skip keeps the life dead.
+pub fn q3_idle_origin(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[2].insert(&[("x", Value::Int64(0))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms[2].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 2, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// A late member. D joins after the fact (a first epoch nobody has witnessed), pulls everything one entry at
+/// a time, writes y; A pulls from D: D's origin starts at 0 under either rule, so D re-serves the old entries.
+/// Only the covered-entry skip keeps the collected life dead.
+pub fn q3_late_member(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms.push(Node::new('D', &cfg));
+    while pull(&mut ms, 2, 1, Some(1)) {
+        let (b, d) = (&ms[1], &ms[2]);
+        if b.servable.iter().all(|(o, h)| *h <= d.witnessed.get(o).copied().unwrap_or(Hlc::ZERO)) {
+            break;
+        }
+    }
+    ms[2].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 2, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// The Q3 scripts on the flags of the given configuration, named.
+pub fn q3_scripts(cfg: &Cfg) -> Vec<(&'static str, Q3Out)> {
+    vec![
+        ("restore", q3_restore(cfg)),
+        ("idle origin", q3_idle_origin(cfg)),
+        ("late member", q3_late_member(cfg)),
+    ]
+}
+
+/// The design is clean on all three scripts; with the covered-entry skip off the idle origin and the late
+/// member bring the collected life back (the start-HLC rule cannot help them); with both rules off the
+/// restore does too, and either rule alone clears it. Returns the problems found (empty when all hold).
+pub fn q3_check() -> Vec<String> {
+    let flags = |skip: bool, start: bool| {
+        let mut c = Cfg::default_ret();
+        c.flags.covered_skip = skip;
+        c.flags.start_hlc = start;
+        c
+    };
+    let mut bad = Vec::new();
+    for (skip, start) in [(true, true), (true, false), (false, true)] {
+        let r = q3_restore(&flags(skip, start));
+        if !r.clean() {
+            bad.push(format!("restore, skip {skip}, start {start}: not clean"));
+        }
+    }
+    if !q3_restore(&flags(false, false)).resurrected() {
+        bad.push("restore with both rules off should resurrect the old life".into());
+    }
+    for (name, f) in [
+        ("idle origin", q3_idle_origin as fn(&Cfg) -> Q3Out),
+        ("late member", q3_late_member as fn(&Cfg) -> Q3Out),
+    ] {
+        for start in [true, false] {
+            if !f(&flags(true, start)).clean() {
+                bad.push(format!("{name}, skip on, start {start}: not clean"));
+            }
+            if !f(&flags(false, start)).resurrected() {
+                bad.push(format!("{name}, skip off, start {start}: the old life should come back"));
+            }
+        }
+    }
+    if !q3_whole_vector(&Cfg::default_ret()) {
+        bad.push(
+            "the design should apply an entry whose stamp is covered but whose vector is not"
+                .into(),
+        );
+    }
+    // the start-HLC rule changes what is delivered, not the states: A is handed fewer entries by the
+    // restored member's pull when a never-witnessed origin starts at its epoch's start HLC
+    let (with, without) = (q3_restore(&flags(true, true)), q3_restore(&flags(true, false)));
+    if with.delivered >= without.delivered {
+        bad.push(format!(
+            "the start-HLC rule should deliver fewer entries ({} against {})",
+            with.delivered, without.delivered
+        ));
+    }
+    bad
+}
+
+/// The covered-entry skip looks at the WHOLE vector of the entry (the model's rule, Step 3's), not at its
+/// stamp: an entry whose stamp the receiver covers but whose state carries a write the receiver lacks must
+/// be applied. In an honest run the two rules agree (a version vector is causally closed: covering a
+/// writer's stamp means holding that writer's whole state at it), so only a hand-made entry tells them
+/// apart: C holds A's insert; B writes y after receiving it; C is handed an entry stamped by A's insert
+/// carrying B's state. Returns whether C learned B's write.
+pub fn q3_whole_vector(cfg: &Cfg) -> bool {
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+    let a1 = ms[0].insert(&[("x", Value::Int64(1))], &mut log, 0).expect("inserted");
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[1].set("y", Value::Int64(2), &mut log, 0);
+    let ent = std::rc::Rc::new(Ent::W {
+        st: a1,
+        state: ms[1].state().clone(),
+        contained: ms[1].contained.clone(),
+    });
+    ms[2].receive_entry(&ent);
+    ms[2].visible().is_some_and(|d| d.get(&p("y")) == Some(&Value::Int64(2)))
 }

@@ -147,8 +147,8 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
     rep.check(&what, &c);
 }
 
-/// A seed of the bounded runs (RET 40, a fixpoint every 3 steps, 80 steps) that FAILS, found by
-/// sweeping 0 to 3000 on both workloads, and why.
+/// Five seeds of the bounded runs (RET 40, a fixpoint every 3 steps, 80 steps) that FAILED before the sim's
+/// protocol had the covered-entry skip, found by sweeping 0 to 3000 on both workloads, and how they failed.
 ///
 /// All five are the same failure, the Q3 resurrection path. A pull window re-sends an old entry
 /// (a writer's whole state at its write) that the receiver already holds, because the receiver's
@@ -158,12 +158,14 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
 /// mark, so the join sees a live life nothing kills. In every one of the five, at the join that
 /// brings the life back the receiver's version vector COVERS the entry's stamp (the entry is
 /// already in the receiver), and a node that does not apply an entry its vector covers (the real
-/// protocol's covered-entry skip, `SimFlags::covered_skip`, which the sim does not have yet)
-/// passes all five (`the_known_bounded_failures_pass_with_the_covered_entry_skip`). It is a
-/// failure of the sim's protocol, which the covered-entry skip port fixes, before Step 3: not a
-/// partition longer than retention (ADR-085, the documented limit, graded by the unbounded
-/// runs), and not the merge state: the same seeds fail on the code before the D7 pass.
-/// A restore is the occasion in four of the five, never the cause (the nested one has none).
+/// protocol's covered-entry skip, `SimFlags::covered_skip`) passes all five. The skip is in the sim's
+/// protocol now (and so is the start-HLC rule, `SimFlags::start_hlc`), the five seeds pass in the
+/// runner like every other, and no failure is known or listed. What is kept is the EVIDENCE:
+/// `the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it` runs them with the skip off (they
+/// fail as listed here) and on (they pass); the mutant `no covered-entry skip` is graded by these runs. It
+/// was a failure of the sim's protocol, not a partition longer than retention (ADR-085, graded by the
+/// unbounded runs), and not the merge state: the same seeds failed on the code before the D7 pass. A
+/// restore is the occasion in four of the five, never the cause (the nested one has none).
 ///
 /// | seed | workload | problem | life brought back by the covered entry | restore (lag of its backup) |
 /// |---|---|---|---|---|
@@ -172,22 +174,18 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
 /// | 1551 | flat   | diverged | 1, entry 1, at horizon 10 | A, lag 25 |
 /// | 2006 | flat   | diverged | 1, entry 1, at horizon 8 | A, lag 38 |
 /// | 2396 | nested | visible  | 1, entry 22, at horizon 35 to 40 | none |
-///
-/// The workload of the bounded runs changed when the odd field names joined it, and the seeds
-/// that failed before (761, 1027, 1633, 2032, 2567, 2919, found on the code before the D7 pass)
-/// no longer reproduce; they had the same cause (each passes with the covered-entry skip).
-struct KnownBoundedFailure {
+struct SkipEvidence {
     nested: bool,
     seed: u64,
     problems: &'static [&'static str],
 }
 
-const KNOWN_BOUNDED_FAILURES: [KnownBoundedFailure; 5] = [
-    KnownBoundedFailure { nested: false, seed: 106, problems: &["visible"] },
-    KnownBoundedFailure { nested: false, seed: 1435, problems: &["diverged"] },
-    KnownBoundedFailure { nested: false, seed: 1551, problems: &["diverged"] },
-    KnownBoundedFailure { nested: false, seed: 2006, problems: &["diverged"] },
-    KnownBoundedFailure { nested: true, seed: 2396, problems: &["visible"] },
+const COVERED_SKIP_EVIDENCE: [SkipEvidence; 5] = [
+    SkipEvidence { nested: false, seed: 106, problems: &["visible"] },
+    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"] },
+    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"] },
+    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"] },
+    SkipEvidence { nested: true, seed: 2396, problems: &["visible"] },
 ];
 
 fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
@@ -198,31 +196,8 @@ fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, 
     for seed in 0..n {
         let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps, nested);
         gap_max = gap_max.max(gap);
-        let problems = grade_bounded(&o.nodes, &o.log);
-        // a seed listed above is expected to fail as listed, and is named in the output; one
-        // that stops failing must be taken off the list
-        let known = (ret == 40 && sync_every == 3 && steps == 80)
-            .then(|| KNOWN_BOUNDED_FAILURES.iter().find(|k| k.nested == nested && k.seed == seed))
-            .flatten();
-        match known {
-            Some(k) if problems == k.problems => println!(
-                "  KNOWN FAILURE (the covered-entry skip port, before Step 3): bounded RET={ret}, {} workload, seed {seed}: {problems:?}",
-                if nested { "nested" } else { "flat" }
-            ),
-            Some(k) => bump(
-                &mut c,
-                format!(
-                    "known failure {} seed {seed} no longer fails as listed: {problems:?}, listed {:?}",
-                    if nested { "nested" } else { "flat" },
-                    k.problems
-                ),
-                seed,
-            ),
-            None => {
-                for e in problems {
-                    bump(&mut c, e, seed);
-                }
-            }
+        for e in grade_bounded(&o.nodes, &o.log) {
+            bump(&mut c, e, seed);
         }
     }
     if gap_max >= ret {
@@ -286,6 +261,27 @@ fn scenario_probes(rep: &mut Report) {
     }
 }
 
+/// The scripts of probes_q3.py (the restore, the idle origin, the late member) with the two rules of Q3
+/// on and off.
+fn q3_probes(rep: &mut Report) {
+    let bad = probes::q3_check();
+    let design = probes::q3_scripts(&Cfg::default_ret());
+    for (name, out) in &design {
+        println!(
+            "[Q3 {name}] design: {}, {} entries handed to A by the pull",
+            if out.clean() { "clean" } else { "NOT CLEAN" },
+            out.delivered
+        );
+    }
+    println!(
+        "[Q3 rules] the skip off brings the collected life back in the idle-origin and late-member scripts; both rules off in the restore; either alone clears it: {}",
+        if bad.is_empty() { "ok".to_string() } else { format!("{bad:?}") }
+    );
+    for b in bad {
+        rep.failures.push(format!("Q3: {b}"));
+    }
+}
+
 #[test]
 fn runner() {
     let t_all = Instant::now();
@@ -302,6 +298,7 @@ fn runner() {
     horizon(&mut rep, 300, 4, 24, "horizon");
     named_probes(&mut rep);
     scenario_probes(&mut rep);
+    q3_probes(&mut rep);
     bounded(&mut rep, 300, 40, 3, 80, false);
     bounded(&mut rep, 300, 40, 3, 80, true);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
@@ -317,9 +314,9 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2) and the nested rules (7): a
-    // removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 23, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7) and the two
+    // rules of Q3 (the covered-entry skip, the start-HLC rule): a removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 26, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
@@ -431,41 +428,61 @@ fn the_sim_workload_holds_odd_names() {
     }
 }
 
-/// The bounded run of `seed` on the given workload, at the runner's parameters.
-fn bounded_problems(seed: u64, nested: bool, covered_skip: bool) -> Vec<String> {
+/// The bounded run of `seed` on the given workload, at the runner's parameters, with the covered-entry
+/// skip and the start-HLC rule as given.
+fn bounded_problems(seed: u64, nested: bool, covered_skip: bool, start_hlc: bool) -> Vec<String> {
     let mut cfg = Cfg::default_ret();
     cfg.flags.covered_skip = covered_skip;
+    cfg.flags.start_hlc = start_hlc;
     let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
     grade_bounded(&o.nodes, &o.log)
 }
 
-/// Each known failure fails as listed, and passes once the sim skips an entry the receiver's
-/// version vector covers: the evidence for the cause named at `KNOWN_BOUNDED_FAILURES`.
+/// The five seeds that failed before the sim had the Q3 rules fail as listed with both rules off (the sim's
+/// old protocol), and pass with the covered-entry skip alone (the entry's whole vector), with the start-HLC
+/// rule alone for the four restores (not for the nested seed, which has no restore), and with both (the
+/// default).
 #[test]
-fn the_known_bounded_failures_pass_with_the_covered_entry_skip() {
-    for k in &KNOWN_BOUNDED_FAILURES {
-        assert_eq!(bounded_problems(k.seed, k.nested, false), k.problems, "seed {}", k.seed);
-        assert_eq!(
-            bounded_problems(k.seed, k.nested, true),
-            Vec::<String>::new(),
-            "seed {}",
-            k.seed
-        );
+fn the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it() {
+    for k in &COVERED_SKIP_EVIDENCE {
+        assert_eq!(bounded_problems(k.seed, k.nested, false, false), k.problems, "seed {}", k.seed);
+        for (skip, start) in [(true, false), (false, true), (true, true)] {
+            // the start-HLC rule alone clears the restores (four flat seeds) but not the nested seed, which has
+            // no restore: START_HLC alone is not the fix (review M1)
+            if k.nested && !skip {
+                assert_eq!(
+                    bounded_problems(k.seed, k.nested, skip, start),
+                    k.problems,
+                    "seed {}",
+                    k.seed
+                );
+                continue;
+            }
+            assert_eq!(
+                bounded_problems(k.seed, k.nested, skip, start),
+                Vec::<String>::new(),
+                "seed {}, skip {skip}, start {start}",
+                k.seed
+            );
+        }
     }
 }
 
-macro_rules! known_failure {
+/// The default protocol (the covered-entry skip and the start-HLC rule on) passes the five seeds.
+macro_rules! bounded_seed {
     ($name:ident, $nested:expr, $seed:expr) => {
         #[test]
-        #[ignore = "known failure: the covered-entry skip port, before Step 3 (see KNOWN_BOUNDED_FAILURES)"]
         fn $name() {
-            assert_eq!(bounded_problems($seed, $nested, false), Vec::<String>::new());
+            let cfg = Cfg::default_ret();
+            assert!(cfg.flags.covered_skip && cfg.flags.start_hlc);
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, $nested);
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new());
         }
     };
 }
 
-known_failure!(bounded_flat_seed_106, false, 106);
-known_failure!(bounded_flat_seed_1435, false, 1435);
-known_failure!(bounded_flat_seed_1551, false, 1551);
-known_failure!(bounded_flat_seed_2006, false, 2006);
-known_failure!(bounded_nested_seed_2396, true, 2396);
+bounded_seed!(bounded_flat_seed_106, false, 106);
+bounded_seed!(bounded_flat_seed_1435, false, 1435);
+bounded_seed!(bounded_flat_seed_1551, false, 1551);
+bounded_seed!(bounded_flat_seed_2006, false, 2006);
+bounded_seed!(bounded_nested_seed_2396, true, 2396);
