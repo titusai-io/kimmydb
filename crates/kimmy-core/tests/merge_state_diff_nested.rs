@@ -767,6 +767,14 @@ fn nested_differential_against_the_python_model() {
 /// register `obs` is dead under ABSORBED = True: the generator checks, on every state it digests that has a register obs entry, that
 /// every read of the model is the same with the obs maps cleared as with them (`check_obs_dead`, a hard failure), and the Rust
 /// writers, which have no obs, agree with the model at every step of this script. Generated and replayed here on its own (under a second).
+///
+/// The test also asserts that the seed STILL REACHES the shape it is named for: the generator reports, per script, the number of digested
+/// states that hold a dangling register obs key (its slot is gone) and a dangling generation `seen` key, and both counts must be above
+/// 0 for seed 792 (46 and 46 member-step states when the test was written). Were the draw stream to change so that seed 792 no longer
+/// produced the shape, the replay alone would still pass and prove nothing about it. The shape is not unique to 792: over the 1000
+/// nested scripts six seeds show a dangling obs key (198, 253, 652, 687, 792 and 893; 165 dangling obs keys in total), so
+/// `check_obs_dead` exercises it in six scripts. (The "18 states, all in seed 792" of an earlier count is the narrower predicate: an obs
+/// entry AND an EMPTY absorbed store.) The count is only reported (on the generator's stdout): it changes neither a script nor a fingerprint.
 #[test]
 fn seed_792_a_register_obs_that_names_a_collected_life_is_dead() {
     let scratch = Scratch::new("seed792");
@@ -778,6 +786,22 @@ fn seed_792_a_register_obs_that_names_a_collected_life_is_dead() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // the generator reports, per script, the digested states with a dangling obs key and with a dangling `seen` key
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.starts_with("dangling seed=792 ")).unwrap_or_else(|| {
+        panic!("the generator reported no dangling count for seed 792:\n{stdout}")
+    });
+    let count = |name: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|t| t.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no `{name}` in `{line}`"))
+    };
+    assert!(
+        count("obs_states") > 0,
+        "seed 792 no longer reaches a dangling register obs key: {line}"
+    );
+    assert!(count("seen_states") > 0, "seed 792 no longer reaches a dangling `seen` key: {line}");
     let path = scratch.0.join("s000792.json");
     let sc: J = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("a script");
     // the draw is the one the shape was found in
