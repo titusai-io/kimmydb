@@ -384,20 +384,22 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     for (name, fp) in got {
         println!("[fingerprint {name}] {fp:#018x}");
     }
-    // The fingerprints leave the order state out (`fingerprint::without_ords`). The seventh is the one that
-    // moved when the Writer began to feed the order state (item O2): 0x520b467cfaab5d4c to
-    // 0x3eb070a76e6956fe. A write that only reorders the fields of a sub-document (no leaf different) is
-    // a write in the model and now in the Writer, where it was a no-op: the nested bounded workload makes
-    // some, and the trajectory goes on from the stamp it takes. With the stage-A rule on
-    // (`ord_reorder_is_noop`) the figure is the old one. The other six are unchanged.
+    // RE-PINNED for item O2 (the Writer feeds the order state), each fingerprint now folding the compact bytes and
+    // hash of the state WITH its order state and the document in the order the order state gives it:
+    //   restore 0x4efca9449bca3d13 -> 0xd5f2038d6cb64fd0      no restore 0x08ad9af402612aaa -> 0x03c831e729d37118
+    //   bound 1000 0xccecf868d8992847 -> 0xb5d376dace70d755    sequential 0xf5da0966517d1134 -> 0x5cf2b4f670f08b9e
+    //   horizon 0x4173d22962941f92 -> 0xaab8149ae0f8c453       bounded 0xb59997222fd1686f -> 0x6a0197bd2778c8c7
+    //   bounded nested 0x3eb070a76e6956fe -> 0x49b01bf0858bb6cd
+    // (the last had moved once before, in Group A, when a write that only reorders became a write). Before
+    // this commit they left the order state out, and six of the seven were the figures of the code before O2.
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x4efca9449bca3d13),
-        ("no restore", 0x08ad9af402612aaa),
-        ("bound 1000", 0xccecf868d8992847),
-        ("sequential", 0xf5da0966517d1134),
-        ("horizon", 0x4173d22962941f92),
-        ("bounded", 0xb59997222fd1686f),
-        ("bounded nested", 0x3eb070a76e6956fe),
+        ("restore", 0xd5f2038d6cb64fd0),
+        ("no restore", 0x03c831e729d37118),
+        ("bound 1000", 0xb5d376dace70d755),
+        ("sequential", 0x5cf2b4f670f08b9e),
+        ("horizon", 0xaab8149ae0f8c453),
+        ("bounded", 0x6a0197bd2778c8c7),
+        ("bounded nested", 0x49b01bf0858bb6cd),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
