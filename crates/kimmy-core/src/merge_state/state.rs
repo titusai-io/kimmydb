@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::Num;
 use super::join::JoinOptions;
-use super::types::{InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{Epoch, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
+use crate::ids::NodeId;
 
 /// A version vector: the newest HLC seen per writer.
 pub type Vv = BTreeMap<WriterId, Hlc>;
@@ -70,13 +71,29 @@ fn mutant_vv(_: &Vv) -> Vv {
 /// A register cell: higher stamp wins. `obs` is what the writer had counted: for each
 /// counted slot the slot's stamp and total at that time (the stamp tells a slot that has
 /// not moved since from one that moved and came back to the same total). `generation` the generation of this base, `soi` marks `$setOnInsert` creation cells.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub struct Reg {
     pub stamp: MStamp,
     pub value: Value,
     pub obs: BTreeMap<ObsKey, (MStamp, Num)>,
     pub generation: Option<Gen>,
     pub soi: bool,
+}
+
+// What `derive(Clone)` writes, by hand so that a test can count the registers a join or a write
+// copies (see `work`).
+impl Clone for Reg {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::RegClones, 1);
+        Reg {
+            stamp: self.stamp,
+            value: self.value.clone(),
+            obs: self.obs.clone(),
+            generation: self.generation.clone(),
+            soi: self.soi,
+        }
+    }
 }
 
 impl Reg {
@@ -254,40 +271,75 @@ impl MergeState {
         self.alive_set(o.retention).into_iter().collect()
     }
 
+    /// Is some alive life an explicit insert (any insert, re-inserts included)?
+    fn insert_alive(&self, al: &BTreeSet<MStamp>) -> bool {
+        al.iter().any(|a| self.lives.get(a).is_some_and(|v| v.kind == LifeKind::Insert))
+    }
+
     /// V6m2: the creation cells of an upsert-created life are dropped when an
-    /// explicit insert is alive (any insert, re-inserts included).
-    pub(crate) fn suppressed(
+    /// explicit insert is alive (any insert, re-inserts included). `insert_alive` is that
+    /// answer, asked for the first time it is needed and kept by the caller.
+    fn suppressed(
         &self,
         life: &MStamp,
         r: &Reg,
         al: &BTreeSet<MStamp>,
         o: &JoinOptions,
+        insert_alive: &mut Option<bool>,
     ) -> bool {
         match self.lives.get(life) {
             Some(l) if l.kind == LifeKind::Upsert && r.soi && o.suppress_soi() => {
-                al.iter().any(|a| self.lives.get(a).is_some_and(|v| v.kind == LifeKind::Insert))
+                *insert_alive.get_or_insert_with(|| self.insert_alive(al))
             }
             _ => false,
         }
     }
 
+    /// The alive registers of `p` in life order, as the read side picks among them: the first of
+    /// the newest stamp wins, a suppressed creation cell never does. One lookup per alive life,
+    /// not a pass over every register.
     pub(crate) fn winner_in(
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
         o: &JoinOptions,
     ) -> Option<&Reg> {
+        let first = al.first()?;
+        let mut key = (*first, p.clone());
+        let mut insert_alive = None;
         let mut best: Option<&Reg> = None;
-        for ((l, q), r) in &self.regs {
-            if q == p
-                && al.contains(l)
-                && !self.suppressed(l, r, al, o)
+        for l in al {
+            key.0 = *l;
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::Visits, 1);
+            if let Some(r) = self.regs.get(&key)
+                && !self.suppressed(l, r, al, o, &mut insert_alive)
                 && best.is_none_or(|b| r.stamp > b.stamp)
             {
                 best = Some(r);
             }
         }
         best
+    }
+
+    /// The counter slots of `p` in the alive lives, in key order: one range per alive life.
+    pub(super) fn slots_at<'a>(
+        &'a self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+    ) -> Vec<(&'a SlotKey, &'a Slot)> {
+        let mut out = Vec::new();
+        let Some(first) = al.first() else { return out };
+        // the smallest writer, and no generation (which sorts first)
+        let least = WriterId { node: NodeId::from_bytes([0; 16]), epoch: Epoch([0; Epoch::LEN]) };
+        let mut from = (*first, p.clone(), least, None);
+        for l in al {
+            from.0 = *l;
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::Visits, 1);
+            out.extend(self.slots.range(&from..).take_while(|(k, _)| k.0 == *l && k.1 == *p));
+        }
+        out
     }
 
     /// The winning register of `p` among the alive lives.
@@ -304,7 +356,7 @@ impl MergeState {
     /// The generation `win` (the winner of `p`) belongs to. Under the V3M3
     /// mutant switch, the v3 rule instead: the newest non-numeric base among
     /// the alive lives, even when it lost.
-    fn gen_in<'a>(
+    pub(super) fn gen_in<'a>(
         &'a self,
         p: &Path,
         al: &BTreeSet<MStamp>,
@@ -331,7 +383,7 @@ impl MergeState {
         self.counted_in(p, &al, win, o)
     }
 
-    fn counted_in(
+    pub(super) fn counted_in(
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
@@ -339,16 +391,7 @@ impl MergeState {
         o: &JoinOptions,
     ) -> BTreeMap<ObsKey, &Slot> {
         let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
-        self.slots
-            .iter()
-            .filter(|((l, q, _, generation), _)| {
-                q == p
-                    && al.contains(l)
-                    && (*generation == g
-                        || (generation.is_some() && (g.is_none() || *generation > g)))
-            })
-            .map(|((l, _, w, generation), s)| ((*l, *w, *generation), s))
-            .collect()
+        counted_among(g, self.slots_at(p, al)).collect()
     }
 
     /// The increments the winning generation overwrote, as state derived from
@@ -362,16 +405,26 @@ impl MergeState {
 
     fn hidden_in(&self, p: &Path, al: &BTreeSet<MStamp>, o: &JoinOptions) -> i128 {
         let win = self.winner_in(p, al, o);
+        self.hidden_with(p, al, win, self.slots_at(p, al), o)
+    }
+
+    /// [`MergeState::hidden`] of `p` from its winner and its alive slots.
+    fn hidden_with<'a>(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        win: Option<&Reg>,
+        slots: impl IntoIterator<Item = (&'a SlotKey, &'a Slot)>,
+        o: &JoinOptions,
+    ) -> i128 {
         let Some(g) = self.gen_in(p, al, win, o) else {
             return 0;
         };
         // An integer figure: the amounts of the other types are not reported (provisional, see
         // the module docs of `counter`).
-        self.slots
-            .iter()
-            .filter(|((l, q, _, generation), _)| {
-                q == p && al.contains(l) && generation.is_none_or(|x| x < g.stamp)
-            })
+        slots
+            .into_iter()
+            .filter(|((_, _, _, generation), _)| generation.is_none_or(|x| x < g.stamp))
             .filter_map(|((l, _, w, generation), s)| {
                 let seen = g.seen.get(&(*l, *w, *generation)).and_then(Num::int).unwrap_or(0);
                 s.total.int().map(|t| t.saturating_sub(seen))
@@ -382,12 +435,11 @@ impl MergeState {
     /// The hidden figure of every path that has a nonzero one.
     pub fn hidden_all(&self, o: &JoinOptions) -> BTreeMap<Path, i128> {
         let al = self.alive_set(o.retention);
-        let paths: BTreeSet<&Path> =
-            self.slots.keys().filter(|k| al.contains(&k.0)).map(|k| &k.1).collect();
-        paths
+        self.index(&al, o)
             .into_iter()
-            .filter_map(|p| {
-                let h = self.hidden_in(p, &al, o);
+            .filter(|(_, c)| !c.slots.is_empty())
+            .filter_map(|(p, c)| {
+                let h = self.hidden_with(p, &al, c.win, c.slots.iter().copied(), o);
                 (h != 0).then(|| (p.clone(), h))
             })
             .collect()
@@ -404,14 +456,18 @@ impl MergeState {
     pub fn over_caps(&self, o: &JoinOptions) -> OverCaps {
         let writers = self.writers().len();
         let al = self.alive_set(o.retention);
-        let paths: BTreeSet<&Path> =
-            self.slots.keys().filter(|k| al.contains(&k.0)).map(|k| &k.1).collect();
         OverCaps {
             writers: (writers > MAX_WRITERS).then_some(writers),
-            counters: paths
+            counters: self
+                .index(&al, o)
                 .into_iter()
-                .filter_map(|p| {
-                    let n = self.contributors(p, o).len();
+                .filter(|(_, c)| !c.slots.is_empty())
+                .filter_map(|(p, c)| {
+                    let g = self.gen_in(p, &al, c.win, o).map(|g| g.stamp);
+                    let n = counted_among(g, c.slots.iter().copied())
+                        .map(|(k, _)| k.1)
+                        .collect::<BTreeSet<_>>()
+                        .len();
                     (n > MAX_CONTRIBUTORS).then(|| (p.clone(), n))
                 })
                 .collect(),
@@ -441,6 +497,18 @@ impl MergeState {
         o: &JoinOptions,
     ) -> Option<(Value, Option<Excess>)> {
         let win = self.winner_in(p, al, o);
+        self.cell_with(p, al, win, self.slots_at(p, al), o)
+    }
+
+    /// [`MergeState::cell_in`] from the winner of `p` and its alive slots.
+    fn cell_with<'a>(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        win: Option<&Reg>,
+        slots: impl IntoIterator<Item = (&'a SlotKey, &'a Slot)>,
+        o: &JoinOptions,
+    ) -> Option<(Value, Option<Excess>)> {
         // A base that is not a counter amount (a string, a double, a map marker, ...) is the
         // value: doubles are not counters.
         let base = match win.map(|w| &w.value) {
@@ -455,7 +523,8 @@ impl MergeState {
         // 0 is still there).
         let mut cut = None;
         let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
-        for (k, s) in self.counted_in(p, al, win, o) {
+        let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
+        for (k, s) in counted_among(g, slots) {
             let ob = win.and_then(|w| w.obs.get(&k));
             let d = ob.map_or(s.total, |x| {
                 if o.no_decimal_saturation() {
@@ -507,11 +576,13 @@ impl MergeState {
     /// nothing is stored, and no join law, hash or byte of either codec depends on it.
     pub fn excess(&self, o: &JoinOptions) -> BTreeMap<Path, Excess> {
         let al = self.alive_set(o.retention);
-        let paths: BTreeSet<&Path> =
-            self.slots.keys().filter(|k| al.contains(&k.0)).map(|k| &k.1).collect();
-        paths
+        self.index(&al, o)
             .into_iter()
-            .filter_map(|p| self.cell_in(p, &al, o)?.1.map(|e| (p.clone(), e)))
+            .filter(|(_, c)| !c.slots.is_empty())
+            .filter_map(|(p, c)| {
+                let cell = self.cell_with(p, &al, c.win, c.slots.iter().copied(), o)?;
+                cell.1.map(|e| (p.clone(), e))
+            })
             .collect()
     }
 
@@ -531,63 +602,116 @@ impl MergeState {
         if al.is_empty() {
             return None;
         }
-        let mut newest: BTreeMap<Path, MStamp> = BTreeMap::new();
-        let mut note = |p: &Path, st: MStamp| {
-            let e = newest.entry(p.clone()).or_insert(st);
-            *e = (*e).max(st);
-        };
-        for ((l, p), r) in &self.regs {
-            if al.contains(l) && !self.suppressed(l, r, &al, o) {
-                note(p, r.stamp);
-            }
-        }
-        for ((l, p, _, _), s) in &self.slots {
-            if al.contains(l) {
-                note(p, s.stamp);
-            }
-        }
+        let idx = self.index(&al, o);
         // every path with a cell, and every path above one
-        let mut all: BTreeSet<Path> = BTreeSet::new();
-        for p in newest.keys() {
-            all.extend(p.ancestors());
-            all.insert(p.clone());
+        let mut above: BTreeSet<Path> = BTreeSet::new();
+        for p in idx.keys() {
+            above.extend(p.ancestors().filter(|a| !idx.contains_key(a)));
         }
-        let mut kids: BTreeMap<Path, Vec<Path>> = BTreeMap::new();
+        let mut all: Vec<&Path> = idx.keys().copied().chain(above.iter()).collect();
+        all.sort_unstable();
+        // the children of a path, by the segments of the path (a slice is not a new path)
+        let mut kids: BTreeMap<&[String], Vec<&Path>> = BTreeMap::new();
         let mut tops = Vec::new();
-        for p in &all {
-            match p.parent() {
-                None => tops.push(p.clone()),
-                Some(par) => kids.entry(par).or_default().push(p.clone()),
+        for p in all {
+            let segs = p.segments();
+            match segs.split_last() {
+                Some((_, par)) if !par.is_empty() => kids.entry(par).or_default().push(p),
+                _ => tops.push(p),
             }
         }
-        let cx = Tree { st: self, al: &al, o, newest: &newest, kids: &kids };
+        let cx = Tree { st: self, al: &al, o, idx: &idx, kids: &kids };
         let mut out = BTreeMap::new();
-        for t in &tops {
+        for t in tops {
             if let Some(n) = cx.node(t) {
                 n.emit(t, &mut out);
             }
         }
         Some(out)
     }
+
+    /// Everything the read side needs of each path that has a cell in an alive life, from one
+    /// pass over the registers and one over the slots: the newest stamp, the winning register
+    /// and the slots. A path with a register that is suppressed and no other cell is absent.
+    fn index<'a>(
+        &'a self,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+    ) -> BTreeMap<&'a Path, PathCells<'a>> {
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::Visits, self.regs.len() + self.slots.len());
+        let mut idx: BTreeMap<&Path, PathCells> = BTreeMap::new();
+        let mut insert_alive = None;
+        for ((l, p), r) in &self.regs {
+            if al.contains(l) && !self.suppressed(l, r, al, o, &mut insert_alive) {
+                let c = idx.entry(p).or_insert_with(|| PathCells::new(r.stamp));
+                c.newest = c.newest.max(r.stamp);
+                if c.win.is_none_or(|b| r.stamp > b.stamp) {
+                    c.win = Some(r);
+                }
+            }
+        }
+        for (k, sl) in &self.slots {
+            if al.contains(&k.0) {
+                let c = idx.entry(&k.1).or_insert_with(|| PathCells::new(sl.stamp));
+                c.newest = c.newest.max(sl.stamp);
+                c.slots.push((k, sl));
+            }
+        }
+        idx
+    }
+}
+
+/// A counter slot's key: `(life, path, writer, generation)`.
+type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
+
+/// The cells of one path in the alive lives, see [`MergeState::index`].
+struct PathCells<'a> {
+    /// The newest stamp among them.
+    newest: MStamp,
+    /// The winning register, `None` when the path has only slots.
+    win: Option<&'a Reg>,
+    /// The slots, in key order.
+    slots: Vec<(&'a SlotKey, &'a Slot)>,
+}
+
+impl PathCells<'_> {
+    fn new(newest: MStamp) -> Self {
+        PathCells { newest, win: None, slots: Vec::new() }
+    }
+}
+
+/// The slots of the winning base's generation `g` and of NEWER generations, as [`ObsKey`] and
+/// slot, from the slots of one path.
+fn counted_among<'a>(
+    g: Option<MStamp>,
+    slots: impl IntoIterator<Item = (&'a SlotKey, &'a Slot)>,
+) -> impl Iterator<Item = (ObsKey, &'a Slot)> {
+    slots
+        .into_iter()
+        .filter(move |((_, _, _, generation), _)| {
+            *generation == g || (generation.is_some() && (g.is_none() || *generation > g))
+        })
+        .map(|((l, _, w, generation), s)| ((*l, *w, *generation), s))
 }
 
 /// What the type rule decided for one path.
-struct Node {
+struct Node<'a> {
     /// The newest stamp among the cells of the visible subtree.
     newest: MStamp,
-    shape: Shape,
+    shape: Shape<'a>,
 }
 
-enum Shape {
+enum Shape<'a> {
     Leaf(Value),
-    Map(BTreeMap<Path, Node>),
+    Map(BTreeMap<&'a Path, Node<'a>>),
 }
 
-impl Node {
-    fn emit(&self, at: &Path, out: &mut BTreeMap<Path, Value>) {
-        match &self.shape {
+impl Node<'_> {
+    fn emit(self, at: &Path, out: &mut BTreeMap<Path, Value>) {
+        match self.shape {
             Shape::Leaf(v) => {
-                out.insert(at.clone(), v.clone());
+                out.insert(at.clone(), v);
             }
             Shape::Map(kids) => {
                 out.insert(at.clone(), Value::Map);
@@ -604,23 +728,26 @@ struct Tree<'a> {
     st: &'a MergeState,
     al: &'a BTreeSet<MStamp>,
     o: &'a JoinOptions,
-    newest: &'a BTreeMap<Path, MStamp>,
-    kids: &'a BTreeMap<Path, Vec<Path>>,
+    idx: &'a BTreeMap<&'a Path, PathCells<'a>>,
+    kids: &'a BTreeMap<&'a [String], Vec<&'a Path>>,
 }
 
-impl Tree<'_> {
+impl<'a> Tree<'a> {
     /// The node of `q`, `None` when `q` is absent.
-    fn node(&self, q: &Path) -> Option<Node> {
-        let ks: BTreeMap<Path, Node> = self
+    fn node(&self, q: &'a Path) -> Option<Node<'a>> {
+        let ks: BTreeMap<&Path, Node> = self
             .kids
-            .get(q)
+            .get(q.segments())
             .into_iter()
             .flatten()
-            .filter_map(|c| self.node(c).map(|n| (c.clone(), n)))
+            .filter_map(|c| self.node(c).map(|n| (*c, n)))
             .collect();
-        let own = self.st.value_in(q, self.al, self.o);
-        let own_n = self.newest.get(q).copied();
-        let top = |v: &BTreeMap<Path, Node>| v.values().map(|n| n.newest).max();
+        let cells = self.idx.get(q);
+        let own = cells.and_then(|c| {
+            self.st.cell_with(q, self.al, c.win, c.slots.iter().copied(), self.o).map(|c| c.0)
+        });
+        let own_n = cells.map(|c| c.newest);
+        let top = |v: &BTreeMap<&Path, Node>| v.values().map(|n| n.newest).max();
         if ks.is_empty() {
             let v = own?;
             let shape = if v == Value::Map { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
@@ -629,12 +756,12 @@ impl Tree<'_> {
         match own {
             // a scalar, number or array at q: only the children newer than its register show
             Some(v) if v != Value::Map => {
-                let reg = self.st.winner_in(q, self.al, self.o);
+                let reg = cells.and_then(|c| c.win);
                 let rs = match reg {
                     Some(r) if r.value.is_plain() => r.stamp,
                     _ => own_n?,
                 };
-                let shown: BTreeMap<Path, Node> = if self.o.type_ignores_recency() {
+                let shown: BTreeMap<&Path, Node> = if self.o.type_ignores_recency() {
                     BTreeMap::new()
                 } else {
                     ks.into_iter().filter(|(_, n)| n.newest > rs).collect()

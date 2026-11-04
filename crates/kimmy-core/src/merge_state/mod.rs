@@ -55,6 +55,8 @@ mod counter;
 mod join;
 mod state;
 mod types;
+#[cfg(test)]
+mod work;
 mod writer;
 
 #[cfg(test)]
@@ -67,6 +69,8 @@ mod nested_tests;
 mod prop_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod work_tests;
 
 pub use codec::{DecodeError, V1CannotHold};
 pub use counter::Num;

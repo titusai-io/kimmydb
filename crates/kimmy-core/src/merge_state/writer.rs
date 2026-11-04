@@ -1,10 +1,10 @@
 //! A writer incarnation: local write operations over its own [`MergeState`]
 //! (the model's `Member` with the `Node.finish` normalisation).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::{self, Inc, Kind, Num};
-use super::join::{JoinOptions, join};
+use super::join::{JoinOptions, join, join_into};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
 };
@@ -128,8 +128,9 @@ fn expand(at: &Path, v: &Value, out: &mut Vec<(Path, Value)>) -> Result<(), Inva
 /// is a one-segment path, distinct, and each value legal input. `None` refuses the document.
 fn expand_document(fields: &[(Path, Value)]) -> Option<Vec<(Path, Value)>> {
     let mut out = Vec::new();
-    for (i, (p, v)) in fields.iter().enumerate() {
-        if p.segments().len() != 1 || fields[..i].iter().any(|(q, _)| q == p) {
+    let mut named = BTreeSet::new();
+    for (p, v) in fields {
+        if p.segments().len() != 1 || !named.insert(p) {
             return None;
         }
         v.check_input().ok()?;
@@ -227,8 +228,12 @@ impl Writer {
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
         // The writer cap: a writer the document does not mention yet is refused at the cap (a
-        // write adds the writer to the version vector).
-        if !self.opts.no_writer_cap() {
+        // write adds the writer to the version vector). Every writer of the version vector is
+        // mentioned, so the walk over the whole state is only needed for a writer that has not
+        // written yet.
+        if !self.opts.no_writer_cap() && !self.state.vv.contains_key(&self.id) {
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::WriterScans, 1);
             let ws = self.state.writers();
             if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
                 return None;
@@ -281,38 +286,34 @@ impl Writer {
         self.state.horizon(&self.opts)
     }
 
-    fn write_life(&self) -> Option<MStamp> {
-        self.state.alive(&self.opts).into_iter().max()
-    }
-
-    /// V5m1: every slot total of `p` (any generation, alive lives) as this
+    /// V5m1: every slot total of `p` (any generation, `al` the alive lives) as this
     /// writer sees it, kept with a generation it starts.
-    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, Num> {
-        let al = self.state.alive_set(self.opts.retention);
+    fn seen(&self, p: &Path, al: &BTreeSet<MStamp>) -> BTreeMap<ObsKey, Num> {
         self.state
-            .slots
-            .iter()
-            .filter(|((l, q, _, _), _)| q == p && al.contains(l))
+            .slots_at(p, al)
+            .into_iter()
             .map(|((l, _, w, g), v)| ((*l, *w, *g), v.total))
             .collect()
     }
 
-    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, Num)> {
-        self.state
-            .counted(p, &self.opts)
+    /// Set the register of `p` in the life `l` (the newest of the alive lives `al`), stamp `st`.
+    /// What the write observed (the winning base, its generation, the counted slots) is read from
+    /// the cells of `p` alone, so cells already set for other paths of the same write change
+    /// nothing of it.
+    fn setreg(&mut self, p: &Path, v: Value, st: MStamp, al: &BTreeSet<MStamp>) {
+        let l = *al.last().expect("a register write needs an alive life");
+        let win = self.state.winner_in(p, al, &self.opts);
+        let generation = if v.is_numeric() {
+            self.state.gen_in(p, al, win, &self.opts).map(std::borrow::Cow::into_owned)
+        } else {
+            Some(Gen::start(st, &self.state.vv, self.seen(p, al)))
+        };
+        let obs = self
+            .state
+            .counted_in(p, al, win, &self.opts)
             .into_iter()
             .map(|(k, v)| (k, (v.stamp, v.total)))
-            .collect()
-    }
-
-    fn setreg(&mut self, p: &Path, v: Value, st: MStamp) {
-        let l = self.write_life().expect("a register write needs an alive life");
-        let generation = if v.is_numeric() {
-            self.state.gen_of(p, &self.opts).map(std::borrow::Cow::into_owned)
-        } else {
-            Some(Gen::start(st, &self.state.vv, self.seen(p)))
-        };
-        let obs = self.obs(p);
+            .collect();
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
             let vv = self.state.vv.clone();
@@ -329,7 +330,8 @@ impl Writer {
     fn finish(&mut self, st: MStamp, record: WriteRecord) -> Written {
         self.state.vv.insert(st.writer, st.hlc);
         if self.opts.normalize_writes() {
-            let (s, _) = join(&self.state, &MergeState::default(), &self.opts);
+            let (s, _) =
+                join_into(std::mem::take(&mut self.state), &MergeState::default(), &self.opts);
             self.state = s;
         }
         Written { stamp: st, record }
@@ -700,10 +702,9 @@ impl Writer {
         let mut paths = Vec::new();
         let mut vals = BTreeMap::new();
         for (q, v) in soi_cells.iter().chain(set_cells.iter()) {
-            if !paths.contains(q) {
+            if vals.insert(q.clone(), v.clone()).is_none() {
                 paths.push(q.clone());
             }
-            vals.insert(q.clone(), v.clone());
         }
         s.vv.insert(st.writer, st.hlc);
         let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
@@ -794,8 +795,9 @@ impl Writer {
                     .map(|(q, _)| q)
                     .filter(|q| q.segments().len() == path.segments().len() + 1)
                     .collect();
+                let named: BTreeSet<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
                 for q in old {
-                    if !fields.iter().any(|(name, _)| name == q.name()) {
+                    if !named.contains(q.name()) {
                         unset_subtree(vis, q, eff, &self.opts);
                     }
                 }
@@ -818,9 +820,10 @@ impl Writer {
     fn commit(&mut self, eff: Eff, m: &mut Mint<'_>) -> Option<Written> {
         let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
-        let l = self.write_life();
+        let al = self.state.alive_set(self.opts.retention);
+        let l = al.last().copied();
         for q in &eff.order {
-            self.setreg(q, eff.vals[q].clone(), st);
+            self.setreg(q, eff.vals[q].clone(), st, &al);
         }
         let mut rec = WriteRecord::new(WriteKind::Reg, l, eff.order);
         rec.vals = eff.vals;
@@ -878,8 +881,10 @@ impl Writer {
             Inc::Slot(res) => res,
         };
         let op = Num::from_value(by)?;
-        let l = self.write_life()?;
-        let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
+        let al = self.state.alive_set(self.opts.retention);
+        let l = *al.last()?;
+        let win = self.state.winner_in(p, &al, &self.opts);
+        let generation = self.state.gen_in(p, &al, win, &self.opts).map(|g| g.stamp);
         let key = (l, p.clone(), self.id, generation);
         // The writer's slot is its running sum in the join of the types it has added. The
         // `Int64` check above is on the saturated visible value, which does not bound the sum
@@ -893,7 +898,8 @@ impl Writer {
         }
         // The contributor cap: a writer the counter does not have yet is refused at the cap.
         if !self.opts.no_contributor_cap() {
-            let cs = self.state.contributors(p, &self.opts);
+            let cs: BTreeSet<WriterId> =
+                self.state.counted_in(p, &al, win, &self.opts).keys().map(|k| k.1).collect();
             if cs.len() >= MAX_CONTRIBUTORS && !cs.contains(&self.id) {
                 return None;
             }
@@ -923,9 +929,10 @@ impl Writer {
         for (q, v) in doc {
             self.diff(&vis, q, v, &mut eff).ok()?;
         }
+        let kept: BTreeSet<&Path> = doc.iter().map(|(d, _)| d).collect();
         let tops: Vec<&Path> = vis.keys().filter(|q| q.segments().len() == 1).collect();
         for q in tops {
-            if !doc.iter().any(|(d, _)| d == q) {
+            if !kept.contains(q) {
                 unset_subtree(&vis, q, &mut eff, &self.opts);
             }
         }

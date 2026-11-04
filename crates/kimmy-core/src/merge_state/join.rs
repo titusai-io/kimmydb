@@ -1,9 +1,11 @@
 //! The join of two merge states (the model's `join`).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::state::{LifeKind, MergeState, cov, sub_ret};
-use super::types::{LossKey, LossKind, LossValue, MStamp, Path, Value};
+use super::counter::Num;
+use super::state::{LifeKind, MergeState, Reg, Slot, Vv, cov, sub_ret};
+use super::types::{LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 /// A refused integer bound: it must not be negative.
@@ -228,16 +230,52 @@ impl JoinOptions {
     switch!(no_writer_cap, set_no_writer_cap, false);
 }
 
-/// The model's `_prefilter`: drop deletes and dead lives older than `h`.
-fn prefilter(st: &MergeState, h: Hlc) -> MergeState {
-    let mut st = st.clone();
+/// The model's `_prefilter` of one state, in place: drop deletes and dead lives older than `h`.
+fn prefilter(st: &mut MergeState, h: Hlc) {
     st.deletes.retain(|d, _| d.hlc >= h);
     let gone: Vec<MStamp> = st.dead.iter().filter(|l| l.hlc < h).copied().collect();
     for l in gone {
         st.dead.remove(&l);
         st.lives.remove(&l);
     }
-    st
+}
+
+/// Is a life alive? Cells come in runs of one life (the maps are ordered by life first), so the
+/// answer for the last life asked is kept.
+struct Alive<'a> {
+    set: &'a BTreeSet<MStamp>,
+    last: Cell<Option<(MStamp, bool)>>,
+}
+
+impl<'a> Alive<'a> {
+    fn new(set: &'a BTreeSet<MStamp>) -> Self {
+        Self { set, last: Cell::new(None) }
+    }
+
+    fn has(&self, l: &MStamp) -> bool {
+        if let Some((m, yes)) = self.last.get()
+            && m == *l
+        {
+            return yes;
+        }
+        let yes = self.set.contains(l);
+        self.last.set(Some((*l, yes)));
+        yes
+    }
+}
+
+/// The cells of one side of a join as the loss detection reads them: the registers, the counter
+/// slots and the version vector, as they were before the join.
+struct Side<'a> {
+    regs: &'a BTreeMap<(MStamp, Path), Reg>,
+    slots: &'a BTreeMap<(MStamp, Path, WriterId, Option<MStamp>), Slot>,
+    vv: &'a Vv,
+}
+
+/// A cell below a path, for the `typeClash` search: the value or total it would report.
+enum Held<'a> {
+    Value(&'a Value),
+    Total(Num),
 }
 
 /// Join `t` into `s`. Returns the new state and the keys of the loss records
@@ -246,43 +284,43 @@ fn prefilter(st: &MergeState, h: Hlc) -> MergeState {
 /// V3M1: the horizon of the JOINED version vectors is applied to both sides
 /// BEFORE the union and before aliveness.
 pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTreeSet<LossKey>) {
+    join_into(s.clone(), t, o)
+}
+
+/// [`join()`] with the first state handed over: the result is built in it, so a caller that does
+/// not need the old state (a writer normalising its own state against the empty one) pays no
+/// copy of it.
+///
+/// The loss detection reads the cells of both sides as they were before the join, so the cells
+/// and the version vector of `out` are changed last; what it reads of `out` before that is the
+/// lives, the dead lives and the deletes, which are joined first.
+pub(super) fn join_into(
+    mut out: MergeState,
+    t: &MergeState,
+    o: &JoinOptions,
+) -> (MergeState, BTreeSet<LossKey>) {
     let ret = o.retention;
-    let h0 = sub_ret(s.max_vv().max(t.max_vv()), ret);
-    let (s, t) = if o.horizon_first() {
-        (prefilter(s, h0), prefilter(t, h0))
-    } else {
-        (s.clone(), t.clone())
-    };
-    let mut out = s.clone();
+    let h0 = sub_ret(out.max_vv().max(t.max_vv()), ret);
+    let hf = o.horizon_first();
+    if hf {
+        prefilter(&mut out, h0);
+    }
+    // `t` as prefiltered: a dead life older than the horizon is gone from its lives and its dead
+    // set, and the deletes older than it from its deletes. Nothing else of it is filtered.
+    let t_gone = |l: &MStamp| hf && l.hlc < h0 && t.dead.contains(l);
+    let t_kept = |h: Hlc| !hf || h >= h0;
 
     // Union. `ok` is evaluated against the dead set of the moment, as in the model.
     for (l, v) in &t.lives {
-        if !out.dead.contains(l) {
+        if !t_gone(l) && !out.dead.contains(l) {
             out.lives.entry(*l).or_insert_with(|| v.clone());
         }
     }
-    out.dead.extend(t.dead.iter().copied());
+    out.dead.extend(t.dead.iter().filter(|l| t_kept(l.hlc)).copied());
     for (d, vv) in &t.deletes {
-        out.deletes.entry(*d).or_insert_with(|| vv.clone());
-    }
-    for (k, r) in &t.regs {
-        if !out.dead.contains(&k.0) && out.regs.get(k).is_none_or(|x| r.stamp > x.stamp) {
-            out.regs.insert(k.clone(), r.clone());
+        if t_kept(d.hlc) {
+            out.deletes.entry(*d).or_insert_with(|| vv.clone());
         }
-    }
-    for (k, v) in &t.slots {
-        if !out.dead.contains(&k.0) && out.slots.get(k).is_none_or(|x| v.stamp > x.stamp) {
-            out.slots.insert(k.clone(), v.clone());
-        }
-    }
-    for (k, g) in &t.gens {
-        if !out.dead.contains(&k.0) && out.gens.get(k).is_none_or(|x| g.0 > x.0) {
-            out.gens.insert(k.clone(), g.clone());
-        }
-    }
-    for (w, h) in &t.vv {
-        let e = out.vv.entry(*w).or_insert(Hlc::ZERO);
-        *e = (*e).max(*h);
     }
 
     let mut new: BTreeMap<LossKey, LossValue> = BTreeMap::new();
@@ -327,118 +365,183 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     let al = out.alive_set(ret);
     let not_alive: Vec<MStamp> = out.lives.keys().filter(|l| !al.contains(l)).copied().collect();
     out.dead.extend(not_alive);
+    let alive = Alive::new(&al);
 
-    // (1) same-path register clashes: a register of s against a register of t,
-    // concurrent by the version vectors. Two arrays are an `arrayClash`.
-    let paths: BTreeSet<&Path> = s.regs.keys().chain(t.regs.keys()).map(|k| &k.1).collect();
-    for p in paths {
-        let rs = s.regs.iter().filter(|(k, _)| &k.1 == p && al.contains(&k.0)).map(|(_, r)| r);
-        let rt: Vec<_> =
-            t.regs.iter().filter(|(k, _)| &k.1 == p && al.contains(&k.0)).map(|(_, r)| r).collect();
-        for a in rs {
-            for b in &rt {
-                if a.stamp != b.stamp && !cov(&t.vv, &a.stamp) && !cov(&s.vv, &b.stamp) {
-                    let lo = if a.stamp < b.stamp { a } else { b };
-                    let arrays = matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
-                    let kind = if arrays && !o.array_clash_as_clash() {
-                        LossKind::ArrayClash
-                    } else {
-                        LossKind::Clash
-                    };
-                    new.insert(key(kind, p, lo.stamp), LossValue::Value(lo.value.clone()));
+    {
+        // The cells of both sides, before the join.
+        let s = Side { regs: &out.regs, slots: &out.slots, vv: &out.vv };
+        let t_side = Side { regs: &t.regs, slots: &t.slots, vv: &t.vv };
+
+        // (1) same-path register clashes: a register of s against a register of t,
+        // concurrent by the version vectors. Two arrays are an `arrayClash`. Only a register
+        // that the other side's version vector does not cover can clash, so only those are
+        // grouped by path (each side in the order of its map, that is by life), and the
+        // registers of s only where t has one.
+        let mut by_path: BTreeMap<&Path, (Vec<&Reg>, Vec<&Reg>)> = BTreeMap::new();
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::Visits, t_side.regs.len());
+        for ((l, p), r) in t_side.regs {
+            if alive.has(l) && !cov(s.vv, &r.stamp) {
+                by_path.entry(p).or_default().1.push(r);
+            }
+        }
+        if !by_path.is_empty() {
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::Visits, s.regs.len());
+            for ((l, p), r) in s.regs {
+                if alive.has(l)
+                    && !cov(t_side.vv, &r.stamp)
+                    && let Some(group) = by_path.get_mut(p)
+                {
+                    group.0.push(r);
                 }
             }
         }
-    }
+        for (p, (rs, rt)) in by_path {
+            for a in &rs {
+                for b in &rt {
+                    if a.stamp != b.stamp {
+                        let lo = if a.stamp < b.stamp { a } else { b };
+                        let arrays =
+                            matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
+                        let kind = if arrays && !o.array_clash_as_clash() {
+                            LossKind::ArrayClash
+                        } else {
+                            LossKind::Clash
+                        };
+                        new.insert(key(kind, p, lo.stamp), LossValue::Value(lo.value.clone()));
+                    }
+                }
+            }
+        }
 
-    // (1b) typeClash: a scalar or array register at p against a cell below p (a register with
-    // a plain value, or a counter slot), concurrent by the version vectors. The loser is the
-    // side the type rule hides: the older stamp (a newer register at p hides the cell below; a
-    // newer cell below makes p a map, and the register at p loses). Any depth below counts.
-    if !o.no_type_clash() {
-        for (a_st, b_st) in [(&s, &t), (&t, &s)] {
-            // b's cells in path order, so that those below a path are one run.
-            let mut cells: Vec<(&Path, MStamp, LossValue)> = b_st
-                .regs
-                .iter()
-                .filter(|(k, r)| al.contains(&k.0) && r.value.is_plain())
-                .map(|(k, r)| (&k.1, r.stamp, LossValue::Value(r.value.clone())))
-                .chain(
-                    b_st.slots
-                        .iter()
-                        .filter(|(k, _)| al.contains(&k.0))
-                        .map(|(k, v)| (&k.1, v.stamp, LossValue::Total(v.total))),
-                )
-                .collect();
-            cells.sort_by(|x, y| x.0.cmp(y.0));
-            for ((l, p), r) in &a_st.regs {
-                if !al.contains(l) || !r.value.is_plain() || cov(&b_st.vv, &r.stamp) {
+        // (1b) typeClash: a scalar or array register at p against a cell below p (a register
+        // with a plain value, or a counter slot), concurrent by the version vectors. The loser
+        // is the side the type rule hides: the older stamp (a newer register at p hides the cell
+        // below; a newer cell below makes p a map, and the register at p loses). Any depth below
+        // counts.
+        if !o.no_type_clash() {
+            for (a_st, b_st) in [(&s, &t_side), (&t_side, &s)] {
+                // b's cells in path order, so that those below a path are one run; listed when
+                // the first register of a asks for them.
+                if b_st.regs.is_empty() && b_st.slots.is_empty() {
                     continue;
                 }
-                let start = cells.partition_point(|c| c.0 <= p);
-                for (q, qst, qv) in cells[start..].iter().take_while(|c| c.0.is_below(p)) {
-                    if *qst != r.stamp && !cov(&a_st.vv, qst) {
-                        if r.stamp > *qst {
-                            new.insert(key(LossKind::TypeClash, q, *qst), qv.clone());
-                        } else {
-                            new.insert(
-                                key(LossKind::TypeClash, p, r.stamp),
-                                LossValue::Value(r.value.clone()),
-                            );
+                let mut cells: Option<Vec<(&Path, MStamp, Held)>> = None;
+                for ((l, p), r) in a_st.regs {
+                    if !alive.has(l) || !r.value.is_plain() || cov(b_st.vv, &r.stamp) {
+                        continue;
+                    }
+                    let cells = cells.get_or_insert_with(|| {
+                        let mut cells: Vec<(&Path, MStamp, Held)> = b_st
+                            .regs
+                            .iter()
+                            .filter(|(k, r)| alive.has(&k.0) && r.value.is_plain())
+                            .map(|(k, r)| (&k.1, r.stamp, Held::Value(&r.value)))
+                            .chain(
+                                b_st.slots
+                                    .iter()
+                                    .filter(|(k, _)| alive.has(&k.0))
+                                    .map(|(k, v)| (&k.1, v.stamp, Held::Total(v.total))),
+                            )
+                            .collect();
+                        cells.sort_by(|x, y| x.0.cmp(y.0));
+                        cells
+                    });
+                    let start = cells.partition_point(|c| c.0 <= p);
+                    for (q, qst, qv) in cells[start..].iter().take_while(|c| c.0.is_below(p)) {
+                        if *qst != r.stamp && !cov(a_st.vv, qst) {
+                            if r.stamp > *qst {
+                                let v = match qv {
+                                    Held::Value(v) => LossValue::Value((*v).clone()),
+                                    Held::Total(n) => LossValue::Total(*n),
+                                };
+                                new.insert(key(LossKind::TypeClash, q, *qst), v);
+                            } else {
+                                new.insert(
+                                    key(LossKind::TypeClash, p, r.stamp),
+                                    LossValue::Value(r.value.clone()),
+                                );
+                            }
                         }
+                    }
+                }
+            }
+        }
+
+        // (2) a cell in a dead life that no known delete saw.
+        let seen_by_delete = |st: &MStamp| out.deletes.values().any(|vv| cov(vv, st));
+        for src in [&s, &t_side] {
+            for (k, r) in src.regs {
+                if o.cells_reported() && reported.contains(&k.0) && r.stamp != k.0 {
+                    // V6M1: a write made into the losing life.
+                    new.insert(
+                        key(LossKind::InsertLost, &k.1, r.stamp),
+                        LossValue::Value(r.value.clone()),
+                    );
+                } else if !alive.has(&k.0) && !reported.contains(&k.0) && !seen_by_delete(&r.stamp)
+                {
+                    new.insert(
+                        key(LossKind::DeleteWon, &k.1, r.stamp),
+                        LossValue::Value(r.value.clone()),
+                    );
+                }
+            }
+            for (k, v) in src.slots {
+                if o.cells_reported() && reported.contains(&k.0) {
+                    new.insert(key(LossKind::InsertLost, &k.1, v.stamp), LossValue::Total(v.total));
+                } else if !alive.has(&k.0) && !reported.contains(&k.0) && !seen_by_delete(&v.stamp)
+                {
+                    new.insert(key(LossKind::DeleteWon, &k.1, v.stamp), LossValue::Total(v.total));
+                }
+            }
+        }
+
+        // V6m2: creation cells of an upsert life dropped for an alive explicit first insert.
+        if al.iter().any(|l| out.lives[l].kind == LifeKind::Insert) {
+            for src in [&s, &t_side] {
+                for (k, r) in src.regs {
+                    if r.soi
+                        && alive.has(&k.0)
+                        && out.lives.get(&k.0).is_some_and(|l| l.kind == LifeKind::Upsert)
+                    {
+                        new.insert(
+                            key(LossKind::InsertLost, &k.1, r.stamp),
+                            LossValue::Value(r.value.clone()),
+                        );
                     }
                 }
             }
         }
     }
 
-    // (2) a cell in a dead life that no known delete saw.
-    let seen_by_delete = |st: &MStamp| out.deletes.values().any(|vv| cov(vv, st));
-    for src in [&s, &t] {
-        for (k, r) in &src.regs {
-            if o.cells_reported() && reported.contains(&k.0) && r.stamp != k.0 {
-                // V6M1: a write made into the losing life.
-                new.insert(
-                    key(LossKind::InsertLost, &k.1, r.stamp),
-                    LossValue::Value(r.value.clone()),
-                );
-            } else if !al.contains(&k.0) && !reported.contains(&k.0) && !seen_by_delete(&r.stamp) {
-                new.insert(
-                    key(LossKind::DeleteWon, &k.1, r.stamp),
-                    LossValue::Value(r.value.clone()),
-                );
-            }
-        }
-        for (k, v) in &src.slots {
-            if o.cells_reported() && reported.contains(&k.0) {
-                new.insert(key(LossKind::InsertLost, &k.1, v.stamp), LossValue::Total(v.total));
-            } else if !al.contains(&k.0) && !reported.contains(&k.0) && !seen_by_delete(&v.stamp) {
-                new.insert(key(LossKind::DeleteWon, &k.1, v.stamp), LossValue::Total(v.total));
-            }
+    // The cells: the higher stamp wins. A cell of a life that is not alive is dropped, as the
+    // model drops it after the union.
+    for (k, r) in &t.regs {
+        if alive.has(&k.0) && out.regs.get(k).is_none_or(|x| r.stamp > x.stamp) {
+            out.regs.insert(k.clone(), r.clone());
         }
     }
-
-    // V6m2: creation cells of an upsert life dropped for an alive explicit first insert.
-    if al.iter().any(|l| out.lives[l].kind == LifeKind::Insert) {
-        for src in [&s, &t] {
-            for (k, r) in &src.regs {
-                if r.soi
-                    && al.contains(&k.0)
-                    && out.lives.get(&k.0).is_some_and(|l| l.kind == LifeKind::Upsert)
-                {
-                    new.insert(
-                        key(LossKind::InsertLost, &k.1, r.stamp),
-                        LossValue::Value(r.value.clone()),
-                    );
-                }
-            }
+    for (k, v) in &t.slots {
+        if alive.has(&k.0) && out.slots.get(k).is_none_or(|x| v.stamp > x.stamp) {
+            out.slots.insert(k.clone(), v.clone());
         }
+    }
+    for (k, g) in &t.gens {
+        if alive.has(&k.0) && out.gens.get(k).is_none_or(|x| g.0 > x.0) {
+            out.gens.insert(k.clone(), g.clone());
+        }
+    }
+    for (w, h) in &t.vv {
+        let e = out.vv.entry(*w).or_insert(Hlc::ZERO);
+        *e = (*e).max(*h);
     }
 
     // Drop cells of dead lives; filter records by the horizon.
-    out.regs.retain(|k, _| al.contains(&k.0));
-    out.slots.retain(|k, _| al.contains(&k.0));
-    out.gens.retain(|k, _| al.contains(&k.0));
+    let alive = Alive::new(&al);
+    out.regs.retain(|k, _| alive.has(&k.0));
+    out.slots.retain(|k, _| alive.has(&k.0));
+    out.gens.retain(|k, _| alive.has(&k.0));
     let h = out.horizon(o);
     out.deletes.retain(|d, _| d.hlc >= h);
     let dead_old: Vec<MStamp> =
@@ -447,14 +550,16 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
         out.lives.remove(&l);
     }
     out.dead.retain(|l| l.hlc >= h);
-    out.losses = BTreeMap::new();
-    let all = s.losses.iter().chain(t.losses.iter()).chain(new.iter());
-    for (k, v) in all {
-        if k.stamp.hlc >= h {
-            out.losses.entry(k.clone()).or_insert_with(|| v.clone());
+    // The records: those of `s` (which `out` still holds) and then `t`'s and the new ones, newest
+    // horizon only; the first to name a key keeps it. What `s` did not have is `fresh`.
+    out.losses.retain(|k, _| k.stamp.hlc >= h);
+    let mut fresh = BTreeSet::new();
+    for (k, v) in t.losses.iter().chain(new.iter()) {
+        if k.stamp.hlc >= h && !out.losses.contains_key(k) {
+            out.losses.insert(k.clone(), v.clone());
+            fresh.insert(k.clone());
         }
     }
-    let fresh = out.losses.keys().filter(|k| !s.losses.contains_key(k)).cloned().collect();
     (out, fresh)
 }
 
