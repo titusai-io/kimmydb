@@ -194,6 +194,17 @@ class NoInit(RecSc):
         self.init_doc = None
         self.script = []
 
+    def upsert_soi(self, who, fields, p, n, sets=None):
+        """A `$setOnInsert` upsert: two writes by one writer; the scenario's entry is the state after the second."""
+        m = self.m[who]
+        st = m.upsert_soi(fields, p, n, self.log, sets=sets)
+        assert st is not None
+        self.writes.append((m, st))
+        self.script.append({"k": "op", "who": who, "op": "upsert_soi", "path": p.split("."), "skew": 0, "clock": None,
+                            "stamp": j_stamp(st),
+                            "arg": {"fields": j_arg(fields), "n": j_val(n), "sets": j_arg(sets or {})}})
+        return st
+
     def upsert_inc(self, who, p, n):
         m = self.m[who]
         st = m.upsert_inc(p, n, self.log)
@@ -598,10 +609,19 @@ def s_hybrid_floor_on_an_update_after_a_receive():
 
 @scenario
 def s_a_standalone_noop_unset_leaves_nothing():
-    """A unsets a field it does not have: no stamp, no floor, no entry (the writer refuses it). B sets that field (6) and C
-    creates e (7): the field goes where B put it."""
-    sc = RecSc({"a": 1, "b": 2})
+    """A unsets a field it does not have: no stamp, no floor, no entry (the writer refuses it); so are an update of nothing
+    but that unset, one whose other change is a no-op, three whose paths meet (the same path twice, a path and the map above it,
+    the other way round) and a write below a scalar, single or in an update. B sets that field (6)
+    and C creates e (7): the field goes where B put it."""
+    sc = RecSc({"a": 1, "b": 2, "m": {"p": 1}})
     sc.refused("A", "unset", "nope", clock=5)
+    sc.refused("A", "update", None, [("unset", "nope", None)])                       # an update of nothing but a no-op unset
+    sc.refused("A", "update", None, [("set", "a", 1), ("unset", "nope", None)])      # the set changes nothing either
+    sc.refused("A", "update", None, [("set", "a", 5), ("unset", "a", None)])         # one path twice
+    sc.refused("A", "update", None, [("set", "m.p", 5), ("set", "m", {"q": 1})])     # a path and the map above it
+    sc.refused("A", "update", None, [("unset", "m", None), ("set", "m.p", 5)])       # a map and the path below it
+    sc.refused("A", "update", None, [("set", "a.b", 5)])                             # below a scalar
+    sc.refused("A", "set", "a.b", 5)                                                 # below a scalar
     sc.op("B", "set", "nope", 1, clock=6)
     sc.op("C", "set", "e", 1, clock=7)
     return sc
@@ -615,6 +635,40 @@ def s_a_subdocument_set_that_only_reorders_is_a_write():
     sc.op("A", "set", "m", {"q": 2, "p": 1}, clock=10)
     sc.op("B", "set", "m.r", 5, clock=11)
     sc.op("C", "set", "z", 1, clock=12)
+    return sc
+
+
+@scenario
+def s_a_writer_with_two_lives_writes_into_the_newest():
+    """A and B each create the document by an upserting inc (two lives); B's entry reaches A, which holds both lives and sets z:
+    the write goes into the newest life."""
+    sc = NoInit()
+    sc.upsert_inc("A", "x", 1)
+    b = sc.upsert_inc("B", "y", 2)
+    sc.recv("A", "B", b)
+    sc.op("A", "set", "z", 3)
+    return sc
+
+
+@scenario
+def s_inc_of_a_double_below_a_map_is_a_register_write():
+    """A double base is no counter: B's inc of m.f is a register write of 2.5, and a write below a map is a write to the map,
+    which A's concurrent unset of m (5) must not void."""
+    sc = RecSc({"x": 1, "m": {"f": 1.5}})
+    sc.op("A", "unset", "m", clock=5)
+    sc.op("B", "inc", "m.f", 1, clock=6)
+    sc.op("C", "set", "w", 1, clock=8)
+    return sc
+
+
+@scenario
+def s_a_set_on_insert_upsert_feeds_both_of_its_writes():
+    """A's upsert (creation of a, b and c, then the increment of n) is two writes; B creates a life of its own by an
+    upserting inc, and A then sets d."""
+    sc = NoInit()
+    sc.upsert_soi("A", {"a": 1, "b": 2}, "n", 3, sets={"c": 9})
+    sc.upsert_inc("B", "e", 1)
+    sc.op("A", "set", "d", 4)
     return sc
 
 

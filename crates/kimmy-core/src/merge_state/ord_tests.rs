@@ -294,10 +294,15 @@ fn disagreements(o: &JoinOptions, all_orders: bool) -> (Vec<String>, Vec<String>
         if !read_ok {
             read.push(name.clone());
         }
-        // (the replay of the bare feed starts every writer from the seed alone: not for a scenario in
-        // which a writer receives, which only the Writer API replay below can follow)
-        let receives = sc["script"].as_array().unwrap().iter().any(|s| s["k"] == "recv");
-        if !receives && !replay(sc, o) {
+        // (the replay of the bare feed starts every writer from the seed alone and replays one entry per
+        // write: not for a scenario in which a writer receives, or in which a write is two entries (a
+        // `$setOnInsert` upsert), which only the Writer API replay below can follow)
+        let not_bare = sc["script"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["k"] == "recv" || s["op"] == "upsert_soi");
+        if !not_bare && !replay(sc, o) {
             feed.push(name.clone());
         }
         // the Writer API: the script replayed through four writers, and the entries THEY built
@@ -494,6 +499,15 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
             "delete" => w.write_delete(skew),
             "upsert_inc" => w.upsert_inc(&at(), arg["v"].as_i64().unwrap(), skew),
             "update" | "setmany" => w.write_update(&script_ops(arg), skew),
+            "upsert_soi" => w
+                .upsert_soi(
+                    &script_fields(&arg["fields"]),
+                    &at(),
+                    arg["n"]["v"].as_i64().unwrap(),
+                    &script_fields(&arg["sets"]),
+                    skew,
+                )
+                .map(|(_, second)| second),
             n => panic!("operator {n}"),
         };
         match (got, stamp_opt(&step["stamp"])) {
@@ -515,9 +529,11 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 38] = [
+const SCENARIOS: [&str; 41] = [
+    "a_set_on_insert_upsert_feeds_both_of_its_writes",
     "a_standalone_noop_unset_leaves_nothing",
     "a_subdocument_set_that_only_reorders_is_a_write",
+    "a_writer_with_two_lives_writes_into_the_newest",
     "approximate_case",
     "concurrent_creation_a_first",
     "concurrent_creation_b_first",
@@ -527,6 +543,7 @@ const SCENARIOS: [&str; 38] = [
     "descendant_survivor_of_an_unset_map",
     "hybrid_floor_on_an_update_after_a_receive",
     "hybrid_noop_unset_rides_on_an_update",
+    "inc_of_a_double_below_a_map_is_a_register_write",
     "inc_unset_replace_concurrent",
     "level_floor_nested_subdocument_set",
     "level_floor_replace",
@@ -593,7 +610,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (38, 1824, 150));
+    assert_eq!((names.len(), joined, fields), (41, 1860, 165));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -609,12 +626,23 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The materialised-order goldens, spelled out. The arrays are what the A2-final model gives
+/// The materialised-order goldens, spelled out. The arrays are what the A2.1 model gives
 /// (the same arrays are in `tests/data/ord_goldens.json`, from which the test above checks the
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 30] = [
+    let pins: [(&str, &[&str]); 41] = [
+        ("a_set_on_insert_upsert_feeds_both_of_its_writes", &["a", "b", "c", "e", "n", "d"]),
+        ("a_standalone_noop_unset_leaves_nothing", &["a", "b", "m", "m.p", "nope", "e"]),
+        ("a_subdocument_set_that_only_reorders_is_a_write", &["m", "m.q", "m.p", "m.r", "k", "z"]),
+        ("a_writer_with_two_lives_writes_into_the_newest", &["x", "y", "z"]),
+        ("hybrid_floor_on_an_update_after_a_receive", &["a", "c", "b", "e"]),
+        ("inc_of_a_double_below_a_map_is_a_register_write", &["x", "m", "m.f", "w"]),
+        ("receive_a_concurrent_replace_then_set", &["c", "b", "a", "d", "e"]),
+        ("receive_a_concurrent_unset_then_set", &["q", "r", "p"]),
+        ("receive_a_survivor_increment_then_unset", &["x", "w", "b"]),
+        ("two_writers_each_receive_the_others_write_then_write", &["x", "q", "r", "s"]),
+        ("unset_then_receive_a_survivor_increment", &["x", "a", "w", "e"]),
         ("approximate_case", &["z", "q", "p", "r"]),
         ("concurrent_creation_a_first", &["a", "c", "d"]),
         ("concurrent_creation_b_first", &["a", "d", "c"]),
@@ -699,7 +727,7 @@ fn the_writer_reproduces_the_models_scenarios_after_every_write() {
         }
     }
     // pinned: what the replay covered (the seed insert of a seeded scenario is one of its writes)
-    assert_eq!((writes, receives, refused, joined), (162, 7, 1, 1824));
+    assert_eq!((writes, receives, refused, joined), (172, 8, 8, 1860));
 }
 
 /// The O2 watch item: a top-level field named `""` is fed as `OrdAt::Field([""])`, never as the
@@ -770,6 +798,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -803,6 +832,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -832,6 +862,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -906,6 +937,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_by_name",
             |o| o.set_ord_by_name(true),
             &[
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
@@ -916,6 +948,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -941,6 +974,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             ],
             &[],
             &[
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
@@ -951,6 +985,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -1095,6 +1130,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -1117,6 +1153,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
@@ -1126,6 +1163,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -1161,6 +1199,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
@@ -1221,6 +1260,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -1245,8 +1285,10 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
+                "a_writer_with_two_lives_writes_into_the_newest",
                 "approximate_case",
                 "concurrent_creation_a_first",
                 "concurrent_creation_b_first",
@@ -1256,6 +1298,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
