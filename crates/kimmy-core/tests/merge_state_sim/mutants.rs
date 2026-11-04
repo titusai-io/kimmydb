@@ -14,16 +14,19 @@ use std::time::Instant;
 
 use kimmy_core::merge_state::LossKind;
 
-use crate::grade::grade;
+use crate::grade::{grade, grade_bounded};
 use crate::probes;
-use crate::sim::{Cfg, RunConfig, run, settle};
+use crate::sim::{Cfg, RunConfig, run, run_bounded, settle};
 
 #[derive(Clone, Copy)]
 pub enum Grader {
     /// `P.run` + `P.grade`, with (`true`) or without a restore.
     Random { restore: bool },
     /// `P.run(steps=24, ret=4)` + `settle`: a flip-flop is a failure.
-    Horizon,
+    /// `skip` says whether the covered-entry skip is on for the runs (see the mutant V3M1).
+    Horizon { skip: bool },
+    /// The bounded runs of the runner (RET 40, a fixpoint every 3 steps, 80 steps), flat or nested.
+    Bounded { nested: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +43,16 @@ pub enum Probe {
     /// (a non-numeric creation value of an upsert and an increment on its path, in the one order
     /// that shows), so a change of the workload's random stream could leave it alive.
     Scenarios,
+    /// The idle-origin and late-member scripts of probes_q3 (`probes::q3_idle_origin`, `q3_late_member`):
+    /// the mutant is killed when the collected life comes back in one of them (the design keeps it dead).
+    Q3Skip,
+    /// The restore script of probes_q3 (`probes::q3_restore`): the start-HLC rule changes no state, only
+    /// what a pull hands over, so the mutant is killed when the restored member's pull hands A MORE
+    /// entries than the design's.
+    Q3Start,
+    /// `probes::q3_whole_vector`: an entry whose stamp the receiver covers and whose state it does not
+    /// is applied by the design and skipped by the stamp-only mutant.
+    Q3Stamp,
 }
 
 pub struct Mutant {
@@ -80,7 +93,10 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "horizon applied after aliveness  [V3M1]",
             apply: |c| c.opts.set_horizon_first(false),
-            grader: Horizon,
+            // graded with the covered-entry skip OFF: this mutant is seen in a flip-flop when entries the receiver
+            // holds are joined again after the horizon moved (ADR-085), which the skip now short-circuits, so
+            // the design protocol cannot show it
+            grader: Horizon { skip: false },
             probe: None,
         },
         Mutant {
@@ -191,6 +207,24 @@ pub fn mutants() -> Vec<Mutant> {
             grader: Random { restore: true },
             probe: None,
         },
+        Mutant {
+            name: "no covered-entry skip: an entry the receiver holds is joined again  [Q3]",
+            apply: |c| c.flags.covered_skip = false,
+            grader: Bounded { nested: false },
+            probe: Q3Skip,
+        },
+        Mutant {
+            name: "covered skip by the entry's stamp only, not its whole vector  [Q3]",
+            apply: |c| c.flags.covered_skip_by_stamp = true,
+            grader: Bounded { nested: false },
+            probe: Q3Stamp,
+        },
+        Mutant {
+            name: "no start-HLC rule: a new origin is pulled from 0  [Q3]",
+            apply: |c| c.flags.start_hlc = false,
+            grader: Random { restore: true },
+            probe: Q3Start,
+        },
     ]
 }
 
@@ -238,9 +272,15 @@ pub fn failing(cfg: &Cfg, g: Grader, n: u64) -> Failing {
                 }
                 f.note(seed, ps);
             }
-            Grader::Horizon => {
+            Grader::Bounded { nested } => {
+                let (o, _) = run_bounded(seed, cfg, 40, 3, 80, nested);
+                f.note(seed, grade_bounded(&o.nodes, &o.log));
+            }
+            Grader::Horizon { skip } => {
                 let rc = RunConfig { steps: 24, retention: Some(4), ..RunConfig::default() };
-                let mut o = run(seed, &rc, cfg);
+                let mut cfg = cfg.clone();
+                cfg.flags.covered_skip = cfg.flags.covered_skip && skip;
+                let mut o = run(seed, &rc, &cfg);
                 let ps = if settle(&mut o.nodes, 6).is_none() {
                     vec!["never-settles".to_string()]
                 } else {
@@ -296,6 +336,48 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
                 .collect();
             let k = !bad.is_empty();
             (Some(format!("scenarios {bad:?}: {}", if k { "killed" } else { "NOT killed" })), k)
+        }
+        Probe::Q3Skip => {
+            let found: Vec<&str> = [
+                ("idle origin", probes::q3_idle_origin(&cfg)),
+                ("late member", probes::q3_late_member(&cfg)),
+            ]
+            .into_iter()
+            .filter(|(_, out)| out.resurrected())
+            .map(|(name, _)| name)
+            .collect();
+            let k = !found.is_empty();
+            (
+                Some(format!(
+                    "Q3 scripts, the collected life comes back in {found:?}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
+        }
+        Probe::Q3Stamp => {
+            let (d, m) = (probes::q3_whole_vector(&design), probes::q3_whole_vector(&cfg));
+            let k = d && !m;
+            (
+                Some(format!(
+                    "Q3 whole vector: the receiver learns the write the entry carries: design {d}, mutant {m}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
+        }
+        Probe::Q3Start => {
+            let (d, m) = (probes::q3_restore(&design), probes::q3_restore(&cfg));
+            let k = m.delivered > d.delivered && m.clean() == d.clean();
+            (
+                Some(format!(
+                    "Q3 restore: the pull hands {} entries against the design's {}: {}",
+                    m.delivered,
+                    d.delivered,
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
         }
         Probe::RestoreInc | Probe::SnapshotLoss => {
             let t = if matches!(m.probe, Probe::RestoreInc) {

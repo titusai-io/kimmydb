@@ -63,13 +63,22 @@ pub struct SimFlags {
     /// again (v4's behaviour). `LossKind` has no hidden kind, so the stand-in is
     /// `RetiredWriter`, which P0 never produces.
     pub hidden_records: bool,
-    /// The covered-entry skip of the real protocol (Q3): an entry whose stamp the receiver's
-    /// version vector already covers is not applied again, only witnessed. NOT in the sim's
-    /// protocol yet (off, the design of the sim): without it a pull window re-sends an old entry
-    /// that the receiver already holds, and after the horizon has collected a delete that
-    /// entry brings a life the delete killed back to life (the known failures of the bounded
-    /// runs, see `main.rs`). On, those runs pass.
+    /// The covered-entry skip of the real protocol (Q3, mandatory at apply): an entry whose stamp
+    /// the receiver's version vector already covers is not applied again, only witnessed. In the
+    /// sim's protocol (on, the design, by the entry's whole version vector); off for the evidence runs and for the mutant: without it a
+    /// pull window re-sends an old entry that the receiver already holds, and after the horizon has
+    /// collected a delete that entry brings a life the delete killed back to life (the five seeds
+    /// of the bounded runs that failed before the skip was ported, `main.rs`; the idle-origin and
+    /// late-member scripts of `probes.rs`).
     pub covered_skip: bool,
+    /// Mutant `covered skip by stamp only`: the skip looks at the entry's own stamp instead of the
+    /// entry's whole version vector. Off (the design: the vector rule).
+    pub covered_skip_by_stamp: bool,
+    /// The start-HLC rule of the real protocol (Q3, an optimisation, not the fix): a pull for an
+    /// origin the puller has never witnessed starts at that epoch's start HLC (the first 10 bytes
+    /// of a restore's epoch; zero for a first epoch), not at 0, so a restored member's first pulls
+    /// do not replay its whole oplog. On (the design); off is the mutant `no start-HLC`.
+    pub start_hlc: bool,
 }
 
 impl Default for SimFlags {
@@ -83,7 +92,9 @@ impl Default for SimFlags {
             drop_kind: None,
             report_neither: false,
             hidden_records: false,
-            covered_skip: false,
+            covered_skip: true,
+            covered_skip_by_stamp: false,
+            start_hlc: true,
         }
     }
 }
@@ -147,6 +158,9 @@ pub struct Node {
     pub snaps: u32,
     pub events: Vec<LossKey>,
     pub restored: bool,
+    /// How many entries `receive_entry` was handed (applied, skipped as covered, or dominated): the
+    /// observable effect of the start-HLC rule, which changes no state.
+    pub entries_received: usize,
     pub flags: SimFlags,
     /// Check every write's leaf effects against the oracle's view of the writer's causal past
     /// (only where the node has seen all it could: not under a short retention).
@@ -182,6 +196,7 @@ impl Node {
             snaps: 0,
             events: Vec::new(),
             restored: false,
+            entries_received: 0,
             flags: cfg.flags,
             check_writes: false,
             problems: Vec::new(),
@@ -189,6 +204,17 @@ impl Node {
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
         }
+    }
+
+    /// The start HLC of an origin's epoch (the start-HLC rule): a restore's epoch is its start HLC and
+    /// 8 random bytes, a first epoch has none (zero). Zero when the rule is off.
+    fn start_of(&self, o: &WriterId) -> Hlc {
+        if !self.flags.start_hlc {
+            return Hlc::ZERO;
+        }
+        let mut b = [0u8; 10];
+        b.copy_from_slice(&o.epoch.0[..10]);
+        Hlc::from_bytes(b)
     }
 
     /// `node(st)`: the origin a stamp counts under.
@@ -348,10 +374,21 @@ impl Node {
         r.changed
     }
 
+    /// Does this node's version vector cover the entry? The model's rule (and Step 3's): the WHOLE vector
+    /// of the entry's state, so that an entry carrying knowledge the receiver lacks is never skipped. The
+    /// weaker rule (`covered_skip_by_stamp`, a mutant) looks at the entry's own stamp only.
+    fn covers(&self, st: &MStamp, state: &MergeState) -> bool {
+        if self.flags.covered_skip_by_stamp {
+            return get(&self.w.state.vv, &st.writer) >= st.hlc;
+        }
+        state.vv.iter().all(|(w, h)| get(&self.w.state.vv, w) >= *h)
+    }
+
     pub fn receive_entry(&mut self, ent: &Rc<Ent>) {
+        self.entries_received += 1;
         if self.flags.covered_skip
-            && let Ent::W { st, .. } = &**ent
-            && get(&self.w.state.vv, &st.writer) >= st.hlc
+            && let Ent::W { st, state, .. } = &**ent
+            && self.covers(st, state)
         {
             let o = self.origin(*st);
             raise(&mut self.witnessed, o, st.hlc);
@@ -530,7 +567,12 @@ pub fn pull(ms: &mut [Node], p: usize, r: usize, limit: Option<usize>) -> bool {
     if behind.is_empty() {
         return false;
     }
-    let thr = behind.iter().map(|o| get(&p.witnessed, o)).min().unwrap();
+    // an origin never witnessed starts at its epoch's start HLC (Q3), not at 0
+    let thr = behind
+        .iter()
+        .map(|o| p.witnessed.get(o).copied().unwrap_or_else(|| p.start_of(o)))
+        .min()
+        .unwrap();
     if r.servable
         .iter()
         .any(|(o, h)| get(&p.witnessed, o) < *h && get(&p.witnessed, o) < get(&r.hole, o))

@@ -157,7 +157,7 @@ fn states_with_order_entries_obey_the_laws_and_both_codecs() {
                     assert_eq!(f.len(), v.len());
                     assert!(f.iter().all(|(p, x)| v.get(p) == Some(x)));
                     assert_eq!(
-                        OrderedValue::paths(&d),
+                        OrderedValue::paths(&d).unwrap(),
                         f.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()
                     );
                 }
@@ -198,7 +198,7 @@ fn the_ordered_document_does_not_depend_on_the_join_order() {
         if let Some(d) = l.ordered_document(&o) {
             compared += 1;
             let by_path: Vec<Path> = l.visible(&o).unwrap().into_keys().collect();
-            differing_from_flat_order += usize::from(OrderedValue::paths(&d) != by_path);
+            differing_from_flat_order += usize::from(OrderedValue::paths(&d).unwrap() != by_path);
         }
     }
     // the order is not the path order, or the test would prove nothing about the order state
