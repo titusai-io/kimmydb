@@ -9,7 +9,7 @@ use super::ord::{OrdAt, OrdMode, OrderedValue, ord_events};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
 };
-use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{InvalidPath, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1116,25 +1116,34 @@ impl Writer {
     }
 
     /// What an `$inc` of `p` by `by` does to the state the writer sees (`vis`), decided before
-    /// anything is stamped: refused (`None`), a register write (a double base), or a counter slot.
-    fn inc_plan(&self, vis: &BTreeMap<Path, Value>, p: &Path, by: &Value) -> Option<IncPlan> {
+    /// anything is stamped: refused (the reason), a register write (a double base), or a counter slot.
+    fn inc_plan(
+        &self,
+        vis: &BTreeMap<Path, Value>,
+        p: &Path,
+        by: &Value,
+    ) -> Result<IncPlan, UpdateRefused> {
+        let out_of_range = || UpdateRefused::IncOutOfRange(p.clone());
         // The production rule decides: a string or a map is refused, so is an integer past the
         // bound, a decimal that overflows and a double operand against a counter. A double base
         // is no counter: its `$inc` is a register write of the computed value.
-        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())? {
+        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())
+            .ok_or_else(|| inc_refusal(vis.get(p), by, p))?
+        {
             Inc::Register(v) => {
                 // A no-op writes nothing (ADR-208), as for a `$set`: the computed value is the
                 // stored representation byte for byte, e.g. `1e300 + 1.0`, or `$inc 0.0`.
                 if !self.opts.rewrite_unchanged() && Value::same(vis.get(p), &v) {
-                    return Some(IncPlan::Nothing);
+                    return Ok(IncPlan::Nothing);
                 }
-                return Some(IncPlan::Register(v));
+                return Ok(IncPlan::Register(v));
             }
             Inc::Slot(res) => res,
         };
-        let op = Num::from_value(by)?;
+        let op =
+            Num::from_value(by).ok_or_else(|| UpdateRefused::IncOperandNotANumber(p.clone()))?;
         let al = self.state.alive_set(self.opts.retention);
-        let life = *al.last()?;
+        let life = *al.last().ok_or(UpdateRefused::NoLife)?;
         let win = self.state.winner_in(p, &al, &self.opts);
         let generation = self.state.gen_in(p, &al, win, &self.opts).map(|g| g.stamp);
         let key = (life, p.clone(), self.id, generation);
@@ -1143,17 +1152,17 @@ impl Writer {
         // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
         let mut total = match self.state.slots.get(&key) {
             None => op,
-            Some(s) => counter::sum_checked(&s.total, &op)?,
+            Some(s) => counter::sum_checked(&s.total, &op).ok_or_else(out_of_range)?,
         };
         if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
-            return None;
+            return Err(out_of_range());
         }
         // The contributor cap: a writer the counter does not have yet is refused at the cap.
         if !self.opts.no_contributor_cap() {
             let cs: BTreeSet<WriterId> =
                 self.state.counted_in(p, &al, win, &self.opts).keys().map(|k| k.1).collect();
             if cs.len() >= MAX_CONTRIBUTORS && !cs.contains(&self.id) {
-                return None;
+                return Err(UpdateRefused::TooManyContributors(p.clone()));
             }
         }
         // The visible value became an Int64: the slot is an Int64 from now on, so a total that
@@ -1161,7 +1170,7 @@ impl Writer {
         if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
             total = total.widened();
         }
-        Some(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
+        Ok(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
     }
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
@@ -1171,7 +1180,7 @@ impl Writer {
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
             return None;
         }
-        let plan = self.inc_plan(&vis, p, by)?;
+        let plan = self.inc_plan(&vis, p, by).ok()?;
         let (mut eff, mut items) = (Eff::default(), Items::new());
         ancestors_of(&vis, p, &mut BTreeSet::new(), &mut eff, &mut items, &self.opts);
         items.push((OrdAt::Field(p.clone()), OrdMode::Write));
@@ -1287,19 +1296,25 @@ impl Writer {
     }
 }
 
-/// One operator of a multi-operator update.
-#[cfg(any(test, feature = "merge-mutants"))]
+/// One operator of a multi-operator update. The paths of one update are pairwise disjoint (no path
+/// equal to or below another).
+///
+/// What a product operator is, to the writer: `$set` is [`UpdateOp::Set`], `$unset` is
+/// [`UpdateOp::Unset`], `$inc` is [`UpdateOp::Inc`] (a counter slot for an `Int32`, `Int64` or
+/// `Decimal128` base, a register write for a `Double` base). Every other operator is computed by the
+/// caller from what the writer sees and sent as a `Set` of the new value (an array is one atomic
+/// value); `$setOnInsert` is the creation of an upsert, not an update operator.
 #[derive(Clone, Debug)]
 pub enum UpdateOp {
-    /// `$set path = value`
+    /// `$set path = value`. A `Value::Document` is a sub-document (only the leaves that changed are
+    /// written); `Value::Unset` is an `$unset`.
     Set(Path, Value),
     /// `$unset path`
     Unset(Path),
-    /// `$inc path by value`
+    /// `$inc path by value`: the operand is an `Int32`, `Int64`, `Decimal128` or `Double`.
     Inc(Path, Value),
 }
 
-#[cfg(any(test, feature = "merge-mutants"))]
 impl UpdateOp {
     fn path(&self) -> &Path {
         match self {
@@ -1308,21 +1323,118 @@ impl UpdateOp {
     }
 }
 
-/// The multi-operator update, as the order scenarios need it. It exists in a test or
-/// `merge-mutants` build only: item O5 owns the public update (the operator table, the
-/// refusals, the implicit markers). This is the model's `_update` for `$set`, `$unset` and
-/// `$inc` on pairwise disjoint paths, with the single operators as its one-operator case.
-#[cfg(any(test, feature = "merge-mutants"))]
+/// Why an update was refused. A refused update changed nothing: no stamp, no clock move, no entry. A
+/// write that changes nothing is not a refusal: it is `Ok(None)`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UpdateRefused {
+    /// No life of the document is alive (an update applies to a document that exists).
+    #[error("merge state: the document does not exist")]
+    NoLife,
+    /// Two operators name paths where one is equal to or below the other.
+    #[error("merge state: the update names both {0} and {1}")]
+    Overlap(Path, Path),
+    /// A path is below a scalar or an array the writer sees: the reference cannot create a field in a
+    /// non-document.
+    #[error("merge state: {0} is below a scalar or an array")]
+    BelowScalar(Path),
+    /// A `$set` value that is not legal input (a map marker, a repeated or NUL field name, nesting past the
+    /// depth limit).
+    #[error("merge state: the value for {0} is not legal: {1}")]
+    BadValue(Path, InvalidValue),
+    /// A field name of a `$set` document cannot be a path segment.
+    #[error("merge state: {0}")]
+    BadPath(InvalidPath),
+    /// The `$inc` operand at this path is not an `Int32`, `Int64`, `Decimal128` or `Double`.
+    #[error("merge state: the $inc operand for {0} is not a number")]
+    IncOperandNotANumber(Path),
+    /// The `$inc` target holds a string, a null, a boolean or another value that is not a number.
+    #[error("merge state: {0} holds a value that is not a number")]
+    IncTargetNotANumber(Path),
+    /// The `$inc` target is a sub-document or an array.
+    #[error("merge state: {0} is a document or an array and cannot be incremented")]
+    IncTargetIsAContainer(Path),
+    /// A `Double` operand against an `Int32`, `Int64` or `Decimal128` counter (doubles are not counters).
+    #[error("merge state: a double cannot be added to the counter {0}")]
+    IncDoubleOnCounter(Path),
+    /// The result passes the integer bound, the theoretical bound on a writer's total, or a decimal
+    /// overflows from finite inputs.
+    #[error("merge state: the $inc of {0} passes a bound")]
+    IncOutOfRange(Path),
+    /// The counter at this path already has [`MAX_CONTRIBUTORS`] writers and this writer is not one.
+    #[error("merge state: the counter {0} has {MAX_CONTRIBUTORS} contributing writers already")]
+    TooManyContributors(Path),
+    /// The document already has [`MAX_WRITERS`] writers and this writer is not one.
+    #[error("merge state: the document has {MAX_WRITERS} writers already")]
+    WriterCap,
+}
+
+/// Why [`Writer::write_update_stamped`] did not write: the update was refused, or the stamp was.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UpdateError {
+    #[error(transparent)]
+    Refused(#[from] UpdateRefused),
+    #[error(transparent)]
+    Stamp(#[from] StampError),
+}
+
+/// Which refusal an `$inc` that [`counter::inc_result`] refused is, from the same inputs.
+fn inc_refusal(cur: Option<&Value>, op: &Value, p: &Path) -> UpdateRefused {
+    let is_num = |v: &Value| matches!(v, Value::Double(_)) || Num::from_value(v).is_some();
+    if !is_num(op) {
+        return UpdateRefused::IncOperandNotANumber(p.clone());
+    }
+    match cur {
+        Some(Value::Map | Value::ImplicitMap | Value::Array(_) | Value::Document(_)) => {
+            UpdateRefused::IncTargetIsAContainer(p.clone())
+        }
+        Some(v) if !is_num(v) => UpdateRefused::IncTargetNotANumber(p.clone()),
+        Some(v) if matches!(op, Value::Double(_)) && !matches!(v, Value::Double(_)) => {
+            UpdateRefused::IncDoubleOnCounter(p.clone())
+        }
+        _ => UpdateRefused::IncOutOfRange(p.clone()),
+    }
+}
+
+/// The multi-operator update: the model's `_update` for `$set`, `$unset` and `$inc` on pairwise disjoint
+/// paths, with the single operators as its one-operator case.
 impl Writer {
-    /// ONE write, ONE stamp for a list of operators on pairwise disjoint paths. Atomic: any
-    /// refusal refuses the whole update. A no-op `$unset` (the path is absent) writes nothing
-    /// itself; if another operator makes the update a write, its floor rides on that stamp (the
-    /// hybrid floor): metadata only, no entry of its own.
-    pub fn write_update(&mut self, ops: &[UpdateOp], skew: u64) -> Option<Written> {
-        self.ticking(skew, |w, m| w.write_update_m(ops, m))
+    /// ONE write, ONE stamp for a list of operators on pairwise disjoint paths, effects and positions in
+    /// the order of the list. Atomic: any refusal refuses the whole update and changes nothing
+    /// ([`UpdateRefused`]). `Ok(None)` is a no-op: nothing changed (no stamp). An `$unset` of an absent
+    /// path writes nothing itself; if another operator makes the update a write, its floor rides on that
+    /// stamp (the hybrid floor): metadata only, no entry of its own. A `$set` or `$inc` below an absent
+    /// map writes the implicit marker of each map it creates, in the same write.
+    pub fn write_update(
+        &mut self,
+        ops: &[UpdateOp],
+        skew: u64,
+    ) -> Result<Option<Written>, UpdateRefused> {
+        let mut m = Mint { source: Source::Skew(skew), error: None };
+        self.write_update_m(ops, &mut m)
     }
 
-    fn write_update_m(&mut self, ops: &[UpdateOp], m: &mut Mint<'_>) -> Option<Written> {
+    /// [`Writer::write_update`] with the stamp taken from `stamp` instead of the writer's own clock: see
+    /// [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once, and never for an
+    /// update that is refused or changes nothing; a stamp that fails the check is
+    /// [`UpdateError::Stamp`] and nothing is written.
+    pub fn write_update_stamped(
+        &mut self,
+        ops: &[UpdateOp],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, UpdateError> {
+        let mut m = Mint { source: Source::Given(stamp), error: None };
+        let r = self.write_update_m(ops, &mut m);
+        match m.error {
+            Some(e) => Err(UpdateError::Stamp(e)),
+            None => Ok(r?),
+        }
+    }
+
+    fn write_update_m(
+        &mut self,
+        ops: &[UpdateOp],
+        m: &mut Mint<'_>,
+    ) -> Result<Option<Written>, UpdateRefused> {
         // an `Unset` spelled as the value of a `Set` is an `Unset`
         let ops: Vec<UpdateOp> = ops
             .iter()
@@ -1336,18 +1448,18 @@ impl Writer {
             for b in &ops[i + 1..] {
                 let (a, b) = (a.path(), b.path());
                 if a == b || a.is_below(b) || b.is_below(a) {
-                    return None;
+                    return Err(UpdateRefused::Overlap(a.clone(), b.clone()));
                 }
             }
         }
-        let vis = self.visible()?;
+        let vis = self.visible().ok_or(UpdateRefused::NoLife)?;
         let (mut eff, mut items) = (Eff::default(), Items::new());
         let (mut seen, mut pending, mut slots) = (BTreeSet::new(), Vec::new(), Vec::new());
         let mut changed = false;
         for op in ops {
             let p = op.path();
             if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
-                return None;
+                return Err(UpdateRefused::BelowScalar(p.clone()));
             }
             match op {
                 UpdateOp::Unset(p) => {
@@ -1362,10 +1474,11 @@ impl Writer {
                     }
                 }
                 UpdateOp::Set(p, v) => {
-                    v.check_input().ok()?;
+                    v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
                     ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
                     let n0 = eff.len();
-                    self.diff(&vis, p, v, &mut eff, &mut items, OrdMode::Write).ok()?;
+                    self.diff(&vis, p, v, &mut eff, &mut items, OrdMode::Write)
+                        .map_err(UpdateRefused::BadPath)?;
                     changed = changed || eff.len() > n0 || self.reordered(p, v);
                 }
                 UpdateOp::Inc(p, by) => {
@@ -1388,13 +1501,16 @@ impl Writer {
             }
         }
         if !changed {
-            return None;
+            return Ok(None);
         }
         if !self.opts.ord_no_hybrid() {
             items.extend(pending.into_iter().map(|p| (OrdAt::Field(p), OrdMode::Unset)));
         }
         let known = self.known();
-        let st = self.mint(m)?;
+        let Some(st) = self.mint(m) else {
+            // a stamp that failed its check is the caller's (`m.error`); otherwise the writer cap
+            return if m.error.is_some() { Ok(None) } else { Err(UpdateRefused::WriterCap) };
+        };
         self.state.vv.insert(st.writer, st.hlc);
         let al = self.state.alive_set(self.opts.retention);
         let l = al.last().copied();
@@ -1411,7 +1527,7 @@ impl Writer {
         }
         let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
         rec.vals = eff.vals;
-        Some(self.finish(st, rec))
+        Ok(Some(self.finish(st, rec)))
     }
 }
 
@@ -1553,8 +1669,8 @@ mod tests {
         assert_eq!(e.state, f.state);
         // and in an update
         let (mut g, mut h) = (nested(), nested());
-        g.write_update(&[UpdateOp::Unset(my.clone())], 0).unwrap();
-        h.write_update(&[UpdateOp::Set(my, Value::Unset)], 0).unwrap();
+        g.write_update(&[UpdateOp::Unset(my.clone())], 0).unwrap().unwrap();
+        h.write_update(&[UpdateOp::Set(my, Value::Unset)], 0).unwrap().unwrap();
         assert_eq!(g.state, h.state);
     }
 }

@@ -509,7 +509,7 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
             "replace" => w.write_replace(&script_fields(arg), skew),
             "delete" => w.write_delete(skew),
             "upsert_inc" => w.upsert_inc(&at(), arg["v"].as_i64().unwrap(), skew),
-            "update" | "setmany" => w.write_update(&script_ops(arg), skew),
+            "update" | "setmany" => w.write_update(&script_ops(arg), skew).ok().flatten(),
             "upsert_soi" => w
                 .upsert_soi(
                     &script_fields(&arg["fields"]),

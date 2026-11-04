@@ -874,6 +874,7 @@ fn an_update_marks_the_absent_ancestors_of_all_its_operators_once() {
             ],
             0,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(markers(&m), ["a", "d", "d.e"]);
     assert_eq!(
