@@ -15,11 +15,19 @@
 //! form (`compact.rs`, written again in Python from its documentation: `ch` and `clen`);
 //! `golden_vectors_match_the_model` does the same for the golden vectors of `merge_state/tests.rs`.
 //!
-//! ODD FIELD NAMES. The sim and the join-law tests take the names no dotted spelling can carry (the
-//! empty name, `_`, a name with a dot); this differential takes the empty name and a name with a
-//! dot (the flat model keeps a name as one string), and not `_`, which the model uses for the
-//! whole document in a loss record, so that a field named `_` would share its record key with the
-//! document's (see `ODD` in `reference_model/q7diff_gen.py`).
+//! ODD FIELD NAMES. The vendored A2.3 model reads a dot in a name as a path separator and keys the root of a replace by the
+//! empty name, so this differential no longer draws the empty name or a name with a dot (two plain extra names take their
+//! place in the "odd" writes). They are covered by the sim (`the_sim_workload_holds_odd_names`, with a floor on their
+//! count), the nested differential (`ODD_LEAVES`), the join-law pools (`the_pools_hold_odd_names`) and the unit tests
+//! (`odd_field_names_are_distinct_cells_and_round_trip`, `dotted_names_and_nested_paths_are_different_cells_and_round_trip`,
+//! `odd_names_are_one_segment_paths_through_write_join_visible_and_both_codecs`,
+//! `every_bson_type_and_odd_names_round_trip_in_the_compact_form`).
+//!
+//! NULLS. A stored null is drawn (insert, replace, set): the model's `None` is a present null (A2), the writer's
+//! `Value::Null`. An unset spelled as a value (`Value::Unset`) is drawn in replace and set, and the generator gives the model
+//! its own spelling: `$unset` of the path, or the field left out of the document. Not in insert: the writer's insert stores an
+//! Unset register for it, which the model has no spelling for (`q4_set_compares_value_and_type`, `q4_replace_compares_value_and_type`
+//! and `an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too` cover the writer's side).
 //!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
@@ -74,10 +82,11 @@ fn jk(k: &LossKey) -> J {
 fn jv(v: &Value) -> J {
     match v {
         Value::Unset => json!(["n"]),
+        Value::Null => json!(["z"]),
         Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
         Value::String(s) => json!(["s", s]),
-        // The flat reference model has these four types only; the other BSON types are
+        // The flat reference model has these five types only (an unset, a null, an integer, a double, a string); the other BSON types are
         // tested in `merge_state::tests` and the codec tests.
         other => panic!("the reference model has no {other:?}"),
     }
@@ -87,6 +96,7 @@ fn unjv(v: &J) -> Value {
     let a = v.as_array().unwrap();
     match a[0].as_str().unwrap() {
         "n" => Value::Unset,
+        "z" => Value::Null,
         "i" => Value::Int64(a[1].as_str().unwrap().parse().unwrap()),
         "d" => {
             Value::Double(f64::from_bits(u64::from_str_radix(a[1].as_str().unwrap(), 16).unwrap()))

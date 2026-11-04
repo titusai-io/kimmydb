@@ -160,6 +160,8 @@ class Enc:
     def value(self, v):
         if v is None:
             self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15, a register value like a string
+            self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
         elif isinstance(v, int):
@@ -347,6 +349,8 @@ class EncCompact:
     def value(self, v):
         if v is None:
             self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15
+            self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
         elif isinstance(v, int):
@@ -531,9 +535,22 @@ def hash128(data):
 # ---------------------------------------------------------------------------------------------
 # JSON forms shared with the Rust side
 # ---------------------------------------------------------------------------------------------
+class _Unset:
+    """`UNSET`: an unset spelled as the value of a field (the writer's `Value::Unset`). The model has no such value: when it is
+    called, a `$set` of it is the model's `$unset` of the path and a replace leaves the field out of its document."""
+
+    def __repr__(self):
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
 def jv(v):
-    if v is None:
+    if v is UNSET:
         return ["n"]
+    if v is None or (isinstance(v, str) and v == M.NULL):   # a stored null
+        return ["z"]
     if isinstance(v, int):
         return ["i", str(v)]
     if isinstance(v, float):
@@ -558,12 +575,10 @@ def jdoc(d):
 # ---------------------------------------------------------------------------------------------
 NAMES = "ABCD"
 
-# Field names no dotted spelling can carry, that the flat model takes: the empty name, and a name with a dot (the
-# flat model keeps a name as one string, it never splits it). NOT `_`: the model names the whole document `_` in a
-# loss record (`("insertLost", "_", life)`, and `p == "_"` in `sound_record`), so a field named `_` would share its
-# record key with the document's whenever its stamp is the life's, and the model cannot tell the two apart. `_` is
-# in the sim and the join-law tests, which key a record by what it is about.
-ODD = ["", "a.b"]
+# The "odd" writes draw their fields from two extra plain names. The vendored A2.3 model reads a dot in a name as a path
+# separator and keys the root of a replace by the empty name, so the empty name and a name with a dot (which the stage-A flat
+# model took as one string) cannot be given to it; the Rust side covers them elsewhere (see the commit that dropped them).
+ODD = ["o1", "o2"]
 
 
 def names(odd, base):
@@ -620,7 +635,7 @@ def gen_script(seed):
         p = rnd.choice(names(odd, paths))
         if op == "insert":
             ks = rnd.sample(names(odd, paths), rnd.choice([1, 1, 2, 3]))
-            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])      # (a null; an unset field is not drawn: the writer's insert stores an Unset register the model has no spelling for)
         elif op == "upsert":
             ops.append(["upsert", m, rnd.choice(names(odd, ["x", "y", "n"])), rnd.choice(incs), sk])
         elif op == "upsert_soi":
@@ -640,11 +655,11 @@ def gen_script(seed):
                 ops.append(["inc", m, p, -n, sk])
         elif op == "replace":
             ks = rnd.sample(names(odd, paths), rnd.choice([1, 2]))
-            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "inc":
             ops.append(["inc", m, p, rnd.choice(incs), sk])
         elif op == "set":
-            ops.append(["set", m, p, jv(rnd.choice(vals + [None])), sk])
+            ops.append(["set", m, p, jv(rnd.choice(vals + [None, UNSET])), sk])
         elif op == "unset":
             ops.append(["unset", m, p, sk])
         else:
@@ -654,6 +669,8 @@ def gen_script(seed):
 
 def unjv(v):
     if v[0] == "n":
+        return UNSET
+    if v[0] == "z":
         return None
     if v[0] == "i":
         return int(v[1])
@@ -697,12 +714,15 @@ def run_script(sc, dump_canon=False):
             res = None if r is None else js(r)
         elif kind == "replace":
             _, m, fields, sk = op
-            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out
+            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind in ("inc", "set", "unset"):
             m, p, arg, sk = op[1], op[2], op[3] if kind != "unset" else None, op[-1]
             if kind == "set":
                 arg = unjv(arg)
+                if arg is UNSET:        # `$set p <unset>` is the model's `$unset p`
+                    kind, arg = "unset", None
             r = ms[m].write(kind, p, arg, log, sk)
             res = None if r is None else js(r)
         elif kind == "delete":
