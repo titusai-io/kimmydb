@@ -434,11 +434,13 @@ impl MergeState {
     ///     slot, its absorbed pair, a generation's `seen` and a loss total alike (the one compact reader,
     ///     `num_payload`). THE DERIVATION. A decimal enters a typed total in three ways, and each ends in
     ///     `pack_raw`: (a) a writer's first amount at a path, `Num::first_amount` (`Writer::inc_plan`,
-    ///     `None => op.first_amount()`), is the product's `$inc` on an absent field, `Int32(0) + operand`
-    ///     (ADR-252, `update.rs` `decimal_arithmetic`), so a NaN of any sign, payload or signalling bit is the
-    ///     plain quiet NaN, a coefficient above 10^34 - 1 or the large-coefficient form a canonical zero, an
-    ///     infinity stays one (its payload dropped), a negative zero is `+0`, and the exponent of the sum is the
-    ///     smaller of the two; (b) every later sum is `sum_checked`, `Num::add`, `dec_bytes` = `pack_raw`; (c) a
+    ///     `None => op.first_amount()`), is the product's stored FORM of the operand (ADR-252, `update.rs`
+    ///     `decimal_arithmetic` ends in `pack_raw`): the canonical encoding `dec_bytes(dec_raw(operand))`, so a NaN
+    ///     of any sign, payload or signalling bit is the plain quiet NaN, a coefficient above 10^34 - 1 or the
+    ///     large-coefficient form a canonical zero, an infinity stays one (its payload dropped), and the cohort
+    ///     member is KEPT (`-0`, `0E2015`, `1E+2` as spelled): not a recomputation `0 + operand`, which would move
+    ///     the exponent to the smaller one and make a read over a decimal base differ from the product's
+    ///     `base + operand`; (b) every later sum is `sum_checked`, `Num::add`, `dec_bytes` = `pack_raw`; (c) a
     ///     base write copies the slot into the pair (`Writer::fold`), a generation's `seen` copies slots
     ///     (`Writer::seen`), and the loss totals copy slots (`join` parts (2), `receive_loss` takes a peer's
     ///     only if canonical). `$set` stores a decimal in a REGISTER as given, as the product does; a register

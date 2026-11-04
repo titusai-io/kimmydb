@@ -198,13 +198,16 @@ impl Num {
         }
     }
 
-    /// A writer's FIRST amount at a path as the product stores it (ADR-252): the product's `$inc` on an absent field
-    /// is `Int32(0) + operand`, which for a decimal is the canonical result of the decimal sum (a NaN of any
-    /// payload is the plain quiet NaN, a non-canonical coefficient a canonical zero, an infinity stays one, a
-    /// negative zero becomes `+0`); an integer is its own sum with zero.
+    /// A writer's FIRST amount at a path in the product's stored FORM (ADR-252): a canonical encoding of the
+    /// operand, the word `pack_raw` writes for it (a NaN of any payload is the plain quiet NaN, a non-canonical
+    /// coefficient or the large-coefficient form a canonical zero, an infinity stays one with its payload dropped),
+    /// with the cohort member kept (`-0` stays `-0`, `0E2015` stays `0E2015`, `1E2` stays `1E+2`). It is NOT a
+    /// recomputation `0 + operand`: the read adds each slot to the register base, and a sum with a zero would move the
+    /// cohort exponent to the smaller one (`1E2` base plus `1E2` would read `200`, the product stores `2E+2`). An
+    /// integer is unchanged.
     pub(super) fn first_amount(self) -> Num {
         match self {
-            Num::Decimal128(_) => Num::Int32(0).add(&self),
+            Num::Decimal128(b) => Num::Decimal128(dec_bytes(dec_raw(&b))),
             n => n,
         }
     }

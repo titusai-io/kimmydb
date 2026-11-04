@@ -1151,8 +1151,8 @@ impl Writer {
         // `Int64` check above is on the saturated visible value, which does not bound the sum
         // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
         let mut total = match self.state.slots.get(&key) {
-            // the writer's first amount at the path is what the product stores for `$inc` on an absent field
-            // (`0 + operand`, canonical), never the operand's own bytes
+            // the writer's first amount at the path is the product's stored form of the operand
+            // (a canonical encoding of the operand, its cohort member kept), never the operand's own bytes
             None => op.first_amount(),
             Some(s) => counter::sum_checked(&s.total, &op).ok_or_else(out_of_range)?,
         };
