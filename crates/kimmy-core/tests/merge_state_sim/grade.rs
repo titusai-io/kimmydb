@@ -1,11 +1,11 @@
 //! `pullmodel5.grade`: the oracle checks of a finished run.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::merge_state::{LossKey, MStamp, MergeState, Path};
+use kimmy_core::merge_state::{FieldOrd, LossKey, MStamp, MergeState, OrdAt, Path, ord_join};
 
 use crate::oracle::{self, Head, Log};
-use crate::sim::Node;
+use crate::sim::{Ent, Node};
 
 /// The names of the components of the state that differ between members.
 fn differing(ms: &[Node]) -> Vec<&'static str> {
@@ -40,6 +40,73 @@ fn decodes(ms: &[Node]) -> bool {
     })
 }
 
+/// The checks of the order state, for a finished run whose members hold one canonical state: every member
+/// reads the same ordered document; no writer read, right after a write of its own, an order the serial
+/// reference does not give (`order_oracle`); and the join laws hold on the order entries the run reached.
+fn order_problems(ms: &[Node]) -> Vec<String> {
+    let mut out = Vec::new();
+    let doc0 = ms[0].w.state.ordered_document(&ms[0].w.opts);
+    if ms.iter().any(|m| m.w.state.ordered_document(&m.w.opts) != doc0) {
+        out.push("ordered-document".into());
+    }
+    if ms.iter().any(|m| !m.order_problems.is_empty()) {
+        out.push("order-ryw".into());
+    }
+    if !ord_laws(ms).is_empty() {
+        out.push("ord-laws".into());
+    }
+    out
+}
+
+/// The join laws on the order entries of the states the run reached (every member's state and every state
+/// in its oplog): commutative and idempotent on all of them; associative on the entries of runs within
+/// retention (ADR-085: beyond it an honest history can reach a non-associative triple). Returns the
+/// disagreements, by key.
+fn ord_laws(ms: &[Node]) -> Vec<String> {
+    let o = &ms[0].w.opts;
+    let assoc = ms[0].ret() >= 1_000_000_000;
+    let mut by_key: BTreeMap<(MStamp, OrdAt), Vec<FieldOrd>> = BTreeMap::new();
+    let mut add = |s: &MergeState| {
+        for (k, e) in &s.ords {
+            let g = by_key.entry(k.clone()).or_default();
+            if g.len() < 8 && !g.contains(e) {
+                g.push(e.clone());
+            }
+        }
+    };
+    for m in ms {
+        add(m.state());
+        for ent in m.oplog.values() {
+            if let Ent::W { state, .. } = &**ent {
+                add(state);
+            }
+        }
+    }
+    let mut bad = Vec::new();
+    for (k, es) in &by_key {
+        for a in es {
+            if ord_join(a, a, o) != *a {
+                bad.push(format!("{k:?}: not idempotent"));
+            }
+            for b in es {
+                if ord_join(a, b, o) != ord_join(b, a, o) {
+                    bad.push(format!("{k:?}: not commutative"));
+                }
+                if assoc {
+                    for c in es {
+                        if ord_join(&ord_join(a, b, o), c, o) != ord_join(a, &ord_join(b, c, o), o)
+                        {
+                            bad.push(format!("{k:?}: not associative"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bad.truncate(3);
+    bad
+}
+
 /// The problems of a finished run, by name (empty when the run is sound).
 pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     let mut errs = Vec::new();
@@ -53,6 +120,7 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     if !decodes(ms) {
         errs.push("undecodable".into());
     }
+    errs.extend(order_problems(ms));
     let (want, alive, dels) = oracle::oracle(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {
         errs.push("visible".into());
@@ -103,6 +171,7 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
     if !decodes(ms) {
         bad.push("undecodable".into());
     }
+    bad.extend(order_problems(ms));
     let (want, alive, dels) = oracle::oracle(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {
         bad.push("visible".into());

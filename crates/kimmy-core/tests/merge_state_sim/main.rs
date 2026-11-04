@@ -22,6 +22,9 @@ mod grade;
 mod mutants;
 mod oracle;
 mod oracle_tests;
+#[path = "../common/ord_replay.rs"]
+mod ord_replay;
+mod order_oracle;
 mod probes;
 mod rng;
 mod sim;
@@ -314,9 +317,10 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7) and the two
-    // rules of Q3 (the covered-entry skip, the start-HLC rule): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 26, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7), the rules of Q3
+    // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
+    // writer's feed of the order state (O2): a removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 33, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
@@ -380,22 +384,48 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     for (name, fp) in got {
         println!("[fingerprint {name}] {fp:#018x}");
     }
-    // The fingerprints leave the order state out (`fingerprint::without_ords`). The seventh is the one that
-    // moved when the Writer began to feed the order state (item O2): 0x520b467cfaab5d4c to
-    // 0x3eb070a76e6956fe. A write that only reorders the fields of a sub-document (no leaf different) is
-    // a write in the model and now in the Writer, where it was a no-op: the nested bounded workload makes
-    // some, and the trajectory goes on from the stamp it takes. With the stage-A rule on
-    // (`ord_reorder_is_noop`) the figure is the old one. The other six are unchanged.
+    // RE-PINNED for item O2 (the Writer feeds the order state), each fingerprint now folding the compact bytes and
+    // hash of the state WITH its order state and the document in the order the order state gives it:
+    //   restore 0x4efca9449bca3d13 -> 0xd5f2038d6cb64fd0      no restore 0x08ad9af402612aaa -> 0x03c831e729d37118
+    //   bound 1000 0xccecf868d8992847 -> 0xb5d376dace70d755    sequential 0xf5da0966517d1134 -> 0x5cf2b4f670f08b9e
+    //   horizon 0x4173d22962941f92 -> 0xaab8149ae0f8c453       bounded 0xb59997222fd1686f -> 0x6a0197bd2778c8c7
+    //   bounded nested 0x3eb070a76e6956fe -> 0x49b01bf0858bb6cd
+    // (the last had moved once before, in Group A, when a write that only reorders became a write). Before
+    // this commit they left the order state out, and six of the seven were the figures of the code before O2.
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x4efca9449bca3d13),
-        ("no restore", 0x08ad9af402612aaa),
-        ("bound 1000", 0xccecf868d8992847),
-        ("sequential", 0xf5da0966517d1134),
-        ("horizon", 0x4173d22962941f92),
-        ("bounded", 0xb59997222fd1686f),
-        ("bounded nested", 0x3eb070a76e6956fe),
+        ("restore", 0xd5f2038d6cb64fd0),
+        ("no restore", 0x03c831e729d37118),
+        ("bound 1000", 0xb5d376dace70d755),
+        ("sequential", 0x5cf2b4f670f08b9e),
+        ("horizon", 0xaab8149ae0f8c453),
+        ("bounded", 0x6a0197bd2778c8c7),
+        ("bounded nested", 0x49b01bf0858bb6cd),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
+}
+
+/// The order checks of the runner are not vacuous: over the default workloads a good share of the writes are
+/// compared against the serial reference (read-your-writes order, `order_oracle.rs`), none disagrees, and the
+/// members of every run read one ordered document (graded by `grade`, which also holds the join laws of the
+/// order entries the run reached).
+#[test]
+fn the_read_your_writes_order_is_compared_on_a_good_share_of_the_writes() {
+    let cfg = Cfg::default_ret();
+    let (mut writes, mut compared, mut problems) = (0usize, 0usize, 0usize);
+    for seed in 0..100 {
+        let o = run(seed, &RunConfig::default(), &cfg);
+        assert!(grade(&o.nodes, &o.log).is_empty(), "seed {seed}");
+        writes += o.log.len();
+        for m in &o.nodes {
+            compared += m.order_checks;
+            problems += m.order_problems.len();
+        }
+    }
+    eprintln!(
+        "read-your-writes order: {compared} of {writes} writes compared, {problems} problems"
+    );
+    assert_eq!(problems, 0);
+    assert!(compared * 2 > writes, "{compared} of {writes}");
 }
 
 /// The odd field names (the empty name, `_`, a name with a dot) are in the workload at a rate that
@@ -482,9 +512,20 @@ fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
     let n = env_u64("Q7_BOUNDED_SEEDS", 3000);
     let cfg = Cfg::default_ret();
     let mut failing = Vec::new();
+    let (mut writes, mut compared, mut last, mut trailing) = (0usize, 0usize, 0usize, 0usize);
+    let (mut seeds_last, mut seeds_trailing) = (0usize, 0usize);
     for nested in [false, true] {
         for seed in 0..n {
             let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+            writes += o.log.len();
+            let (l0, t0) = (last, trailing);
+            for m in &o.nodes {
+                compared += m.order_checks;
+                last += m.order_last_checks;
+                trailing += m.order_trailing_checks;
+            }
+            seeds_last += usize::from(last > l0);
+            seeds_trailing += usize::from(trailing > t0);
             let ps = grade_bounded(&o.nodes, &o.log);
             if !ps.is_empty() {
                 failing.push(format!(
@@ -494,7 +535,12 @@ fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
             }
         }
     }
-    println!("bounded sweep, {n} seeds on each workload: {} failing {failing:?}", failing.len());
+    println!(
+        "bounded sweep, {n} seeds on each workload: {} failing {failing:?}; read-your-writes: {writes} writes, {compared} compared, \
+         {last} decided the rule \"a new field goes after the fields with a place\", {trailing} of them on a level with a map without a place; seeds exercising the rule {seeds_last}, seeds with such a map {seeds_trailing}",
+        failing.len()
+    );
+    assert!(last > 1000 && seeds_trailing >= 4, "the rule is exercised: {last} {trailing}");
     assert!(failing.is_empty(), "{failing:?}");
 }
 
@@ -516,3 +562,30 @@ bounded_seed!(bounded_flat_seed_1435, false, 1435);
 bounded_seed!(bounded_flat_seed_1551, false, 1551);
 bounded_seed!(bounded_flat_seed_2006, false, 2006);
 bounded_seed!(bounded_nested_seed_2396, true, 2396);
+
+/// Four nested seeds of the bounded runs that the first version of the read-your-writes oracle got wrong (found by the
+/// 3,000-seed sweep). The oracle said a field a write creates is the last of its level; in these a map `a` is visible through
+/// a surviving child alone (a replace by C unset it, and its child `a.d`, written by someone C had not heard from, survived), has
+/// no place, and trails every field that has one, so a field created afterwards goes BEFORE it. The model agrees (the traces
+/// of the four runs, replayed through model6.py, give the same order after every event: `born_of(a)` is `None`, and
+/// `okey` puts a child without a born last), and the oracle now says so. Each seed also decides the rule on a level with such a map.
+macro_rules! trailing_seed {
+    ($name:ident, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, true);
+            let why: Vec<String> = o.nodes.iter().flat_map(|m| m.order_problems.clone()).collect();
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new(), "{why:?}");
+            let trailing: usize = o.nodes.iter().map(|m| m.order_trailing_checks).sum();
+            assert!(
+                trailing > 0,
+                "the seed no longer reaches a level with a map that has no place"
+            );
+        }
+    };
+}
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1080, 1080);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1357, 1357);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2626, 2626);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2654, 2654);

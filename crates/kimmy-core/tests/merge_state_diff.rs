@@ -591,7 +591,12 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// generator's pools: the pools grew, the code did not change. The old code (`8e36e8de`) gives this
 /// value on the new pools, as the new code does (the equivalence test of the D7 pass, retired when the order state changed the join, pinned it). Any
 /// other change to it is a change of behaviour, never to be re-pinned for speed.
-const PINNED_300: u64 = 0x55c8_39db_ba2a_e84a;
+///
+/// RE-PINNED for item O2 (the Writer feeds the order state): 0x55c8_39db_ba2a_e84a to 0x2aee_26c6_deda_603d. The fingerprint folds the
+/// compact bytes and hash of the state WITH its order state (section 10) and the document in the order the order state gives it, which
+/// the fingerprint did not hold before; the version 1 bytes, the hashes, the visible documents, every stamp and refusal are still compared
+/// with the model, with the order state left out, and did not change (the Group A pin was the same figure).
+const PINNED_300: u64 = 0x2aee_26c6_deda_603d;
 
 #[test]
 fn differential_against_the_python_model() {

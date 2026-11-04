@@ -15,6 +15,7 @@ use std::time::Instant;
 use kimmy_core::merge_state::LossKind;
 
 use crate::grade::{grade, grade_bounded};
+use crate::ord_replay;
 use crate::probes;
 use crate::sim::{Cfg, RunConfig, run, run_bounded, settle};
 
@@ -56,6 +57,11 @@ pub enum Probe {
     /// `probes::v3m1_order_independent`: two members that apply the same entries in different orders, after
     /// a partition longer than retention, must hold the same state. The default protocol, skip on.
     HorizonOrder,
+    /// The Ord differential's scripts (`tests/data/ord_diff_scripts.json`, the A2.1 model) replayed through
+    /// the mutated writers: killed when one script disagrees with the model. The scripted probe for the
+    /// mutants of the order state's writer-side rules that the random runs do not show (no multi-operator
+    /// update is in the sim's workload, and a field order needs a model to tell it from another).
+    OrdDiff,
 }
 
 pub struct Mutant {
@@ -231,6 +237,48 @@ pub fn mutants() -> Vec<Mutant> {
             grader: Random { restore: true },
             probe: Q3Start,
         },
+        Mutant {
+            name: "a write below a map is not a write to the map (no ancestor candidates)  [O2]",
+            apply: |c| c.opts.set_ord_no_ancestor(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "no hybrid floor: the floor of a no-op unset in an update is dropped  [O2]",
+            apply: |c| c.opts.set_ord_no_hybrid(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "a no-op unset is a write of its own (a stamp and a floor)  [O2]",
+            apply: |c| c.opts.set_ord_noop_unset_stands(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "the update bit is never set in an unset's floor  [O2]",
+            apply: |c| c.opts.set_ord_bit_unpacked(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "the first write of a writer to a path is not recorded  [O2]",
+            apply: |c| c.opts.set_ord_no_first(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "a replace names its fields as plain writes, not resets  [O2]",
+            apply: |c| c.opts.set_ord_replace_without_reset(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
+        Mutant {
+            name: "a write that only reorders the fields is a no-op (the stage-A rule)  [O2]",
+            apply: |c| c.opts.set_ord_reorder_is_noop(true),
+            grader: Random { restore: true },
+            probe: OrdDiff,
+        },
     ]
 }
 
@@ -368,6 +416,19 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
             (
                 Some(format!(
                     "V3M1 order independence after a long partition (skip on): design {d}, mutant {m}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
+        }
+        Probe::OrdDiff => {
+            let f = ord_replay::replay(&cfg.opts);
+            let k = !f.bad.is_empty();
+            (
+                Some(format!(
+                    "Ord differential: {} disagreements with the model in {} scripts: {}",
+                    f.bad.len(),
+                    f.scripts,
                     if k { "killed" } else { "NOT killed" }
                 )),
                 k,
