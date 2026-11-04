@@ -17,7 +17,7 @@ Drives the vendored A2.3 model (`model6.py`, with `pullmodel6.Node`'s normalised
 
 THE VENDORED MODEL IS NEVER EDITED, and no longer patched: its `same` is the Rust diff (bit pattern for doubles, the
 representation for a Decimal128, type strict), and the harness asserts that at import. It sets the model as the Rust side is
-today: `ABSORBED = True` (the absorbed counter cell, Q6) and `NO_IMPLICIT_MARKER = True` (no implicit marker yet). `--plant NAME`
+today: `ABSORBED = True` (the absorbed counter cell, Q6) and `NO_IMPLICIT_MARKER = False` (the implicit marker, Q2, is built). `--plant NAME`
 flips one of the model's own mutation switches, so that the Rust replay MUST disagree (the self-check of the comparison).
 States are compared with `exact()`, never through the repr strings of `canon()` alone (the bits of a NaN).
 
@@ -25,9 +25,8 @@ THE RESTRICTED SUBSET. The Rust side does not implement everything stage A2 may 
 these restrictions is lifted here (each is lifted deliberately when the Rust side implements it):
 
   * nulls (Null versus Unset): no value is `None`; `$set x null` is never drawn;
-  * a map-creating `$inc` and any leaf write under an absent map (the implicit marker, Q2): every
-    drawn write is dry-run on a copy of the writer and dropped if it would write a marker it did not
-    name, or two stamps;
+  * every drawn write is dry-run on a copy of the writer and dropped if it would take two stamps (a leaf write under
+    an absent map, and a map-creating `$inc`, are drawn: the implicit marker, Q2, is built);
   * multi-operator updates (one stamp): no `setmany`, and the two-write upsert is not drawn;
   * restore and covered-entry cases (Q3): no backup, no restore;
   * order state and field order (Q4): no order-only write is drawn (a replace or a `$set` of a
@@ -75,9 +74,9 @@ assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
 assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
 assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
 assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
-# the harness runs the model as the Rust side is today: the absorbed counter cell, no implicit map marker yet
+# the harness runs the model as the Rust side is today: the absorbed counter cell, and the implicit map marker (Q2)
 M.ABSORBED = True
-M.NO_IMPLICIT_MARKER = True
+M.NO_IMPLICIT_MARKER = False
 
 
 def _x(v):
@@ -367,15 +366,13 @@ def pools(bound):
 
 def trial_ok(m, apply):
     """Dry-run `apply(member, log)` on a copy: the write must be one the Rust side models, that is
-    NO implicit marker, one stamp at most, and no order-only write. Returns True if the op may be drawn."""
+    one stamp at most and no order-only write. Returns True if the op may be drawn."""
     t = light_copy(m)
     log = {}
     apply(t, log)
     if len(log) > 1:
         return False
     for _, (_, meta) in log.items():
-        if any(isinstance(v, str) and v == M.MAPI for v in meta.get("vals", {}).values()):
-            return False
         if meta["kind"] == "reg" and not meta["paths"]:
             return False                     # an order-only write
     return True

@@ -33,8 +33,8 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit
-//! marker, as the Rust side is today. THE (h, len) COLUMNS: a state with an absorbed pair has no version 1 spelling, so the model's `h`
+//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and `NO_IMPLICIT_MARKER = False`
+//! (the implicit marker; a flat document has no absent ancestor, so no flat script writes one). THE (h, len) COLUMNS: a state with an absorbed pair has no version 1 spelling, so the model's `h`
 //! and `len` are null for it and the Rust side must answer `V1CannotHold` for exactly those states (both directions); for every other
 //! state `h` and `len` are compared exactly, and the compact `ch` and `clen` for all of them. A write that only reorders the fields is a write in the model and in the writer.
 //! The replay compares the bytes and hashes of states WITHOUT their order state (`fingerprint::without_ords`: the

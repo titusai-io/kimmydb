@@ -17,8 +17,8 @@
 //! against the model's oracle on the Python log.
 //!
 //! THE RESTRICTED SUBSET. The generator draws only what stage A2 does not change and what the Rust
-//! side implements; none of these is lifted here: nulls (Null versus Unset), a map-creating `$inc`
-//! and any leaf write under an absent map (the implicit marker), multi-operator updates (one
+//! side implements (a leaf write under an absent map and a map-creating `$inc` are drawn: the
+//! implicit marker is built); none of these is lifted here: nulls (Null versus Unset), multi-operator updates (one
 //! stamp), restore and covered-entry cases, order state and field order (no order-only write is
 //! drawn and the order of a level is not compared), and the absorbed counter rule. The `same`
 //! patch (a no-op is a write that leaves the stored representation byte-identical: doubles by
@@ -36,7 +36,7 @@
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
 //! PATH: if it is not, the tests FAIL (they do not skip). The model is the vendored A2.3 one
-//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit marker. The `merge-mutants` feature is
+//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and `NO_IMPLICIT_MARKER = False` (the implicit marker). The `merge-mutants` feature is
 //! needed (`Cargo.toml`): the test `rust_mutants_are_caught_by_the_replay` turns each nested mutation switch on and
 //! requires the replay to disagree.
 
@@ -115,6 +115,7 @@ fn sort_keys(mut v: Vec<LossKey>) -> Vec<LossKey> {
 fn jv(v: &Value) -> J {
     match v {
         Value::Map => json!(["m"]),
+        Value::ImplicitMap => json!(["mi"]),
         Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
         Value::String(s) => json!(["s", s]),
@@ -170,6 +171,7 @@ fn fv(v: &Value) -> String {
     match v {
         Value::Unset => "u".into(),
         Value::Map => "m".into(),
+        Value::ImplicitMap => "mi".into(),
         Value::Int64(i) => format!("i:{i}"),
         Value::Double(d) => format!("d:{:016x}", d.to_bits()),
         Value::String(s) => format!("s:{}", serde_json::to_string(s).unwrap()),

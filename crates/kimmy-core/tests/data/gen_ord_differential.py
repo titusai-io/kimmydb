@@ -10,8 +10,8 @@ Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_differential.py <out-
          (-B and sys.dont_write_bytecode: the model directory must not get a __pycache__)
 
 Model switches (the restrictions are those of the Rust side today): ABSORBED = True (the counter cell: a slot's absorbed pair; the
-flip of the counter-cell series), NO_IMPLICIT_MARKER = True (a leaf write under an absent map writes no marker: item O4 is not built;
-the writer still names the ancestors to the order state), retention 10**9 (the associativity of the order join is claimed within
+flip of the counter-cell series), NO_IMPLICIT_MARKER = False (a leaf write under an absent map writes an implicit marker there: item O4 is
+built), retention 10**9 (the associativity of the order join is claimed within
 retention only). No field is named "" (the model keys the root of a replace by "" and cannot tell it from a top-level field of that
 name: the Rust keys them OrdAt::Root and OrdAt::Field([""]) and has its own test); no name has a dot.
 
@@ -36,7 +36,7 @@ sys.path.insert(0, MODEL)
 import model6 as M            # noqa: E402
 
 M.ABSORBED = True
-M.NO_IMPLICIT_MARKER = True
+M.NO_IMPLICIT_MARKER = False
 M.RET = 10 ** 9
 
 FIELDS = ["a", "b", "c", "d", "e", "f"]

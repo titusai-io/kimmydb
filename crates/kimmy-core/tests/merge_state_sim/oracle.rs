@@ -44,6 +44,21 @@ fn is_reg_kind(k: WriteKind) -> bool {
     matches!(k, WriteKind::Insert | WriteKind::Reg)
 }
 
+/// The paths a write put a cell at, a counter slot or a register: its `paths`, and the implicit
+/// markers an `$inc` made beside its slot (a map-creating `$inc` is ONE write; the markers are in
+/// its `vals`, its `paths` hold the counter's path alone).
+fn touched(m: &WriteRecord) -> BTreeSet<&Path> {
+    let markers = (m.kind == WriteKind::Inc).then_some(&m.vals);
+    m.paths.iter().chain(markers.into_iter().flat_map(|v| v.keys())).collect()
+}
+
+/// Did the write set a REGISTER at `p`: an insert or a set, or the implicit marker of a map an
+/// `$inc` created?
+fn sets_reg(m: &WriteRecord, p: &Path) -> bool {
+    (is_reg_kind(m.kind) && m.paths.contains(p))
+        || (m.kind == WriteKind::Inc && m.vals.contains_key(p))
+}
+
 /// An explicit insert (insertOne/insertMany), not the creation write of an upsert.
 fn _explicit(m: &WriteRecord) -> bool {
     m.kind == WriteKind::Insert && !m.upsert
@@ -68,7 +83,7 @@ fn creators(log: &Log) -> BTreeSet<MStamp> {
 }
 
 fn all_paths(log: &Log) -> BTreeSet<Path> {
-    log.values().flat_map(|(_, m)| m.paths.iter().cloned()).collect()
+    log.values().flat_map(|(_, m)| touched(m).into_iter().cloned()).collect()
 }
 
 pub fn killed_lives(log: &Log, ret: u64) -> BTreeSet<MStamp> {
@@ -162,16 +177,13 @@ impl MakeGen<'_> {
             return *g;
         }
         let (ctx, m) = &self.log[&st];
-        let g = if is_reg_kind(m.kind) && !m.vals[p].is_numeric() {
+        let g = if sets_reg(m, p) && !m.vals[p].is_numeric() {
             Some(st)
         } else {
             let al = _alive_at(self.log, ctx, &self.ins, &self.dels, self.ret);
             let cands = ctx.iter().filter(|w| {
                 let m2 = &self.log[*w].1;
-                is_reg_kind(m2.kind)
-                    && m2.paths.iter().any(|q| q == p)
-                    && in_set(&m2.life, &al)
-                    && !_supp(self.log, m2, p, &al)
+                sets_reg(m2, p) && in_set(&m2.life, &al) && !_supp(self.log, m2, p, &al)
             });
             cands.max().and_then(|w| self.of(*w, p))
         };
@@ -220,8 +232,10 @@ fn flat_oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp
 
     let mut doc = Doc::new();
     for p in all_paths(log) {
-        let regs: Vec<_> = writes_on(&p, &[WriteKind::Insert, WriteKind::Reg])
-            .into_iter()
+        let regs: Vec<_> = log
+            .iter()
+            .filter(|(_, (_, m))| sets_reg(m, &p) && m.life.is_some())
+            .map(|(st, (ctx, m))| (*st, ctx, m))
             .filter(|(_, _, m)| in_set(&m.life, &alive) && !_supp(log, m, &p, &alive))
             .collect();
         let incs: Vec<_> = writes_on(&p, &[WriteKind::Inc])
@@ -259,7 +273,7 @@ fn flat_oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp
 }
 
 fn is_val(v: &Value) -> bool {
-    !matches!(v, Value::Unset | Value::Map)
+    !matches!(v, Value::Unset | Value::Map | Value::ImplicitMap)
 }
 
 type WriteAt<'a> = (MStamp, &'a BTreeSet<MStamp>, &'a WriteRecord);
@@ -267,12 +281,7 @@ type WriteAt<'a> = (MStamp, &'a BTreeSet<MStamp>, &'a WriteRecord);
 /// Register writes (inserts and sets, unsets and markers included) at `p` in alive lives.
 fn regs_at<'a>(log: &'a Log, alive: &BTreeSet<MStamp>, p: &Path) -> Vec<WriteAt<'a>> {
     log.iter()
-        .filter(|(_, (_, m))| {
-            is_reg_kind(m.kind)
-                && m.paths.contains(p)
-                && in_set(&m.life, alive)
-                && !_supp(log, m, p, alive)
-        })
+        .filter(|(_, (_, m))| sets_reg(m, p) && in_set(&m.life, alive) && !_supp(log, m, p, alive))
         .map(|(st, (ctx, m))| (*st, ctx, m))
         .collect()
 }
@@ -331,10 +340,10 @@ impl TypeRule<'_> {
         if ks.is_empty() {
             let own = own?;
             let tree =
-                if *own == Value::Map { Tree::Map(Vec::new()) } else { Tree::Leaf(own.clone()) };
+                if own.is_marker() { Tree::Map(Vec::new()) } else { Tree::Leaf(own.clone()) };
             return Some((tree, own_n?));
         }
-        if let Some(own) = own.filter(|v| **v != Value::Map) {
+        if let Some(own) = own.filter(|v| !v.is_marker()) {
             // a scalar or an array hides the children that are not newer than its register
             let rs = match regs.iter().max_by_key(|r| r.0) {
                 Some(r) if is_val(&r.2.vals[q]) => r.0,
@@ -364,9 +373,10 @@ impl TypeRule<'_> {
 /// among all writes to the descendant (a register write or an increment, in an alive life) with
 /// the stamp of p's register: a stale scalar hides only the children older than it (D-13).
 ///
-/// A leaf write under an absent map writes no marker for the maps above it (EXPECTED DIFFERENCE
-/// from the model's implicit marker, which is not built: see `nested_tests`): a path with no cell
-/// of its own is a map if a child shows. The ORDER of a level is not modelled.
+/// A leaf write under an absent map writes an implicit marker for each map above it that its
+/// writer does not see (it arrives in the write's record: see [`touched`]); a marker reads as a
+/// map like the explicit one, and a path with no cell of its own is a map if a child shows. The
+/// ORDER of a level is not modelled.
 pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>, Vec<MStamp>) {
     let (flat, alive, dels) = flat_oracle(log, ret, bound);
     let Some(flat) = flat else { return (None, alive, dels) };
@@ -470,10 +480,10 @@ pub fn loss_oracle(
             && matches!(m.kind, WriteKind::Reg | WriteKind::Inc)
             && Some(*st) != m.life
         {
-            for p in &m.paths {
-                let later = log
-                    .values()
-                    .any(|(c2, m2)| c2.contains(st) && m2.paths.contains(p) && m2.life == m.life);
+            for p in touched(m) {
+                let later = log.values().any(|(c2, m2)| {
+                    c2.contains(st) && touched(m2).contains(p) && m2.life == m.life
+                });
                 if !later {
                     must.insert((p.clone(), *st));
                 }
@@ -501,10 +511,7 @@ pub fn loss_oracle(
         let regs: Vec<(MStamp, &BTreeSet<MStamp>, &WriteRecord)> = log
             .iter()
             .filter(|(_, (_, m))| {
-                is_reg_kind(m.kind)
-                    && m.paths.contains(&p)
-                    && in_set(&m.life, alive)
-                    && !_supp(log, m, &p, alive)
+                sets_reg(m, &p) && in_set(&m.life, alive) && !_supp(log, m, &p, alive)
             })
             .map(|(st, (ctx, m))| (*st, ctx, m))
             .collect();
@@ -512,7 +519,8 @@ pub fn loss_oracle(
             regs.iter().filter(|r| !regs.iter().any(|r2| r2.1.contains(&r.0))).collect();
         if let Some(top) = heads.iter().max_by_key(|r| r.0) {
             for h in &heads {
-                if h.0 != top.0 {
+                // an implicit marker carries no user value: never a reported loser (model6.py line 1472)
+                if h.0 != top.0 && h.2.vals[&p] != Value::ImplicitMap {
                     must.insert((p.clone(), h.0));
                 }
             }
@@ -520,8 +528,7 @@ pub fn loss_oracle(
         let dead_regs: Vec<(MStamp, &BTreeSet<MStamp>, &WriteRecord)> = log
             .iter()
             .filter(|(st, (_, m))| {
-                is_reg_kind(m.kind)
-                    && m.paths.contains(&p)
+                sets_reg(m, &p)
                     && !in_set(&m.life, alive)
                     && !in_set(&m.life, &sup_live)
                     && !(in_set(&m.life, &sup) && Some(**st) == m.life)
@@ -575,10 +582,7 @@ pub fn hidden_oracle(log: &Log, ret: u64) -> BTreeMap<Path, i128> {
         let regs: Vec<MStamp> = log
             .iter()
             .filter(|(_, (_, m))| {
-                is_reg_kind(m.kind)
-                    && m.paths.contains(&p)
-                    && in_set(&m.life, &alive)
-                    && !_supp(log, m, &p, &alive)
+                sets_reg(m, &p) && in_set(&m.life, &alive) && !_supp(log, m, &p, &alive)
             })
             .map(|(st, _)| *st)
             .collect();
@@ -630,10 +634,7 @@ pub fn stale_records(
         let regs: Vec<MStamp> = log
             .iter()
             .filter(|(_, (_, m2))| {
-                is_reg_kind(m2.kind)
-                    && m2.paths.contains(p)
-                    && in_set(&m2.life, &alive)
-                    && !_supp(log, m2, p, &alive)
+                sets_reg(m2, p) && in_set(&m2.life, &alive) && !_supp(log, m2, p, &alive)
             })
             .map(|(w, _)| *w)
             .collect();
@@ -705,14 +706,12 @@ pub fn sound_record(
         // array when the loser is one.
         LossKind::Clash | LossKind::ArrayClash => {
             let arr = |m: &WriteRecord| matches!(m.vals.get(p), Some(Value::Array(_)));
-            is_reg_kind(m.kind)
-                && m.paths.contains(p)
+            sets_reg(m, p)
                 && log.iter().any(|(w, (c2, m2))| {
                     *w > st
                         && !c2.contains(&st)
                         && !ctx.contains(w)
-                        && m2.paths.contains(p)
-                        && is_reg_kind(m2.kind)
+                        && sets_reg(m2, p)
                         && ((arr(m) && arr(m2)) == (kind == LossKind::ArrayClash))
                 })
         }
@@ -721,7 +720,7 @@ pub fn sound_record(
         // concurrent.
         LossKind::TypeClash => {
             let bears = |m2: &WriteRecord, q: &Path| {
-                (is_reg_kind(m2.kind) && m2.paths.contains(q) && is_val(&m2.vals[q]))
+                (sets_reg(m2, q) && is_val(&m2.vals[q]))
                     || (m2.kind == WriteKind::Inc && m2.paths.contains(q))
             };
             let conc = |w: &MStamp, c2: &BTreeSet<MStamp>| {
@@ -730,21 +729,18 @@ pub fn sound_record(
             if bears(m, p)
                 && p.ancestors().any(|par| {
                     log.iter().any(|(w, (c2, m2))| {
-                        *w > st
-                            && conc(w, c2)
-                            && is_reg_kind(m2.kind)
-                            && m2.paths.contains(&par)
-                            && is_val(&m2.vals[&par])
+                        *w > st && conc(w, c2) && sets_reg(m2, &par) && is_val(&m2.vals[&par])
                     })
                 })
             {
                 return true;
             }
-            is_reg_kind(m.kind)
-                && m.paths.contains(p)
+            sets_reg(m, p)
                 && is_val(&m.vals[p])
                 && log.iter().any(|(w, (c2, m2))| {
-                    *w > st && conc(w, c2) && m2.paths.iter().any(|q| q.is_below(p) && bears(m2, q))
+                    *w > st
+                        && conc(w, c2)
+                        && touched(m2).into_iter().any(|q| q.is_below(p) && bears(m2, q))
                 })
         }
         LossKind::InsertLost => {
@@ -752,11 +748,11 @@ pub fn sound_record(
             if *p == whole_document() {
                 return sup.contains(&st);
             }
-            m.paths.contains(p)
+            touched(m).contains(p)
                 && (in_set(&m.life, &sup) || (m.kind == WriteKind::Insert && m.soi.contains(p)))
         }
         LossKind::DeleteWon => {
-            m.paths.contains(p)
+            touched(m).contains(p)
                 && m.life.is_some_and(|l| {
                     log.contains_key(&l)
                         && !alive.contains(&l)
@@ -800,6 +796,15 @@ fn ident(a: &Value, b: &Value) -> bool {
 /// a field below one, so the write is refused (D-2).
 fn below_scalar(old: &Doc, p: &Path) -> bool {
     p.ancestors().any(|a| old.get(&a).is_some_and(|v| *v != Value::Map))
+}
+
+/// The implicit marker of each proper ancestor of `p` the writer does not see (the model's
+/// `ancestors_of`, `model6.py` lines 966-973), written by a leaf write in the same write. An
+/// insert, a replace, an unset and the creation of an upsert place none.
+fn implicit_markers(old: &Doc, p: &Path, out: &mut BTreeMap<Path, Value>) {
+    for a in p.ancestors().filter(|a| !old.contains_key(a)) {
+        out.insert(a, Value::ImplicitMap);
+    }
 }
 
 /// Everything visible strictly below `p`, and `p`, unset.
@@ -869,6 +874,7 @@ pub fn expected_effects(old: Option<&Doc>, intent: &Intent) -> Expected {
             if below_scalar(old, p) {
                 return Expected::Refused;
             }
+            implicit_markers(old, p, &mut out);
             eff_of(old, p, v, &mut out);
         }
         (Some(old), Intent::Unset(p)) => {
@@ -910,6 +916,18 @@ pub fn check_write(
     match (&want, got, intent) {
         // an $inc: refused where the rule says so, otherwise the writer decides (type, bound)
         (Expected::Refused, Some(_), _) => Err(format!("{intent:?} was accepted, want a refusal")),
+        // an increment that made a slot also made the implicit markers of the maps it created (one
+        // write); a double base is a register write, whose cells are the writer's business
+        (_, Some(r), Intent::Inc(p)) if r.kind == WriteKind::Inc => {
+            let mut markers = BTreeMap::new();
+            if let Some(old) = old {
+                implicit_markers(old, p, &mut markers);
+            }
+            (r.vals == markers && r.paths == [p.clone()]).then_some(()).ok_or(format!(
+                "{intent:?} wrote {:?} at {:?}, want the markers {markers:?} at its path alone",
+                r.vals, r.paths
+            ))
+        }
         (_, _, Intent::Inc(_)) => Ok(()),
         // a no-op is no write; only a write of a sub-document or a replace can change the ORDER of the
         // fields and nothing else, and then it is a write with no cell

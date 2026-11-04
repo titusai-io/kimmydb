@@ -648,3 +648,32 @@ trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1080, 1
 trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1357, 1357);
 trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2626, 2626);
 trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2654, 2654);
+
+/// Nine seeds of the bounded runs (flat 912 and 2518, nested 380, 861, 1128, 1815, 1840, 2663, 2979) where the third part of the
+/// read-your-writes oracle ("a field the write creates goes after the fields that have a place") DISAGREES with the Writer when its
+/// exclusion for a field with history (a standing candidate in the writer's order state) is taken out, and the model AGREES with the
+/// Writer: the traces of all nine, replayed through model6.py (ABSORBED on, implicit markers on, `replay_trace.py`), give the same
+/// ordered document after every event. The cause, read in seed 912 (C's replace names `x` and `n`, writes no cell for `x`
+/// because its value is unchanged, and B's older replace unsets `x`; the replace's place for `x` stands, so C's later `$inc x`
+/// creates the field FIRST, at the place the replace gave it). The oracle keeps its exclusion until it encodes that rule from the
+/// log instead of from the writer's order state; these seeds are the cases to pass without it.
+macro_rules! history_seed {
+    ($name:ident, $nested:expr, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, $nested);
+            let why: Vec<String> = o.nodes.iter().flat_map(|m| m.order_problems.clone()).collect();
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new(), "{why:?}");
+        }
+    };
+}
+history_seed!(a_field_created_again_keeps_its_place_flat_seed_912, false, 912);
+history_seed!(a_field_created_again_keeps_its_place_flat_seed_2518, false, 2518);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_380, true, 380);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_861, true, 861);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1128, true, 1128);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1815, true, 1815);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1840, true, 1840);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_2663, true, 2663);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_2979, true, 2979);

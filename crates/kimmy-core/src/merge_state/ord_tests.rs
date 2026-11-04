@@ -72,6 +72,7 @@ fn value(j: &J) -> Value {
         "unset" => Value::Unset,
         "null" => Value::Null,
         "map" => Value::Map,
+        "mapi" => Value::ImplicitMap,
         "i" => Value::Int64(j["v"].as_i64().unwrap()),
         "d" => Value::Double(j["v"].as_str().unwrap().parse().unwrap()),
         "s" => Value::String(j["v"].as_str().unwrap().to_string()),
@@ -1863,7 +1864,7 @@ fn expected_flat(j: &J) -> Vec<(Path, Value)> {
 /// O1-4 of the O1 review. The goldens have no path with entries in two alive lives, no increment below
 /// an unset map and no `lvl` in two lives, so five mutants of the read survived them. This fixture is
 /// 79 states of the model's random nested runs (300 seeds, 30 steps; every writer entry of every
-/// member's oplog and every final state, no implicit markers since O4 is not built, 2,094 distinct), with
+/// member's oplog and every final state, implicit markers included; the count is pinned below), with
 /// the model's ordered document under ABSORBED off (the counter cell the Rust has): chosen as the
 /// smallest states that each of the five mutants changes, and a spread of others. The Rust read must
 /// give the model's order and values on every one. The five mutants (their lines in `ord.rs`):

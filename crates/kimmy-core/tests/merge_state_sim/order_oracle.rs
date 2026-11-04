@@ -27,9 +27,12 @@
 //!   cases the seeds reach (1080, 1357, 2626, 2654 of the bounded runs, pinned below).
 //!
 //! The third part is left out for a field with history: the place an earlier write gave it stands (the
-//! model's rule: the earliest write since the last void), as with a map that was emptied and vanished
-//! because the implicit marker is not built (item O4), and for content that survived an unset, which the
-//! survivor clamp placed and the write then gives a standing candidate.
+//! model's rule: the earliest write since the last void). A map that was emptied no longer vanishes (the implicit
+//! marker is built), so that cause of history is gone. What is left is a field that is created again after the
+//! cell it had was unset by a write the place did not outlive: nine seeds of the 3,000-seed bounded sweeps (see
+//! `history_seed!` in `main.rs`) disagree with the Writer without the exclusion, and the model agrees with the
+//! Writer on every one. The exclusion goes when the oracle encodes that rule from the log instead of reading the
+//! writer's order state.
 
 use std::collections::BTreeSet;
 

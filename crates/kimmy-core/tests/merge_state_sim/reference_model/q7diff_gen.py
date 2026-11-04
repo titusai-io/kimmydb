@@ -45,9 +45,10 @@ assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
 assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
 assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
 assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
-# the harness runs the model as the Rust side is today: the absorbed counter cell (Q6, ABSORBED on), no implicit map marker yet
+# the harness runs the model as the Rust side is today: the absorbed counter cell (Q6, ABSORBED on) and the implicit map marker (Q2;
+# a flat document has no absent ancestor, so no flat write makes one)
 M.ABSORBED = True
-M.NO_IMPLICIT_MARKER = True
+M.NO_IMPLICIT_MARKER = False
 
 
 def _x(v):

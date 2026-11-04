@@ -111,7 +111,7 @@ fn dec(s: &str) -> Num {
 }
 
 fn value_from(r: &mut Rng) -> Value {
-    match r.below(18) {
+    match r.below(19) {
         0 => Value::Int64(0),
         1 => Value::Int64(7),
         2 => Value::Int64(-7),
@@ -129,6 +129,7 @@ fn value_from(r: &mut Rng) -> Value {
         14 => Value::Map,
         15 => Value::Decimal128("0.1".parse::<bson::Decimal128>().unwrap().bytes()),
         16 => Value::Array(Vec::new()),
+        17 => Value::ImplicitMap,
         _ => Value::Double(-0.0),
     }
 }
@@ -1013,7 +1014,7 @@ pub(super) fn shapes_of(s: &MergeState, t: &MergeState, ret: u64) -> Vec<&'stati
     let mut cells: BTreeMap<&Path, Vec<(MStamp, bool, bool)>> = BTreeMap::new();
     for x in [s, t] {
         for ((_, p), r) in &x.regs {
-            cells.entry(p).or_default().push((r.stamp, r.value == Value::Map, r.value.is_plain()));
+            cells.entry(p).or_default().push((r.stamp, r.value.is_marker(), r.value.is_plain()));
         }
         for ((_, p, _, _), sl) in &x.slots {
             cells.entry(p).or_default().push((sl.stamp, false, true));
