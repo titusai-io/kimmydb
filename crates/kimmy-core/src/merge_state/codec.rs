@@ -27,12 +27,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
+use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-const MAGIC: [u8; 3] = *b"QMS";
+pub(super) const MAGIC: [u8; 3] = *b"QMS";
 const VERSION: u8 = 1;
+
+/// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
+pub(super) const MAX_VALUE_DEPTH: usize = 100;
 
 /// A failure to decode an encoded state.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -45,10 +48,16 @@ pub enum DecodeError {
     BadTag(u8),
     #[error("merge state: invalid utf-8 string")]
     BadString,
+    #[error("merge state: invalid path")]
+    BadPath,
+    #[error("merge state: an index is outside its table")]
+    BadIndex,
     #[error("merge state: {0} trailing bytes")]
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
     TotalOutOfRange,
+    #[error("merge state: a value is nested too deep")]
+    TooDeep,
     #[error("merge state: not canonical (map keys duplicated or out of order)")]
     NotCanonical,
 }
@@ -74,6 +83,10 @@ impl W {
         self.len(s.len());
         self.0.extend_from_slice(s.as_bytes());
     }
+    /// A path: its segments joined by NUL (no segment contains one), as one string.
+    fn path(&mut self, p: &Path) {
+        self.str(&p.segments().join("\0"));
+    }
     fn hlc(&mut self, h: Hlc) {
         self.0.extend_from_slice(&h.to_bytes());
     }
@@ -96,8 +109,9 @@ impl W {
     }
     fn value(&mut self, v: &Value) {
         match v {
-            Value::Null => self.u8(0),
-            Value::Int(i) => {
+            Value::Unset => self.u8(0),
+            Value::Null => self.u8(15),
+            Value::Int64(i) => {
                 self.u8(1);
                 self.i64(*i);
             }
@@ -105,9 +119,53 @@ impl W {
                 self.u8(2);
                 self.0.extend_from_slice(&d.to_bits().to_be_bytes());
             }
-            Value::Str(s) => {
+            Value::String(s) => {
                 self.u8(3);
                 self.str(s);
+            }
+            // 4 is the array; 5 and 6 are kept for the map markers.
+            Value::Array(a) => {
+                self.u8(4);
+                self.len(a.len());
+                for x in a {
+                    self.value(x);
+                }
+            }
+            Value::Int32(i) => {
+                self.u8(7);
+                self.0.extend_from_slice(&i.to_be_bytes());
+            }
+            Value::Decimal128(d) => {
+                self.u8(8);
+                self.0.extend_from_slice(d);
+            }
+            Value::Bool(b) => {
+                self.u8(9);
+                self.u8(u8::from(*b));
+            }
+            Value::Date(ms) => {
+                self.u8(10);
+                self.i64(*ms);
+            }
+            Value::ObjectId(o) => {
+                self.u8(11);
+                self.0.extend_from_slice(o);
+            }
+            Value::Binary { subtype, bytes } => {
+                self.u8(12);
+                self.u8(*subtype);
+                self.len(bytes.len());
+                self.0.extend_from_slice(bytes);
+            }
+            Value::Timestamp { time, increment } => {
+                self.u8(13);
+                self.0.extend_from_slice(&time.to_be_bytes());
+                self.0.extend_from_slice(&increment.to_be_bytes());
+            }
+            Value::Regex { pattern, options } => {
+                self.u8(14);
+                self.str(pattern);
+                self.str(options);
             }
         }
     }
@@ -153,8 +211,10 @@ impl W {
             LossKind::DeleteWon => 1,
             LossKind::InsertLost => 2,
             LossKind::RetiredWriter => 3,
+            LossKind::TypeClash => 4,
+            LossKind::ArrayClash => 5,
         });
-        self.str(&k.path);
+        self.path(&k.path);
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -171,7 +231,7 @@ impl W {
                 self.u8(2);
                 self.len(f.len());
                 for p in f {
-                    self.str(p);
+                    self.path(p);
                 }
             }
         }
@@ -189,7 +249,7 @@ impl MergeState {
             }
             w.len(v.order.len());
             for p in &v.order {
-                w.str(p);
+                w.path(p);
             }
             w.u8(match v.kind {
                 LifeKind::Insert => 0,
@@ -208,7 +268,7 @@ impl MergeState {
         w.len(self.regs.len());
         for ((l, p), r) in &self.regs {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
             w.obs_stamped(&r.obs);
@@ -218,7 +278,7 @@ impl MergeState {
         w.len(self.slots.len());
         for ((l, p, wr, g), s) in &self.slots {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
@@ -275,7 +335,7 @@ impl MergeState {
             }
             let mut order = Vec::new();
             for _ in 0..r.len()? {
-                order.push(r.str()?);
+                order.push(r.path()?);
             }
             let kind = match r.u8()? {
                 0 => LifeKind::Insert,
@@ -293,7 +353,7 @@ impl MergeState {
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
             let obs = r.obs_stamped()?;
@@ -307,7 +367,7 @@ impl MergeState {
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let wr = r.wid()?;
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
@@ -331,7 +391,7 @@ impl MergeState {
 
 /// Insert into a map that is written in key order: a key that is not strictly above the last
 /// one is a duplicate or out of order, and the input is not the encoding of any state.
-fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
+pub(super) fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
     if m.last_key_value().is_some_and(|(last, _)| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -340,7 +400,7 @@ fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError>
 }
 
 /// [`put`] for a set.
-fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
+pub(super) fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
     if m.last().is_some_and(|last| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -389,6 +449,11 @@ impl R<'_> {
         let n = self.len()?;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::BadString)
     }
+    /// A path written by `W::path`: segments joined by NUL, none empty.
+    fn path(&mut self) -> Result<Path, DecodeError> {
+        let joined = self.str()?;
+        Path::new(joined.split('\0')).map_err(|_| DecodeError::BadPath)
+    }
     fn hlc(&mut self) -> Result<Hlc, DecodeError> {
         Ok(Hlc::from_bytes(self.arr()?))
     }
@@ -408,11 +473,46 @@ impl R<'_> {
         }
     }
     fn value(&mut self) -> Result<Value, DecodeError> {
+        self.value_at(0)
+    }
+    /// A value nested `depth` arrays deep; deeper than [`MAX_VALUE_DEPTH`] is refused, so that
+    /// hostile input cannot exhaust the stack.
+    fn value_at(&mut self, depth: usize) -> Result<Value, DecodeError> {
         match self.u8()? {
-            0 => Ok(Value::Null),
-            1 => Ok(Value::Int(self.i64()?)),
+            0 => Ok(Value::Unset),
+            15 => Ok(Value::Null),
+            1 => Ok(Value::Int64(self.i64()?)),
             2 => Ok(Value::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
-            3 => Ok(Value::Str(self.str()?)),
+            3 => Ok(Value::String(self.str()?)),
+            4 => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(DecodeError::TooDeep);
+                }
+                let mut a = Vec::new();
+                for _ in 0..self.len()? {
+                    a.push(self.value_at(depth + 1)?);
+                }
+                Ok(Value::Array(a))
+            }
+            7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
+            8 => Ok(Value::Decimal128(self.arr()?)),
+            9 => match self.u8()? {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                t => Err(DecodeError::BadTag(t)),
+            },
+            10 => Ok(Value::Date(self.i64()?)),
+            11 => Ok(Value::ObjectId(self.arr()?)),
+            12 => {
+                let subtype = self.u8()?;
+                let n = self.len()?;
+                Ok(Value::Binary { subtype, bytes: self.take(n)?.to_vec() })
+            }
+            13 => Ok(Value::Timestamp {
+                time: u32::from_be_bytes(self.arr()?),
+                increment: u32::from_be_bytes(self.arr()?),
+            }),
+            14 => Ok(Value::Regex { pattern: self.str()?, options: self.str()? }),
             t => Err(DecodeError::BadTag(t)),
         }
     }
@@ -461,9 +561,11 @@ impl R<'_> {
             1 => LossKind::DeleteWon,
             2 => LossKind::InsertLost,
             3 => LossKind::RetiredWriter,
+            4 => LossKind::TypeClash,
+            5 => LossKind::ArrayClash,
             t => return Err(DecodeError::BadTag(t)),
         };
-        let path = self.str()?;
+        let path = self.path()?;
         Ok(LossKey { kind, path, stamp: self.stamp()? })
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
@@ -473,7 +575,7 @@ impl R<'_> {
             2 => {
                 let mut f = Vec::new();
                 for _ in 0..self.len()? {
-                    f.push(self.str()?);
+                    f.push(self.path()?);
                 }
                 Ok(LossValue::Fields(f))
             }
@@ -490,7 +592,7 @@ fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn hash128(data: &[u8]) -> [u8; 16] {
+pub(super) fn hash128(data: &[u8]) -> [u8; 16] {
     const P1: u64 = 0x9E37_79B1_85EB_CA87;
     const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
     let mut a: u64 = 0x243F_6A88_85A3_08D3;
@@ -595,9 +697,9 @@ mod tests {
         w.len(0); // deletes
         w.len(1); // regs
         w.stamp(&life);
-        w.str("x");
+        w.str("x"); // the path
         w.stamp(&life); // the register's stamp
-        w.value(&Value::Int(1));
+        w.value(&Value::Int64(1));
         w.len(obs.len());
         for (slot_life, slot_stamp, total) in obs {
             w.stamp(slot_life);
@@ -647,7 +749,14 @@ mod tests {
             WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) },
             JoinOptions::default(),
         );
-        w.upsert_soi(&[("y", Value::Int(1))], "x", 1, &[], 0).unwrap();
+        w.upsert_soi(
+            &[(Path::flat("y").unwrap(), Value::Int64(1))],
+            &Path::flat("x").unwrap(),
+            1,
+            &[],
+            0,
+        )
+        .unwrap();
         let enc = w.state.encode();
         let st = MergeState::decode(&enc).unwrap();
         assert!(st.regs.values().any(|r| r.soi));

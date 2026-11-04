@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::state::{LifeKind, MergeState, cov, sub_ret};
-use super::types::{LossKey, LossKind, LossValue, MStamp};
+use super::types::{LossKey, LossKind, LossValue, MStamp, Path};
 use crate::hlc::Hlc;
 
 /// A refused integer bound: it must not be negative.
@@ -195,8 +195,9 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     }
 
     let mut new: BTreeMap<LossKey, LossValue> = BTreeMap::new();
+    let whole = Path::whole_document();
     let key =
-        |kind: LossKind, path: &str, stamp: MStamp| LossKey { kind, path: path.to_string(), stamp };
+        |kind: LossKind, path: &Path, stamp: MStamp| LossKey { kind, path: path.clone(), stamp };
 
     // Q2: concurrent FIRST inserts of one _id (explicit inserts whose creator had
     // seen no delete): the newest whole document wins, the others are superseded
@@ -226,7 +227,7 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
         reported = superseded.difference(&killed).copied().collect();
         for l in &reported {
             new.insert(
-                key(LossKind::InsertLost, "_", *l),
+                key(LossKind::InsertLost, &whole, *l),
                 LossValue::Fields(out.lives[l].order.clone()),
             );
         }
@@ -239,7 +240,7 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
 
     // (1) same-path register clashes: a register of s against a register of t,
     // concurrent by the version vectors.
-    let paths: BTreeSet<&String> = s.regs.keys().chain(t.regs.keys()).map(|k| &k.1).collect();
+    let paths: BTreeSet<&Path> = s.regs.keys().chain(t.regs.keys()).map(|k| &k.1).collect();
     for p in paths {
         let rs = s.regs.iter().filter(|(k, _)| &k.1 == p && al.contains(&k.0)).map(|(_, r)| r);
         let rt: Vec<_> =

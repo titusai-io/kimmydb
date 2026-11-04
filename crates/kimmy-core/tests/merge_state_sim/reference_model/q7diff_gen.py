@@ -9,6 +9,7 @@ reproduce:
   * for every join: the `changed` flag and the fresh loss keys,
   * after every step, for every member: the 128-bit state hash of the Python state ENCODED IN THE RUST
     CANONICAL FORMAT (crates/kimmy-core/src/merge_state/codec.rs `write_body`, ported below), its length,
+    and the same two for the COMPACT form (compact.rs, QMS version 2, written again below),
     the visible document and the hidden figure,
   * at the end (after a full-mesh sync): the oracle's answers (visible doc, alive lives, required heads,
     hidden figure, killed-and-superseded groups, and the stale/unsound verdicts on member 0's records).
@@ -21,7 +22,8 @@ Usage (standard library only):
       write s<seed>.json for each seed; --plant changes the model on purpose (the Rust replay must
       then disagree): same-ignores-type, hidden-le, no-saturation, zero-absent
   python3 -I q7diff_gen.py --golden
-      print the hash and canonical length of the golden vectors of tests.rs, computed from the model
+      print the hash and canonical length of the golden vectors of tests.rs, computed from the model (the version 1
+      form and, as <name>-compact, the compact form)
 """
 import ast
 import json
@@ -236,6 +238,236 @@ class Enc:
         return bytes(self.b)
 
 
+# ---------------------------------------------------------------------------------------------
+# the compact canonical form, QMS version 2 (crates/kimmy-core/src/merge_state/compact.rs), written
+# again here from the format description in the module documentation of compact.rs, not from its code
+# ---------------------------------------------------------------------------------------------
+FLAG_GEN_OWN, FLAG_GEN_OTHER, FLAG_SOI, FLAG_STAMP_IS_LIFE = 1, 2, 4, 8
+
+
+def k_path(p):
+    """Paths order by their segments, each compared as UTF-8 bytes (the model's names have no dot)."""
+    return [x.encode() for x in p.split(".")]
+
+
+class EncCompact:
+    """Collects the body as a list of byte strings and two kinds of reference: a writer, and a life.
+    Once everything is collected, the sorted writer table and life table are known and the
+    references become indexes."""
+
+    def __init__(self, log):
+        self.parts = []
+        self.log = log
+
+    # -- primitives
+    def raw(self, b):
+        self.parts.append(bytes(b))
+
+    def u8(self, v):
+        self.raw([v])
+
+    def vi(self, v):
+        """An unsigned LEB128 varint, shortest form."""
+        assert v >= 0
+        out = bytearray()
+        while v >= 0x80:
+            out.append((v & 0x7F) | 0x80)
+            v >>= 7
+        out.append(v)
+        self.raw(out)
+
+    def total(self, v):
+        """A counter total: zigzag, then a varint."""
+        self.vi((v << 1) if v >= 0 else (((-v) << 1) - 1))
+
+    def i64(self, v):
+        self.raw(v.to_bytes(8, "big", signed=True))
+
+    def s(self, x):
+        e = x.encode("utf-8")
+        self.vi(len(e))
+        self.raw(e)
+
+    def path(self, p):
+        segs = p.split(".")
+        self.vi(len(segs))
+        for x in segs:
+            self.s(x)
+
+    def hlc(self, h):
+        self.raw(h.to_bytes(8, "big") + (0).to_bytes(2, "big"))
+
+    def wid(self, w):
+        self.parts.append(("w", w))
+
+    def life(self, st):
+        self.parts.append(("l", st))
+
+    def stamp(self, st):
+        self.hlc(st[0])
+        self.wid(st[1])
+
+    def opt_stamp(self, g):
+        if g is None:
+            self.u8(0)
+        else:
+            self.u8(1)
+            self.stamp(g)
+
+    def value(self, v):
+        if v is None:
+            self.u8(0)
+        elif isinstance(v, bool):
+            raise TypeError("bool")
+        elif isinstance(v, int):
+            self.u8(1)
+            self.i64(v)
+        elif isinstance(v, float):
+            self.u8(2)
+            self.raw(struct.pack(">d", v))
+        elif isinstance(v, str):
+            self.u8(3)
+            self.s(v)
+        else:
+            raise TypeError(type(v))
+
+    def vv(self, vv):
+        self.vi(len(vv))
+        for w in sorted(vv, key=k_wid):
+            self.wid(w)
+            self.hlc(vv[w])
+
+    @staticmethod
+    def obs_order(k):
+        return (k_stamp(k[0]), k_wid(k[1]), k_opt(k[2]))
+
+    def obs_key(self, k):
+        self.life(k[0])
+        self.wid(k[1])
+        self.opt_stamp(k[2])
+
+    def obs(self, m):
+        self.vi(len(m))
+        for k in sorted(m, key=self.obs_order):
+            self.obs_key(k)
+            self.total(m[k])
+
+    def obs_stamped(self, m):
+        """A register's `obs`: for each counted slot its stamp and total when the base saw it."""
+        self.vi(len(m))
+        for k in sorted(m, key=self.obs_order):
+            self.obs_key(k)
+            self.stamp(m[k][0])
+            self.total(m[k][1])
+
+    def loss_value(self, key, v):
+        kind, p, st = key
+        if kind == "insertLost" and p == "_":
+            self.u8(2)
+            f = ast.literal_eval(v)
+            self.vi(len(f))
+            for x in f:
+                self.path(x)
+        elif self.log[st][1]["kind"] == "inc":
+            self.u8(1)
+            self.total(v)
+        else:
+            self.u8(0)
+            self.value(v)
+
+    # -- the sections
+    def sections(self, st):
+        self.vi(len(st.lives))
+        for L in sorted(st.lives, key=k_stamp):
+            seen, order, kind = st.lives[L]
+            self.life(L)
+            self.vi(len(seen))
+            for d in sorted(seen, key=k_stamp):
+                self.stamp(d)
+            self.vi(len(order))
+            for p in order:
+                self.path(p)
+            self.u8({"insert": 0, "upsert": 1}[kind])
+        self.vi(len(st.dead))
+        for L in sorted(st.dead, key=k_stamp):
+            self.life(L)
+        self.vi(len(st.deletes))
+        for d in sorted(st.deletes, key=k_stamp):
+            self.stamp(d)
+            self.vv(st.deletes[d])
+        self.vi(len(st.regs))
+        for k in sorted(st.regs, key=lambda k: (k_stamp(k[0]), k_path(k[1]))):
+            r = st.regs[k]
+            life, stamp, gen = k[0], r[0], r[3]
+            flags = FLAG_SOI if len(r) > 4 and r[4] == "soi" else 0
+            if stamp == life:
+                flags |= FLAG_STAMP_IS_LIFE
+            if gen is not None:
+                flags |= FLAG_GEN_OWN if gen[0] == stamp else FLAG_GEN_OTHER
+            self.life(life)
+            self.path(k[1])
+            self.u8(flags)
+            if stamp != life:
+                self.stamp(stamp)
+            self.value(r[1])
+            self.obs_stamped(r[2])
+            if gen is not None:
+                if gen[0] != stamp:
+                    self.stamp(gen[0])
+                self.obs(gen[2] if len(gen) > 2 else {})        # the starter's vv (gen[1]) is not encoded
+        self.vi(len(st.slots))
+        for k in sorted(st.slots, key=lambda k: (k_stamp(k[0]), k_path(k[1]), k_wid(k[2]), k_opt(k[3]))):
+            sl = st.slots[k]
+            self.life(k[0])
+            self.path(k[1])
+            self.wid(k[2])
+            self.opt_stamp(k[3])
+            self.stamp(sl[0])
+            self.total(sl[1])
+        self.vv(st.vv)
+        self.vi(len(st.losses))
+        for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):
+            self.u8(KIND[key[0]])
+            self.path(key[1])
+            self.stamp(key[2])
+            self.loss_value(key, st.losses[key])
+
+    def state(self, st):
+        """The canonical body: the writer table, the life table, then the sections."""
+        self.sections(st)
+        lives = sorted({p[1] for p in self.parts if isinstance(p, tuple) and p[0] == "l"}, key=k_stamp)
+        writers = {p[1] for p in self.parts if isinstance(p, tuple) and p[0] == "w"}
+        writers |= {l[1] for l in lives}
+        writers = sorted(writers, key=k_wid)
+        widx = {w: i for i, w in enumerate(writers)}
+        lidx = {l: i for i, l in enumerate(lives)}
+        head = EncCompact(self.log)
+        head.vi(len(writers))
+        for w in writers:
+            head.raw(bytes([ord(w[0])]) * 16 + bytes(10) + w[1].to_bytes(8, "big"))
+        head.vi(len(lives))
+        for l in lives:
+            head.hlc(l[0])
+            head.vi(widx[l[1]])
+        out = bytearray()
+        for p in head.parts + self.parts:
+            if isinstance(p, tuple):
+                out += self._varint_bytes(widx[p[1]] if p[0] == "w" else lidx[p[1]])
+            else:
+                out += p
+        return bytes(out)
+
+    @staticmethod
+    def _varint_bytes(v):
+        e = EncCompact(None)
+        e.vi(v)
+        return e.parts[0]
+
+    def encode(self, st):
+        """The whole state: `QMS`, the version byte 2, the body."""
+        return b"QMS\x02" + self.state(st)
+
+
 def rotl(x, r):
     return ((x << r) | (x >> (64 - r))) & M64
 
@@ -385,7 +617,9 @@ def snap(ms, log):
     out = []
     for m in ms:
         b = Enc(log).state(m.state)
-        out.append({"h": hash128(b), "len": len(b), "v": jdoc(m.state.visible()),
+        cb = EncCompact(log).state(m.state)
+        out.append({"h": hash128(b), "len": len(b), "ch": hash128(cb), "clen": len(cb),
+                    "v": jdoc(m.state.visible()),
                     "hid": {p: str(h) for p, h in m.state.hidden_all().items()}})
     return out
 
@@ -533,7 +767,9 @@ def golden():
 
     def h(name, st, log):
         b = Enc(log).state(st)
+        cb = EncCompact(log).state(st)
         out[name] = [hash128(b), len(b)]
+        out[name + "-compact"] = [hash128(cb), len(cb)]
 
     h("empty", M.State(), {})
     # 170: x=100 inserted by A, then +20 by B and +50 by C, all joined into A

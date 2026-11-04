@@ -169,8 +169,8 @@ fn named_probes(rep: &mut Report) {
     epoch_from_backup.flags.epoch_from_backup = true;
     let d = probes::v4m2_epoch_twice(&design);
     let m = probes::v4m2_epoch_twice(&epoch_from_backup);
-    let ok = d.values().all(|v| *v == kimmy_core::merge_state::Value::Int(125))
-        && m.values().all(|v| *v == kimmy_core::merge_state::Value::Int(105));
+    let ok = d.values().all(|v| *v == kimmy_core::merge_state::Value::Int64(125))
+        && m.values().all(|v| *v == kimmy_core::merge_state::Value::Int64(105));
     println!(
         "[probe V4M2 epoch twice] fresh epoch {d:?}; epoch from the backup {m:?}: {}",
         if ok { "ok" } else { "FAILED" }

@@ -11,8 +11,9 @@
 //! (`merge_state_sim/oracle.rs`) on the Rust log against the model's oracle on the Python log.
 //!
 //! The Python side encodes its state in the Rust canonical format (`codec.rs` ported), so the
-//! hashes also pin the format against an independent implementation; `golden_vectors_match_the_model`
-//! does the same for the golden vectors of `merge_state/tests.rs`.
+//! hashes also pin the format against an independent implementation, and the same for the compact
+//! form (`compact.rs`, written again in Python from its documentation: `ch` and `clen`);
+//! `golden_vectors_match_the_model` does the same for the golden vectors of `merge_state/tests.rs`.
 //!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
@@ -24,12 +25,13 @@
 mod oracle;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
-    Epoch, JoinOptions, LossKey, LossKind, MStamp, MergeState, Value, Writer, WriterId, Written,
+    Epoch, JoinOptions, LossKey, LossKind, MStamp, MergeState, Path, Value, Writer, WriterId,
+    Written,
 };
 use serde_json::{Value as J, json};
 
@@ -49,48 +51,55 @@ fn kind_s(k: LossKind) -> &'static str {
         LossKind::DeleteWon => "deleteWon",
         LossKind::InsertLost => "insertLost",
         LossKind::RetiredWriter => "retiredWriter",
+        LossKind::TypeClash => "typeClash",
+        LossKind::ArrayClash => "arrayClash",
     }
 }
 
 fn jk(k: &LossKey) -> J {
-    json!([kind_s(k.kind), k.path, js(&k.stamp)])
+    json!([kind_s(k.kind), k.path.to_string(), js(&k.stamp)])
 }
 
 fn jv(v: &Value) -> J {
     match v {
-        Value::Null => json!(["n"]),
-        Value::Int(i) => json!(["i", i.to_string()]),
+        Value::Unset => json!(["n"]),
+        Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
-        Value::Str(s) => json!(["s", s]),
+        Value::String(s) => json!(["s", s]),
+        // The flat reference model has these four types only; the other BSON types are
+        // tested in `merge_state::tests` and the codec tests.
+        other => panic!("the reference model has no {other:?}"),
     }
 }
 
 fn unjv(v: &J) -> Value {
     let a = v.as_array().unwrap();
     match a[0].as_str().unwrap() {
-        "n" => Value::Null,
-        "i" => Value::Int(a[1].as_str().unwrap().parse().unwrap()),
+        "n" => Value::Unset,
+        "i" => Value::Int64(a[1].as_str().unwrap().parse().unwrap()),
         "d" => {
             Value::Double(f64::from_bits(u64::from_str_radix(a[1].as_str().unwrap(), 16).unwrap()))
         }
-        "s" => Value::Str(a[1].as_str().unwrap().to_string()),
+        "s" => Value::String(a[1].as_str().unwrap().to_string()),
         t => panic!("bad tag {t}"),
     }
 }
 
-fn jdoc(d: &Option<BTreeMap<String, Value>>) -> J {
+fn jdoc(d: &Option<BTreeMap<Path, Value>>) -> J {
     match d {
         None => J::Null,
-        Some(m) => J::Object(m.iter().map(|(k, v)| (k.clone(), jv(v))).collect()),
+        Some(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), jv(v))).collect()),
     }
 }
 
-fn fields(v: &J) -> Vec<(String, Value)> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|kv| (kv[0].as_str().unwrap().to_string(), unjv(&kv[1])))
-        .collect()
+/// The script names a path by a dotted string; its names contain no dot, so the segments are
+/// the parts (the reference model cannot represent a name with a dot).
+fn pth(s: &str) -> Path {
+    Path::new(s.split('.')).expect("a valid path")
+}
+
+fn fields(v: &J) -> Vec<(Path, Value)> {
+    v.as_array().unwrap().iter().map(|kv| (pth(kv[0].as_str().unwrap()), unjv(&kv[1]))).collect()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -119,8 +128,10 @@ fn snap(ms: &[Mem]) -> Vec<J> {
             json!({
                 "h": hex(&m.w.state.state_hash()),
                 "len": cb.len(),
+                "ch": hex(&m.w.state.compact_hash()),
+                "clen": m.w.state.compact_bytes().len(),
                 "v": jdoc(&m.w.visible()),
-                "hid": J::Object(m.w.hidden_all().iter().map(|(p, h)| (p.clone(), J::String(h.to_string()))).collect()),
+                "hid": J::Object(m.w.hidden_all().iter().map(|(p, h)| (p.to_string(), J::String(h.to_string()))).collect()),
             })
         })
         .collect()
@@ -130,10 +141,10 @@ fn opt_stamp_j(s: Option<MStamp>) -> J {
     s.map_or(J::Null, |s| js(&s))
 }
 
-fn sorted_heads(h: impl IntoIterator<Item = (String, MStamp)>) -> Vec<J> {
-    let mut v: Vec<(String, MStamp)> = h.into_iter().collect();
+fn sorted_heads(h: impl IntoIterator<Item = (Path, MStamp)>) -> Vec<J> {
+    let mut v: Vec<(Path, MStamp)> = h.into_iter().collect();
     v.sort();
-    v.iter().map(|(p, st)| json!([p, js(st)])).collect()
+    v.iter().map(|(p, st)| json!([p.to_string(), js(st)])).collect()
 }
 
 /// Returns a list of mismatch descriptions (empty when the script agrees).
@@ -179,15 +190,13 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             "insert" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let f = fields(&op[2]);
-                let fr: Vec<(&str, Value)> =
-                    f.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                let r = ms[m].w.insert(&fr, op[3].as_u64().unwrap());
+                let r = ms[m].w.insert(&f, op[3].as_u64().unwrap());
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "upsert" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let r = ms[m].w.upsert_inc(
-                    op[2].as_str().unwrap(),
+                    &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
                 );
@@ -196,23 +205,16 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             "upsert_soi" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let f = fields(&op[2]);
-                let fr: Vec<(&str, Value)> =
-                    f.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 let s = fields(&op[5]);
-                let sr: Vec<(&str, Value)> =
-                    s.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                let inc_path = pth(op[3].as_str().unwrap());
                 let sk = op[6].as_u64().unwrap();
                 // as the harness does it: the creation, logged, then the increment, logged
-                let created = ms[m].w.upsert_soi_create(&fr, op[3].as_str().unwrap(), &sr, sk);
+                let created = ms[m].w.upsert_soi_create(&f, &inc_path, &s, sk);
                 match ms[m].logged(created, &mut log) {
                     None => J::Null,
                     Some(s1) => {
-                        let incd = ms[m].w.upsert_inc_on(
-                            s1,
-                            op[3].as_str().unwrap(),
-                            op[4].as_i64().unwrap(),
-                            sk,
-                        );
+                        let incd =
+                            ms[m].w.upsert_inc_on(s1, &inc_path, op[4].as_i64().unwrap(), sk);
                         opt_stamp_j(ms[m].logged(incd, &mut log))
                     }
                 }
@@ -220,15 +222,13 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             "replace" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let f = fields(&op[2]);
-                let fr: Vec<(&str, Value)> =
-                    f.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                let r = ms[m].w.write_replace(&fr, op[3].as_u64().unwrap());
+                let r = ms[m].w.write_replace(&f, op[3].as_u64().unwrap());
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "inc" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let r = ms[m].w.write_inc(
-                    op[2].as_str().unwrap(),
+                    &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
                 );
@@ -237,7 +237,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             "set" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let r = ms[m].w.write_set(
-                    op[2].as_str().unwrap(),
+                    &pth(op[2].as_str().unwrap()),
                     unjv(&op[3]),
                     op[4].as_u64().unwrap(),
                 );
@@ -245,7 +245,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             }
             "unset" => {
                 let m = op[1].as_u64().unwrap() as usize;
-                let r = ms[m].w.write_unset(op[2].as_str().unwrap(), op[3].as_u64().unwrap());
+                let r = ms[m].w.write_unset(&pth(op[2].as_str().unwrap()), op[3].as_u64().unwrap());
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "delete" => {
@@ -358,7 +358,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
     let hid = oracle::hidden_oracle(&log, ret);
     cmp(
         "hidden",
-        J::Object(hid.iter().map(|(p, h)| (p.clone(), J::String(h.to_string()))).collect()),
+        J::Object(hid.iter().map(|(p, h)| (p.to_string(), J::String(h.to_string()))).collect()),
         &po["hidden"],
     );
     let mut ksa: Vec<Vec<J>> =
@@ -378,11 +378,11 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
     cmp("ksa", json!(ksa), &po["ksa"]);
     let have: BTreeSet<LossKey> = ms[0].w.state.losses.keys().cloned().collect();
     cmp("have", J::Array(have.iter().map(jk).collect()), &po["have"]);
-    let mut stale: Vec<(LossKind, String, MStamp)> = oracle::stale_records(&have, &log, ret);
+    let mut stale: Vec<(LossKind, Path, MStamp)> = oracle::stale_records(&have, &log, ret);
     stale.sort();
     cmp(
         "stale",
-        J::Array(stale.iter().map(|(k, p, s)| json!([kind_s(*k), p, js(s)])).collect()),
+        J::Array(stale.iter().map(|(k, p, s)| json!([kind_s(*k), p.to_string(), js(s)])).collect()),
         &po["stale"],
     );
     let unsound: Vec<J> = have
@@ -397,7 +397,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
 // ---- running the generator ---------------------------------------------------------------
 
 fn generator() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/merge_state_sim/reference_model/q7diff_gen.py")
 }
 
@@ -453,7 +453,7 @@ impl Drop for Scratch {
 }
 
 /// Generate `n` scripts (seeds 0..n) into `dir`, `workers()` python processes at a time.
-fn generate(dir: &Path, n: u64, plant: Option<&str>) {
+fn generate(dir: &std::path::Path, n: u64, plant: Option<&str>) {
     let w = workers() as u64;
     let per = n.div_ceil(w);
     let mut kids = Vec::new();
@@ -487,7 +487,7 @@ struct Verdict {
 }
 
 /// Replay every script of `dir` on the Rust side, in `workers()` threads.
-fn replay(dir: &Path) -> Verdict {
+fn replay(dir: &std::path::Path) -> Verdict {
     let mut paths: Vec<PathBuf> =
         std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
     paths.sort();
@@ -598,6 +598,12 @@ fn golden_vectors_match_the_model() {
         "mixed": ["34ce6696c01c0c70255c54445944f39c", 1401],
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
         "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
+        // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
+        "empty-compact": ["e145d6a7daf371398c7b574cd9aa42d4", 9],
+        "170-compact": ["45e14c7b5dd32f32f7cf6543335f3fb1", 213],
+        "mixed-compact": ["f712215ec186fc7a782838f4f25fff6b", 341],
+        "delete-compact": ["1aace531f9c13dc54b5da4f77056e82a", 231],
+        "obs-compact": ["d785253ed2c10e27e148d2a7f2f251cd", 255],
     });
     assert_eq!(got, want);
 }

@@ -9,12 +9,14 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::merge_state::{LossKey, LossKind, MStamp, Value, WriteKind, WriteRecord, WriterId};
+use kimmy_core::merge_state::{
+    LossKey, LossKind, MStamp, Path, Value, WriteKind, WriteRecord, WriterId,
+};
 
 pub type Log = BTreeMap<MStamp, (BTreeSet<MStamp>, WriteRecord)>;
-pub type Doc = BTreeMap<String, Value>;
+pub type Doc = BTreeMap<Path, Value>;
 /// A head that must be, or is, reported: `(path, stamp)`.
-pub type Head = (String, MStamp);
+pub type Head = (Path, MStamp);
 
 /// `st[0]`: the sim only makes stamps with a zero counter.
 fn t(st: &MStamp) -> i128 {
@@ -36,7 +38,7 @@ fn _explicit(m: &WriteRecord) -> bool {
 
 /// V6m2/V7m1/V7m2: a `$setOnInsert` cell of an upsert creation is dropped when
 /// an explicit insert (a first insert or a re-insert after a delete) is alive.
-fn _supp(log: &Log, m: &WriteRecord, p: &str, alive: &BTreeSet<MStamp>) -> bool {
+fn _supp(log: &Log, m: &WriteRecord, p: &Path, alive: &BTreeSet<MStamp>) -> bool {
     m.soi.iter().any(|q| q == p) && alive.iter().any(|l| _explicit(&log[l].1))
 }
 
@@ -52,7 +54,7 @@ fn creators(log: &Log) -> BTreeSet<MStamp> {
         .collect()
 }
 
-fn all_paths(log: &Log) -> BTreeSet<String> {
+fn all_paths(log: &Log) -> BTreeSet<Path> {
     log.values().flat_map(|(_, m)| m.paths.iter().cloned()).collect()
 }
 
@@ -128,7 +130,7 @@ pub struct MakeGen<'a> {
     ins: BTreeSet<MStamp>,
     dels: Vec<MStamp>,
     ret: u64,
-    memo: RefCell<BTreeMap<(MStamp, String), Option<MStamp>>>,
+    memo: RefCell<BTreeMap<(MStamp, Path), Option<MStamp>>>,
 }
 
 pub fn make_gen(log: &Log, ret: u64) -> MakeGen<'_> {
@@ -142,8 +144,8 @@ pub fn make_gen(log: &Log, ret: u64) -> MakeGen<'_> {
 }
 
 impl MakeGen<'_> {
-    pub fn of(&self, st: MStamp, p: &str) -> Option<MStamp> {
-        if let Some(g) = self.memo.borrow().get(&(st, p.to_string())) {
+    pub fn of(&self, st: MStamp, p: &Path) -> Option<MStamp> {
+        if let Some(g) = self.memo.borrow().get(&(st, p.clone())) {
             return *g;
         }
         let (ctx, m) = &self.log[&st];
@@ -160,7 +162,7 @@ impl MakeGen<'_> {
             });
             cands.max().and_then(|w| self.of(*w, p))
         };
-        self.memo.borrow_mut().insert((st, p.to_string()), g);
+        self.memo.borrow_mut().insert((st, p.clone()), g);
         g
     }
 }
@@ -189,7 +191,7 @@ pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>
     let gener = make_gen(log, ret);
 
     let writes_on =
-        |p: &str, kinds: &[WriteKind]| -> Vec<(MStamp, &BTreeSet<MStamp>, &WriteRecord)> {
+        |p: &Path, kinds: &[WriteKind]| -> Vec<(MStamp, &BTreeSet<MStamp>, &WriteRecord)> {
             log.iter()
                 .filter(|(_, (_, m))| {
                     kinds.contains(&m.kind) && m.paths.iter().any(|q| q == p) && m.life.is_some()
@@ -218,7 +220,7 @@ pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>
         let g_w = win.and_then(|w| gener.of(w.0, &p));
         let counted = incs.iter().filter(|(st, _, _)| gen_counts(gener.of(*st, &p), g_w));
         let base: Option<i128> = match win.map(|w| &w.2.vals[&p]) {
-            Some(Value::Int(i)) => Some(i128::from(*i)),
+            Some(Value::Int64(i)) => Some(i128::from(*i)),
             _ => None,
         };
         let empty = BTreeSet::new();
@@ -229,7 +231,7 @@ pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>
             continue;
         }
         let total = base.unwrap_or(0) + extra.iter().map(|n| i128::from(*n)).sum::<i128>();
-        doc.insert(p, Value::Int(total.clamp(-b - 1, b) as i64));
+        doc.insert(p, Value::Int64(total.clamp(-b - 1, b) as i64));
     }
     ((!alive.is_empty()).then_some(doc), alive, dels)
 }
@@ -248,7 +250,7 @@ pub fn loss_oracle(
     let killed = killed_lives(log, ret);
     let sup_live: BTreeSet<MStamp> = sup.difference(&killed).copied().collect();
     for l in &sup_live {
-        must.insert(("_".to_string(), *l));
+        must.insert((Path::whole_document(), *l));
     }
     // V6M1: every head written into a losing first insert is reported
     for (st, (_, m)) in log {
@@ -351,7 +353,7 @@ pub fn loss_oracle(
 /// base: the whole total of every (life, writer, generation) group of
 /// increments in an OLDER generation than the winner's, whose latest increment
 /// is not in the causal past of the starter of the winner's generation.
-pub fn hidden_oracle(log: &Log, ret: u64) -> BTreeMap<String, i128> {
+pub fn hidden_oracle(log: &Log, ret: u64) -> BTreeMap<Path, i128> {
     let ins = creators(log);
     let dels = deletes(log);
     let alive = _alive_lives(log, &ins, &dels, ret);
@@ -400,7 +402,7 @@ pub fn stale_records(
     records: &BTreeSet<LossKey>,
     log: &Log,
     ret: u64,
-) -> Vec<(LossKind, String, MStamp)> {
+) -> Vec<(LossKind, Path, MStamp)> {
     let ins = creators(log);
     let dels = deletes(log);
     let alive = _alive_lives(log, &ins, &dels, ret);
@@ -450,7 +452,7 @@ pub fn killed_superseded_any(log: &Log, ret: u64) -> Vec<BTreeSet<Head>> {
             && !dels.iter().any(|d| log[d].0.contains(&l))
         {
             let mut set: BTreeSet<Head> = BTreeSet::new();
-            set.insert(("_".to_string(), l));
+            set.insert((Path::whole_document(), l));
             set.extend(m.paths.iter().map(|p| (p.clone(), l)));
             out.push(set);
         }
@@ -499,7 +501,7 @@ pub fn sound_record(
         }
         LossKind::InsertLost => {
             let sup = superseded_lives(log, None);
-            if p == "_" {
+            if *p == Path::whole_document() {
                 return sup.contains(&st);
             }
             m.paths.contains(p)
@@ -513,6 +515,7 @@ pub fn sound_record(
                         && killers(log, &l, dels, ret).iter().any(|d| !log[d].0.contains(&st))
                 })
         }
-        LossKind::RetiredWriter => false,
+        // Not produced by the flat workload: no record of these kinds is sound here.
+        LossKind::RetiredWriter | LossKind::TypeClash | LossKind::ArrayClash => false,
     }
 }
