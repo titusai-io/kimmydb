@@ -216,6 +216,21 @@ pub fn op_of(intent: &Intent) -> OrdOp {
     }
 }
 
+/// Does the write put the fields the writer sees in another ORDER, with the same fields? Then it is a write whatever the
+/// values (a replace, or a `$set` of a sub-document), and a writer that refuses it has dropped a reorder.
+pub fn reorders(before: Option<&[(String, OrderedValue)]>, op: &OrdOp) -> bool {
+    let Some(b) = before.map(tree_of_ordered) else { return false };
+    let (cur, want) = match op {
+        OrdOp::Make(f) => (b, tree_of_fields(f)),
+        OrdOp::Set(p, v @ Value::Document(_)) => {
+            let (Some(cur), Some(want)) = (b.level(p.segments()), node_of(v)) else { return false };
+            (cur.clone(), want)
+        }
+        _ => return false,
+    };
+    cur != want && cur.paths() == want.paths()
+}
+
 /// What a check decided.
 #[derive(Clone, Copy, Default)]
 pub struct Checked {

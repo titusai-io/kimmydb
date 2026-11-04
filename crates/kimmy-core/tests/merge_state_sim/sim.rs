@@ -526,6 +526,11 @@ impl Node {
         wrote: bool,
     ) {
         if !wrote {
+            // a replace or a sub-document `$set` that puts the fields the writer sees in another order IS a write
+            if order_oracle::reorders(before.as_deref(), &op) {
+                self.order_problems
+                    .push(format!("order-ryw {}: a reorder of {op:?} was refused", self.name));
+            }
             return;
         }
         let after = self.w.state.ordered_document(&self.w.opts);
