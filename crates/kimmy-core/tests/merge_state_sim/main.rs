@@ -181,14 +181,21 @@ struct SkipEvidence {
     nested: bool,
     seed: u64,
     problems: &'static [&'static str],
+    /// With both rules off, the alive lives every member holds and the alive lives the oracle has, for
+    /// a seed whose resurrection no longer shows as a problem.
+    alive_without: Option<(usize, usize)>,
 }
 
 const COVERED_SKIP_EVIDENCE: [SkipEvidence; 5] = [
-    SkipEvidence { nested: false, seed: 106, problems: &["visible"] },
-    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"] },
-    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"] },
-    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"] },
-    SkipEvidence { nested: true, seed: 2396, problems: &["visible"] },
+    // Seed 106 showed `visible` before the counter cell. With the cell and the oracle of "no base write had
+    // seen it" the collected life still comes back (three alive lives in every member against the oracle's
+    // one) but the document it brings back coincides with the oracle's, so no problem is graded. A search of
+    // the seeds 0 to 2999 (flat and nested) found no other seed that shows `visible` without the rules.
+    SkipEvidence { nested: false, seed: 106, problems: &[], alive_without: Some((3, 1)) },
+    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: true, seed: 2396, problems: &["visible"], alive_without: None },
 ];
 
 /// The Ord differential's scripts (the A2.1 model) replayed through the design's writers: no disagreement. (The mutants that
@@ -504,14 +511,36 @@ fn bounded_problems(seed: u64, nested: bool, covered_skip: bool, start_hlc: bool
     grade_bounded(&o.nodes, &o.log)
 }
 
+/// The alive lives of every member after the bounded run of `seed`, and the oracle's.
+fn alive_lives(
+    seed: u64,
+    nested: bool,
+    covered_skip: bool,
+    start_hlc: bool,
+) -> (Vec<usize>, usize) {
+    let mut cfg = Cfg::default_ret();
+    cfg.flags.covered_skip = covered_skip;
+    cfg.flags.start_hlc = start_hlc;
+    let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+    let (_, alive, _) = oracle::oracle(&o.log, o.nodes[0].ret(), o.nodes[0].bound());
+    (o.nodes.iter().map(|n| n.w.alive().len()).collect(), alive.len())
+}
+
 /// The five seeds that failed before the sim had the Q3 rules fail as listed with both rules off (the sim's
 /// old protocol), and pass with the covered-entry skip alone (the entry's whole vector), with the start-HLC
 /// rule alone for the four restores (not for the nested seed, which has no restore), and with both (the
-/// default).
+/// default). Seed 106 is pinned by the alive lives it still resurrects (see `COVERED_SKIP_EVIDENCE`), not by a problem.
 #[test]
 fn the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it() {
     for k in &COVERED_SKIP_EVIDENCE {
         assert_eq!(bounded_problems(k.seed, k.nested, false, false), k.problems, "seed {}", k.seed);
+        if let Some((members, oracle_alive)) = k.alive_without {
+            let (got, want) = alive_lives(k.seed, k.nested, false, false);
+            assert_eq!((got.iter().all(|n| *n == members), want), (true, oracle_alive), "{got:?}");
+            // and with the skip and the start-HLC rule the members hold the oracle's lives
+            let (got, want) = alive_lives(k.seed, k.nested, true, true);
+            assert!(got.iter().all(|n| *n == want), "{got:?} against {want}");
+        }
         for (skip, start) in [(true, false), (false, true), (true, true)] {
             // the start-HLC rule alone clears the restores (four flat seeds) but not the nested seed, which has
             // no restore: START_HLC alone is not the fix (review M1)
