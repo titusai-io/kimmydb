@@ -368,6 +368,8 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
     let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
+    // the stage-A model has no field order: a write that only reorders is a no-op there
+    opts.set_ord_reorder_is_noop(true);
     tweak(&mut opts);
     let mut ms: Vec<Mem> = "ABCD"
         .chars()

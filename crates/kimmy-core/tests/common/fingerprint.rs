@@ -1,7 +1,7 @@
 //! A deterministic fingerprint of merge states, for the tests that must show a change to the
 //! `merge_state` code left every state, every byte and every read unchanged.
 //!
-//! A [`Fp`] folds, for a state, its `state_hash` and `encode` bytes (where the version 1 form can
+//! A [`Fp`] folds, for a state WITHOUT its order state (see [`without_ords`]), its `state_hash` and `encode` bytes (where the version 1 form can
 //! hold the state), its compact bytes and hash, the visible document, the hidden figures, the
 //! excess and the caps, as bytes into a 64-bit FNV-1a. It is a change detector, not a format: the
 //! pinned values in the tests are the figures of the code before the performance pass of Q7 step 0.
@@ -9,6 +9,16 @@
 #![allow(dead_code)]
 
 use kimmy_core::merge_state::{JoinOptions, MergeState};
+
+/// The state without its order state. NAMED RESTRICTION (item O2): the vendored stage-A model, which
+/// the differentials compare with, has no order state, so the bytes, the hashes and the fingerprints
+/// of the comparison leave the Ord state out; the Ord state is compared with the A2.1 model in its
+/// own differential (`merge_state_ord_diff`). Lifted at the D8 re-vendor.
+pub fn without_ords(s: &MergeState) -> MergeState {
+    let mut s = s.clone();
+    s.ords.clear();
+    s
+}
 
 pub struct Fp(u64);
 
@@ -42,6 +52,7 @@ impl Fp {
 
     /// Everything a state and its reads show.
     pub fn state(&mut self, s: &MergeState, o: &JoinOptions) {
+        let s = &without_ords(s);
         match s.try_encode() {
             Ok(e) => {
                 self.bytes(&e);

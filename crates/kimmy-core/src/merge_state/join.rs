@@ -24,7 +24,9 @@ pub struct InvalidIntBound(pub i64);
 /// mutants: the type rule's recency, a marker that hides, `typeClash`, `arrayClash`, the
 /// sub-document diff and the refusal below a scalar, and the nine mutants of the order state:
 /// the floor, the earliest candidate, `last`, the order itself, the survivor clamp, the level
-/// floor, the update bit, the reset of a replace and the position inside a write) can be
+/// floor, the update bit, the reset of a replace and the position inside a write, and the six of the
+/// writer's feed: no ancestor candidates, no hybrid floor, a no-op unset that stands, the update bit
+/// unpacked, no first recorded, a replace without reset, a reorder that is a no-op) can be
 /// changed only in a test or `merge-mutants` build, through the `set_*` methods that exist
 /// there: they let the harness reproduce the model's mutants. The production code path is
 /// the same code with the switches at their correct values.
@@ -141,6 +143,32 @@ pub struct JoinOptions {
     /// Order mutant (feed): the position inside a write is ignored (every field has position 0).
     #[cfg(any(test, feature = "merge-mutants"))]
     ord_no_pos: bool,
+    /// Order mutant (writer): a write below a map is not a write to the map (the ancestors of a
+    /// written path get no candidate).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_ancestor: bool,
+    /// Order mutant (writer): the hybrid floor is off: the floor of a no-op `$unset` inside an
+    /// update that another change already stamps is dropped.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_hybrid: bool,
+    /// Order mutant (writer): a no-op `$unset` is a write in its own right (it mints a stamp and
+    /// raises a floor, standalone or not).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_noop_unset_stands: bool,
+    /// Order mutant (writer): the update bit is never set in the floor an unset leaves.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_bit_unpacked: bool,
+    /// Order mutant (writer): the first write of a writer to a path is not recorded.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_first: bool,
+    /// Order mutant (writer): a replace names its fields as plain writes, not resets.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_replace_without_reset: bool,
+    /// Order mutant (writer), and the stage-A rule: a write that changes the ORDER of the fields
+    /// and no value (a `$set` of a sub-document, or a replace, in another field order) is a no-op,
+    /// as in a model that has no field order. The differentials against that model set it.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_reorder_is_noop: bool,
 }
 
 impl Default for JoinOptions {
@@ -211,6 +239,20 @@ impl Default for JoinOptions {
             ord_no_reset: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             ord_no_pos: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_ancestor: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_hybrid: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_noop_unset_stands: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_bit_unpacked: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_first: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_replace_without_reset: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_reorder_is_noop: false,
         }
     }
 }
@@ -287,6 +329,13 @@ impl JoinOptions {
     switch!(ord_ignores_bit, set_ord_ignores_bit, false);
     switch!(ord_no_reset, set_ord_no_reset, false);
     switch!(ord_no_pos, set_ord_no_pos, false);
+    switch!(ord_no_ancestor, set_ord_no_ancestor, false);
+    switch!(ord_no_hybrid, set_ord_no_hybrid, false);
+    switch!(ord_noop_unset_stands, set_ord_noop_unset_stands, false);
+    switch!(ord_bit_unpacked, set_ord_bit_unpacked, false);
+    switch!(ord_no_first, set_ord_no_first, false);
+    switch!(ord_replace_without_reset, set_ord_replace_without_reset, false);
+    switch!(ord_reorder_is_noop, set_ord_reorder_is_noop, false);
 }
 
 /// The model's `_prefilter` of one state, in place: drop deletes and dead lives older than `h`.

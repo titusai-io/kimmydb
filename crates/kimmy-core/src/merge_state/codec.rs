@@ -468,19 +468,30 @@ impl MergeState {
     }
 }
 
-/// The panicking spellings the tests use on states they build and know the version 1 form can hold.
+/// The spellings the tests use on states they build and know the version 1 form can hold.
+///
+/// NAMED RESTRICTION: they leave the order state OUT. A state a `Writer` builds carries one (it
+/// feeds it with every write) and version 1 has no section for it (`try_*` refuse such a state);
+/// the reference these tests pin the version 1 form against is the stage-A model, which has none.
+/// What the form holds of a state that has no order state is the same. The compact form carries
+/// the order state, and the tests of it say so.
 #[cfg(test)]
 impl MergeState {
+    /// The state without its order state.
+    pub(crate) fn without_ords(&self) -> MergeState {
+        MergeState { ords: BTreeMap::new(), ..self.clone() }
+    }
+
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        self.try_canonical_bytes().expect("the test state is one version 1 can hold")
+        self.without_ords().try_canonical_bytes().expect("the test state is one version 1 can hold")
     }
 
     pub(crate) fn state_hash(&self) -> [u8; 16] {
-        self.try_state_hash().expect("the test state is one version 1 can hold")
+        self.without_ords().try_state_hash().expect("the test state is one version 1 can hold")
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        self.try_encode().expect("the test state is one version 1 can hold")
+        self.without_ords().try_encode().expect("the test state is one version 1 can hold")
     }
 }
 
