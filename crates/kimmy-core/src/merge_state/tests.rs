@@ -1022,9 +1022,9 @@ pub(super) fn golden_obs() -> MergeState {
     let rx = &st.regs[&(i0, p("x"))];
     assert_eq!(rx.obs.len(), 1, "x's base observed its one slot");
     let (_, t) = rx.obs.values().next().unwrap();
-    assert_eq!(*t, 3);
+    assert_eq!(*t, Num::from(3));
     let gy = st.regs[&(i0, p("y"))].generation.as_ref().unwrap();
-    assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![2]);
+    assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![Num::from(2)]);
     assert_eq!(obs.visible(), doc(&[("x", i(20)), ("y", s("t"))]));
     assert_eq!(obs.w.hidden_all(), BTreeMap::from([(p("y"), 7)]));
     st
@@ -1309,7 +1309,7 @@ fn register_obs_keeps_the_slot_stamp() {
     w.write_inc(&p("x"), 3, 0).unwrap();
     w.write_set(&p("x"), i(20), 0).unwrap();
     let r = w.state.regs.values().find(|r| r.value == i(20)).unwrap();
-    assert!(!r.obs.is_empty() && r.obs.values().all(|(st, t)| *t == 3 && *st < r.stamp));
+    assert!(!r.obs.is_empty() && r.obs.values().all(|(st, t)| *t == Num::from(3) && *st < r.stamp));
     w.write_inc(&p("x"), 4, 0).unwrap();
     w.write_inc(&p("x"), -4, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("x", i(20))]));
@@ -1407,7 +1407,7 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     let life = *st.lives.keys().next().unwrap();
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert((life, p("x"), wid(c, 0), None), Slot { stamp, total });
+        st.slots.insert((life, p("x"), wid(c, 0), None), Slot { stamp, total: total.into() });
     }
     (st, life)
 }
@@ -1437,14 +1437,14 @@ fn decode_refuses_totals_past_the_bound() {
     let mut good = w.state.clone();
     good.losses.insert(
         LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
-        LossValue::Total(5),
+        LossValue::Total(5.into()),
     );
     assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
     let big = MAX_TOTAL + 1;
     let mut bad = good.clone();
     for r in bad.regs.values_mut() {
         for v in r.obs.values_mut() {
-            v.1 = big;
+            v.1 = big.into();
         }
     }
     let mut hit = 0;
@@ -1458,13 +1458,13 @@ fn decode_refuses_totals_past_the_bound() {
     let mut bad = good.clone();
     for r in bad.regs.values_mut() {
         if let Some(g) = r.generation.as_mut() {
-            g.seen.insert((g.stamp, wid('A', 0), None), big);
+            g.seen.insert((g.stamp, wid('A', 0), None), big.into());
         }
     }
     try_state(&bad);
     let mut bad = good.clone();
     for v in bad.losses.values_mut() {
-        *v = LossValue::Total(big);
+        *v = LossValue::Total(big.into());
     }
     try_state(&bad);
     assert_eq!(hit, 3, "each copy of a total was exercised");
@@ -1496,11 +1496,12 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     w.state.slots.insert(
         (life, p("x"), wid('A', 0), None),
-        Slot { stamp: w.state.slots.values().next().unwrap().stamp, total: MAX_TOTAL - 2 },
+        Slot { stamp: w.state.slots.values().next().unwrap().stamp, total: (MAX_TOTAL - 2).into() },
     );
-    w.state
-        .slots
-        .insert((life, p("x"), wid('B', 0), None), Slot { stamp, total: -(MAX_TOTAL - 2) });
+    w.state.slots.insert(
+        (life, p("x"), wid('B', 0), None),
+        Slot { stamp, total: (-(MAX_TOTAL - 2)).into() },
+    );
     assert_eq!(w.visible().unwrap()[&p("x")], i(0));
     let clock = w.clock;
     assert!(w.write_inc(&p("x"), 3, 0).is_none(), "MAX_TOTAL + 1");
@@ -1575,13 +1576,13 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for k in 0..64u8 {
         let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
-        st.slots.insert((life, p("x"), wr, None), Slot { stamp, total: MAX_TOTAL });
+        st.slots.insert((life, p("x"), wr, None), Slot { stamp, total: MAX_TOTAL.into() });
     }
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "a state at the bound decodes");
     // Half at +bound, half at -bound: the exact sum is 0, which only exact arithmetic gives.
     for (k, slot) in st.slots.values_mut().enumerate() {
-        slot.total = if k % 2 == 0 { MAX_TOTAL } else { -MAX_TOTAL };
+        slot.total = if k % 2 == 0 { MAX_TOTAL } else { -MAX_TOTAL }.into();
     }
     assert_eq!(st.value(&p("x"), &o), Some(i(0)));
     // The same terms through the hidden figure: a generation that saw nothing, over 64 slots of
@@ -1589,7 +1590,7 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     let gen_stamp = MStamp { hlc: h(5), writer: wid('B', 0) };
     let mut st = st.clone();
     for slot in st.slots.values_mut() {
-        slot.total = MAX_TOTAL;
+        slot.total = MAX_TOTAL.into();
     }
     st.regs.insert(
         (life, p("x")),
@@ -1619,7 +1620,7 @@ fn receive_loss_refuses_a_total_past_the_bound() {
         ("e", i128::MAX, false),
         ("f", i128::MIN, false),
     ] {
-        assert_eq!(w.receive_loss(key(p), LossValue::Total(t)), added, "{p}");
+        assert_eq!(w.receive_loss(key(p), LossValue::Total(t.into())), added, "{p}");
     }
     // Whatever was stored decodes.
     assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
@@ -1640,12 +1641,14 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     let gen_stamp = MStamp { hlc: h(9), writer: wid('A', 0) };
     let slot_stamp = MStamp { hlc: h(2), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots
-            .insert((life, p("x"), wid(c, 0), None), Slot { stamp: slot_stamp, total: i128::MAX });
+        st.slots.insert(
+            (life, p("x"), wid(c, 0), None),
+            Slot { stamp: slot_stamp, total: i128::MAX.into() },
+        );
     }
     let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
     // B's slot was seen at -1: i128::MAX - (-1) overflows a plain subtraction
-    g.seen.insert((life, wid('B', 0), None), -1);
+    g.seen.insert((life, wid('B', 0), None), (-1).into());
     st.regs.insert(
         (life, p("x")),
         Reg {
@@ -1757,9 +1760,10 @@ fn arrays_compare_element_by_element_and_type_for_type() {
 }
 
 #[test]
-fn only_null_and_int64_are_numeric() {
+fn the_numeric_values_are_unset_int32_int64_and_decimal128() {
+    // A double is not numeric (and no counter): a double base starts a generation.
     for (k, v) in every_type() {
-        assert_eq!(v.is_numeric(), k == "unset" || k == "i64", "{k}");
+        assert_eq!(v.is_numeric(), matches!(k, "unset" | "i32" | "i64" | "dec"), "{k}");
     }
 }
 
@@ -1773,7 +1777,8 @@ fn a_write_across_integer_widths_is_a_write() {
     assert!(w.write_set(&p("n"), f(5.0), 0).is_some(), "a double over an Int32 is a write");
     assert!(w.write_set(&p("n"), Value::Decimal128([1; 16]), 0).is_some());
     assert_eq!(w.visible().unwrap()[&p("n")], Value::Decimal128([1; 16]));
-    // A string or an Int32 base refuses `$inc` like any non-counter.
+    // A string base refuses `$inc` like any non-counter.
+    assert!(w.write_set(&p("n"), s("t"), 0).is_some());
     assert!(w.write_inc(&p("n"), 1, 0).is_none());
 }
 

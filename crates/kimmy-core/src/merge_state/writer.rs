@@ -3,8 +3,11 @@
 
 use std::collections::BTreeMap;
 
+use super::counter::{self, Inc, Kind, Num};
 use super::join::{JoinOptions, join};
-use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
+use super::state::{
+    Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
+};
 use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
@@ -26,8 +29,10 @@ pub struct WriteRecord {
     pub paths: Vec<Path>,
     /// Register values written (`Insert`, `Reg`).
     pub vals: BTreeMap<Path, Value>,
-    /// The increment (`Inc`).
+    /// The increment (`Inc`), when it is an integer that fits an `i64`.
     pub n: Option<i64>,
+    /// The increment (`Inc`) with its type: an `Int32`, `Int64`, `Double` or `Decimal128`.
+    pub amount: Option<Num>,
     /// The generation an increment belongs to (`Inc`).
     pub generation: Option<MStamp>,
     /// An upsert that created the life (the `Inc` of `upsert_inc`, the creation write of `upsert_soi`).
@@ -46,6 +51,7 @@ impl WriteRecord {
             paths,
             vals: BTreeMap::new(),
             n: None,
+            amount: None,
             generation: None,
             insert: false,
             upsert: false,
@@ -217,6 +223,14 @@ impl Writer {
     /// Mint the stamp of one write from `m`. A refused stamp is kept in `m` and reported as
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
+        // The writer cap: a writer the document does not mention yet is refused at the cap (a
+        // write adds the writer to the version vector).
+        if !self.opts.no_writer_cap() {
+            let ws = self.state.writers();
+            if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
+                return None;
+            }
+        }
         let r = match &mut m.source {
             Source::Skew(skew) => Ok(self.tick(*skew)),
             Source::Given(f) => {
@@ -270,7 +284,7 @@ impl Writer {
 
     /// V5m1: every slot total of `p` (any generation, alive lives) as this
     /// writer sees it, kept with a generation it starts.
-    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, i128> {
+    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, Num> {
         let al = self.state.alive_set(self.opts.retention);
         self.state
             .slots
@@ -280,7 +294,7 @@ impl Writer {
             .collect()
     }
 
-    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, i128)> {
+    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, Num)> {
         self.state
             .counted(p, &self.opts)
             .into_iter()
@@ -488,11 +502,34 @@ impl Writer {
         self.stamped(stamp, |w, m| w.write_unset_m(path, m))
     }
 
-    /// `$inc path by n`. A local increment past the bound is refused (Q11), and so is one that
-    /// would carry the writer's slot past [`MAX_TOTAL`]; on a double base it is a register
-    /// write that starts a generation (Nm5); on a string it is refused.
+    /// `$inc path by n`, an `Int64` operand. A local increment past the bound is refused (Q11),
+    /// and so is one that would carry the writer's slot past [`MAX_TOTAL`]; on a string or a map
+    /// it is refused; on a double base it is a register write. See [`Writer::write_inc_value`]
+    /// for the other operand types.
     pub fn write_inc(&mut self, p: &Path, n: i64, skew: u64) -> Option<Written> {
-        self.ticking(skew, |w, m| w.write_inc_m(p, n, m))
+        self.ticking(skew, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
+    }
+
+    /// `$inc path by by`, where `by` is an `Int32`, `Int64`, `Decimal128` or `Double` (anything
+    /// else is refused). The result type is production's (`counter`): two `Int32`s stay an
+    /// `Int32` while the total fits, any `Int64` makes it an `Int64`, a `Decimal128` a
+    /// `Decimal128` (refused when it overflows from finite inputs). Concurrent increments from
+    /// other writers sum with this one. DOUBLES ARE NOT COUNTERS: a `Double` operand against an
+    /// `Int32`, `Int64` or `Decimal128` counter is refused, and `$inc` of a double base (or of
+    /// an absent field by a double) is a register write.
+    pub fn write_inc_value(&mut self, p: &Path, by: &Value, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_inc_m(p, by, m))
+    }
+
+    /// [`Writer::write_inc_value`] with the stamp taken from `stamp` instead of the writer's own
+    /// clock: see [`Writer::tick_to`] for what a stamp must satisfy.
+    pub fn write_inc_value_stamped(
+        &mut self,
+        p: &Path,
+        by: &Value,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_inc_m(p, by, m))
     }
 
     /// [`Writer::write_inc`] with the stamp taken from `stamp` instead of the writer's own clock:
@@ -505,7 +542,7 @@ impl Writer {
         n: i64,
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<Option<Written>, StampError> {
-        self.stamped(stamp, |w, m| w.write_inc_m(p, n, m))
+        self.stamped(stamp, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
     }
 
     /// Replace the whole document: changed fields are set, absent ones unset. Each field is a
@@ -692,11 +729,13 @@ impl Writer {
         }
         let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.state
-            .slots
-            .insert((life, path.clone(), self.id, None), Slot { stamp: st2, total: i128::from(n) });
+        self.state.slots.insert(
+            (life, path.clone(), self.id, None),
+            Slot { stamp: st2, total: Num::from(i128::from(n)) },
+        );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         Some(self.finish(st2, rec))
     }
 
@@ -715,9 +754,13 @@ impl Writer {
                 kind: LifeKind::Upsert,
             },
         );
-        s.slots.insert((st, path.clone(), self.id, None), Slot { stamp: st, total: i128::from(n) });
+        s.slots.insert(
+            (st, path.clone(), self.id, None),
+            Slot { stamp: st, total: Num::from(i128::from(n)) },
+        );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         rec.insert = true;
         Some(self.finish(st, rec))
     }
@@ -808,43 +851,56 @@ impl Writer {
         self.commit(eff, m)
     }
 
-    /// The body of [`Writer::write_inc`], with the stamp from `m`.
-    fn write_inc_m(&mut self, p: &Path, n: i64, m: &mut Mint<'_>) -> Option<Written> {
+    /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
+    /// type; the rules are in the module docs of `counter`.
+    fn write_inc_m(&mut self, p: &Path, by: &Value, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
             return None;
         }
-        let cur = vis.get(p);
-        let b = i128::from(self.opts.int_bound());
-        match cur {
-            None | Some(Value::Int64(_)) => {
-                let c = if let Some(Value::Int64(c)) = cur { i128::from(*c) } else { 0 };
-                if !(-b - 1..=b).contains(&(c + i128::from(n))) {
-                    return None;
-                }
-            }
-            Some(Value::Double(d)) => {
+        // The production rule decides: a string or a map is refused, so is an integer past the
+        // bound, a decimal that overflows and a double operand against a counter. A double base
+        // is no counter: its `$inc` is a register write of the computed value.
+        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())? {
+            Inc::Register(v) => {
                 let mut eff = Eff::default();
-                eff.put(p.clone(), Value::Double(d + n as f64));
+                eff.put(p.clone(), v);
                 return self.commit(eff, m);
             }
-            _ => return None,
-        }
+            Inc::Slot(res) => res,
+        };
+        let op = Num::from_value(by)?;
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
         let key = (l, p.clone(), self.id, generation);
-        let old = self.state.slots.get(&key).map_or(0, |s| s.total);
-        // The slot is this writer's running sum, which the saturated check above does not
-        // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
-        let total = old.saturating_add(i128::from(n));
-        if total.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
+        // The writer's slot is its running sum in the join of the types it has added. The
+        // `Int64` check above is on the saturated visible value, which does not bound the sum
+        // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
+        let mut total = match self.state.slots.get(&key) {
+            None => op,
+            Some(s) => counter::sum_checked(&s.total, &op)?,
+        };
+        if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
             return None;
+        }
+        // The contributor cap: a writer the counter does not have yet is refused at the cap.
+        if !self.opts.no_contributor_cap() {
+            let cs = self.state.contributors(p, &self.opts);
+            if cs.len() >= MAX_CONTRIBUTORS && !cs.contains(&self.id) {
+                return None;
+            }
+        }
+        // The visible value became an Int64: the slot is an Int64 from now on, so a total that
+        // later dips back under the i32 range does not narrow again.
+        if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
+            total = total.widened();
         }
         let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
         self.state.slots.insert(key, Slot { stamp: st, total });
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.clone()]);
-        rec.n = Some(n);
+        rec.n = op.int().and_then(|v| i64::try_from(v).ok());
+        rec.amount = Some(op);
         rec.generation = generation;
         Some(self.finish(st, rec))
     }
@@ -905,7 +961,8 @@ impl Writer {
             return false;
         }
         // A total past `MAX_TOTAL` is one `decode` refuses: never store a state that cannot be read back.
-        if matches!(val, LossValue::Total(t) if t.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
+        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()))
+        {
             return false;
         }
         self.state.losses.insert(key, val);

@@ -35,6 +35,13 @@
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
 //!
+//! Counters are typed (`counter.rs`): `Int32`, `Int64` and `Decimal128` amounts merge (doubles
+//! are not counters), the type of a merged cell is the join of its parts, the parts are added in
+//! a canonical order, and a merge that crosses a bound saturates and reports the excess
+//! ([`MergeState::excess`]). A counter has at most [`MAX_CONTRIBUTORS`] contributing writers and a document at most
+//! [`MAX_WRITERS`] writers: a LOCAL write that would pass either is refused, a received state
+//! past either is kept and reported ([`MergeState::over_caps`]).
+//!
 //! Two bounds apply to a counter. The integer bound (Q11, [`JoinOptions::int_bound`], the Int64
 //! range unless lowered) is what a client sees: a total saturates there, and a local `$inc` that
 //! would pass it is refused. [`MAX_TOTAL`] (2^119) is a theoretical bound on the `i128` totals
@@ -44,6 +51,7 @@
 
 mod codec;
 mod compact;
+mod counter;
 mod join;
 mod state;
 mod types;
@@ -52,6 +60,8 @@ mod writer;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
+mod counter_tests;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod prop_tests;
@@ -59,8 +69,12 @@ mod prop_tests;
 mod tests;
 
 pub use codec::{DecodeError, V1CannotHold};
+pub use counter::Num;
 pub use join::{InvalidIntBound, JoinOptions, join};
-pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
+pub use state::{
+    Excess, Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey,
+    OverCaps, Reg, Slot, Vv,
+};
 pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
     WriterId,
@@ -100,6 +114,10 @@ const _: () = {
     let _: fn(&MergeState, &Path, &JoinOptions) -> Option<Value> = MergeState::value;
     let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<Path, Value>> = MergeState::visible;
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
+    let _: fn(&MergeState) -> BTreeSet<WriterId> = MergeState::writers;
+    let _: fn(&MergeState, &Path, &JoinOptions) -> BTreeSet<WriterId> = MergeState::contributors;
+    let _: fn(&MergeState, &JoinOptions) -> OverCaps = MergeState::over_caps;
+    let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, Excess> = MergeState::excess;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
@@ -108,7 +126,7 @@ const _: () = {
     let _: fn(
         MStamp,
         Value,
-        BTreeMap<ObsKey, (MStamp, i128)>,
+        BTreeMap<ObsKey, (MStamp, Num)>,
         Option<Gen>,
         bool,
     ) -> Result<Reg, InvalidValue> = Reg::new;
@@ -137,6 +155,9 @@ const _: () = {
     let _: fn(&mut Writer, &Path, Value, u64) -> Option<Written> = Writer::write_set;
     let _: fn(&mut Writer, &Path, u64) -> Option<Written> = Writer::write_unset;
     let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::write_inc;
+    let _: fn(&mut Writer, &Path, &Value, u64) -> Option<Written> = Writer::write_inc_value;
+    let _: fn(&Value) -> Option<Num> = Num::from_value;
+    let _: fn(&Num) -> Option<i128> = Num::int;
     let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::write_replace;
     let _: fn(&mut Writer, u64) -> Option<Written> = Writer::write_delete;
     let _: fn(&mut Writer, MStamp) -> Result<MStamp, StampError> = Writer::tick_to;
@@ -168,6 +189,8 @@ const _: () = {
         Writer::write_unset_stamped;
     let _: fn(&mut Writer, &Path, i64, Mint) -> Result<Option<Written>, StampError> =
         Writer::write_inc_stamped;
+    let _: fn(&mut Writer, &Path, &Value, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_inc_value_stamped;
     let _: fn(&mut Writer, &[(Path, Value)], Mint) -> Result<Option<Written>, StampError> =
         Writer::write_replace_stamped;
     let _: fn(&mut Writer, Mint) -> Result<Option<Written>, StampError> =

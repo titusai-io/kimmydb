@@ -742,3 +742,153 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
     }
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
 }
+
+// ---- typed counters --------------------------------------------------------------------------
+
+fn dec_value(s: &str) -> Value {
+    Value::Decimal128(s.parse::<bson::Decimal128>().unwrap().bytes())
+}
+
+/// An amount of any counter type: small and large, near the bounds (so that merges saturate),
+/// and the decimal sums that are not associative.
+fn amount(rng: &mut Rng) -> Value {
+    match rng.below(16) {
+        0 => Value::Int32(1),
+        1 => Value::Int32(-1),
+        2 => Value::Int32(2_000_000_000),
+        3 => Value::Int32(-2_000_000_000),
+        4 => Value::Int64(1 << 40),
+        5 => Value::Int64(7),
+        6 => Value::Int64(i64::MAX),
+        7 => Value::Int64(i64::MIN + 1),
+        8 => dec_value("0.1"),
+        9 => dec_value("1E+34"),
+        10 => dec_value("-1E+34"),
+        11 => dec_value("5"),
+        12 => dec_value("9.999999999999999999999999999999999E+6144"),
+        13 => dec_value("-9.999999999999999999999999999999999E+6144"),
+        _ => Value::Int64(-7),
+    }
+}
+
+/// Three writers on the counters `x` and `y`, whose bases and increments are of every type.
+fn run_counters(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut ws: Vec<Writer> = (0..3)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let mut pool = Vec::new();
+    ws[0].insert(&fl(&[("x", amount(&mut rng)), ("y", amount(&mut rng))]), 0);
+    for _ in 0..steps {
+        let m = rng.below(3);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 40 {
+            let other = (m + 1 + rng.below(2)) % 3;
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let path = p(rng.pick(&["x", "y"]));
+            let w = &mut ws[m];
+            match rng.below(12) {
+                0..=6 => {
+                    let by = amount(&mut rng);
+                    w.write_inc_value(&path, &by, skew);
+                }
+                7 | 8 => {
+                    let v = amount(&mut rng);
+                    w.write_set(&path, v, skew);
+                }
+                9 => {
+                    w.write_set(&path, Value::String("s".into()), skew);
+                }
+                10 => {
+                    w.write_unset(&path, skew);
+                }
+                _ => {
+                    w.write_delete(skew);
+                }
+            }
+        }
+        pool.push(ws[m].state.clone());
+    }
+    pool
+}
+
+#[test]
+fn typed_counter_join_laws_and_hashes() {
+    for (o, exact) in [(opts(1_000_000_000), true), (opts(20), true)] {
+        let ps: Vec<Vec<MergeState>> = (1..=60).map(|s| run_counters(s, 30, &o)).collect();
+        let (mut typed, mut slots) = (0, 0);
+        for st in ps.iter().flatten() {
+            slots += st.slots.len();
+            typed += st.totals().filter(|n| !matches!(n, Num::Int64(_))).count();
+        }
+        assert!(
+            slots > 0 && typed > 0,
+            "the runs must exercise typed slots ({typed} of {slots} totals)"
+        );
+        check_laws_on(&o, exact, &ps, 400);
+        for st in ps.iter().flatten() {
+            let c = st.encode_compact();
+            let back = MergeState::decode_compact(&c).expect("decode_compact");
+            assert_eq!(&back, st);
+            assert_eq!(back.encode_compact(), c);
+            assert_eq!(back.visible(&o), st.visible(&o));
+            if st.v1_can_hold() {
+                assert_eq!(&MergeState::decode(&st.encode()).unwrap(), st);
+            }
+        }
+    }
+}
+
+/// The read of a cell does not depend on the order the states were joined in: the same value,
+/// byte for byte (a `Double` or `Decimal128` sum is not associative, so this is the canonical
+/// order at work), and the same hashes.
+#[test]
+fn typed_counter_reads_and_hashes_do_not_depend_on_the_join_order() {
+    let o = opts(1_000_000_000);
+    let ps: Vec<Vec<MergeState>> = (1..=60).map(|s| run_counters(s, 30, &o)).collect();
+    let (mut n, mut saturated) = (0, 0);
+    for (a, b, c) in triples(&ps, 400) {
+        // without the loss records, which are not an associative function of the states
+        let abc = bare(join(&join(a, b, &o).0, c, &o).0);
+        let cba = bare(join(&join(c, b, &o).0, a, &o).0);
+        let bca = bare(join(b, &join(c, a, &o).0, &o).0);
+        for other in [&cba, &bca] {
+            assert_eq!(abc.compact_bytes(), other.compact_bytes());
+            assert_eq!(abc.compact_hash(), other.compact_hash());
+            if abc.v1_can_hold() {
+                assert_eq!(abc.state_hash(), other.state_hash());
+            }
+            let (va, vb) = (abc.visible(&o), other.visible(&o));
+            assert_eq!(format!("{va:?}"), format!("{vb:?}"));
+            assert_eq!(abc.hidden_all(&o), other.hidden_all(&o));
+            assert_eq!(abc.excess(&o), other.excess(&o));
+        }
+        n += 1;
+        saturated += usize::from(!abc.excess(&o).is_empty());
+    }
+    assert_eq!(n, 400);
+    assert!(saturated > 0, "the joins must cross a bound sometimes");
+}
+
+#[test]
+fn a_typed_writers_hash_equals_every_receivers() {
+    let o = opts(1_000_000_000);
+    for s in 1..=30 {
+        for st in &run_counters(s, 30, &o) {
+            let mut r = Writer::new(
+                WriterId { node: NodeId::from_bytes([b'Z'; 16]), epoch: Epoch::from_u64(0) },
+                o.clone(),
+            );
+            r.receive(st);
+            assert_eq!(r.state.compact_hash(), st.compact_hash());
+        }
+    }
+}

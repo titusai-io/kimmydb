@@ -78,6 +78,31 @@ pub struct JoinOptions {
     /// Nested mutant: a write below a scalar or an array is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     write_below_scalar: bool,
+    /// The read side adds a cell's slots in the order of their stamps instead of the canonical
+    /// order (writer `(node, epoch)`, then life and generation): a `Decimal128` total then
+    /// depends on whose write was the later.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    sum_in_stamp_order: bool,
+    /// An integer cell that crosses the integer bound wraps instead of saturating.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_saturation: bool,
+    /// A `Decimal128` cell that overflows from finite parts becomes an infinity instead of
+    /// saturating at the largest finite value of its sign.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_decimal_saturation: bool,
+    /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    int32_saturates: bool,
+    /// A writer whose increment made the visible value an `Int64` still leaves its slot an
+    /// `Int32`, so a total that dips back under the `i32` range narrows again.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    slot_never_widens: bool,
+    /// A local `$inc` by a 65th contributor is accepted.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_contributor_cap: bool,
+    /// A local write by a 257th writer is accepted.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_writer_cap: bool,
 }
 
 impl Default for JoinOptions {
@@ -114,6 +139,20 @@ impl Default for JoinOptions {
             rewrite_unchanged: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             write_below_scalar: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            sum_in_stamp_order: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_saturation: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_decimal_saturation: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            int32_saturates: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            slot_never_widens: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_contributor_cap: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_writer_cap: false,
         }
     }
 }
@@ -173,6 +212,13 @@ impl JoinOptions {
     switch!(array_clash_as_clash, set_array_clash_as_clash, false);
     switch!(rewrite_unchanged, set_rewrite_unchanged, false);
     switch!(write_below_scalar, set_write_below_scalar, false);
+    switch!(sum_in_stamp_order, set_sum_in_stamp_order, false);
+    switch!(no_saturation, set_no_saturation, false);
+    switch!(no_decimal_saturation, set_no_decimal_saturation, false);
+    switch!(int32_saturates, set_int32_saturates, false);
+    switch!(slot_never_widens, set_slot_never_widens, false);
+    switch!(no_contributor_cap, set_no_contributor_cap, false);
+    switch!(no_writer_cap, set_no_writer_cap, false);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.

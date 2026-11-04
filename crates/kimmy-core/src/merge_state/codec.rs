@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
+use super::counter::Num;
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
@@ -92,6 +93,10 @@ impl W {
     }
     fn i128(&mut self, v: i128) {
         self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    /// A counter total: version 1 spells an `Int64` amount only ([`MergeState::v1_can_hold`]).
+    fn num(&mut self, n: &Num) {
+        self.i128(n.int().expect("v1_can_hold: a version 1 total is an Int64 amount"));
     }
     fn str(&mut self, s: &str) {
         self.len(s.len());
@@ -193,23 +198,23 @@ impl W {
             self.hlc(*h);
         }
     }
-    fn obs(&mut self, m: &BTreeMap<ObsKey, i128>) {
+    fn obs(&mut self, m: &BTreeMap<ObsKey, Num>) {
         self.len(m.len());
         for ((l, w, g), t) in m {
             self.stamp(l);
             self.wid(w);
             self.opt_stamp(g);
-            self.i128(*t);
+            self.num(t);
         }
     }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, i128)>) {
+    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, Num)>) {
         self.len(m.len());
         for ((l, w, g), (s, t)) in m {
             self.stamp(l);
             self.wid(w);
             self.opt_stamp(g);
             self.stamp(s);
-            self.i128(*t);
+            self.num(t);
         }
     }
     fn gen_(&mut self, g: &Option<Gen>) {
@@ -242,7 +247,7 @@ impl W {
             }
             LossValue::Total(t) => {
                 self.u8(1);
-                self.i128(*t);
+                self.num(t);
             }
             LossValue::Fields(f) => {
                 self.u8(2);
@@ -299,7 +304,7 @@ impl MergeState {
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
-            w.i128(s.total);
+            w.num(&s.total);
         }
         w.vv(&self.vv);
         w.len(self.losses.len());
@@ -310,9 +315,12 @@ impl MergeState {
     }
 
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
-    /// `Document` inside an array (it has no tag there; the compact form has one).
+    /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
+    /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
+    /// type; the compact form spells them).
     pub fn v1_can_hold(&self) -> bool {
-        !self.regs.values().any(|r| r.value.contains_document())
+        self.totals().all(|n| matches!(n, Num::Int64(_)))
+            && !self.regs.values().any(|r| r.value.contains_document())
             && !self
                 .losses
                 .values()
@@ -490,12 +498,12 @@ impl R<'_> {
         Ok(i128::from_be_bytes(self.arr()?))
     }
     /// A counter total: an `i128` of magnitude at most [`MAX_TOTAL`] (see there).
-    fn total(&mut self) -> Result<i128, DecodeError> {
+    fn total(&mut self) -> Result<Num, DecodeError> {
         let t = self.i128()?;
         if t.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
             return Err(DecodeError::TotalOutOfRange);
         }
-        Ok(t)
+        Ok(Num::Int64(t))
     }
     fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.len()?;
@@ -578,7 +586,7 @@ impl R<'_> {
         }
         Ok(m)
     }
-    fn obs(&mut self) -> Result<BTreeMap<ObsKey, i128>, DecodeError> {
+    fn obs(&mut self) -> Result<BTreeMap<ObsKey, Num>, DecodeError> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let l = self.stamp()?;
@@ -588,7 +596,7 @@ impl R<'_> {
         }
         Ok(m)
     }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, i128)>, DecodeError> {
+    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, Num)>, DecodeError> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let l = self.stamp()?;
