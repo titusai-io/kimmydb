@@ -496,6 +496,60 @@ impl MergeState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         self.without_ords().try_encode().expect("the test state is one version 1 can hold")
     }
+
+    /// Is this a state the version 1 form cannot spell ONLY because a slot carries an absorbed
+    /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
+    pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
+        let mut bare = self.without_ords();
+        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some());
+        bare.slots.values_mut().for_each(|s| s.absorbed = None);
+        had_pair && bare.v1_can_hold()
+    }
+}
+
+#[cfg(test)]
+impl MergeState {
+    /// The length of the version 1 bytes, for a size comparison with the compact form, and whether
+    /// it is exact. A state with an absorbed pair has no version 1 length: it is then the version 1
+    /// length of the same state with its pairs removed (a lower bound of what version 1 would
+    /// have spelled), and `false`.
+    pub(crate) fn v1_len_for_size_checks(&self) -> (usize, bool) {
+        if self.without_ords().v1_can_hold() {
+            return (self.canonical_bytes().len(), true);
+        }
+        assert!(self.v1_refused_only_for_a_pair(), "version 1 refuses a state for another reason");
+        let mut stripped = self.without_ords();
+        stripped.slots.values_mut().for_each(|s| s.absorbed = None);
+        (stripped.canonical_bytes().len(), false)
+    }
+}
+
+/// How many of the states a test looked at the version 1 form holds, and how many it cannot
+/// spell for the one reason the counter cell adds: an absorbed pair. A state version 1 refuses for
+/// any other reason panics, so the version-1-not-applicable set is exactly the pair states.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct V1Split {
+    pub held: usize,
+    pub pair_only: usize,
+}
+
+#[cfg(test)]
+impl V1Split {
+    /// Count `st`; true when version 1 holds it (the caller then runs its version 1 assertions).
+    pub(crate) fn note(&mut self, st: &MergeState) -> bool {
+        if st.without_ords().v1_can_hold() {
+            self.held += 1;
+            true
+        } else {
+            assert!(
+                st.v1_refused_only_for_a_pair(),
+                "version 1 refuses a state for another reason"
+            );
+            self.pair_only += 1;
+            false
+        }
+    }
 }
 
 // ---- reading ---------------------------------------------------------------
@@ -848,18 +902,20 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_or_duplicate_obs_and_seen_entries_are_refused() {
+    fn unsorted_or_duplicate_seen_entries_and_any_obs_entry_are_refused() {
         let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
         let no = Err(DecodeError::NotCanonical);
-        // sorted: fine, and canonical
-        let good = with_obs(&[(a, a, 1), (b, a, 2)], &[(a, 1), (b, 2)]);
+        // sorted seen entries and no obs: fine, and canonical
+        let good = with_obs(&[], &[(a, 1), (b, 2)]);
         assert_eq!(MergeState::decode(&good).unwrap().encode(), good);
-        // a register's obs: out of order, duplicate
-        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
-        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (a, b, 2)], &[])), no);
         // a generation's seen totals: out of order, duplicate
         assert_eq!(MergeState::decode(&with_obs(&[], &[(b, 2), (a, 1)])), no);
         assert_eq!(MergeState::decode(&with_obs(&[], &[(a, 1), (a, 2)])), no);
+        // the register's obs place is still there and always empty: any entry is refused, sorted or
+        // not (what a base had counted is the slots' absorbed pairs, which this form cannot spell)
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1)], &[(a, 1)])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (b, a, 2)], &[])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
     }
 
     #[test]

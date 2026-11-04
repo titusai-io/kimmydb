@@ -560,17 +560,29 @@ fn encode_decode_round_trip() {
     for o in [opts(1_000_000_000), opts(6)] {
         let mut seen_gens = false;
         let mut seen_losses = false;
+        let mut split = codec::V1Split::default();
         for pool in pools(40, 24, &o) {
             for st in &pool {
-                let bytes = st.encode();
-                let back = MergeState::decode(&bytes).expect("decode");
-                assert_eq!(&back, st);
-                assert_eq!(back.canonical_bytes(), st.canonical_bytes());
-                assert_eq!(back.state_hash(), st.state_hash());
+                // the compact form, for every state
+                let c = st.encode_compact();
+                let back_c = MergeState::decode_compact(&c).expect("decode compact");
+                assert_eq!(&back_c, st);
+                assert_eq!(back_c.encode_compact(), c);
+                assert_eq!(back_c.compact_hash(), st.compact_hash());
+                // version 1, where it can spell the state
+                if split.note(st) {
+                    let bytes = st.encode();
+                    let back = MergeState::decode(&bytes).expect("decode");
+                    assert_eq!(&back, st);
+                    assert_eq!(back.canonical_bytes(), st.canonical_bytes());
+                    assert_eq!(back.state_hash(), st.state_hash());
+                }
                 seen_gens |= !st.gens.is_empty();
                 seen_losses |= !st.losses.is_empty();
             }
         }
+        eprintln!("encode_decode_round_trip R={}: {split:?}", o.retention);
+        assert!(split.held > 100, "version 1 still round-trips {} states", split.held);
         assert!(seen_gens && seen_losses, "the generated states should exercise gens and losses");
     }
     let empty = MergeState::default();
@@ -598,6 +610,7 @@ fn state_hash_of_different_join_orders_is_equal() {
     // is equal outright; the records converge by pulling the loss entries (model probe P5), done
     // here by `receive_loss` of the other side's records, after which the hashes are equal.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         let fwd = pool.iter().fold(MergeState::default(), |acc, s| join(&acc, s, &o).0);
         let mut rev_order: Vec<&MergeState> = pool.iter().collect();
@@ -621,9 +634,15 @@ fn state_hash_of_different_join_orders_is_equal() {
             wr.receive_loss(k.clone(), v.clone());
         }
         assert!(wf.state == wr.state);
-        assert_eq!(wf.state.state_hash(), wr.state.state_hash());
-        assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        assert_eq!(wf.state.compact_hash(), wr.state.compact_hash());
+        assert_eq!(wf.state.compact_bytes(), wr.state.compact_bytes());
+        if split.note(&wf.state) {
+            assert_eq!(wf.state.state_hash(), wr.state.state_hash());
+            assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        }
     }
+    eprintln!("state_hash_of_different_join_orders: {split:?}");
+    assert!(split.held > 5, "version 1 still compares {} joins", split.held);
 }
 
 #[test]
@@ -631,25 +650,46 @@ fn state_hash_separates_states() {
     let o = opts(1_000_000_000);
     let mut hashes = BTreeSet::new();
     let mut states = BTreeSet::new();
+    let (mut c_hashes, mut c_states) = (BTreeSet::new(), BTreeSet::new());
+    let mut split = codec::V1Split::default();
     for pool in pools(40, 24, &o) {
         for st in pool {
-            hashes.insert(st.state_hash());
-            states.insert(st.canonical_bytes());
+            // the compact form, for every state
+            c_hashes.insert(st.compact_hash());
+            c_states.insert(st.compact_bytes());
+            // version 1, where it can spell the state
+            if split.note(&st) {
+                hashes.insert(st.state_hash());
+                states.insert(st.canonical_bytes());
+            }
         }
     }
+    eprintln!(
+        "state_hash_separates_states: {split:?}, {} version 1 states, {} compact states",
+        states.len(),
+        c_states.len()
+    );
     assert_eq!(hashes.len(), states.len());
+    assert_eq!(c_hashes.len(), c_states.len());
+    assert!(states.len() > 100, "version 1 still separates {} states", states.len());
 }
 
 #[test]
 fn writer_state_hash_equals_receivers() {
     // A writer's normalised state hashes like the state a receiver reaches by joining it in.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         for st in &pool {
             let recv = join(&MergeState::default(), st, &o).0;
-            assert_eq!(recv.state_hash(), st.state_hash());
+            assert_eq!(recv.compact_hash(), st.compact_hash());
+            if split.note(st) {
+                assert_eq!(recv.state_hash(), st.state_hash());
+            }
         }
     }
+    eprintln!("writer_state_hash_equals_receivers: {split:?}");
+    assert!(split.held > 100, "version 1 still hashes {} states", split.held);
 }
 
 #[test]
@@ -720,7 +760,22 @@ pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
     let mut corpus: Vec<Vec<u8>> = Vec::new();
     for pool in pools(24, 24, o) {
         for st in pool.iter().step_by(5) {
-            corpus.push(st.encode());
+            // version 1, for the states it can spell (the others are in the compact corpus)
+            if st.without_ords().v1_can_hold() {
+                corpus.push(st.encode());
+            }
+        }
+    }
+    corpus
+}
+
+/// The compact encodings the compact decode fuzz damages: the same states, every fifth of the pools
+/// of 24 runs, all of them (the compact form spells every state).
+pub(super) fn fuzz_corpus_compact(o: &JoinOptions) -> Vec<Vec<u8>> {
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, o) {
+        for st in pool.iter().step_by(5) {
+            corpus.push(st.encode_compact());
         }
     }
     corpus
@@ -766,6 +821,16 @@ fn decode_mutation_fuzz() {
         std::env::var("Q7_DECODE_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     let o = opts(1_000_000_000);
     let corpus = fuzz_corpus(&o);
+    // the corpus is the states version 1 can spell; the others (an absorbed pair) are fuzzed through the
+    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`, and the d7 sweep)
+    let mut split = codec::V1Split::default();
+    for pool in pools(24, 24, &o) {
+        pool.iter().step_by(5).for_each(|st| {
+            split.note(st);
+        });
+    }
+    assert_eq!(corpus.len(), split.held);
+    eprintln!("decode_mutation_fuzz corpus: {split:?}");
     let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
     let (mut accepted, mut refused) = (0u64, 0u64);
     for k in 0..n {
@@ -1041,11 +1106,26 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
     );
     let (mut same, mut differ) = (0, 0);
+    let (mut v1_pairs, mut v1_held_pairs) = (0, 0);
     for (a, b, _) in triples(&pools_, 600) {
         let merged = join(a, b, &o).0;
         for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
             let by_state = x == y;
-            assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+            // the compact bytes, for every state (the version 1 form cannot spell a state with an
+            // absorbed pair)
+            assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
+            // version 1, where it holds both states of the pair
+            let (hx, hy) = (x.without_ords().v1_can_hold(), y.without_ords().v1_can_hold());
+            if hx && hy {
+                assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+                v1_held_pairs += 1;
+            } else {
+                assert!(
+                    (hx || x.v1_refused_only_for_a_pair())
+                        && (hy || y.v1_refused_only_for_a_pair())
+                );
+            }
+            v1_pairs += 1;
             if by_state {
                 same += 1;
             } else {
@@ -1053,7 +1133,9 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             }
         }
     }
+    eprintln!("state_equality: {v1_held_pairs} of {v1_pairs} pairs also on version 1");
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
+    assert!(v1_held_pairs > 50, "version 1 still compares {v1_held_pairs} pairs");
 }
 
 // ---- typed counters --------------------------------------------------------------------------

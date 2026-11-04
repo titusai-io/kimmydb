@@ -1110,15 +1110,15 @@ fn golden_vectors_delete() {
 
 #[test]
 fn golden_vectors_obs() {
-    check_golden(
-        "obs",
-        &golden_obs(),
-        (
-            "f96f244c2b3198f724fcea0eafec32c7",
-            1325,
-            "00000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
-        ),
-    );
+    // The state has slots with an absorbed pair: the version 1 form cannot spell it (its golden,
+    // hash f96f244c2b3198f724fcea0eafec32c7 and 1325 bytes, was of the register `obs` map the cell
+    // replaced). Its golden is the compact one: `compact_tests` pins it with the others.
+    let st = golden_obs();
+    assert!(st.slots.values().any(|s| s.absorbed.is_some()));
+    assert!(st.without_ords().v1_refused_only_for_a_pair());
+    assert_eq!(st.without_ords().try_canonical_bytes(), Err(V1CannotHold));
+    assert_eq!(st.without_ords().try_state_hash(), Err(V1CannotHold));
+    assert_eq!(MergeState::decode_compact(&st.encode_compact()).unwrap(), st);
 }
 
 #[test]
@@ -1982,6 +1982,7 @@ fn next_stamp_of(w: &Writer, skew: u64) -> MStamp {
 fn stamped_writes_equal_self_ticking_writes() {
     let mut own = Writer::new(wid('A', 0), opts());
     let mut ext = Writer::new(wid('A', 0), opts());
+    let mut split = super::codec::V1Split::default();
     // Both sides run the same step; `$e` is the self-ticking call, `$x` the stamped one given
     // `st` (the stamp of `tick`) through a closure.
     macro_rules! step {
@@ -1998,7 +1999,10 @@ fn stamped_writes_equal_self_ticking_writes() {
             assert_eq!(a.as_ref().map(|w: &Written| w.stamp), b.unwrap().map(|w| w.stamp));
             assert_eq!(own.state, ext.state);
             assert_eq!(own.clock, ext.clock);
-            assert_eq!(own.state.state_hash(), ext.state.state_hash());
+            assert_eq!(own.state.compact_hash(), ext.state.compact_hash());
+            if split.note(&own.state) {
+                assert_eq!(own.state.state_hash(), ext.state.state_hash());
+            }
         }};
     }
     let (x, y, n) = (p("x"), p("y"), p("n"));
@@ -2046,6 +2050,7 @@ fn stamped_writes_equal_self_ticking_writes() {
         e2.upsert_soi_stamped(&sf, &v, 2, &sets, &mut || mint.next().unwrap()).unwrap().unwrap();
     assert_eq!((a1.stamp, a2.stamp), (b1.stamp, b2.stamp));
     assert_eq!(o2.state, e2.state);
+    eprintln!("stamped_writes_equal_self_ticking_writes: {split:?}");
 }
 
 #[test]

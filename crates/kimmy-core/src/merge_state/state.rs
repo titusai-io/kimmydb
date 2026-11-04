@@ -387,6 +387,14 @@ impl MergeState {
     /// NOT checked, one state could show it and no law needs it: the absorbed stamp being by the
     /// writer of the slot's key (an honest pair is, since it is a stamp of that slot).
     ///
+    /// The version 1 form only (`decode`, not `decode_compact`):
+    ///
+    /// 26. A register's `obs` place is always empty ([`DecodeError::NotCanonical`]). A version 1
+    ///     register still has a count where the `obs` map used to be; what a base had counted is
+    ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
+    ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
+    ///     (a decoded state has no `obs` to show it).
+    ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
         if self.dead.iter().any(|l| !self.lives.contains_key(l)) {

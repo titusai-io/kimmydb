@@ -46,8 +46,14 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
         ("small", golden_small()),
     ] {
         let enc = round_trip(&st);
-        let verbose = st.canonical_bytes().len();
-        println!("{name}: compact {} B, verbose {verbose} B", enc.len() - 4);
+        // a state with an absorbed pair has no version 1 length: it is then the length of the same
+        // state without its pairs (a lower bound), marked `>=`
+        let (verbose, exact) = st.v1_len_for_size_checks();
+        println!(
+            "{name}: compact {} B, verbose {}{verbose} B",
+            enc.len() - 4,
+            if exact { "" } else { ">= " }
+        );
         if name != "empty" {
             assert!(enc.len() * 2 < verbose, "{name}: {} against {verbose}", enc.len());
         }
@@ -189,13 +195,25 @@ fn pool(seed: u64) -> Vec<MergeState> {
 #[test]
 fn random_states_round_trip_and_equal_states_encode_equal() {
     let mut seen: Vec<(MergeState, Vec<u8>)> = Vec::new();
+    let (mut exact, mut lower_bound) = (0, 0);
     for seed in 1..=12u64 {
         for st in pool(seed * 0x9E37) {
             let enc = round_trip(&st);
-            assert!(enc.len() < st.encode().len(), "compact is smaller");
+            // against version 1 where it can spell the state; a state with an absorbed pair has no
+            // version 1 length, and is compared with the length of the same state without its pairs
+            let (v1_len, is_exact) = st.v1_len_for_size_checks();
+            assert!(enc.len() < v1_len + 4, "compact is smaller");
+            if is_exact {
+                exact += 1;
+            } else {
+                lower_bound += 1;
+            }
             seen.push((st, enc));
         }
     }
+    eprintln!(
+        "compact is smaller than version 1: {exact} states exactly, {lower_bound} against the pair-free length"
+    );
     // Distinct states, distinct bytes; equal states, equal bytes (checked on a sample).
     for (a, b) in seen.iter().step_by(7).zip(seen.iter().skip(3).step_by(11)) {
         assert_eq!(a.0 == b.0, a.1 == b.1);
@@ -621,12 +639,13 @@ fn b1_shapes_compact_against_verbose() {
             .sum();
         for history in ["fresh", "aged", "clashed"] {
             let st = b1_state(&fields, history);
-            let (verbose, compact) =
-                (st.canonical_bytes().len(), st.without_ords().compact_bytes().len());
+            let (verbose, exact) = st.v1_len_for_size_checks();
+            let compact = st.without_ords().compact_bytes().len();
+            let verbose_text = format!("{}{verbose}", if exact { "" } else { ">= " });
             assert_eq!(MergeState::decode_compact(&st.encode_compact()).unwrap(), st);
             assert!(compact * 3 < verbose, "{n} {history}: {compact} against {verbose}");
             rows.push(format!(
-                "| {n} | {history} | {verbose} | {compact} | {:.1}x | {} |",
+                "| {n} | {history} | {verbose_text} | {compact} | {:.1}x | {} |",
                 verbose as f64 / compact as f64,
                 compact + 16 - payload
             ));
