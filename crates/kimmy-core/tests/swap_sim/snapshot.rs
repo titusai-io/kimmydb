@@ -301,6 +301,11 @@ impl Member {
                 dp.docs = pd.docs.clone();
                 if w.policy == Policy::Field {
                     self.witness_docs(&pd.docs);
+                    let recs: Vec<(u32, Vec<_>)> =
+                        pd.docs.iter().map(|(k, v)| (*k, crate::field::page_records(v))).collect();
+                    for (k, fresh) in recs {
+                        self.mint_q7(w, &name, k, &fresh);
+                    }
                 }
                 if ungranted {
                     for (k, v) in pd.docs.iter() {
@@ -315,7 +320,7 @@ impl Member {
             Some(true) if w.policy == Policy::Field => {
                 self.witness_docs(&pd.docs);
                 for (k, v) in pd.docs.iter() {
-                    let merged = match self.phys.get(&name).unwrap().docs.get(k) {
+                    let (merged, fresh) = match self.phys.get(&name).unwrap().docs.get(k) {
                         Some(cur) => crate::field::merge_page(cur, v, ungranted, &w.fopts),
                         None => {
                             // a document this member did not hold: while the join is unfinished the entries delivered in
@@ -326,10 +331,12 @@ impl Member {
                                     kimmy_core::merge_state::MergeState::default(),
                                 ));
                             }
-                            nv
+                            let fresh = crate::field::page_records(&nv);
+                            (nv, fresh)
                         }
                     };
                     self.phys.get_mut(&name).unwrap().docs.insert(*k, merged);
+                    self.mint_q7(w, &name, *k, &fresh);
                 }
                 self.page_entries(w, &name, &pd.docs, &mut j);
             }
@@ -458,7 +465,7 @@ impl Member {
         let mut rows: HashMap<usize, i64> = HashMap::new();
         for &i in j.pl.held.iter().filter(|&&i| !self.cv.has(i)) {
             let x = w.ent(i);
-            if x.kind != Kind::Loss {
+            if !matches!(x.kind, Kind::Loss | Kind::LossQ7) {
                 let r = rows.entry(x.origin).or_insert(-1);
                 *r = (*r).max(x.hlc);
             }

@@ -406,8 +406,15 @@ mod tests {
                 .iter()
                 .filter(|(k, v)| {
                     **v != 0
-                        && (["diverged", "loss_extra", "loss_missing", "oracle_state", "invariant"]
-                            .contains(&k.as_str())
+                        && ([
+                            "diverged",
+                            "loss_extra",
+                            "loss_missing",
+                            "oracle_state",
+                            "invariant",
+                            "q7_records_diverged",
+                        ]
+                        .contains(&k.as_str())
                             || k.starts_with("inv_"))
                 })
                 .collect();
@@ -438,6 +445,26 @@ mod tests {
                             .map(|m| m.name.clone())
                             .collect::<Vec<_>>()
                     );
+                }
+                for m in &r.ms {
+                    for (n, p) in m.phys.iter().filter(|(_, p)| p.alive) {
+                        for (k, v) in p.docs.iter() {
+                            if let Some(st) = &v.state
+                                && !st.losses.is_empty()
+                            {
+                                eprintln!(
+                                    "Q7 {} {} key {} records {:?}",
+                                    m.name,
+                                    n,
+                                    k,
+                                    st.losses
+                                        .keys()
+                                        .map(|lk| format!("{:?}@{}", lk.kind, lk.stamp.hlc.wall_ms))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                    }
                 }
                 eprintln!(
                     "ALLOWED {:?}",

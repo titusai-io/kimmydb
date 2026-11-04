@@ -13,6 +13,11 @@ use kimmy_core::merge_state::{
 
 use crate::entry::*;
 
+/// RULED (the manager, after phase F report 1): an insert's own field cells are covered by the whole-insert write (Q7 D10 (1),
+/// made the `field` contract by Chris's note 3), so the REQUIRED set holds the insert's document-level write only. The one place
+/// to change if the ruling changes: `false` requires every field cell of an insert as well (the allowed set holds them anyway).
+pub const REQUIRE_INSERT_FIELD_CELLS: bool = false;
+
 /// The cut of a loss record's value (Chris's L34-B ruling: 64 B, per value, with a `truncated` flag).
 pub const VALUE_CUT: usize = 64;
 
@@ -73,7 +78,7 @@ pub struct Applied {
     /// the covered-entry skip fired
     pub skipped: bool,
     /// the records the join detected that were new to the joined state (Q7's family)
-    pub fresh: usize,
+    pub fresh: Vec<(kimmy_core::merge_state::LossKey, LossValue)>,
 }
 
 /// Apply the entry `e` to the version `cur` (`None`: the document is unknown here). `missing`: the physical is a
@@ -86,7 +91,7 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
             changed: true,
             held_state: false,
             skipped: false,
-            fresh: es.losses.len(),
+            fresh: es.losses.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
     };
     let base = cur.state.as_ref().expect("a field version carries its state");
@@ -99,7 +104,13 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
         // unchanged only because pages cover it: a placeholder is all page state; an alive physical keeps `applied`
         let held_state =
             if cur.applied.is_some() { applied_would_change(cur, es, o) } else { missing };
-        return Applied { ver: cur.clone(), changed: false, held_state, skipped: true, fresh: 0 };
+        return Applied {
+            ver: cur.clone(),
+            changed: false,
+            held_state,
+            skipped: true,
+            fresh: Vec::new(),
+        };
     }
     let (merged, fresh) = join(base, es, o);
     let changed = merged != **base;
@@ -112,7 +123,11 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
         None => (None, missing && !changed),
     };
     let stamp = if e.stamp > cur.stamp { e.stamp } else { cur.stamp };
-    let new_fresh = fresh.iter().filter(|k| !base.losses.contains_key(*k)).count();
+    let new_fresh: Vec<_> = fresh
+        .iter()
+        .filter(|k| !base.losses.contains_key(*k))
+        .filter_map(|k| merged.losses.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
     Applied {
         ver: Ver { stamp, body: body_of(&merged, o), state: Some(Rc::new(merged)), applied },
         changed,
@@ -140,16 +155,34 @@ fn applied_would_change(cur: &Ver, es: &MergeState, o: &JoinOptions) -> bool {
 
 /// Merge a snapshot page's version into the version held here. While the join is unfinished (`ungranted`) the page state
 /// is held out of position: `applied` keeps the state the in-position entries built.
-pub fn merge_page(cur: &Ver, page: &Ver, ungranted: bool, o: &JoinOptions) -> Ver {
+pub fn merge_page(
+    cur: &Ver,
+    page: &Ver,
+    ungranted: bool,
+    o: &JoinOptions,
+) -> (Ver, Vec<(kimmy_core::merge_state::LossKey, LossValue)>) {
     let (cs, ps) = (cur.state.as_ref().expect("state"), page.state.as_ref().expect("state"));
-    let (merged, _) = join(cs, ps, o);
+    let (merged, fresh) = join(cs, ps, o);
+    let fresh: Vec<_> = fresh
+        .iter()
+        .filter(|k| !cs.losses.contains_key(*k))
+        .filter_map(|k| merged.losses.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
     let applied = if ungranted {
         Some(cur.applied.clone().unwrap_or_else(|| cs.clone()))
     } else {
         cur.applied.clone()
     };
     let stamp = if page.stamp > cur.stamp { page.stamp } else { cur.stamp };
-    Ver { stamp, body: body_of(&merged, o), state: Some(Rc::new(merged)), applied }
+    (Ver { stamp, body: body_of(&merged, o), state: Some(Rc::new(merged)), applied }, fresh)
+}
+
+/// The records of a page version that are new to a member that held no version of the document.
+pub fn page_records(v: &Ver) -> Vec<(kimmy_core::merge_state::LossKey, LossValue)> {
+    v.state
+        .as_ref()
+        .map(|s| s.losses.iter().map(|(k, x)| (k.clone(), x.clone())).collect())
+        .unwrap_or_default()
 }
 
 /// A write of a state that some cell of which is after `after`: one lost cell.
@@ -237,7 +270,7 @@ pub fn local_write(
     mark: &str,
     o: &JoinOptions,
     counter: bool,
-) -> Option<Rc<MergeState>> {
+) -> Result<Option<Rc<MergeState>>, kimmy_core::merge_state::StampError> {
     use crate::member::DocOp;
     let mut wr =
         Writer::from_state(writer(id), state.map(|s| (**s).clone()).unwrap_or_default(), o.clone());
@@ -257,8 +290,9 @@ pub fn local_write(
         DocOp::Delete => wr.write_delete_stamped(&mut mint),
     };
     match r {
-        Ok(Some(_)) => Some(Rc::new(wr.state)),
-        _ => None,
+        Ok(Some(_)) => Ok(Some(Rc::new(wr.state))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

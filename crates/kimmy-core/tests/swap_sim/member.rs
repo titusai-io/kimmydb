@@ -255,7 +255,17 @@ impl Member {
             &mark,
             &w.fopts,
             counter,
-        )?;
+        );
+        let st = match st {
+            Ok(Some(st)) => st,
+            Ok(None) => return None,
+            Err(_) => {
+                // the stamp is not above something the document's state has merged: the HLC rule (witness, no tick) is meant to
+                // make this impossible; it is counted and the run fails on it
+                w.stats.bump("field_stamp_refused");
+                return None;
+            }
+        };
         let opk = match op {
             DocOp::Insert => Opk::Insert,
             DocOp::Update => Opk::Replace,
@@ -356,6 +366,7 @@ impl Member {
                     &w.fopts,
                     false,
                 )
+                .expect("a stamp above an empty state")
                 .expect("a staged insert");
                 row.body = crate::field::body_of(&st, &w.fopts);
                 row.fstate = Some(st);
