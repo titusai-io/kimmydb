@@ -10,6 +10,7 @@ use crate::member::{DocOp, Member};
 use crate::oracle::{Res, finish};
 use crate::relay::{pair, take_quiesce};
 use crate::rng::Rng;
+use crate::snapshot::{land_page_in, snapshot_begin_in};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
@@ -24,7 +25,7 @@ pub struct Cfg {
 
 impl Cfg {
     pub fn new(members: usize, outs: usize, keys: usize) -> Self {
-        Self { members, keys, outs, steps: None, delete_bias: false, snapshots: false }
+        Self { members, keys, outs, steps: None, delete_bias: false, snapshots: true }
     }
 }
 
@@ -147,7 +148,48 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                     ms[m].local_lcreate(&mut w);
                 }
             }
-            4 | 5 => unreachable!("snapshot joins are phase B"),
+            4 => {
+                if active.is_empty() {
+                    continue;
+                }
+                let dst = active[w.rng.below(active.len())];
+                let cands: Vec<usize> = (0..ms.len())
+                    .filter(|&i| i != dst && !ms[i].vanished && ms[i].eligible_source())
+                    .collect();
+                let post: Vec<usize> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        ms[i].cur.as_ref().is_some_and(|c| {
+                            c.kind == Kind::Bind
+                                && ms[i]
+                                    .phys
+                                    .get(&c.phys)
+                                    .unwrap()
+                                    .docs
+                                    .values()
+                                    .any(|v| v.stamp > c.stamp)
+                        })
+                    })
+                    .collect();
+                if !cands.is_empty() {
+                    let src = if !post.is_empty() && w.rng.f64() < 0.6 {
+                        post[w.rng.below(post.len())]
+                    } else {
+                        cands[w.rng.below(cands.len())]
+                    };
+                    let lazy = w.rng.f64() < 0.5;
+                    snapshot_begin_in(&mut ms, dst, src, &mut w, lazy);
+                }
+            }
+            5 => {
+                let joining: Vec<usize> =
+                    (0..ms.len()).filter(|&i| ms[i].join.is_some() && !ms[i].vanished).collect();
+                if !joining.is_empty() {
+                    let m = joining[w.rng.below(joining.len())];
+                    land_page_in(&mut ms, m, &mut w);
+                }
+            }
             6 => {
                 if active.len() < 2 {
                     continue;
@@ -182,9 +224,19 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         ms[j.writer].do_bind(&mut w, &mut j, live);
     }
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();
+    for &i in &live {
+        while ms[i].join.is_some() {
+            land_page_in(&mut ms, i, &mut w);
+        }
+    }
     w.lost =
         w.all.iter().filter(|e| !live.iter().any(|&i| ms[i].holds(e.idx))).map(|e| e.idx).collect();
     for _ in 0..12 {
+        for &i in &live {
+            while ms[i].join.is_some() {
+                land_page_in(&mut ms, i, &mut w);
+            }
+        }
         for &i in &live {
             let mut order: Vec<EntryRef> =
                 w.all.iter().filter(|e| !w.lost.contains(&e.idx)).cloned().collect();

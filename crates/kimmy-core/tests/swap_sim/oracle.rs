@@ -410,6 +410,29 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             }
         }
     }
+    // invariant (i): no grant and no page names an entry above its sender's coverage
+    if w.stats.get("grant_above_coverage") > 0 {
+        inv.insert("grant_above_coverage".into());
+    }
+    if w.stats.get("page_above_coverage") > 0 {
+        inv.insert("page_above_coverage".into());
+    }
+    // D3 invariant: a join's register events are its sender's own (never read from another member)
+    if w.stats.get("register_read_from_a_member_that_is_not_the_sender") > 0 {
+        inv.insert("register_read_from_a_member_that_is_not_the_sender".into());
+    }
+    // D10 liveness: in an in-order run (register events travel only in position) no live member may still be refusing
+    // writes at the end of the run (a covered or parked event supersedes the physical it serves)
+    if w.in_order {
+        for &i in &live {
+            if let Some(s) = ms[i].serving()
+                && (ms[i].first_superseding(w, &s).is_some()
+                    || ms[i].info_superseding(w, &s).is_some())
+            {
+                inv.insert("open_refusal_at_run_end".into());
+            }
+        }
+    }
     let st = &w.stats;
     if st.get("accepted_while_pending") > 0 {
         inv.insert("write_accepted_while_pending".into());
@@ -503,6 +526,19 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "snap_versions_as_entries",
     ] {
         res.insert(format!("nv_{kk}"), (st.get(kk) > 0) as i64);
+        res.insert(format!("cnt_{kk}"), st.get(kk));
+    }
+    for kk in [
+        "info_parked",
+        "info_taken_effect",
+        "accepted_while_info_superseded",
+        "grant_above_coverage",
+        "page_above_coverage",
+        "grant_entries_withheld_above_coverage",
+        "dead_page_versions_retained",
+        "snap_completed",
+        "join_superseded",
+    ] {
         res.insert(format!("cnt_{kk}"), st.get(kk));
     }
     res.insert("late_write_count".into(), o.loss.len() as i64);

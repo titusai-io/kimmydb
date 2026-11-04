@@ -39,14 +39,20 @@ pub struct Flags {
     pub paged_register_read: bool,
     pub register_grant_filter: bool,
     pub stale_src_bug: bool,
+    /// v6: a register event takes effect only once covered; one ahead of its position is information
+    pub rule_b: bool,
+    /// v6: the product's grant: the sender's contiguous coverage, and only that prefix of its held set
+    pub grant_prefix: bool,
+    /// v6 (seed 885): a snapshot page's versions of a physical buried on the receiver are history on arrival: retained
+    pub dead_page_retained: bool,
 }
 
 /// Every base the harness knows.
 pub const BASES: [&str; 4] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule"];
 
-/// The 29 mutants of `MUTANTS` (`swapmodel5.py` 160-190), in the model's order.
-pub const MUTANTS: [&str; 29] = [
+/// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
+pub const MUTANTS: [&str; 32] = [
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -76,6 +82,10 @@ pub const MUTANTS: [&str; 29] = [
     "m-ignored-event-not-served",
     "m-no-defer-received",
     "m-no-pending-dedup",
+    "m-rule-b-off",
+    "m-dead-page-dropped",
+    // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
+    "m-stale-src",
 ];
 
 fn v5() -> Flags {
@@ -98,6 +108,11 @@ pub fn base(name: &str) -> Option<Flags> {
     let mut f = v5();
     match name {
         "v5" => {}
+        "v6" => {
+            f.rule_b = true;
+            f.grant_prefix = true;
+            f.dead_page_retained = true;
+        }
         "v5-late-register" => f.register_grant_filter = false,
         "v5-late-register-literal" => {
             f.register_grant_filter = false;
@@ -143,6 +158,9 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-ignored-event-not-served" => f.ignored_not_served = true,
         "m-no-defer-received" => f.defer_received = false,
         "m-no-pending-dedup" => f.pending_dedup = false,
+        "m-rule-b-off" => f.rule_b = false,
+        "m-dead-page-dropped" => f.dead_page_retained = false,
+        "m-stale-src" => f.stale_src_bug = true,
         _ => return false,
     }
     true
@@ -158,9 +176,12 @@ pub fn flags_for(mode: &str, base_name: &str) -> Flags {
             None => (part, None),
         };
         if let Some(b) = base(name) {
-            // a base in the mode overrides what it sets; every base differs from `v5` only in these two flags
+            // a base in the mode overrides what it sets; the bases differ from `v5` only in these flags
             f.register_grant_filter = b.register_grant_filter;
             f.stale_src_bug = b.stale_src_bug;
+            f.rule_b = b.rule_b;
+            f.grant_prefix = b.grant_prefix;
+            f.dead_page_retained = b.dead_page_retained;
         } else if !apply_mutant(&mut f, name, arg) {
             panic!("unknown mode {mode}");
         }
@@ -175,8 +196,8 @@ mod tests {
     #[test]
     fn every_mutant_name_is_known_and_changes_a_flag() {
         for m in MUTANTS {
-            let base = flags_for("v5", "v5");
-            let f = flags_for(m, "v5");
+            let base = flags_for("v6", "v6");
+            let f = flags_for(m, "v6");
             assert_ne!(format!("{base:?}"), format!("{f:?}"), "{m} changes nothing");
         }
     }

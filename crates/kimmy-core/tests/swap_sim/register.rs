@@ -11,9 +11,20 @@ impl Member {
         w.f.orphan_no_deadline || w.valid(e)
     }
 
-    pub fn add_event(&mut self, w: &World, e: &Entry) -> bool {
+    pub fn add_event(&mut self, w: &mut World, e: &Entry) -> bool {
         if self.events.contains(&e.idx) {
             return false;
+        }
+        if w.f.rule_b && !self.covers(w, e.origin, e.hlc) {
+            // rule B: the event is ahead of its position here: information, no effect until the member covers it
+            if !self.info.contains_key(&e.idx) {
+                self.info.insert(e.idx, w.ent_rc(e.idx));
+                w.stats.bump("info_parked");
+            }
+            return false;
+        }
+        if self.info.remove(&e.idx).is_some() {
+            w.stats.bump("info_taken_effect");
         }
         self.events.insert(e.idx);
         let pos = self.evl.partition_point(|&i| w.ent(i).stamp <= e.stamp);
@@ -53,6 +64,40 @@ impl Member {
         self.first_superseding(w, name).map(|e| e.stamp)
     }
 
+    /// The earliest valid register event held as information that would supersede the physical (rule B), or `None`.
+    pub fn info_superseding(&self, w: &World, name: &str) -> Option<EntryRef> {
+        let b = *self.bmap.get(name)?;
+        let mut xs: Vec<&EntryRef> = self.info.values().collect();
+        xs.sort_by_key(|x| x.stamp);
+        xs.into_iter()
+            .find(|x| x.stamp > b && (x.kind == Kind::Ldrop || x.phys != name) && w.valid(x))
+            .cloned()
+    }
+
+    /// Rule B: an event held as information whose origin the member now covers takes effect, as an arrival (D11's rescan).
+    pub fn activate_info(&mut self, w: &mut World) -> bool {
+        if self.info.is_empty() {
+            return false;
+        }
+        let mut prog = false;
+        let mut xs: Vec<EntryRef> = self.info.values().cloned().collect();
+        xs.sort_by_key(|x| x.stamp);
+        for e in xs {
+            if self.covers(w, e.origin, e.hlc) {
+                if self.add_event(w, &e) {
+                    if e.kind == Kind::Lcreate && !self.phys.contains_key(&e.phys) {
+                        self.phys.insert(e.phys.clone(), Phys::new(PKind::Rc));
+                    }
+                    self.rescan(w, None);
+                    prog = true;
+                } else {
+                    self.info.remove(&e.idx);
+                }
+            }
+        }
+        prog
+    }
+
     /// v2.1's R5 (kept for m-pending-narrow): a valid binding above the visible event whose stage is not buried.
     pub fn pending(&self, w: &World) -> bool {
         let curst = self.cur.as_ref().map_or_else(neg, |c| c.stamp);
@@ -78,7 +123,9 @@ impl Member {
         if f.pend_narrow {
             return if self.pending(w) { Some("bind") } else { None };
         }
-        self.first_superseding(w, s).map(|ev| ev.kind.name())
+        // rule B / D10: "known" includes an event held as information ahead of its position
+        let x = self.first_superseding(w, s).or_else(|| self.info_superseding(w, s));
+        x.map(|ev| ev.kind.name())
     }
 
     // ---- R3, R4, R7, R9: the flip machinery
@@ -315,6 +362,9 @@ impl Member {
     pub fn settle(&mut self, w: &mut World) {
         for _ in 0..60 {
             let mut prog = false;
+            if self.activate_info(w) {
+                prog = true;
+            }
             if self.retry_deferred(w) {
                 prog = true; // held entries are applied before visibility is judged
             }

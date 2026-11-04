@@ -10,15 +10,17 @@
 //! delivery is in position; ADR-127's rule for raising the vector past a window's end; the full-stamp cursor;
 //! far-future clock checks; epoch retirement.
 
+use std::cell::RefCell;
+
 use crate::entry::EntryId;
 use crate::world::World;
 
 pub trait CoverageOf {
     /// Does this member's coverage of `origin` reach `hlc`: every entry of the origin with `hlc <=` the given
     /// one is applied, history, or held as state? (`swapmodel5.py` `covers`, 358-366)
-    fn covers(&mut self, w: &World, origin: usize, hlc: i64) -> bool;
+    fn covers(&self, w: &World, origin: usize, hlc: i64) -> bool;
     /// `covers`, and some held entry of the origin is above `hlc` (the D9 safety net; `covers_past`, 368-372).
-    fn covers_past(&mut self, w: &World, origin: usize, hlc: i64) -> bool;
+    fn covers_past(&self, w: &World, origin: usize, hlc: i64) -> bool;
     /// The member holds the entry (applied, history, witnessed, or held as state).
     fn has(&self, id: EntryId) -> bool;
     /// Mark an entry held (the coverage claim rises when the prefix is contiguous).
@@ -30,7 +32,7 @@ pub trait CoverageOf {
 #[derive(Clone, Debug, Default)]
 pub struct PrefixCoverage {
     held: Vec<u64>,
-    cursor: Vec<usize>,
+    cursor: RefCell<Vec<usize>>,
 }
 
 impl PrefixCoverage {
@@ -58,21 +60,22 @@ impl PrefixCoverage {
 }
 
 impl CoverageOf for PrefixCoverage {
-    fn covers(&mut self, w: &World, origin: usize, hlc: i64) -> bool {
-        if self.cursor.len() <= origin {
-            self.cursor.resize(origin + 1, 0);
+    fn covers(&self, w: &World, origin: usize, hlc: i64) -> bool {
+        let mut cursor = self.cursor.borrow_mut();
+        if cursor.len() <= origin {
+            cursor.resize(origin + 1, 0);
         }
         let lst = &w.by_origin[origin];
-        let mut i = self.cursor[origin];
+        let mut i = cursor[origin];
         let n = lst.len();
         while i < n && self.has(lst[i]) {
             i += 1;
         }
-        self.cursor[origin] = i;
+        cursor[origin] = i;
         i >= n || w.ent(lst[i]).hlc > hlc
     }
 
-    fn covers_past(&mut self, w: &World, origin: usize, hlc: i64) -> bool {
+    fn covers_past(&self, w: &World, origin: usize, hlc: i64) -> bool {
         if !self.covers(w, origin, hlc) {
             return false;
         }
