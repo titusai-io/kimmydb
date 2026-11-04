@@ -14,7 +14,7 @@ use kimmy_core::merge_state::{
 use serde_json::Value as J;
 
 const SCRIPTS: &str = include_str!("../data/ord_diff_scripts.json");
-const MODEL6_SHA256: &str = "865808753a5f9a4b80688a874f887ca1935de53b43ea19a0c6f13aa6b3497d08";
+const MODEL6_SHA256: &str = "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d";
 
 fn wid(c: char) -> WriterId {
     WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(0) }
@@ -48,7 +48,12 @@ fn fields(j: &J) -> Vec<(Path, Value)> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|f| (Path::flat(f[0].as_str().unwrap()).unwrap(), value(&f[1])))
+        .map(|f| {
+            (
+                Path::new(f[0].as_str().unwrap().split('.').map(str::to_string)).unwrap(),
+                value(&f[1]),
+            )
+        })
         .collect()
 }
 
@@ -264,4 +269,41 @@ pub fn replay(opts: &JoinOptions) -> Found {
         }
     }
     f
+}
+
+/// How many upserts of the scripts name a nested path (the incremented path, or a creation or `$set` field): the shape the Rust
+/// fix of O2-2 and the model's A2.3 fix are compared on.
+pub fn nested_upserts() -> usize {
+    let all: J = serde_json::from_str(SCRIPTS).unwrap();
+    let nested = |s: &J| {
+        let mut names: Vec<String> = vec![
+            s["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("."),
+        ];
+        if s["op"] == "upsert_soi" {
+            for k in ["fields", "sets"] {
+                names.extend(
+                    s["arg"][k]["v"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|f| f[0].as_str().unwrap().to_string()),
+                );
+            }
+        }
+        s["path"].as_array().unwrap().len() > 1 || names.iter().any(|n| n.contains('.'))
+    };
+    all["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|sc| sc["steps"].as_array().unwrap())
+        .filter(|s| s["k"] == "op" && matches!(s["op"].as_str(), Some("upsert_inc" | "upsert_soi")))
+        .filter(|s| nested(s))
+        .count()
 }

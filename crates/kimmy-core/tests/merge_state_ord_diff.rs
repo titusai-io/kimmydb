@@ -43,8 +43,10 @@ fn the_writers_order_state_and_ordered_document_equal_the_models_after_every_ste
     // non-vacuity, pinned (the scripts are seeded)
     assert_eq!(
         (f.scripts, f.steps, f.writes, f.refused, f.receives),
-        (300, 9000, 6152, 1435, 2848)
+        (300, 9000, 6154, 1452, 2846)
     );
+    // the upserts of nested paths (A2.3 and eb40bbcf name their ancestors): drawn, and compared like every other step
+    assert_eq!(ord_replay::nested_upserts(), 94);
     assert!(f.ordered_docs > 7000 && f.ord_keys > 30_000, "{} {}", f.ordered_docs, f.ord_keys);
 }
 

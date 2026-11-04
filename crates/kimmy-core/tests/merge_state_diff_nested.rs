@@ -796,7 +796,8 @@ fn rust_mutants_are_caught_by_the_replay() {
 #[test]
 fn the_vendored_model_is_the_reviewed_one() {
     use sha2::{Digest, Sha256};
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
         ("model6.py", "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"),
         ("pullmodel6.py", "e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"),

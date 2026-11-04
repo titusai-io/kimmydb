@@ -1,6 +1,10 @@
-"""Q7 Step 0, Rust item O2: the ORDER differential. Random scripts of local writes AND receives, run on the A2.1 Python model; the Rust
+"""Q7 Step 0, Rust item O2: the ORDER differential. Random scripts of local writes AND receives, run on the A2.3 Python model (model6.py 72da18eb); the Rust
 test (`tests/merge_state_ord_diff.rs`) replays each script through `Writer`s and compares, after every step, the acting member's
 ordered document and order state, and the result of the step (the stamp it got, or none for a refusal or a no-op).
+
+Upserts of NESTED paths are drawn (A2.3 names their ancestors, as the Rust writer does since eb40bbcf): in the nested scripts the
+incremented path of an `upsert_inc` and the paths of an `upsert_soi` (creation fields, `$set` fields, incremented path, pairwise
+disjoint) come from the nested pool.
 
 Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_differential.py <out-dir> [seed-to-show]
          (-B and sys.dont_write_bytecode: the model directory must not get a __pycache__)
@@ -199,15 +203,28 @@ def script(kind, seed, steps=30):
                 st = m.insert(doc, log, skew)
                 step = {"op": "insert", "arg": j_arg(doc)}
             elif k < 0.88:
-                p = rnd.choice(FIELDS)
+                p = rnd.choice(NPATHS if nested else FIELDS)       # (A2.3: an upsert of a nested path names its ancestors)
                 n = rnd.randint(-2, 5)
                 st = m.upsert_inc(p, n, log, skew)
                 step = {"op": "upsert_inc", "path": p.split("."), "arg": j_arg(n)}
             else:
-                flds = {n_: rnd.randint(0, 9) for n_ in rnd.sample(FIELDS[:3], rnd.randint(0, 3))}
-                free = [f for f in FIELDS if f not in flds]
-                p = rnd.choice(free)
-                sets = {n_: rnd.randint(0, 9) for n_ in rnd.sample([f for f in free if f != p], rnd.randint(0, 2))}
+                if nested:
+                    # the paths of the creation, the $set fields and the incremented field may be nested; they must be disjoint
+                    for _ in range(50):
+                        ps = rnd.sample(NPATHS, rnd.randint(1, 4))
+                        if disjoint(ps):
+                            break
+                    else:
+                        ps = ps[:1]
+                    p, rest = ps[0], ps[1:]
+                    cut = rnd.randint(0, len(rest))
+                    flds = {n_: rnd.randint(0, 9) for n_ in rest[:cut]}
+                    sets = {n_: rnd.randint(0, 9) for n_ in rest[cut:]}
+                else:
+                    flds = {n_: rnd.randint(0, 9) for n_ in rnd.sample(FIELDS[:3], rnd.randint(0, 3))}
+                    free = [f for f in FIELDS if f not in flds]
+                    p = rnd.choice(free)
+                    sets = {n_: rnd.randint(0, 9) for n_ in rnd.sample([f for f in free if f != p], rnd.randint(0, 2))}
                 n = rnd.randint(1, 4)
                 st = m.upsert_soi(flds, p, n, log, skew, sets=sets)
                 step = {"op": "upsert_soi", "path": p.split("."),
@@ -283,7 +300,7 @@ def script(kind, seed, steps=30):
 def main(outdir, show=None):
     sha = hashlib.sha256(open(os.path.join(MODEL, "model6.py"), "rb").read()).hexdigest()
     scripts = []
-    stats = {"ops": 0, "recvs": 0, "refused": 0}
+    stats = {"ops": 0, "recvs": 0, "refused": 0, "upserts": 0, "nested upserts": 0, "nested upserts applied": 0}
     for kind, seeds in (("flat", range(1, 151)), ("nested", range(1001, 1151))):
         for seed in seeds:
             sc, shown = script(kind, seed)
@@ -297,6 +314,12 @@ def main(outdir, show=None):
                 else:
                     stats["ops"] += 1
                     stats["refused"] += s["res"] is None
+                    if s["op"] in ("upsert_inc", "upsert_soi"):
+                        stats["upserts"] += 1
+                        paths = ["".join(s["path"])] + ([f[0] for f in s["arg"]["fields"]["v"] + s["arg"]["sets"]["v"]] if s["op"] == "upsert_soi" else [])
+                        isn = any("." in q or len(s["path"]) > 1 for q in paths)
+                        stats["nested upserts"] += isn
+                        stats["nested upserts applied"] += isn and s["res"] is not None
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "ord_diff_scripts.json"), "w") as f:
         json.dump({"model6_sha256": sha, "scripts": scripts}, f, separators=(",", ":"), sort_keys=True)
