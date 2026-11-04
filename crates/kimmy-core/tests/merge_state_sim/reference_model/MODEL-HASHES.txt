@@ -1,0 +1,4 @@
+The vendored reference model of the Q7 merge state: the A2.3 model, byte for byte from the model tree (q7step0-model).
+72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d  model6.py       (A2.3; was 865808753a5f9a4b at A2.1/A2.2)
+e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b  pullmodel6.py   (unchanged since A2.1)
+The sha256 of each file is checked by a Rust test (merge_state_diff_nested.rs, `the_vendored_model_is_the_reviewed_one`).

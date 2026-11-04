@@ -15,19 +15,28 @@
 //! form (`compact.rs`, written again in Python from its documentation: `ch` and `clen`);
 //! `golden_vectors_match_the_model` does the same for the golden vectors of `merge_state/tests.rs`.
 //!
-//! ODD FIELD NAMES. The sim and the join-law tests take the names no dotted spelling can carry (the
-//! empty name, `_`, a name with a dot); this differential takes the empty name and a name with a
-//! dot (the flat model keeps a name as one string), and not `_`, which the model uses for the
-//! whole document in a loss record, so that a field named `_` would share its record key with the
-//! document's (see `ODD` in `reference_model/q7diff_gen.py`).
+//! ODD FIELD NAMES. The vendored A2.3 model reads a dot in a name as a path separator and keys the root of a replace by the
+//! empty name, so this differential no longer draws the empty name or a name with a dot (two plain extra names take their
+//! place in the "odd" writes). They are covered by the sim (`the_sim_workload_holds_odd_names`, with a floor on their
+//! count), the nested differential (`ODD_LEAVES`), the join-law pools (`the_pools_hold_odd_names`) and the unit tests
+//! (`odd_field_names_are_distinct_cells_and_round_trip`, `dotted_names_and_nested_paths_are_different_cells_and_round_trip`,
+//! `odd_names_are_one_segment_paths_through_write_join_visible_and_both_codecs`,
+//! `every_bson_type_and_odd_names_round_trip_in_the_compact_form`).
+//!
+//! NULLS. A stored null is drawn (insert, replace, set): the model's `None` is a present null (A2), the writer's
+//! `Value::Null`. An unset spelled as a value (`Value::Unset`) is drawn in insert, replace and set, and the generator gives the
+//! model its own spelling: `$unset` of the path, or the field left out of the document. The writer stores no register for an
+//! `Unset` field of an insert (or of the creation of an upsert), as the model's absent field; `q4_set_compares_value_and_type`,
+//! `q4_replace_compares_value_and_type`, `an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too` and
+//! `an_unset_field_in_an_insert_or_an_upsert_creation_stores_nothing` cover the writer's side.
 //!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! The `merge-mutants` feature is needed (`Cargo.toml`): the replay sets the stage-A rule that a write which only
-//! reorders the fields is a no-op (the model has no field order), and compares states WITHOUT their order state
-//! (`fingerprint::without_ords`, a named restriction lifted at the D8 re-vendor); the order state meets a model
-//! that has it in `merge_state_ord_diff`.
+//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit
+//! marker, as the Rust side is today. A write that only reorders the fields is a write in the model and in the writer.
+//! The replay compares the bytes and hashes of states WITHOUT their order state (`fingerprint::without_ords`: the
+//! generator's encoders write an empty order section); the order state meets the model in `merge_state_ord_diff`.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
@@ -74,10 +83,11 @@ fn jk(k: &LossKey) -> J {
 fn jv(v: &Value) -> J {
     match v {
         Value::Unset => json!(["n"]),
+        Value::Null => json!(["z"]),
         Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
         Value::String(s) => json!(["s", s]),
-        // The flat reference model has these four types only; the other BSON types are
+        // The flat reference model has these five types only (an unset, a null, an integer, a double, a string); the other BSON types are
         // tested in `merge_state::tests` and the codec tests.
         other => panic!("the reference model has no {other:?}"),
     }
@@ -87,6 +97,7 @@ fn unjv(v: &J) -> Value {
     let a = v.as_array().unwrap();
     match a[0].as_str().unwrap() {
         "n" => Value::Unset,
+        "z" => Value::Null,
         "i" => Value::Int64(a[1].as_str().unwrap().parse().unwrap()),
         "d" => {
             Value::Double(f64::from_bits(u64::from_str_radix(a[1].as_str().unwrap(), 16).unwrap()))
@@ -172,9 +183,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
-    let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
-    // the stage-A model has no field order: a write that only reorders is a no-op there
-    opts.set_ord_reorder_is_noop(true);
+    let opts = JoinOptions::new(ret, bound).expect("a valid bound");
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
         .take(nm)
@@ -596,7 +605,12 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// compact bytes and hash of the state WITH its order state (section 10) and the document in the order the order state gives it, which
 /// the fingerprint did not hold before; the version 1 bytes, the hashes, the visible documents, every stamp and refusal are still compared
 /// with the model, with the order state left out, and did not change (the Group A pin was the same figure).
-const PINNED_300: u64 = 0x2aee_26c6_deda_603d;
+///
+/// RE-PINNED for the D8 re-vendor (the A2.3 model, the flat generator's new draws): 0x2aee_26c6_deda_603d to 0xfbde_c4a1_8eb1_bb13.
+///
+/// RE-PINNED when the generator drew an Unset field in an insert again (the Writer drops such a field): 0xfbde_c4a1_8eb1_bb13 to
+/// 0x5f0f_3ecf_ab90_7bba. The scripts changed (an insert draws one more value); the code under test did not change for the re-pin.
+const PINNED_300: u64 = 0x5f0f_3ecf_ab90_7bba;
 
 #[test]
 fn differential_against_the_python_model() {

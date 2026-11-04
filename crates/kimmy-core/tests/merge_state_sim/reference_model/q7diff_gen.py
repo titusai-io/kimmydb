@@ -1,7 +1,7 @@
 """Differential test of the Rust `merge_state` module against the Python reference model: the
 script generator and the expected answers.
 
-Drives the reference model (model5.py, with pullmodel5.Node's normalised `finish`) through random
+Drives the reference model (model6.py, the vendored A2.3 model, with pullmodel6.Node's normalised `finish`) through random
 operation scripts and writes, for every step, what the Rust side (tests/merge_state_diff.rs) must
 reproduce:
 
@@ -15,7 +15,7 @@ reproduce:
     hidden figure, killed-and-superseded groups, and the stale/unsound verdicts on member 0's records).
 
 Implements the Q7 design document (field-level merge with summing $inc counters and conflictResolved,
-v7.2) by running its reference model; see model5.py.
+v7.2) by running its reference model; see model6.py and MODEL-HASHES.txt.
 
 Usage (standard library only):
   python3 -I q7diff_gen.py <out-dir> <n-scripts> [first-seed] [--plant NAME]
@@ -34,61 +34,61 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import model5 as M  # noqa: E402
+import model6 as M  # noqa: E402
 
 
-def _bits(x):
-    return struct.pack(">d", x) if isinstance(x, float) else x
+# The vendored `same()` is the diff the Rust side uses (bit pattern for doubles, representation for Decimal128, type strict): the
+# harness no longer patches it; it asserts what it relies on. (The scripts draw no NaN and no Dec128; the Rust side tests both.)
+_nan1 = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+_nan2 = struct.unpack(">d", bytes.fromhex("7ff8000000000002"))[0]
+assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
+assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
+assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
+assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
+# the harness runs the model as the Rust side is today: no absorbed cell yet, no implicit map marker yet
+M.ABSORBED = False
+M.NO_IMPLICIT_MARKER = True
 
 
-def same_by_bits(a, b):
-    """The diff, as ruled 2026-11-03: a no-op is a write that leaves the stored representation
-    byte-identical, so doubles compare by bit pattern (0.0 is not -0.0; a NaN is its own bits).
-    model5.py itself is vendored as it was and compares them as numbers, so the harness replaces
-    its `same` here, for the scripts and for the replay."""
-    return type(a) is type(b) and _bits(a) == _bits(b)
+def _x(v):
+    """A value as something that tells apart what the repr strings of `canon()` do not: the bits of a double (a NaN payload, -0.0),
+    a Dec128 from the plain string of the same text."""
+    if isinstance(v, float):
+        return ("f", struct.pack(">d", v).hex())
+    if isinstance(v, tuple):
+        return ("t", tuple(_x(e) for e in v))
+    if isinstance(v, dict):
+        return ("d", tuple((k, _x(e)) for k, e in v.items()))
+    return (type(v).__name__, v)
 
 
-# KimmyDB keeps the cohort member visible (2.30 and 2.3 differ,
-# crates/kimmy-query/src/decimal_arith_tests.rs:32); doubles compare by bit pattern; a no-op is a
-# write that leaves the stored representation byte-identical (manager ruling 2026-11-03); do not
-# "fix" this back to numeric equality.
-M.same = same_by_bits
+def exact(st):
+    """The state, compared exactly: `canon()` plus the register and loss values by their bits (never through repr strings alone)."""
+    return (st.canon(), tuple(sorted((repr(k), _x(r[1])) for k, r in st.regs.items())),
+            tuple(sorted((repr(k), _x(v)) for k, v in st.losses.items())))
 
 M64 = (1 << 64) - 1
 I64_MAX = 2 ** 63 - 1
 
 
 # ---------------------------------------------------------------------------------------------
-# the model, as pullmodel5.Node runs it, without the oplog
+# the model, as pullmodel6.Node runs it, without the oplog
 # ---------------------------------------------------------------------------------------------
 class D(M.Member):
     def finish(self, st, log, meta):
         s = self.state
         s.vv[st[1]] = st[0]
-        s, _ = M.join(s, M.State())          # pullmodel5.NORMALIZE_WRITES
+        s, _ = M.join(s, M.State())          # pullmodel6.NORMALIZE_WRITES
         self.state = s
         s.contained = s.contained | {st}
         log[st] = (frozenset(s.contained - {st}), meta)
         return st
 
-    def write(self, op, p, arg, log, skew=0):
-        # A no-op writes nothing: an `$inc` of a double base is a register write, and one whose
-        # result is the stored representation byte for byte (`1e300 + 1`, `$inc 0`) changes nothing.
-        # model5.py (vendored as it was) turns it into an unconditional `set`; model6.py and the
-        # ruling of 2026-11-03 make it a no-op, as the Rust side does, so the harness applies it here.
-        if op == "inc":
-            vis = self.state.visible()
-            cur = vis.get(p) if vis is not None else None
-            if isinstance(cur, float) and same_by_bits(cur, cur + arg):
-                return None
-        return super().write(op, p, arg, log, skew)
-
     def absorb(self, other):
         before = self.state
         merged, fresh = M.join(before, other)
         self.clock = max([self.clock] + list(merged.vv.values()))
-        changed = merged.canon() != before.canon()
+        changed = exact(merged) != exact(before)
         self.state = merged
         return changed, fresh
 
@@ -160,6 +160,8 @@ class Enc:
     def value(self, v):
         if v is None:
             self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15, a register value like a string
+            self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
         elif isinstance(v, int):
@@ -347,6 +349,8 @@ class EncCompact:
     def value(self, v):
         if v is None:
             self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15
+            self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
         elif isinstance(v, int):
@@ -531,9 +535,22 @@ def hash128(data):
 # ---------------------------------------------------------------------------------------------
 # JSON forms shared with the Rust side
 # ---------------------------------------------------------------------------------------------
+class _Unset:
+    """`UNSET`: an unset spelled as the value of a field (the writer's `Value::Unset`). The model has no such value: when it is
+    called, a `$set` of it is the model's `$unset` of the path and a replace leaves the field out of its document."""
+
+    def __repr__(self):
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
 def jv(v):
-    if v is None:
+    if v is UNSET:
         return ["n"]
+    if v is None or (isinstance(v, str) and v == M.NULL):   # a stored null
+        return ["z"]
     if isinstance(v, int):
         return ["i", str(v)]
     if isinstance(v, float):
@@ -558,12 +575,10 @@ def jdoc(d):
 # ---------------------------------------------------------------------------------------------
 NAMES = "ABCD"
 
-# Field names no dotted spelling can carry, that the flat model takes: the empty name, and a name with a dot (the
-# flat model keeps a name as one string, it never splits it). NOT `_`: the model names the whole document `_` in a
-# loss record (`("insertLost", "_", life)`, and `p == "_"` in `sound_record`), so a field named `_` would share its
-# record key with the document's whenever its stamp is the life's, and the model cannot tell the two apart. `_` is
-# in the sim and the join-law tests, which key a record by what it is about.
-ODD = ["", "a.b"]
+# The "odd" writes draw their fields from two extra plain names. The vendored A2.3 model reads a dot in a name as a path
+# separator and keys the root of a replace by the empty name, so the empty name and a name with a dot (which the stage-A flat
+# model took as one string) cannot be given to it; the Rust side covers them elsewhere (see the commit that dropped them).
+ODD = ["o1", "o2"]
 
 
 def names(odd, base):
@@ -620,7 +635,7 @@ def gen_script(seed):
         p = rnd.choice(names(odd, paths))
         if op == "insert":
             ks = rnd.sample(names(odd, paths), rnd.choice([1, 1, 2, 3]))
-            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "upsert":
             ops.append(["upsert", m, rnd.choice(names(odd, ["x", "y", "n"])), rnd.choice(incs), sk])
         elif op == "upsert_soi":
@@ -640,11 +655,11 @@ def gen_script(seed):
                 ops.append(["inc", m, p, -n, sk])
         elif op == "replace":
             ks = rnd.sample(names(odd, paths), rnd.choice([1, 2]))
-            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "inc":
             ops.append(["inc", m, p, rnd.choice(incs), sk])
         elif op == "set":
-            ops.append(["set", m, p, jv(rnd.choice(vals + [None])), sk])
+            ops.append(["set", m, p, jv(rnd.choice(vals + [None, UNSET])), sk])
         elif op == "unset":
             ops.append(["unset", m, p, sk])
         else:
@@ -654,6 +669,8 @@ def gen_script(seed):
 
 def unjv(v):
     if v[0] == "n":
+        return UNSET
+    if v[0] == "z":
         return None
     if v[0] == "i":
         return int(v[1])
@@ -685,7 +702,8 @@ def run_script(sc, dump_canon=False):
         res = None
         if kind == "insert":
             _, m, fields, sk = op
-            r = ms[m].insert({k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out (the writer stores no register for it either)
+            r = ms[m].insert({k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind == "upsert":
             _, m, p, n, sk = op
@@ -697,12 +715,15 @@ def run_script(sc, dump_canon=False):
             res = None if r is None else js(r)
         elif kind == "replace":
             _, m, fields, sk = op
-            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out
+            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind in ("inc", "set", "unset"):
             m, p, arg, sk = op[1], op[2], op[3] if kind != "unset" else None, op[-1]
             if kind == "set":
                 arg = unjv(arg)
+                if arg is UNSET:        # `$set p <unset>` is the model's `$unset p`
+                    kind, arg = "unset", None
             r = ms[m].write(kind, p, arg, log, sk)
             res = None if r is None else js(r)
         elif kind == "delete":
@@ -730,14 +751,14 @@ def run_script(sc, dump_canon=False):
                 ms[m].epoch = ep
                 res = True
         steps.append({"res": res, "after": snap(ms, log)})
-    # final full-mesh sync (model5.sync over whole states)
+    # final full-mesh sync (whole states)
     for _ in range(12):
-        before = [m.state.canon() for m in ms]
+        before = [exact(m.state) for m in ms]
         for r in ms:
             for s in ms:
                 if r is not s:
                     r.absorb(s.state.copy())
-        if [m.state.canon() for m in ms] == before:
+        if [exact(m.state) for m in ms] == before:
             break
     fin = {"after": snap(ms, log)}
     if dump_canon:
@@ -755,7 +776,7 @@ def run_script(sc, dump_canon=False):
         "have": [jk(k) for k in have],
         "stale": sorted([jk(k) for k in M.stale_records(set(have), log)]),
         "unsound": [jk(k) for k in have if not M.sound_record(k, log, alive, dels)],
-        "converged": len({m.state.canon() for m in ms}) == 1,
+        "converged": len({repr(exact(m.state)) for m in ms}) == 1,
         "log": len(log),
     }
     return {"steps": steps, "final": fin}

@@ -112,8 +112,13 @@ impl Eff {
 }
 
 /// The cells a value stands for at `at`: a `Document` is a map marker and the cells of its
-/// fields (the writer's expansion of a sub-document); anything else is its one cell.
+/// fields (the writer's expansion of a sub-document); `Unset` is none (no such field); anything
+/// else is its one cell.
 fn expand(at: &Path, v: &Value, out: &mut Vec<(Path, Value)>) -> Result<(), InvalidPath> {
+    if *v == Value::Unset {
+        // an Unset field is no field: no register, so no stamp for it to win a race with (the model's absent field)
+        return Ok(());
+    }
     if let Value::Document(fields) = v {
         out.push((at.clone(), Value::Map));
         for (name, x) in fields {
@@ -738,8 +743,14 @@ impl Writer {
         }
         // The paths of one update must not meet: no path twice, none below another (the
         // reference refuses a conflicting update).
-        let mut paths: Vec<&Path> =
-            fields.iter().chain(sets.iter()).map(|(q, _)| q).chain([inc_path]).collect();
+        // (an Unset field is no field: it names nothing that could meet another path)
+        let mut paths: Vec<&Path> = fields
+            .iter()
+            .chain(sets.iter())
+            .filter(|(_, v)| *v != Value::Unset)
+            .map(|(q, _)| q)
+            .chain([inc_path])
+            .collect();
         paths.sort_unstable();
         if paths.windows(2).any(|w| w[0] == w[1] || w[1].is_below(w[0])) {
             return None;
@@ -1360,6 +1371,63 @@ mod tests {
         assert!(!same_fields(&doc(&[("m", leaf(1))]), &same), "a map where a leaf stands");
         let deeper = fields(&[("m", Value::Document(fields(&[("a", i(2))])))]);
         assert!(!same_fields(&nested, &deeper), "a leaf one level down");
+    }
+
+    /// An `Unset` field of the document of an insert, or of the creation of an upsert, is NO FIELD: no register, so no stamp
+    /// for it to win a race with. The model's insert has the field absent, and a register that carried the insert's stamp would
+    /// act as an unset above a concurrent, lower-stamped `$set` of the field by another writer. Two lives are alive at once
+    /// after a delete (a re-insert and an upsert merge): A upserts `a = 5` at a low stamp, B re-inserts with `a` spelled
+    /// `Unset` at a high one; `a` must be 5 after the join, in both orders.
+    #[test]
+    fn an_unset_field_in_an_insert_or_an_upsert_creation_stores_nothing() {
+        let (a, x, y) =
+            (Path::flat("a").unwrap(), Path::flat("x").unwrap(), Path::flat("y").unwrap());
+        for creation in 0..2 {
+            let mut w0 = Writer::new(wid('I', 0), opts());
+            w0.insert(&[(x.clone(), i(1))], 0).unwrap();
+            w0.write_delete(0).unwrap();
+            let (mut wa, mut wb) =
+                (Writer::new(wid('A', 0), opts()), Writer::new(wid('B', 0), opts()));
+            wa.receive(&w0.state);
+            wb.receive(&w0.state);
+            // A: a low-stamped creation that sets a = 5
+            wa.upsert_soi(&[], &y, 1, &[(a.clone(), i(5))], 0).unwrap();
+            // B: a high-stamped creation whose document spells `a` as an Unset
+            let st = if creation == 0 {
+                wb.insert(&[(a.clone(), Value::Unset), (x.clone(), i(2))], 9).unwrap().stamp
+            } else {
+                wb.upsert_soi(&[(a.clone(), Value::Unset)], &y, 1, &[], 9).unwrap().1.stamp
+            };
+            assert!(st.hlc > wa.state.vv[&wa.id], "B's stamp is above A's");
+            let ab = join(&wa.state, &wb.state, &opts()).0;
+            let ba = join(&wb.state, &wa.state, &opts()).0;
+            assert_eq!(ab, ba, "creation {creation}");
+            assert_eq!(
+                ab.visible(&opts()).unwrap().get(&a),
+                Some(&i(5)),
+                "creation {creation}: a = 5 survives"
+            );
+            assert!(
+                !wb.state.regs.keys().any(|(l, p)| *p == a && wb.state.lives.contains_key(l)),
+                "creation {creation}: B stored a register for the Unset field"
+            );
+        }
+    }
+
+    /// An insert whose every field is `Unset` is the insert of the empty document, whatever the spelling: the same state, a
+    /// life with no register and no order event (the model's `insert({})`: a stamp, an alive life, no cell).
+    #[test]
+    fn an_insert_of_only_unset_fields_is_the_insert_of_the_empty_document() {
+        let (a, b) = (Path::flat("a").unwrap(), Path::flat("b").unwrap());
+        let mut empty = Writer::new(wid('A', 0), opts());
+        let mut unsets = Writer::new(wid('A', 0), opts());
+        let e = empty.insert(&[], 3).unwrap();
+        let u = unsets.insert(&[(a.clone(), Value::Unset), (b, Value::Unset)], 3).unwrap();
+        assert_eq!(e.stamp, u.stamp);
+        assert_eq!(empty.state, unsets.state);
+        assert!(unsets.state.regs.is_empty(), "no register");
+        assert_eq!(unsets.state.lives.len(), 1, "one life");
+        assert_eq!(unsets.state.visible(&opts()).unwrap(), BTreeMap::new(), "alive, and empty");
     }
 
     /// A field spelled `Value::Unset` in a document handed to a write is an unset, for the order state

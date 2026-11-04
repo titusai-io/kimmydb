@@ -35,10 +35,10 @@
 //! `reference_model/q7diff_gen6.py`, at `ODD_LEAVES`.
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
-//! PATH: if it is not, the tests FAIL (they do not skip). The `merge-mutants` feature is needed (`Cargo.toml`: the replay
-//! sets the stage-A rule that a write which only reorders fields is a no-op, the model having no field order);
-//! the test `rust_mutants_are_caught_by_the_replay` turns each nested
-//! mutation switch on and requires the replay to disagree.
+//! PATH: if it is not, the tests FAIL (they do not skip). The model is the vendored A2.3 one
+//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit marker. The `merge-mutants` feature is
+//! needed (`Cargo.toml`): the test `rust_mutants_are_caught_by_the_replay` turns each nested mutation switch on and
+//! requires the replay to disagree.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
@@ -369,8 +369,6 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
     let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
-    // the stage-A model has no field order: a write that only reorders is a no-op there
-    opts.set_ord_reorder_is_noop(true);
     tweak(&mut opts);
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
@@ -705,7 +703,9 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 ///
 /// RE-PINNED for item O2: 0xf05c_9aba_cf02_eb9c to 0x117c_d4f5_b468_200c, for the reason given at the flat differential's pin (the order
 /// state and the ordered document are in the fingerprint now; the comparison with the model is unchanged).
-const PINNED_300: u64 = 0x117c_d4f5_b468_200c;
+///
+/// RE-PINNED for the D8 re-vendor (the A2.3 model): 0x117c_d4f5_b468_200c to 0x5b22_de2a_6b43_3270.
+const PINNED_300: u64 = 0x5b22_de2a_6b43_3270;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -790,4 +790,25 @@ fn rust_mutants_are_caught_by_the_replay() {
         println!("rust mutant `{what}`: {} of {} scripts disagree", v.fails.len(), v.scripts);
         assert!(!v.fails.is_empty(), "the replay missed the Rust mutant: {what}");
     }
+}
+
+/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3) and of
+/// `pullmodel6.py`, as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
+/// differential's fixture are made from these files; a changed byte fails here before it fails anywhere else.
+#[test]
+fn the_vendored_model_is_the_reviewed_one() {
+    use sha2::{Digest, Sha256};
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
+    for (file, want) in [
+        ("model6.py", "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"),
+        ("pullmodel6.py", "e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"),
+    ] {
+        let bytes = std::fs::read(dir.join(file)).unwrap();
+        let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want, "{file}");
+    }
+    let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
+    assert!(recorded.contains("72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"));
+    assert!(recorded.contains("e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"));
 }
