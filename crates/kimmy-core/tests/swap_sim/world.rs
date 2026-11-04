@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+use kimmy_core::merge_state::{JoinOptions, Path};
+
 use crate::entry::{Entry, EntryId, EntryRef, Kind, Stamp};
 use crate::flags::Flags;
 use crate::rng::Rng;
@@ -23,7 +25,22 @@ impl Counter {
     }
 }
 
+/// What a physical does with a document entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Policy {
+    /// whole-document last-writer-wins (the model)
+    #[default]
+    Document,
+    /// field-level merge: entries carry the writer's whole `merge_state` (Q7)
+    Field,
+}
+
 pub struct World {
+    pub policy: Policy,
+    /// `field`: the join options (retention 10^9, the Int64 bound), as the Q7 differential
+    pub fopts: JoinOptions,
+    /// `field`: the paths of loss records, interned (`LKey.path` indexes it)
+    pub paths: Vec<Path>,
     pub f: Flags,
     pub rng: Rng,
     /// the deadline gap of a stage (the model's `D`)
@@ -57,6 +74,9 @@ impl World {
     pub fn new(names: Vec<String>, f: Flags, rng: Rng, d: i64, trace: bool) -> Self {
         let n = names.len();
         Self {
+            policy: Policy::Document,
+            fopts: JoinOptions::new(1_000_000_000, i64::MAX).expect("a valid bound"),
+            paths: Vec::new(),
             f,
             rng,
             d,
@@ -118,6 +138,19 @@ impl World {
         if self.trace {
             self.log.push(format!("[{:3} c={}] {}", self.step, self.clock, msg));
         }
+    }
+
+    /// The index of a path in the table (interned on first use).
+    pub fn path_id(&mut self, p: &Path) -> u16 {
+        if let Some(i) = self.paths.iter().position(|x| x == p) {
+            return i as u16;
+        }
+        self.paths.push(p.clone());
+        (self.paths.len() - 1) as u16
+    }
+
+    pub fn path_label(&self, id: u16) -> String {
+        self.paths[id as usize].segments().join(".")
     }
 
     pub fn name(&self, origin: usize) -> String {

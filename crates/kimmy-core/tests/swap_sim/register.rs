@@ -3,7 +3,7 @@
 
 use crate::entry::*;
 use crate::member::Member;
-use crate::world::World;
+use crate::world::{Policy, World};
 
 impl Member {
     // ---- the register
@@ -213,6 +213,12 @@ impl Member {
                         let c = p.docs.get(&se.key);
                         if c.is_none_or(|c| c.stamp < se.stamp) {
                             self.inv.insert("partial_flip");
+                            let have = c.map(|c| (hlc_of(&c.stamp), c.body.clone()));
+                            let msg = format!(
+                                "{} PARTIAL FLIP into {}: staged row {} (key {}) missing or older; the stage holds {:?}",
+                                self.name, v.phys, se, se.key, have
+                            );
+                            w.note(msg);
                             break;
                         }
                     }
@@ -276,7 +282,19 @@ impl Member {
             && let Some(ks) = self.late_stamp(w, name)
         {
             for (k, v) in old_docs.iter() {
-                if v.stamp > ks
+                if w.policy == Policy::Field {
+                    // per lost head: every late cell of the version and the losers its join recorded
+                    if v.stamp > ks {
+                        for c in v
+                            .state
+                            .as_ref()
+                            .map(|st| crate::field::late_cells(st, ks, None))
+                            .unwrap_or_default()
+                        {
+                            self.report_cell(w, *k, &c, name);
+                        }
+                    }
+                } else if v.stamp > ks
                     && !(f.snap_delete_bare
                         && self.bare_state.contains(&(name.to_string(), *k, v.stamp)))
                 {

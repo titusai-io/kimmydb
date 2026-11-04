@@ -3,7 +3,7 @@
 use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::member::Member;
-use crate::world::World;
+use crate::world::{Policy, World};
 
 impl Member {
     /// An entry that takes no effect at this member (`m-ignored-event-not-served`: such an entry is not appended).
@@ -130,7 +130,7 @@ impl Member {
     fn lww(p: &mut Phys, key: u32, stamp: Stamp, body: Body) {
         let newer = p.docs.get(&key).is_none_or(|c| stamp > c.stamp);
         if newer {
-            p.docs.insert(key, Ver { stamp, body });
+            p.docs.insert(key, Ver::doc(stamp, body));
         }
     }
 
@@ -141,6 +141,9 @@ impl Member {
         let Some(p) = self.phys.get(&e.phys) else { return self.apply_doc_orig(w, e) };
         if !p.alive {
             return self.apply_doc_orig(w, e);
+        }
+        if w.policy == Policy::Field {
+            return self.apply_doc_field(w, e);
         }
         let cur = p.docs.get(&e.key).map(|c| c.stamp);
         let wins = cur.is_none_or(|c| e.stamp >= c); // an equal stamp is the same entry, held as a snapshot's state
@@ -156,6 +159,39 @@ impl Member {
             w.stats.bump("appended_in_position");
         } else if e.origin != self.id {
             self.dochist.remove(&e.idx); // superseded on arrival: witnessed, not in the product's oplog, never served
+            w.stats.bump("lww_losers_not_kept");
+        }
+    }
+
+    /// The `field` policy: the entry's state is joined into the document's (Q7 D11: "if unchanged only witness"); the entry
+    /// is appended iff the join changed the state, or (the gap-1 analogue) iff the state of an unfinished join's pages
+    /// already covers it; the covered-entry skip decides "witnessed only" before the join.
+    fn apply_doc_field(&mut self, w: &mut World, e: &EntryRef) {
+        let f = w.f;
+        let p = self.phys.get(&e.phys).expect("the physical is alive here");
+        let a = crate::field::apply_entry(p.docs.get(&e.key), e, &w.fopts, p.missing);
+        w.note(format!(
+            "{} applies {} changed={} skipped={} held_state={}",
+            self.name, e, a.changed, a.skipped, a.held_state
+        ));
+        self.phys.get_mut(&e.phys).unwrap().docs.insert(e.key, a.ver);
+        if a.skipped {
+            w.stats.bump("covered_skips");
+        }
+        if a.fresh > 0 {
+            w.stats.add("q7_records_fresh", a.fresh as i64);
+        }
+        if !e.staging {
+            self.dochist.insert(e.idx); // m1: retained while the physical is alive here
+            self.check_late(w, e);
+        }
+        if a.changed {
+            self.appended.insert(e.idx);
+        } else if f.append_in_position && a.held_state {
+            self.appended.insert(e.idx);
+            w.stats.bump("appended_in_position");
+        } else if e.origin != self.id {
+            self.dochist.remove(&e.idx); // unchanged on arrival: witnessed, not in the oplog, never served
             w.stats.bump("lww_losers_not_kept");
         }
     }
@@ -200,6 +236,26 @@ impl Member {
         let alive_or_unknown = self.phys.get(&e.phys).is_none_or(|p| p.alive);
         if !w.f.report_before_burial && alive_or_unknown {
             w.stats.bump("report_delayed_until_burial");
+            return;
+        }
+        if w.policy == Policy::Field {
+            // per lost head: the entry's own write (the cells stamped with its stamp) and, for a retained page version, every
+            // late cell of the page state and the losers its join recorded
+            let mut cells = e
+                .fstate
+                .as_ref()
+                .map(|s| crate::field::late_cells(s, ks, Some(e.stamp)))
+                .unwrap_or_default();
+            if let Some(ps) = self.page_states.get(&e.idx).cloned() {
+                for c in crate::field::late_cells(&ps, ks, None) {
+                    if !cells.contains(&c) {
+                        cells.push(c);
+                    }
+                }
+            }
+            for c in cells {
+                self.report_cell(w, e.key, &c, &e.phys);
+            }
             return;
         }
         self.report(w, e.key, e.stamp, e.body.clone(), &e.phys);

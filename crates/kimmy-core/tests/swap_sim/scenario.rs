@@ -18,10 +18,22 @@ pub struct Sc {
 impl Sc {
     /// `members`: name and skew, in order; the index of a member is its position.
     pub fn new(mode: &str, members: &[(&str, i64)], d: i64) -> Self {
+        // a mode "field:<mode>" runs the scenario under the `field` policy
+        let (policy, mode) = match mode.strip_prefix("field:") {
+            Some(m) => (crate::world::Policy::Field, m),
+            None => (crate::world::Policy::Document, mode),
+        };
         let names: Vec<String> = members.iter().map(|(n, _)| n.to_string()).collect();
-        let w = World::new(names, flags_for(mode, "v6"), Rng::new(0), d, false);
+        let mut w = World::new(names, flags_for(mode, "v6"), Rng::new(0), d, false);
+        w.policy = policy;
         let ms = members.iter().enumerate().map(|(i, (n, s))| Member::new(i, n, *s)).collect();
         Self { w, ms }
+    }
+    /// The same scenario under the `field` policy.
+    pub fn field(mode: &str, members: &[(&str, i64)], d: i64) -> Self {
+        let mut sc = Self::new(mode, members, d);
+        sc.w.policy = crate::world::Policy::Field;
+        sc
     }
     pub fn idx(&self, name: &str) -> usize {
         self.ms.iter().position(|m| m.name == name).unwrap_or_else(|| panic!("no member {name}"))

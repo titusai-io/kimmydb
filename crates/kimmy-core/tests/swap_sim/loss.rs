@@ -7,17 +7,35 @@ use crate::world::World;
 
 impl Member {
     pub fn report(&mut self, w: &mut World, key: u32, stamp: Stamp, body: Body, phys: &str) {
+        self.report_path(w, key, None, stamp, body, phys);
+    }
+
+    /// `field`: the loss record of one lost cell (a head candidate): key `(_id, path, loser stamp)`, the value cut at 64 B.
+    pub fn report_cell(&mut self, w: &mut World, key: u32, c: &crate::field::LateCell, phys: &str) {
+        let path = c.path.as_ref().map(|p| w.path_id(p));
+        self.report_path(w, key, path, c.stamp, crate::field::record_body(&c.value), phys);
+    }
+
+    pub fn report_path(
+        &mut self,
+        w: &mut World,
+        key: u32,
+        path: Option<u16>,
+        stamp: Stamp,
+        body: Body,
+        phys: &str,
+    ) {
         let f = w.f;
         if f.no_loss {
             return;
         }
         let mut k = if f.loss_key_collapse {
-            LKey { key, stamp: None, minter: None }
+            LKey { key, path, stamp: None, minter: None }
         } else {
-            LKey::plain(key, stamp)
+            LKey::at(key, path, stamp)
         };
         if f.record_per_minter {
-            k = LKey { key, stamp: Some(stamp), minter: Some(self.id) }; // MUTANT: the minter is part of the key
+            k = LKey { key, path, stamp: Some(stamp), minter: Some(self.id) }; // MUTANT: the minter is part of the key
         }
         if self.loss.contains_key(&k) || (f.pending_dedup && self.loss_pending.contains_key(&k)) {
             return;

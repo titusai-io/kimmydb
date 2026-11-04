@@ -31,7 +31,7 @@ fn nonzero(res: &Res) -> Vec<(String, i64)> {
 
 fn has_record(sc: &Sc, member: &str, key: u32, stamp: Stamp) -> bool {
     let m = &sc.ms[sc.idx(member)];
-    m.loss.keys().any(|k| k.head() == (key, Some(stamp)))
+    m.loss.keys().any(|k| k.key == key && k.stamp == Some(stamp))
 }
 
 /// `probes6.py` `seed885_shape`: a late write held only by C; D binds (burying L) and takes C's page of L as a snapshot,
@@ -144,7 +144,7 @@ fn late_delete_only_as_state(mode: &str) -> (Vec<bool>, Vec<(String, i64)>) {
         .iter()
         .map(|m| {
             let mm = &sc.ms[sc.idx(m)];
-            let key = (0u32, Some(d.stamp));
+            let key = (0u32, None, Some(d.stamp));
             mm.loss.keys().filter(|k| k.head() == key).count() == 1
                 && mm.events_emitted.get(&key).copied() == Some(1)
         })
@@ -363,22 +363,22 @@ fn sender_dies_mid_join(mode: &str) -> Supersede {
 mod tests {
     use super::*;
 
-    #[test]
-    fn seed_885_shape_the_page_of_a_buried_physical_is_retained_and_the_head_reported() {
-        let (_, recs, problems) = seed885("v6");
+    fn seed_885_shape_the_page_of_a_buried_physical_is_retained_and_the_head_reported_under(
+        pre: &str,
+    ) {
+        let (_, recs, problems) = seed885(&format!("{pre}v6"));
         assert_eq!(recs, vec![true, true, true], "the late head has a record on A, B and D");
         assert!(problems.is_empty(), "{problems:?}");
         // the seed-885 rule off: every live member holds the write as granted state only and nobody mints the record
-        let (_, recs, problems) = seed885("m-dead-page-dropped");
+        let (_, recs, problems) = seed885(&format!("{pre}m-dead-page-dropped"));
         assert_eq!(recs, vec![false, false, false]);
         let names: Vec<&str> = problems.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"loss_missing"), "{problems:?}");
         assert!(names.contains(&"inv_head_not_exactly_one_record_and_event"), "{problems:?}");
     }
 
-    #[test]
-    fn the_snapshot_record_set_is_the_sole_carrier_of_a_record() {
-        let (e_has, problems) = sole_carrier("v6");
+    fn the_snapshot_record_set_is_the_sole_carrier_of_a_record_under(pre: &str) {
+        let (e_has, problems) = sole_carrier(&format!("{pre}v6"));
         assert!(e_has && problems.is_empty(), "{problems:?}");
         for mutant in ["m-snap-drop-loss", "m-snap-no-loss-records"] {
             let (e_has, problems) = sole_carrier(mutant);
@@ -392,24 +392,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere() {
-        let (recs, problems) = late_delete_only_as_state("v6");
+    fn a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere_under(pre: &str) {
+        let (recs, problems) = late_delete_only_as_state(&format!("{pre}v6"));
         assert_eq!(recs, vec![true, true, true], "one record and one event on W, Y and N");
         assert!(problems.is_empty(), "{problems:?}");
         // ADR-228's bare tombstone: no _id, no entry, no member mints the record
-        let (recs, problems) = late_delete_only_as_state("m-snap-delete-bare");
+        let (recs, problems) = late_delete_only_as_state(&format!("{pre}m-snap-delete-bare"));
         assert_eq!(recs, vec![false, false, false]);
         assert!(!problems.is_empty());
     }
 
-    #[test]
-    fn the_mid_join_append_in_position_rule() {
-        let (appended, partial, flipped) = append_in_position("v6");
+    fn the_mid_join_append_in_position_rule_under(pre: &str) {
+        let (appended, partial, flipped) = append_in_position(&format!("{pre}v6"));
         assert!(appended, "the staged entry is appended in position and servable");
         assert!(!partial, "A flips with k");
         assert!(flipped);
-        let (appended, partial, _) = append_in_position("m-no-append-in-position");
+        let (appended, partial, _) = append_in_position(&format!("{pre}m-no-append-in-position"));
         assert!(!appended);
         assert!(
             partial,
@@ -417,9 +415,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_join_is_resumed_only_from_its_own_sending_peer() {
-        let (unchanged, serves, problems) = join_from_another_peer("v6");
+    fn a_join_is_resumed_only_from_its_own_sending_peer_under(pre: &str) {
+        let (unchanged, serves, problems) = join_from_another_peer(&format!("{pre}v6"));
         assert!(
             unchanged,
             "a begin from another peer while a join is in progress is refused with no side effect"
@@ -427,7 +424,7 @@ mod tests {
         assert!(serves, "N serves the output after its join completes: the register came from X");
         assert!(problems.is_empty(), "{problems:?}");
         // the reviewer's source-overwrite defect: the last page reads the register of the member of the last begin call
-        let (_, serves, problems) = join_from_another_peer("m-stale-src");
+        let (_, serves, problems) = join_from_another_peer(&format!("{pre}m-stale-src"));
         assert!(!serves, "the register was read from a member that is not the sender");
         let names: Vec<&str> = problems.iter().map(|(k, _)| k.as_str()).collect();
         assert!(
@@ -436,16 +433,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rule_b_a_held_bind_is_information_until_covered() {
-        let (parked, refused, took_effect, partial, problems) = rule_b_shape("v6");
+    fn rule_b_a_held_bind_is_information_until_covered_under(pre: &str) {
+        let (parked, refused, took_effect, partial, problems) = rule_b_shape(&format!("{pre}v6"));
         assert!(parked && refused, "the held bind is information and D10 refuses writes on it");
         assert!(took_effect, "it takes effect once covered");
         assert!(!partial, "C flips whole");
         assert!(problems.is_empty(), "{problems:?}");
         // rule B off: the known bind sets the stage's birth, A's own drop buries the stage before its rows arrive, the
         // rows are history there and never served, and C flips to a stage without them
-        let (parked, refused, _, partial, _) = rule_b_shape("m-rule-b-off");
+        let (parked, refused, _, partial, _) = rule_b_shape(&format!("{pre}m-rule-b-off"));
         assert!(!parked && refused);
         assert!(
             partial,
@@ -453,9 +449,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies() {
-        let s = sender_dies_mid_join("v6");
+    fn a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies_under(
+        pre: &str,
+    ) {
+        let s = sender_dies_mid_join(&format!("{pre}v6"));
         assert!(
             s.placeholder_before && s.join_open_before,
             "the stage is a placeholder page of an unfinished join"
@@ -475,5 +472,65 @@ mod tests {
         assert!(s.serving_stage_after, "the binding is visible");
         assert!(s.write_accepted_after, "the refusal is released");
         assert!(s.problems.is_empty(), "{:?}", s.problems);
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn seed_885_shape_the_page_of_a_buried_physical_is_retained_and_the_head_reported() {
+        for pre in ["", "field:"] {
+            seed_885_shape_the_page_of_a_buried_physical_is_retained_and_the_head_reported_under(
+                pre,
+            );
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn the_snapshot_record_set_is_the_sole_carrier_of_a_record() {
+        for pre in ["", "field:"] {
+            the_snapshot_record_set_is_the_sole_carrier_of_a_record_under(pre);
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere() {
+        for pre in ["", "field:"] {
+            a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere_under(pre);
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn the_mid_join_append_in_position_rule() {
+        for pre in ["", "field:"] {
+            the_mid_join_append_in_position_rule_under(pre);
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn a_join_is_resumed_only_from_its_own_sending_peer() {
+        for pre in ["", "field:"] {
+            a_join_is_resumed_only_from_its_own_sending_peer_under(pre);
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn rule_b_a_held_bind_is_information_until_covered() {
+        for pre in ["", "field:"] {
+            rule_b_a_held_bind_is_information_until_covered_under(pre);
+        }
+    }
+
+    /// Under both policies: the `document` policy (the model) and the `field` policy (`merge_state`).
+    #[test]
+    fn a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies() {
+        for pre in ["", "field:"] {
+            a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies_under(
+                pre,
+            );
+        }
     }
 }

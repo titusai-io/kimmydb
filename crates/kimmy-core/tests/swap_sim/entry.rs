@@ -8,6 +8,8 @@ use kimmy_core::hlc::Hlc;
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{Epoch, MStamp, WriterId};
 
+use kimmy_core::merge_state::MergeState;
+
 use crate::omap::OMap;
 
 pub const L: &str = "L";
@@ -77,19 +79,29 @@ pub enum Opk {
 
 /// The key of a loss record: `(key, loser stamp)`, or `(key,)` under `m-loss-key-collapse`, or
 /// `(key, stamp, minter)` under `m-record-per-minter`. `head()` is the model's `k[:2]`.
+///
+/// Under the `field` policy a record is per lost head, so the key also names the `path` (an index into the world's path
+/// table; `None` for the `document` policy and for a whole-document lost write such as a delete).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct LKey {
     pub key: u32,
+    pub path: Option<u16>,
     pub stamp: Option<Stamp>,
     pub minter: Option<usize>,
 }
 
+/// What identifies a lost head: `(_id, path, loser stamp)`.
+pub type HeadKey = (u32, Option<u16>, Option<Stamp>);
+
 impl LKey {
     pub fn plain(key: u32, stamp: Stamp) -> Self {
-        Self { key, stamp: Some(stamp), minter: None }
+        Self { key, path: None, stamp: Some(stamp), minter: None }
     }
-    pub fn head(&self) -> (u32, Option<Stamp>) {
-        (self.key, self.stamp)
+    pub fn at(key: u32, path: Option<u16>, stamp: Stamp) -> Self {
+        Self { key, path, stamp: Some(stamp), minter: None }
+    }
+    pub fn head(&self) -> HeadKey {
+        (self.key, self.path, self.stamp)
     }
 }
 
@@ -118,6 +130,8 @@ pub struct Entry {
     pub staging: bool,
     pub dl: i64,
     pub extra: Extra,
+    /// `field` policy: the writer's whole merge state after the write (Q7 D1/D11)
+    pub fstate: Option<Rc<MergeState>>,
 }
 
 impl Entry {
@@ -136,6 +150,7 @@ impl Entry {
             staging: false,
             dl: 0,
             extra: Extra::None,
+            fstate: None,
         }
     }
     pub fn phys(mut self, p: &str) -> Self {
@@ -169,10 +184,33 @@ impl std::fmt::Display for Entry {
 }
 
 /// One version of a document in a physical.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Ver {
+    /// `document`: the write's stamp; `field`: the latest write merged in (Q7 D11)
     pub stamp: Stamp,
+    /// the visible body (`None` for a deleted document)
     pub body: Body,
+    /// `field`: the merge state (joined with any unfinished join's page states)
+    pub state: Option<Rc<MergeState>>,
+    /// `field`: the state built by entries delivered in position only, while an unfinished join's page states are
+    /// held (the gap-1 analogue, `held_records`); `None` when there is no such split
+    pub applied: Option<Rc<MergeState>>,
+}
+
+impl Ver {
+    pub fn doc(stamp: Stamp, body: Body) -> Self {
+        Self { stamp, body, state: None, applied: None }
+    }
+}
+
+/// Convergence of a version: the stamp, the visible body and (`field`) the version vector. The records a join detects
+/// (`MergeState.losses`) are left out: they converge through the loss entries, not through the join.
+impl PartialEq for Ver {
+    fn eq(&self, o: &Self) -> bool {
+        self.stamp == o.stamp
+            && self.body == o.body
+            && self.state.as_ref().map(|s| &s.vv) == o.state.as_ref().map(|s| &s.vv)
+    }
 }
 
 pub type Docs = OMap<u32, Ver>;
