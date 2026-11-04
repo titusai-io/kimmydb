@@ -1,85 +1,20 @@
 //! Tests of the order state that need the codecs and the property tests' runs: the join laws, both
 //! codecs and the ordered read on states that carry order entries.
 //!
-//! The runs of the property tests are given the order state after every local write by
-//! [`feed_orders`], a test-only stand-in for item O2 (the writer does not feed it yet). The
-//! semantics of the feed and the read are checked against the reference model in `ord_tests`.
+//! The runs of the property tests build their states with `Writer`s, which feed the order state
+//! with every local write. The semantics of the feed and the read are checked against the
+//! reference model in `ord_tests`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ord_tests::{at, flatten, u, w};
-use super::prop_tests::{Rng, check_laws_on, nested_ord_pools, opts, ord_pools};
+use super::prop_tests::{
+    Rng, check_laws_on, nested_ord_pools, opts, ord_pools, run_nested_tagged, run_tagged,
+};
 use super::*;
 use crate::hlc::Hlc;
 
-// ---- the feed on the states of the property tests ---------------------------------------
-
-/// Feed the order state of a writer after a local write, the way a writer that feeds it would:
-/// the cells this writer stamped since `before` (its vector before the op) are the writes; each
-/// stamp is one write into the life its cells are in, naming its cells (an unset for a register
-/// that holds `Unset`, a write for the rest) and the maps above them. One write in three that
-/// names two cells or more is a replace (the root's level floor, every cell a reset), a map
-/// marker is a document-valued write (a write at the map, the level mark, the cells below it
-/// resets). `frng` is a stream of its own: the run the writer is in draws the same numbers with
-/// the feed and without it. This is a test-only stand-in for item O2.
-pub(super) fn feed_orders(w: &mut Writer, before: &Vv, frng: &mut Rng, o: &JoinOptions) {
-    let id = w.id;
-    let old = before.get(&id).copied().unwrap_or(Hlc::ZERO);
-    let known = before.values().copied().max().unwrap_or(Hlc::ZERO);
-    // per write stamp: the life, and the cells it wrote as (path, is an unset, is a map marker)
-    type Written = (MStamp, Vec<(Path, bool, bool)>);
-    let mut cells: BTreeMap<MStamp, Written> = BTreeMap::new();
-    for ((l, p), r) in &w.state.regs {
-        if r.stamp.writer == id && r.stamp.hlc > old {
-            let e = cells.entry(r.stamp).or_insert_with(|| (*l, Vec::new()));
-            e.1.push((p.clone(), r.value == Value::Unset, r.value == Value::Map));
-        }
-    }
-    for ((l, p, _, _), s) in &w.state.slots {
-        if s.stamp.writer == id && s.stamp.hlc > old {
-            cells.entry(s.stamp).or_insert_with(|| (*l, Vec::new())).1.push((
-                p.clone(),
-                false,
-                false,
-            ));
-        }
-    }
-    for (stamp, (life, mut cs)) in cells {
-        // a cell and the slot of the same path in one write name the field once
-        cs.sort();
-        cs.dedup_by(|a, b| a.0 == b.0);
-        let replace = cs.len() >= 2 && frng.below(3) == 0;
-        let mut items: Vec<(OrdAt, OrdMode)> = Vec::new();
-        if replace {
-            items.push((OrdAt::Root, OrdMode::Level));
-        }
-        let mut anc = BTreeSet::new();
-        for (p, unset, map) in &cs {
-            let at = OrdAt::Field(p.clone());
-            if *unset {
-                items.push((at, OrdMode::Unset));
-                continue;
-            }
-            for a in p.ancestors() {
-                if anc.insert(a.clone()) && !cs.iter().any(|c| c.0 == a) {
-                    items.push((OrdAt::Field(a), OrdMode::Write));
-                }
-            }
-            let below_a_map = cs.iter().any(|(q, _, m)| *m && p.is_below(q));
-            items.push((
-                at.clone(),
-                if replace || below_a_map { OrdMode::Reset } else { OrdMode::Write },
-            ));
-            if *map {
-                items.push((at, OrdMode::Level));
-            }
-        }
-        let events = ord_events(&items, o);
-        w.state.ord_apply(life, stamp, known, &events, o);
-    }
-}
-
-// ---- the property tests' states with the order state fed -----------------------------
+// ---- the property tests' states with the order state the writers built -----------------------------
 
 /// What a pool of states with order entries holds, by shape.
 #[derive(Default, Debug)]
@@ -119,9 +54,8 @@ fn tally(pools: &[Vec<MergeState>]) -> Seen {
 }
 
 /// The join laws, the codecs and the ordered read on states that carry order entries: the flat and
-/// the nested runs of the property tests with the order state fed after every local write (a
-/// stand-in for item O2: `feed_orders`), at a retention beyond any clock, at 20, and at 6 where the
-/// exact associativity is not claimed.
+/// the nested runs of the property tests with the order state the writers built, at a retention
+/// beyond any clock, at 20, and at 6 where the exact associativity is not claimed.
 #[test]
 fn states_with_order_entries_obey_the_laws_and_both_codecs() {
     let mut total = Seen::default();
@@ -644,13 +578,13 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     let refused_total: usize = refused.values().sum();
     assert_eq!((candidates, accepted, refused_total), (60_000, 31_795, 28_205), "{refused:?}");
     assert_eq!(refused.len(), 8, "every clause that one state can show is reached: {refused:?}");
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_489));
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_592));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (130_422, 102_594, 384));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_196, 110_814, 524));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }
@@ -1016,4 +950,69 @@ fn the_write_api_refuses_a_document_nested_deeper_than_the_depth_limit() {
             "replace, {m}"
         );
     }
+}
+
+/// A writer's states only grow (the feed is cumulative over its own history): in the runs of the
+/// property tests, a writer's state after any step is its state before joined with what the step
+/// added (writes and receives alike), for the order state of every key that is still there, and, at
+/// a retention beyond any clock, for the whole state. So no write re-emits a first that an earlier
+/// state of the writer voided or drops a floor it held. Also: every state a writer builds is accepted
+/// by `check_decoded`, round trips both ways of the compact codec, and its compact hash does not
+/// depend on the order of the joins that made it.
+#[test]
+fn a_writers_states_only_grow_and_every_state_it_builds_is_accepted() {
+    let (mut steps, mut grown, mut checked) = (0usize, 0usize, 0usize);
+    for (ret, whole) in [(1_000_000_000u64, true), (20, false)] {
+        let o = opts(ret);
+        for seed in 1..=60u64 {
+            for (name, run) in [
+                ("flat", run_tagged(seed, 24, &o, true)),
+                ("nested", run_nested_tagged(seed, 26, &o, true)),
+            ] {
+                let mut last: BTreeMap<usize, &MergeState> = BTreeMap::new();
+                for (m, st) in &run {
+                    steps += 1;
+                    assert_eq!(st.check_decoded(), Ok(()), "{name} {seed}: accepted");
+                    let c = st.encode_compact();
+                    assert_eq!(MergeState::decode_compact(&c).as_ref(), Ok(st), "{name} {seed}");
+                    if let Some(prev) = last.get(m) {
+                        checked += 1;
+                        let joined = join(prev, st, &o).0;
+                        if whole {
+                            assert_eq!(&joined, st, "{name} {seed}: the writer's state only grows");
+                        } else {
+                            // the keys of the lives still alive keep their entry
+                            for (k, x) in &prev.ords {
+                                if let Some(y) = st.ords.get(k) {
+                                    assert_eq!(&ord_join(x, y, &o), y, "{name} {seed}: {k:?}");
+                                }
+                            }
+                        }
+                        grown += usize::from(prev.ords != st.ords);
+                    }
+                    last.insert(*m, st);
+                }
+                // the compact hash of the join of the run's states does not depend on the order
+                let all: Vec<&MergeState> = run.iter().map(|(_, s)| s).collect();
+                let (mut fwd, mut rev) = (MergeState::default(), MergeState::default());
+                for s in &all {
+                    fwd = join(&fwd, s, &o).0;
+                }
+                for s in all.iter().rev() {
+                    rev = join(&rev, s, &o).0;
+                }
+                if ret == 1_000_000_000 {
+                    // (the loss records are not associative, and are left out as everywhere)
+                    assert_eq!(fwd.ords, rev.ords, "{name} {seed}");
+                    let (mut f, mut r) = (fwd.clone(), rev.clone());
+                    (f.losses, r.losses) = (BTreeMap::new(), BTreeMap::new());
+                    assert_eq!(f.compact_hash(), r.compact_hash(), "{name} {seed}");
+                    assert_eq!(f.compact_bytes(), r.compact_bytes());
+                }
+            }
+        }
+    }
+    // non-vacuity: the order state moved in many of the steps
+    eprintln!("writer steps {steps}, compared {checked}, order state grew in {grown}");
+    assert!(grown * 3 > checked, "{grown} of {checked}");
 }

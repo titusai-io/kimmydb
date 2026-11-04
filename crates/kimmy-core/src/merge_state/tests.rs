@@ -1132,7 +1132,7 @@ fn golden_encode_bytes_round_trip() {
     // The header: magic "QMS" and the format version byte.
     assert_eq!(&bytes[..4], b"QMS\x01");
     let back = MergeState::decode(&bytes).unwrap();
-    assert_eq!(back, st);
+    assert_eq!(back, st.without_ords());
     assert_eq!(back.encode(), bytes);
     // Lengths are big-endian u64: the first count (lives = 1) follows the header.
     assert_eq!(&bytes[4..12], &1u64.to_be_bytes());
@@ -1422,9 +1422,9 @@ fn decode_refuses_totals_past_the_bound() {
     assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
     // The bound itself is accepted, one past it (either sign) is not.
     let (st, _) = state_with_big_slots(MAX_TOTAL);
-    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st.without_ords());
     let (st, _) = state_with_big_slots(-MAX_TOTAL);
-    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st.without_ords());
     let (st, _) = state_with_big_slots(MAX_TOTAL + 1);
     assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
     let (st, _) = state_with_big_slots(-MAX_TOTAL - 1);
@@ -1440,7 +1440,7 @@ fn decode_refuses_totals_past_the_bound() {
         LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
         LossValue::Total(5.into()),
     );
-    assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
+    assert_eq!(MergeState::decode(&good.encode()).unwrap(), good.without_ords());
     let big = MAX_TOTAL + 1;
     let mut bad = good.clone();
     for r in bad.regs.values_mut() {
@@ -1536,7 +1536,7 @@ fn generation_vv_and_gens_are_outside_bytes_hash_and_equality() {
     // A decoded state has none of it, and equals the original.
     let back = MergeState::decode(&st.encode()).unwrap();
     assert!(back.gens.is_empty());
-    assert_eq!(back, st);
+    assert_eq!(back, st.without_ords());
 }
 
 // ---- m5/m6: the options -----------------------------------------------------------------
@@ -1581,7 +1581,11 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     }
     st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
-    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "a state at the bound decodes");
+    assert_eq!(
+        MergeState::decode(&st.encode()).unwrap(),
+        st.without_ords(),
+        "a state at the bound decodes"
+    );
     // Half at +bound, half at -bound: the exact sum is 0, which only exact arithmetic gives.
     for (k, slot) in st.slots.values_mut().enumerate() {
         slot.total = if k % 2 == 0 { MAX_TOTAL } else { -MAX_TOTAL }.into();
@@ -1625,7 +1629,7 @@ fn receive_loss_refuses_a_total_past_the_bound() {
         assert_eq!(w.receive_loss(key(p), LossValue::Total(t.into())), added, "{p}");
     }
     // Whatever was stored decodes.
-    assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
+    assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state.without_ords());
     // Other loss values are unaffected.
     assert!(w.receive_loss(key("g"), LossValue::Value(i(i64::MAX))));
 }
@@ -1702,7 +1706,7 @@ fn every_bson_type_is_stored_read_back_and_round_trips() {
     }
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
-    assert_eq!(back, w.state);
+    assert_eq!(back, w.state.without_ords());
     assert_eq!(back.encode(), enc);
     assert_eq!(back.state_hash(), w.state.state_hash());
     // A loss record keeps any value too.
@@ -1894,7 +1898,7 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     // The state encodes, decodes and hashes with the paths intact.
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
-    assert_eq!(back, w.state);
+    assert_eq!(back, w.state.without_ords());
     assert_eq!(back.encode(), enc);
     // ... and the two spellings of "a.b" encode differently.
     let mut x = Writer::new(wid('A', 0), opts());
@@ -1945,7 +1949,7 @@ fn odd_field_names_are_distinct_cells_and_round_trip() {
     assert_eq!(vis[&Path::new(["a", "b"]).unwrap()], i(3));
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
-    assert_eq!(back, w.state);
+    assert_eq!(back, w.state.without_ords());
     assert_eq!(back.encode(), enc);
     assert_eq!(back.visible(&opts()).unwrap(), vis);
 }
@@ -2236,7 +2240,7 @@ fn a_null_and_an_unset_merge_and_encode_as_different_values() {
     u.insert(&fl(&[("x", Value::Unset)]), 0).unwrap();
     assert_ne!(n.state.canonical_bytes(), u.state.canonical_bytes());
     for w in [&n, &u] {
-        assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
+        assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state.without_ords());
     }
 }
 

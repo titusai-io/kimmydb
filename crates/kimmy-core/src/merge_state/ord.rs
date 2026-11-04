@@ -29,10 +29,16 @@
 //! # What lives here, and what does not
 //!
 //! The type, its join ([`ord_join`]), the lowest feed primitive of the writer side
-//! ([`MergeState::ord_apply`], with [`ord_events`]) and the read. The WRITER does not call the
-//! feed yet: a state built by `Writer` carries no `FieldOrd`, and joins of such states are what
-//! they were. The feed exists so that the join, the read and the codec can be tested against the
-//! reference model on states that do carry them.
+//! ([`MergeState::ord_apply`], with [`ord_events`]) and the read. The WRITER feeds the order
+//! state with every local write (`writer.rs`: the items of each write, in the model's order, then
+//! `ord_events` and `ord_apply` on the writer's own state), so a state a writer builds is the join
+//! of everything it received and its own history.
+//!
+//! The feed needs no state of its own: a write names its fields as `(path, mode)` items, the
+//! events give each one its position among the siblings the write names, and `ord_apply` raises
+//! the floor, records the first and the last, and marks the level on the writer's state. What a
+//! write that is a no-op does (nothing: no stamp, no floor) and the one rule that lets such a
+//! write leave a trace (the hybrid floor) are in `writer.rs`.
 //!
 //! # Keys and ordering
 //!
@@ -356,9 +362,9 @@ pub fn ord_events(items: &[(OrdAt, OrdMode)], o: &JoinOptions) -> Vec<OrdEvent> 
 impl MergeState {
     /// The lowest feed of the order state (the model's `Member._ord_apply`): the events of the
     /// write `stamp` into `life`. `known` is the highest HLC the writer had seen before the write
-    /// (what a `u` floor remembers). Only the tests call it until the writer feeds the order
-    /// state (item O2).
-    #[allow(dead_code)]
+    /// (what a `u` floor remembers). The [`Writer`](super::Writer) calls it once for every write
+    /// it makes, on its own state (which is the join of everything it received and its own
+    /// earlier writes), so a state a writer builds is cumulative over its own history.
     pub(crate) fn ord_apply(
         &mut self,
         life: MStamp,
@@ -369,7 +375,8 @@ impl MergeState {
     ) {
         let writer = stamp.writer;
         // the unsetting write also writes other fields: any event that is not an unset or a mark
-        let others = events.iter().any(|e| !matches!(e.mode, OrdMode::Unset | OrdMode::Level));
+        let others = !o.ord_bit_unpacked()
+            && events.iter().any(|e| !matches!(e.mode, OrdMode::Unset | OrdMode::Level));
         for e in events {
             let key = (life, e.at.clone());
             let mut ord = self.ords.get(&key).cloned().unwrap_or_default();
@@ -389,7 +396,9 @@ impl MergeState {
                         ord.floor = ord.floor.max(Some(Floor::R { stamp }));
                     }
                     ord.normalise(o);
-                    ord.firsts.entry(writer).or_insert((stamp, e.pos));
+                    if !o.ord_no_first() {
+                        ord.firsts.entry(writer).or_insert((stamp, e.pos));
+                    }
                     ord.last = Some((stamp, e.pos));
                 }
             }

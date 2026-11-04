@@ -24,7 +24,10 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! No `merge-mutants` feature is needed: nothing here reads a mutation switch.
+//! The `merge-mutants` feature is needed (`Cargo.toml`): the replay sets the stage-A rule that a write which only
+//! reorders the fields is a no-op (the model has no field order), and compares states WITHOUT their order state
+//! (`fingerprint::without_ords`, a named restriction lifted at the D8 re-vendor); the order state meets a model
+//! that has it in `merge_state_ord_diff`.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
@@ -134,12 +137,13 @@ impl Mem {
 fn snap(ms: &[Mem]) -> Vec<J> {
     ms.iter()
         .map(|m| {
-            let cb = m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states");
+            let st = fingerprint::without_ords(&m.w.state);
+            let cb = st.try_canonical_bytes().expect("version 1 spells the differential's states");
             json!({
-                "h": hex(&m.w.state.try_state_hash().expect("version 1 spells the differential's states")),
+                "h": hex(&st.try_state_hash().expect("version 1 spells the differential's states")),
                 "len": cb.len(),
-                "ch": hex(&m.w.state.compact_hash()),
-                "clen": m.w.state.compact_bytes().len(),
+                "ch": hex(&st.compact_hash()),
+                "clen": st.compact_bytes().len(),
                 "v": jdoc(&m.w.visible()),
                 "hid": J::Object(m.w.hidden_all().iter().map(|(p, h)| (p.to_string(), J::String(h.to_string()))).collect()),
             })
@@ -168,7 +172,9 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
-    let opts = JoinOptions::new(ret, bound).expect("a valid bound");
+    let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
+    // the stage-A model has no field order: a write that only reorders is a no-op there
+    opts.set_ord_reorder_is_noop(true);
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
         .take(nm)
@@ -344,7 +350,9 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
         let before: Vec<Vec<u8>> = ms
             .iter()
             .map(|m| {
-                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+                fingerprint::without_ords(&m.w.state)
+                    .try_canonical_bytes()
+                    .expect("version 1 spells the differential's states")
             })
             .collect();
         for r in 0..nm {
@@ -360,7 +368,9 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
         if ms
             .iter()
             .map(|m| {
-                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+                fingerprint::without_ords(&m.w.state)
+                    .try_canonical_bytes()
+                    .expect("version 1 spells the differential's states")
             })
             .collect::<Vec<_>>()
             == before

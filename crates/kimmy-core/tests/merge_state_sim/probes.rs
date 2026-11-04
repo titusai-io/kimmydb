@@ -452,6 +452,9 @@ pub fn q3_check() -> Vec<String> {
             }
         }
     }
+    if !v3m1_order_independent(&Cfg::default_ret()) {
+        bad.push("the design should hold one state whatever the order of the entries after a long partition".into());
+    }
     if !q3_whole_vector(&Cfg::default_ret()) {
         bad.push(
             "the design should apply an entry whose stamp is covered but whose vector is not"
@@ -490,4 +493,38 @@ pub fn q3_whole_vector(cfg: &Cfg) -> bool {
     });
     ms[2].receive_entry(&ent);
     ms[2].visible().is_some_and(|d| d.get(&p("y")) == Some(&Value::Int64(2)))
+}
+
+/// V3M1 under the covered-entry skip (the default protocol): a partition longer than retention
+/// (ADR-085). C inserts and is silent from A, who kills the life; C then writes twice with its clock far
+/// ahead (`u` and `u2`), so the horizon of any join with C's entries is past the dead life and its delete.
+/// Two members that apply the SAME entries in different orders must agree: `W` applies A's delete `s`, then
+/// `u`, then `u2`; `V` applies `s`, then `u2` (then `u`, which the skip witnesses and does not apply).
+/// None of the entries is covered by the receiver's vector when it arrives, so the skip never applies:
+/// this is the case where the order of horizon and aliveness still matters in the default protocol.
+/// The design (the horizon of the joined vectors first) takes the dead life out BEFORE the union and
+/// both members hold C's life; applied after aliveness, `W` collects the life at `u` and C's `u2`
+/// brings it back, while `V` never lets it in. Returns whether `W` and `V` hold the same state.
+pub fn v3m1_order_independent(cfg: &Cfg) -> bool {
+    let mut cfg = cfg.clone();
+    cfg.opts.retention = 10;
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[1].insert(&[("x", Value::Int64(1))], &mut log, 0);
+    pull(&mut ms, 0, 1, None);
+    ms[0].delete(&mut log, 0);
+    ms[1].set("x", Value::Int64(2), &mut log, 1000);
+    ms[1].set("x", Value::Int64(3), &mut log, 1000);
+    let entry = |n: &Node, i: usize| std::rc::Rc::clone(n.oplog.values().nth(i).expect("an entry"));
+    let s = entry(&ms[0], ms[0].oplog.len() - 1);
+    let (u, u2) = (entry(&ms[1], 1), entry(&ms[1], 2));
+    let mut w = Node::new('W', &cfg);
+    let mut v = Node::new('V', &cfg);
+    for e in [&s, &u, &u2] {
+        w.receive_entry(e);
+    }
+    for e in [&s, &u2, &u] {
+        v.receive_entry(e);
+    }
+    w.canon() == v.canon()
 }

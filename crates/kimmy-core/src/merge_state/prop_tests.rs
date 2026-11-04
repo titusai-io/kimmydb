@@ -92,11 +92,26 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     run_with(seed, steps, o, false)
 }
 
-/// [`run`], with the order state fed after every local write when `feed` (see
-/// [`super::ord_codec_tests::feed_orders`]): the run draws the same numbers either way, so the states
-/// are the same but for their `ords`.
-pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, feed: bool) -> Vec<MergeState> {
-    let mut frng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+/// [`run`] with the writers' order state kept in the pooled states (`ords`) or left out of them.
+/// A writer feeds its order state with every local write; the runs without it are the runs of the
+/// stage-A model's rules: a write that changes only the ORDER of the fields is a no-op there, so
+/// they run with `ord_reorder_is_noop` on and the pooled states are the writers' states with the
+/// order state cleared. Both draw the same random numbers; the states are the same but for their
+/// `ords` and for the writes that only reorder.
+pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, ords: bool) -> Vec<MergeState> {
+    run_tagged(seed, steps, o, ords).into_iter().map(|(_, s)| s).collect()
+}
+
+/// [`run_with`] with the number of the writer that held each pooled state.
+pub(super) fn run_tagged(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    ords: bool,
+) -> Vec<(usize, MergeState)> {
+    let mut o = o.clone();
+    o.set_ord_reorder_is_noop(!ords);
+    let o = &o;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -122,7 +137,6 @@ pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, feed: bool) -> 
             ws[m].receive(&st);
         } else {
             let path = p(rng.pick(&["x", "n", "y", "", "_", "a.b"]));
-            let before = feed.then(|| ws[m].state.vv.clone());
             let w = &mut ws[m];
             match rng.below(14) {
                 0 => {
@@ -175,11 +189,8 @@ pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, feed: bool) -> 
                     w.write_delete(skew);
                 }
             }
-            if let Some(before) = before {
-                super::ord_codec_tests::feed_orders(&mut ws[m], &before, &mut frng, o);
-            }
         }
-        pool.push(ws[m].state.clone());
+        pool.push((m, if ords { ws[m].state.clone() } else { ws[m].state.without_ords() }));
     }
     pool
 }
@@ -188,7 +199,7 @@ pub(super) fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeS
     (1..=seeds).map(|s| run(s, steps, o)).collect()
 }
 
-/// [`pools`] with the order state fed.
+/// [`pools`] with the order state the writers built.
 pub(super) fn ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run_with(s, steps, o, true)).collect()
 }
@@ -824,14 +835,26 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
     run_nested_with(seed, steps, o, false)
 }
 
-/// [`run_nested`], with the order state fed after every local write when `feed`.
+/// [`run_nested`] with the order state kept in the pooled states or left out (see [`run_with`]).
 pub(super) fn run_nested_with(
     seed: u64,
     steps: usize,
     o: &JoinOptions,
-    feed: bool,
+    ords: bool,
 ) -> Vec<MergeState> {
-    let mut frng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+    run_nested_tagged(seed, steps, o, ords).into_iter().map(|(_, s)| s).collect()
+}
+
+/// [`run_nested_with`] with the number of the writer that held each pooled state.
+pub(super) fn run_nested_tagged(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    ords: bool,
+) -> Vec<(usize, MergeState)> {
+    let mut o = o.clone();
+    o.set_ord_reorder_is_noop(!ords);
+    let o = &o;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -874,7 +897,6 @@ pub(super) fn run_nested_with(
             ws[m].receive(&st);
         } else {
             let path = rng.pick(&all).clone();
-            let before = feed.then(|| ws[m].state.vv.clone());
             let w = &mut ws[m];
             match rng.below(14) {
                 0..=3 => {
@@ -906,11 +928,8 @@ pub(super) fn run_nested_with(
                     w.insert(&[(p("x"), Value::Int64(100)), (p("a"), v)], skew);
                 }
             }
-            if let Some(before) = before {
-                super::ord_codec_tests::feed_orders(&mut ws[m], &before, &mut frng, o);
-            }
         }
-        pool.push(ws[m].state.clone());
+        pool.push((m, if ords { ws[m].state.clone() } else { ws[m].state.without_ords() }));
     }
     pool
 }
@@ -919,7 +938,7 @@ pub(super) fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec
     (1..=seeds).map(|s| run_nested(s, steps, o)).collect()
 }
 
-/// [`nested_pools`] with the order state fed.
+/// [`nested_pools`] with the order state the writers built.
 pub(super) fn nested_ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run_nested_with(s, steps, o, true)).collect()
 }

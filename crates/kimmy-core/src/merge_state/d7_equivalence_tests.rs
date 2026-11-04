@@ -27,8 +27,8 @@
 //! ORDER ENTRIES CLEARED (restored after the O1 review, O1-9). This file was deleted when the order
 //! state joined the join; the join's change was purely additive (the `t.ords` loop and the `ords`
 //! retain, no line of the cell join changed), so the frozen copies of `8e36e8de` still pin the cells,
-//! and the guard is needed while the writer's feed (O2), the probes (O3) and the implicit marker (O4)
-//! change the code around the join. Every input state has its `ords` cleared before the live code and
+//! and the guard is needed while the writer's feed (O2, now built), the probes (O3) and the implicit
+//! marker (O4) change the code around the join. Every input state has its `ords` cleared before the live code and
 //! the frozen copy see it, so what is compared is the join and the reads of the cells, as before; the
 //! order state has its own tests (`ord_tests`, `ord_codec_tests`).
 //!

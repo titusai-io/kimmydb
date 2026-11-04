@@ -47,3 +47,15 @@ merge-mutants = []
 name = "merge_state_sim"
 path = "tests/merge_state_sim/main.rs"
 required-features = ["merge-mutants"]
+
+# The differentials against the stage-A model set the stage-A rule that a write which only reorders
+# fields is a no-op (a mutation switch): they need the switches.
+[[test]]
+name = "merge_state_diff"
+path = "tests/merge_state_diff.rs"
+required-features = ["merge-mutants"]
+
+[[test]]
+name = "merge_state_diff_nested"
+path = "tests/merge_state_diff_nested.rs"
+required-features = ["merge-mutants"]

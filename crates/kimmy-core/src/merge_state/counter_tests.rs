@@ -243,8 +243,8 @@ fn typed_counters_round_trip_in_the_compact_form_and_version_1_refuses_them() {
     let mut only = Writer::new(wid('C', 0), o);
     only.insert(&fl(&[("d", i64v(9))]), 0).unwrap();
     only.write_inc(&p("d"), 1, 0).unwrap();
-    assert!(only.state.v1_can_hold());
-    assert_eq!(MergeState::decode(&only.state.encode()).unwrap(), only.state);
+    assert!(only.state.without_ords().v1_can_hold());
+    assert_eq!(MergeState::decode(&only.state.encode()).unwrap(), only.state.without_ords());
 }
 
 // ---- every rule has a mutant that a scenario catches ------------------------------------------

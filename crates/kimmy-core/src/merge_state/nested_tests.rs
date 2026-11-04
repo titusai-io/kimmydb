@@ -518,7 +518,8 @@ fn diff_writes_only_changed_leaves(o: &JoinOptions) -> Result<(), String> {
     chk(written(&mut m, "a", sub(&[])), None, "an empty map over an empty map is a no-op")?;
     // replace: only changed fields, and an absent field of the replacing document is unset
     let before = m.w.state.clone();
-    let r = m.w.write_replace(&fl(&[("k", i(0)), ("a", sub(&[]))]), 0);
+    // (in the order the writer shows: a replace in another order of the same fields is a write)
+    let r = m.w.write_replace(&fl(&[("a", sub(&[])), ("k", i(0))]), 0);
     if r.is_some() || m.w.state != before {
         return Err("an identical replace must change nothing".into());
     }
@@ -658,7 +659,7 @@ fn odd_names_are_one_segment_paths_through_write_join_visible_and_both_codecs() 
         assert_eq!(vis[&one.child("other").unwrap()], s("t"));
         assert_eq!(b.state.join(&a.state, &o).0, a.state, "{name:?} joins");
         for st in [&a.state, &b.state] {
-            assert_eq!(&MergeState::decode(&st.encode()).unwrap(), st);
+            assert_eq!(MergeState::decode(&st.encode()).unwrap(), st.without_ords());
             assert_eq!(&MergeState::decode_compact(&st.encode_compact()).unwrap(), st);
         }
         assert_eq!(MergeState::decode(&a.state.encode()).unwrap().visible(&o).unwrap(), vis);

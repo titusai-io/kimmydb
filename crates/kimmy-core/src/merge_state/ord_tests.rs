@@ -1,11 +1,12 @@
 //! Tests of the order state (`ord.rs`): the join and its laws, the read (the materialised document
 //! in field order), the feed, and the mutation switches.
 //!
-//! The expected results are the reference model's own, from the A2-final Python model
-//! (`q7step0-model-A2-final/`, `model6.py`): `tests/data/ord_goldens.json` holds, for each named
+//! The expected results are the reference model's own, from the A2.1 Python model
+//! (`q7step0-model/`, `model6.py`): `tests/data/ord_goldens.json` holds, for each named
 //! scenario, the state of every writer entry (what the Rust joins, in many delivery orders), the
-//! ordered document and the order state the model's observer ends with, and the writes themselves
-//! (for the replay of the feed). `tests/data/ord_join_laws.json` holds the distinct order entries
+//! ordered document and the order state the model's observer ends with, the writes themselves
+//! (for the replay of the feed) and the script (for the replay through the `Writer` API: every
+//! write and receive, in program order). `tests/data/ord_join_laws.json` holds the distinct order entries
 //! of the model's `probe_ord_join_laws` (150 nested runs). Both are made by
 //! `tests/data/gen_ord_goldens.py`; the hash of `model6.py` is in the fixtures.
 
@@ -23,8 +24,8 @@ const GOLDENS: &str = include_str!("../../tests/data/ord_goldens.json");
 const JOIN_LAWS: &str = include_str!("../../tests/data/ord_join_laws.json");
 const RANDOM_STATES: &str = include_str!("../../tests/data/ord_random_states.json");
 
-/// The `sha256` of `model6.py` that both fixtures were made from.
-const MODEL6_SHA256: &str = "0506450e0afc4c307a6ebce032df4f1b1588e719cde6c148c5ff033a8df7f85a";
+/// The `sha256` of `model6.py` (the reviewed A2.1 tree) that the fixtures were made from.
+const MODEL6_SHA256: &str = "865808753a5f9a4b80688a874f887ca1935de53b43ea19a0c6f13aa6b3497d08";
 
 // ---- the fixtures ---------------------------------------------------------------------
 
@@ -269,9 +270,9 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
 /// The scenarios the model's observer and the Rust join do not agree on, under `o`, by name: the
 /// read side (the entries joined in `ordered`, the ordered document and the order state compared
 /// with the model's) and the feed (the writes replayed, the order state of each entry compared).
-fn disagreements(o: &JoinOptions, all_orders: bool) -> (Vec<String>, Vec<String>) {
+fn disagreements(o: &JoinOptions, all_orders: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
     let g = goldens();
-    let (mut read, mut feed) = (Vec::new(), Vec::new());
+    let (mut read, mut feed, mut writer) = (Vec::new(), Vec::new(), Vec::new());
     for (name, sc) in g["scenarios"].as_object().unwrap() {
         let entries: Vec<MergeState> =
             sc["entries"].as_array().unwrap().iter().map(state).collect();
@@ -293,11 +294,35 @@ fn disagreements(o: &JoinOptions, all_orders: bool) -> (Vec<String>, Vec<String>
         if !read_ok {
             read.push(name.clone());
         }
-        if !replay(sc, o) {
+        // (the replay of the bare feed starts every writer from the seed alone and replays one entry per
+        // write: not for a scenario in which a writer receives, or in which a write is two entries (a
+        // `$setOnInsert` upsert), which only the Writer API replay below can follow)
+        let not_bare = sc["script"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["k"] == "recv" || s["op"] == "upsert_soi");
+        if !not_bare && !replay(sc, o) {
             feed.push(name.clone());
         }
+        // the Writer API: the script replayed through four writers, and the entries THEY built
+        // delivered to a fresh observer in the same orders
+        let writer_ok = replay_script(sc, o).is_ok_and(|r| {
+            r.entries.len() == entries.len()
+                && ords_to_try.iter().all(|ord| {
+                    let mut s = MergeState::default();
+                    for &i in ord {
+                        s = join(&s, &r.entries[i], o).0;
+                    }
+                    s.ords == want_ords
+                        && s.ordered_document(o).map(|d| flatten(&d)).as_deref() == Some(&want[..])
+                })
+        });
+        if !writer_ok {
+            writer.push(name.clone());
+        }
     }
-    (read, feed)
+    (read, feed, writer)
 }
 
 /// Replay the writes of a scenario through the feed, each writer on a state of its own that
@@ -341,10 +366,175 @@ fn replay(sc: &J, o: &JoinOptions) -> bool {
     true
 }
 
+// ---- the replay through the Writer API --------------------------------------------------
+
+/// A document value of a script: `{"t": "doc", "v": [[name, value], ...]}` is a sub-document.
+fn script_value(j: &J) -> Value {
+    if j["t"] == "doc" {
+        Value::Document(
+            j["v"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| (f[0].as_str().unwrap().to_string(), script_value(&f[1])))
+                .collect(),
+        )
+    } else {
+        value(j)
+    }
+}
+
+/// The fields of a whole document of a script (insert, replace): one-segment paths.
+fn script_fields(j: &J) -> Vec<(Path, Value)> {
+    j["v"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (Path::flat(f[0].as_str().unwrap()).unwrap(), script_value(&f[1])))
+        .collect()
+}
+
+/// The operators of an `update` of a script.
+fn script_ops(j: &J) -> Vec<UpdateOp> {
+    j.as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            let p = path(&o[1]);
+            match o[0].as_str().unwrap() {
+                "set" => UpdateOp::Set(p, script_value(&o[2])),
+                "unset" => UpdateOp::Unset(p),
+                "inc" => UpdateOp::Inc(p, script_value(&o[2])),
+                k => panic!("operator {k}"),
+            }
+        })
+        .collect()
+}
+
+/// What a replay of a scenario's script through the `Writer`s gave.
+struct Replayed {
+    /// The state of the writer right after each write, in program order (the model's entries).
+    entries: Vec<MergeState>,
+}
+
+/// Replay the script of a scenario through the Writer API: four writers (`I`, `A`, `B`, `C`), the
+/// seed insert by `I` received by the other three, then every write and every receive in program
+/// order. Each write must give or refuse a stamp as the model's did, at the model's stamp, leave the
+/// model's order state in the entry, and show the model's ordered document to its own writer.
+/// `Err` names the first step that disagrees.
+fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
+    let wid = |c: &str| writer(&serde_json::json!([c, 0]));
+    let mut ws: BTreeMap<String, Writer> = ["I", "A", "B", "C"]
+        .iter()
+        .map(|c| ((*c).to_string(), Writer::new(wid(c), o.clone())))
+        .collect();
+    let (entries_j, own_j) = (sc["entries"].as_array().unwrap(), sc["own"].as_array().unwrap());
+    let mut entries: Vec<MergeState> = Vec::new();
+    let mut sent: BTreeMap<MStamp, MergeState> = BTreeMap::new();
+    let mut k = 0usize;
+    // check the entry just made against the model's k-th
+    let mut check = |ws: &BTreeMap<String, Writer>,
+                     who: &str,
+                     at: MStamp,
+                     entries: &mut Vec<MergeState>,
+                     sent: &mut BTreeMap<MStamp, MergeState>,
+                     what: &str|
+     -> Result<(), String> {
+        let w = &ws[who];
+        // the model's entry is not normalised (a deleted life keeps its order entries until a join
+        // drops them); the writer's state is, as every receiver's join leaves it
+        let want_ords = join(&MergeState::default(), &state(&entries_j[k]), o).0.ords;
+        if w.state.ords != want_ords {
+            return Err(format!(
+                "{what}: the order state after write {k} differs from the model's"
+            ));
+        }
+        let own = &own_j[k];
+        let got = w.state.ordered_document(o).map(|d| flatten(&d));
+        let want = (!own.is_null()).then(|| expected(&serde_json::json!({ "expected": own })));
+        if got != want {
+            return Err(format!("{what}: {who} reads {got:?} after write {k}, the model {want:?}"));
+        }
+        sent.insert(at, w.state.clone());
+        entries.push(w.state.clone());
+        k += 1;
+        Ok(())
+    };
+    if !sc["init"].is_null() {
+        let fields = script_fields(&sc["init"]);
+        let who = "I";
+        let w = ws.get_mut(who).unwrap();
+        let written = w.insert(&fields, 0).ok_or("the seed insert is refused")?;
+        if written.stamp != stamp(&sc["entry_stamps"][0]) {
+            return Err("the seed insert has another stamp".into());
+        }
+        check(&ws, who, written.stamp, &mut entries, &mut sent, "seed insert")?;
+        let st = ws[who].state.clone();
+        for c in ["A", "B", "C"] {
+            ws.get_mut(c).unwrap().receive_report(&st);
+        }
+    }
+    for (i, step) in sc["script"].as_array().unwrap().iter().enumerate() {
+        let who = step["who"].as_str().unwrap();
+        if step["k"] == "recv" {
+            let from = &sent[&stamp(&step["stamp"])];
+            ws.get_mut(who).unwrap().receive_report(&from.clone());
+            continue;
+        }
+        let name = step["op"].as_str().unwrap();
+        let what = format!("step {i}: {who} {name}");
+        let w = ws.get_mut(who).unwrap();
+        if let Some(c) = step["clock"].as_u64() {
+            w.clock = Hlc::new(c, 0);
+        }
+        let skew = step["skew"].as_u64().unwrap();
+        let at = || path(&step["path"]);
+        let arg = &step["arg"];
+        let got = match name {
+            "insert" => w.insert(&script_fields(arg), skew),
+            "set" => w.write_set(&at(), script_value(arg), skew),
+            "unset" => w.write_unset(&at(), skew),
+            "inc" => w.write_inc(&at(), arg["v"].as_i64().unwrap(), skew),
+            "replace" => w.write_replace(&script_fields(arg), skew),
+            "delete" => w.write_delete(skew),
+            "upsert_inc" => w.upsert_inc(&at(), arg["v"].as_i64().unwrap(), skew),
+            "update" | "setmany" => w.write_update(&script_ops(arg), skew),
+            "upsert_soi" => w
+                .upsert_soi(
+                    &script_fields(&arg["fields"]),
+                    &at(),
+                    arg["n"]["v"].as_i64().unwrap(),
+                    &script_fields(&arg["sets"]),
+                    skew,
+                )
+                .map(|(_, second)| second),
+            n => panic!("operator {n}"),
+        };
+        match (got, stamp_opt(&step["stamp"])) {
+            (None, None) => {}
+            (Some(g), Some(want)) if g.stamp == want => {
+                check(&ws, who, g.stamp, &mut entries, &mut sent, &what)?;
+            }
+            (g, want) => {
+                return Err(format!(
+                    "{what}: the writer gave {:?}, the model {want:?}",
+                    g.map(|x| x.stamp)
+                ));
+            }
+        }
+    }
+    Ok(Replayed { entries })
+}
+
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 30] = [
+const SCENARIOS: [&str; 43] = [
+    "a_scalar_over_a_map_voids_the_places_of_its_fields",
+    "a_set_on_insert_upsert_feeds_both_of_its_writes",
+    "a_standalone_noop_unset_leaves_nothing",
+    "a_subdocument_set_that_only_reorders_is_a_write",
+    "a_writer_with_two_lives_writes_into_the_newest",
     "approximate_case",
     "concurrent_creation_a_first",
     "concurrent_creation_b_first",
@@ -352,11 +542,16 @@ const SCENARIOS: [&str; 30] = [
     "delete_reinsert_with_a_concurrent_set",
     "descendant_above_the_floor_is_not_a_survivor",
     "descendant_survivor_of_an_unset_map",
+    "hybrid_floor_on_an_update_after_a_receive",
     "hybrid_noop_unset_rides_on_an_update",
+    "inc_of_a_double_below_a_map_is_a_register_write",
     "inc_unset_replace_concurrent",
     "level_floor_nested_subdocument_set",
     "level_floor_replace",
     "level_floor_subdocument_set",
+    "receive_a_concurrent_replace_then_set",
+    "receive_a_concurrent_unset_then_set",
+    "receive_a_survivor_increment_then_unset",
     "replace_drops_a_field_then_set_appends",
     "replace_reorders_even_unchanged",
     "replace_with_an_empty_document_has_no_update_bit",
@@ -370,10 +565,13 @@ const SCENARIOS: [&str; 30] = [
     "survivor_placement_a_inc_before_c",
     "survivor_placement_b_unset_knew_c",
     "two_lives_by_two_upserts",
+    "two_writers_each_receive_the_others_write_then_write",
     "unset_then_concurrent_set",
+    "unset_then_receive_a_survivor_increment",
     "update_bit_survivor_after_all_the_updates_fields",
     "update_with_inc_and_unset_of_a_map",
     "update_without_bit_survivor_by_prev",
+    "updates_that_are_writes_by_what_they_name_alone",
     "write_below_a_map_is_a_write_to_the_map",
 ];
 
@@ -414,7 +612,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (30, 1088, 117));
+    assert_eq!((names.len(), joined, fields), (43, 3300, 177));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -430,12 +628,23 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The materialised-order goldens, spelled out. The arrays are what the A2-final model gives
+/// The materialised-order goldens, spelled out. The arrays are what the A2.1 model gives
 /// (the same arrays are in `tests/data/ord_goldens.json`, from which the test above checks the
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 30] = [
+    let pins: [(&str, &[&str]); 43] = [
+        ("a_set_on_insert_upsert_feeds_both_of_its_writes", &["a", "b", "c", "e", "n", "d"]),
+        ("a_standalone_noop_unset_leaves_nothing", &["a", "b", "m", "m.p", "nope", "e"]),
+        ("a_subdocument_set_that_only_reorders_is_a_write", &["m", "m.q", "m.p", "m.r", "k", "z"]),
+        ("a_writer_with_two_lives_writes_into_the_newest", &["x", "y", "z"]),
+        ("hybrid_floor_on_an_update_after_a_receive", &["a", "c", "b", "e"]),
+        ("inc_of_a_double_below_a_map_is_a_register_write", &["x", "m", "m.f", "w"]),
+        ("receive_a_concurrent_replace_then_set", &["c", "b", "a", "d", "e"]),
+        ("receive_a_concurrent_unset_then_set", &["q", "r", "p"]),
+        ("receive_a_survivor_increment_then_unset", &["x", "w", "b"]),
+        ("two_writers_each_receive_the_others_write_then_write", &["x", "q", "r", "s"]),
+        ("unset_then_receive_a_survivor_increment", &["x", "a", "w", "e"]),
         ("approximate_case", &["z", "q", "p", "r"]),
         ("concurrent_creation_a_first", &["a", "c", "d"]),
         ("concurrent_creation_b_first", &["a", "d", "c"]),
@@ -472,6 +681,11 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
         ),
         ("update_without_bit_survivor_by_prev", &["x", "a", "w"]),
         ("write_below_a_map_is_a_write_to_the_map", &["x", "z", "a", "a.b", "w"]),
+        ("a_scalar_over_a_map_voids_the_places_of_its_fields", &["x", "m", "m.q", "m.p", "w"]),
+        (
+            "updates_that_are_writes_by_what_they_name_alone",
+            &["a", "m", "m.q", "m.p", "k", "k.j", "e"],
+        ),
     ];
     for (name, want) in pins {
         assert_eq!(order_of(name), strs(want), "{name}");
@@ -483,39 +697,125 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
 /// entry holds after every write.
 #[test]
 fn the_feed_reproduces_the_models_order_state_after_every_write() {
-    let (read, feed) = disagreements(&JoinOptions::default(), true);
+    let (read, feed, writer) = disagreements(&JoinOptions::default(), true);
     assert_eq!((read, feed), (Vec::<String>::new(), Vec::<String>::new()));
+    assert_eq!(writer, Vec::<String>::new(), "the Writer API reproduces the model");
+}
+
+/// The scenarios, replayed through four `Writer`s (the model's members) by their scripts, give the
+/// model's stamps, refusals, order state and own ordered document after every write, and the
+/// entries the writers built give the model's order state and document to an observer in every
+/// delivery order (all permutations up to six entries, 202 shuffles above), as the entries the
+/// model built do. A writer that receives before it writes feeds the join of what it received and
+/// its own history.
+#[test]
+fn the_writer_reproduces_the_models_scenarios_after_every_write() {
+    let g = goldens();
+    let o = JoinOptions::default();
+    let (mut writes, mut receives, mut refused, mut joined) = (0, 0, 0, 0);
+    for (name, sc) in g["scenarios"].as_object().unwrap() {
+        let r = replay_script(sc, &o).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let script = sc["script"].as_array().unwrap();
+        receives += script.iter().filter(|s| s["k"] == "recv").count();
+        refused += script.iter().filter(|s| s["k"] == "op" && s["stamp"].is_null()).count();
+        writes += r.entries.len();
+        let want = expected(sc);
+        let want_ords = ords(&sc["ords"]);
+        for ord in orders(r.entries.len()) {
+            let mut s = MergeState::default();
+            for &i in &ord {
+                s = join(&s, &r.entries[i], &o).0;
+            }
+            joined += 1;
+            assert_eq!(s.ords, want_ords, "{name}: the order state, delivery order {ord:?}");
+            let doc = s.ordered_document(&o).expect("a life is alive");
+            assert_eq!(flatten(&doc), want, "{name}: delivery order {ord:?}");
+            assert_eq!(s.check_decoded(), Ok(()), "{name}: a state a writer built is accepted");
+        }
+    }
+    // pinned: what the replay covered (the seed insert of a seeded scenario is one of its writes)
+    assert_eq!((writes, receives, refused, joined), (184, 8, 9, 3300));
+}
+
+/// The O2 watch item: a top-level field named `""` is fed as `OrdAt::Field([""])`, never as the
+/// root. A writer inserts it with a sibling, sets a sub-document at it, and replaces the document
+/// (the root's level mark): the order state holds both keys, the root only a level mark, and the
+/// state is accepted by both decoders and round trips.
+#[test]
+fn the_writer_feeds_a_top_level_field_named_empty_as_a_field() {
+    let o = JoinOptions::default();
+    let mut w = Writer::new(super::tests::wid('A', 0), o.clone());
+    let empty = Path::flat("").unwrap();
+    let x = Path::flat("x").unwrap();
+    let sub = Value::Document(vec![("c".into(), Value::Int64(1))]);
+    let life = w
+        .insert(&[(empty.clone(), Value::Int64(0)), (x.clone(), Value::Int64(1))], 0)
+        .unwrap()
+        .stamp;
+    assert!(w.state.ords.contains_key(&(life, OrdAt::Field(empty.clone()))));
+    assert!(!w.state.ords.contains_key(&(life, OrdAt::Root)));
+    w.write_set(&empty, sub.clone(), 0).unwrap();
+    let r = w.write_replace(&[(x.clone(), Value::Int64(2)), (empty.clone(), sub)], 0).unwrap();
+    let root = &w.state.ords[&(life, OrdAt::Root)];
+    assert_eq!(
+        (root.floor, root.firsts.len(), root.last, root.lvl),
+        (None, 0, None, Some(r.stamp))
+    );
+    let field = &w.state.ords[&(life, OrdAt::Field(empty.clone()))];
+    assert_eq!(field.lvl, Some(r.stamp));
+    assert_eq!(w.state.check_decoded(), Ok(()));
+    let enc = w.state.encode_compact();
+    assert_eq!(MergeState::decode_compact(&enc).as_ref(), Ok(&w.state));
+    let doc = w.state.ordered_document(&o).unwrap();
+    assert_eq!(doc.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["x", ""]);
 }
 
 // ---- the mutation switches ----------------------------------------------------------
 
 /// Each order switch, set wrong, changes the outcome of the scenarios named: the killers. A
 /// switch of the read side changes the joined order state or the document; a switch of the feed
-/// changes the order state a replayed write leaves. (The writer does not feed the order state yet
-/// and the sim does not generate it, so these lib tests are the killers until item O2.) The
-/// shortest killers: `ord_no_last` by `approximate_case` (the field whose only valid candidate is
-/// its last write), `ord_latest` by `same_new_path_from_two_writers`, `ord_no_survivor_clamp` by
-/// `survivor_increment_after_unset`, `ord_no_level_floor` by `level_floor_subdocument_set`,
-/// `ord_ignores_bit` by `update_bit_survivor_after_all_the_updates_fields`, `ord_no_reset` and
-/// `ord_no_pos` through the feed by `level_floor_replace` and `sequential_rules`.
+/// changes the order state a replayed write leaves (the bare feed, `ord_events` and `ord_apply`,
+/// on scenarios in which no writer receives); a switch of the writer changes what the `Writer`
+/// API gives when the script is replayed through it (stamps, refusals, order state, own document,
+/// and the entries joined in every delivery order). The shortest killers: `ord_no_last` by
+/// `approximate_case` (the field whose only valid candidate is its last write), `ord_latest` by
+/// `same_new_path_from_two_writers`, `ord_no_survivor_clamp` by `survivor_increment_after_unset`,
+/// `ord_no_level_floor` by `level_floor_subdocument_set`, `ord_ignores_bit` by
+/// `update_bit_survivor_after_all_the_updates_fields`, `ord_no_reset` and `ord_no_pos` by
+/// `level_floor_replace` and `sequential_rules`, and the switches of the writer's own rules by:
+/// `ord_no_ancestor` `write_below_a_map_is_a_write_to_the_map`, `ord_no_hybrid`
+/// `hybrid_noop_unset_rides_on_an_update` and `hybrid_floor_on_an_update_after_a_receive`,
+/// `ord_noop_unset_stands` `a_standalone_noop_unset_leaves_nothing`, `ord_bit_unpacked`
+/// `update_bit_survivor_after_all_the_updates_fields`, `ord_no_first`
+/// `same_new_path_from_two_writers`, `ord_replace_without_reset` `replace_reorders_even_unchanged`,
+/// `ord_reorder_is_noop` `a_subdocument_set_that_only_reorders_is_a_write`.
 #[test]
 fn the_order_switches_change_the_outcome_of_named_scenarios() {
     type Set = fn(&mut JoinOptions);
     // (switch, how to set it, scenarios killed through the read, scenarios killed through the feed)
-    let switches: [(&str, Set, &[&str], &[&str]); 9] = [
+    // (switch, how to set it, killed through the read, the bare feed, the Writer API)
+    type Row<'a> = (&'a str, Set, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+    let switches: [Row; 16] = [
         (
             "ord_keep_all",
             |o| o.set_ord_keep_all(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -527,18 +827,24 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "survivor_older_than_the_fields_own_write_lowers_its_position",
                 "survivor_placement_a_inc_before_c",
                 "survivor_placement_b_unset_knew_c",
+                "two_writers_each_receive_the_others_write_then_write",
                 "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -558,6 +864,44 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "approximate_case",
+                "concurrent_replaces",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "sequential_rules",
+                "set_then_concurrent_unset",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_increment_after_unset",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "survivor_placement_b_unset_knew_c",
+                "two_writers_each_receive_the_others_write_then_write",
+                "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+                "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -565,29 +909,72 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_latest",
             |o| o.set_ord_latest(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "level_floor_nested_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
                 "same_new_path_from_two_writers",
                 "sequential_rules",
+                "two_writers_each_receive_the_others_write_then_write",
                 "update_with_inc_and_unset_of_a_map",
             ],
             &[],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "approximate_case",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "same_new_path_from_two_writers",
+                "sequential_rules",
+                "set_then_concurrent_unset",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_placement_a_inc_before_c",
+                "two_writers_each_receive_the_others_write_then_write",
+                "unset_then_concurrent_set",
+                "update_with_inc_and_unset_of_a_map",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
         ),
-        ("ord_no_last", |o| o.set_ord_no_last(true), &["approximate_case"], &[]),
+        (
+            "ord_no_last",
+            |o| o.set_ord_no_last(true),
+            &["approximate_case"],
+            &[],
+            &["approximate_case"],
+        ),
         (
             "ord_by_name",
             |o| o.set_ord_by_name(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_creation_b_first",
                 "concurrent_replaces",
                 "delete_reinsert_with_a_concurrent_set",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "sequential_rules",
@@ -596,27 +983,82 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
                 "survivor_older_than_the_fields_own_write_lowers_its_position",
                 "survivor_placement_a_inc_before_c",
+                "two_writers_each_receive_the_others_write_then_write",
                 "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "approximate_case",
+                "concurrent_creation_b_first",
+                "concurrent_replaces",
+                "delete_reinsert_with_a_concurrent_set",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "sequential_rules",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_increment_after_unset",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "survivor_placement_b_unset_knew_c",
+                "two_writers_each_receive_the_others_write_then_write",
+                "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+                "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
         ),
         (
             "ord_no_survivor_clamp",
             |o| o.set_ord_no_survivor_clamp(true),
             &[
                 "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
                 "replace_with_an_empty_document_has_no_update_bit",
                 "survivor_increment_after_unset",
                 "survivor_older_than_the_fields_own_write_lowers_its_position",
                 "survivor_placement_a_inc_before_c",
+                "unset_then_receive_a_survivor_increment",
                 "update_without_bit_survivor_by_prev",
             ],
             &[],
+            &[
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "survivor_increment_after_unset",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "unset_then_receive_a_survivor_increment",
+                "update_without_bit_survivor_by_prev",
+            ],
         ),
         (
             "ord_no_level_floor",
@@ -627,6 +1069,8 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "concurrent_replaces",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
@@ -636,23 +1080,47 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
+            ],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "concurrent_replaces",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
         ),
         (
             "ord_ignores_bit",
             |o| o.set_ord_ignores_bit(true),
             &[
+                "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
             ],
             &[],
+            &[
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+            ],
         ),
         (
             "ord_no_reset",
             |o| o.set_ord_no_reset(true),
             &[],
             &[
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "concurrent_replaces",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
@@ -661,6 +1129,20 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
+            ],
+            &[
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "concurrent_replaces",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
         ),
         (
@@ -668,12 +1150,16 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             |o| o.set_ord_no_pos(true),
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
                 "delete_reinsert_with_a_concurrent_set",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
@@ -693,17 +1179,237 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "approximate_case",
+                "concurrent_replaces",
+                "delete_reinsert_with_a_concurrent_set",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "sequential_rules",
+                "set_then_concurrent_unset",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_increment_after_unset",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "survivor_placement_b_unset_knew_c",
+                "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+                "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
+        (
+            "ord_no_ancestor",
+            |o| o.set_ord_no_ancestor(true),
+            &[],
+            &[],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "sequential_rules",
+                "survivor_placement_b_unset_knew_c",
+                "update_with_inc_and_unset_of_a_map",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
+        ),
+        (
+            "ord_no_hybrid",
+            |o| o.set_ord_no_hybrid(true),
+            &[],
+            &[],
+            &["hybrid_floor_on_an_update_after_a_receive", "hybrid_noop_unset_rides_on_an_update"],
+        ),
+        (
+            "ord_noop_unset_stands",
+            |o| o.set_ord_noop_unset_stands(true),
+            &[],
+            &[],
+            &["a_standalone_noop_unset_leaves_nothing"],
+        ),
+        (
+            "ord_bit_unpacked",
+            |o| o.set_ord_bit_unpacked(true),
+            &[],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_unset_replace_concurrent",
+                "replace_drops_a_field_then_set_appends",
+                "sequential_rules",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+            ],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_unset_replace_concurrent",
+                "replace_drops_a_field_then_set_appends",
+                "sequential_rules",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+            ],
+        ),
+        (
+            "ord_no_first",
+            |o| o.set_ord_no_first(true),
+            &[],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "approximate_case",
+                "concurrent_creation_a_first",
+                "concurrent_creation_b_first",
+                "concurrent_replaces",
+                "delete_reinsert_with_a_concurrent_set",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "same_new_path_from_two_writers",
+                "sequential_rules",
+                "set_then_concurrent_unset",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_increment_after_unset",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "survivor_placement_b_unset_knew_c",
+                "two_lives_by_two_upserts",
+                "unset_then_concurrent_set",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+                "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
+            &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
+                "a_set_on_insert_upsert_feeds_both_of_its_writes",
+                "a_standalone_noop_unset_leaves_nothing",
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "a_writer_with_two_lives_writes_into_the_newest",
+                "approximate_case",
+                "concurrent_creation_a_first",
+                "concurrent_creation_b_first",
+                "concurrent_replaces",
+                "delete_reinsert_with_a_concurrent_set",
+                "descendant_above_the_floor_is_not_a_survivor",
+                "descendant_survivor_of_an_unset_map",
+                "hybrid_floor_on_an_update_after_a_receive",
+                "hybrid_noop_unset_rides_on_an_update",
+                "inc_of_a_double_below_a_map_is_a_register_write",
+                "inc_unset_replace_concurrent",
+                "level_floor_nested_subdocument_set",
+                "level_floor_replace",
+                "level_floor_subdocument_set",
+                "receive_a_concurrent_replace_then_set",
+                "receive_a_concurrent_unset_then_set",
+                "receive_a_survivor_increment_then_unset",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
+                "same_new_path_from_two_writers",
+                "sequential_rules",
+                "set_then_concurrent_unset",
+                "slot_above_the_floor_is_not_a_survivor",
+                "survivor_increment_after_unset",
+                "survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew",
+                "survivor_older_than_the_fields_own_write_lowers_its_position",
+                "survivor_placement_a_inc_before_c",
+                "survivor_placement_b_unset_knew_c",
+                "two_lives_by_two_upserts",
+                "two_writers_each_receive_the_others_write_then_write",
+                "unset_then_concurrent_set",
+                "unset_then_receive_a_survivor_increment",
+                "update_bit_survivor_after_all_the_updates_fields",
+                "update_with_inc_and_unset_of_a_map",
+                "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
+                "write_below_a_map_is_a_write_to_the_map",
+            ],
+        ),
+        (
+            "ord_replace_without_reset",
+            |o| o.set_ord_replace_without_reset(true),
+            &[],
+            &[],
+            &[
+                "concurrent_replaces",
+                "inc_unset_replace_concurrent",
+                "level_floor_replace",
+                "receive_a_concurrent_replace_then_set",
+                "replace_drops_a_field_then_set_appends",
+                "replace_reorders_even_unchanged",
+                "sequential_rules",
+            ],
+        ),
+        (
+            "ord_reorder_is_noop",
+            |o| o.set_ord_reorder_is_noop(true),
+            &[],
+            &[],
+            &[
+                "a_subdocument_set_that_only_reorders_is_a_write",
+                "concurrent_replaces",
+                "level_floor_replace",
+                "receive_a_concurrent_replace_then_set",
+                "replace_reorders_even_unchanged",
+                "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
+            ],
+        ),
     ];
-    for (name, set, read_killers, feed_killers) in switches {
+    for (name, set, read_killers, feed_killers, writer_killers) in switches {
         let mut o = JoinOptions::default();
         set(&mut o);
-        let (read, feed) = disagreements(&o, false);
+        let (read, feed, writer) = disagreements(&o, false);
         assert_eq!(read, strs(read_killers), "{name}: scenarios killed through the read");
         assert_eq!(feed, strs(feed_killers), "{name}: scenarios killed through the feed");
-        assert!(!read.is_empty() || !feed.is_empty(), "{name} changes nothing");
+        assert_eq!(writer, strs(writer_killers), "{name}: scenarios killed through the Writer API");
+        assert!(
+            !read.is_empty() || !feed.is_empty() || !writer.is_empty(),
+            "{name} changes nothing"
+        );
     }
 }
 
@@ -996,8 +1702,8 @@ fn the_feed_only_moves_forward_the_floor_the_level_and_the_first() {
 /// (the later state has seen the floor, and carries it). Here are two firsts of one writer that no
 /// such history keeps side by side and an unset between them: the groupings disagree. (Beyond
 /// retention an honest history reaches the same shape: `ord_codec_tests`, the seed 1421 case.) The
-/// model's probe and the simulation below pin the reachable side; the writer's feed (item O2) must
-/// keep to it.
+/// model's probe and the simulation below pin the reachable side; the writer's feed keeps to it
+/// (`a_writers_states_only_grow` in `ord_codec_tests`).
 #[test]
 fn the_order_join_is_associative_only_on_the_entries_a_history_reaches() {
     let o = JoinOptions::default();
@@ -1178,9 +1884,9 @@ fn the_read_equals_the_model_with_absorbed_on() {
 /// can reach it (the model cannot name the field). Here: they are two keys with two encodings (a
 /// segment count of 0, and a count of 1 with an empty segment), in this order; and a replace (the root's
 /// level mark) and a `$set "" = {c}` (the level mark of the field `""`) joined in both orders leave each
-/// mark at its own key. A NOTE FOR O2: the feed must write a top-level field named `""` as
-/// `OrdAt::Field([""])`, never as the root: fed as the root, `OrdRootNotALevel` would refuse an honest
-/// document. The state below is that honest document (a replace's root mark and a top-level `""`
+/// mark at its own key. The feed writes a top-level field named `""` as `OrdAt::Field([""])`, never as
+/// the root (`the_writer_feeds_a_top_level_field_named_empty_as_a_field`): fed as the root,
+/// `OrdRootNotALevel` would refuse an honest document. The state below is that honest document (a replace's root mark and a top-level `""`
 /// with a level mark and a child) and `decode` accepts it.
 #[test]
 fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {

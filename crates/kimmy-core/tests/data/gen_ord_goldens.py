@@ -1,21 +1,28 @@
-"""Q7 Step 0, Rust item O1: the materialised-order goldens and the order-join fixtures, from the A2-FINAL Python model.
+"""Q7 Step 0, Rust items O1 and O2: the materialised-order goldens and the order-join fixtures, from the A2.1 Python model.
 
-Reads (never edits) the model in q7step0-model-A2-final/ (model6.py sha256 recorded in HASHES.txt next to this file), runs named
-scenarios (the order scenarios of probes_order.py plus the hybrid-floor, update-bit and level-floor cases the Rust port must
-reproduce) and writes two JSON fixtures that the Rust tests read:
+Reads (never edits) the model in the reviewed A2.1 tree (`q7step0-model/`, model6.py sha256 865808753a5f9a4b..., recorded in the
+fixtures and in HASHES.txt next to the output), runs named scenarios (the order scenarios of probes_order.py plus the hybrid-floor,
+update-bit and level-floor cases, and, for O2, scenarios in which a writer RECEIVES before it writes and the writer-side no-op rules)
+and writes JSON fixtures that the Rust tests read:
 
   ord_goldens.json    per scenario: the STATES of every writer entry (the states the Rust side joins, in many delivery
                       orders), the expected ORDERED document of the observer (pre-order list of [dotted path, value|"map"]), the
-                      observer's order state (every Ord), and what the model itself checked (orders tried, ABSORBED on/off).
+                      observer's order state (every Ord), what the model itself checked (orders tried, ABSORBED on/off), the
+                      writes themselves (stamp, life, what the author knew, order items: the feed's input), and the SCRIPT: the
+                      initial document, then every write and every receive in program order (who, operator, path, operand,
+                      clock, the stamp it got, or None when it was refused). The Rust tests replay the script through the Writer API.
   ord_join_laws.json  the Ords of probe_ord_join_laws (150 nested runs, steps=14): per path the distinct entry Ords, which the
                       Rust test joins pairwise and in triples with PINNED counts.
+  ord_random_states.json  states of the model's random nested runs with the model's ordered document of each (ABSORBED = False).
 
-Usage:   Q7MODEL_DIR=<q7step0-model-A2-final> python3 -I -B gen_ord_goldens.py <out-dir>
+Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_goldens.py <out-dir>
          (-B: the model directory must not get a __pycache__; the script also sets sys.dont_write_bytecode)
 
-`model6.py` is NOT in this repository (the reference model lives with the Q7 review files); the fixtures record its sha256
-(0506450e0afc4c307a6ebce032df4f1b1588e719cde6c148c5ff033a8df7f85a) and the Rust tests check it. A new scenario here needs a new
-name in `SCENARIOS` of `src/merge_state/ord_tests.rs` and its order pinned there.
+The 30 scenarios of O1 give the same expected order, order state, entries and writes under A2.1 as under A2-final (the O2 round
+compared the two fixtures field by field: only `model6_sha256` differs). `model6.py` is NOT in this repository (the reference model
+lives with the Q7 review files); the fixtures record its sha256 and the Rust tests check it. A new scenario here needs a new name in
+`SCENARIOS` of `src/merge_state/ord_tests.rs` and its order pinned there. In the model the root of a replace is keyed by "" (and a
+top-level field named "" by "" too); the Rust keys them OrdAt::Root and OrdAt::Field([""]), told apart by context.
 """
 import hashlib, itertools, json, os, random, sys
 
@@ -128,7 +135,55 @@ def flat(doc, prefix=()):
 
 # ---- scenarios --------------------------------------------------------------------------------------------------------
 
-class NoInit(Sc):
+def j_arg(a):
+    """An operand of a recorded write: a value, a document (field order kept), or the operator list of an update."""
+    if isinstance(a, dict):
+        return {"t": "doc", "v": [[k, j_arg(v)] for k, v in a.items()]}
+    return j_val(a)
+
+
+def j_ops(ops):
+    return [[o, p.split("."), j_arg(a)] for o, p, a in ops]
+
+
+class RecSc(Sc):
+    """`Sc` that records what is done to it, for the replay of the scenarios through the Writer API: the initial document, then
+    every write (who, which operator, where, with what operand, the clock set before it, the stamp it got or None when it
+    was refused) and every receive (who received which entry of whom), in program order."""
+    def __init__(self, init):
+        super().__init__(init)
+        self.init_doc = init
+        self.script = []
+
+    def _record(self, who, op, p, arg, skew, clock, st):
+        if op in ("update", "setmany"):
+            jarg = j_ops(arg if op == "update" else [("set", q, v) for q, v in arg])
+        else:
+            jarg = None if arg is None else j_arg(arg)
+        self.script.append({"k": "op", "who": who, "op": op, "path": None if p is None else p.split("."), "arg": jarg,
+                            "skew": skew, "clock": clock, "stamp": None if st is None else j_stamp(st)})
+
+    def op(self, who, op, p, arg=None, skew=0, clock=None):
+        st = super().op(who, op, p, arg, skew=skew, clock=clock)
+        self._record(who, op, p, arg, skew, clock, st)
+        return st
+
+    def refused(self, who, op, p, arg=None, skew=0, clock=None):
+        """A write the writer refuses or finds a no-op: it mints no stamp and changes nothing."""
+        m = self.m[who]
+        if clock is not None:
+            m.clock = clock
+        before = m.state.canon()
+        st = m.write(op, p, arg, self.log, skew)
+        assert st is None and m.state.canon() == before, (who, op, p, arg)
+        self._record(who, op, p, arg, skew, clock, None)
+
+    def recv(self, who, frm, st):
+        super().recv(who, frm, st)
+        self.script.append({"k": "recv", "who": who, "from": frm, "stamp": j_stamp(st)})
+
+
+class NoInit(RecSc):
     """Members I, A, B, C that hold nothing: the first writes create the lives."""
     def __init__(self):
         M.RET = 10 ** 9
@@ -136,6 +191,28 @@ class NoInit(Sc):
         self.I, self.A, self.B, self.C = (M.Member(n) for n in "IABC")
         self.m = {"I": self.I, "A": self.A, "B": self.B, "C": self.C}
         self.i0 = None
+        self.init_doc = None
+        self.script = []
+
+    def upsert_soi(self, who, fields, p, n, sets=None):
+        """A `$setOnInsert` upsert: two writes by one writer; the scenario's entry is the state after the second."""
+        m = self.m[who]
+        st = m.upsert_soi(fields, p, n, self.log, sets=sets)
+        assert st is not None
+        self.writes.append((m, st))
+        self.script.append({"k": "op", "who": who, "op": "upsert_soi", "path": p.split("."), "skew": 0, "clock": None,
+                            "stamp": j_stamp(st),
+                            "arg": {"fields": j_arg(fields), "n": j_val(n), "sets": j_arg(sets or {})}})
+        return st
+
+    def upsert_inc(self, who, p, n):
+        m = self.m[who]
+        st = m.upsert_inc(p, n, self.log)
+        assert st is not None
+        self.writes.append((m, st))
+        self.script.append({"k": "op", "who": who, "op": "upsert_inc", "path": p.split("."), "arg": j_val(n), "skew": 0,
+                            "clock": None, "stamp": j_stamp(st)})
+        return st
 
 
 # `known` of a write: the highest HLC its author knew before the write (what a `u` floor remembers), recorded at tick
@@ -163,7 +240,7 @@ def scenario(f):
 def s_sequential_rules():
     """One writer: set keeps the place, unset then set appends, inc of an absent field appends, setmany in update order,
     a re-ordering replace, a whole sub-document set."""
-    sc = Sc({"b": 1, "a": 2, "m": {"q": 1, "p": 2}})
+    sc = RecSc({"b": 1, "a": 2, "m": {"q": 1, "p": 2}})
     for st in [("A", "set", "b", 5), ("A", "unset", "b", None), ("A", "set", "b", 6), ("A", "inc", "a", 1), ("A", "inc", "z", 1),
                ("A", "set", "m.p", 9), ("A", "set", "m.r", 1), ("A", "unset", "m.q", None), ("A", "set", "m.q", 2),
                ("A", "setmany", None, [("zz", 1), ("yy", 2)])]:
@@ -176,7 +253,7 @@ def s_sequential_rules():
 
 @scenario
 def s_concurrent_creation_a_first():
-    sc = Sc({"a": 1})
+    sc = RecSc({"a": 1})
     sc.op("A", "set", "c", 1, clock=0)
     sc.op("B", "set", "d", 1, clock=5)
     return sc
@@ -184,7 +261,7 @@ def s_concurrent_creation_a_first():
 
 @scenario
 def s_concurrent_creation_b_first():
-    sc = Sc({"a": 1})
+    sc = RecSc({"a": 1})
     sc.op("A", "set", "c", 1, clock=5)
     sc.op("B", "set", "d", 1, clock=0)
     return sc
@@ -192,7 +269,7 @@ def s_concurrent_creation_b_first():
 
 @scenario
 def s_same_new_path_from_two_writers():
-    sc = Sc({"a": 1})
+    sc = RecSc({"a": 1})
     sc.op("A", "set", "c", 1, clock=10)
     sc.op("B", "set", "d", 1, clock=11)
     sc.op("C", "set", "c", 2, clock=12)
@@ -201,7 +278,7 @@ def s_same_new_path_from_two_writers():
 
 @scenario
 def s_unset_then_concurrent_set():
-    sc = Sc({"p": 1, "q": 2})
+    sc = RecSc({"p": 1, "q": 2})
     sc.op("B", "unset", "p", clock=5)
     sc.op("A", "set", "p", 9, clock=7)
     sc.op("C", "set", "r", 1, clock=6)
@@ -210,7 +287,7 @@ def s_unset_then_concurrent_set():
 
 @scenario
 def s_set_then_concurrent_unset():
-    sc = Sc({"p": 1, "q": 2})
+    sc = RecSc({"p": 1, "q": 2})
     sc.op("A", "set", "p", 9, clock=5)
     sc.op("B", "unset", "p", clock=7)
     return sc
@@ -218,7 +295,7 @@ def s_set_then_concurrent_unset():
 
 @scenario
 def s_replace_reorders_even_unchanged():
-    sc = Sc({"a": 1, "b": 2, "c": 3})
+    sc = RecSc({"a": 1, "b": 2, "c": 3})
     sc.op("A", "replace", None, {"c": 3, "b": 2, "a": 1}, clock=20)
     sc.op("B", "set", "b", 7, clock=10)
     return sc
@@ -226,7 +303,7 @@ def s_replace_reorders_even_unchanged():
 
 @scenario
 def s_approximate_case():
-    sc = Sc({"p": 1, "z": 0})
+    sc = RecSc({"p": 1, "z": 0})
     sc.op("A", "set", "p", 2, clock=10)
     sc.op("B", "unset", "p", clock=12)
     sc.op("A", "set", "p", 3, clock=14)
@@ -238,7 +315,7 @@ def s_approximate_case():
 
 @scenario
 def s_write_below_a_map_is_a_write_to_the_map():
-    sc = Sc({"x": 1, "a": {"b": 1}, "z": 2})
+    sc = RecSc({"x": 1, "a": {"b": 1}, "z": 2})
     sc.op("A", "unset", "a", clock=5)
     sc.op("B", "inc", "a.b", 1, clock=6)
     sc.op("C", "set", "w", 1, clock=8)
@@ -247,7 +324,7 @@ def s_write_below_a_map_is_a_write_to_the_map():
 
 @scenario
 def s_level_floor_replace():
-    sc = Sc({"a": 1, "b": 2, "m": {"p": 1, "q": 2}})
+    sc = RecSc({"a": 1, "b": 2, "m": {"p": 1, "q": 2}})
     sc.op("B", "set", "c", 3, clock=10)
     sc.op("C", "set", "m.r", 5, clock=11)
     sc.op("A", "replace", None, {"b": 2, "m": {"q": 2, "p": 1}, "a": 1}, clock=20)
@@ -256,7 +333,7 @@ def s_level_floor_replace():
 
 @scenario
 def s_level_floor_subdocument_set():
-    sc = Sc({"m": {"p": 1, "q": 2}})
+    sc = RecSc({"m": {"p": 1, "q": 2}})
     sc.op("C", "set", "m.r", 5, clock=11)
     sc.op("A", "set", "m", {"q": 1, "p": 2}, clock=20)
     return sc
@@ -264,7 +341,7 @@ def s_level_floor_subdocument_set():
 
 @scenario
 def s_level_floor_nested_subdocument_set():
-    sc = Sc({"a": {"d": {"x": 1, "y": 2}, "e": 3}})
+    sc = RecSc({"a": {"d": {"x": 1, "y": 2}, "e": 3}})
     sc.op("C", "set", "a.d.k", 5, clock=11)
     sc.op("B", "set", "a.f", 6, clock=12)
     sc.op("A", "set", "a.d", {"y": 7, "x": 8}, clock=20)
@@ -273,7 +350,7 @@ def s_level_floor_nested_subdocument_set():
 
 @scenario
 def s_survivor_increment_after_unset():
-    sc = Sc({"x": 1, "a": 1})
+    sc = RecSc({"x": 1, "a": 1})
     sc.op("B", "inc", "a", 1, clock=2)
     sc.op("C", "unset", "a", clock=4)
     sc.op("B", "set", "b", 7, clock=5)
@@ -282,7 +359,7 @@ def s_survivor_increment_after_unset():
 
 @scenario
 def s_survivor_placement_a_inc_before_c():
-    sc = Sc({"a": 1, "b": 2})
+    sc = RecSc({"a": 1, "b": 2})
     sc.op("A", "inc", "a", 1, clock=2)
     sc.op("A", "set", "c", 7, clock=3)
     sc.op("B", "unset", "a", clock=4)
@@ -291,7 +368,7 @@ def s_survivor_placement_a_inc_before_c():
 
 @scenario
 def s_survivor_placement_b_unset_knew_c():
-    sc = Sc({"a": 1, "m": {"p": 1}})
+    sc = RecSc({"a": 1, "m": {"p": 1}})
     sc.op("B", "set", "m.r", 3, clock=2)
     sc.op("A", "set", "c", 7, clock=3)
     sc.op("A", "unset", "m", clock=4)
@@ -300,7 +377,7 @@ def s_survivor_placement_b_unset_knew_c():
 
 @scenario
 def s_replace_drops_a_field_then_set_appends():
-    sc = Sc({"a": 1, "b": 2, "c": 3})
+    sc = RecSc({"a": 1, "b": 2, "c": 3})
     sc.op("A", "replace", None, {"c": 3, "a": 1})
     sc.op("A", "set", "b", 5)
     return sc
@@ -310,7 +387,7 @@ def s_replace_drops_a_field_then_set_appends():
 def s_hybrid_noop_unset_rides_on_an_update():
     """A unsets a; B (unaware) sets a; A then updates {set c, unset a} where a is already absent at A: the unset is a no-op
     component whose floor rides on the update (the hybrid floor), so a=5 goes AFTER c and before e, which C creates later."""
-    sc = Sc({"a": 1, "b": 2})
+    sc = RecSc({"a": 1, "b": 2})
     sc.op("A", "unset", "a", clock=10)
     sc.op("B", "set", "a", 5, clock=11)
     sc.op("A", "update", None, [("set", "c", 7), ("unset", "a", None)], clock=12)
@@ -322,7 +399,7 @@ def s_hybrid_noop_unset_rides_on_an_update():
 def s_update_bit_survivor_after_all_the_updates_fields():
     """The u floor of an update that also wrote other fields (the bit): an increment the unsetter never saw goes after ALL
     of that update's fields."""
-    sc = Sc({"x": 1, "a": 1})
+    sc = RecSc({"x": 1, "a": 1})
     sc.op("B", "inc", "a", 1, clock=2)
     sc.op("C", "set", "w", 9, clock=3)
     sc.op("A", "update", None, [("set", "z", 1), ("set", "y", 2), ("unset", "a", None)], clock=5)
@@ -332,7 +409,7 @@ def s_update_bit_survivor_after_all_the_updates_fields():
 @scenario
 def s_update_without_bit_survivor_by_prev():
     """The same unset on its own (no bit): the survivor is placed by `prev` and its own write."""
-    sc = Sc({"x": 1, "a": 1})
+    sc = RecSc({"x": 1, "a": 1})
     sc.op("B", "inc", "a", 1, clock=2)
     sc.op("C", "set", "w", 9, clock=3)
     sc.op("A", "unset", "a", clock=5)
@@ -343,7 +420,7 @@ def s_update_without_bit_survivor_by_prev():
 def s_survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew():
     """The increment (stamp 5) is above `prev` of the unset (the insert), so it is re-created at its own stamp, after the field
     d that C created at stamp 3: not at `prev`, which would put it before d."""
-    sc = Sc({"a": 1, "b": 2})
+    sc = RecSc({"a": 1, "b": 2})
     sc.op("A", "inc", "a", 1, clock=5)
     sc.op("C", "set", "d", 1, clock=3)
     sc.op("B", "unset", "a", clock=7)
@@ -354,7 +431,7 @@ def s_survivor_keeps_its_own_stamp_when_it_is_after_what_the_unsetter_knew():
 def s_slot_above_the_floor_is_not_a_survivor():
     """B's update (stamp 6) `$set z`, `$inc a` is above C's unset of a (stamp 4): the increment is an ordinary write at
     position 1 after z, not a survivor (a survivor would take position 0 and tie with z)."""
-    sc = Sc({"x": 1, "a": 1})
+    sc = RecSc({"x": 1, "a": 1})
     sc.op("C", "unset", "a", clock=4)
     sc.op("B", "update", None, [("set", "z", 1), ("inc", "a", 1)], clock=6)
     return sc
@@ -363,7 +440,7 @@ def s_slot_above_the_floor_is_not_a_survivor():
 @scenario
 def s_descendant_above_the_floor_is_not_a_survivor():
     """The same for a register below a map: B's update `$set z`, `$set a.b` (stamp 6) is above C's unset of a (stamp 4)."""
-    sc = Sc({"x": 1, "a": {"b": 1}})
+    sc = RecSc({"x": 1, "a": {"b": 1}})
     sc.op("C", "unset", "a", clock=4)
     sc.op("B", "update", None, [("set", "z", 1), ("set", "a.b", 2)], clock=6)
     return sc
@@ -373,7 +450,7 @@ def s_descendant_above_the_floor_is_not_a_survivor():
 def s_survivor_older_than_the_fields_own_write_lowers_its_position():
     """B unsets a (stamp 4) and sets it again (stamp 6); C's increment (stamp 2) B never saw survives the unset, so a is
     re-created at the increment, before d (stamp 3), not at B's own later write."""
-    sc = Sc({"x": 1, "a": 1})
+    sc = RecSc({"x": 1, "a": 1})
     sc.op("C", "inc", "a", 1, clock=2)
     sc.op("A", "set", "d", 1, clock=3)
     sc.op("B", "unset", "a", clock=4)
@@ -386,7 +463,7 @@ def s_replace_with_an_empty_document_has_no_update_bit():
     """O1-10 of the O1 review: A replaces the document with {} (a level mark on the root and unsets, no other field), over a
     field a that B incremented and A never saw. A level mark is not a field the write also wrote, so the update bit is clear and
     a is placed by `prev` and its own stamp, before the field d that C creates later."""
-    sc = Sc({"a": 1, "b": 2})
+    sc = RecSc({"a": 1, "b": 2})
     sc.op("B", "inc", "a", 5, clock=2)
     sc.op("C", "set", "d", 1, clock=3)
     sc.op("A", "replace", None, {}, clock=6)
@@ -395,7 +472,7 @@ def s_replace_with_an_empty_document_has_no_update_bit():
 
 @scenario
 def s_descendant_survivor_of_an_unset_map():
-    sc = Sc({"a": {"b": 1, "c": 2}, "z": 0})
+    sc = RecSc({"a": {"b": 1, "c": 2}, "z": 0})
     sc.op("B", "set", "a.d", 4, clock=3)
     sc.op("C", "set", "y", 6, clock=4)
     sc.op("A", "unset", "a", clock=6)
@@ -404,7 +481,7 @@ def s_descendant_survivor_of_an_unset_map():
 
 @scenario
 def s_concurrent_replaces():
-    sc = Sc({"a": 1, "b": 2, "c": 3})
+    sc = RecSc({"a": 1, "b": 2, "c": 3})
     sc.op("A", "replace", None, {"c": 3, "b": 2, "a": 1}, clock=20)
     sc.op("B", "replace", None, {"b": 2, "a": 1, "c": 3, "d": 4}, clock=21)
     sc.op("C", "set", "e", 5, clock=22)
@@ -413,7 +490,7 @@ def s_concurrent_replaces():
 
 @scenario
 def s_inc_unset_replace_concurrent():
-    sc = Sc({"a": 1, "b": 2})
+    sc = RecSc({"a": 1, "b": 2})
     sc.op("A", "replace", None, {"b": 2, "c": 3}, clock=20)
     sc.op("B", "inc", "a", 5, clock=10)
     sc.op("C", "unset", "b", clock=12)
@@ -422,7 +499,7 @@ def s_inc_unset_replace_concurrent():
 
 @scenario
 def s_delete_reinsert_with_a_concurrent_set():
-    sc = Sc({"x": 1, "y": 2})
+    sc = RecSc({"x": 1, "y": 2})
     sc.op("A", "delete", None, clock=10)
     sc.op("A", "insert", None, {"y": 3, "x": 4}, clock=11)
     sc.op("B", "set", "c", 9, clock=5)
@@ -432,17 +509,195 @@ def s_delete_reinsert_with_a_concurrent_set():
 @scenario
 def s_two_lives_by_two_upserts():
     sc = NoInit()
-    sc.writes.append((sc.A, sc.A.upsert_inc("x", 1, sc.log)))
-    sc.writes.append((sc.B, sc.B.upsert_inc("y", 2, sc.log)))
+    sc.upsert_inc("A", "x", 1)
+    sc.upsert_inc("B", "y", 2)
     sc.op("A", "set", "z", 3, clock=5)
     return sc
 
 
 @scenario
 def s_update_with_inc_and_unset_of_a_map():
-    sc = Sc({"a": 1, "b": 2, "s": "str", "k": {"u": 1}, "j": {"v": 1}})
+    sc = RecSc({"a": 1, "b": 2, "s": "str", "k": {"u": 1}, "j": {"v": 1}})
     sc.op("A", "update", None, [("set", "z", 1), ("unset", "k", None), ("inc", "y", 2), ("set", "j.w", 3)], clock=9)
     sc.op("B", "set", "k.v", 5, clock=4)
+    return sc
+
+
+# ---- O2: scenarios in which a writer RECEIVES before it writes, and the writer-side no-op rules -------------------------------
+# (the first 30 scenarios above never let a writer receive anything but the seed insert: the O1 review's note that the goldens
+# never test the receive-then-write feed. Each of these runs through the Writer API in Rust, which must join what it received
+# with its own feed.)
+
+@scenario
+def s_receive_a_concurrent_unset_then_set():
+    """B unsets p (5); A RECEIVES that entry, then sets p (7): A's write is above the floor it holds, so p is a fresh field at
+    A, placed by A's write; C (which saw nothing) creates r (6) meanwhile."""
+    sc = RecSc({"p": 1, "q": 2})
+    u = sc.op("B", "unset", "p", clock=5)
+    sc.recv("A", "B", u)
+    sc.op("A", "set", "p", 9, clock=7)
+    sc.op("C", "set", "r", 1, clock=6)
+    return sc
+
+
+@scenario
+def s_receive_a_concurrent_replace_then_set():
+    """B replaces the document in another order (20); A receives it, then sets b and a new field d; C creates e (22)."""
+    sc = RecSc({"a": 1, "b": 2, "c": 3})
+    r = sc.op("B", "replace", None, {"c": 3, "b": 2, "a": 1}, clock=20)
+    sc.recv("A", "B", r)
+    sc.op("A", "set", "b", 7)
+    sc.op("A", "set", "d", 4)
+    sc.op("C", "set", "e", 5, clock=22)
+    return sc
+
+
+@scenario
+def s_receive_a_survivor_increment_then_unset():
+    """B increments a (2); A receives it, then unsets a (4): A saw the increment, so it is no survivor of A's unset; C's w (3)
+    and B's later b (5) are concurrent with the unset."""
+    sc = RecSc({"x": 1, "a": 1})
+    i = sc.op("B", "inc", "a", 1, clock=2)
+    sc.recv("A", "B", i)
+    sc.op("A", "unset", "a", clock=4)
+    sc.op("C", "set", "w", 9, clock=3)
+    sc.op("B", "set", "b", 7, clock=5)
+    return sc
+
+
+@scenario
+def s_unset_then_receive_a_survivor_increment():
+    """The other order: A unsets a (4), THEN receives B's increment (2), which A had not seen: it survives A's unset and is
+    placed by the survivor clamp; A then sets e. C's w (3) is concurrent."""
+    sc = RecSc({"x": 1, "a": 1})
+    i = sc.op("B", "inc", "a", 1, clock=2)
+    sc.op("C", "set", "w", 9, clock=3)
+    sc.op("A", "unset", "a", clock=4)
+    sc.recv("A", "B", i)
+    sc.op("A", "set", "e", 1)
+    return sc
+
+
+@scenario
+def s_two_writers_each_receive_the_others_write_then_write():
+    """A sets p (5) and B sets q (6); each receives the other's entry; then A sets r and q, B unsets p and sets s."""
+    sc = RecSc({"x": 1})
+    a1 = sc.op("A", "set", "p", 1, clock=5)
+    b1 = sc.op("B", "set", "q", 1, clock=6)
+    sc.recv("A", "B", b1)
+    sc.recv("B", "A", a1)
+    sc.op("A", "set", "r", 1)
+    sc.op("B", "unset", "p")
+    sc.op("B", "set", "s", 1)
+    sc.op("A", "set", "q", 2)
+    return sc
+
+
+@scenario
+def s_hybrid_floor_on_an_update_after_a_receive():
+    """C unsets b (10); A receives it, so b is absent at A; A updates {set c, unset b}: the unset is a no-op component whose
+    floor rides on the update (prev is what A had seen after the receive). B, which never saw C's unset, sets b (11) meanwhile,
+    and C creates e after the update (13)."""
+    sc = RecSc({"a": 1, "b": 2})
+    u = sc.op("C", "unset", "b", clock=10)
+    sc.recv("A", "C", u)
+    sc.op("A", "update", None, [("set", "c", 7), ("unset", "b", None)], clock=12)
+    sc.op("B", "set", "b", 5, clock=11)
+    sc.op("C", "set", "e", 1, clock=13)
+    return sc
+
+
+@scenario
+def s_a_standalone_noop_unset_leaves_nothing():
+    """A unsets a field it does not have: no stamp, no floor, no entry (the writer refuses it); so are an update of nothing
+    but that unset, one whose other change is a no-op, three whose paths meet (the same path twice, a path and the map above it,
+    the other way round) and a write below a scalar, single or in an update. B sets that field (6)
+    and C creates e (7): the field goes where B put it."""
+    sc = RecSc({"a": 1, "b": 2, "m": {"p": 1}})
+    sc.refused("A", "unset", "nope", clock=5)
+    sc.refused("A", "update", None, [("unset", "nope", None)])                       # an update of nothing but a no-op unset
+    sc.refused("A", "update", None, [("set", "a", 1), ("unset", "nope", None)])      # the set changes nothing either
+    sc.refused("A", "update", None, [("set", "a", 5), ("unset", "a", None)])         # one path twice
+    sc.refused("A", "update", None, [("set", "m.p", 5), ("set", "m", {"q": 1})])     # a path and the map above it
+    sc.refused("A", "update", None, [("unset", "m", None), ("set", "m.p", 5)])       # a map and the path below it
+    sc.refused("A", "update", None, [("set", "a.b", 5)])                             # below a scalar
+    sc.refused("A", "set", "a.b", 5)                                                 # below a scalar
+    sc.op("B", "set", "nope", 1, clock=6)
+    sc.op("C", "set", "e", 1, clock=7)
+    return sc
+
+
+@scenario
+def s_a_subdocument_set_that_only_reorders_is_a_write():
+    """A sets m to the same fields in another order: no leaf changes, the order does, so it is a write (an order state
+    only). B sets a new field m.r concurrently; C creates z."""
+    sc = RecSc({"m": {"p": 1, "q": 2}, "k": 0})
+    sc.op("A", "set", "m", {"q": 2, "p": 1}, clock=10)
+    sc.op("B", "set", "m.r", 5, clock=11)
+    sc.op("C", "set", "z", 1, clock=12)
+    return sc
+
+
+@scenario
+def s_a_writer_with_two_lives_writes_into_the_newest():
+    """A and B each create the document by an upserting inc (two lives); B's entry reaches A, which holds both lives and sets z:
+    the write goes into the newest life."""
+    sc = NoInit()
+    sc.upsert_inc("A", "x", 1)
+    b = sc.upsert_inc("B", "y", 2)
+    sc.recv("A", "B", b)
+    sc.op("A", "set", "z", 3)
+    return sc
+
+
+@scenario
+def s_inc_of_a_double_below_a_map_is_a_register_write():
+    """A double base is no counter: B's inc of m.f is a register write of 2.5, and a write below a map is a write to the map,
+    which A's concurrent unset of m (5) must not void. An inc by 0 of the double changes nothing and is no write."""
+    sc = RecSc({"x": 1, "m": {"f": 1.5}})
+    sc.refused("B", "inc", "m.f", 0)                      # 1.5 + 0 is the stored 1.5 byte for byte: no write
+    sc.op("A", "unset", "m", clock=5)
+    sc.op("B", "inc", "m.f", 1, clock=6)
+    sc.op("C", "set", "w", 1, clock=8)
+    return sc
+
+
+@scenario
+def s_a_set_on_insert_upsert_feeds_both_of_its_writes():
+    """A's upsert (creation of a, b and c, then the increment of n) is two writes; B creates a life of its own by an
+    upserting inc, and A then sets d."""
+    sc = NoInit()
+    sc.upsert_soi("A", {"a": 1, "b": 2}, "n", 3, sets={"c": 9})
+    sc.upsert_inc("B", "e", 1)
+    sc.op("A", "set", "d", 4)
+    return sc
+
+
+@scenario
+def s_a_scalar_over_a_map_voids_the_places_of_its_fields():
+    """A sets m (a map with p and q) to a scalar, then to a map again, then writes q and p: the unsets of the scalar write made
+    the old places of p and q void, so the fields come back in the order they are written (q, then p), not in the order of
+    the first insert. B creates w meanwhile."""
+    sc = RecSc({"x": 1, "m": {"p": 1, "q": 2}})
+    sc.op("A", "set", "m", 7, clock=10)
+    sc.op("B", "set", "w", 1, clock=11)
+    sc.op("A", "set", "m", {}, clock=12)
+    sc.op("A", "set", "m.q", 3)
+    sc.op("A", "set", "m.p", 4)
+    return sc
+
+
+@scenario
+def s_updates_that_are_writes_by_what_they_name_alone():
+    """An update of one unset of a field that exists is a write; an update that sets a sub-document to the same values in another
+    order (the values are equal, only the names tell) is a write of the order alone; an update that increments a field below a
+    map is a write to the map, which C's concurrent unset of the map (6) must void only up to its own stamp."""
+    sc = RecSc({"x": 1, "a": 1, "m": {"p": 1, "q": 1}, "k": {"j": 1}})
+    sc.op("A", "update", None, [("unset", "x", None)], clock=5)
+    sc.op("A", "update", None, [("set", "m", {"q": 1, "p": 1})])
+    sc.op("C", "unset", "k", clock=6)
+    sc.op("B", "update", None, [("inc", "k.j", 1)], clock=7)
+    sc.op("C", "set", "e", 1, clock=9)
     return sc
 
 
@@ -488,6 +743,10 @@ def run_scenario(name, fn):
                     writes.append({"stamp": j_stamp(e[1]), "life": j_stamp(meta.get("life")), "known": KNOWN[e[1]],
                                    "items": [[j_path(p), mode] for p, mode in meta.get("items", [])]})
                 out["writes"] = writes
+                # what each writer shows right after its write (read-your-writes): the ordered document of the entry's state
+                out["own"] = [None if M.unwire(e[2]).visible() is None else flat(M.unwire(e[2]).visible()) for e in all_ents]
+                out["init"] = None if sc.init_doc is None else j_arg(sc.init_doc)
+                out["script"] = sc.script
                 out["expected"] = flat(vis)
                 out["ords"] = j_ords(o.state.ords)
                 out["absorbed_slots"] = len(o.state.absorbed)

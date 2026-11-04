@@ -19,9 +19,11 @@
 //! * The field order (`ord.rs`, option A): [`MergeState::ords`] holds, per `(life, path)`, a
 //!   [`FieldOrd`] (floor, per-writer firsts, last, level floor), joined with the cells by
 //!   [`ord_join`]; [`MergeState::ordered_document`] reads the document in that order. The state,
-//!   its join, the read and the compact codec's section 10 are built; the [`Writer`] does NOT
-//!   feed the order state yet (a state a writer builds has none), so the order of a document is
-//!   tested against the reference model on states assembled from its writes.
+//!   its join, the read and the compact codec's section 10 are built, and the [`Writer`] feeds
+//!   the order state with every local write (the items of the write in the model's order, then
+//!   the events of `ord_events` applied to the writer's own state, which is the join of what it
+//!   received and its own history). The order is tested against the reference model on the
+//!   scenarios replayed through the Writer API and on random scripts of writes and receives.
 //! * [`MergeState`] holds lives, deletes, dead lives, registers, counter slots,
 //!   generation marks, the version vector and the loss records.
 //! * [`join()`] merges two states and reports the loss records that are new
@@ -101,6 +103,8 @@ pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
     WriterId,
 };
+#[cfg(any(test, feature = "merge-mutants"))]
+pub use writer::UpdateOp;
 pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the

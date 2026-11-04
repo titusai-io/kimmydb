@@ -380,6 +380,12 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     for (name, fp) in got {
         println!("[fingerprint {name}] {fp:#018x}");
     }
+    // The fingerprints leave the order state out (`fingerprint::without_ords`). The seventh is the one that
+    // moved when the Writer began to feed the order state (item O2): 0x520b467cfaab5d4c to
+    // 0x3eb070a76e6956fe. A write that only reorders the fields of a sub-document (no leaf different) is
+    // a write in the model and now in the Writer, where it was a no-op: the nested bounded workload makes
+    // some, and the trajectory goes on from the stamp it takes. With the stage-A rule on
+    // (`ord_reorder_is_noop`) the figure is the old one. The other six are unchanged.
     let pinned: [(&str, u64); 7] = [
         ("restore", 0x4efca9449bca3d13),
         ("no restore", 0x08ad9af402612aaa),
@@ -387,7 +393,7 @@ fn states_and_reads_match_the_pinned_fingerprints() {
         ("sequential", 0xf5da0966517d1134),
         ("horizon", 0x4173d22962941f92),
         ("bounded", 0xb59997222fd1686f),
-        ("bounded nested", 0x520b467cfaab5d4c),
+        ("bounded nested", 0x3eb070a76e6956fe),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
