@@ -728,7 +728,10 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// state and the ordered document are in the fingerprint now; the comparison with the model is unchanged).
 ///
 /// RE-PINNED for the D8 re-vendor (the A2.3 model): 0x117c_d4f5_b468_200c to 0x5b22_de2a_6b43_3270.
-const PINNED_300: u64 = 0x5b22_de2a_6b43_3270;
+///
+/// RE-PINNED for the counter cell (the differential flips to ABSORBED = True, the digest prints each slot's absorbed pair and no
+/// register obs): 0x5b22_de2a_6b43_3270 to 0xed99_fd18_a146_9659. 0 of the 300 scripts disagree with the model.
+const PINNED_300: u64 = 0xed99_fd18_a146_9659;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)

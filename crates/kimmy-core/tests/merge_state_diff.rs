@@ -645,7 +645,11 @@ fn replay(dir: &std::path::Path) -> Verdict {
 ///
 /// RE-PINNED when the generator drew an Unset field in an insert again (the Writer drops such a field): 0xfbde_c4a1_8eb1_bb13 to
 /// 0x5f0f_3ecf_ab90_7bba. The scripts changed (an insert draws one more value); the code under test did not change for the re-pin.
-const PINNED_300: u64 = 0x5f0f_3ecf_ab90_7bba;
+///
+/// RE-PINNED for the counter cell (the differential flips to ABSORBED = True; the compact bytes in the fold changed with
+/// the slot flag byte and the pair): 0x5f0f_3ecf_ab90_7bba to 0x3ddd_f823_ee88_e7c7. The replay's 300 scripts agree with the
+/// model; the scripts are the same draws (12,854 steps) and the model's states differ by the absorbed store.
+const PINNED_300: u64 = 0x3ddd_f823_ee88_e7c7;
 
 #[test]
 fn differential_against_the_python_model() {

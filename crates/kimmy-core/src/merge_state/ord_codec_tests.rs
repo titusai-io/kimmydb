@@ -578,13 +578,20 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     let refused_total: usize = refused.values().sum();
     assert_eq!((candidates, accepted, refused_total), (60_000, 31_795, 28_205), "{refused:?}");
     assert_eq!(refused.len(), 8, "every clause that one state can show is reached: {refused:?}");
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_524));
+    // RE-PINNED for the counter cell and the check that an absorbed stamp is by its slot's writer. The damaged
+    // inputs are the same seeded stream applied to a corpus whose bytes changed (the slot flag byte and the pair,
+    // no obs, no ESCAPE: 72,936 B for the 243 states against 73,602 B), so they are other inputs: accepted
+    // 10,524 -> 10,618 with the new spelling (a sampling difference: the same loop over 11 seeds accepts a mean
+    // of 10,486.9 of 40,000 with the old spelling and 10,445.5 with the new), -> 10,617 with the writer check
+    // (one damaged encoding moved a pair to another writer). The laws over the accepted damaged entries moved with
+    // them: triples 143,568 -> 141,714, agreeing 114,462 -> 112,602, not associative 604 -> 440.
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_617));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (143_568, 114_462, 604));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (141_714, 112_602, 440));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }
