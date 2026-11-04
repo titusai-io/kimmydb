@@ -75,6 +75,52 @@ fn seed885(mode: &str) -> (Stamp, Vec<bool>, Vec<(String, i64)>) {
     (late.stamp, recs, nonzero(&res))
 }
 
+/// Seed 885's shape under `field`, with two late writes by C on two paths (an even clock sets `v`, an odd clock increments `n`):
+/// D takes C's state, so the older write's cell (`v`) is held only inside the page state whose version is the newer write's
+/// (`n`). Returns, per surviving member, whether it holds the records of both late writes, and the failing checks.
+type TwoPathRecords = Vec<(bool, bool)>;
+
+fn seed885_two_paths(mode: &str) -> (TwoPathRecords, Vec<(String, i64)>) {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("D", 0)], 60);
+    sc.advance(1);
+    let seed = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
+    for m in ["B", "C", "D"] {
+        sc.window(m, "A", &seed);
+    }
+    sc.advance(10);
+    let mut job_a = sc.ms[0].start_out(&mut sc.w, vec![0], JobKind::Good, 12);
+    sc.advance(12);
+    sc.ms[0].do_bind(&mut sc.w, &mut job_a, 4);
+    sc.advance(20);
+    let late_v = sc.ms[2].local_doc(&mut sc.w, 6, DocOp::Update).unwrap(); // clock 20: a set of v
+    sc.advance(21);
+    let late_n = sc.ms[2].local_doc(&mut sc.w, 6, DocOp::Update).unwrap(); // clock 21: an increment of n
+    sc.advance(30);
+    let mut job_d = sc.ms[3].start_out(&mut sc.w, vec![1], JobKind::Good, 31);
+    sc.advance(31);
+    sc.ms[3].do_bind(&mut sc.w, &mut job_d, 4);
+    sc.advance(32);
+    sc.snapshot("D", "C", false);
+    sc.advance(40);
+    sc.vanish(&["C"]);
+    sc.advance(41);
+    sc.snapshot("A", "D", false);
+    sc.advance(42);
+    sc.snapshot("B", "D", false);
+    for _ in 0..3 {
+        sc.pull("D", "A");
+        sc.pull("B", "A");
+        sc.pull("A", "B");
+    }
+    sc.quiesce();
+    let recs: Vec<(bool, bool)> = ["A", "B", "D"]
+        .iter()
+        .map(|m| (has_record(&sc, m, 6, late_v.stamp), has_record(&sc, m, 6, late_n.stamp)))
+        .collect();
+    let res = finish(&mut sc.w, &mut sc.ms);
+    (recs, nonzero(&res))
+}
+
 /// `probes6a.py` `snapshot-record-sole-carrier`: B holds C's late write as history and mints the record; D takes B's
 /// window and only witnesses the write (held as granted state); B and C vanish; E joins by a snapshot from D, whose
 /// grant names both the write and the record entry. The snapshot's loss-record set is the sole carrier of the record.
@@ -390,6 +436,22 @@ mod tests {
                 "{mutant}: {problems:?}"
             );
         }
+    }
+
+    /// The Rust-only mutants of the field apply and loss path that no random run of the metamorphic comparison or the field grid
+    /// sees are killed here by the scenarios built for the shapes they break: a retained page version's late cells (seed 885's
+    /// shape: the write is held only as a snapshot's state).
+    #[test]
+    fn a_field_mutant_the_random_runs_cannot_see_is_killed_by_the_scenario_of_its_shape() {
+        let (recs, problems) = seed885_two_paths("field:v6");
+        assert_eq!(recs, vec![(true, true); 3], "both late writes are reported at A, B and D");
+        assert!(problems.is_empty(), "{problems:?}");
+        let (recs, problems) = seed885_two_paths("field:v6+m-field-no-page-loss");
+        eprintln!("m-field-no-page-loss on the two-path seed 885: {recs:?} {problems:?}");
+        assert!(
+            recs != vec![(true, true); 3] && !problems.is_empty(),
+            "m-field-no-page-loss survived the scenario of its shape"
+        );
     }
 
     fn a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere_under(pre: &str) {

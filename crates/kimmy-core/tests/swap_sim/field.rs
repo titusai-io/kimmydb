@@ -75,6 +75,10 @@ pub struct Applied {
     /// the entry changed nothing only because the page states of an unfinished join already cover it (the gap-1
     /// analogue, ASSUMED in the design note, section 1.3)
     pub held_state: bool,
+    /// The entry's stamp is the held version's stamp: the same write, held as a page state (the model's equal stamp: "the same
+    /// entry", `wins = e.stamp >= cur[0]`); appended as a winner whatever the append-in-position flag. A write whose elements
+    /// survive in the joined state under a later version (the version stamp is higher) is not this: that is the gap-1 case
+    pub same_write: bool,
     /// the covered-entry skip fired
     pub skipped: bool,
     /// the records the join detected that were new to the joined state (Q7's family)
@@ -83,19 +87,27 @@ pub struct Applied {
 
 /// Apply the entry `e` to the version `cur` (`None`: the document is unknown here). `missing`: the physical is a
 /// placeholder of an unfinished join, so everything in it came from pages.
-pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool) -> Applied {
+pub fn apply_entry(
+    cur: Option<&Ver>,
+    e: &Entry,
+    o: &JoinOptions,
+    missing: bool,
+    stale_stamp: bool,
+) -> Applied {
     let es = e.fstate.as_ref().expect("a field entry carries its state");
     let Some(cur) = cur else {
         return Applied {
             ver: ver_of(es.clone(), e.stamp, o),
             changed: true,
             held_state: false,
+            same_write: false,
             skipped: false,
             fresh: es.losses.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
     };
     let base = cur.state.as_ref().expect("a field version carries its state");
-    if vv_covers(base, es) {
+    let covered = vv_covers(base, es);
+    if covered {
         // the covered-entry skip decides "witnessed only"; the self-check of the design: it never hides a change
         debug_assert!(
             unchanged_but_records(&join(base, es, o).0, base),
@@ -108,6 +120,7 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
             ver: cur.clone(),
             changed: false,
             held_state,
+            same_write: cur.stamp == e.stamp,
             skipped: true,
             fresh: Vec::new(),
         };
@@ -122,7 +135,8 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
         }
         None => (None, missing && !changed),
     };
-    let stamp = if e.stamp > cur.stamp { e.stamp } else { cur.stamp };
+    // `stale_stamp` is the mutant `m-field-stale-version-stamp`: the version keeps its old stamp after a join
+    let stamp = if e.stamp > cur.stamp && !stale_stamp { e.stamp } else { cur.stamp };
     let new_fresh: Vec<_> = fresh
         .iter()
         .filter(|k| !base.losses.contains_key(*k))
@@ -132,6 +146,7 @@ pub fn apply_entry(cur: Option<&Ver>, e: &Entry, o: &JoinOptions, missing: bool)
         ver: Ver { stamp, body: body_of(&merged, o), state: Some(Rc::new(merged)), applied },
         changed,
         held_state,
+        same_write: cur.stamp == e.stamp,
         skipped: false,
         fresh: new_fresh,
     }

@@ -25,6 +25,8 @@ mod field_tests;
 mod flags;
 mod loss;
 mod member;
+#[cfg(test)]
+mod metamorphic;
 mod omap;
 mod oracle;
 mod register;
@@ -102,6 +104,48 @@ mod tests {
         }
         assert_eq!(res["heads_required"], 1);
         assert_eq!(res["true_late_writes_allowed"], 1);
+    }
+
+    /// `K = 4` on the field grid (design note 1.4, rule 2; `outReplaced` and Q7's records share one per-document `K`): 0 problems
+    /// under the relaxed required set (up to `K` per document, the newest by loser stamp), no member holds a record that `K` newer
+    /// ones push out, and the run is not vacuous (records are dropped, heads exempted). The default of the harness is `K` off.
+    #[test]
+    fn the_field_grid_with_k_4_is_clean() {
+        let seeds = env_u64("Q6_K_RUNS", 40);
+        let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            c.policy = crate::world::Policy::Field;
+            c.k = Some(4);
+        }
+        let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
+        eprintln!(
+            "field grid with K = 4: {} runs; records dropped {}, runs with an exempt head {}, heads required {}",
+            s.runs,
+            s.get("cnt_k_dropped"),
+            s.get("k_exempt_heads"),
+            s.get("heads_required")
+        );
+        let p = s.problems();
+        assert!(p.is_empty(), "problems on the K = 4 field grid: {p:?}");
+        assert!(s.get("cnt_k_dropped") > 0, "vacuous: no record was dropped past K");
+        assert!(s.get("k_exempt_heads") > 0, "vacuous: no head was exempted by K");
+    }
+
+    /// Each Rust-only mutant of `K` fails the `K = 4` grid.
+    #[test]
+    fn the_k_mutants_fail_the_k_4_grid() {
+        let seeds = env_u64("Q6_K_MUTANT_RUNS", 40);
+        let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            c.policy = crate::world::Policy::Field;
+            c.k = Some(4);
+        }
+        for m in crate::flags::K_MUTANTS {
+            let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+            let p = s.problems();
+            eprintln!("{m:28} {} kinds: {:?}", p.len(), p.keys().collect::<Vec<_>>());
+            assert!(!p.is_empty(), "{m} survived the K = 4 grid");
+        }
     }
 
     /// The `field` policy on the 36-configuration grid: 0 problems (the oracle folds `join` over every entry addressed to the
@@ -271,24 +315,15 @@ mod tests {
         replay_all(&dir);
     }
 
-    const FINDING_F_3_1: &[(&str, &str)] = &[
-        (
-            "s-append-in-position-m-no-append-in-position.jsonl",
-            "member C.appended_n: python 3 <> rust 2",
-        ),
-        ("s-append-in-position-v6.jsonl", "appended_in_position: python Some(1) <> rust Some(2)"),
-    ];
-
     /// The scripted scenarios without a delete and without concurrent same-key writes (the tracer's `field_safe` marker), replayed
-    /// under the `field` policy: last-writer-wins and the join agree there, so every difference is a disagreement. Two traces
-    /// disagree today, FINDING F-3-1 of report 3, asserted here by name and text so that the test flips when it is settled: the
-    /// model counts an entry whose stamp equals the held page version's (the same write) as winning, appended whatever the
-    /// append-in-position flag; the `field` join sees "unchanged" and appends it only through the append-in-position branch.
+    /// under the `field` policy: last-writer-wins and the join agree there, so every difference is a disagreement. (FINDING
+    /// F-3-1 of report 3, an entry whose stamp equals the held page version's, was fixed: the same write held by a page state is
+    /// appended as a winner, as the model's equal stamp.)
     #[test]
     fn the_differential_replays_the_field_safe_scripted_traces_under_the_field_policy() {
         let dir = trace_dir("scripted-field", "scripted", &[]);
         let ((n, events, _), stopped, _) =
-            replay_all_mode(&dir, crate::trace::ReplayMode::FieldExact, FINDING_F_3_1);
+            replay_all_mode(&dir, crate::trace::ReplayMode::FieldExact, &[]);
         assert!(n > 0 && events > 0 && stopped.is_empty());
     }
 
@@ -480,6 +515,7 @@ mod tests {
         };
         for mut c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
             c.policy = policy;
+            c.k = std::env::var("Q6_K").ok().and_then(|k| k.parse().ok());
             let r = run("v6", "v6", seed, c, true);
             let bad: Vec<_> = r
                 .res
@@ -500,6 +536,26 @@ mod tests {
                 .collect();
             if !bad.is_empty() {
                 eprintln!("CONFIG {c:?}: {bad:?}");
+                if c.k.is_some() {
+                    for mm in &r.ms {
+                        let mut ks: Vec<_> = mm
+                            .loss
+                            .keys()
+                            .map(|k| (k.key, k.path, k.stamp.map(|s| s.hlc.wall_ms)))
+                            .collect();
+                        ks.sort();
+                        let mut dr: Vec<_> = mm
+                            .dropped_loss
+                            .iter()
+                            .map(|k| (k.key, k.path, k.stamp.map(|s| s.hlc.wall_ms)))
+                            .collect();
+                        dr.sort();
+                        eprintln!(
+                            "RECORDS {} vanished={} kept {ks:?} dropped {dr:?}",
+                            mm.name, mm.vanished
+                        );
+                    }
+                }
                 for l in &r.w.log {
                     eprintln!("{l}");
                 }

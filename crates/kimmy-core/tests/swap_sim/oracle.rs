@@ -269,6 +269,10 @@ fn bk(m: &Member) -> HashSet<HeadKey> {
 /// `finish`: every check, as a map of named counts (0 = clean), as the model's `res`.
 pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let o = oracle(w);
+    // the replays (two fresh replicas that receive every entry) keep every record they receive: with `K` on, a replica's Q7 side
+    // of the window holds the records it detected itself, which no member has, so it would drop what the cluster keeps. They
+    // still check that every required head is present and nothing but allowed records is
+    let k_final = std::mem::replace(&mut w.k_final, false);
     let mut res: Res = BTreeMap::new();
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();
     let first = live[0];
@@ -330,6 +334,72 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         })
         .map(|(k, _)| *k)
         .collect();
+    // `K` (field collections only; ASSUMED rules in design note 1.4): a required head (or any late write) is exempt iff at least `K` records of its
+    // document have later loser stamps: the records minted (a loss entry exists for each, dropped or not), the required heads,
+    // and Q7's records of the document in the live members' head states (one family, one window)
+    let (heads, exempt): (HashSet<HeadKey>, HashSet<HeadKey>) = match w.k {
+        Some(kk) if w.policy == Policy::Field => {
+            let minted: HashSet<HeadKey> = w
+                .all
+                .iter()
+                .filter(|x| x.kind == Kind::Loss && !w.lost.contains(&x.idx))
+                .filter_map(|x| x.lkey.map(|k| k.head()))
+                .chain(heads.iter().copied())
+                .collect();
+            let mut q7: HashSet<(u32, Stamp, String)> = HashSet::new();
+            for &i in &live {
+                if let Some(sp) = ms[i].serving().and_then(|s| ms[i].phys.get(&s)) {
+                    for (id, v) in sp.docs.iter() {
+                        if let Some(st) = &v.state {
+                            q7.extend(
+                                st.losses.keys().map(|lk| (*id, lk.stamp, format!("{lk:?}"))),
+                            );
+                        }
+                    }
+                }
+            }
+            // the window's total order (as `Member::enforce_k`): loser stamp, then path for `outReplaced`'s records; a Q7 record is
+            // older than an `outReplaced` one of the same stamp
+            let later = |h: &HeadKey| {
+                minted.iter().filter(|g| g.0 == h.0 && (g.2, g.1) > (h.2, h.1)).count()
+                    + q7.iter().filter(|g| g.0 == h.0 && Some(g.1) > h.2).count()
+            };
+            // every key of the required pool is judged (a non-head dropped everywhere is not an unreported one either)
+            let exempt: HashSet<HeadKey> =
+                okeys.iter().filter(|h| later(h) >= kk).copied().collect();
+            let keep: HashSet<HeadKey> =
+                heads.iter().filter(|h| !exempt.contains(*h)).copied().collect();
+            (keep, exempt)
+        }
+        _ => (heads, HashSet::new()),
+    };
+    res.insert("k_exempt_heads".into(), exempt.len() as i64);
+    if let Some(kk) = w.k.filter(|_| w.policy == Policy::Field) {
+        // no member holds an `outReplaced` record of a document that `K` or more records of it (both families, in its own
+        // view: its records and Q7's in its serving physical's state) are newer than
+        let over = live.iter().any(|&i| {
+            ms[i].loss.keys().any(|k| {
+                let Some(s) = k.stamp else { return false };
+                let q7 = ms[i]
+                    .serving()
+                    .and_then(|sv| ms[i].phys.get(&sv))
+                    .and_then(|sp| sp.docs.get(&k.key))
+                    .and_then(|v| v.state.as_ref())
+                    .map_or(0, |st| st.losses.keys().filter(|lk| lk.stamp > s).count());
+                let mine = ms[i]
+                    .loss
+                    .keys()
+                    .filter(|o| o.key == k.key && (o.stamp, o.path) > (Some(s), k.path))
+                    .count();
+                mine + q7 >= kk
+            })
+        });
+        res.insert(
+            "cnt_k_dropped".into(),
+            live.iter().map(|&i| ms[i].dropped_loss.len() as i64).sum(),
+        );
+        res.insert("k_exceeded".into(), over as i64);
+    }
     let m0state = ms[first].state();
     let div_replay = replays.iter().any(|(st, recs)| {
         *st != m0state
@@ -361,7 +431,8 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     res.insert("heads_required".into(), heads.len() as i64);
     res.insert("true_late_writes_allowed".into(), allowed.len() as i64);
     res.insert("late_writes_required_pool".into(), okeys.len() as i64);
-    let nonheads: Vec<HeadKey> = okeys.iter().filter(|k| !heads.contains(k)).copied().collect();
+    let nonheads: Vec<HeadKey> =
+        okeys.iter().filter(|k| !heads.contains(k) && !exempt.contains(k)).copied().collect();
     let unrep: Vec<HeadKey> = nonheads
         .iter()
         .filter(|k| live.iter().any(|&i| !bk(&ms[i]).contains(k)))
@@ -393,6 +464,16 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             let m = &ms[i];
             let n = m.loss.keys().filter(|kk| kk.head() == *k).count();
             if n != 1 || m.events_emitted.get(k).copied().unwrap_or(0) != 1 {
+                bad = true;
+            }
+        }
+    }
+    // an exempt head is reported at most once, and held at most once
+    for k in &exempt {
+        for &i in &live {
+            let m = &ms[i];
+            let n = m.loss.keys().filter(|kk| kk.head() == *k).count();
+            if n > 1 || m.events_emitted.get(k).copied().unwrap_or(0) > 1 {
                 bad = true;
             }
         }
@@ -680,6 +761,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "join_superseded",
         "covered_skips",
         "q7_records_fresh",
+        "same_write_held",
     ] {
         res.insert(format!("cnt_{kk}"), st.get(kk));
     }
@@ -726,5 +808,6 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         }
     }
     res.insert("div_replay_interleaved".into(), div_interleaved as i64);
+    w.k_final = k_final;
     res
 }

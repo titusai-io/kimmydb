@@ -246,7 +246,15 @@ fn a_write_below_the_merged_version_vector_is_refused_by_the_writer() {
 /// must tick above it and proceed (no refusal, no delay).
 #[test]
 fn a_member_mid_join_writes_above_the_page_states_version_vector() {
-    let mut sc = Sc::new("field:v6", &[("S", 0), ("W2", 0), ("O", 50), ("N", 0)], 60);
+    mid_join_write("field:v6");
+    // the mutant `m-field-witness-off` (the page state's version vector is not witnessed) is killed by this scenario
+    let killed =
+        std::panic::catch_unwind(|| mid_join_write("field:v6+m-field-witness-off")).is_err();
+    assert!(killed, "m-field-witness-off survived the mid-join scenario");
+}
+
+fn mid_join_write(mode: &str) {
+    let mut sc = Sc::new(mode, &[("S", 0), ("W2", 0), ("O", 50), ("N", 0)], 60);
     let (s, o, n) = (sc.idx("S"), sc.idx("O"), sc.idx("N"));
     sc.advance(1);
     let seed = sc.ms[s].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();

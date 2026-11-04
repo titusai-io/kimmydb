@@ -24,6 +24,23 @@ pub struct Cfg {
     pub policy: Policy,
     /// `field`: mint Q7's loss records as entries (default on)
     pub q7_entries: bool,
+    /// `field`: `K` records per document, both families together (off by default)
+    pub k: Option<usize>,
+    /// `field`: updates alternate `$set` and `$inc` by the clock's parity (default); off, every update is a `$set`
+    pub field_counters: bool,
+    /// the `document` policy witnesses page versions' stamps too (the metamorphic runs; see `World::witness_pages`)
+    pub witness_pages: bool,
+    /// a workload on which last-writer-wins and the join agree: no delete, and every document written by one member only
+    pub lww_workload: Option<Writers>,
+}
+
+/// Who writes a document in an `lww_workload`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writers {
+    /// the document's owner, member `key % members` (the write is skipped when the owner has vanished)
+    OwnerByKey,
+    /// member 0 writes everything
+    OneWriter,
 }
 
 impl Cfg {
@@ -37,6 +54,10 @@ impl Cfg {
             snapshots: true,
             policy: Policy::Document,
             q7_entries: true,
+            k: None,
+            field_counters: true,
+            witness_pages: false,
+            lww_workload: None,
         }
     }
 }
@@ -86,6 +107,9 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         names.iter().enumerate().map(|(i, n)| Member::new(i, n, skews[i])).collect();
     w.policy = cfg.policy;
     w.q7_entries = cfg.q7_entries;
+    w.k = cfg.k;
+    w.field_counters = cfg.field_counters;
+    w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
     for k in 0..cfg.keys as u32 {
         ms[0].local_doc(&mut w, k, DocOp::Insert);
@@ -133,7 +157,27 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                     [DocOp::Insert, DocOp::Update, DocOp::Update, DocOp::Delete]
                 };
                 let op = ops[w.rng.below(4)];
-                ms[m].local_doc(&mut w, key, op);
+                // the draws above are the same for every policy; an `lww_workload` only reshapes what they do
+                let (m, op) = match cfg.lww_workload {
+                    None => (Some(m), op),
+                    Some(who) => {
+                        // (the owner is by the key as the model draws it: `key % members` below is of the mapped key)
+                        let key = key % cfg.keys as u32;
+                        let owner = match who {
+                            Writers::OwnerByKey => key as usize % cfg.members,
+                            Writers::OneWriter => 0,
+                        };
+                        let op = DocOp::Update; // no delete, and no later insert (see below)
+                        (Some(owner).filter(|&o| !ms[o].vanished), op)
+                    }
+                };
+                // updates only (after the setup's inserts): a lost insert is two records under `field` (the document-level write and
+                // its field cell) and one under `document`, and each record ticks its minter's clock, so the two policies'
+                // stamps would part; an update is one cell, one record
+                let key = if cfg.lww_workload.is_some() { key % cfg.keys as u32 } else { key };
+                if let Some(m) = m {
+                    ms[m].local_doc(&mut w, key, op);
+                }
             }
             1 => {
                 outs_left -= 1;
@@ -267,6 +311,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
             break;
         }
     }
+    w.k_final = true;
     for &i in &live {
         ms[i].settle(&mut w);
         ms[i].check_inv();
@@ -363,6 +408,7 @@ impl Summary {
             "loss_extra",
             "loss_body_mismatch",
             "loss_missing_unexplained",
+            "k_exceeded",
             "invariant",
         ];
         for k in keys {

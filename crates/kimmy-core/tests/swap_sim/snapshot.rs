@@ -60,9 +60,14 @@ pub struct Join {
 impl Member {
     /// `field`: raise the clock by the version vectors of page states joined here (witness, no tick: the product's HLC
     /// rule, design note Q-F6), so the next local write ticks strictly above everything merged.
-    pub fn witness_docs(&mut self, docs: &Docs) {
+    pub fn witness_docs(&mut self, w: &World, docs: &Docs) {
+        if w.f.fm_witness_off {
+            return; // MUTANT: the page state's vv is not witnessed
+        }
         for v in docs.values() {
-            if let Some(st) = &v.state {
+            if w.policy == Policy::Document {
+                self.hlc = self.hlc.max(v.stamp.hlc.wall_ms as i64);
+            } else if let Some(st) = &v.state {
                 for h in st.vv.values() {
                     self.hlc = self.hlc.max(h.wall_ms as i64);
                 }
@@ -295,12 +300,17 @@ impl Member {
         let pd = j.pl.phys.get(&name).expect("a page of the payload").clone();
         let ungranted = !j.granted;
         let dp_state = self.phys.get(&name).map(|p| p.alive);
+        if w.policy == Policy::Document && w.witness_pages {
+            // the metamorphic runs: the document policy witnesses a page's versions' stamps as the field policy does its
+            // states' version vectors (equal on a workload where each document's latest write is its greatest stamp)
+            self.witness_docs(w, &pd.docs);
+        }
         match dp_state {
             None => {
                 let mut dp = Phys::new(pd.kind);
                 dp.docs = pd.docs.clone();
                 if w.policy == Policy::Field {
-                    self.witness_docs(&pd.docs);
+                    self.witness_docs(w, &pd.docs);
                     let recs: Vec<(u32, Vec<_>)> =
                         pd.docs.iter().map(|(k, v)| (*k, crate::field::page_records(v))).collect();
                     for (k, fresh) in recs {
@@ -318,7 +328,7 @@ impl Member {
                 self.page_entries(w, &name, &pd.docs, &mut j);
             }
             Some(true) if w.policy == Policy::Field => {
-                self.witness_docs(&pd.docs);
+                self.witness_docs(w, &pd.docs);
                 for (k, v) in pd.docs.iter() {
                     let cur_stamp = self.phys.get(&name).unwrap().docs.get(k).map(|c| c.stamp);
                     if ungranted && cur_stamp.is_none_or(|c| v.stamp > c) {

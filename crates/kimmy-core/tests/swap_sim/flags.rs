@@ -45,7 +45,45 @@ pub struct Flags {
     pub grant_prefix: bool,
     /// v6 (seed 885): a snapshot page's versions of a physical buried on the receiver are history on arrival: retained
     pub dead_page_retained: bool,
+    /// Rust-only mutants of the `field` policy's apply and loss path (point 4; read only under `Policy::Field`, no-ops otherwise)
+    pub fm_always_append: bool,
+    pub fm_stale_body: bool,
+    pub fm_loss_superseder_stamp: bool,
+    pub fm_no_page_loss: bool,
+    pub fm_stale_version_stamp: bool,
+    pub fm_witness_off: bool,
+    /// Rust-only mutants of `K` (read only with `Cfg::k` set)
+    pub fm_k_drop_newest: bool,
+    pub fm_k_plus_one: bool,
+    pub fm_k_ignore_q7: bool,
 }
+
+/// The Rust-only mutants of the `K` bound (graded on the `K = 4` grid).
+pub const K_MUTANTS: [&str; 3] = [
+    // the window keeps the oldest `K` records, drops the newest
+    "m-field-k-drop-newest",
+    // the window keeps `K + 1`
+    "m-field-k-plus-one",
+    // the window counts `outReplaced`'s records only, not Q7's beside them
+    "m-field-k-ignore-q7",
+];
+
+/// The Rust-only mutants of the `field` policy (a deliberate fault in its apply or loss path); the Document-vs-Field
+/// metamorphic check and the field grid are graded on them.
+pub const FIELD_MUTANTS: [&str; 6] = [
+    // every entry is appended, also one the join left unchanged or the covered-entry skip only witnessed
+    "m-field-always-append",
+    // the body is not refreshed when the join changed the state: the document keeps its old body
+    "m-field-stale-body",
+    // a loss record is keyed by the superseding event's stamp, not by the loser's
+    "m-field-loss-superseder-stamp",
+    // a retained page version's late cells are not reported
+    "m-field-no-page-loss",
+    // after a join the version keeps its old stamp (the stamp of the latest write merged is not taken)
+    "m-field-stale-version-stamp",
+    // the HLC rule's witness of a joined page state's version vector is off
+    "m-field-witness-off",
+];
 
 /// Every base the harness knows.
 pub const BASES: [&str; 4] =
@@ -161,6 +199,15 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-rule-b-off" => f.rule_b = false,
         "m-dead-page-dropped" => f.dead_page_retained = false,
         "m-stale-src" => f.stale_src_bug = true,
+        "m-field-always-append" => f.fm_always_append = true,
+        "m-field-stale-body" => f.fm_stale_body = true,
+        "m-field-loss-superseder-stamp" => f.fm_loss_superseder_stamp = true,
+        "m-field-no-page-loss" => f.fm_no_page_loss = true,
+        "m-field-stale-version-stamp" => f.fm_stale_version_stamp = true,
+        "m-field-witness-off" => f.fm_witness_off = true,
+        "m-field-k-drop-newest" => f.fm_k_drop_newest = true,
+        "m-field-k-plus-one" => f.fm_k_plus_one = true,
+        "m-field-k-ignore-q7" => f.fm_k_ignore_q7 = true,
         _ => return false,
     }
     true
@@ -196,6 +243,15 @@ mod tests {
     #[test]
     fn every_mutant_name_is_known_and_changes_a_flag() {
         for m in MUTANTS {
+            let base = flags_for("v6", "v6");
+            let f = flags_for(m, "v6");
+            assert_ne!(format!("{base:?}"), format!("{f:?}"), "{m} changes nothing");
+        }
+    }
+
+    #[test]
+    fn every_field_mutant_name_is_known_and_changes_a_flag() {
+        for m in FIELD_MUTANTS.into_iter().chain(K_MUTANTS) {
             let base = flags_for("v6", "v6");
             let f = flags_for(m, "v6");
             assert_ne!(format!("{base:?}"), format!("{f:?}"), "{m} changes nothing");

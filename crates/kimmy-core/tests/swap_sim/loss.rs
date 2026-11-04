@@ -4,6 +4,7 @@ use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::member::Member;
 use crate::world::World;
+use std::collections::HashSet;
 
 impl Member {
     pub fn report(&mut self, w: &mut World, key: u32, stamp: Stamp, body: Body, phys: &str) {
@@ -37,13 +38,16 @@ impl Member {
         if f.record_per_minter {
             k = LKey { key, path, stamp: Some(stamp), minter: Some(self.id) }; // MUTANT: the minter is part of the key
         }
-        if self.loss.contains_key(&k) || (f.pending_dedup && self.loss_pending.contains_key(&k)) {
+        if self.loss.contains_key(&k)
+            || self.dropped_loss.contains(&k)
+            || (f.pending_dedup && self.loss_pending.contains_key(&k))
+        {
             return;
         }
         if self.vanished {
             return; // a vanished writer never writes again: a record IS an entry (Q7 D10), so it makes none
         }
-        self.enter_loss(k, body.clone());
+        self.enter_loss(w, k, body.clone());
         self.loss_phys.insert(k, phys.to_string());
         if let Some(s) = self.serving()
             && let Some(sp) = self.phys.get(&s)
@@ -71,7 +75,7 @@ impl Member {
     /// v3fix (F3): a record is an ordinary entry and replicates, but it enters this member's state (and emits its
     /// outReplaced event) only once the physical of the lost write is buried HERE.
     pub fn merge_loss(&mut self, w: &mut World, k: LKey, body: Body, phys: &str) {
-        if self.loss.contains_key(&k) {
+        if self.loss.contains_key(&k) || self.dropped_loss.contains(&k) {
             return;
         }
         self.loss_phys.insert(k, phys.to_string());
@@ -82,26 +86,85 @@ impl Member {
             w.stats.bump("records_deferred_while_served");
             return;
         }
-        self.enter_loss(k, body);
+        self.enter_loss(w, k, body);
         self.loss_pending.remove(&k);
     }
 
     /// A record first enters this member's state: its outReplaced event is emitted, once per record key.
-    pub fn enter_loss(&mut self, k: LKey, body: Body) {
+    pub fn enter_loss(&mut self, w: &World, k: LKey, body: Body) {
         self.loss.insert(k, body);
         *self.events_emitted.entry(k.head()).or_insert(0) += 1;
+        self.enforce_k(w, k.key);
+    }
+
+    /// `K` (`field` collections, Chris's L34-B ruling, design note 1.4 rule 2): per `_id` the member keeps the `K` newest
+    /// records by loser stamp across both families, `outReplaced`'s (`self.loss`) and Q7's (`MergeState.losses` of the head
+    /// physical's state, ASSUMED here to be the serving physical's state at the end of the run) and drops the older `outReplaced` ones: a dropped record
+    /// is reported at most once (its event was emitted on entry; `dropped_loss` refuses it a second entry). Q7's own records
+    /// are never dropped here (`merge_state` has no `K`; Step 4).
+    pub fn enforce_k(&mut self, w: &World, id: u32) {
+        // the window is applied once the run has converged (`World::k_final`): the Q7 side of it is the head physical's state, which
+        // is only the same at every member then; an early drop is irreversible
+        let Some(kk) = w.k.filter(|_| w.k_final) else { return };
+        if w.policy != crate::world::Policy::Field {
+            return;
+        }
+        // the window's total order, the same at every member: loser stamp, then the family (Q7's records are older than an
+        // `outReplaced` one of the same stamp), then the path
+        type Order = (Stamp, u8, Option<u16>);
+        let mut recs: Vec<(Order, Option<LKey>)> = self
+            .loss
+            .keys()
+            .filter(|k| k.key == id)
+            .filter_map(|k| k.stamp.map(|s| ((s, 1, k.path), Some(*k))))
+            .collect();
+        if !w.f.fm_k_ignore_q7 {
+            // MUTANT (`m-field-k-ignore-q7`): Q7's records are not in the window. Otherwise: the records of the document in
+            // the serving (head) physical's state, which at the end of a run is the converged one
+            let q7: HashSet<_> = self
+                .serving()
+                .and_then(|s| self.phys.get(&s))
+                .and_then(|p| p.docs.get(&id))
+                .and_then(|v| v.state.as_ref())
+                .map(|st| st.losses.keys().cloned().collect())
+                .unwrap_or_default();
+            recs.extend(q7.iter().map(|lk| ((lk.stamp, 0, None), None)));
+        }
+        recs.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
+        if w.f.fm_k_drop_newest {
+            recs.reverse(); // MUTANT: the oldest are kept
+        }
+        let kk = if w.f.fm_k_plus_one { kk + 1 } else { kk }; // MUTANT
+        for (_, k) in recs.into_iter().skip(kk) {
+            if let Some(k) = k {
+                self.loss.remove(&k);
+                self.dropped_loss.insert(k);
+            }
+        }
+    }
+
+    pub fn enforce_k_all(&mut self, w: &World) {
+        if w.k.is_none() {
+            return;
+        }
+        let mut ids: Vec<u32> = self.loss.keys().map(|k| k.key).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            self.enforce_k(w, id);
+        }
     }
 
     pub fn buried_here(&self, phys: &str) -> bool {
         self.phys.get(phys).is_some_and(|p| !p.alive)
     }
 
-    pub fn promote_pending(&mut self, _w: &mut World) {
+    pub fn promote_pending(&mut self, w: &mut World) {
         let keys: Vec<LKey> = self.loss_pending.keys().copied().collect();
         for k in keys {
             if self.buried_here(&self.loss_phys[&k].clone()) {
                 let b = self.loss_pending.remove(&k).unwrap();
-                self.enter_loss(k, b);
+                self.enter_loss(w, k, b);
             }
         }
     }
