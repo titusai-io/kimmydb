@@ -207,11 +207,9 @@ fn the_leaf_effects_of_a_nested_write_are_the_changed_leaves() {
 // ---- the read-your-writes oracle (`order_oracle.rs`) on small documents ------------------------
 
 mod order_oracle_cases {
-    use std::collections::BTreeSet;
-
     use kimmy_core::merge_state::{OrderedValue, Value};
 
-    use crate::order_oracle::{OrdOp, check, reorders};
+    use crate::order_oracle::{OrdOp, Places, check, reorders};
     use crate::sim::np;
 
     type Doc = Vec<(String, OrderedValue)>;
@@ -223,11 +221,11 @@ mod order_oracle_cases {
         (n.to_string(), OrderedValue::Doc(vec![("c".to_string(), OrderedValue::Doc(Vec::new()))]))
     }
 
-    fn history(of: &[&[&str]]) -> BTreeSet<Vec<String>> {
-        of.iter().map(|p| p.iter().map(|s| (*s).to_string()).collect()).collect()
+    fn history(of: &[&[&str]]) -> Places {
+        Places::of_paths(of)
     }
 
-    fn set_n(before: &Doc, after: &Doc, hist: &BTreeSet<Vec<String>>) -> Result<bool, String> {
+    fn set_n(before: &Doc, after: &Doc, hist: &Places) -> Result<bool, String> {
         check(Some(before), Some(after), &OrdOp::Set(np("n"), Value::Int64(1)), hist, true)
             .map(|c| c.trailing)
     }

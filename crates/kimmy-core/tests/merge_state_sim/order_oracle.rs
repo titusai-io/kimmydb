@@ -13,10 +13,10 @@
 //! * a write moves only what it names: at every level, the fields the writer saw before and after, that the
 //!   write does not name (the path, the maps above it, and everything under a document it sets), keep their
 //!   relative order;
-//! * a field the write creates, that no earlier write of the order state gave a place (no HISTORY: a
-//!   standing candidate in some life), in a document with one alive life, goes AFTER every field of its level
+//! * a field the write creates, that no earlier write of its causal past gave a standing place (see below), in a
+//!   document with one alive life, goes AFTER every field of its level
 //!   that has a born and BEFORE every field that has none. The fields without a born are the MAPS WITHOUT A LEAF
-//!   ANYWHERE BELOW THEM and without history of their own: such a map is visible through empty maps alone (the
+//!   ANYWHERE BELOW THEM and without a standing place of their own: such a map is visible through empty maps alone (the
 //!   unset that took its own cell left a floor and no candidate, and a child marker written by someone the
 //!   unsetter had not heard from survived), and nothing places it. They trail, in order of their paths. Every
 //!   other field has a born: a leaf has one (a candidate, or the survivor clamp), and a map with a leaf below
@@ -26,17 +26,16 @@
 //!   with the born of a map decided from the documents alone, as the survivor placement decides it in the
 //!   cases the seeds reach (1080, 1357, 2626, 2654 of the bounded runs, pinned below).
 //!
-//! The third part is left out for a field with history: the place an earlier write gave it stands (the
-//! model's rule: the earliest write since the last void). A map that was emptied no longer vanishes (the implicit
-//! marker is built), so that cause of history is gone. What is left is a field that is created again after the
-//! cell it had was unset by a write the place did not outlive: nine seeds of the 3,000-seed bounded sweeps (see
-//! `history_seed!` in `main.rs`) disagree with the Writer without the exclusion, and the model agrees with the
-//! Writer on every one. The exclusion goes when the oracle encodes that rule from the log instead of reading the
-//! writer's order state.
+//! The third part is decided by the PLACES the log gives (see [`places`]): the model's rule, restated from the design and
+//! read from the writes of the writer's causal past alone (what each write named, what it unset and which levels it
+//! marked; never the writer's or the model's order state). A field with no standing place goes after the fields that have
+//! one; a field whose place stands (a write in the past named it at a stamp above every unset of it in the past) is
+//! ordered by that place against the fields whose places are plain.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::merge_state::{OrderedValue, Path, Value};
+use kimmy_core::merge_state::{MStamp, OrderedValue, Path, Value};
 
 use crate::oracle::Intent;
 
@@ -55,6 +54,249 @@ impl std::ops::DerefMut for Tree {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+/// One name a write gave a field: its path, and whether the write RESET it (a replace's fields, the fields of a
+/// sub-document: they re-assign the place and void the older ones) or only wrote it (a `$set` of the path, its
+/// ancestors, an `$inc`).
+#[derive(Clone, Debug)]
+pub struct NameEv {
+    pub path: Vec<String>,
+    pub reset: bool,
+}
+
+/// What one write did to the order, from its intent and the document its writer saw: the fields it named (in the order
+/// of the write), the paths it unset (what its writer saw below an unset, or removed by a replace or a sub-document) and
+/// the levels it marked (a replace marks the root, a sub-document its path).
+#[derive(Clone, Debug, Default)]
+pub struct WriteOrd {
+    pub names: Vec<NameEv>,
+    pub unsets: Vec<Vec<String>>,
+    pub levels: Vec<Vec<String>>,
+    /// The life the write went into (set when it is logged).
+    pub life: Option<MStamp>,
+}
+
+thread_local! {
+    /// ORACLE ONLY: `WriteOrd` of every logged write, by stamp. The sim clears it when a new log starts.
+    static PAST: RefCell<BTreeMap<MStamp, WriteOrd>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Record the order facts of the write that got `st`. `new_log`: the log was empty, so this starts a run.
+pub fn record(st: MStamp, mut w: WriteOrd, life: Option<MStamp>, new_log: bool) {
+    w.life = life;
+    PAST.with(|t| {
+        let mut t = t.borrow_mut();
+        if new_log {
+            t.clear();
+        }
+        t.insert(st, w);
+    });
+}
+
+fn sub_paths(t: &Tree, at: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    for (n, kids) in t.iter() {
+        at.push(n.clone());
+        out.push(at.clone());
+        if let Some(k) = kids {
+            sub_paths(k, at, out);
+        }
+        at.pop();
+    }
+}
+
+/// The node at `segs` in a tree: `Some(None)` a leaf, `Some(Some(kids))` a map.
+fn node_at<'a>(t: &'a Tree, segs: &[String]) -> Option<&'a Option<Tree>> {
+    let (head, rest) = segs.split_first()?;
+    let (_, kids) = t.iter().find(|(n, _)| n == head)?;
+    if rest.is_empty() {
+        return Some(kids);
+    }
+    kids.as_ref().and_then(|k| node_at(k, rest))
+}
+
+/// Names of the fields of a document value written under `at` (each RESET, a sub-document marks its level), in order.
+fn doc_names(at: &[String], f: &[(String, Value)], w: &mut WriteOrd) {
+    for (n, v) in f.iter().filter(|(_, v)| *v != Value::Unset) {
+        let mut q = at.to_vec();
+        q.push(n.clone());
+        w.names.push(NameEv { path: q.clone(), reset: true });
+        if let Value::Document(inner) = v {
+            w.levels.push(q.clone());
+            doc_names(&q, inner, w);
+        }
+    }
+}
+
+/// The paths a document value written over the map `old` (at `at`) unsets: the old fields it lacks, with everything
+/// below them, and below a field that was a map and is not one now.
+fn doc_unsets(old: &Tree, at: &[String], f: &[(String, Value)], out: &mut Vec<Vec<String>>) {
+    for (n, kids) in old.iter() {
+        let mut q = at.to_vec();
+        q.push(n.clone());
+        let new = f.iter().find(|(m, v)| m == n && *v != Value::Unset).map(|(_, v)| v);
+        match (new, kids) {
+            (None, k) => {
+                out.push(q.clone());
+                if let Some(k) = k {
+                    sub_paths(k, &mut q.clone(), out);
+                }
+            }
+            (Some(Value::Document(inner)), Some(k)) => doc_unsets(k, &q, inner, out),
+            (Some(_), Some(k)) => sub_paths(k, &mut q.clone(), out),
+            _ => {}
+        }
+    }
+}
+
+fn write_names(segs: &[String], w: &mut WriteOrd) {
+    for n in 1..=segs.len() {
+        w.names.push(NameEv { path: segs[..n].to_vec(), reset: false });
+    }
+}
+
+/// What a write did to the order: the model's order items of the write (`_update`, `_diff`), restated from the intent
+/// and the document the writer saw.
+pub fn write_ord(before: Option<&[(String, OrderedValue)]>, op: &OrdOp) -> WriteOrd {
+    let tree = before.map(tree_of_ordered).unwrap_or_default();
+    let mut w = WriteOrd::default();
+    match op {
+        OrdOp::Insert(f) => {
+            fn flat(at: &[String], f: &[(String, Value)], w: &mut WriteOrd) {
+                for (n, v) in f.iter().filter(|(_, v)| *v != Value::Unset) {
+                    let mut q = at.to_vec();
+                    q.push(n.clone());
+                    w.names.push(NameEv { path: q.clone(), reset: false });
+                    if let Value::Document(inner) = v {
+                        flat(&q, inner, w);
+                    }
+                }
+            }
+            flat(&[], f, &mut w);
+        }
+        OrdOp::Upsert(names) => {
+            for n in names {
+                w.names.push(NameEv { path: vec![n.clone()], reset: false });
+            }
+        }
+        OrdOp::Replace(f) => {
+            w.levels.push(Vec::new());
+            doc_names(&[], f, &mut w);
+            doc_unsets(&tree, &[], f, &mut w.unsets);
+        }
+        OrdOp::Set(p, v) => {
+            let segs = p.segments().to_vec();
+            write_names(&segs, &mut w);
+            let old_kids = match node_at(&tree, &segs) {
+                Some(Some(k)) => Some(k),
+                _ => None,
+            };
+            if let Value::Document(f) = v {
+                w.levels.push(segs.clone());
+                doc_names(&segs, f, &mut w);
+                if let Some(k) = old_kids {
+                    doc_unsets(k, &segs, f, &mut w.unsets);
+                }
+            } else if let Some(k) = old_kids {
+                sub_paths(k, &mut segs.clone(), &mut w.unsets);
+            }
+        }
+        OrdOp::Inc(p) => write_names(p.segments(), &mut w),
+        OrdOp::Unset(p) => {
+            let segs = p.segments().to_vec();
+            if let Some(n) = node_at(&tree, &segs) {
+                w.unsets.push(segs.clone());
+                if let Some(k) = n {
+                    sub_paths(k, &mut segs.clone(), &mut w.unsets);
+                }
+            }
+        }
+    }
+    w
+}
+
+/// The place of a field: `(stamp, position)` of its earliest standing candidate; a field the latest level mark above it
+/// never named is put after the fields that mark names: `(mark, MAX, place)`.
+pub type Key = (MStamp, usize, Option<(MStamp, usize)>);
+
+/// What the log says about the places of the fields, for a writer whose causal past is `past`.
+#[derive(Clone, Debug, Default)]
+pub struct Places {
+    /// Fields with a standing place (a candidate named by a write in the past, above the unsets and resets of it).
+    pub born: BTreeMap<Vec<String>, Key>,
+    /// Paths unset in the past, and their ancestors: their place may be a survivor's, which this does not restate.
+    pub touched: BTreeSet<Vec<String>>,
+}
+
+impl Places {
+    /// For the unit tests: the given paths have a place, in the order given, and no unset touched anything.
+    pub fn of_paths(paths: &[&[&str]]) -> Places {
+        let z = MStamp {
+            hlc: kimmy_core::hlc::Hlc::ZERO,
+            writer: kimmy_core::merge_state::WriterId {
+                node: kimmy_core::ids::NodeId::from_bytes([0; 16]),
+                epoch: kimmy_core::merge_state::Epoch::from_u64(0),
+            },
+        };
+        Places {
+            born: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.iter().map(|s| (*s).to_string()).collect(), (z, i, None)))
+                .collect(),
+            touched: BTreeSet::new(),
+        }
+    }
+}
+
+/// The places of the fields in the causal past `past` (the model's rule, restated from the design: a field's place is its
+/// earliest candidate since its last unset floor (strict) and its last reset (inclusive); a field a later level mark
+/// did not name goes after the fields the mark names).
+pub fn places(past: &BTreeSet<MStamp>, life: Option<MStamp>) -> Places {
+    PAST.with(|t| {
+        let t = t.borrow();
+        let mut names: BTreeMap<Vec<String>, Vec<(MStamp, usize, bool)>> = BTreeMap::new();
+        let mut floor_u: BTreeMap<Vec<String>, MStamp> = BTreeMap::new();
+        let mut lvl: BTreeMap<Vec<String>, MStamp> = BTreeMap::new();
+        let mut out = Places::default();
+        for st in past {
+            let Some(w) = t.get(st) else { continue };
+            if w.life != life {
+                continue; // another life of the document: its places are dead
+            }
+            for (i, n) in w.names.iter().enumerate() {
+                names.entry(n.path.clone()).or_default().push((*st, i, n.reset));
+            }
+            for u in &w.unsets {
+                let e = floor_u.entry(u.clone()).or_insert(*st);
+                *e = (*e).max(*st);
+                for k in 1..=u.len() {
+                    out.touched.insert(u[..k].to_vec());
+                }
+            }
+            for l in &w.levels {
+                let e = lvl.entry(l.clone()).or_insert(*st);
+                *e = (*e).max(*st);
+            }
+        }
+        for (path, ns) in names {
+            let fu = floor_u.get(&path);
+            let fr = ns.iter().filter(|n| n.2).map(|n| n.0).max();
+            let born = ns
+                .iter()
+                .filter(|n| fu.is_none_or(|f| n.0 > *f) && fr.is_none_or(|f| n.0 >= f))
+                .map(|n| (n.0, n.1))
+                .min();
+            let Some(b) = born else { continue };
+            let parent = path[..path.len() - 1].to_vec();
+            let key = match lvl.get(&parent) {
+                Some(l) if b.0 < *l => (*l, usize::MAX, Some(b)),
+                _ => (b.0, b.1, None),
+            };
+            out.born.insert(path, key);
+        }
+        out
+    })
 }
 
 /// What a write does to the order, as the serial reference reads it.
@@ -249,14 +491,13 @@ pub struct Checked {
     pub trailing: bool,
 }
 
-/// The writer's document after its write against the rules above. `Err` with the first disagreement. `history` is the set of paths
-/// with a standing candidate in the order state before the write; `one_life` says the document had one
-/// alive life before and after.
+/// The writer's document after its write against the rules above. `Err` with the first disagreement. `places` is what the log
+/// says about the places of the fields before the write; `one_life` says the document had one alive life before and after.
 pub fn check(
     before: Option<&[(String, OrderedValue)]>,
     after: Option<&[(String, OrderedValue)]>,
     op: &OrdOp,
-    history: &BTreeSet<Vec<String>>,
+    places: &Places,
     one_life: bool,
 ) -> Result<Checked, String> {
     let before = before.map(tree_of_ordered);
@@ -288,16 +529,38 @@ pub fn check(
             if one_life && !matches!(op, OrdOp::Unset(_)) {
                 let had: BTreeSet<Vec<String>> = b.paths().into_iter().map(|q| q.0).collect();
                 let at = p.segments().to_vec();
-                if !had.contains(&at)
-                    && !history.contains(&at)
-                    && g.paths().iter().any(|q| q.0 == at)
-                {
+                if !had.contains(&at) && g.paths().iter().any(|q| q.0 == at) {
                     let parent = &at[..at.len() - 1];
                     let key = |n: &String| {
                         let mut q = parent.to_vec();
                         q.push(n.clone());
                         q
                     };
+                    if let Some(kf) = places.born.get(&at) {
+                        // the field's place stands: the fields whose places are plain are ordered against it by their places
+                        let names: Vec<String> = g
+                            .level(parent)
+                            .map(|l| l.iter().map(|(n, _)| n.clone()).collect())
+                            .unwrap_or_default();
+                        let i = names
+                            .iter()
+                            .position(|n| Some(n) == at.last())
+                            .expect("the field is there");
+                        for (j, m) in names.iter().enumerate() {
+                            let q = key(m);
+                            if j == i || named.contains(&q) || places.touched.contains(&q) {
+                                continue;
+                            }
+                            if let Some(kg) = places.born.get(&q)
+                                && (kf < kg) != (i < j)
+                            {
+                                return fail(
+                                    "a field created again is not at the place a write of the past gave it",
+                                );
+                            }
+                        }
+                        return Ok(Checked { any: true, ..Checked::default() });
+                    }
                     // the maps of the level, before the write, that no earlier write gave a place
                     let unplaced: Vec<String> = b
                         .level(parent)
@@ -305,7 +568,7 @@ pub fn check(
                             l.iter()
                                 .filter(|(n, kids)| {
                                     kids.as_ref().is_some_and(|k| !k.has_leaf())
-                                        && !history.contains(&key(n))
+                                        && !places.born.contains_key(&key(n))
                                 })
                                 .map(|(n, _)| n.clone())
                                 .collect()

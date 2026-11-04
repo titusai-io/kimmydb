@@ -656,14 +656,14 @@ trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1357, 1
 trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2626, 2626);
 trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2654, 2654);
 
-/// Nine seeds of the bounded runs (flat 912 and 2518, nested 380, 861, 1128, 1815, 1840, 2663, 2979) where the third part of the
-/// read-your-writes oracle ("a field the write creates goes after the fields that have a place") DISAGREES with the Writer when its
-/// exclusion for a field with history (a standing candidate in the writer's order state) is taken out, and the model AGREES with the
-/// Writer: the traces of all nine, replayed through model6.py (ABSORBED on, implicit markers on, `replay_trace.py`), give the same
-/// ordered document after every event. The cause, read in seed 912 (C's replace names `x` and `n`, writes no cell for `x`
-/// because its value is unchanged, and B's older replace unsets `x`; the replace's place for `x` stands, so C's later `$inc x`
-/// creates the field FIRST, at the place the replace gave it). The oracle keeps its exclusion until it encodes that rule from the
-/// log instead of from the writer's order state; these seeds are the cases to pass without it.
+/// Nine seeds of the bounded runs (flat 912 and 2518, nested 380, 861, 1128, 1815, 1840, 2663, 2979) where a field is created again
+/// and the third part of the read-your-writes oracle ("a field the write creates goes after the fields that have a place") once
+/// needed an exclusion for a field with history. The model agrees with the Writer on all nine (the traces, replayed through
+/// model6.py with the implicit markers on, give the same ordered document after every event). The cause, read in seed 912: C's
+/// replace names `x` and `n`, writes no cell for `x` because its value is unchanged, and B's older replace unsets `x`; the
+/// replace's place for `x` stands, so C's later `$inc x` creates the field FIRST, at the place the replace gave it. The oracle
+/// now restates that rule from the log (`order_oracle::places`: what each write named, unset and marked, in the writer's causal
+/// past and life) and has no exclusion; these seeds pass with it.
 macro_rules! history_seed {
     ($name:ident, $nested:expr, $seed:expr) => {
         #[test]
