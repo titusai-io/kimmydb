@@ -398,25 +398,25 @@ fn unhex(h: &str) -> Vec<u8> {
 /// version, before the generator closed its states: it is not in the tree), as the compact bytes
 /// of the states normalised by a join with the empty one, at the retention `10^9`. The join of `A`
 /// and `B` was not commutative: both have a dead life that `lives` does not list.
+///
+/// Spelled in the counter cell's compact form (re-pinned with the cell): the bytes were converted from the
+/// form they were first pinned in (a register `obs` map, `ESCAPE` totals) by a script that reads the old spelling,
+/// turns each register's `obs` entries into the absorbed pair of the slot they name, and writes the new one.
 const PINNED_A: &str = concat!(
-    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
-    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
-    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
-    "00000000000300000201000000010102000300010000000000000000000b00000001fffffffffffffff90101",
-    "0100000000000000000b0000000000020161016201000000000000000b00000004011001000f020001000000",
-    "00000000000b000000ffffffffffffffffffffffffffffffffff01000200000000000000000b000000ffffff",
-    "ffffffffffffffffffffffffffff0101000000feffffffffffffffffffffffffffffffff0100010178010000",
-    "00000000000b0000000001010100000000000000000b000000d00f00030001000000000000000000000b0000",
-    "008080808080808080808080808080808080020002016101620000000000000000000b000000808080808080",
-    "808080808080808080808002000101780000000000000000000b000000feffffffffffffffffffffffffffff",
-    "ffff010100000000000000001400000901010100000000000000000c00000001828080808080808080808080",
-    "8080808080040100000000000000000000000000843001010100000000000000000d00000001feffffffffff",
-    "ffffffffffffffffffffff0101010100000000000000000f0000000182808080808080808080808080808080",
-    "80040100000000000000000000000000843001010201610162000000000000000c0000000180808080808080",
-    "80800101010201610162000000000000000d00000001d00f01010201610162000000000000000f0000000180",
-    "8080808080808080010101010178000000000000000c00000001818080808080808080808080808080808004",
-    "0e0101010178000000000000000d000000018180808080808080808080808080808080040e01010101780000",
-    "00000000000f00000001feffffffffffffffffffffffffffffffff01",
+    "514d530202414141414141414141414141414141410000000000000000000000000000000000004343434343",
+    "4343434343434343434343000000000000000000000000000000000000020000000000000001000000000000",
+    "000000000300000101000000010101000300010000000000000000000b00000001fffffffffffffff9000201",
+    "61016201000000000000000b00000004011001000f0100000000feffffffffffffffffffffffffffffffff01",
+    "0001017801000000000000000b0000000000030001000000000000000000000b000000008080808080808080",
+    "808080808080808080020002016101620000000000000000000b000000008080808080808080808080808080",
+    "80808002000101780000000000000000000b00000000feffffffffffffffffffffffffffffffff0101000000",
+    "00000000001400000901010100000000000000000c0000000102010000000000000000000000000084300101",
+    "0100000000000000000d0000000100feffffffffffffffffffffffffffffffff010101010000000000000000",
+    "0f00000001020100000000000000000000000000843001010201610162000000000000000c00000001008080",
+    "808080808080800101010201610162000000000000000d0000000100d00f0101020161016200000000000000",
+    "0f0000000100808080808080808080010101010178000000000000000c00000001010e010101017800000000",
+    "0000000d00000001010e0101010178000000000000000f0000000100feffffffffffffffffffffffffffffff",
+    "ff01",
     // section 10: the order state's count, 0
     "00",
 );
@@ -426,44 +426,38 @@ const PINNED_B: &str = concat!(
     "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
     "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
     "0000000000030000020201000101015f0102000102000161010100000601010005000000000000000d000001",
-    "010000000000000007000001020161016201000000000000000d000001050002000000feffffffffffffffff",
-    "ffffffffffffffff010002008080808080808080808080808080808080020101017801000000000000000d00",
-    "00010280000000000000000002000000090101000202010001000000000000000e0000010301730001010100",
-    "feffffffffffffffffffffffffffffffff0102020161016201000000000000000e0000010280000000000000",
-    "000001000100d00f0201017801000000000000000e000001070000000502000000000000000000000e000001",
-    "d00f000200000000000000000e0000010001010000d00f060101000100000000000000000d00000109010201",
-    "6101620100000000000000000d0000018180808080808080808080808080808080040e010101780100000000",
-    "000000000d000001ffffffffffffffffffffffffffffffffff010201000100000000000000000e0000018080",
-    "80808080808080010202016101620100000000000000000e0000018180808080808080808080808080808080",
-    "040e020101780100000000000000000e000001d00f0101000000000000001400000601010100000000000000",
-    "000c000001010901010100000000000000001000000101828080808080808080808080808080808004010000",
-    "0000000000000000000000843001010201610162000000000000000c00000101828080808080808080808080",
-    "8080808080040100000000000000000000000000843001010201610162000000000000001000000101808080",
-    "808080808080010101010178000000000000000c000001010201010101780000000000000010000001018080",
-    "80808080808080808080808080808002",
+    "0100000000000000070001020161016201000000000000000d000001050200000000feffffffffffffffffff",
+    "ffffffffffffff01000200008080808080808080808080808080808080020101017801000000000000000d00",
+    "0001028000000000000000020000000009010100000202010001000000000000000e00000103017301010100",
+    "00feffffffffffffffffffffffffffffffff0102020161016201000000000000000e00000102800000000000",
+    "00000100010000d00f0201017801000000000000000e00000107000000050101000000d00f06010100010000",
+    "0000000000000d00000100090102016101620100000000000000000d000001020e0101017801000000000000",
+    "00000d00000100ffffffffffffffffffffffffffffffffff010201000100000000000000000e000001008080",
+    "80808080808080010202016101620100000000000000000e000001020e020101780100000000000000000e00",
+    "000100d00f0101000000000000001400000601010100000000000000000c0000010100090101010000000000",
+    "0000001000000101020100000000000000000000000000843001010201610162000000000000000c00000101",
+    "0201000000000000000000000000008430010102016101620000000000000010000001010080808080808080",
+    "8080010101010178000000000000000c00000101000201010101780000000000000010000001010080808080",
+    "8080808080808080808080808002",
     // section 10: the order state's count, 0
     "00",
 );
 
 const PINNED_C: &str = concat!(
-    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
-    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
-    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
-    "00000000000300000201000000010102000300010000000000000000000b00000001fffffffffffffff90101",
-    "0100000000000000000b0000000000020161016201000000000000000b00000004011001000f020001000000",
-    "00000000000b000000ffffffffffffffffffffffffffffffffff01000200000000000000000b000000ffffff",
-    "ffffffffffffffffffffffffffff0101000000feffffffffffffffffffffffffffffffff0100010178010000",
-    "00000000000b0000000001010100000000000000000b000000d00f00030001000000000000000000000b0000",
-    "008080808080808080808080808080808080020002016101620000000000000000000b000000808080808080",
-    "808080808080808080808002000101780000000000000000000b000000feffffffffffffffffffffffffffff",
-    "ffff010100000000000000001400000901010100000000000000000c00000001828080808080808080808080",
-    "8080808080040100000000000000000000000000843001010100000000000000000d00000001feffffffffff",
-    "ffffffffffffffffffffff0101010100000000000000000f0000000182808080808080808080808080808080",
-    "80040100000000000000000000000000843001010201610162000000000000000c0000000180808080808080",
-    "80800101010201610162000000000000000d00000001d00f01010201610162000000000000000f0000000180",
-    "8080808080808080010101010178000000000000000c00000001818080808080808080808080808080808004",
-    "0e0101010178000000000000000d000000018180808080808080808080808080808080040e01010101780000",
-    "00000000000f00000001feffffffffffffffffffffffffffffffff01",
+    "514d530202414141414141414141414141414141410000000000000000000000000000000000004343434343",
+    "4343434343434343434343000000000000000000000000000000000000020000000000000001000000000000",
+    "000000000300000101000000010101000300010000000000000000000b00000001fffffffffffffff9000201",
+    "61016201000000000000000b00000004011001000f0100000000feffffffffffffffffffffffffffffffff01",
+    "0001017801000000000000000b0000000000030001000000000000000000000b000000008080808080808080",
+    "808080808080808080020002016101620000000000000000000b000000008080808080808080808080808080",
+    "80808002000101780000000000000000000b00000000feffffffffffffffffffffffffffffffff0101000000",
+    "00000000001400000901010100000000000000000c0000000102010000000000000000000000000084300101",
+    "0100000000000000000d0000000100feffffffffffffffffffffffffffffffff010101010000000000000000",
+    "0f00000001020100000000000000000000000000843001010201610162000000000000000c00000001008080",
+    "808080808080800101010201610162000000000000000d0000000100d00f0101020161016200000000000000",
+    "0f0000000100808080808080808080010101010178000000000000000c00000001010e010101017800000000",
+    "0000000d00000001010e0101010178000000000000000f0000000100feffffffffffffffffffffffffffffff",
+    "ff01",
     // section 10: the order state's count, 0
     "00",
 );
@@ -560,17 +554,29 @@ fn encode_decode_round_trip() {
     for o in [opts(1_000_000_000), opts(6)] {
         let mut seen_gens = false;
         let mut seen_losses = false;
+        let mut split = codec::V1Split::default();
         for pool in pools(40, 24, &o) {
             for st in &pool {
-                let bytes = st.encode();
-                let back = MergeState::decode(&bytes).expect("decode");
-                assert_eq!(&back, st);
-                assert_eq!(back.canonical_bytes(), st.canonical_bytes());
-                assert_eq!(back.state_hash(), st.state_hash());
+                // the compact form, for every state
+                let c = st.encode_compact();
+                let back_c = MergeState::decode_compact(&c).expect("decode compact");
+                assert_eq!(&back_c, st);
+                assert_eq!(back_c.encode_compact(), c);
+                assert_eq!(back_c.compact_hash(), st.compact_hash());
+                // version 1, where it can spell the state
+                if split.note(st) {
+                    let bytes = st.encode();
+                    let back = MergeState::decode(&bytes).expect("decode");
+                    assert_eq!(&back, st);
+                    assert_eq!(back.canonical_bytes(), st.canonical_bytes());
+                    assert_eq!(back.state_hash(), st.state_hash());
+                }
                 seen_gens |= !st.gens.is_empty();
                 seen_losses |= !st.losses.is_empty();
             }
         }
+        eprintln!("encode_decode_round_trip R={}: {split:?}", o.retention);
+        assert!(split.held > 100, "version 1 still round-trips {} states", split.held);
         assert!(seen_gens && seen_losses, "the generated states should exercise gens and losses");
     }
     let empty = MergeState::default();
@@ -598,6 +604,7 @@ fn state_hash_of_different_join_orders_is_equal() {
     // is equal outright; the records converge by pulling the loss entries (model probe P5), done
     // here by `receive_loss` of the other side's records, after which the hashes are equal.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         let fwd = pool.iter().fold(MergeState::default(), |acc, s| join(&acc, s, &o).0);
         let mut rev_order: Vec<&MergeState> = pool.iter().collect();
@@ -621,9 +628,15 @@ fn state_hash_of_different_join_orders_is_equal() {
             wr.receive_loss(k.clone(), v.clone());
         }
         assert!(wf.state == wr.state);
-        assert_eq!(wf.state.state_hash(), wr.state.state_hash());
-        assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        assert_eq!(wf.state.compact_hash(), wr.state.compact_hash());
+        assert_eq!(wf.state.compact_bytes(), wr.state.compact_bytes());
+        if split.note(&wf.state) {
+            assert_eq!(wf.state.state_hash(), wr.state.state_hash());
+            assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        }
     }
+    eprintln!("state_hash_of_different_join_orders: {split:?}");
+    assert!(split.held > 5, "version 1 still compares {} joins", split.held);
 }
 
 #[test]
@@ -631,25 +644,46 @@ fn state_hash_separates_states() {
     let o = opts(1_000_000_000);
     let mut hashes = BTreeSet::new();
     let mut states = BTreeSet::new();
+    let (mut c_hashes, mut c_states) = (BTreeSet::new(), BTreeSet::new());
+    let mut split = codec::V1Split::default();
     for pool in pools(40, 24, &o) {
         for st in pool {
-            hashes.insert(st.state_hash());
-            states.insert(st.canonical_bytes());
+            // the compact form, for every state
+            c_hashes.insert(st.compact_hash());
+            c_states.insert(st.compact_bytes());
+            // version 1, where it can spell the state
+            if split.note(&st) {
+                hashes.insert(st.state_hash());
+                states.insert(st.canonical_bytes());
+            }
         }
     }
+    eprintln!(
+        "state_hash_separates_states: {split:?}, {} version 1 states, {} compact states",
+        states.len(),
+        c_states.len()
+    );
     assert_eq!(hashes.len(), states.len());
+    assert_eq!(c_hashes.len(), c_states.len());
+    assert!(states.len() > 100, "version 1 still separates {} states", states.len());
 }
 
 #[test]
 fn writer_state_hash_equals_receivers() {
     // A writer's normalised state hashes like the state a receiver reaches by joining it in.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         for st in &pool {
             let recv = join(&MergeState::default(), st, &o).0;
-            assert_eq!(recv.state_hash(), st.state_hash());
+            assert_eq!(recv.compact_hash(), st.compact_hash());
+            if split.note(st) {
+                assert_eq!(recv.state_hash(), st.state_hash());
+            }
         }
     }
+    eprintln!("writer_state_hash_equals_receivers: {split:?}");
+    assert!(split.held > 100, "version 1 still hashes {} states", split.held);
 }
 
 #[test]
@@ -720,7 +754,22 @@ pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
     let mut corpus: Vec<Vec<u8>> = Vec::new();
     for pool in pools(24, 24, o) {
         for st in pool.iter().step_by(5) {
-            corpus.push(st.encode());
+            // version 1, for the states it can spell (the others are in the compact corpus)
+            if st.without_ords().v1_can_hold() {
+                corpus.push(st.encode());
+            }
+        }
+    }
+    corpus
+}
+
+/// The compact encodings the compact decode fuzz damages: the same states, every fifth of the pools
+/// of 24 runs, all of them (the compact form spells every state).
+pub(super) fn fuzz_corpus_compact(o: &JoinOptions) -> Vec<Vec<u8>> {
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, o) {
+        for st in pool.iter().step_by(5) {
+            corpus.push(st.encode_compact());
         }
     }
     corpus
@@ -766,6 +815,16 @@ fn decode_mutation_fuzz() {
         std::env::var("Q7_DECODE_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     let o = opts(1_000_000_000);
     let corpus = fuzz_corpus(&o);
+    // the corpus is the states version 1 can spell; the others (an absorbed pair) are fuzzed through the
+    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`, and the d7 sweep)
+    let mut split = codec::V1Split::default();
+    for pool in pools(24, 24, &o) {
+        pool.iter().step_by(5).for_each(|st| {
+            split.note(st);
+        });
+    }
+    assert_eq!(corpus.len(), split.held);
+    eprintln!("decode_mutation_fuzz corpus: {split:?}");
     let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
     let (mut accepted, mut refused) = (0u64, 0u64);
     for k in 0..n {
@@ -1041,11 +1100,26 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
     );
     let (mut same, mut differ) = (0, 0);
+    let (mut v1_pairs, mut v1_held_pairs) = (0, 0);
     for (a, b, _) in triples(&pools_, 600) {
         let merged = join(a, b, &o).0;
         for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
             let by_state = x == y;
-            assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+            // the compact bytes, for every state (the version 1 form cannot spell a state with an
+            // absorbed pair)
+            assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
+            // version 1, where it holds both states of the pair
+            let (hx, hy) = (x.without_ords().v1_can_hold(), y.without_ords().v1_can_hold());
+            if hx && hy {
+                assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+                v1_held_pairs += 1;
+            } else {
+                assert!(
+                    (hx || x.v1_refused_only_for_a_pair())
+                        && (hy || y.v1_refused_only_for_a_pair())
+                );
+            }
+            v1_pairs += 1;
             if by_state {
                 same += 1;
             } else {
@@ -1053,7 +1127,9 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             }
         }
     }
+    eprintln!("state_equality: {v1_held_pairs} of {v1_pairs} pairs also on version 1");
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
+    assert!(v1_held_pairs > 50, "version 1 still compares {v1_held_pairs} pairs");
 }
 
 // ---- typed counters --------------------------------------------------------------------------

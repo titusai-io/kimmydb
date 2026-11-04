@@ -13,7 +13,9 @@ and writes JSON fixtures that the Rust tests read:
                       clock, the stamp it got, or None when it was refused). The Rust tests replay the script through the Writer API.
   ord_join_laws.json  the Ords of probe_ord_join_laws (150 nested runs, steps=14): per path the distinct entry Ords, which the
                       Rust test joins pairwise and in triples with PINNED counts.
-  ord_random_states.json  states of the model's random nested runs with the model's ordered document of each (ABSORBED = False).
+  ord_random_states.json  states of the model's random nested runs with the model's ordered document of each (ABSORBED = True, the
+                      counter cell the Rust has; each state carries the model's absorbed store, which the Rust test loads as the
+                      absorbed pair of each slot), and the states where the Q6 rule changes the document (expected_on, expected_off).
 
 Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_goldens.py <out-dir>
          (-B: the model directory must not get a __pycache__; the script also sets sys.dont_write_bytecode)
@@ -109,13 +111,16 @@ def j_ords(ords):
 def j_state(s):
     regs = []
     for (L, p), r in sorted(s.regs.items(), key=lambda kv: (kv[0][0], kv[0][1].split("."))):
-        obs = [[*j_obs_key(k), j_stamp(v[0]), v[1]] for k, v in sorted(r[2].items(), key=repr)]
-        regs.append([j_stamp(L), p.split("."), j_stamp(r[0]), j_val(r[1]), obs, j_gen(r[3]) if len(r) > 3 else None,
+        regs.append([j_stamp(L), p.split("."), j_stamp(r[0]), j_val(r[1]), j_gen(r[3]) if len(r) > 3 else None,
                      len(r) > 4 and r[4] == "soi"])
     slots = [[j_stamp(k[0]), k[1].split("."), j_writer(k[2]), j_stamp(k[3]), j_stamp(v[0]), v[1]]
              for k, v in sorted(s.slots.items(), key=lambda kv: (kv[0][0], kv[0][1].split("."), kv[0][2], repr(kv[0][3])))]
     lives = [[j_stamp(L), [j_stamp(d) for d in sorted(v[0])], [p.split(".") for p in v[1]], v[2]] for L, v in sorted(s.lives.items())]
-    return {"lives": lives, "dead": [j_stamp(L) for L in sorted(s.dead)],
+    # the counter cell: a slot's absorbed pair, from the model's absorbed store (slot key -> the highest (stamp, total) any base
+    # write on the path observed); the registers no longer carry an `obs` map
+    absorbed = [[j_stamp(k[0]), k[1].split("."), j_writer(k[2]), j_stamp(k[3]), j_stamp(v[0]), v[1]]
+                for k, v in sorted(s.absorbed.items(), key=lambda kv: (kv[0][0], kv[0][1].split("."), kv[0][2], repr(kv[0][3])))]
+    return {"lives": lives, "dead": [j_stamp(L) for L in sorted(s.dead)], "absorbed": absorbed,
             "deletes": [[j_stamp(d), [[j_writer(w), h] for w, h in sorted(vv.items())]] for d, vv in sorted(s.deletes.items())],
             "regs": regs, "slots": slots, "vv": [[j_writer(w), h] for w, h in sorted(s.vv.items())],
             "ords": j_ords(s.ords)}
@@ -897,12 +902,12 @@ def _mutants():
 def random_states_fixture(seeds=300, steps=30):
     """O1-4 and O1-6 of the O1 review. States of the model's random nested runs (every writer entry of every member's oplog and
     every member's final state; no implicit markers: O4 is not built), with the model's ordered document of each under
-    ABSORBED = False (the counter cell the Rust has). Chosen: for each of five mutants of the read the states it changes
-    (smallest first), and a spread of others; and, from runs with ABSORBED = True, the states whose order or values the
-    Q6 rule changes (the Rust has no `absorbed` yet: pinned as a known divergence)."""
+    ABSORBED = True (the counter cell the Rust has). Chosen: for each of five mutants of the read the states it changes
+    (smallest first), and a spread of others; and, from the same runs, the states whose order or values the
+    Q6 rule changes (the Rust gives expected_on and not expected_off)."""
     muts = _mutants()
     seen, pool = set(), []
-    M.ABSORBED = False
+    M.ABSORBED = True
     for seed in range(seeds):
         ms, log, ok = P.run(seed, steps=steps, nested=True)
         sts = [m.state for m in ms]

@@ -9,8 +9,8 @@ disjoint) come from the nested pool.
 Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_differential.py <out-dir> [seed-to-show]
          (-B and sys.dont_write_bytecode: the model directory must not get a __pycache__)
 
-Model switches (the restrictions are those of the Rust side today): ABSORBED = False (the counter cell has no `absorbed` yet;
-Rust reads the winner's `obs` only), NO_IMPLICIT_MARKER = True (a leaf write under an absent map writes no marker: item O4 is not built;
+Model switches (the restrictions are those of the Rust side today): ABSORBED = True (the counter cell: a slot's absorbed pair; the
+flip of the counter-cell series), NO_IMPLICIT_MARKER = True (a leaf write under an absent map writes no marker: item O4 is not built;
 the writer still names the ancestors to the order state), retention 10**9 (the associativity of the order join is claimed within
 retention only). No field is named "" (the model keys the root of a replace by "" and cannot tell it from a top-level field of that
 name: the Rust keys them OrdAt::Root and OrdAt::Field([""]) and has its own test); no name has a dot.
@@ -21,6 +21,11 @@ upsert) or a receive (a member joins another member's current state). Every step
 text) of the acting member's ordered document and of its order state AFTER joining the empty state (the Rust writer's state is
 normalised; the model's is not until the next join): the text is defined below and written by the Rust test in the same words. A
 disagreement is a finding: re-run with a seed to print the model's text for every step.
+
+THE FLIP'S EVIDENCE. Every script is also run with ABSORBED = False. A script whose steps (an operation's result, or a member's digest)
+differ between the two settings carries an `off` record: the index of the first step that differs and that step as the ABSORBED-off
+model made it (and the final digest). The Rust test pins the seeds of these scripts: its writers equal the ABSORBED-on digests (the
+comparison above) and so differ from the off ones at that step.
 """
 import hashlib, json, os, random, sys
 
@@ -30,7 +35,7 @@ MODEL = os.environ["Q7MODEL_DIR"]
 sys.path.insert(0, MODEL)
 import model6 as M            # noqa: E402
 
-M.ABSORBED = False
+M.ABSORBED = True
 M.NO_IMPLICIT_MARKER = True
 M.RET = 10 ** 9
 
@@ -297,6 +302,25 @@ def script(kind, seed, steps=30):
     return {"kind": kind, "seed": seed, "members": nm, "steps": out, "final": final[names[0]]}, shown
 
 
+def with_absorbed(on_flag, kind, seed):
+    old = M.ABSORBED
+    M.ABSORBED = on_flag
+    try:
+        return script(kind, seed)[0]
+    finally:
+        M.ABSORBED = old
+
+
+def off_record(on, kind, seed):
+    """None when the ABSORBED-off model makes the same script; else where it first differs."""
+    off = with_absorbed(False, kind, seed)
+    if off["steps"] == on["steps"] and off["final"] == on["final"]:
+        return None
+    n = min(len(on["steps"]), len(off["steps"]))
+    i = next((k for k in range(n) if on["steps"][k] != off["steps"][k]), n)
+    return {"step": i, "off_step": off["steps"][i] if i < len(off["steps"]) else None, "off_final": off["final"]}
+
+
 def main(outdir, show=None):
     sha = hashlib.sha256(open(os.path.join(MODEL, "model6.py"), "rb").read()).hexdigest()
     scripts = []
@@ -307,6 +331,9 @@ def main(outdir, show=None):
             if show is not None and seed == int(show):
                 for i, (who, what, dt, ot) in enumerate(shown):
                     print("== step %d %s %s\n%s\n--\n%s" % (i, who, what, dt, ot))
+            rec = off_record(sc, kind, seed)
+            if rec is not None:
+                sc["off"] = rec
             scripts.append(sc)
             for s in sc["steps"]:
                 if s["k"] == "recv":
@@ -324,6 +351,7 @@ def main(outdir, show=None):
     with open(os.path.join(outdir, "ord_diff_scripts.json"), "w") as f:
         json.dump({"model6_sha256": sha, "scripts": scripts}, f, separators=(",", ":"), sort_keys=True)
     print("scripts", len(scripts), stats)
+    print("scripts that differ with ABSORBED off:", [(s["kind"], s["seed"], s["off"]["step"]) for s in scripts if "off" in s])
 
 
 if __name__ == "__main__":

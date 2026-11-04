@@ -44,6 +44,10 @@ pub enum Probe {
     /// (a non-numeric creation value of an upsert and an increment on its path, in the one order
     /// that shows), so a change of the workload's random stream could leave it alive.
     Scenarios,
+    /// The fold scenarios of the counter cell (`probes::fold_scenarios_with`: the four-step case of the
+    /// review and EG2), read by value: the mutant is killed when a member reads another value than the
+    /// design's.
+    Fold,
     /// The idle-origin and late-member scripts of probes_q3 (`probes::q3_idle_origin`, `q3_late_member`):
     /// the mutant is killed when the collected life comes back in one of them (the design keeps it dead).
     Q3Skip,
@@ -170,6 +174,12 @@ pub fn mutants() -> Vec<Mutant> {
             apply: |c| c.opts.set_creation_without_generation(true),
             grader: Random { restore: true },
             probe: Scenarios,
+        },
+        Mutant {
+            name: "a base write folds only the slots it counts, not every slot held  [M2 fold]",
+            apply: |c| c.opts.set_fold_counted_only(true),
+            grader: Random { restore: true },
+            probe: Fold,
         },
         Mutant {
             name: "a superseded and killed first insert reported neither way  [V7m4]",
@@ -390,6 +400,21 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
                 .collect();
             let k = !bad.is_empty();
             (Some(format!("scenarios {bad:?}: {}", if k { "killed" } else { "NOT killed" })), k)
+        }
+        Probe::Fold => {
+            let bad: Vec<String> = probes::fold_scenarios_with(&cfg)
+                .into_iter()
+                .filter(|(_, problems)| !problems.is_empty())
+                .map(|(name, _)| name)
+                .collect();
+            let k = !bad.is_empty();
+            (
+                Some(format!(
+                    "fold scenarios {bad:?}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
         }
         Probe::Q3Skip => {
             let found: Vec<&str> = [

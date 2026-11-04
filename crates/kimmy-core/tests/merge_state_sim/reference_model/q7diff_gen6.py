@@ -9,7 +9,7 @@ Drives the vendored A2.3 model (`model6.py`, with `pullmodel6.Node`'s normalised
   * for every join: the `changed` flag and the fresh loss keys; for every loss entry: acceptance,
   * after every step, for every member: the visible document (every present path, the order of a
     level left out), the hidden figure, and a DIGEST of the state: the lives, deletes, dead lives,
-    registers (stamp, value, observed totals, generation, `$setOnInsert` mark), counter slots, version
+    registers (stamp, value, generation, `$setOnInsert` mark), counter slots (stamp, total and the absorbed pair), version
     vector and loss records, as sorted text lines hashed together (`--explain` prints the lines),
   * at the end (after a full-mesh sync): the oracle's answers (visible document, alive lives, required
     heads, hidden figure, killed-and-superseded groups, and the stale/unsound verdicts on member 0's
@@ -17,7 +17,7 @@ Drives the vendored A2.3 model (`model6.py`, with `pullmodel6.Node`'s normalised
 
 THE VENDORED MODEL IS NEVER EDITED, and no longer patched: its `same` is the Rust diff (bit pattern for doubles, the
 representation for a Decimal128, type strict), and the harness asserts that at import. It sets the model as the Rust side is
-today: `ABSORBED = False` (no absorbed cell yet) and `NO_IMPLICIT_MARKER = True` (no implicit marker yet). `--plant NAME`
+today: `ABSORBED = True` (the absorbed counter cell, Q6) and `NO_IMPLICIT_MARKER = True` (no implicit marker yet). `--plant NAME`
 flips one of the model's own mutation switches, so that the Rust replay MUST disagree (the self-check of the comparison).
 States are compared with `exact()`, never through the repr strings of `canon()` alone (the bits of a NaN).
 
@@ -33,7 +33,6 @@ these restrictions is lifted here (each is lifted deliberately when the Rust sid
   * order state and field order (Q4): no order-only write is drawn (a replace or a `$set` of a
     document whose content is the writer's but whose key order is not), and the visible documents are
     compared without the order of a level;
-  * the absorbed counter rule (Q6): the stage A model has none, as the Rust side.
 
 Usage (standard library only):
   python3 -I q7diff_gen6.py <out-dir> <n-scripts> [first-seed] [--plant NAME]
@@ -76,8 +75,8 @@ assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
 assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
 assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
 assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
-# the harness runs the model as the Rust side is today: no absorbed cell yet, no implicit map marker yet
-M.ABSORBED = False
+# the harness runs the model as the Rust side is today: the absorbed counter cell, no implicit map marker yet
+M.ABSORBED = True
 M.NO_IMPLICIT_MARKER = True
 
 
@@ -190,7 +189,30 @@ def fobs(d):
                                  for k, val in d.items())) + "]"
 
 
+# THE REGISTER `obs` IS DEAD under ABSORBED = True. The model still keeps a register's `obs` map (what its base counted); the Rust
+# cell has none (a slot's absorbed pair replaces it), so nothing may depend on it. Checked, not assumed, on EVERY state this harness
+# encodes or digests that has any register obs entry: every read of the model is the same with the obs maps cleared as with them.
+# (An obs key can name a slot of a life that was collected past the horizon, so `obs` may be non-empty with an empty absorbed
+# store; seed 792 of the nested generator is such a state. Such a key can matter only if the cells of that life come back from a state
+# older than the horizon, which is outside the retention claim.) A mismatch fails the run.
+def _obs_reads(s):
+    paths = sorted({k[1] for k in list(s.regs) + list(s.slots)})
+    slot_paths = sorted({k[1] for k in s.slots})
+    return (repr(s.visible()), repr(s.hidden_all()), repr(s.order_report()),
+            repr([(p, s.value(p)) for p in paths]),
+            repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
+
+
+def check_obs_dead(s):
+    if not any(r[2] for r in s.regs.values()):
+        return
+    cleared = s.copy()
+    cleared.regs = {k: (r[0], r[1], {}) + tuple(r[3:]) for k, r in s.regs.items()}
+    assert _obs_reads(s) == _obs_reads(cleared), "a read of the model depends on a register's obs under ABSORBED"
+
+
 def digest_lines(s):
+    check_obs_dead(s)
     out = []
     for L, v in s.lives.items():
         out.append("life %s seen[%s] %s" % (fs(L), ",".join(sorted(fs(d) for d in v[0])), v[2]))
@@ -199,16 +221,18 @@ def digest_lines(s):
     for d, vv in s.deletes.items():
         out.append("del %s vv[%s]" % (fs(d), ",".join(sorted("%s=%d" % (fw(w), h) for w, h in vv.items()))))
     for (L, p), r in s.regs.items():
-        obs = fobs({k: "%s,%s" % (fs(o[0]), o[1]) for k, o in r[2].items()})
         gen = r[3]
         if gen is None:
             g = "-"
         else:
             g = fs(gen[0]) + "/seen" + fobs({k: str(t) for k, t in gen[2].items()})
         soi = 1 if len(r) > 4 and r[4] == "soi" else 0
-        out.append("reg %s %s %s %s obs%s gen=%s soi=%d" % (fs(L), p, fs(r[0]), fv(r[1]), obs, g, soi))
+        out.append("reg %s %s %s %s gen=%s soi=%d" % (fs(L), p, fs(r[0]), fv(r[1]), g, soi))
+    assert set(s.absorbed) <= set(s.slots), "an absorbed pair without its slot"
     for (L, p, w, g), (st, tot) in s.slots.items():
-        out.append("slot %s %s %s %s %s %d" % (fs(L), p, fw(w), fg(g), fs(st), tot))
+        a = s.absorbed.get((L, p, w, g))
+        ab = "-" if a is None else "%s,%d" % (fs(a[0]), a[1])
+        out.append("slot %s %s %s %s %s %d abs=%s" % (fs(L), p, fw(w), fg(g), fs(st), tot, ab))
     for w, h in s.vv.items():
         out.append("vv %s %d" % (fw(w), h))
     for (kind, path, st), val in s.losses.items():

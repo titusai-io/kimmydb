@@ -10,7 +10,7 @@
 //! lowered one. This test replays every script on `merge_state::Writer`s and compares, after every
 //! step and for every member: the visible document (every present path, a map marked, the order of
 //! a level not compared), the hidden figure, and a digest of the whole state (lives, deletes, dead
-//! lives, registers with their observed totals and generations, counter slots, version vector, loss
+//! lives, registers with their generations, counter slots with their absorbed pairs, version vector, loss
 //! records, as sorted text lines hashed together); every write's stamp (or refusal or no-op); every
 //! join's `changed` flag and fresh loss keys; every loss entry's acceptance; and, after a final
 //! full-mesh sync, the recursive harness oracle (`merge_state_sim/oracle.rs`) on the Rust log
@@ -36,7 +36,7 @@
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
 //! PATH: if it is not, the tests FAIL (they do not skip). The model is the vendored A2.3 one
-//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit marker. The `merge-mutants` feature is
+//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit marker. The `merge-mutants` feature is
 //! needed (`Cargo.toml`): the test `rust_mutants_are_caught_by_the_replay` turns each nested mutation switch on and
 //! requires the replay to disagree.
 
@@ -178,6 +178,15 @@ fn fv(v: &Value) -> String {
     }
 }
 
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
+
 fn total(n: &Num) -> String {
     match n {
         Num::Int32(i) | Num::Int64(i) => i.to_string(),
@@ -217,12 +226,11 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
         out.push(format!("del {} vv[{}]", fs(d), v.join(",")));
     }
     for ((l, p), r) in &s.regs {
-        let obs = fobs(r.obs.iter().map(|(k, (st, n))| (k, format!("{},{}", fs(st), total(n)))));
         let g = r.generation.as_ref().map_or("-".to_string(), |g| {
             format!("{}/seen{}", fs(&g.stamp), fobs(g.seen.iter().map(|(k, n)| (k, total(n)))))
         });
         out.push(format!(
-            "reg {} {p} {} {} obs{obs} gen={g} soi={}",
+            "reg {} {p} {} {} gen={g} soi={}",
             fs(l),
             fs(&r.stamp),
             fv(&r.value),
@@ -231,12 +239,17 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
     }
     for ((l, p, w, g), sl) in &s.slots {
         out.push(format!(
-            "slot {} {p} {} {} {} {}",
+            "slot {} {p} {} {} {} {} abs={}",
             fs(l),
             fw(w),
             fg(g),
             fs(&sl.stamp),
-            total(&sl.total)
+            total(&sl.total),
+            sl.absorbed.as_ref().map_or("-".to_string(), |(st, n)| format!(
+                "{},{}",
+                fs(st),
+                total(n)
+            ))
         ));
     }
     for (w, h) in &s.vv {
@@ -386,14 +399,24 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
         let m = |k: usize| op[k].as_u64().unwrap() as usize;
         let res: J = match kind {
             "insert" => {
+                let held = slot_in_alive_life(&ms[m(1)].w);
                 let r = ms[m(1)].w.insert(&top_fields(&op[2]), op[3].as_u64().unwrap());
+                assert!(
+                    r.is_none() || !held,
+                    "an insert was accepted over a slot of an alive life"
+                );
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }
             "upsert" => {
+                let held = slot_in_alive_life(&ms[m(1)].w);
                 let r = ms[m(1)].w.upsert_inc(
                     &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
+                );
+                assert!(
+                    r.is_none() || !held,
+                    "an upsert was accepted over a slot of an alive life"
                 );
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }
@@ -705,7 +728,10 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// state and the ordered document are in the fingerprint now; the comparison with the model is unchanged).
 ///
 /// RE-PINNED for the D8 re-vendor (the A2.3 model): 0x117c_d4f5_b468_200c to 0x5b22_de2a_6b43_3270.
-const PINNED_300: u64 = 0x5b22_de2a_6b43_3270;
+///
+/// RE-PINNED for the counter cell (the differential flips to ABSORBED = True, the digest prints each slot's absorbed pair and no
+/// register obs): 0x5b22_de2a_6b43_3270 to 0xed99_fd18_a146_9659. 0 of the 300 scripts disagree with the model.
+const PINNED_300: u64 = 0xed99_fd18_a146_9659;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -733,6 +759,40 @@ fn nested_differential_against_the_python_model() {
         println!("MISMATCH {f}");
     }
     assert!(v.fails.is_empty(), "{} scripts disagree with the Python model", v.fails.len());
+}
+
+/// SEED 792, pinned. The nested script of seed 792 (4 members, retention 5) reaches a state the first 300 scripts do not: a register
+/// whose base counted a slot of ANOTHER life, which was then collected past the horizon while the base survives in its own life, so
+/// the model's register `obs` (and the generation's `seen`) name a slot that no longer exists, with an EMPTY absorbed store. The
+/// register `obs` is dead under ABSORBED = True: the generator checks, on every state it digests that has a register obs entry, that
+/// every read of the model is the same with the obs maps cleared as with them (`check_obs_dead`, a hard failure), and the Rust
+/// writers, which have no obs, agree with the model at every step of this script. Generated and replayed here on its own (under a second).
+#[test]
+fn seed_792_a_register_obs_that_names_a_collected_life_is_dead() {
+    let scratch = Scratch::new("seed792");
+    let args = vec![scratch.0.display().to_string(), "1".to_string(), "792".to_string()];
+    let out = python(&args).wait_with_output().expect("python3 ran");
+    assert!(
+        out.status.success(),
+        "q7diff_gen6.py {args:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = scratch.0.join("s000792.json");
+    let sc: J = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("a script");
+    // the draw is the one the shape was found in
+    assert_eq!(
+        (
+            sc["seed"].as_u64(),
+            sc["ret"].as_u64(),
+            sc["members"].as_u64(),
+            sc["ops"].as_array().unwrap().len()
+        ),
+        (Some(792), Some(5), Some(4), 60)
+    );
+    let v = replay(&scratch.0, &|_| {});
+    assert_eq!(v.scripts, 1);
+    assert!(v.fails.is_empty(), "{:?}", v.fails);
 }
 
 /// Generate `scripts` scripts from the model with `plant` applied: the replay must disagree.

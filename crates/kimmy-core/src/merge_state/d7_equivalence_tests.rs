@@ -41,7 +41,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::hand_built::{self, Mode};
-use super::prop_tests::{Rng, fuzz_corpus, fuzz_mutate, nested_pools, opts, pools, run_counters};
+use super::prop_tests::{
+    Rng, fuzz_corpus, fuzz_corpus_compact, fuzz_mutate, nested_pools, opts, pools, run_counters,
+};
 use super::*;
 
 /// The retentions of the pools: far beyond any clock, and three that the pooled runs outrun.
@@ -458,19 +460,34 @@ fn live_and_frozen_agree_on_the_states_the_decode_fuzz_accepts_full() {
 fn fuzz_sweep(inputs: u64, partners: usize) {
     let mut t = Tally::default();
     let o1 = opts(1_000_000_000);
+    // the version 1 corpus (the states it can spell) and the compact corpus (every state): the
+    // fuzz damages each with its own decoder
     let corpus = fuzz_corpus(&o1);
+    let corpus_c = fuzz_corpus_compact(&o1);
     let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
     let mut accepted = Vec::new();
+    let (mut accepted_v1, mut accepted_compact) = (0usize, 0usize);
     for _ in 0..inputs {
         let b = fuzz_mutate(&mut rng, &corpus);
         if let Ok(st) = MergeState::decode(&b) {
             accepted.push(st);
+            accepted_v1 += 1;
+        }
+    }
+    for _ in 0..inputs {
+        let b = fuzz_mutate(&mut rng, &corpus_c);
+        if let Ok(st) = MergeState::decode_compact(&b) {
+            accepted.push(st);
+            accepted_compact += 1;
         }
     }
     // distinct states, and not merely the corpus back
-    let distinct: BTreeSet<Vec<u8>> = accepted.iter().map(MergeState::encode).collect();
-    let corpus_set: BTreeSet<&Vec<u8>> = corpus.iter().collect();
+    let distinct: BTreeSet<Vec<u8>> = accepted.iter().map(MergeState::encode_compact).collect();
+    let corpus_set: BTreeSet<&Vec<u8>> = corpus_c.iter().collect();
     let novel = distinct.iter().filter(|b| !corpus_set.contains(b)).count();
+    eprintln!(
+        "  accepted by the version 1 decoder {accepted_v1}, by the compact decoder {accepted_compact}"
+    );
     let empty = MergeState::default();
     for ret in [1_000_000_000, 10] {
         let o = opts(ret);
@@ -682,9 +699,25 @@ mod frozen {
                 out.regs.insert(k.clone(), r.clone());
             }
         }
+        // The counter cell, from its design text and not from the live join: a slot with the
+        // higher stamp wins; the absorbed pair of a slot, with the higher absorbed stamp, wins; the
+        // two are decided apart (the model keeps the pairs in a store of their own); both go with
+        // the slot of a dead life.
         for (k, v) in &t.slots {
-            if !out.dead.contains(&k.0) && out.slots.get(k).is_none_or(|x| v.stamp > x.stamp) {
+            if out.dead.contains(&k.0) {
+                continue;
+            }
+            let (mine, theirs) = (out.slots.get(k).and_then(|x| x.absorbed), v.absorbed);
+            let pair = match (mine, theirs) {
+                (Some(a), Some(b)) => Some(if b.0 > a.0 { b } else { a }),
+                (a, None) => a,
+                (None, b) => b,
+            };
+            if out.slots.get(k).is_none_or(|x| v.stamp > x.stamp) {
                 out.slots.insert(k.clone(), v.clone());
+            }
+            if let Some(x) = out.slots.get_mut(k) {
+                x.absorbed = pair;
             }
         }
         for (k, g) in &t.gens {
@@ -1079,13 +1112,13 @@ mod frozen {
                 },
                 _ => None,
             };
-            // What each slot gained since the base observed it. B1: the field is present when the
-            // slot moved since the base saw it, even if its increments net to 0 (a counter back at
-            // 0 is still there).
+            // What each slot gained since a base write absorbed it. B1: the field is present when
+            // the slot moved since its absorbed stamp, even if its increments net to 0 (a counter
+            // back at 0 is still there).
             let mut cut = None;
             let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
             for (k, s) in self.frozen_counted_in(p, al, win, o) {
-                let ob = win.and_then(|w| w.obs.get(&k));
+                let ob = s.absorbed.as_ref();
                 let d = ob.map_or(s.total, |x| {
                     if o.no_decimal_saturation() {
                         s.total.sub(&x.1)

@@ -47,7 +47,7 @@ const VERSION: u8 = 1;
 pub(super) const MAX_VALUE_DEPTH: usize = 100;
 
 /// The version 1 form cannot hold a `Document` inside an array, a counter total of another type
-/// than `Int64`, or an order state. A state with one is written in the compact form (`QMS`
+/// than `Int64`, an absorbed pair on a counter slot, or an order state. A state with one is written in the compact form (`QMS`
 /// version 2), and `decode` of version 1 refuses the compact tag.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("merge state: the version 1 form cannot hold this state")]
@@ -82,6 +82,12 @@ pub enum DecodeError {
     DeadLifeNotListed,
     #[error("merge state: the version vector does not cover a stamp the state holds")]
     VersionVectorBehind,
+    #[error("merge state: a slot's absorbed stamp is above the slot's own")]
+    AbsorbedAboveSlot,
+    #[error("merge state: a slot's absorbed total differs from the slot's at the same stamp")]
+    AbsorbedTotalMismatch,
+    #[error("merge state: a slot's absorbed stamp is not by the writer of the slot's key")]
+    AbsorbedWriterMismatch,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]
@@ -236,16 +242,6 @@ impl W {
             self.num(t);
         }
     }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, Num)>) {
-        self.len(m.len());
-        for ((l, w, g), (s, t)) in m {
-            self.stamp(l);
-            self.wid(w);
-            self.opt_stamp(g);
-            self.stamp(s);
-            self.num(t);
-        }
-    }
     fn gen_(&mut self, g: &Option<Gen>) {
         match g {
             None => self.u8(0),
@@ -322,7 +318,10 @@ impl MergeState {
             w.path(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
-            w.obs_stamped(&r.obs);
+            // the version 1 spelling of a register still has a place for the `obs` map the
+            // register used to carry: it is always empty now (what a base had counted is the
+            // slots' absorbed pairs, which this form cannot spell, `v1_can_hold`)
+            w.len(0);
             w.gen_(&r.generation);
             w.u8(u8::from(r.soi));
         }
@@ -346,10 +345,12 @@ impl MergeState {
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
     /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
     /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
-    /// type; the compact form spells them), and not when it carries an order state (the version
+    /// type; the compact form spells them), and not when a slot carries an absorbed pair (the
+    /// version 1 form has no place for it), and not when it carries an order state (the version
     /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
         self.ords.is_empty()
+            && self.slots.values().all(|s| s.absorbed.is_none())
             && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
@@ -429,14 +430,18 @@ impl MergeState {
             let p = r.path()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
-            let obs = r.obs_stamped()?;
+            // the empty `obs` place of the register: a register that names observed slots has
+            // no state to decode into, and the form could not write it back
+            if r.len()? != 0 {
+                return Err(DecodeError::NotCanonical);
+            }
             let generation = r.gen_()?;
             let soi = match r.u8()? {
                 0 => false,
                 1 => true,
                 t => return Err(DecodeError::BadTag(t)),
             };
-            put(&mut s.regs, (l, p), Reg { stamp, value, obs, generation, soi })?;
+            put(&mut s.regs, (l, p), Reg { stamp, value, generation, soi })?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
@@ -445,7 +450,7 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total })?;
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed: None })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
@@ -492,6 +497,60 @@ impl MergeState {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         self.without_ords().try_encode().expect("the test state is one version 1 can hold")
+    }
+
+    /// Is this a state the version 1 form cannot spell ONLY because a slot carries an absorbed
+    /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
+    pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
+        let mut bare = self.without_ords();
+        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some());
+        bare.slots.values_mut().for_each(|s| s.absorbed = None);
+        had_pair && bare.v1_can_hold()
+    }
+}
+
+#[cfg(test)]
+impl MergeState {
+    /// The length of the version 1 bytes, for a size comparison with the compact form, and whether
+    /// it is exact. A state with an absorbed pair has no version 1 length: it is then the version 1
+    /// length of the same state with its pairs removed (a lower bound of what version 1 would
+    /// have spelled), and `false`.
+    pub(crate) fn v1_len_for_size_checks(&self) -> (usize, bool) {
+        if self.without_ords().v1_can_hold() {
+            return (self.canonical_bytes().len(), true);
+        }
+        assert!(self.v1_refused_only_for_a_pair(), "version 1 refuses a state for another reason");
+        let mut stripped = self.without_ords();
+        stripped.slots.values_mut().for_each(|s| s.absorbed = None);
+        (stripped.canonical_bytes().len(), false)
+    }
+}
+
+/// How many of the states a test looked at the version 1 form holds, and how many it cannot
+/// spell for the one reason the counter cell adds: an absorbed pair. A state version 1 refuses for
+/// any other reason panics, so the version-1-not-applicable set is exactly the pair states.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct V1Split {
+    pub held: usize,
+    pub pair_only: usize,
+}
+
+#[cfg(test)]
+impl V1Split {
+    /// Count `st`; true when version 1 holds it (the caller then runs its version 1 assertions).
+    pub(crate) fn note(&mut self, st: &MergeState) -> bool {
+        if st.without_ords().v1_can_hold() {
+            self.held += 1;
+            true
+        } else {
+            assert!(
+                st.v1_refused_only_for_a_pair(),
+                "version 1 refuses a state for another reason"
+            );
+            self.pair_only += 1;
+            false
+        }
     }
 }
 
@@ -645,17 +704,6 @@ impl R<'_> {
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             put(&mut m, (l, w, g), self.total()?)?;
-        }
-        Ok(m)
-    }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, Num)>, DecodeError> {
-        let mut m = BTreeMap::new();
-        for _ in 0..self.len()? {
-            let l = self.stamp()?;
-            let w = self.wid()?;
-            let g = self.opt_stamp()?;
-            let s = self.stamp()?;
-            put(&mut m, (l, w, g), (s, self.total()?))?;
         }
         Ok(m)
     }
@@ -856,18 +904,20 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_or_duplicate_obs_and_seen_entries_are_refused() {
+    fn unsorted_or_duplicate_seen_entries_and_any_obs_entry_are_refused() {
         let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
         let no = Err(DecodeError::NotCanonical);
-        // sorted: fine, and canonical
-        let good = with_obs(&[(a, a, 1), (b, a, 2)], &[(a, 1), (b, 2)]);
+        // sorted seen entries and no obs: fine, and canonical
+        let good = with_obs(&[], &[(a, 1), (b, 2)]);
         assert_eq!(MergeState::decode(&good).unwrap().encode(), good);
-        // a register's obs: out of order, duplicate
-        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
-        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (a, b, 2)], &[])), no);
         // a generation's seen totals: out of order, duplicate
         assert_eq!(MergeState::decode(&with_obs(&[], &[(b, 2), (a, 1)])), no);
         assert_eq!(MergeState::decode(&with_obs(&[], &[(a, 1), (a, 2)])), no);
+        // the register's obs place is still there and always empty: any entry is refused, sorted or
+        // not (what a base had counted is the slots' absorbed pairs, which this form cannot spell)
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1)], &[(a, 1)])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (b, a, 2)], &[])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
     }
 
     #[test]

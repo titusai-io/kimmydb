@@ -1,7 +1,7 @@
 //! Tests of the compact canonical form (`compact.rs`): round trips, canonicity and refusals,
 //! and its size on the shapes of the L34-B1 benchmark.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::codec::MAX_VALUE_DEPTH;
 use super::tests::{
@@ -46,8 +46,14 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
         ("small", golden_small()),
     ] {
         let enc = round_trip(&st);
-        let verbose = st.canonical_bytes().len();
-        println!("{name}: compact {} B, verbose {verbose} B", enc.len() - 4);
+        // a state with an absorbed pair has no version 1 length: it is then the length of the same
+        // state without its pairs (a lower bound), marked `>=`
+        let (verbose, exact) = st.v1_len_for_size_checks();
+        println!(
+            "{name}: compact {} B, verbose {}{verbose} B",
+            enc.len() - 4,
+            if exact { "" } else { ">= " }
+        );
         if name != "empty" {
             assert!(enc.len() * 2 < verbose, "{name}: {} against {verbose}", enc.len());
         }
@@ -59,20 +65,46 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
 /// The compact hash and length of the five golden states, as the reference model's independent
 /// encoder computes them (`merge_state_diff::golden_vectors_match_the_model` pins the same
 /// numbers). The compact form is not stored or hashed by anything yet, so these are a pin of the
-/// skeleton, not a released format.
+/// skeleton, not a released format. Re-pinned once for the counter cell (the slot flag byte and the
+/// absorbed pair, the type byte, no register obs, no ESCAPE): the model's Python writer, rewritten from
+/// the documentation, gives the same five hashes and lengths (170: 214 B to 215, mixed 341 to 338, delete 234
+/// to 235, obs 256 to 252; empty unchanged).
 #[test]
 fn the_compact_golden_hashes_agree_with_the_reference_model() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     for (name, st, want) in [
         ("empty", golden_empty(), ("6a9f06d361f4fb8c789c079f6563280a", 10)),
-        ("170", golden_170(), ("9852c38d33bbede32993a047338b65f3", 214)),
-        ("mixed", golden_mixed(), ("220d1eaef3e4f5a85dc9516dc3f0edaa", 341)),
-        ("delete", golden_delete(), ("13a5a3379b963c8ee4ac35a7102437df", 234)),
-        ("obs", golden_obs(), ("f0a36fa50cacf322ad787f91a73c2a97", 256)),
+        ("170", golden_170(), ("abedfb140b687b3671abd3023efa93a8", 215)),
+        ("mixed", golden_mixed(), ("d368f0edd26e1ed5e300dd97df80065e", 338)),
+        ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235)),
+        ("obs", golden_obs(), ("3894def7793a573b2dad9a4de56bf7cc", 252)),
     ] {
         // NAMED RESTRICTION: the goldens are the stage-A reference model's, which has no order state
         let st = st.without_ords();
         assert_eq!((hex(st.compact_hash()).as_str(), st.compact_bytes().len()), want, "{name}");
+    }
+}
+
+/// The compact hash and length of the same golden states WITH their order state (section 10), which the test
+/// above leaves out because the reference model's Python writer has none. Pinned once with the counter cell, with
+/// the Rust writer's bytes: the order section meets an independent implementation only through the Ord
+/// differential (digests of the order state), not through bytes. The sixth golden, `small`, is pinned here too.
+#[test]
+fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
+    let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    for (name, st, want) in [
+        ("empty", golden_empty(), ("6a9f06d361f4fb8c789c079f6563280a", 10, 0)),
+        ("170", golden_170(), ("79f811df1f679ba13896538b36c9e324", 273, 1)),
+        ("mixed", golden_mixed(), ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5)),
+        ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0)),
+        ("obs", golden_obs(), ("1714242f8331d6b9ca194c73191730ed", 329, 2)),
+        ("small", golden_small(), ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2)),
+    ] {
+        assert_eq!(
+            (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
+            (want.0, want.1, want.2),
+            "{name}"
+        );
     }
 }
 
@@ -189,13 +221,25 @@ fn pool(seed: u64) -> Vec<MergeState> {
 #[test]
 fn random_states_round_trip_and_equal_states_encode_equal() {
     let mut seen: Vec<(MergeState, Vec<u8>)> = Vec::new();
+    let (mut exact, mut lower_bound) = (0, 0);
     for seed in 1..=12u64 {
         for st in pool(seed * 0x9E37) {
             let enc = round_trip(&st);
-            assert!(enc.len() < st.encode().len(), "compact is smaller");
+            // against version 1 where it can spell the state; a state with an absorbed pair has no
+            // version 1 length, and is compared with the length of the same state without its pairs
+            let (v1_len, is_exact) = st.v1_len_for_size_checks();
+            assert!(enc.len() < v1_len + 4, "compact is smaller");
+            if is_exact {
+                exact += 1;
+            } else {
+                lower_bound += 1;
+            }
             seen.push((st, enc));
         }
     }
+    eprintln!(
+        "compact is smaller than version 1: {exact} states exactly, {lower_bound} against the pair-free length"
+    );
     // Distinct states, distinct bytes; equal states, equal bytes (checked on a sample).
     for (a, b) in seen.iter().step_by(7).zip(seen.iter().skip(3).step_by(11)) {
         assert_eq!(a.0 == b.0, a.1 == b.1);
@@ -621,12 +665,13 @@ fn b1_shapes_compact_against_verbose() {
             .sum();
         for history in ["fresh", "aged", "clashed"] {
             let st = b1_state(&fields, history);
-            let (verbose, compact) =
-                (st.canonical_bytes().len(), st.without_ords().compact_bytes().len());
+            let (verbose, exact) = st.v1_len_for_size_checks();
+            let compact = st.without_ords().compact_bytes().len();
+            let verbose_text = format!("{}{verbose}", if exact { "" } else { ">= " });
             assert_eq!(MergeState::decode_compact(&st.encode_compact()).unwrap(), st);
             assert!(compact * 3 < verbose, "{n} {history}: {compact} against {verbose}");
             rows.push(format!(
-                "| {n} | {history} | {verbose} | {compact} | {:.1}x | {} |",
+                "| {n} | {history} | {verbose_text} | {compact} | {:.1}x | {} |",
                 verbose as f64 / compact as f64,
                 compact + 16 - payload
             ));
@@ -731,7 +776,7 @@ fn a_document_is_refused_as_a_register_by_the_checks_and_the_decoder() {
     assert_eq!(doc.check_register(), Err(InvalidValue::DocumentAsRegister));
     assert_eq!(Value::Array(vec![doc.clone()]).check_register(), Ok(()));
     let life = MStamp { hlc: Hlc::new(1, 0), writer: wid(b'A', 0) };
-    let reg = |v: Value| Reg::new(life, v, BTreeMap::new(), None, false);
+    let reg = |v: Value| Reg::new(life, v, None, false);
     assert_eq!(reg(doc.clone()), Err(InvalidValue::DocumentAsRegister));
     assert!(reg(Value::Array(vec![doc.clone()])).is_ok());
     // a writer expands one (a sub-document is a map, never a register)
@@ -889,7 +934,7 @@ fn every_table_of_one_to_three_hundred_writers_round_trips() {
             let at = MStamp { hlc: Hlc::new(2 + k as u64, 0), writer: w };
             s.slots.insert(
                 (life, p("x"), w, None),
-                Slot { stamp: at, total: Num::Int64(k as i128 + 1) },
+                Slot { stamp: at, total: Num::Int64(k as i128 + 1), absorbed: None },
             );
             s.vv.insert(w, at.hlc);
         }

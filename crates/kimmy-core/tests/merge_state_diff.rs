@@ -33,8 +33,10 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit
-//! marker, as the Rust side is today. A write that only reorders the fields is a write in the model and in the writer.
+//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit
+//! marker, as the Rust side is today. THE (h, len) COLUMNS: a state with an absorbed pair has no version 1 spelling, so the model's `h`
+//! and `len` are null for it and the Rust side must answer `V1CannotHold` for exactly those states (both directions); for every other
+//! state `h` and `len` are compared exactly, and the compact `ch` and `clen` for all of them. A write that only reorders the fields is a write in the model and in the writer.
 //! The replay compares the bytes and hashes of states WITHOUT their order state (`fingerprint::without_ords`: the
 //! generator's encoders write an empty order section); the order state meets the model in `merge_state_ord_diff`.
 
@@ -47,6 +49,7 @@ mod oracle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
@@ -54,6 +57,15 @@ use kimmy_core::merge_state::{
     Written,
 };
 use serde_json::{Value as J, json};
+
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
 
 fn wid(c: char, e: u64) -> WriterId {
     WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(e) }
@@ -145,14 +157,32 @@ impl Mem {
     }
 }
 
+/// The states the replay compared, and how many of them have no version 1 spelling (an absorbed pair).
+static STATES: AtomicUsize = AtomicUsize::new(0);
+static NO_V1: AtomicUsize = AtomicUsize::new(0);
+
 fn snap(ms: &[Mem]) -> Vec<J> {
     ms.iter()
         .map(|m| {
             let st = fingerprint::without_ords(&m.w.state);
-            let cb = st.try_canonical_bytes().expect("version 1 spells the differential's states");
+            // THE (h, len) RULE. Version 1 cannot spell a state with an absorbed pair (`V1CannotHold`), and
+            // the model's v1 column is null for exactly those states: the two are compared as part of the
+            // snapshot, so `V1CannotHold` happens exactly when the model state has an absorbed store, in both
+            // directions. The compact columns are compared for every state.
+            let has_pair = st.slots.values().any(|s| s.absorbed.is_some());
+            let v1 = st.try_canonical_bytes();
+            assert_eq!(
+                v1.is_err(),
+                has_pair,
+                "the differential's states are Int64 counters: version 1 refuses a state exactly for its pair"
+            );
+            STATES.fetch_add(1, Ordering::Relaxed);
+            if has_pair {
+                NO_V1.fetch_add(1, Ordering::Relaxed);
+            }
             json!({
-                "h": hex(&st.try_state_hash().expect("version 1 spells the differential's states")),
-                "len": cb.len(),
+                "h": v1.as_ref().map_or(J::Null, |_| json!(hex(&st.try_state_hash().unwrap()))),
+                "len": v1.as_ref().map_or(J::Null, |cb| json!(cb.len())),
                 "ch": hex(&st.compact_hash()),
                 "clen": st.compact_bytes().len(),
                 "v": jdoc(&m.w.visible()),
@@ -223,15 +253,25 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
             "insert" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let f = fields(&op[2]);
+                let held = slot_in_alive_life(&ms[m].w);
                 let r = ms[m].w.insert(&f, op[3].as_u64().unwrap());
+                assert!(
+                    r.is_none() || !held,
+                    "an insert was accepted over a slot of an alive life"
+                );
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "upsert" => {
                 let m = op[1].as_u64().unwrap() as usize;
+                let held = slot_in_alive_life(&ms[m].w);
                 let r = ms[m].w.upsert_inc(
                     &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
+                );
+                assert!(
+                    r.is_none() || !held,
+                    "an upsert was accepted over a slot of an alive life"
                 );
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
@@ -242,7 +282,12 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
                 let inc_path = pth(op[3].as_str().unwrap());
                 let sk = op[6].as_u64().unwrap();
                 // as the harness does it: the creation, logged, then the increment, logged
+                let held = slot_in_alive_life(&ms[m].w);
                 let created = ms[m].w.upsert_soi_create(&f, &inc_path, &s, sk);
+                assert!(
+                    created.is_none() || !held,
+                    "an upsert creation was accepted over a slot of an alive life"
+                );
                 match ms[m].logged(created, &mut log) {
                     None => J::Null,
                     Some(s1) => {
@@ -356,14 +401,8 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     }
     // final full-mesh sync
     for _ in 0..12 {
-        let before: Vec<Vec<u8>> = ms
-            .iter()
-            .map(|m| {
-                fingerprint::without_ords(&m.w.state)
-                    .try_canonical_bytes()
-                    .expect("version 1 spells the differential's states")
-            })
-            .collect();
+        let before: Vec<Vec<u8>> =
+            ms.iter().map(|m| fingerprint::without_ords(&m.w.state).compact_bytes()).collect();
         for r in 0..nm {
             for s in 0..nm {
                 if r != s {
@@ -376,11 +415,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
         }
         if ms
             .iter()
-            .map(|m| {
-                fingerprint::without_ords(&m.w.state)
-                    .try_canonical_bytes()
-                    .expect("version 1 spells the differential's states")
-            })
+            .map(|m| fingerprint::without_ords(&m.w.state).compact_bytes())
             .collect::<Vec<_>>()
             == before
         {
@@ -610,7 +645,11 @@ fn replay(dir: &std::path::Path) -> Verdict {
 ///
 /// RE-PINNED when the generator drew an Unset field in an insert again (the Writer drops such a field): 0xfbde_c4a1_8eb1_bb13 to
 /// 0x5f0f_3ecf_ab90_7bba. The scripts changed (an insert draws one more value); the code under test did not change for the re-pin.
-const PINNED_300: u64 = 0x5f0f_3ecf_ab90_7bba;
+///
+/// RE-PINNED for the counter cell (the differential flips to ABSORBED = True; the compact bytes in the fold changed with
+/// the slot flag byte and the pair): 0x5f0f_3ecf_ab90_7bba to 0x3ddd_f823_ee88_e7c7. The replay's 300 scripts agree with the
+/// model; the scripts are the same draws (12,854 steps) and the model's states differ by the absorbed store.
+const PINNED_300: u64 = 0x3ddd_f823_ee88_e7c7;
 
 #[test]
 fn differential_against_the_python_model() {
@@ -626,6 +665,11 @@ fn differential_against_the_python_model() {
         v.fails.len()
     );
     println!("differential fingerprint ({n} scripts): {:#018x}", v.fp);
+    let (states, no_v1) = (STATES.load(Ordering::Relaxed), NO_V1.load(Ordering::Relaxed));
+    println!(
+        "(h, len): {states} member-step states compared, {no_v1} without a version 1 spelling (an absorbed pair), {} exact on version 1",
+        states - no_v1
+    );
     if n == 300 {
         assert_eq!(v.fp, PINNED_300, "a state or a read changed");
     }
@@ -683,13 +727,14 @@ fn golden_vectors_match_the_model() {
         "170": ["42b0c20d1b0c26903625be81f0a105a0", 670],
         "mixed": ["34ce6696c01c0c70255c54445944f39c", 1401],
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
-        "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
+        // the state has absorbed pairs: no version 1 spelling (the old golden was of the register obs map)
+        "obs": J::Null,
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
         "empty-compact": ["6a9f06d361f4fb8c789c079f6563280a", 10],
-        "170-compact": ["9852c38d33bbede32993a047338b65f3", 214],
-        "mixed-compact": ["220d1eaef3e4f5a85dc9516dc3f0edaa", 341],
-        "delete-compact": ["13a5a3379b963c8ee4ac35a7102437df", 234],
-        "obs-compact": ["f0a36fa50cacf322ad787f91a73c2a97", 256],
+        "170-compact": ["abedfb140b687b3671abd3023efa93a8", 215],
+        "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
+        "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
+        "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
     });
     assert_eq!(got, want);
 }

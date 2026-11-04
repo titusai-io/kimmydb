@@ -181,14 +181,21 @@ struct SkipEvidence {
     nested: bool,
     seed: u64,
     problems: &'static [&'static str],
+    /// With both rules off, the alive lives every member holds and the alive lives the oracle has, for
+    /// a seed whose resurrection no longer shows as a problem.
+    alive_without: Option<(usize, usize)>,
 }
 
 const COVERED_SKIP_EVIDENCE: [SkipEvidence; 5] = [
-    SkipEvidence { nested: false, seed: 106, problems: &["visible"] },
-    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"] },
-    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"] },
-    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"] },
-    SkipEvidence { nested: true, seed: 2396, problems: &["visible"] },
+    // Seed 106 showed `visible` before the counter cell. With the cell and the oracle of "no base write had
+    // seen it" the collected life still comes back (three alive lives in every member against the oracle's
+    // one) but the document it brings back coincides with the oracle's, so no problem is graded. A search of
+    // the seeds 0 to 2999 (flat and nested) found no other seed that shows `visible` without the rules.
+    SkipEvidence { nested: false, seed: 106, problems: &[], alive_without: Some((3, 1)) },
+    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: true, seed: 2396, problems: &["visible"], alive_without: None },
 ];
 
 /// The Ord differential's scripts (the A2.1 model) replayed through the design's writers: no disagreement. (The mutants that
@@ -266,9 +273,11 @@ fn named_probes(rep: &mut Report) {
 }
 
 /// B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
-/// graded against the oracle.
+/// graded against the oracle, and the fold scenarios of the counter cell (the four-step case and EG2),
+/// read by value.
 fn scenario_probes(rep: &mut Report) {
-    for (name, problems) in probes::scenarios() {
+    let fold = probes::fold_scenarios_with(&Cfg::default_ret());
+    for (name, problems) in probes::scenarios().into_iter().chain(fold) {
         println!(
             "[scenario {name}]: {}",
             if problems.is_empty() { "ok".to_string() } else { format!("{problems:?}") }
@@ -333,10 +342,10 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7), the rules of Q3
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (1), the nested rules (7), the rules of Q3
     // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
     // writer's feed of the order state (O2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 33, "the mutant list changed");
+    assert_eq!(mutants::mutants().len(), 34, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
@@ -408,14 +417,26 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   bounded nested 0x3eb070a76e6956fe -> 0x49b01bf0858bb6cd
     // (the last had moved once before, in Group A, when a write that only reorders became a write). Before
     // this commit they left the order state out, and six of the seven were the figures of the code before O2.
+    // RE-PINNED for the counter cell (a slot's absorbed pair, the typed compact spelling, no `obs`): the BYTES
+    // moved and no read did. The same seven runs fold, in a scratch test, only the reads (visible document,
+    // hidden figures, excess, caps, alive lives, ordered document, clock and events of every member before
+    // every step): the figures are identical at 45169322 (before the cell) and after it,
+    //   restore 0x97efdf3f3574b9d6   no restore 0x0ce9f62bfa3c66c8   bound 1000 0xf65d997041ec7783
+    //   sequential 0x566e60b79b81676c   horizon 0x00df956681c1c24c   bounded 0x412e0e245196e033
+    //   bounded nested 0xca3d1972381f336b
+    // and the figures below are those of the full fold:
+    //   restore 0xd5f2038d6cb64fd0 -> 0xff85ad3d5b95647a      no restore 0x03c831e729d37118 -> 0x1d4d18761d99dc46
+    //   bound 1000 0xb5d376dace70d755 -> 0x405c7af0cbda4a1a   sequential 0x5cf2b4f670f08b9e -> 0x66628b9442fa1213
+    //   horizon 0xaab8149ae0f8c453 -> 0x35fe713c19988bed      bounded 0x6a0197bd2778c8c7 -> 0x0ddcbb0a2eb7ebf0
+    //   bounded nested 0x49b01bf0858bb6cd -> 0x95744a329c2b2f5e
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0xd5f2038d6cb64fd0),
-        ("no restore", 0x03c831e729d37118),
-        ("bound 1000", 0xb5d376dace70d755),
-        ("sequential", 0x5cf2b4f670f08b9e),
-        ("horizon", 0xaab8149ae0f8c453),
-        ("bounded", 0x6a0197bd2778c8c7),
-        ("bounded nested", 0x49b01bf0858bb6cd),
+        ("restore", 0xff85ad3d5b95647a),
+        ("no restore", 0x1d4d18761d99dc46),
+        ("bound 1000", 0x405c7af0cbda4a1a),
+        ("sequential", 0x66628b9442fa1213),
+        ("horizon", 0x35fe713c19988bed),
+        ("bounded", 0x0ddcbb0a2eb7ebf0),
+        ("bounded nested", 0x95744a329c2b2f5e),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
@@ -490,14 +511,36 @@ fn bounded_problems(seed: u64, nested: bool, covered_skip: bool, start_hlc: bool
     grade_bounded(&o.nodes, &o.log)
 }
 
+/// The alive lives of every member after the bounded run of `seed`, and the oracle's.
+fn alive_lives(
+    seed: u64,
+    nested: bool,
+    covered_skip: bool,
+    start_hlc: bool,
+) -> (Vec<usize>, usize) {
+    let mut cfg = Cfg::default_ret();
+    cfg.flags.covered_skip = covered_skip;
+    cfg.flags.start_hlc = start_hlc;
+    let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+    let (_, alive, _) = oracle::oracle(&o.log, o.nodes[0].ret(), o.nodes[0].bound());
+    (o.nodes.iter().map(|n| n.w.alive().len()).collect(), alive.len())
+}
+
 /// The five seeds that failed before the sim had the Q3 rules fail as listed with both rules off (the sim's
 /// old protocol), and pass with the covered-entry skip alone (the entry's whole vector), with the start-HLC
 /// rule alone for the four restores (not for the nested seed, which has no restore), and with both (the
-/// default).
+/// default). Seed 106 is pinned by the alive lives it still resurrects (see `COVERED_SKIP_EVIDENCE`), not by a problem.
 #[test]
 fn the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it() {
     for k in &COVERED_SKIP_EVIDENCE {
         assert_eq!(bounded_problems(k.seed, k.nested, false, false), k.problems, "seed {}", k.seed);
+        if let Some((members, oracle_alive)) = k.alive_without {
+            let (got, want) = alive_lives(k.seed, k.nested, false, false);
+            assert_eq!((got.iter().all(|n| *n == members), want), (true, oracle_alive), "{got:?}");
+            // and with the skip and the start-HLC rule the members hold the oracle's lives
+            let (got, want) = alive_lives(k.seed, k.nested, true, true);
+            assert!(got.iter().all(|n| *n == want), "{got:?} against {want}");
+        }
         for (skip, start) in [(true, false), (false, true), (true, true)] {
             // the start-HLC rule alone clears the restores (four flat seeds) but not the nested seed, which has
             // no restore: START_HLC alone is not the fix (review M1)

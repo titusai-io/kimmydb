@@ -553,11 +553,8 @@ impl MergeState {
     /// comes first and the survivor is (re-)created after it: not before everything the unsetter
     /// had seen (`prev`), and, when the unset's write also wrote other fields, after all of them.
     ///
-    /// A slot survives when it moved since the winning base observed it (`obs` of the winner). The
-    /// model's A2 round also remembers, per slot, the highest observation any base write made
-    /// (`absorbed`); the Rust counter cell has no such field yet (the cell is not frozen), so the
-    /// clamp reads the winner's `obs` only, which is the model with `ABSORBED` off. The
-    /// goldens' generator asserts that every scenario orders the same with it on and off.
+    /// A slot survives when it moved since the highest observation any base write made of it
+    /// (its `absorbed` pair): the model with `ABSORBED` on. A slot nobody absorbed has moved.
     ///
     /// Cost. Each path under an unset floor looks at every path below it, so a chain of depth d costs
     /// d(d - 1)/2 visits: quadratic only because of the cap of 100 on the depth of a path (at most about
@@ -588,9 +585,8 @@ impl MergeState {
         let slot_survivors = |q: &Path| -> Vec<Born> {
             let win = self.winner_in(q, al, o);
             let mut out = Vec::new();
-            for (k, s) in self.counted_in(q, al, win, o) {
-                let seen = win.and_then(|w| w.obs.get(&k));
-                let moved = match seen {
+            for (_, s) in self.counted_in(q, al, win, o) {
+                let moved = match &s.absorbed {
                     None => true,
                     Some((st, total)) => {
                         !s.total.sub_sat(total, &mut None).is_zero() || *st != s.stamp

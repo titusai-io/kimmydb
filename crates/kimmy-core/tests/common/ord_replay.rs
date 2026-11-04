@@ -165,8 +165,25 @@ fn stamp_of(j: &J) -> Option<MStamp> {
     })
 }
 
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
+
 /// One write of a script on a writer.
 fn write(w: &mut Writer, step: &J) -> Option<Written> {
+    let creation = matches!(step["op"].as_str(), Some("insert" | "upsert_inc" | "upsert_soi"));
+    let held = creation && slot_in_alive_life(w);
+    let r = write_op(w, step);
+    assert!(r.is_none() || !held, "a creation was accepted over a slot of an alive life");
+    r
+}
+
+fn write_op(w: &mut Writer, step: &J) -> Option<Written> {
     let skew = step["skew"].as_u64().unwrap();
     let at = || path(&step["path"]);
     let arg = &step["arg"];
@@ -269,6 +286,35 @@ pub fn replay(opts: &JoinOptions) -> Found {
         }
     }
     f
+}
+
+/// The scripts that differ between the model with ABSORBED off and with it on (the flip's evidence), as
+/// `(kind, seed, first differing step, whether the digest of that step differs)`. A step index past the last step
+/// is the final digest after the full sync. Every script of the fixture is the ABSORBED-on model's; the `off`
+/// record is what the ABSORBED-off model made of the same seed.
+pub fn off_differences() -> Vec<(String, u64, usize, bool)> {
+    let all: J = serde_json::from_str(SCRIPTS).unwrap();
+    all["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|sc| sc.get("off").is_some())
+        .map(|sc| {
+            let off = &sc["off"];
+            let i = off["step"].as_u64().unwrap() as usize;
+            let steps = sc["steps"].as_array().unwrap();
+            let differs = match (steps.get(i), off["off_step"].as_object()) {
+                (Some(on), Some(off_step)) => {
+                    on["d"] != off_step["d"]
+                        || on["res"] != off_step["res"]
+                        || on["op"] != off_step["op"]
+                }
+                (None, _) => off["off_final"] != sc["final"],
+                (Some(_), None) => true,
+            };
+            (sc["kind"].as_str().unwrap().to_string(), sc["seed"].as_u64().unwrap(), i, differs)
+        })
+        .collect()
 }
 
 /// How many upserts of the scripts name a nested path (the incremented path, or a creation or `$set` field): the shape the Rust

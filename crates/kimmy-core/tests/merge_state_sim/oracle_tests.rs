@@ -304,3 +304,75 @@ mod order_oracle_cases {
         assert!(!reorders(Some(&before), &insert));
     }
 }
+
+// ---- the absorbed rule: an increment counts only if no base write on the path had seen it ------
+
+/// The review's four-step case (item M2). x = 100 (A); B adds 5; C, which saw only the insert, sets x
+/// to a string, receives the 5 (an older generation) and sets x to 7; D, which saw only the insert, sets
+/// 50 with the newest stamp. The 5 is in the causal past of C's base, so no other base counts it again:
+/// the oracle reads 50 (the reading "the winner's writer had not seen" gives 55, which no serial order
+/// of the writes does), and every member agrees with it.
+#[test]
+fn the_oracle_reads_the_four_step_case_as_50() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    ms[1].inc("x", 5, &mut log, 0).unwrap();
+    pull(&mut ms, 2, 0, None);
+    ms[2].set("x", Value::String("s".into()), &mut log, 0).unwrap();
+    pull(&mut ms, 2, 1, None);
+    ms[2].set("x", Value::Int64(7), &mut log, 0).unwrap();
+    pull(&mut ms, 3, 0, None);
+    ms[3].set("x", Value::Int64(50), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let ret = cfg.opts.retention;
+    let (doc, _, _) = oracle::oracle(&log, ret, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("x"))), Some(&Value::Int64(50)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    assert_eq!(crate::grade::grade(&ms, &log), Vec::<String>::new());
+}
+
+/// EG2: the double-base form. A adds 1; B sets a to 2.5 (a generation that hides A's add); A receives
+/// it and sets 5; C, which saw only the insert, sets 5 with the newest stamp. Every serial order reads 5.
+#[test]
+fn the_oracle_reads_a_double_base_set_a_2_5_as_5() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("a", Value::Int64(0))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[0].inc("a", 1, &mut log, 0).unwrap();
+    ms[1].set("a", Value::Double(2.5), &mut log, 0).unwrap();
+    pull(&mut ms, 0, 1, None);
+    ms[0].set("a", Value::Int64(5), &mut log, 0).unwrap();
+    ms[2].set("a", Value::Int64(5), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let (doc, _, _) = oracle::oracle(&log, cfg.opts.retention, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("a"))), Some(&Value::Int64(5)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    assert_eq!(crate::grade::grade(&ms, &log), Vec::<String>::new());
+}
+
+/// An increment that a base write other than the winner saw is not counted either: A adds 3, B (which
+/// saw the 3) sets x to 20, C (which saw only the insert) sets x to 30 with the newest stamp. Reading
+/// "the winner's writer had not seen" gives 33; the 3 is in B's past, so 30.
+#[test]
+fn an_increment_seen_by_a_losing_base_is_not_counted_again() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(10))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[0].inc("x", 3, &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    ms[1].set("x", Value::Int64(20), &mut log, 0).unwrap();
+    ms[2].set("x", Value::Int64(30), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let (doc, _, _) = oracle::oracle(&log, cfg.opts.retention, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("x"))), Some(&Value::Int64(30)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+}
