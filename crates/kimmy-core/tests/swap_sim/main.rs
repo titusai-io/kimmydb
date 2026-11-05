@@ -421,38 +421,200 @@ mod tests {
         eprintln!("route traces: {holds} traces, {events} events, {views} member states compared");
     }
 
-    /// The eight route rows (hold / repair x 0.1 / 0.3 x rule B on / off) run on the Rust harness: the routes fire, the refusal
-    /// episodes and the state counters are counted, and the table is printed (the comparison with REPORT6 is a later report).
+    /// REPORT6 (b) and (d), 54,000 runs per row (`q6v2-model/REPORT6.md`): (route, rate, rule B on, partial flip, bury without newer
+    /// visible, alive mismatch, served mismatch, false records, heads missing, diverged, invariant runs, refusal episodes, member-runs
+    /// refusing at the steps' end and at the run's end). The episodes and the end counters are given for rule B on only.
+    #[allow(clippy::type_complexity)]
+    const REPORT6_ROWS: [(&str, f64, bool, [i64; 8], [i64; 3]); 8] = [
+        ("hold", 0.3, true, [0, 0, 23, 0, 19, 0, 704, 0], [62_603, 14_171, 249]),
+        ("hold", 0.3, false, [218, 482, 101, 1, 95, 1, 782, 697], [0, 0, 0]),
+        ("hold", 0.1, true, [0, 0, 29, 0, 4, 0, 257, 0], [19_587, 3_849, 53]),
+        ("hold", 0.1, false, [167, 180, 52, 0, 21, 0, 283, 346], [0, 0, 0]),
+        ("repair", 0.3, true, [0, 0, 0, 0, 0, 0, 0, 0], [99_899, 29_635, 233]),
+        ("repair", 0.3, false, [438, 104, 187, 0, 151, 0, 243, 540], [0, 0, 0]),
+        ("repair", 0.1, true, [0, 0, 0, 0, 0, 0, 0, 0], [46_270, 12_776, 94]),
+        ("repair", 0.1, false, [210, 71, 64, 0, 72, 0, 105, 281], [0, 0, 0]),
+    ];
+
+    /// The eight route rows (hold / repair x 0.3 / 0.1 x rule B on / off) on the Rust harness against REPORT6's. Asserted: rule B on,
+    /// every row: no partial flip, no premature burial, no served mismatch, no head missing, no grant or page above the sender's
+    /// coverage, no orphan with a valid binding; the repair rows with rule B on: no problem at all; with rule B off (at 7,200 runs a
+    /// row or more): partial flips and premature burials fire. PRINTED, not asserted (the PRNGs differ, so the counts cannot match):
+    /// the hold remainder, the refusal episodes and the state counters, each with its rate per 1,000 runs next to REPORT6's and the
+    /// ratio; a ratio outside a factor of 3 is reported and not tuned.
     #[test]
-    fn the_route_rows_exercise_the_routes() {
+    fn the_route_rows_against_report6() {
         let seeds = env_u64("Q6_ROUTE_RUNS", 20);
-        for rule_b in [true, false] {
-            for (hold, repair, route) in [(true, false, "hold"), (false, true, "repair")] {
+        for (route, f, rule_b, r6, r6d) in REPORT6_ROWS {
+            let (hold, repair) = (route == "hold", route == "repair");
+            let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+            for c in cfgs.iter_mut() {
+                c.routes = Some(crate::run::Routes {
+                    f,
+                    hold,
+                    repair,
+                    doc_hold: false,
+                    doc_repair: false,
+                });
+            }
+            let mode = if rule_b { "v6" } else { "m-rule-b-off" };
+            let s = run_grid(mode, "v6", &cfgs, 0, seeds, threads());
+            let p = s.problems();
+            let per_k = |n: i64, runs: i64| 1000.0 * n as f64 / runs as f64;
+            let runs = s.runs as i64;
+            let line = |name: &str, rust: i64, py: i64| {
+                let (a, b) = (per_k(rust, runs), per_k(py, 54_000));
+                let ratio = if b > 0.0 { format!("{:.2}", a / b) } else { "-".into() };
+                let flag =
+                    if b > 0.0 && (a / b > 3.0 || a / b < 1.0 / 3.0) { "  OUTSIDE x3" } else { "" };
+                format!(
+                    "    {name:30} rust {rust:6} ({a:8.2}/1000)  REPORT6 {py:6} ({b:8.2}/1000)  ratio {ratio}{flag}"
+                )
+            };
+            eprintln!("{route} {f} rule B {}: {} runs", if rule_b { "on " } else { "off" }, s.runs);
+            let g = |k: &str| s.get(k);
+            for (name, rust, py) in [
+                ("partial flip", g("inv_partial_flip"), r6[0]),
+                ("bury without newer visible", g("inv_bury_without_newer_visible"), r6[1]),
+                ("alive mismatch", g("alive_mismatch"), r6[2]),
+                ("served mismatch", g("served_mismatch"), r6[3]),
+                ("false records (loss_extra)", g("loss_extra"), r6[4]),
+                ("heads missing", g("loss_missing"), r6[5]),
+                ("diverged", g("diverged"), r6[6]),
+                ("invariant runs", g("invariant"), r6[7]),
+            ] {
+                eprintln!("{}", line(name, rust, py));
+            }
+            if rule_b {
+                eprintln!("{}", line("refusal episodes", g("cnt_refusal_episodes"), r6d[0]));
+                eprintln!(
+                    "{}",
+                    line("refusing at the steps' end", g("cnt_refusal_open_at_steps_end"), r6d[1])
+                );
+                eprintln!(
+                    "{}",
+                    line("refusing at the run's end", g("cnt_refusal_open_at_run_end"), r6d[2])
+                );
+            }
+            eprintln!(
+                "    hold_taken {} repair_events {} info_parked {} grant/page above coverage {}/{}; all problems: {:?}",
+                g("cnt_hold_taken"),
+                g("cnt_repair_events"),
+                g("cnt_info_parked"),
+                g("cnt_grant_above_coverage"),
+                g("cnt_page_above_coverage"),
+                p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
+            );
+            assert!(g(if hold { "cnt_hold_taken" } else { "cnt_repair_events" }) > 0);
+            assert!(g("cnt_refusal_episodes") > 0);
+            assert_eq!(g("cnt_grant_above_coverage"), 0);
+            assert_eq!(g("cnt_page_above_coverage"), 0);
+            if rule_b {
+                for k in [
+                    "inv_partial_flip",
+                    "inv_bury_without_newer_visible",
+                    "served_mismatch",
+                    "loss_missing",
+                    "inv_orphan_with_valid_binding",
+                    "inv_serve_not_alive",
+                ] {
+                    assert_eq!(g(k), 0, "{route} {f}, rule B on: {k}");
+                }
+                if repair {
+                    assert!(p.is_empty(), "the repair route with rule B on is clean: {p:?}");
+                }
+            } else if s.runs >= 7_200 {
+                assert!(
+                    g("inv_partial_flip") > 0,
+                    "{route} {f}: rule B off must fire partial flips"
+                );
+                assert!(
+                    g("inv_bury_without_newer_visible") > 0,
+                    "{route} {f}: rule B off must fire premature burials"
+                );
+            }
+        }
+    }
+
+    /// The product's out-of-order routes (design note, phase G addition; no model counterpart): document entries held out of position
+    /// (`doc_hold`), a scoped repair of document rows that grants no coverage (`doc_repair`), and both, with the windows running
+    /// between; register events always in position. The full invariant and oracle set on BOTH policies, with `K` off; the
+    /// assertion that no register event is ever taken out of position (`register_event_out_of_position`, invariant (ii)) is part
+    /// of the invariants (the routes keep `w.in_order`). The mutant `m-register-ahead` (`doc_hold` also delivers register events
+    /// ahead of their position) trips it.
+    #[test]
+    fn the_product_routes_keep_register_events_in_position_on_both_policies() {
+        let seeds = env_u64("Q6_PRODUCT_RUNS", 20);
+        let mut total = 0;
+        for policy in [crate::world::Policy::Document, crate::world::Policy::Field] {
+            for (doc_hold, doc_repair) in [(true, false), (false, true), (true, true)] {
                 for f in [0.3, 0.1] {
                     let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
                     for c in cfgs.iter_mut() {
-                        c.routes = Some(crate::run::Routes { f, hold, repair });
+                        c.policy = policy;
+                        c.routes = Some(crate::run::Routes {
+                            f,
+                            hold: false,
+                            repair: false,
+                            doc_hold,
+                            doc_repair,
+                        });
                     }
-                    let mode = if rule_b { "v6" } else { "m-rule-b-off" };
-                    let s = run_grid(mode, "v6", &cfgs, 0, seeds, threads());
+                    let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
                     let p = s.problems();
                     eprintln!(
-                        "{route} {f} rule B {}: {} runs; hold_taken {} repair_events {} info_parked {} refusal episodes {} (info {}); open at steps end {} / run end {}; problems {:?}",
-                        if rule_b { "on " } else { "off" },
+                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; problems {:?}",
                         s.runs,
-                        s.get("cnt_hold_taken"),
-                        s.get("cnt_repair_events"),
-                        s.get("cnt_info_parked"),
-                        s.get("cnt_refusal_episodes"),
-                        s.get("cnt_refusal_episodes_info"),
-                        s.get("cnt_refusal_open_at_steps_end"),
-                        s.get("cnt_refusal_open_at_run_end"),
+                        s.get("cnt_doc_hold_taken"),
+                        s.get("cnt_doc_repair"),
+                        s.get("cnt_register_event_out_of_position"),
                         p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
                     );
-                    assert!(s.get(if hold { "cnt_hold_taken" } else { "cnt_repair_events" }) > 0);
-                    assert!(s.get("cnt_refusal_episodes") > 0);
+                    if doc_hold {
+                        assert!(s.get("cnt_doc_hold_taken") > 0);
+                    }
+                    if doc_repair {
+                        assert!(s.get("cnt_doc_repair") > 0);
+                    }
+                    assert_eq!(s.get("cnt_register_event_out_of_position"), 0);
+                    assert_eq!(s.get("cnt_grant_above_coverage"), 0);
+                    assert_eq!(s.get("inv_register_event_out_of_position"), 0);
+                    // FINDING F-G-1 (report 2): the rest is not clean when `doc_hold` is on; printed above, not asserted
+                    total += s.runs;
                 }
             }
+        }
+        eprintln!("product routes: {total} runs");
+    }
+
+    /// `m-register-ahead` trips the assertion on the product routes (and so has teeth).
+    #[test]
+    fn m_register_ahead_trips_the_register_in_position_assertion() {
+        let seeds = env_u64("Q6_PRODUCT_RUNS", 20);
+        for policy in [crate::world::Policy::Document, crate::world::Policy::Field] {
+            let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+            for c in cfgs.iter_mut() {
+                c.policy = policy;
+                c.routes = Some(crate::run::Routes {
+                    f: 0.3,
+                    hold: false,
+                    repair: false,
+                    doc_hold: true,
+                    doc_repair: false,
+                });
+            }
+            let s = run_grid("m-register-ahead", "v6", &cfgs, 0, seeds, threads());
+            eprintln!(
+                "m-register-ahead {policy:?}: {} runs, out-of-position register events {}, invariant runs {}",
+                s.runs,
+                s.get("cnt_register_event_out_of_position"),
+                s.get("inv_register_event_out_of_position")
+            );
+            assert!(s.get("cnt_register_event_out_of_position") > 0);
+            assert!(
+                s.get("inv_register_event_out_of_position") > 0,
+                "{policy:?}: the assertion must trip"
+            );
         }
     }
 
@@ -579,7 +741,18 @@ mod tests {
         for mut c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
             c.policy = policy;
             c.k = std::env::var("Q6_K").ok().and_then(|k| k.parse().ok());
-            let r = run("v6", "v6", seed, c, true);
+            if let Ok(spec) = std::env::var("Q6_ROUTE") {
+                // "<hold|repair|doc_hold|doc_repair|...,>:<f>", e.g. doc_hold:0.3
+                let (kinds, f) = spec.split_once(':').expect("kinds:f");
+                c.routes = Some(crate::run::Routes {
+                    f: f.parse().unwrap(),
+                    hold: kinds.split(',').any(|k| k == "hold"),
+                    repair: kinds.split(',').any(|k| k == "repair"),
+                    doc_hold: kinds.split(',').any(|k| k == "doc_hold"),
+                    doc_repair: kinds.split(',').any(|k| k == "doc_repair"),
+                });
+            }
+            let r = run(&std::env::var("Q6_MODE").unwrap_or("v6".into()), "v6", seed, c, true);
             let bad: Vec<_> = r
                 .res
                 .iter()
@@ -599,6 +772,26 @@ mod tests {
                 .collect();
             if !bad.is_empty() {
                 eprintln!("CONFIG {c:?}: {bad:?}");
+                if let Ok(spec) = std::env::var("Q6_WATCH") {
+                    // "<origin index>:<hlc>,<hlc>": who holds / appended / holds out of position those entries at the end
+                    let (o, hs) = spec.split_once(':').unwrap();
+                    let o: usize = o.parse().unwrap();
+                    for h in hs.split(',').map(|x| x.parse::<i64>().unwrap()) {
+                        if let Some(e) = r.w.all.iter().find(|e| e.origin == o && e.hlc == h) {
+                            for mm in &r.ms {
+                                eprintln!(
+                                    "WATCH {} ({h}) at {}: has {} appended {} oop {} covers_origin_to_it {}",
+                                    e,
+                                    mm.name,
+                                    mm.holds(e.idx),
+                                    mm.appended.contains(&e.idx),
+                                    mm.held_oop.contains(&e.idx),
+                                    mm.covers(&r.w, o, h)
+                                );
+                            }
+                        }
+                    }
+                }
                 if c.k.is_some() {
                     for mm in &r.ms {
                         let mut ks: Vec<_> = mm

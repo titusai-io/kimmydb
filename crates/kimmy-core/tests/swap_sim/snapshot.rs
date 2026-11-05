@@ -55,6 +55,8 @@ pub struct Join {
     pub begin_events: HashSet<EntryId>,
     pub dead_pages: Vec<(String, Docs)>,
     pub bare_ids: HashSet<EntryId>,
+    /// a scoped repair (the product's, document rows only): the last page lands and nothing completes: no grant, no coverage
+    pub repair: bool,
 }
 
 impl Member {
@@ -140,7 +142,11 @@ impl Member {
             phys,
             events: if f.snap_no_events { Vec::new() } else { self.evl.clone() },
             loss,
-            held: self.cv.iter().collect(),
+            held: self
+                .cv
+                .iter()
+                .filter(|i| !(w.held_uncovered && self.held_oop.contains(i)))
+                .collect(),
             creates: self.creates.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             learned: self.learned.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             pend: self.pend_tombs.clone(),
@@ -234,13 +240,23 @@ impl Member {
         {
             w.stats.bump("grant_above_coverage");
         }
-        let page_above = pl.phys.iter().any(|(n, pd)| {
-            pd.docs.iter().any(|(k, v)| {
-                w.rec_index
-                    .get(&(n.clone(), *k, v.stamp))
-                    .is_some_and(|&i| !src.covers(w, w.ent(i).origin, w.ent(i).hlc))
-            })
-        });
+        // a page version whose entry the sender does not cover: in the model's routes a violation of invariant (i); on the product
+        // routes (`held_uncovered`) it is state the sender holds above the vector it advertises (written by a snapshot page, a carried
+        // delete or a scoped repair: `docs/operations.md:1423`), carried and never claimed, counted `page_carries_held_state`
+        let mut page_above = false;
+        for (n, pd) in pl.phys.iter() {
+            for (k, v) in pd.docs.iter() {
+                if let Some(&i) = w.rec_index.get(&(n.clone(), *k, v.stamp))
+                    && !src.covers(w, w.ent(i).origin, w.ent(i).hlc)
+                {
+                    if w.held_uncovered {
+                        w.stats.bump("page_carries_held_state");
+                    } else {
+                        page_above = true;
+                    }
+                }
+            }
+        }
         if page_above {
             w.stats.bump("page_above_coverage");
         }
@@ -261,6 +277,7 @@ impl Member {
             begin_events,
             dead_pages: Vec::new(),
             bare_ids: HashSet::new(),
+            repair: false,
         });
         let src_evl = src.evl.clone();
         if f.grant_before_pages {
@@ -277,6 +294,51 @@ impl Member {
         if self.join.as_ref().is_some_and(|j| j.pages.is_empty()) {
             self.complete_join(w, &src_evl);
         }
+        true
+    }
+
+    /// The product's scoped repair (design note, phase G addition; `live_count.rs:599-608`): the source's document versions of the
+    /// physicals this member holds alive are handed over as pages of a snapshot that grants NO coverage and carries no register
+    /// events, so what they write stays held as state (`held_records`, the pages' retained versions) until the entries arrive in
+    /// position. ASSUMED to be the whole of what a repair does in the harness. Returns false when nothing was repaired.
+    pub fn scoped_repair(&mut self, w: &mut World, src: &Member) -> bool {
+        if self.join.is_some() || !src.eligible_source() || src.id == self.id {
+            return false;
+        }
+        let mut pl = src.make_payload(w);
+        let pages: Vec<String> = pl
+            .phys
+            .iter()
+            .filter(|(n, pd)| pd.alive && self.phys.get(*n).is_some_and(|p| p.alive && !p.missing))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if pages.is_empty() {
+            return false;
+        }
+        // no grant: nothing claimed, nothing served, no register events, no loss records, no creates
+        pl.vec = BTreeMap::new();
+        pl.held = BTreeSet::new();
+        pl.appended = BTreeSet::new();
+        pl.events = Vec::new();
+        pl.loss = OMap::new();
+        pl.dochist = Vec::new();
+        pl.page_states = Vec::new();
+        let n = pages.len();
+        self.join = Some(Join {
+            src: src.id,
+            pl,
+            pages,
+            created: BTreeSet::new(),
+            granted: false,
+            begin_events: HashSet::new(),
+            dead_pages: Vec::new(),
+            bare_ids: HashSet::new(),
+            repair: true,
+        });
+        for _ in 0..n {
+            self.land_page(w, &[]);
+        }
+        self.join = None;
         true
     }
 
@@ -397,7 +459,7 @@ impl Member {
                 }
             }
         }
-        let done = j.pages.is_empty();
+        let done = j.pages.is_empty() && !j.repair;
         self.join = Some(j);
         if done {
             self.complete_join(w, src_evl);

@@ -171,13 +171,14 @@ impl Member {
         if self.held_oop.is_empty() {
             return;
         }
-        let ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
+        let mut ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
+        ids.sort_unstable(); // per origin, ids are in stamp order: one pass releases a whole run
         for i in ids {
             let e = w.ent(i);
             let ok = w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
-                .all(|&x| self.cv.has(x));
+                .all(|&x| self.cv.has(x) && !(w.held_uncovered && self.held_oop.contains(&x)));
             if ok {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
@@ -190,7 +191,9 @@ impl Member {
     pub fn take_hold(&mut self, w: &mut World, e: &EntryRef) {
         let was = self.cv.has(e.idx);
         self.take(w, e);
-        if !was && e.kind != Kind::Doc {
+        // every entry a route passes is held: the model's hold route passes non-document entries only, the product's `doc_hold`
+        // route document entries (or, in `m-register-ahead`, register events as well)
+        if !was {
             self.appended.remove(&e.idx);
             self.held_oop.insert(e.idx);
         }

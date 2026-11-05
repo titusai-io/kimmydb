@@ -45,6 +45,11 @@ pub struct Routes {
     pub hold: bool,
     /// `repair`: the source's register events are handed over as information only
     pub repair: bool,
+    /// the product's routes (no model counterpart; register events stay in position): `doc_hold`: a DOCUMENT entry of the source's
+    /// held set is delivered out of position (held as state, released in position); `doc_repair`: a scoped repair, the source's
+    /// document versions handed over as pages of a snapshot that grants no coverage and carries no register events
+    pub doc_hold: bool,
+    pub doc_repair: bool,
 }
 
 /// Who writes a document in an `lww_workload`.
@@ -143,7 +148,9 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.policy = cfg.policy;
     w.q7_entries = cfg.q7_entries;
     w.k = cfg.k;
-    w.in_order = cfg.routes.is_none();
+    w.in_order = cfg.routes.is_none_or(|rt| !rt.hold && !rt.repair);
+    w.reg_in_position_check = w.in_order;
+    w.held_uncovered = cfg.routes.is_some_and(|rt| rt.doc_hold || rt.doc_repair);
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
@@ -308,42 +315,76 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                     _ => 1.0,
                 };
                 if let Some(rt) = cfg.routes.filter(|rt| rt.f > 0.0 && r < rt.f) {
-                    let kinds: Vec<bool> = [(rt.hold, true), (rt.repair, false)]
+                    let kinds: Vec<u8> = [rt.hold, rt.repair, rt.doc_hold, rt.doc_repair]
                         .iter()
-                        .filter(|k| k.0)
-                        .map(|k| k.1)
+                        .enumerate()
+                        .filter(|(_, on)| **on)
+                        .map(|(i, _)| i as u8)
                         .collect();
-                    let hold = kinds[w.rng.below(kinds.len())];
-                    if hold {
-                        // the hold route: a non-document entry the source holds (any stamp, origin or kind) is delivered out of position
-                        let nd: Vec<EntryRef> = w
-                            .all
-                            .iter()
-                            .filter(|e| e.kind != Kind::Doc && s.holds(e.idx) && !d.holds(e.idx))
-                            .cloned()
-                            .collect();
-                        if !nd.is_empty() {
-                            let e = nd[w.rng.below(nd.len())].clone();
-                            w.note(format!("HOLD {} <- {}: {}", d.name, s.name, e));
-                            w.stats.bump("hold_taken");
-                            d.take_hold(&mut w, &e);
-                        }
-                    } else {
-                        // the repair route: the source's register events are handed over as information (a scoped repair that carries
-                        // the register and grants no coverage): no entry, no coverage, no clock witness
-                        let new: Vec<EntryId> =
-                            s.evl.iter().copied().filter(|i| !d.events.contains(i)).collect();
-                        if !new.is_empty() {
-                            w.note(format!(
-                                "REPAIR {} <- {}: register events {:?}",
-                                d.name, s.name, new
-                            ));
-                            for &i in &new {
-                                let e = w.ent_rc(i);
-                                d.add_event(&mut w, &e);
+                    match kinds[w.rng.below(kinds.len())] {
+                        0 => {
+                            // the hold route: a non-document entry the source holds (any stamp, origin or kind) is delivered out of position
+                            let nd: Vec<EntryRef> = w
+                                .all
+                                .iter()
+                                .filter(|e| {
+                                    e.kind != Kind::Doc && s.holds(e.idx) && !d.holds(e.idx)
+                                })
+                                .cloned()
+                                .collect();
+                            if !nd.is_empty() {
+                                let e = nd[w.rng.below(nd.len())].clone();
+                                w.note(format!("HOLD {} <- {}: {}", d.name, s.name, e));
+                                w.stats.bump("hold_taken");
+                                d.take_hold(&mut w, &e);
                             }
-                            w.stats.add("repair_events", new.len() as i64);
-                            d.settle(&mut w);
+                        }
+                        1 => {
+                            // the repair route: the source's register events are handed over as information (a scoped repair that carries
+                            // the register and grants no coverage): no entry, no coverage, no clock witness
+                            let new: Vec<EntryId> =
+                                s.evl.iter().copied().filter(|i| !d.events.contains(i)).collect();
+                            if !new.is_empty() {
+                                w.note(format!(
+                                    "REPAIR {} <- {}: register events {:?}",
+                                    d.name, s.name, new
+                                ));
+                                for &i in &new {
+                                    let e = w.ent_rc(i);
+                                    d.add_event(&mut w, &e);
+                                }
+                                w.stats.add("repair_events", new.len() as i64);
+                                d.settle(&mut w);
+                            }
+                        }
+                        2 => {
+                            // the product's held document entries (ADR-160/169): a document entry the source holds, delivered out of
+                            // position: applied, not appended, released once every earlier entry of its origin is held.
+                            // `m-register-ahead` lets a register event be picked as well (invariant (ii) broken on purpose)
+                            let ahead = w.f.fm_register_ahead;
+                            let nd: Vec<EntryRef> = w
+                                .all
+                                .iter()
+                                .filter(|e| {
+                                    (e.kind == Kind::Doc || (ahead && e.kind.is_register_event()))
+                                        && s.holds(e.idx)
+                                        && !d.holds(e.idx)
+                                })
+                                .cloned()
+                                .collect();
+                            if !nd.is_empty() {
+                                let e = nd[w.rng.below(nd.len())].clone();
+                                w.note(format!("DOC-HOLD {} <- {}: {}", d.name, s.name, e));
+                                w.stats.bump("doc_hold_taken");
+                                d.take_hold(&mut w, &e);
+                            }
+                        }
+                        _ => {
+                            // the product's scoped repair: document versions as state, no grant, no register events
+                            w.note(format!("DOC-REPAIR {} <- {}", d.name, s.name));
+                            if d.scoped_repair(&mut w, s) {
+                                w.stats.bump("doc_repair");
+                            }
                         }
                     }
                 } else if let Some(e) = cand {
