@@ -53,7 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The cluster protocol this build speaks. Every member must run one
 /// release: a `Hello` or `Welcome` that does not name this protocol is refused
 /// ([`release_fault`]).
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// What a member says to a peer whose handshake named `theirs` instead of
 /// [`PROTOCOL`], naming both.
@@ -64,7 +64,7 @@ pub fn release_fault(theirs: Option<u32>) -> String {
     };
     format!(
         "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}); the peer speaks {peer}; every member must run one release",
-        kimmy_core::build::SCHEMA_6_RELEASE
+        kimmy_core::build::SCHEMA_8_RELEASE
     )
 }
 

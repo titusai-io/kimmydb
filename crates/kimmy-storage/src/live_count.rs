@@ -844,7 +844,7 @@ mod tests {
         assert_digests_exact(&engine, "a bare tombstone");
 
         // Removing a tombstone (retention) does not lower either.
-        let later = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 1, 0), stamp.node, Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 1, 0), stamp.node, stamp.epoch);
         {
             let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();

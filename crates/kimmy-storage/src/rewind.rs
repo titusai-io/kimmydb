@@ -98,6 +98,10 @@ struct History {
 impl Engine {
     /// Rewind document state to `until`.
     ///
+    /// **The caller must reopen the engine afterwards.** The rewind clears the `epoch` row in its
+    /// transaction, so the next open mints a new epoch; this engine keeps writing under the
+    /// old one until it is dropped. The offline restore command already reopens.
+    ///
     /// Refuses, without writing anything, if the target predates the oplog
     /// horizon, if any schema change happened after it, or if any document's
     /// value at that instant is no longer recoverable.
@@ -529,6 +533,10 @@ impl Engine {
             restored_floor
         };
         Engine::lower_vectors_in(&txn, schema, until, floor)?;
+        // The writes above the target are gone: whatever this member wrote under its epoch may
+        // be among them, so the next open mints a new one, as after a restore. In this
+        // transaction, so a rewind that failed leaves the epoch as it was.
+        txn.open_table(tables::META)?.remove(tables::META_EPOCH)?;
         // After the log lost everything above the target, so these survive it,
         // and in the transaction that filed the documents.
         let unkeyed_entries = self.append_unkeyed(&txn, unkeyed)?;
@@ -675,7 +683,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use bson::doc;
-    use kimmy_core::Epoch;
     use kimmy_core::index_meta::IndexField;
 
     use super::*;
@@ -965,7 +972,7 @@ mod tests {
         engine.advance_clock_past(&Stamp::new(
             Hlc::new(base + t, 0),
             engine.node_id(),
-            Epoch::ZERO,
+            engine.epoch(),
         ));
     }
 
@@ -1162,7 +1169,7 @@ mod tests {
             engine.advance_clock_past(&Stamp::new(
                 Hlc::new(ahead, 0),
                 engine.node_id(),
-                Epoch::ZERO,
+                engine.epoch(),
             ));
             engine.insert(&coll, doc! { "_id": 2 }).unwrap();
             engine.insert(&coll, doc! { "_id": 3 }).unwrap();

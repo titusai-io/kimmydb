@@ -2670,7 +2670,7 @@ mod tests {
 
     /// A stamp `ms` milliseconds past `stamp`, from the same node.
     fn later_by(stamp: Stamp, ms: u64) -> Stamp {
-        Stamp::new(Hlc::new(stamp.hlc.wall_ms + ms, 0), stamp.node, Epoch::ZERO)
+        Stamp::new(Hlc::new(stamp.hlc.wall_ms + ms, 0), stamp.node, stamp.epoch)
     }
 
     /// Drop `app.docs`, collect the drop's oplog entry while keeping its
@@ -2747,7 +2747,7 @@ mod tests {
         // older than everything retained here refused the open outright.
         let (engine, coll, _dir) = setup();
         let first = newest_stamp(&engine);
-        let before = Stamp::new(Hlc::new(first.hlc.wall_ms - 1_000, 0), first.node, Epoch::ZERO);
+        let before = Stamp::new(Hlc::new(first.hlc.wall_ms - 1_000, 0), first.node, first.epoch);
         engine.record_collection_drop(coll.id, before).unwrap();
         engine.insert(&coll, doc! { "_id": 99i64 }).unwrap();
 
@@ -3146,7 +3146,7 @@ mod tests {
             .unwrap();
         let newest = first_retained_stamp(&engine);
         let above_the_collected =
-            Stamp::new(newest.hlc.predecessor(), engine.node_id(), Epoch::ZERO);
+            Stamp::new(newest.hlc.predecessor(), engine.node_id(), engine.epoch());
         let old = OplogEntry {
             stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO),
             kind: OpKind::Delete,
@@ -3185,7 +3185,7 @@ mod tests {
         crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stranger).unwrap();
         txn.commit().unwrap();
 
-        let token = Stamp::new(held.hlc.predecessor(), held.node, Epoch::ZERO);
+        let token = Stamp::new(held.hlc.predecessor(), held.node, held.epoch);
         assert!(
             engine
                 .watch(
@@ -3554,32 +3554,36 @@ mod tests {
         );
     }
 
+    /// A token for "t", issued by a stream of `engine`; then a replicated write stamped below
+    /// "t" but taken in after it, a local write after that, and a rewind to "t" that undoes the
+    /// local one and keeps the other two. The engine is returned still open.
+    async fn a_token_issued_before_a_rewind(
+        path: &std::path::Path,
+    ) -> (Engine, CollectionMeta, ResumeToken) {
+        let engine = Engine::open(path).unwrap();
+        let coll = engine.create_collection("app", "docs").unwrap();
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "t" }).unwrap();
+        let (t, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+        engine.apply_remote(&coll, &remote_entry(&coll, "late", t.stamp.hlc.wall_ms - 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+        engine.rewind_to(t.stamp.hlc).unwrap();
+        (engine, coll, token)
+    }
+
     #[tokio::test]
     async fn a_rewind_leaves_the_issuing_members_order_as_its_streams_saw_it() {
         // A replicated write stamped below the token's entry but taken in after
         // it. A rewind that keeps both must not reorder them, or the issuing
-        // member resumes past it after its next start.
+        // member resumes past it. The rewind clears the epoch row, which only a
+        // reopened engine notices (`rewind_to`): this engine keeps writing, and
+        // issuing, under the epoch it had, so it is still the token's issuer.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
-        let token = {
-            let engine = Engine::open(&path).unwrap();
-            let coll = engine.create_collection("app", "docs").unwrap();
-            let mut stream =
-                engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
-            engine.insert(&coll, doc! { "_id": "t" }).unwrap();
-            let (t, token) = next_change(&engine, &mut stream).await;
-            drop(stream);
-            engine
-                .apply_remote(&coll, &remote_entry(&coll, "late", t.stamp.hlc.wall_ms - 1))
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
-            engine.rewind_to(t.stamp.hlc).unwrap();
-            token
-        };
-
-        let engine = Engine::open(&path).unwrap();
-        let coll = engine.get_collection("app", "docs").unwrap();
+        let (engine, coll, token) = a_token_issued_before_a_rewind(&path).await;
         let mut stream = engine
             .watch(
                 WatchScope::Collection(coll.id),
@@ -3587,6 +3591,39 @@ mod tests {
             )
             .expect("the token's entry survived the rewind");
         assert_eq!(ids(&changes_until(&engine, &mut stream, &["late"]).await), vec!["late"]);
+    }
+
+    /// After a rewind and a restart, a token issued before is **foreign**: the restart mints a
+    /// new epoch (D13), the token's issuer is the origin of the old one (U3), and an origin that
+    /// is no longer this member's names an arrival order this member no longer keeps. So the
+    /// token resumes through its vector, not as an exact position, and the stream may deliver
+    /// an entry the client already has ("t", here). That is at-least-once: the consumer
+    /// deduplicates. Before epochs the same restart resumed exactly.
+    #[tokio::test]
+    async fn after_a_rewind_and_a_restart_a_token_issued_before_is_foreign_and_may_redeliver() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (before, token) = {
+            let (engine, _, token) = a_token_issued_before_a_rewind(&path).await;
+            (engine.origin(), token)
+        };
+
+        let engine = Engine::open(&path).unwrap();
+        assert_ne!(engine.origin(), before, "the restart minted a new epoch");
+        assert_eq!(engine.origin().node, before.node);
+        assert_eq!(token.issued.as_ref().map(|i| i.by), Some(before));
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token's entry survived the rewind");
+        assert_eq!(
+            ids(&changes_until(&engine, &mut stream, &["late"]).await),
+            vec!["t", "late"],
+            "through the vector: the entry the client has is delivered again"
+        );
     }
 
     #[tokio::test]

@@ -333,7 +333,7 @@ fn a_collection_tombstone_defers_while_the_drop_is_above_the_cut_or_the_life_is_
     let created = a.get_collection("shop", "orders").unwrap().created;
     // A drop stamped exactly at the creation of the life standing: the life is
     // not newer than the drop.
-    let tie = Stamp::new(created, a.node_id(), Epoch::ZERO);
+    let tie = Stamp::new(created, a.node_id(), a.epoch());
     a.record_collection_drop(orders, tie).unwrap();
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(deferred(&verdicts, orders), Some(DefinitionDefer::Incarnation), "{verdicts:?}");
@@ -343,7 +343,7 @@ fn a_collection_tombstone_defers_while_the_drop_is_above_the_cut_or_the_life_is_
 fn a_covered_drop_over_a_newer_life_does_not_defer() {
     let (a, b, orders, _items, _dirs) = converged();
     let created = a.get_collection("shop", "orders").unwrap().created;
-    let before = Stamp::new(Hlc::new(created.wall_ms - 1, 0), a.node_id(), Epoch::ZERO);
+    let before = Stamp::new(Hlc::new(created.wall_ms - 1, 0), a.node_id(), a.epoch());
     a.record_collection_drop(orders, before).unwrap();
     // The drop arrived after the life, so the life owes ADR-231's sweep; done here,
     // as an apply does it, before the drop is judged covered (the state a member
@@ -353,8 +353,7 @@ fn a_covered_drop_over_a_newer_life_does_not_defer() {
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
     // One above the cut: not covered.
-    let future =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), Epoch::ZERO);
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
     a.record_collection_drop(orders, future).unwrap();
     // Swept too, so that what defers it is the cut and not the sweep it owes.
     a.sweep_late_drop("shop", "orders", future).unwrap();
@@ -366,8 +365,7 @@ fn a_covered_drop_over_a_newer_life_does_not_defer() {
 fn a_database_tombstone_defers_its_collections_by_the_same_rule() {
     let (a, b, orders, items, _dirs) = converged();
     let db_drop = kimmy_core::database_drop_id("shop");
-    let future =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), Epoch::ZERO);
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
     a.record_database_tombstone_for_test(db_drop, future).unwrap();
     let verdicts = exchange(&a, &b, &[]);
     for id in [orders, items] {
@@ -478,7 +476,7 @@ fn a_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_predicate() {
         let future = Stamp::new(
             Hlc::new(crate::physical_now_ms() + 60_000, 0),
             writer.node_id(),
-            Epoch::ZERO,
+            writer.epoch(),
         );
         writer.record_collection_drop(orders, future).unwrap();
     });
@@ -741,7 +739,7 @@ fn a_hint_round_trips_and_a_name_with_colons_is_kept_whole() {
         orders,
         HintKind::Index,
         "a:b:c",
-        Stamp::new(Hlc::new(40, 0), stamp.node, Epoch::ZERO),
+        Stamp::new(Hlc::new(40, 0), stamp.node, stamp.epoch),
         0x1111,
     );
     a.record_refusal_hint(&older).unwrap();
@@ -911,7 +909,7 @@ fn a_database_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_pred
         let future = Stamp::new(
             Hlc::new(crate::physical_now_ms() + 60_000, 0),
             writer.node_id(),
-            Epoch::ZERO,
+            writer.epoch(),
         );
         writer
             .record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), future)
@@ -1230,8 +1228,7 @@ fn a_deferred_collection_carries_no_detail() {
     let hash = hash_of(&a, "orders", "ttl");
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
     b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash)).unwrap();
-    let future =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.node_id(), Epoch::ZERO);
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.node_id(), b.epoch());
     b.record_collection_drop(orders, future).unwrap();
     let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
     let reply = b.definition_answer(&ask).unwrap();

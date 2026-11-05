@@ -2877,7 +2877,7 @@ mod tests {
         let (engine, coll, _dir) = engine();
         engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid"}).unwrap();
         let current = engine.document_stamp(&coll, &DocId::Int64(1)).unwrap().unwrap();
-        let stale = Stamp::new(kimmy_core::Hlc::new(1, 0), current.node, Epoch::ZERO);
+        let stale = Stamp::new(kimmy_core::Hlc::new(1, 0), current.node, current.epoch);
 
         let mut spec = Operators::new(doc! {"$set": {"status": "paid"}});
         spec.expected = Some(stale);

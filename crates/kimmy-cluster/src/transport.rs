@@ -10595,7 +10595,7 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "this member speaks cluster protocol 2 (KimmyDB 0.53.0); the peer speaks none \
+            "this member speaks cluster protocol 3 (KimmyDB 0.61.0); the peer speaks none \
              (0.52.x or older); every member must run one release"
         );
         assert_eq!(answer, Message::Fault(reason));
@@ -10614,7 +10614,7 @@ mod tests {
         let asking = async {
             write_frame(
                 &mut ours,
-                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(3) },
+                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(2) },
             )
             .await
             .unwrap();
@@ -10623,7 +10623,7 @@ mod tests {
         let (refused, answer) = tokio::join!(refusing, asking);
         assert!(matches!(refused, Err(ProtocolError::Release(_))), "{refused:?}");
         let Message::Fault(reason) = answer else { panic!("expected a Fault, got {answer:?}") };
-        assert!(reason.contains("protocol 2") && reason.contains("cluster protocol 3"), "{reason}");
+        assert!(reason.contains("protocol 3") && reason.contains("cluster protocol 2"), "{reason}");
     }
 
     /// A `Welcome` that names no protocol is refused by the initiator, which
@@ -12999,7 +12999,7 @@ mod tests {
         let elsewhere = peer.create_collection("shop", "peer_only").unwrap();
         let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
         let lost = kimmy_core::OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id(), Epoch::ZERO),
+            stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id(), writer.epoch()),
             kind: kimmy_core::OpKind::Insert,
             collection: elsewhere.id,
             doc_id: Some(kimmy_core::DocId::String("lost".into())),

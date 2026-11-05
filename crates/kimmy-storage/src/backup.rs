@@ -413,6 +413,10 @@ pub fn restore_with(
                     // applied after the backup, and nothing else covers one no peer holds.
                     T_META
                         if key.as_slice() == crate::tables::META_TOMBSTONE_HORIZON.as_bytes() => {}
+                    // The source's epoch: a restored store is a new incarnation. Its first open
+                    // finds no row and mints one, so what the restore threw away stays owed
+                    // under the old epoch and the new writes cannot be mistaken for it.
+                    T_META if key.as_slice() == crate::tables::META_EPOCH.as_bytes() => {}
                     T_META => {
                         meta.insert(as_str(&key)?, value.as_slice())?;
                     }

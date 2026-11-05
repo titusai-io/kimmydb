@@ -233,7 +233,7 @@ fn a_scoped_drop_or_a_creation_the_senders_coverage_does_not_name_moves_nothing(
     transfer(&b, &a);
     let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
     let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
-    page.dropped = Some(Stamp::new(far, a.node_id(), Epoch::ZERO));
+    page.dropped = Some(Stamp::new(far, a.node_id(), a.epoch()));
     for state in &mut page.collections {
         state.created = far;
     }
@@ -251,7 +251,7 @@ fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
     a.create_collection("shop", "orders").unwrap();
     transfer(&b, &a);
     let far =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 86_400_000, 0), a.node_id(), Epoch::ZERO);
+        Stamp::new(Hlc::new(crate::physical_now_ms() + 86_400_000, 0), a.node_id(), a.epoch());
     let mut page = a.snapshot_page(None, None).unwrap();
     page.dropped_collections.push((CollectionId::derive("shop", "other"), far));
     page.dropped_indexes.push((CollectionId::derive("shop", "orders"), 7, far));

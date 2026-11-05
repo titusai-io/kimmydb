@@ -1,7 +1,6 @@
 //! The later-life stop a page holding no life answers (F7), and a relayed drop of an earlier
 //! life in a collection stream (F4).
 
-use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -280,7 +279,7 @@ fn a_whole_page_grants_a_refused_lifes_definition_in_the_drops_own_hlc() {
     // The index's stamp moved into the drop's own `Hlc`, as a member whose clock tied with
     // the dropper's would have made it.
     let mut meta = b.get_collection("shop", "orders").unwrap();
-    let tied = kimmy_core::Stamp::new(dropped.hlc, b.node_id(), Epoch::ZERO);
+    let tied = kimmy_core::Stamp::new(dropped.hlc, b.node_id(), b.epoch());
     meta.indexes[0].created = Some(tied);
     let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
     Engine::put_collection_meta(&txn, &meta).unwrap();

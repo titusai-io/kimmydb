@@ -58,6 +58,9 @@ pub struct Engine {
     /// records it (ADR-188).
     health: std::sync::Arc<crate::health::StorageHealth>,
     node_id: NodeId,
+    /// This member's epoch, minted at the open that found none (`tables::META_EPOCH`). With
+    /// the node it is the origin of every local write.
+    epoch: Epoch,
     /// The highest stamp of this node's own origin in the oplog when the store
     /// was opened, before this run wrote anything (ADR-202): the position a
     /// replay of this node's own origin asks a peer from.
@@ -1525,6 +1528,10 @@ impl Engine {
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::resume_hlc(&db)?;
+        let mut clock = HlcClock::resuming_from(resumed);
+        // After the clock resumed, so a minted epoch starts at or above every stamp the store
+        // holds. A first open, a restored store and a rewound one all find no row and mint.
+        let (epoch, minted) = Self::load_or_mint_epoch(&db, &mut clock)?;
 
         if resumed != Hlc::ZERO {
             debug!(hlc = %resumed, "resumed logical clock from the oplog tail");
@@ -1534,16 +1541,30 @@ impl Engine {
 
         info!(node = %node_id, path = %path.display(), "storage engine open");
 
-        // Read before anything of this run can write under this origin.
-        let own_position_at_open = Self::read_versions(&db, tables::OPLOG_VERSIONS)?
-            .get(Origin::new(node_id, Epoch::ZERO));
+        // Read before anything of this run can write under this origin. A start that kept its
+        // epoch asks from its own position under it. A start that minted one (a restore, a
+        // rewind, the first open) lost writes it may have made under any earlier epoch of this
+        // node, so it asks from the lowest position of them: that over-asks, never under-asks,
+        // and an entry already held is dropped by the replay's `has_oplog_entry`.
+        let positions = Self::read_versions(&db, tables::OPLOG_VERSIONS)?;
+        let own_position_at_open = if minted {
+            positions
+                .iter()
+                .filter(|(origin, _)| origin.node == node_id)
+                .map(|(_, hlc)| hlc)
+                .min()
+                .unwrap_or(Hlc::ZERO)
+        } else {
+            positions.get(Origin::new(node_id, epoch))
+        };
         let engine = Self {
             db,
             health,
             node_id,
+            epoch,
             own_position_at_open,
             repairs_at_open,
-            clock: Mutex::new(HlcClock::resuming_from(resumed)),
+            clock: Mutex::new(clock),
             events,
             buried: broadcast::channel(EVENT_BUFFER).0,
             swept: Mutex::new(Default::default()),
@@ -2082,12 +2103,14 @@ impl Engine {
         self.node_id
     }
 
+    /// The epoch this member writes under, minted at the open that found none.
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     /// The origin this member writes under: its node and its epoch.
-    ///
-    /// Until the epoch is minted at open (a later commit of this series) the epoch is
-    /// [`Epoch::ZERO`].
     pub fn origin(&self) -> Origin {
-        Origin::new(self.node_id, Epoch::ZERO)
+        Origin::new(self.node_id, self.epoch)
     }
 
     pub fn path(&self) -> &Path {
@@ -2277,6 +2300,36 @@ impl Engine {
         };
         txn.commit()?;
         Ok(id)
+    }
+
+    /// This member's epoch: the row if the store has one, else a fresh one, written in the same
+    /// transaction. `minted` says which.
+    ///
+    /// The start HLC is a tick of `clock`, which resumed from the store's stamps, so it is at or
+    /// above every stamp the store holds; the other 64 bits come from the operating system. The
+    /// mint reads no value from the store: a row is read back only as this member's own earlier
+    /// mint, and a restore does not carry it (`backup.rs`).
+    fn load_or_mint_epoch(db: &Database, clock: &mut HlcClock) -> Result<(Epoch, bool)> {
+        let txn = db.begin_write()?;
+        let found = {
+            let meta = txn.open_table(tables::META)?;
+            meta.get(tables::META_EPOCH)?.map(|v| <[u8; Epoch::LEN]>::try_from(v.value()))
+        };
+        let (epoch, minted) = match found {
+            Some(bytes) => (
+                Epoch(bytes.map_err(|_| StorageError::Corrupt("epoch is not 18 bytes".into()))?),
+                false,
+            ),
+            None => {
+                let start = clock.tick(physical_now_ms());
+                let epoch = Epoch::generate(start);
+                txn.open_table(tables::META)?.insert(tables::META_EPOCH, epoch.0.as_slice())?;
+                info!(epoch = %epoch.to_hex(), %start, "minted a new epoch");
+                (epoch, true)
+            }
+        };
+        txn.commit()?;
+        Ok((epoch, minted))
     }
 
     /// Rebuild the arrival index if it does not cover the oplog exactly.
@@ -3813,7 +3866,7 @@ impl Engine {
     /// Mint the next stamp for a local write.
     pub(crate) fn next_stamp(&self) -> Stamp {
         let hlc = self.clock.lock().tick(physical_now_ms());
-        Stamp::new(hlc, self.node_id, Epoch::ZERO)
+        Stamp::new(hlc, self.node_id, self.epoch)
     }
 
     /// The last time the clock handed out, for a test that a path mints
@@ -4684,7 +4737,7 @@ impl Engine {
             // ADR-233's witnesses and its restart rule pass it.
             let stamp = match (mint(), incarnation_floor) {
                 (stamp, Some(floor)) if stamp.hlc <= floor => {
-                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id, Epoch::ZERO)))
+                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id, self.epoch)))
                 }
                 (stamp, _) => stamp,
             };
@@ -5068,9 +5121,7 @@ impl Engine {
         // life comes back here by entries over the acknowledged drop.
         let stamp = match replicated {
             Some(stamp) => stamp,
-            None => {
-                self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id, Epoch::ZERO)))
-            }
+            None => self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id, self.epoch))),
         };
         // The purge that follows removes every record of the life, and the life can hold a
         // tombstone stamped **after** the drop (a delete of a write made after it): that is
@@ -5942,7 +5993,6 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use kimmy_core::Epoch;
     #[test]
     fn a_meter_a_panic_unwinds_through_is_put_back() {
         // A thread that survives a panic inside a metered call must not go
@@ -6517,6 +6567,7 @@ mod tests {
         const RAW: &[&str] = &[
             "open_cleared_forced",
             "load_or_create_node_id",
+            "load_or_mint_epoch",
             "repair_arrival_index_from_oplog",
             "rebuild_stamp_half_from_positions",
             "rebuild_version_vector_if_stale",
@@ -6832,7 +6883,7 @@ mod tests {
     #[test]
     fn stamps_are_strictly_increasing() {
         let (engine, _dir) = engine();
-        let mut previous = Stamp::new(Hlc::ZERO, engine.node_id(), Epoch::ZERO);
+        let mut previous = Stamp::new(Hlc::ZERO, engine.node_id(), engine.epoch());
         for _ in 0..1000 {
             let next = engine.next_stamp();
             assert!(next > previous, "{next:?} did not exceed {previous:?}");

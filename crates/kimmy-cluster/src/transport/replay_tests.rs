@@ -176,7 +176,7 @@ async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
 fn own_entry(f: &Fixture, hlc: Hlc, id: &str) -> OplogEntry {
     let orders = f.a.get_collection("shop", "orders").unwrap();
     OplogEntry {
-        stamp: Stamp::new(hlc, f.a.node_id(), Epoch::ZERO),
+        stamp: Stamp::new(hlc, f.a.node_id(), f.a.epoch()),
         kind: OpKind::Insert,
         collection: orders.id,
         doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -458,7 +458,7 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     // lacks them.
     let backup_at = writer.version_vector().unwrap().get(writer.origin());
     let lost = OplogEntry {
-        stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, 0), writer.node_id(), Epoch::ZERO),
+        stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, 0), writer.node_id(), writer.epoch()),
         kind: OpKind::Insert,
         collection: elsewhere.id,
         doc_id: Some(kimmy_core::DocId::String("lost".into())),

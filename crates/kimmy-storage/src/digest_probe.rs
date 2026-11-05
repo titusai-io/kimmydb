@@ -1079,8 +1079,8 @@ mod tests {
         (a, b, orders, items, [da, db])
     }
 
-    fn old_stamp(node: NodeId) -> Stamp {
-        Stamp::new(Hlc::new(1, 0), node, Epoch::ZERO)
+    fn old_stamp(origin: kimmy_core::Origin) -> Stamp {
+        Stamp::new(Hlc::new(1, 0), origin.node, origin.epoch)
     }
 
     #[test]
@@ -1112,7 +1112,7 @@ mod tests {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 3i64, "n": -1 }).unwrap();
-            let record = kimmy_core::DocRecord::live(old_stamp(a.node_id()), body);
+            let record = kimmy_core::DocRecord::live(old_stamp(a.origin()), body);
             crate::live_count::put_record(
                 &txn,
                 &mut docs,
@@ -1253,7 +1253,7 @@ mod tests {
         let (a, b, orders, items, _dirs) = converged();
         // An origin that wrote once, long ago, on both: it stays in both
         // vectors at its last stamp for ever (a reseeded member's old id).
-        let old = NodeId::generate();
+        let old = kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO);
         for e in [&a, &b] {
             // In the collection that goes busy below: the frozen origin is in
             // its row, covered, and must not pull the scan's start back.
@@ -1556,7 +1556,7 @@ mod tests {
         let (a, b, orders, _items, _dirs) = converged();
         // A drop stamped exactly at the creation of the life standing: the
         // life is not newer than the drop.
-        let tie = Stamp::new(orders.created, a.node_id(), Epoch::ZERO);
+        let tie = Stamp::new(orders.created, a.node_id(), a.epoch());
         a.record_collection_drop(orders.id, tie).unwrap();
         let verdicts = exchange(&a, &b, None);
         assert_eq!(
@@ -1637,7 +1637,7 @@ mod tests {
         // The drop lands on A alone and above everything B has witnessed: the
         // cut does not cover it, so every collection of the database defers.
         let future =
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), Epoch::ZERO);
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
         a.record_database_tombstone_for_test(db_drop, future).unwrap();
         let verdicts = exchange(&a, &b, None);
         for id in [orders.id, items.id, late.id] {
@@ -1967,7 +1967,7 @@ mod tests {
         let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
         a.record_database_tombstone_for_test(
             kimmy_core::database_drop_id("shop"),
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id(), Epoch::ZERO),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id(), a.epoch()),
         )
         .unwrap();
         let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();

@@ -8832,7 +8832,11 @@ async fn the_replay_moves_the_clock_past_the_lost_writes() {
     // A write this member made an hour ahead of the clock it will restart with.
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.engine.node_id(), Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(
+            Hlc::new(ahead, 0),
+            writer.engine.node_id(),
+            writer.engine.epoch(),
+        ),
         kind: kimmy_core::OpKind::Insert,
         collection: meta.id,
         doc_id: Some(DocId::String("99".into())),

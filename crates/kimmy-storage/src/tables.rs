@@ -303,6 +303,18 @@ pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
 
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
+
+/// `META`: this member's current epoch, 18 bytes (`kimmy_core::Epoch`): the HLC of the open
+/// that minted it and 64 random bits. The incarnation part of the origin every local write is
+/// stamped with.
+///
+/// **Not carried across a restore**: a backup copies `META` whole, but `restore_with` skips this
+/// row (as it skips `redb_version`), so a restored store has none and its first open mints a
+/// fresh one: the writes the restore threw away stay owed
+/// under the old epoch, and the new writes cannot be mistaken for them. `rewind_to` clears it in
+/// its own transaction, so the next open mints a new epoch there too. Minted at the open that
+/// finds no row, never from a value read from the store.
+pub const META_EPOCH: &str = "epoch";
 pub const META_FORMAT_VERSION: &str = "format_version";
 /// Left over from counter-allocated collection ids. Ids are derived from the
 /// collection name now, so nothing reads this; it is kept so that a database

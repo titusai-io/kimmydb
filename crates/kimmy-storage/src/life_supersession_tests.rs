@@ -594,7 +594,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     c.insert(&on_c, doc! { "_id": 2 }).unwrap();
     let mut page = c.snapshot_page(None, None).unwrap();
     assert!(page.next.is_none(), "premise: one page");
-    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id(), Epoch::ZERO);
+    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id(), a.epoch());
     for (id, stamp) in page.dropped_collections.iter_mut() {
         if *id == orders_id() {
             *stamp = other;

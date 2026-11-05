@@ -369,7 +369,7 @@ fn a_page_whose_sender_dropped_the_collection_ends_the_pull_abandoned() {
     let (a, b, _d) = pair();
     let mut progress = SnapshotProgress::of_collection_definitions(orders(), BIG);
     let mut page = a.snapshot_page(None, progress.scope()).unwrap();
-    page.dropped = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), a.node_id(), Epoch::ZERO));
+    page.dropped = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), a.node_id(), a.epoch()));
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert!(done.sender_dropped);
     assert_eq!(done.definitions, DefinitionRestore::default());

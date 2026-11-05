@@ -5489,7 +5489,7 @@ mod tests {
                 stamp: Stamp::new(
                     a.version_vector().unwrap().get(a.origin()),
                     a.node_id(),
-                    Epoch::ZERO,
+                    a.epoch(),
                 ),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 424_242, "v": 2 }).unwrap()),
             }],
@@ -5972,7 +5972,7 @@ mod tests {
         // A denial of the very collection the receiver holds, at a stamp above
         // its incarnation -- which on the whole-database route would take it.
         page.dropped_collections =
-            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO))];
+            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()))];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
             .unwrap();
@@ -6012,8 +6012,8 @@ mod tests {
              shows the denial is not a stale echo of something the sender dropped"
         );
         page.dropped_collections = vec![
-            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO)),
-            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO)),
+            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
+            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
         ];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6321,7 +6321,7 @@ mod tests {
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
             key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
-            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), Epoch::ZERO),
+            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -6495,8 +6495,8 @@ mod tests {
         let floor = cb.incarnation_floor.expect("the fixture must restore a floor");
 
         let below = crate::physical_now_ms();
-        let document = Stamp::new(Hlc::new(below, 0), c.node_id(), Epoch::ZERO);
-        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id(), Epoch::ZERO);
+        let document = Stamp::new(Hlc::new(below, 0), c.node_id(), c.epoch());
+        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id(), c.epoch());
         assert!(delete.hlc < floor, "premise: both sit below the floor");
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
@@ -7501,7 +7501,7 @@ mod tests {
         let far = Stamp::new(
             Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
             a.node_id(),
-            Epoch::ZERO,
+            a.epoch(),
         );
         page.deleted_documents[0].stamp = far;
         page.versions.insert(far.origin(), far.hlc);
@@ -7631,7 +7631,8 @@ mod tests {
     fn a_live_write_below_a_bare_or_appended_tombstone_still_loses() {
         let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
         let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
-        let older = Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node, Epoch::ZERO);
+        let older =
+            Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node, delete.stamp.epoch);
         let write = OplogEntry {
             stamp: older,
             kind: OpKind::Insert,
@@ -8132,7 +8133,7 @@ mod tests {
         page.deleted_documents.clear();
         let held = b.get_collection("shop", "orders").unwrap();
         let newer =
-            Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id(), Epoch::ZERO);
+            Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id(), a.epoch());
         for state in &mut page.collections {
             if state.name == "orders" {
                 state.vector = Some(kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
@@ -9018,7 +9019,7 @@ mod tests {
         let newer = Stamp::new(
             held.vector_changed.unwrap().hlc.successor(),
             held.vector_changed.unwrap().node,
-            Epoch::ZERO,
+            held.vector_changed.unwrap().epoch,
         );
         for state in &mut page.collections {
             if state.name == "orders" {
@@ -9043,8 +9044,8 @@ mod tests {
         let (a, _da, b, _db) = both_hold_a_configuration();
         let held = b.get_collection("shop", "orders").unwrap();
         let first = held.vector_changed.unwrap();
-        let second = Stamp::new(first.hlc.successor(), first.node, Epoch::ZERO);
-        let third = Stamp::new(second.hlc.successor(), first.node, Epoch::ZERO);
+        let second = Stamp::new(first.hlc.successor(), first.node, first.epoch);
+        let third = Stamp::new(second.hlc.successor(), first.node, first.epoch);
         let page_at = |stamp: Stamp, config: kimmy_core::VectorConfig| {
             let mut page = a.snapshot_page(None, None).unwrap();
             page.collections.retain(|state| state.name == "orders");

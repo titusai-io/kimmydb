@@ -928,7 +928,7 @@ mod tests {
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2, 5]), vec![2, 5]);
         let id = CollectionId::derive("shop", "orders");
         let dropped = *b.collection_tombstones().unwrap().get(&id).unwrap();
-        let dropped = Stamp::new(dropped, a.node_id(), Epoch::ZERO);
+        let dropped = Stamp::new(dropped, a.node_id(), a.epoch());
         assert!(!owes_a_sweep(&b.get_collection("shop", "orders").unwrap(), dropped.hlc));
         assert_eq!(
             b.sweep_late_drop("shop", "orders", dropped).unwrap(),
@@ -1138,7 +1138,7 @@ mod tests {
             Engine::put_collection_meta(&txn, &meta).unwrap();
             txn.commit().unwrap();
         }
-        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node, Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node, dropped.epoch);
         {
             let key = crate::docs::doc_key(&DocId::Int64(1_000_000)).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1_000_000i64 }).unwrap();
@@ -1847,7 +1847,7 @@ mod tests {
                 created: Some(Stamp::new(
                     Hlc::new(dropped.hlc.wall_ms - 1, 0),
                     a.node_id(),
-                    Epoch::ZERO,
+                    a.epoch(),
                 )),
             },
         };
@@ -2145,7 +2145,7 @@ mod tests {
         let (d, _dd) = engine();
         let base = crate::engine::physical_now_ms() + 3_600_000;
         let at = |e: &Engine, t: u64| {
-            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id(), Epoch::ZERO));
+            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id(), e.epoch()));
         };
         let scoped = |into: &Engine, from: &Engine, id| {
             let mut progress = crate::SnapshotProgress::of_collection(id);

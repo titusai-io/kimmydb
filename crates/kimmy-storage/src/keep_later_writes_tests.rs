@@ -819,39 +819,35 @@ fn a_start_sweeps_the_parent_before_its_shadow() {
 #[test]
 fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
-    let reaches = |e: &Engine, node: kimmy_core::NodeId, at: Hlc, how: &str| {
+    let reaches = |e: &Engine, origin: kimmy_core::Origin, at: Hlc, how: &str| {
         let row = e.digest_row(id).unwrap().unwrap_or_else(|| panic!("{how}: no row"));
-        let held = row
-            .maxw
-            .get(&kimmy_core::Origin::new(node, kimmy_core::Epoch::ZERO))
-            .copied()
-            .unwrap_or(Hlc::ZERO);
+        let held = row.maxw.get(&origin).copied().unwrap_or(Hlc::ZERO);
         assert!(held >= at, "{how}: maxw {held:?} is below the record's {at:?}");
     };
     // A local insert and a local delete (a tombstone).
     let on_d = d.get_collection("shop", "orders").unwrap();
     later();
     let (_, inserted) = d.insert_stamped(&on_d, doc! { "_id": 7i64 }).unwrap();
-    reaches(&d, d.node_id(), inserted.hlc, "a local insert");
+    reaches(&d, d.origin(), inserted.hlc, "a local insert");
     later();
     assert!(d.delete(&on_d, &DocId::Int64(7)).unwrap());
     let deleted = d.version_vector().unwrap().get(d.origin());
-    reaches(&d, d.node_id(), deleted, "a local delete");
+    reaches(&d, d.origin(), deleted, "a local delete");
     // A replicated insert from a peer.
     later();
     let on_a = a.get_collection("shop", "orders").unwrap();
     let (_, replicated) = a.insert_stamped(&on_a, doc! { "_id": 8i64 }).unwrap();
     sync(&a, &d);
-    reaches(&d, a.node_id(), replicated.hlc, "a replicated insert");
+    reaches(&d, a.origin(), replicated.hlc, "a replicated insert");
     // A record a snapshot page carries.
     later();
     let (_, carried) = a.insert_stamped(&on_a, doc! { "_id": 9i64 }).unwrap();
     let page = a.snapshot_page(None, None).unwrap();
     d.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-    reaches(&d, a.node_id(), carried.hlc, "a record from a snapshot page");
+    reaches(&d, a.origin(), carried.hlc, "a record from a snapshot page");
     // The tombstones a sweep writes with no entry behind them: at the drop's stamp.
     let drop_at = Hlc::new(carried.hlc.wall_ms + 50, 0);
-    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id(), Epoch::ZERO);
+    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id(), a.epoch());
     let sweeper = d.get_collection("shop", "orders").unwrap();
     let mut newer = sweeper.clone();
     newer.created = Hlc::new(drop_at.wall_ms + 1, 0);
@@ -862,7 +858,7 @@ fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     }
     d.record_collection_drop(id, dropper).unwrap();
     d.sweep_late_drop("shop", "orders", dropper).unwrap();
-    reaches(&d, a.node_id(), drop_at, "a sweep's tombstone at the drop");
+    reaches(&d, a.origin(), drop_at, "a sweep's tombstone at the drop");
 }
 
 // -- The owed window ----------------------------------------------------------

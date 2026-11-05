@@ -39,6 +39,17 @@ impl Epoch {
         Self(b)
     }
 
+    /// A fresh epoch: `start`, the HLC of the operation that begins the incarnation, followed
+    /// by 64 random bits from the operating system's generator (a version-4 UUID's bytes that
+    /// carry no version or variant bits). Never derived from anything read from a store: two
+    /// restores of one backup at the same HLC still get different epochs.
+    pub fn generate(start: Hlc) -> Self {
+        let uuid = *uuid::Uuid::new_v4().as_bytes();
+        // bytes 6 (version) and 8 (variant) hold fixed bits; the other bytes are random
+        let random = [uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[7], uuid[9]];
+        Self::new(start, random)
+    }
+
     /// A small epoch for tests and models: `n` in the low 8 bytes.
     pub fn from_u64(n: u64) -> Self {
         let mut b = [0u8; Self::LEN];

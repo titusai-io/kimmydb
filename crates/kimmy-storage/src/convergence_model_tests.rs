@@ -47,7 +47,6 @@
 //! whether or not the writer had heard of it: ADR-236) must be on every member with
 //! that stamp.
 //!
-use kimmy_core::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -621,7 +620,7 @@ impl Cluster {
         e.advance_clock_past(&Stamp::new(
             Hlc::new(self.base + u64::from(t), 0),
             e.node_id(),
-            Epoch::ZERO,
+            e.epoch(),
         ));
     }
 
