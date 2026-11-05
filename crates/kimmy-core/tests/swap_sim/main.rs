@@ -213,7 +213,7 @@ mod tests {
         );
     }
 
-    /// Generate traces with the vendored tracer in the machine's small-job scope (256 MB, 60 s, no bytecode), or read a
+    /// Generate traces with the vendored tracer in the machine's small-job scope (256 MB, no bytecode; no wall-clock bound, the tracer is bounded by its event counts, so a loaded machine only makes it slower), or read a
     /// directory of traces made elsewhere (`Q6DIFF_DIR`, for the large samples generated under the Python lane).
     fn trace_dir(tag: &str, kind: &str, args: &[&str]) -> std::path::PathBuf {
         if let Ok(d) = std::env::var("Q6DIFF_DIR") {
@@ -226,7 +226,7 @@ mod tests {
         let tracer = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/swap_sim/reference_model/q6diff_gen.py");
         let st = std::process::Command::new("systemd-run")
-            .args(["--user", "--scope", "-q", "-p", "MemoryMax=256M", "-p", "MemorySwapMax=0", "-p", "TasksMax=16", "--", "timeout", "60", "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B"])
+            .args(["--user", "--scope", "-q", "-p", "MemoryMax=256M", "-p", "MemorySwapMax=0", "-p", "TasksMax=16", "--", "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B"])
             .arg(&tracer)
             .arg(kind)
             .arg(&dir)
@@ -370,8 +370,6 @@ mod tests {
                         "-p",
                         "TasksMax=16",
                         "--",
-                        "timeout",
-                        "60",
                         "env",
                         "PYTHONDONTWRITEBYTECODE=1",
                         "python3",

@@ -300,9 +300,11 @@ impl Member {
         let pd = j.pl.phys.get(&name).expect("a page of the payload").clone();
         let ungranted = !j.granted;
         let dp_state = self.phys.get(&name).map(|p| p.alive);
-        if w.policy == Policy::Document && w.witness_pages {
+        if w.policy == Policy::Document && w.witness_pages && matches!(dp_state, None | Some(true))
+        {
             // the metamorphic runs: the document policy witnesses a page's versions' stamps as the field policy does its
-            // states' version vectors (equal on a workload where each document's latest write is its greatest stamp)
+            // states' version vectors (equal on a workload where each document's latest write is its greatest stamp), and for
+            // the same pages: those of a physical not held here or alive here (the field policy does not witness a dead one's)
             self.witness_docs(w, &pd.docs);
         }
         match dp_state {
