@@ -60,6 +60,11 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// A register event (the swap register's: a binding, a recreate or a logical drop).
+    pub fn is_register_event(self) -> bool {
+        matches!(self, Kind::Bind | Kind::Lcreate | Kind::Ldrop)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Kind::Doc => "doc",

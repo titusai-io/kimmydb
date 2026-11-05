@@ -62,6 +62,12 @@ pub struct World {
     pub in_order: bool,
     /// the run's steps are over and the end-of-run delivery is running (`swapmodel6a.py` `w.quiescing`)
     pub quiescing: bool,
+    /// a register event taken out of position is an invariant violation (set by the random run when it has no model route; the
+    /// scripted scenarios take one out of position on purpose, and the replay follows the model's own invariants)
+    pub reg_in_position_check: bool,
+    /// the product routes: an entry held out of position is not covered (the servable vector skips it); the model's hold route
+    /// counts a held entry as covered, and the differential is made with this off
+    pub held_uncovered: bool,
     pub steps_end: i64,
     /// replay hooks: the page order and the tombstone choice the traced model drew (consumed by the next call)
     pub forced_pages: Option<Vec<String>>,
@@ -103,6 +109,8 @@ impl World {
             trace,
             in_order: true,
             quiescing: false,
+            reg_in_position_check: false,
+            held_uncovered: false,
             steps_end: 0,
             forced_pages: None,
             forced_choice: None,

@@ -56,7 +56,12 @@ pub struct Flags {
     pub fm_k_drop_newest: bool,
     pub fm_k_plus_one: bool,
     pub fm_k_ignore_q7: bool,
+    /// Rust-only mutant of the product routes: `doc_hold` also delivers register events out of position
+    pub fm_register_ahead: bool,
 }
+
+/// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
+pub const ROUTE_MUTANTS: [&str; 1] = ["m-register-ahead"];
 
 /// The Rust-only mutants of the `K` bound (graded on the `K = 4` grid).
 pub const K_MUTANTS: [&str; 3] = [
@@ -208,6 +213,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-field-k-drop-newest" => f.fm_k_drop_newest = true,
         "m-field-k-plus-one" => f.fm_k_plus_one = true,
         "m-field-k-ignore-q7" => f.fm_k_ignore_q7 = true,
+        "m-register-ahead" => f.fm_register_ahead = true,
         _ => return false,
     }
     true
@@ -251,7 +257,7 @@ mod tests {
 
     #[test]
     fn every_field_mutant_name_is_known_and_changes_a_flag() {
-        for m in FIELD_MUTANTS.into_iter().chain(K_MUTANTS) {
+        for m in FIELD_MUTANTS.into_iter().chain(K_MUTANTS).chain(ROUTE_MUTANTS) {
             let base = flags_for("v6", "v6");
             let f = flags_for(m, "v6");
             assert_ne!(format!("{base:?}"), format!("{f:?}"), "{m} changes nothing");

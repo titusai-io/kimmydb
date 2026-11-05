@@ -48,7 +48,8 @@ impl Member {
     pub fn next_window_entry(&self, w: &World, src: &Member) -> Option<EntryRef> {
         src.appended
             .iter()
-            .filter(|&&i| !self.cv.has(i))
+            // an entry held out of position is not at the receiver's servable position: a window delivers it again (ADR-169)
+            .filter(|&&i| !self.cv.has(i) || (w.held_uncovered && self.held_oop.contains(&i)))
             .map(|&i| w.ent_rc(i))
             .min_by_key(|e| e.stamp)
     }
@@ -57,7 +58,9 @@ impl Member {
     /// without receiving them, the earlier entries of `e`'s origin that `src` holds but did not append.
     /// ADR-224: `src` refuses a window below a row it holds only as a COMPLETED snapshot's state.
     pub fn take_from(&mut self, w: &mut World, src: &Member, e: &EntryRef, quiesce: bool) -> Taken {
-        if self.cv.has(e.idx) {
+        // ADR-169: an entry held as state that arrives in a window contiguous from the receiver's position is released
+        let release = w.held_uncovered && self.held_oop.contains(&e.idx);
+        if self.cv.has(e.idx) && !release {
             return Taken::AlreadyHeld;
         }
         if !quiesce
@@ -80,9 +83,33 @@ impl Member {
                 self.cv.add(xid);
                 self.witness(&x);
                 w.stats.bump("witnessed_without_receiving");
+                if w.trace {
+                    w.note(format!(
+                        "{} witnesses {} without receiving it (window from {} for {})",
+                        self.name, x, src.name, e
+                    ));
+                }
             }
         }
+        if release {
+            self.held_oop.remove(&e.idx);
+            self.appended.insert(e.idx);
+            w.stats.bump("held_released_in_window");
+            return Taken::Received;
+        }
         self.take(w, e);
+        if w.held_uncovered
+            && w.by_origin[e.origin]
+                .iter()
+                .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                .any(|x| self.held_oop.contains(x))
+        {
+            // the servable position cannot pass an entry held out of position (docs/oplog.md:489-491: held entries sit above it):
+            // an entry that arrives behind one is itself held until its predecessors are released
+            self.appended.remove(&e.idx);
+            self.held_oop.insert(e.idx);
+            w.stats.bump("held_behind_held");
+        }
         Taken::Received
     }
 
@@ -150,6 +177,17 @@ pub fn take_quiesce(ms: &mut [Member], dst: usize, w: &mut World, e: &EntryRef) 
             d.take_from(w, s, e, true);
         }
         None => {
+            if w.held_uncovered && ms.iter().any(|m| !m.vanished && m.held_oop.contains(&e.idx)) {
+                // a live member holds it out of position and will serve it once it is in position: not witnessed away (the
+                // end-of-run delivery's shortcut is for an entry lost with a vanished member; REPORT6 (e))
+                return;
+            }
+            if w.trace {
+                w.note(format!(
+                    "{} witnesses {} at quiescence (no live member appended it)",
+                    ms[dst].name, e
+                ));
+            }
             ms[dst].cv.add(e.idx); // no live member appended it: it is only witnessed
             ms[dst].witness(e);
             w.stats.bump("witnessed_at_quiescence");
@@ -167,6 +205,9 @@ pub fn take_quiesce_replica(replica: &mut Member, ms: &[Member], w: &mut World, 
             replica.take_from(w, &ms[src], e, true);
         }
         None => {
+            if w.held_uncovered && ms.iter().any(|m| !m.vanished && m.held_oop.contains(&e.idx)) {
+                return;
+            }
             replica.cv.add(e.idx);
             replica.witness(e);
             w.stats.bump("witnessed_at_quiescence");
