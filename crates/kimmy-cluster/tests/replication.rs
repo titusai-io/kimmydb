@@ -1307,7 +1307,7 @@ async fn converged_after_a_long_silence() -> (Node, Node, Node, kimmy_core::Hlc)
     let cc = c.engine.get_collection("shop", "orders").unwrap();
     c.engine.insert(&cc, doc! { "_id": "c-before" }).unwrap();
     converge(&a, &b, &c).await;
-    let a_last = b.engine.witnessed_vector().unwrap().get(a.engine.node_id());
+    let a_last = b.engine.witnessed_vector().unwrap().get(a.engine.origin());
     assert!(a_last > kimmy_core::Hlc::ZERO);
 
     // 36 hours pass. Every member's clock moves, and the entry that moved it
@@ -1339,7 +1339,7 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
     for peer in [&b, &c] {
         // The bare span is the incident's number: A's new write against the
         // peer's coverage of A, which is A's write from before the silence.
-        let a_id = a.engine.node_id();
+        let a_id = a.engine.origin();
         let raw = a
             .engine
             .witnessed_vector()
@@ -1511,7 +1511,7 @@ async fn one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer() {
         .unwrap()
         .len();
     assert!(above > BUSY, "the fixture must put A's writes above C's position on B: {above}");
-    assert!(held.get(a.engine.node_id()) > from, "and C must already hold them");
+    assert!(held.get(a.engine.origin()) > from, "and C must already hold them");
 
     let started = std::time::Instant::now();
     let pulls = drain(&c, &b).await;
@@ -1552,10 +1552,10 @@ async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() 
     let cc = c.engine.get_collection("shop", "orders").unwrap();
     c.engine.insert(&cc, doc! { "_id": "c-later" }).unwrap();
     let held = c.engine.witnessed_vector().unwrap();
-    let c_own = held.get(c.engine.node_id());
-    let a_part = held.get(a.engine.node_id());
+    let c_own = held.get(c.engine.origin());
+    let a_part = held.get(a.engine.origin());
     assert!(
-        c_own > a.engine.version_vector().unwrap().get(a.engine.node_id()) && a_part < c_own,
+        c_own > a.engine.version_vector().unwrap().get(a.engine.origin()) && a_part < c_own,
         "the fixture must put C's newest stamp above everything of A's it lacks"
     );
 
@@ -1566,8 +1566,8 @@ async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() 
         "every write of A's C lacked arrives from B"
     );
     assert_eq!(
-        c.engine.witnessed_vector().unwrap().get(a.engine.node_id()),
-        b.engine.version_vector().unwrap().get(a.engine.node_id())
+        c.engine.witnessed_vector().unwrap().get(a.engine.origin()),
+        b.engine.version_vector().unwrap().get(a.engine.origin())
     );
 }
 
@@ -1582,9 +1582,9 @@ async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds()
     b.engine.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
     // B's newest write of its own, read by its stamp: `newest` scans the first
     // two batches of the oplog, and A's writes sit between them and this.
-    let b_id = b.engine.node_id();
+    let b_id = b.engine.origin();
     let stamp =
-        kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id, Epoch::ZERO);
+        kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id.node, b_id.epoch);
     let entry = b.engine.oplog_entry(&stamp).unwrap().expect("B's schema change");
     assert_eq!(entry.kind, kimmy_core::OpKind::CreateIndex);
 
@@ -1613,7 +1613,7 @@ async fn a_member_holding_a_repaired_entry_below_its_position()
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": "a0" }).unwrap();
     a.engine.insert(&ca, doc! { "_id": "s" }).unwrap();
-    let a_id = a.engine.node_id();
+    let a_id = a.engine.origin();
     let s = a.engine.version_vector().unwrap().get(a_id);
 
     let history = a
@@ -1623,7 +1623,7 @@ async fn a_member_holding_a_repaired_entry_below_its_position()
     let holed: Vec<kimmy_core::OplogEntry> = history
         .entries
         .iter()
-        .filter(|e| !(e.stamp.node == a_id && e.stamp.hlc == s))
+        .filter(|e| !(e.stamp.origin() == a_id && e.stamp.hlc == s))
         .cloned()
         .collect();
     assert_eq!(holed.len() + 1, history.entries.len());
@@ -1633,7 +1633,7 @@ async fn a_member_holding_a_repaired_entry_below_its_position()
     let mut progress = kimmy_storage::SnapshotProgress::of_collection(ca.id);
     while !progress.is_complete() {
         let page = a.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        r.engine.apply_snapshot_page(a_id, &mut progress, &page).unwrap();
+        r.engine.apply_snapshot_page(a_id.node, &mut progress, &page).unwrap();
     }
 
     let cr = r.engine.get_collection("shop", "orders").unwrap();
@@ -1661,7 +1661,7 @@ async fn a_held_entry_below_the_members_position_is_released_by_its_next_pull() 
     assert!(outcome.exhausted && !outcome.truncated, "one pull: {outcome:?}");
     assert_eq!(outcome.superseded, 1, "S alone is served: {outcome:?}");
     assert_eq!(
-        r.engine.version_vector().unwrap().get(a.engine.node_id()),
+        r.engine.version_vector().unwrap().get(a.engine.origin()),
         s,
         "released: R advertises S"
     );
@@ -1879,11 +1879,13 @@ async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stam
     let r = node().await;
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     sync(&a, &r).await;
-    let l = kimmy_core::NodeId::from_bytes([1; 16]);
-    let o = kimmy_core::NodeId::from_bytes([2; 16]);
+    let l =
+        kimmy_core::Origin::new(kimmy_core::NodeId::from_bytes([1; 16]), kimmy_core::Epoch::ZERO);
+    let o =
+        kimmy_core::Origin::new(kimmy_core::NodeId::from_bytes([2; 16]), kimmy_core::Epoch::ZERO);
     let base = kimmy_storage::physical_now_ms() + 1_000;
-    let entry = |origin: kimmy_core::NodeId, wall: u64, id: String| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
+    let entry = |origin: kimmy_core::Origin, wall: u64, id: String| kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection: ca.id,
         doc_id: Some(DocId::String(id.clone())),
@@ -1905,7 +1907,9 @@ async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stam
     let holes = [DocId::String("o1".into()), DocId::String("o1024".into())];
     let r_window: Vec<kimmy_core::OplogEntry> = history
         .iter()
-        .filter(|e| e.stamp.node == o && !e.doc_id.as_ref().is_some_and(|id| holes.contains(id)))
+        .filter(|e| {
+            e.stamp.origin() == o && !e.doc_id.as_ref().is_some_and(|id| holes.contains(id))
+        })
         .cloned()
         .collect();
     r.engine.apply_peer_batch(&r_vector, &r_window, Hlc::new(h, 0), true).unwrap();
@@ -1987,7 +1991,7 @@ async fn a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_
     assert_eq!(
         r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap(),
         vec![kimmy_storage::MarkedRange {
-            origin: x,
+            origin: kimmy_core::Origin::new(x, kimmy_core::Epoch::ZERO),
             from: history[10].stamp.hlc,
             through: history[2_900].stamp.hlc
         }],
@@ -2214,7 +2218,7 @@ async fn a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapsh
     );
     assert_eq!(outcome.applied, 1, "R takes the later write: {outcome:?}");
     assert!(
-        r.engine.version_vector().unwrap().get(a.engine.node_id()) < s,
+        r.engine.version_vector().unwrap().get(a.engine.origin()) < s,
         "S is gone from A, so R's mark stays for R's own retention"
     );
 }
@@ -3503,10 +3507,10 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
 
     let b = node().await;
     let coll = b.engine.create_collection("shop", "orders").unwrap();
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -3535,7 +3539,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                         return;
                     };
                     let welcome = Message::Welcome {
-                        node: origin,
+                        node: origin.node,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
                         protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -4903,7 +4907,7 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
     // A drops it while B is repairing from A.
     assert!(a.engine.drop_collection("shop", "bench").unwrap());
     let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
-    let minted = b.engine.version_vector().unwrap().get(b.engine.node_id());
+    let minted = b.engine.version_vector().unwrap().get(b.engine.origin());
 
     let mut stalls = PeerStalls::new();
     assert!(stalls.plan_repair(a.engine.node_id(), ca.id, Repair::Snapshot));
@@ -4923,7 +4927,7 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
         "the tombstone is at A's stamp, not B's clock"
     );
     assert_eq!(
-        b.engine.version_vector().unwrap().get(b.engine.node_id()),
+        b.engine.version_vector().unwrap().get(b.engine.origin()),
         minted,
         "a replicated drop mints no entry here"
     );
@@ -5030,7 +5034,7 @@ async fn a_repair_whose_sender_drops_the_collection_between_pages_discards_the_p
     // finds out.
     assert!(a.engine.drop_collection("shop", "bench").unwrap());
     let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
-    let minted = b.engine.version_vector().unwrap().get(b.engine.node_id());
+    let minted = b.engine.version_vector().unwrap().get(b.engine.origin());
 
     let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
     assert!(outcome.repairing, "the resumed round is the repair: {outcome:?}");
@@ -5050,7 +5054,7 @@ async fn a_repair_whose_sender_drops_the_collection_between_pages_discards_the_p
         "the tombstone is at A's stamp, not B's clock"
     );
     assert_eq!(
-        b.engine.version_vector().unwrap().get(b.engine.node_id()),
+        b.engine.version_vector().unwrap().get(b.engine.origin()),
         minted,
         "a replicated drop mints no entry here"
     );
@@ -6679,7 +6683,7 @@ async fn an_origin_that_can_serve_m_and_a_member_with_a_hole() -> (Node, Node, N
     a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
     let m = node().await;
     sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
-    let first = m.engine.version_vector().unwrap().get(a.engine.node_id());
+    let first = m.engine.version_vector().unwrap().get(a.engine.origin());
 
     tokio::time::sleep(Duration::from_millis(30)).await;
     a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
@@ -7412,10 +7416,10 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
         .engine
         .get_collection("shop", "orders")
         .unwrap_or_else(|_| b.engine.create_collection("shop", "orders").unwrap());
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -7438,7 +7442,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                     return;
                 };
                 let welcome = Message::Welcome {
-                    node: origin,
+                    node: origin.node,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
                     protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -7532,10 +7536,10 @@ async fn a_wedged_pull_with_a_foreign_push_mid_apply_is_not_advanced() {
 async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
     use kimmy_cluster::protocol::prove;
     let coll = b.engine.create_collection("shop", "orders").unwrap();
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -7557,7 +7561,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                     return;
                 };
                 let welcome = Message::Welcome {
-                    node: origin,
+                    node: origin.node,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
                     protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -7614,8 +7618,8 @@ async fn a_second_pull_of_a_contact_is_judged_against_its_own_held() {
 #[tokio::test]
 async fn only_self_coverage_is_not_coverage_raised() {
     let b = node().await;
-    let local = b.engine.node_id();
-    let other = kimmy_core::NodeId::generate();
+    let local = b.engine.origin();
+    let other = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let mine = b.engine.witnessed_vector().unwrap();
     let mut theirs = kimmy_core::VersionVector::new();
     theirs.insert(local, Hlc::new(u64::MAX / 4, 0));
@@ -7649,10 +7653,10 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
         .engine
         .get_collection("shop", "orders")
         .unwrap_or_else(|_| b.engine.create_collection("shop", "orders").unwrap());
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String("d0".into())),
@@ -7675,7 +7679,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                     return;
                 };
                 let welcome = Message::Welcome {
-                    node: origin,
+                    node: origin.node,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
                     protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -8051,10 +8055,10 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
 
     let d = node().await;
     let coll = d.engine.create_collection("shop", "orders").unwrap();
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -8080,7 +8084,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                         return;
                     };
                     let welcome = Message::Welcome {
-                        node: origin,
+                        node: origin.node,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
                         protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -8217,10 +8221,10 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
 
     let b = node().await;
     let coll = b.engine.create_collection("shop", "orders").unwrap();
-    let origin = kimmy_core::NodeId::generate();
+    let origin = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
     let collection = coll.id;
     let entry = move |n: u64| kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin.node, origin.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
@@ -8246,7 +8250,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                         return;
                     };
                     let welcome = Message::Welcome {
-                        node: origin,
+                        node: origin.node,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
                         protocol: Some(kimmy_cluster::protocol::PROTOCOL),
@@ -8801,7 +8805,7 @@ async fn a_member_that_lost_nothing_does_not_mark_itself() {
     // member's origin above the position the store had at open.
     sync_once(&scenario.peer.engine, scenario.restored.addr, SECRET, None).await.unwrap();
     assert!(
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id())
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin())
             > scenario.restored.engine.own_position_at_open(),
         "premise: the peer holds this run's own writes"
     );
@@ -8853,7 +8857,7 @@ async fn the_replay_moves_the_clock_past_the_lost_writes() {
     assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
 
     restored.engine.insert(&here, doc! { "_id": "after" }).unwrap();
-    let mine = restored.engine.version_vector().unwrap().get(restored.engine.node_id());
+    let mine = restored.engine.version_vector().unwrap().get(restored.engine.origin());
     assert!(
         mine > lost.stamp.hlc,
         "a write after the replay is stamped above the lost one: {mine:?} against {:?}",
@@ -8950,8 +8954,8 @@ async fn a_peer_with_a_hole_at_the_restored_members_origin(scenario: &LostTail) 
     let hole = node().await;
     sync_once(&hole.engine, scenario.peer.addr, SECRET, None).await.unwrap();
     assert_eq!(
-        hole.engine.state_held().unwrap().get(scenario.restored.engine.node_id()),
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id()),
+        hole.engine.state_held().unwrap().get(scenario.restored.engine.origin()),
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin()),
         "premise: its hole reaches the restored member's newest write"
     );
     hole
@@ -9024,7 +9028,7 @@ async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
     let peer = node().await;
     let meta = writer.engine.create_collection("shop", "orders").unwrap();
     writer.engine.insert_many(&meta, (0..2i64).map(|i| doc! { "_id": i }).collect()).unwrap();
-    let old_floor = writer.engine.version_vector().unwrap().get(writer.engine.node_id());
+    let old_floor = writer.engine.version_vector().unwrap().get(writer.engine.origin());
     writer.engine.insert_many(&meta, (2..4i64).map(|i| doc! { "_id": i }).collect()).unwrap();
     while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
         sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
@@ -9392,7 +9396,7 @@ async fn a_peer_that_holds_nothing_more_of_this_members_origin_answers_the_repla
     let catch_up = marker_in(&marker_dir);
     catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
     assert_eq!(
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id()),
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin()),
         scenario.restored.engine.own_position_at_open(),
         "premise: the peer holds exactly what the store held of this origin"
     );
@@ -9412,10 +9416,10 @@ async fn a_peer_that_holds_nothing_more_of_this_members_origin_answers_the_repla
 async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
     let scenario = lost_tail(2, 0, true).await;
     let peer_only = scenario.peer.engine.create_collection("shop", "peer_only").unwrap();
-    let me = scenario.restored.engine.node_id();
+    let me = scenario.restored.engine.origin();
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me, Epoch::ZERO),
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me.node, me.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection: peer_only.id,
         doc_id: Some(DocId::String("lost".into())),
@@ -9446,7 +9450,7 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
 async fn a_start_that_wrote_and_stopped_before_a_peer_leaves_the_replay_its_floor() {
     let scenario = lost_tail(2, 3, true).await;
     let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
-    let me = scenario.restored.engine.node_id();
+    let me = scenario.restored.engine.origin();
     let backup_position = scenario.peer.engine.version_vector().unwrap().get(me);
     assert!(backup_position > Hlc::ZERO);
 

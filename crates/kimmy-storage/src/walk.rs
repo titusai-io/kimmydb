@@ -590,7 +590,10 @@ mod tests {
         type Walk = fn(&Engine, &crate::CollectionMeta) -> Result<()>;
         // A peer's marks, as a snapshot leaves them, so the marks' walk has
         // rows to be stopped among.
-        const HELD_ORIGIN: kimmy_core::NodeId = kimmy_core::NodeId::from_bytes([7; 16]);
+        const HELD_ORIGIN: kimmy_core::Origin = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([7; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         // Documents, a unique index over them, a compound one that cannot key
         // the documents with two arrays, documents holding a Decimal128 (a
         // partial index once held them in ADR-185's undecidable run, gone
@@ -664,8 +667,11 @@ mod tests {
             {
                 let mut held = txn.open_table(crate::tables::OPLOG_HELD).unwrap();
                 for wall_ms in 1..=10 {
-                    let stamp =
-                        kimmy_core::Stamp::new(Hlc::new(wall_ms, 0), HELD_ORIGIN, Epoch::ZERO);
+                    let stamp = kimmy_core::Stamp::new(
+                        Hlc::new(wall_ms, 0),
+                        HELD_ORIGIN.node,
+                        HELD_ORIGIN.epoch,
+                    );
                     held.insert(crate::codec::oplog_key(&stamp).as_slice(), ()).unwrap();
                 }
             }

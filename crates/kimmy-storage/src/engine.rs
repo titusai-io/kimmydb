@@ -1,6 +1,6 @@
 //! The storage engine.
 
-use kimmy_core::Epoch;
+use kimmy_core::{Epoch, Origin};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1535,7 +1535,8 @@ impl Engine {
         info!(node = %node_id, path = %path.display(), "storage engine open");
 
         // Read before anything of this run can write under this origin.
-        let own_position_at_open = Self::read_versions(&db, tables::OPLOG_VERSIONS)?.get(node_id);
+        let own_position_at_open = Self::read_versions(&db, tables::OPLOG_VERSIONS)?
+            .get(Origin::new(node_id, Epoch::ZERO));
         let engine = Self {
             db,
             health,
@@ -2081,6 +2082,14 @@ impl Engine {
         self.node_id
     }
 
+    /// The origin this member writes under: its node and its epoch.
+    ///
+    /// Until the epoch is minted at open (a later commit of this series) the epoch is
+    /// [`Epoch::ZERO`].
+    pub fn origin(&self) -> Origin {
+        Origin::new(self.node_id, Epoch::ZERO)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -2581,12 +2590,12 @@ impl Engine {
         let txn = db.begin_write()?;
         if raised {
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-            for (node, hlc) in stored.iter() {
-                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            for (origin, hlc) in stored.iter() {
+                versions.insert(origin.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
             let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
-            for (node, hlc) in witnessed.iter() {
-                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            for (origin, hlc) in witnessed.iter() {
+                seen.insert(origin.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
         // Not when the walk found the arrival index damaged: the caller repairs
@@ -2797,7 +2806,7 @@ impl Engine {
             let table = txn.open_table(tables::OPLOG_COLLECTED)?;
             for row in table.iter()? {
                 let (node, hlc) = row?;
-                collected.insert(decode_node(node.value())?, decode_hlc(hlc.value())?);
+                collected.insert(decode_origin(node.value())?, decode_hlc(hlc.value())?);
             }
         }
         let mut lowered = 0usize;
@@ -2810,18 +2819,18 @@ impl Engine {
             let mut lower = Vec::new();
             for row in vector.iter()? {
                 let (node, hlc) = row?;
-                let node = decode_node(node.value())?;
+                let origin = decode_origin(node.value())?;
                 let before = decode_hlc(hlc.value())?;
                 let mut after = before.min(until);
                 if let Some(floor) = floor {
-                    after = after.min(floor.max(kept.get(node)).max(collected.get(node)));
+                    after = after.min(floor.max(kept.get(origin)).max(collected.get(origin)));
                 }
                 if after < before {
-                    lower.push((node, after));
+                    lower.push((origin, after));
                 }
             }
-            for (node, after) in lower {
-                vector.insert(node.to_bytes().as_slice(), after.to_bytes().as_slice())?;
+            for (origin, after) in lower {
+                vector.insert(origin.to_bytes().as_slice(), after.to_bytes().as_slice())?;
                 lowered += 1;
             }
         }
@@ -2851,7 +2860,7 @@ impl Engine {
         let mut out = kimmy_core::VersionVector::new();
         for row in versions.iter()? {
             let (node, hlc) = row?;
-            out.insert(decode_node(node.value())?, decode_hlc(hlc.value())?);
+            out.insert(decode_origin(node.value())?, decode_hlc(hlc.value())?);
         }
         Ok(out)
     }
@@ -3081,12 +3090,12 @@ impl Engine {
         let mut out = kimmy_core::VersionVector::new();
         for row in meta.range(tables::META_STATE_HELD_PREFIX..tables::META_STATE_HELD_END)? {
             let (key, value) = row?;
-            let node = key
+            let origin = key
                 .value()
                 .strip_prefix(tables::META_STATE_HELD_PREFIX)
-                .and_then(|node| node.parse::<NodeId>().ok())
-                .ok_or_else(|| StorageError::Corrupt("a state_held key is not a node id".into()))?;
-            out.insert(node, decode_hlc(value.value())?);
+                .and_then(|origin| origin.parse::<Origin>().ok())
+                .ok_or_else(|| StorageError::Corrupt("a state_held key is not an origin".into()))?;
+            out.insert(origin, decode_hlc(value.value())?);
         }
         Ok(out)
     }
@@ -3097,7 +3106,7 @@ impl Engine {
     fn record_state_held_in_txn(txn: &redb::WriteTransaction, stamp: &Stamp) -> Result<bool> {
         let servable = {
             let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-            let current = versions.get(stamp.node.to_bytes().as_slice())?;
+            let current = versions.get(stamp.origin().to_bytes().as_slice())?;
             match current {
                 Some(current) => decode_hlc(current.value())?,
                 None => Hlc::ZERO,
@@ -3106,7 +3115,7 @@ impl Engine {
         if stamp.hlc <= servable {
             return Ok(false);
         }
-        let key = format!("{}{}", tables::META_STATE_HELD_PREFIX, stamp.node);
+        let key = format!("{}{}", tables::META_STATE_HELD_PREFIX, stamp.origin());
         let mut meta = txn.open_table(tables::META)?;
         let higher = match meta.get(key.as_str())? {
             Some(held) => stamp.hlc > decode_hlc(held.value())?,
@@ -3147,8 +3156,8 @@ impl Engine {
         granted: &kimmy_core::VersionVector,
     ) -> Result<bool> {
         let mut raised = false;
-        for (node, hlc) in granted.iter() {
-            let stamp = Stamp::new(hlc, node, Epoch::ZERO);
+        for (origin, hlc) in granted.iter() {
+            let stamp = Stamp::new(hlc, origin.node, origin.epoch);
             // What this raises the servable vector over, and has no entries for,
             // is a hole in what this node can serve (ADR-224): recorded before
             // the raise, in the same transaction, from the vector as it stood.
@@ -3422,7 +3431,7 @@ impl Engine {
                     // `HlcClock::tick` never mints one. An unmentioned origin
                     // therefore keeps its marks, which is the conservative
                     // half.
-                    if stamp.hlc <= granted.get(stamp.node) {
+                    if stamp.hlc <= granted.get(stamp.origin()) {
                         covered.push(key.to_vec());
                         if covered.len() == crate::index::CLEAR_BATCH {
                             exhausted = false;
@@ -3640,8 +3649,8 @@ impl Engine {
         txn: &redb::WriteTransaction,
         seen: &kimmy_core::VersionVector,
     ) -> Result<()> {
-        for (node, hlc) in seen.iter() {
-            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node, Epoch::ZERO))?;
+        for (origin, hlc) in seen.iter() {
+            raise_origin_version(txn, tables::OPLOG_WITNESSED, origin, hlc)?;
         }
         Ok(())
     }
@@ -5496,11 +5505,11 @@ fn decode_hlc(bytes: &[u8]) -> Result<Hlc> {
     Ok(Hlc::from_bytes(fixed))
 }
 
-fn decode_node(bytes: &[u8]) -> Result<NodeId> {
-    let fixed: [u8; 16] = bytes
+fn decode_origin(bytes: &[u8]) -> Result<Origin> {
+    let fixed: [u8; Origin::LEN] = bytes
         .try_into()
-        .map_err(|_| StorageError::Corrupt("version vector key is not a node id".into()))?;
-    Ok(NodeId::from_bytes(fixed))
+        .map_err(|_| StorageError::Corrupt("version vector key is not an origin".into()))?;
+    Ok(Origin::from_bytes(fixed))
 }
 
 /// Append one oplog entry inside an existing transaction.
@@ -5518,14 +5527,25 @@ pub(crate) fn raise_version(
     table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     stamp: &Stamp,
 ) -> Result<bool> {
+    raise_origin_version(txn, table, stamp.origin(), stamp.hlc)
+}
+
+/// [`raise_version`] for an origin and a position, which is what a vector holds: the table is
+/// keyed by the origin's 34 bytes (node, then epoch).
+pub(crate) fn raise_origin_version(
+    txn: &redb::WriteTransaction,
+    table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    origin: Origin,
+    hlc: Hlc,
+) -> Result<bool> {
     let mut versions = txn.open_table(table)?;
-    let node = stamp.node.to_bytes();
-    let higher = match versions.get(node.as_slice())? {
-        Some(current) => stamp.hlc > decode_hlc(current.value())?,
+    let key = origin.to_bytes();
+    let higher = match versions.get(key.as_slice())? {
+        Some(current) => hlc > decode_hlc(current.value())?,
         None => true,
     };
     if higher {
-        versions.insert(node.as_slice(), stamp.hlc.to_bytes().as_slice())?;
+        versions.insert(key.as_slice(), hlc.to_bytes().as_slice())?;
     }
     Ok(higher)
 }
@@ -5542,9 +5562,9 @@ pub(crate) fn delete_entry_is_owed(txn: &WriteTxn<'_>, stamp: &Stamp) -> Result<
     if txn.open_table(tables::OPLOG)?.get(key.as_slice())?.is_some() {
         return Ok(false);
     }
-    let node = stamp.node.to_bytes();
+    let origin = stamp.origin().to_bytes();
     let collected = txn.open_table(tables::OPLOG_COLLECTED)?;
-    let above = match collected.get(node.as_slice())? {
+    let above = match collected.get(origin.as_slice())? {
         Some(current) => stamp.hlc > decode_hlc(current.value())?,
         None => true,
     };
@@ -5948,8 +5968,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let engine = Engine::open(&path).unwrap();
-        let local = engine.node_id();
-        let other = kimmy_core::NodeId::generate();
+        let local = engine.origin();
+        let other =
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
 
         let mut seen = kimmy_core::VersionVector::new();
         seen.insert(local, Hlc::new(2_000, 0));

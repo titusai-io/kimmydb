@@ -2731,7 +2731,7 @@ async fn a_standalone_start_after_a_restore_is_ready_and_unmarked() {
     let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
     assert_eq!(
         kimmy_cluster::catchup::replay_floor_on_disk(&dir.path().join("data")),
-        Some(source.version_vector().unwrap().get(source.node_id())),
+        Some(source.version_vector().unwrap().get(source.origin())),
         "the floor is the backup's own-origin position"
     );
     drop(source);

@@ -824,7 +824,11 @@ fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
     let reaches = |e: &Engine, node: kimmy_core::NodeId, at: Hlc, how: &str| {
         let row = e.digest_row(id).unwrap().unwrap_or_else(|| panic!("{how}: no row"));
-        let held = row.maxw.get(&node).copied().unwrap_or(Hlc::ZERO);
+        let held = row
+            .maxw
+            .get(&kimmy_core::Origin::new(node, kimmy_core::Epoch::ZERO))
+            .copied()
+            .unwrap_or(Hlc::ZERO);
         assert!(held >= at, "{how}: maxw {held:?} is below the record's {at:?}");
     };
     // A local insert and a local delete (a tombstone).
@@ -834,7 +838,7 @@ fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     reaches(&d, d.node_id(), inserted.hlc, "a local insert");
     later();
     assert!(d.delete(&on_d, &DocId::Int64(7)).unwrap());
-    let deleted = d.version_vector().unwrap().get(d.node_id());
+    let deleted = d.version_vector().unwrap().get(d.origin());
     reaches(&d, d.node_id(), deleted, "a local delete");
     // A replicated insert from a peer.
     later();
@@ -1201,7 +1205,7 @@ fn a_chunk_whose_document_is_not_here_stays_if_made_after_the_drop_and_goes_if_n
     // Something after the drop, so the survivors path is taken.
     d.insert(&on_d, doc! { "_id": 9i64 }).unwrap();
     let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    let after_the_drop = d.version_vector().unwrap().get(d.node_id());
+    let after_the_drop = d.version_vector().unwrap().get(d.origin());
     // Documents 7 and 8 are not in the parent here. 7's chunk was made from a
     // version before the drop, 8's from one after it.
     d.put_vectors(&shadow, &DocId::Int64(7), &[chunk_of(7, on_d.created)]).unwrap();

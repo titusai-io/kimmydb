@@ -2010,7 +2010,7 @@ mod tests {
         assert!(newer.hlc > held.indexes[0].created.unwrap().hlc, "premise: later");
         let start = b.version_vector().unwrap().behind(&c.version_vector().unwrap()).unwrap();
         let from_c = c.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
-        let own = |e: &Engine| e.version_vector().unwrap().get(e.node_id());
+        let own = |e: &Engine| e.version_vector().unwrap().get(e.origin());
         let before = own(&b);
         b.apply_batch(&from_c).unwrap();
         assert_eq!(own(&b), before, "B minted an entry of its own for a peer's creation");

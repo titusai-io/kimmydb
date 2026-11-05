@@ -30,7 +30,6 @@
 //! Every outcome that is not a comparison has a [`Defer`] reason and is
 //! counted by the caller; none is silent.
 
-use kimmy_core::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -420,7 +419,7 @@ enum ScanFor {
 /// A drop older than the retention is no longer held: that case is the
 /// horizon's (`tombstone_retention_secs >= oplog_retention_secs`).
 pub(crate) fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionVector) -> bool {
-    tombstone.is_some_and(|at| at.hlc > cut.get(at.node) || created <= at.hlc)
+    tombstone.is_some_and(|at| at.hlc > cut.get(at.origin()) || created <= at.hlc)
 }
 
 /// What subtracting a set of keys from a row came to.
@@ -781,7 +780,7 @@ impl Engine {
                 return Ok(None);
             }
             let stamp = codec::decode_oplog_key(key)?;
-            if stamp.hlc <= cut.get(stamp.node) {
+            if stamp.hlc <= cut.get(stamp.origin()) {
                 continue;
             }
             let (_, collection) = codec::decode_oplog_kind_and_collection(value)?;
@@ -890,8 +889,8 @@ impl Engine {
             let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
             let mut now = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
             now.digest ^= fix;
-            for (node, hlc) in &walked.maxw {
-                now.raise_maxw(&Stamp::new(*hlc, *node, Epoch::ZERO));
+            for (origin, hlc) in &walked.maxw {
+                now.raise_maxw(&Stamp::new(*hlc, origin.node, origin.epoch));
             }
             rows.insert(collection.0, now.encode().as_slice())?;
         }
@@ -1760,7 +1759,12 @@ mod tests {
     #[test]
     fn a_digest_message_round_trips_through_bson() {
         let ask = DigestAsk {
-            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
             uncovered: vec![Uncovered {
                 collection: CollectionId(u64::MAX),
                 keys: vec![ByteBuf::from(vec![1, 2, 3])],

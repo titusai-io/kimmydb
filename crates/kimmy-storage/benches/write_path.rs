@@ -229,7 +229,7 @@ fn background_consumer(c: &mut Criterion) {
                             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            let token = ResumeToken::new(entry.stamp.hlc, entry.stamp.node);
+                            let token = ResumeToken::new(entry.stamp.hlc, entry.stamp.origin());
                             engine.put_consumer_position("bench", token).unwrap();
                             handled.fetch_add(1, std::sync::atomic::Ordering::Release);
                         }

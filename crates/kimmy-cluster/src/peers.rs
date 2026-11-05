@@ -2117,7 +2117,7 @@ struct DigestState {
     /// is the persistent-drift case the check exists for, so it expires.
     verified: std::collections::HashMap<
         kimmy_core::CollectionId,
-        (u128, BTreeMap<NodeId, kimmy_core::Hlc>, Instant),
+        (u128, BTreeMap<kimmy_core::Origin, kimmy_core::Hlc>, Instant),
     >,
     /// When each confirmed `(peer, collection)` was last logged.
     warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
@@ -2541,7 +2541,7 @@ struct DefinitionState {
     /// cut's component last seen, and the count.
     stuck: std::collections::HashMap<
         (NodeId, kimmy_core::CollectionId),
-        (NodeId, kimmy_core::Hlc, u32),
+        (kimmy_core::Origin, kimmy_core::Hlc, u32),
     >,
     /// When a stuck stamp was last named.
     stuck_warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
@@ -2744,7 +2744,7 @@ fn note_stuck_stamp(
     node: NodeId,
     peer: SocketAddr,
     id: kimmy_core::CollectionId,
-    origin: NodeId,
+    origin: kimmy_core::Origin,
     cut_at: kimmy_core::Hlc,
 ) {
     let key = (node, id);
@@ -3073,7 +3073,7 @@ mod tests {
     #[test]
     fn the_lag_is_computed_from_each_peers_last_vector_when_read() {
         use kimmy_core::{Hlc, NodeId, VersionVector};
-        let origin = NodeId::from_bytes([7; 16]);
+        let origin = kimmy_core::Origin::new(NodeId::from_bytes([7; 16]), kimmy_core::Epoch::ZERO);
         let peer: SocketAddr = "127.0.0.1:3".parse().unwrap();
         let lag = LagVectors::default();
         let mut theirs = VersionVector::new();
@@ -4736,7 +4736,8 @@ mod tests {
         let t0 = Instant::now();
         catch_up.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, t0).unwrap();
 
-        let departed = NodeId::from_bytes([7; 16]);
+        let departed =
+            kimmy_core::Origin::new(NodeId::from_bytes([7; 16]), kimmy_core::Epoch::ZERO);
         let mut servable = engine.version_vector().unwrap();
         servable.insert(departed, kimmy_core::Hlc::new(10, 0));
         let peer = NodeId::from_bytes([4; 16]);
@@ -4941,7 +4942,10 @@ mod digest_fold_tests {
     fn the_cut_of_an_exact_mismatch_is_kept_for_the_repair_it_plans() {
         let mut f = fixture();
         let mut cut = kimmy_core::VersionVector::new();
-        cut.insert(NodeId::from_bytes([9; 16]), kimmy_core::Hlc::new(1_000, 0));
+        cut.insert(
+            kimmy_core::Origin::new(NodeId::from_bytes([9; 16]), kimmy_core::Epoch::ZERO),
+            kimmy_core::Hlc::new(1_000, 0),
+        );
         let mut round = f.mismatch();
         round.cut = cut.clone();
         f.fold(round);
@@ -5412,7 +5416,7 @@ mod definition_fold_tests {
         assert_eq!(f.report.definition_compared, 0, "none of them a comparison");
     }
 
-    fn above(origin: NodeId, cut_at: u64) -> DefinitionRound {
+    fn above(origin: kimmy_core::Origin, cut_at: u64) -> DefinitionRound {
         let mut round = DefinitionRound::new(DefinitionAnswered::Answered);
         round.held = 1;
         round.verdicts.push(DefinitionVerdict {
@@ -5429,7 +5433,7 @@ mod definition_fold_tests {
     #[test]
     fn a_frozen_stamp_is_named_after_sixty_contacts_and_a_lagging_peer_never_is() {
         let mut f = fixture();
-        let origin = NodeId::from_bytes([9; 16]);
+        let origin = kimmy_core::Origin::new(NodeId::from_bytes([9; 16]), kimmy_core::Epoch::ZERO);
         let mut logs = String::new();
         for _ in 0..59 {
             logs.push_str(&f.fold(above(origin, 500)));
@@ -5453,7 +5457,7 @@ mod definition_fold_tests {
     #[test]
     fn a_stuck_count_ends_when_the_collection_is_compared_again() {
         let mut f = fixture();
-        let origin = NodeId::from_bytes([9; 16]);
+        let origin = kimmy_core::Origin::new(NodeId::from_bytes([9; 16]), kimmy_core::Epoch::ZERO);
         for _ in 0..59 {
             f.fold(above(origin, 500));
         }
@@ -5473,7 +5477,10 @@ mod definition_fold_tests {
     #[test]
     fn a_changed_origin_restarts_the_stuck_count() {
         let mut f = fixture();
-        let (x, y) = (NodeId::from_bytes([9; 16]), NodeId::from_bytes([8; 16]));
+        let (x, y) = (
+            kimmy_core::Origin::new(NodeId::from_bytes([9; 16]), kimmy_core::Epoch::ZERO),
+            kimmy_core::Origin::new(NodeId::from_bytes([8; 16]), kimmy_core::Epoch::ZERO),
+        );
         for _ in 0..59 {
             f.fold(above(x, 500));
         }
@@ -5492,7 +5499,7 @@ mod definition_fold_tests {
     #[test]
     fn the_stuck_map_is_pruned_by_collection_and_by_peer() {
         let mut f = fixture();
-        let origin = NodeId::from_bytes([9; 16]);
+        let origin = kimmy_core::Origin::new(NodeId::from_bytes([9; 16]), kimmy_core::Epoch::ZERO);
         f.fold(above(origin, 500));
         let held = BTreeSet::from([CollectionId(1)]);
         let members = BTreeSet::from([f.node]);

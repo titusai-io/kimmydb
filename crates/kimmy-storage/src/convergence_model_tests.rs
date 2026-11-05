@@ -832,7 +832,7 @@ impl Cluster {
                         }
                         let undone = |stamp: &Stamp| {
                             stamp.hlc > until
-                                && others.iter().all(|w| w.get(stamp.node) < stamp.hlc)
+                                && others.iter().all(|w| w.get(stamp.origin()) < stamp.hlc)
                         };
                         self.ghost.writes.retain(|w| !undone(&w.stamp));
                         self.ghost.deletes.retain(|(_, _, stamp)| !undone(stamp));
@@ -1049,7 +1049,7 @@ impl Cluster {
         page: &crate::SnapshotPage,
     ) {
         let named = |hlc: Hlc| page.versions.iter().any(|(_, covered)| hlc <= covered);
-        let covered = |stamp: &Stamp| stamp.hlc <= page.versions.get(stamp.node);
+        let covered = |stamp: &Stamp| stamp.hlc <= page.versions.get(stamp.origin());
         let mut vouched: Vec<(&str, Hlc)> = Vec::new();
         for state in &page.collections {
             if let Some(created) = Some(state.created).filter(|c| named(*c)) {

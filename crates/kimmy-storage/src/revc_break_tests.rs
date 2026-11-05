@@ -1380,7 +1380,7 @@ fn random_history(seed: u64, steps: usize) -> Seen {
                     } else if let Some((r_stamp, r_live)) = mine {
                         if *r_live && r_stamp < s_stamp {
                             let covered =
-                                members[s].e().version_vector().unwrap().get(s_stamp.node);
+                                members[s].e().version_vector().unwrap().get(s_stamp.origin());
                             if s_stamp.hlc > covered {
                                 // The sender's own coverage does not name its tombstone (it
                                 // holds it from a repair, under `Hold`): ignored by design
@@ -1397,7 +1397,7 @@ fn random_history(seed: u64, steps: usize) -> Seen {
                             // (review C m2); one the sender's coverage does not name is
                             // ignored by design, counted apart.
                             let covered =
-                                members[s].e().version_vector().unwrap().get(s_stamp.node);
+                                members[s].e().version_vector().unwrap().get(s_stamp.origin());
                             if s_stamp.hlc > covered {
                                 seen.unvouched_deletes += 1;
                             } else {

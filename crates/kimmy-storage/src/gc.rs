@@ -32,7 +32,6 @@
 //! streams already handle that (`ResumeTokenExpired`, surfaced as HTTP 410), so
 //! it is a contract, not a surprise.
 
-use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, Hlc, OpKind};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
@@ -317,16 +316,21 @@ impl Engine {
                     None => None,
                 };
                 if previous.is_none_or(|p| highest > p) {
-                    let marker = kimmy_core::Stamp::new(highest, self.node_id(), Epoch::ZERO);
+                    let origin = self.origin();
+                    let marker = kimmy_core::Stamp::new(highest, origin.node, origin.epoch);
                     meta.insert(
                         tables::META_OPLOG_COLLECTED_THROUGH,
                         codec::oplog_key(&marker).as_slice(),
                     )?;
                 }
 
-                for (node, hlc) in per_origin.iter() {
-                    let stamp = kimmy_core::Stamp::new(hlc, node, Epoch::ZERO);
-                    crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stamp)?;
+                for (origin, hlc) in per_origin.iter() {
+                    crate::engine::raise_origin_version(
+                        &txn,
+                        tables::OPLOG_COLLECTED,
+                        origin,
+                        hlc,
+                    )?;
                 }
             }
         }
@@ -871,7 +875,7 @@ mod tests {
         let cb = b.get_collection("db", "c").unwrap();
         b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
         b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
-        let start = a.version_vector().unwrap().get(b.node_id());
+        let start = a.version_vector().unwrap().get(b.origin());
         let entries =
             b.entries_for_peer(start, usize::MAX, crate::WalkScope::Background).unwrap().entries;
         a.apply_batch(&entries).unwrap();
@@ -887,11 +891,11 @@ mod tests {
 
         let collected = a.oplog_collected().unwrap();
         // Everything of A's went; A's record is its newest.
-        assert_eq!(collected.get(a.node_id()), before.get(a.node_id()));
+        assert_eq!(collected.get(a.origin()), before.get(a.origin()));
         // B's last entry is the tail and survives, so B's record is the one
         // before it — strictly below what A holds of B.
-        let b_recorded = collected.get(b.node_id());
-        assert!(b_recorded > Hlc::ZERO && b_recorded < before.get(b.node_id()), "{collected:?}");
+        let b_recorded = collected.get(b.origin());
+        assert!(b_recorded > Hlc::ZERO && b_recorded < before.get(b.origin()), "{collected:?}");
         // The coarse horizon is the highest of the per-origin records: the two
         // are one fact at two grains, written in one transaction.
         assert_eq!(
@@ -918,7 +922,7 @@ mod tests {
             a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
             a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
             a.collect_garbage_at(much_later(), policy()).unwrap();
-            node = a.node_id();
+            node = a.origin();
             horizon = a.oplog_collected_through().unwrap();
             held = a.version_vector().unwrap();
             assert!(horizon > Hlc::ZERO);

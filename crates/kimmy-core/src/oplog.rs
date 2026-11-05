@@ -11,14 +11,14 @@
 //! change streams work here at all — the log exists whether or not the node is
 //! part of a cluster, rather than being a byproduct of replication.
 
-use crate::Epoch;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::hlc::{HLC_ENCODED_LEN, Hlc, Stamp};
-use crate::ids::{CollectionId, DocId, NodeId};
+use crate::ids::{CollectionId, DocId};
+use crate::origin::Origin;
 use crate::version::VersionVector;
 
 /// What kind of mutation an oplog entry describes.
@@ -153,61 +153,67 @@ impl OplogEntry {
 /// A token without `issued` is a position inside a process, which a background
 /// consumer (the vector worker) records and resumes from. No member issues one to
 /// a client, and a client's is refused ([`ResumeToken::decode_client`]).
+///
+/// The entry is named by its full stamp (`hlc`, and the [`Origin`] that wrote it: node and
+/// epoch), and every origin in the token, the issuer's included, is a node **and an epoch**.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ResumeToken {
     pub hlc: Hlc,
-    pub node: NodeId,
+    pub origin: Origin,
     pub issued: Option<Issued>,
 }
 
 /// Who issued a resume token, and what their stream had delivered.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Issued {
-    /// The member whose stream delivered the token's entry.
-    pub by: NodeId,
+    /// The member whose stream delivered the token's entry, as the origin it wrote under at the
+    /// time. After a restore the same node has a different arrival order under a new epoch, so
+    /// a token issued before it names an origin that is no longer this member's, and is not
+    /// trusted as an exact position.
+    pub by: Origin,
     /// Per origin, a stamp at or below which the issuing member's stream had
     /// taken every entry that member holds — delivered it, or passed over it
     /// as out of scope — when the token was issued (ADR-173).
     pub delivered: VersionVector,
 }
 
-/// A single-stamp token: `hlc ‖ node`, as issued before 0.30.0.
-const SINGLE_STAMP_LEN: usize = HLC_ENCODED_LEN + 16;
+/// A single-stamp token: the stamp's key form, `hlc ‖ node ‖ epoch`.
+const SINGLE_STAMP_LEN: usize = Stamp::KEY_LEN;
 
 /// The first byte of an issued token. A single-stamp token has no version
 /// byte, and is told apart by its length, which no issued token can have.
-const ISSUED_VERSION: u8 = 2;
+const ISSUED_VERSION: u8 = 3;
 
-/// `version ‖ hlc ‖ node ‖ issued-by ‖ origin count (u16, big-endian)`.
-const ISSUED_HEADER_LEN: usize = 1 + HLC_ENCODED_LEN + 16 + 16 + 2;
+/// `version ‖ hlc ‖ node ‖ epoch ‖ issued-by (node ‖ epoch) ‖ origin count (u16, big-endian)`.
+const ISSUED_HEADER_LEN: usize = 1 + Stamp::KEY_LEN + Origin::LEN + 2;
 
-/// One origin of the delivered vector: `node ‖ hlc`.
-const ORIGIN_LEN: usize = 16 + HLC_ENCODED_LEN;
+/// One origin of the delivered vector: `node ‖ epoch ‖ hlc`.
+const ORIGIN_LEN: usize = Origin::LEN + HLC_ENCODED_LEN;
 
 /// The most origins a token may name. A cluster's vector has one per member
-/// that ever wrote; the bound keeps a token a string a query parameter can
+/// epoch that ever wrote; the bound keeps a token a string a query parameter can
 /// carry and refuses a forged one that asks for an unbounded decode.
 pub const MAX_TOKEN_ORIGINS: usize = 1024;
 
 impl ResumeToken {
     /// A single-stamp token, with no issuing member.
-    pub fn new(hlc: Hlc, node: NodeId) -> Self {
-        Self { hlc, node, issued: None }
+    pub fn new(hlc: Hlc, origin: Origin) -> Self {
+        Self { hlc, origin, issued: None }
     }
 
     /// A single-stamp token naming `stamp`, with no issuing member.
     pub fn from_stamp(stamp: Stamp) -> Self {
-        Self::new(stamp.hlc, stamp.node)
+        Self::new(stamp.hlc, stamp.origin())
     }
 
     /// The token a member's stream issues for the entry stamped `stamp`.
-    pub fn issued(stamp: Stamp, by: NodeId, delivered: VersionVector) -> Self {
-        Self { hlc: stamp.hlc, node: stamp.node, issued: Some(Issued { by, delivered }) }
+    pub fn issued(stamp: Stamp, by: Origin, delivered: VersionVector) -> Self {
+        Self { hlc: stamp.hlc, origin: stamp.origin(), issued: Some(Issued { by, delivered }) }
     }
 
     pub fn to_stamp(&self) -> Stamp {
-        Stamp::new(self.hlc, self.node, Epoch::ZERO)
+        Stamp::new(self.hlc, self.origin.node, self.origin.epoch)
     }
 
     /// The exclusive lower bound for a `resume_after` scan.
@@ -221,22 +227,18 @@ impl ResumeToken {
 
     pub fn encode(&self) -> String {
         let Some(issued) = &self.issued else {
-            let mut buf = [0u8; SINGLE_STAMP_LEN];
-            buf[..HLC_ENCODED_LEN].copy_from_slice(&self.hlc.to_bytes());
-            buf[HLC_ENCODED_LEN..].copy_from_slice(&self.node.to_bytes());
-            return URL_SAFE_NO_PAD.encode(buf);
+            return URL_SAFE_NO_PAD.encode(self.to_stamp().to_key_bytes());
         };
         let origins = issued.delivered.len().min(MAX_TOKEN_ORIGINS);
         let mut buf = Vec::with_capacity(ISSUED_HEADER_LEN + origins * ORIGIN_LEN);
         buf.push(ISSUED_VERSION);
-        buf.extend_from_slice(&self.hlc.to_bytes());
-        buf.extend_from_slice(&self.node.to_bytes());
+        buf.extend_from_slice(&self.to_stamp().to_key_bytes());
         buf.extend_from_slice(&issued.by.to_bytes());
         // `origins` fits: MAX_TOKEN_ORIGINS is below u16::MAX.
         buf.extend_from_slice(&(origins as u16).to_be_bytes());
-        // A vector iterates in node order, which is what `decode` requires.
-        for (node, hlc) in issued.delivered.iter().take(origins) {
-            buf.extend_from_slice(&node.to_bytes());
+        // A vector iterates in origin order, which is what `decode` requires.
+        for (origin, hlc) in issued.delivered.iter().take(origins) {
+            buf.extend_from_slice(&origin.to_bytes());
             buf.extend_from_slice(&hlc.to_bytes());
         }
         URL_SAFE_NO_PAD.encode(buf)
@@ -244,10 +246,11 @@ impl ResumeToken {
 
     /// A token a client handed back: one a member issued, with its `issued`.
     ///
-    /// The single-stamp form (`hlc ‖ node`, 26 bytes) is what every member
-    /// issued before 0.30.0. It is refused here as any other malformed token is,
-    /// with the same error. [`Self::decode`] still reads it, because it is the
-    /// form a background consumer's position is stored in.
+    /// The single-stamp form (`hlc ‖ node ‖ epoch`, 44 bytes) is a background consumer's
+    /// stored position, never issued to a client. It is refused here as any other malformed
+    /// token is, with the same error. [`Self::decode`] still reads it, because it is the form
+    /// a background consumer's position is stored in. A token of an earlier layout (26 bytes
+    /// single, or an issued token of version 2) is refused by both.
     pub fn decode_client(s: &str) -> Result<Self> {
         let token = Self::decode(s)?;
         if token.issued.is_none() {
@@ -259,33 +262,33 @@ impl ResumeToken {
     pub fn decode(s: &str) -> Result<Self> {
         let raw = URL_SAFE_NO_PAD.decode(s).map_err(|_| Error::MalformedResumeToken)?;
         if raw.len() == SINGLE_STAMP_LEN {
-            return Ok(Self::new(hlc_at(&raw, 0), node_at(&raw, HLC_ENCODED_LEN)));
+            return Ok(Self::new(hlc_at(&raw, 0), origin_at(&raw, HLC_ENCODED_LEN)));
         }
         if raw.len() < ISSUED_HEADER_LEN || raw[0] != ISSUED_VERSION {
             return Err(Error::MalformedResumeToken);
         }
         let hlc = hlc_at(&raw, 1);
-        let node = node_at(&raw, 1 + HLC_ENCODED_LEN);
-        let by = node_at(&raw, 1 + HLC_ENCODED_LEN + 16);
+        let origin = origin_at(&raw, 1 + HLC_ENCODED_LEN);
+        let by = origin_at(&raw, 1 + Stamp::KEY_LEN);
         let count_at = ISSUED_HEADER_LEN - 2;
         let origins = u16::from_be_bytes([raw[count_at], raw[count_at + 1]]) as usize;
         if origins > MAX_TOKEN_ORIGINS || raw.len() != ISSUED_HEADER_LEN + origins * ORIGIN_LEN {
             return Err(Error::MalformedResumeToken);
         }
         let mut delivered = VersionVector::new();
-        let mut previous: Option<NodeId> = None;
+        let mut previous: Option<Origin> = None;
         for i in 0..origins {
             let at = ISSUED_HEADER_LEN + i * ORIGIN_LEN;
-            let origin = node_at(&raw, at);
+            let origin = origin_at(&raw, at);
             // Strictly ascending, as `encode` writes them: a repeated origin
             // would be a token that says two things about one member.
             if previous.is_some_and(|p| p >= origin) {
                 return Err(Error::MalformedResumeToken);
             }
             previous = Some(origin);
-            delivered.insert(origin, hlc_at(&raw, at + 16));
+            delivered.insert(origin, hlc_at(&raw, at + Origin::LEN));
         }
-        Ok(Self { hlc, node, issued: Some(Issued { by, delivered }) })
+        Ok(Self { hlc, origin, issued: Some(Issued { by, delivered }) })
     }
 }
 
@@ -295,10 +298,10 @@ fn hlc_at(raw: &[u8], at: usize) -> Hlc {
     Hlc::from_bytes(bytes)
 }
 
-fn node_at(raw: &[u8], at: usize) -> NodeId {
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&raw[at..at + 16]);
-    NodeId::from_bytes(bytes)
+fn origin_at(raw: &[u8], at: usize) -> Origin {
+    let mut bytes = [0u8; Origin::LEN];
+    bytes.copy_from_slice(&raw[at..at + Origin::LEN]);
+    Origin::from_bytes(bytes)
 }
 
 impl std::fmt::Display for ResumeToken {
@@ -325,9 +328,14 @@ impl TryFrom<String> for ResumeToken {
 mod tests {
     use super::*;
     use crate::Epoch;
+    use crate::ids::NodeId;
+
+    fn origin(node: u8, epoch: u64) -> Origin {
+        Origin::new(NodeId::from_bytes([node; 16]), Epoch::from_u64(epoch))
+    }
 
     fn token() -> ResumeToken {
-        ResumeToken::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16]))
+        ResumeToken::new(Hlc::new(1_700_000_000_000, 42), origin(9, 4))
     }
 
     #[test]
@@ -360,11 +368,15 @@ mod tests {
 
     fn issued_token() -> ResumeToken {
         let mut delivered = VersionVector::new();
-        delivered.insert(NodeId::from_bytes([3; 16]), Hlc::new(1_700_000_000_500, 1));
-        delivered.insert(NodeId::from_bytes([9; 16]), Hlc::new(1_700_000_000_000, 42));
+        delivered.insert(origin(3, 1), Hlc::new(1_700_000_000_500, 1));
+        delivered.insert(origin(9, 4), Hlc::new(1_700_000_000_000, 42));
         ResumeToken::issued(
-            Stamp::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16]), Epoch::ZERO),
-            NodeId::from_bytes([5; 16]),
+            Stamp::new(
+                Hlc::new(1_700_000_000_000, 42),
+                NodeId::from_bytes([9; 16]),
+                Epoch::from_u64(4),
+            ),
+            origin(5, 2),
             delivered,
         )
     }
@@ -377,7 +389,7 @@ mod tests {
         assert_eq!(back.issued.unwrap().delivered.len(), 2);
     }
 
-    /// What every member issued before 0.30.0: `hlc ‖ node`, 26 bytes, no
+    /// A background consumer's stored position: `hlc ‖ node ‖ epoch`, 44 bytes, no
     /// version byte. Built here from the layout rather than through `encode`,
     /// so a change to how a single-stamp token is written cannot also change
     /// what this test expects of one.
@@ -385,9 +397,11 @@ mod tests {
     fn a_single_stamp_token_is_refused_from_a_client_as_any_malformed_one_is() {
         let hlc = Hlc::new(1_700_000_000_000, 42);
         let node = NodeId::from_bytes([9; 16]);
+        let epoch = Epoch::from_u64(7);
         let mut raw = Vec::new();
         raw.extend_from_slice(&hlc.to_bytes());
         raw.extend_from_slice(&node.to_bytes());
+        raw.extend_from_slice(&epoch.0);
         let old = URL_SAFE_NO_PAD.encode(&raw);
 
         let refused = ResumeToken::decode_client(&old).unwrap_err();
@@ -402,7 +416,7 @@ mod tests {
         // And a process's own position is still read back from where it is
         // stored: the form is the vector worker's, not a client's.
         let position = ResumeToken::decode(&old).unwrap();
-        assert_eq!(position.to_stamp(), Stamp::new(hlc, node, Epoch::ZERO));
+        assert_eq!(position.to_stamp(), Stamp::new(hlc, node, epoch));
         assert_eq!(position.issued, None);
         assert_eq!(position.encode(), old);
     }
@@ -411,9 +425,12 @@ mod tests {
     fn malformed_issued_tokens_are_rejected() {
         let raw = URL_SAFE_NO_PAD.decode(issued_token().encode()).unwrap();
 
-        let mut wrong_version = raw.clone();
-        wrong_version[0] = 3;
-        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(wrong_version)).is_err());
+        // the version before the epoch existed, and one nobody issues
+        for version in [2, 4] {
+            let mut wrong_version = raw.clone();
+            wrong_version[0] = version;
+            assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(wrong_version)).is_err());
+        }
 
         let mut truncated = raw.clone();
         truncated.pop();
@@ -443,5 +460,71 @@ mod tests {
         assert!(json.starts_with('"'), "expected a JSON string, got {json}");
         let back: ResumeToken = serde_json::from_str(&json).unwrap();
         assert_eq!(back, token());
+    }
+
+    /// A token of the layout before epochs: 26 bytes single, or an issued token of version 2,
+    /// is refused whole (the store and the cluster are wiped across the change).
+    #[test]
+    fn a_token_of_the_layout_before_epochs_is_refused() {
+        let hlc = Hlc::new(1_700_000_000_000, 42);
+        let mut single = Vec::new();
+        single.extend_from_slice(&hlc.to_bytes());
+        single.extend_from_slice(&[9; 16]);
+        assert_eq!(single.len(), 26);
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(&single)).is_err());
+        assert!(ResumeToken::decode_client(&URL_SAFE_NO_PAD.encode(&single)).is_err());
+
+        // version 2: version, hlc, node, by (node), count, then (node, hlc) per origin
+        let mut v2 = vec![2u8];
+        v2.extend_from_slice(&hlc.to_bytes());
+        v2.extend_from_slice(&[9; 16]);
+        v2.extend_from_slice(&[5; 16]);
+        v2.extend_from_slice(&1u16.to_be_bytes());
+        v2.extend_from_slice(&[3; 16]);
+        v2.extend_from_slice(&hlc.to_bytes());
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(&v2)).is_err());
+        assert!(ResumeToken::decode_client(&URL_SAFE_NO_PAD.encode(&v2)).is_err());
+    }
+
+    /// The token names the issuer and each delivered origin by node and epoch: two epochs of one
+    /// node are two entries, and the epoch of the entry's own origin survives the round trip.
+    #[test]
+    fn a_token_keeps_every_epoch_it_names() {
+        let node = NodeId::from_bytes([6; 16]);
+        let (old, new) =
+            (Origin::new(node, Epoch::from_u64(1)), Origin::new(node, Epoch::from_u64(2)));
+        let mut delivered = VersionVector::new();
+        delivered.insert(old, Hlc::new(10, 0));
+        delivered.insert(new, Hlc::new(20, 0));
+        let stamp = Stamp::new(Hlc::new(20, 0), node, Epoch::from_u64(2));
+        let t = ResumeToken::issued(stamp, new, delivered);
+        let back = ResumeToken::decode_client(&t.encode()).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.to_stamp(), stamp);
+        let issued = back.issued.unwrap();
+        assert_eq!(issued.by, new);
+        assert_eq!(issued.delivered.len(), 2);
+        assert_eq!(issued.delivered.get(old), Hlc::new(10, 0));
+        assert_eq!(issued.delivered.get(new), Hlc::new(20, 0));
+    }
+
+    #[test]
+    fn token_sizes_are_the_layout_sizes() {
+        use base64::Engine as _;
+        let raw = |t: &ResumeToken| URL_SAFE_NO_PAD.decode(t.encode()).unwrap().len();
+        assert_eq!(raw(&token()), 44);
+        assert_eq!(token().encode().len(), 59);
+        // 3 origins: 1 + 44 + 34 + 2 + 3 * 44
+        let mut delivered = VersionVector::new();
+        for n in 1..=3u8 {
+            delivered.insert(origin(n, 1), Hlc::new(1, 0));
+        }
+        let t = ResumeToken::issued(
+            Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(1)),
+            origin(5, 2),
+            delivered,
+        );
+        assert_eq!(raw(&t), 1 + 44 + 34 + 2 + 3 * 44);
+        assert_eq!(raw(&t), 213);
     }
 }

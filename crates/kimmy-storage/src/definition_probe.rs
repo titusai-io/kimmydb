@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::{CollectionId, Hlc, NodeId, Stamp, VersionVector};
+use kimmy_core::{CollectionId, Hlc, Origin, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -143,7 +143,7 @@ pub struct DefinitionEntry {
     /// For a collection deferred as [`DefinitionDefer::DefinitionAboveCut`]: the
     /// origin of a stamp above the cut, so the requester can tell a stamp that
     /// is only in motion from one the cut can never cover (h2-N4).
-    pub above: Option<NodeId>,
+    pub above: Option<Origin>,
     /// For a collection named in the request's `detail`: the peer's definitions.
     pub definitions: Vec<WireDefinition>,
     /// For a collection named in `detail`: the refusals the peer holds that are
@@ -239,7 +239,7 @@ pub struct DefinitionVerdict {
     /// whose origin's component does not advance contact after contact is one
     /// the cut cannot cover (a decommissioned node's last create), which the
     /// caller names after a while (h2-N4).
-    pub above: Option<(NodeId, Hlc)>,
+    pub above: Option<(Origin, Hlc)>,
 }
 
 /// What a contact's definition probe came to, for the caller to count.
@@ -269,7 +269,7 @@ struct Facet {
     list: Vec<(DefinitionKey, DefinitionHash)>,
     deferred: Option<DefinitionDefer>,
     /// The origin of a definition stamp above the cut, when that is why.
-    above: Option<NodeId>,
+    above: Option<Origin>,
     /// The standing life's incarnation floor, which a refusal hint must be above.
     floor: Option<Hlc>,
 }
@@ -391,8 +391,8 @@ impl Engine {
         dropped_indexes: &impl ReadableTable<(u64, u32), &'static [u8]>,
         meta: &CollectionMeta,
         cut: &VersionVector,
-    ) -> Result<Option<NodeId>> {
-        let above = |stamp: &Stamp| stamp.hlc > cut.get(stamp.node);
+    ) -> Result<Option<Origin>> {
+        let above = |stamp: &Stamp| stamp.hlc > cut.get(stamp.origin());
         if let Some(stamp) = meta
             .indexes
             .iter()
@@ -401,13 +401,13 @@ impl Engine {
             .chain(meta.validator_changed.as_ref())
             .find(|stamp| above(stamp))
         {
-            return Ok(Some(stamp.node));
+            return Ok(Some(stamp.origin()));
         }
         for row in dropped_indexes.range((meta.id.0, 0)..=(meta.id.0, u32::MAX))? {
             let (_, raw) = row?;
             let stamp = codec::decode_oplog_key(raw.value())?;
             if above(&stamp) {
-                return Ok(Some(stamp.node));
+                return Ok(Some(stamp.origin()));
             }
         }
         Ok(None)
@@ -510,7 +510,7 @@ impl Engine {
                 out.push(DefinitionVerdict {
                     collection: id,
                     outcome: DefinitionOutcome::Deferred(reason),
-                    above: origin.map(|node| (node, ask.cut.get(node))),
+                    above: origin.map(|origin| (origin, ask.cut.get(origin))),
                 });
                 continue;
             }

@@ -18,12 +18,11 @@
 //! or not the node has ever seen one. That is the reason change streams here do
 //! not require a replica set.
 
-use kimmy_core::Epoch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use kimmy_core::{
-    CollectionId, Hlc, NodeId, OpKind, OplogEntry, ResumeToken, Stamp, VersionVector,
+    CollectionId, Hlc, OpKind, OplogEntry, Origin, ResumeToken, Stamp, VersionVector,
 };
 use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
@@ -175,7 +174,7 @@ impl Engine {
             resume_floor: start,
             replay: Vec::new().into_iter(),
             last_delivered: None,
-            issuer: self.node_id(),
+            issuer: self.origin(),
             delivered: opened.delivered,
             pending: None,
             skip: opened.skip,
@@ -299,10 +298,10 @@ impl Engine {
         // covers the drop.
         if let Some(token) = &options.resume_after
             && let Some(issued) = &token.issued
-            && issued.by != self.node_id()
+            && issued.by != self.origin()
         {
             let after_the_drop = token.to_stamp() > dropped_at
-                || issued.delivered.get(dropped_at.node) >= dropped_at.hlc;
+                || issued.delivered.get(dropped_at.origin()) >= dropped_at.hlc;
             return match after_the_drop {
                 true => Ok((start, Some((id, dropped_at)))),
                 false => Err(expired()),
@@ -491,7 +490,7 @@ impl Engine {
         let stamp = token.to_stamp();
         let held = self.arrival_of(&stamp)?;
         walked.kind = match (&token.issued, held) {
-            (Some(issued), _) if issued.by == self.node_id() => "issuer",
+            (Some(issued), _) if issued.by == self.origin() => "issuer",
             (Some(_), _) => "foreign_vector",
             (None, Some(_)) => "single_stamp_held",
             (None, None) => "single_stamp_not_held",
@@ -500,7 +499,7 @@ impl Engine {
             return Err(expired());
         }
         match &token.issued {
-            Some(issued) if issued.by == self.node_id() => match held {
+            Some(issued) if issued.by == self.origin() => match held {
                 Some(seq) => Ok(Opened {
                     start: seq + 1,
                     delivered: issued.delivered.clone(),
@@ -669,7 +668,7 @@ impl Engine {
     fn stamp_beyond_the_horizon(&self, stamp: &Stamp) -> Result<bool> {
         let witnessed = self.witnessed_vector()?;
         if self.oplog_collected()?.iter().any(|(origin, hlc)| {
-            Stamp::new(hlc.min(witnessed.get(origin)), origin, Epoch::ZERO) > *stamp
+            Stamp::new(hlc.min(witnessed.get(origin)), origin.node, origin.epoch) > *stamp
         }) {
             return Ok(true);
         }
@@ -680,7 +679,7 @@ impl Engine {
         Ok(self
             .state_held()?
             .iter()
-            .any(|(origin, hlc)| Stamp::new(hlc, origin, Epoch::ZERO) > *stamp))
+            .any(|(origin, hlc)| Stamp::new(hlc, origin.node, origin.epoch) > *stamp))
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -1238,7 +1237,7 @@ impl<'t> Walk<'t> {
         let (seq, key) = row?;
         walked.rows += 1;
         let stamp = codec::decode_oplog_key(key.value())?;
-        Ok((stamp.hlc > self.delivered.get(stamp.node)).then_some(Some(seq.value())))
+        Ok((stamp.hlc > self.delivered.get(stamp.origin())).then_some(Some(seq.value())))
     }
 }
 
@@ -1312,7 +1311,7 @@ impl<'t> Seek<'t> {
                     walked.held_rows += 1;
                     match codec::decode_oplog_key(key.value()) {
                         Ok(stamp) => {
-                            let v = self.delivered.get(stamp.node);
+                            let v = self.delivered.get(stamp.origin());
                             if stamp.hlc > v {
                                 self.lower(v);
                             }
@@ -1343,7 +1342,7 @@ impl<'t> Seek<'t> {
                 let (key, seq) = row?;
                 walked.rows += 1;
                 let stamp = codec::decode_oplog_key(key.value())?;
-                if stamp.hlc > self.delivered.get(stamp.node) {
+                if stamp.hlc > self.delivered.get(stamp.origin()) {
                     let seq = seq.value();
                     self.best = Some(self.best.map_or(seq, |b| b.min(seq)));
                 }
@@ -1438,7 +1437,7 @@ pub struct ChangeStream {
     /// The last stamp handed to the caller, which is what a resume token names.
     last_delivered: Option<Stamp>,
     /// This member, which issues every token the stream hands out.
-    issuer: NodeId,
+    issuer: Origin,
     /// Per origin, a stamp at or below which this stream has taken every entry
     /// this member holds: delivered it, or passed over it. Every token carries
     /// it (ADR-173).
@@ -1666,7 +1665,7 @@ impl ChangeStream {
         // event.
         if let Some(skip) = &self.skip
             && !entry.kind.is_local_observation()
-            && entry.stamp.hlc <= skip.get(entry.stamp.node)
+            && entry.stamp.hlc <= skip.get(entry.stamp.origin())
         {
             return None;
         }
@@ -1753,6 +1752,7 @@ impl Engine {
 mod tests {
     use bson::doc;
     use kimmy_core::Epoch;
+    use kimmy_core::NodeId;
     use kimmy_core::OpKind;
 
     use super::*;
@@ -1823,7 +1823,8 @@ mod tests {
         let walks: &[(&str, Walk)] = &[
             // covers: watch::Seek::new, watch::Seek::step, watch::Walk::new, watch::Walk::step
             ("first_arrival_beyond", |(e, _, middle)| {
-                let delivered: VersionVector = [(middle.node, middle.hlc)].into_iter().collect();
+                let delivered: VersionVector =
+                    [(middle.origin(), middle.hlc)].into_iter().collect();
                 e.first_arrival_beyond(&delivered, &mut Walked::default()).map(drop)
             }),
             // covers: watch::Engine::first_arrival_at_or_after
@@ -2391,7 +2392,7 @@ mod tests {
 
         // A token from before the oldest retained entry: silently starting from
         // the beginning would hide the fact that events were missed.
-        let ancient = ResumeToken::new(Hlc::new(1, 0), engine.node_id());
+        let ancient = ResumeToken::new(Hlc::new(1, 0), engine.origin());
         let result = engine.watch(
             WatchScope::Cluster,
             WatchOptions { resume_after: Some(ancient), ..Default::default() },
@@ -2408,7 +2409,7 @@ mod tests {
         let (engine, coll, _dir) = setup();
         engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
 
-        let future = ResumeToken::new(Hlc::new(u64::MAX / 2, 0), engine.node_id());
+        let future = ResumeToken::new(Hlc::new(u64::MAX / 2, 0), engine.origin());
         assert!(
             engine
                 .watch(
@@ -2987,7 +2988,7 @@ mod tests {
         let (a, b, _stale, coll, _da, _dir) =
             a_member_built_from_a_snapshot_of_a_write_after_the_token().await;
         let covering =
-            ResumeToken::issued(newest_stamp(&a), a.node_id(), a.version_vector().unwrap());
+            ResumeToken::issued(newest_stamp(&a), a.origin(), a.version_vector().unwrap());
         let cb = b.get_collection("app", "docs").unwrap();
         assert_eq!(cb.id, coll.id, "premise: the same collection");
         b.insert(&cb, doc! { "_id": "after" }).unwrap();
@@ -3211,7 +3212,7 @@ mod tests {
         a.insert(&coll, doc! { "_id": "old" }).unwrap();
         a.insert(&coll, doc! { "_id": "y" }).unwrap();
         let at_y = newest_stamp(&a);
-        let issued = ResumeToken::issued(at_y, a.node_id(), a.version_vector().unwrap());
+        let issued = ResumeToken::issued(at_y, a.origin(), a.version_vector().unwrap());
         assert!(a.delete(&coll, &kimmy_core::DocId::String("y".into())).unwrap());
         a.insert(&coll, doc! { "_id": "z" }).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3293,7 +3294,7 @@ mod tests {
             a_client_that_saw_y_and_a_member_to_resume_on(false);
         let top = p.state_held().unwrap();
         let (origin, hlc) = top.iter().next().expect("a hole");
-        let above = Stamp::new(hlc.successor(), origin, Epoch::ZERO);
+        let above = Stamp::new(hlc.successor(), origin.node, origin.epoch);
         let delivered = resumed_with(&p, ResumeToken::from_stamp(above)).await;
         assert!(delivered.is_ok(), "nothing above this token is held only as state: {delivered:?}");
     }
@@ -3413,7 +3414,7 @@ mod tests {
             body: None,
         };
         engine.apply_batch(std::slice::from_ref(&late)).unwrap();
-        let horizon = engine.oplog_collected().unwrap().get(engine.node_id());
+        let horizon = engine.oplog_collected().unwrap().get(engine.origin());
         assert_eq!(horizon, written[1].hlc, "premise: retention reached the second write");
 
         let outcome = resumed_with(&engine, ResumeToken::from_stamp(written[1])).await;
@@ -3442,7 +3443,7 @@ mod tests {
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         }
-        assert_eq!(p.state_held().unwrap().get(a.node_id()), top.hlc, "premise: top of the hole");
+        assert_eq!(p.state_held().unwrap().get(a.origin()), top.hlc, "premise: top of the hole");
         assert!(p.arrival_of(&top).unwrap().is_none(), "premise: not held");
 
         let outcome = resumed_with(&p, ResumeToken::from_stamp(top)).await;
@@ -3676,8 +3677,12 @@ mod tests {
         // The issuing member had sent everything of this member's through the
         // drop.
         let mut delivered = VersionVector::new();
-        delivered.insert(dropped_at.node, dropped_at.hlc);
-        let token = ResumeToken::issued(dropped_at, NodeId::generate(), delivered);
+        delivered.insert(dropped_at.origin(), dropped_at.hlc);
+        let token = ResumeToken::issued(
+            dropped_at,
+            Origin::new(NodeId::generate(), Epoch::ZERO),
+            delivered,
+        );
 
         let mut stream = engine
             .watch(
@@ -3723,9 +3728,10 @@ mod tests {
         assert_eq!(report.node, engine.node_id(), "the report is this member's own");
 
         let mut delivered = VersionVector::new();
-        delivered.insert(unkeyed.stamp.node, unkeyed.stamp.hlc);
-        delivered.insert(report.node, report.hlc);
-        let token = ResumeToken::issued(report, NodeId::generate(), delivered);
+        delivered.insert(unkeyed.stamp.origin(), unkeyed.stamp.hlc);
+        delivered.insert(report.origin(), report.hlc);
+        let token =
+            ResumeToken::issued(report, Origin::new(NodeId::generate(), Epoch::ZERO), delivered);
         let mut stream = engine
             .watch(
                 WatchScope::Cluster,
@@ -3780,16 +3786,17 @@ mod tests {
         };
         let engine = Engine::open(&path).unwrap();
         assert!(
-            engine.oplog_collected().unwrap().get(quiet.stamp.node) > quiet.stamp.hlc,
+            engine.oplog_collected().unwrap().get(quiet.stamp.origin()) > quiet.stamp.hlc,
             "the fixture must seed the quiet origin above its only write"
         );
 
         // A token whose vector holds everything the quiet origin ever wrote,
         // and everything of this member's.
         let mut delivered = VersionVector::new();
-        delivered.insert(quiet.stamp.node, quiet.stamp.hlc);
-        delivered.insert(newest.node, newest.hlc);
-        let token = ResumeToken::issued(newest, NodeId::generate(), delivered);
+        delivered.insert(quiet.stamp.origin(), quiet.stamp.hlc);
+        delivered.insert(newest.origin(), newest.hlc);
+        let token =
+            ResumeToken::issued(newest, Origin::new(NodeId::generate(), Epoch::ZERO), delivered);
         let coll = engine.get_collection("app", "docs").unwrap();
         engine
             .watch(
@@ -3834,7 +3841,11 @@ mod tests {
     fn foreign_token(engine: &Engine) -> ResumeToken {
         let first =
             engine.read_oplog_from(Hlc::ZERO, 1, crate::WalkScope::Background).unwrap().remove(0);
-        ResumeToken::issued(first.stamp, NodeId::generate(), VersionVector::new())
+        ResumeToken::issued(
+            first.stamp,
+            Origin::new(NodeId::generate(), Epoch::ZERO),
+            VersionVector::new(),
+        )
     }
 
     /// Run `step` on the runtime's one worker, with `hook` installed to hold the
@@ -4386,6 +4397,7 @@ mod tests {
     /// by every writer of the oplog, the arrival index and the vectors.
     mod first_arrival {
         use kimmy_core::Epoch;
+        use kimmy_core::NodeId;
         use proptest::prelude::*;
         use redb::ReadableTableMetadata;
 
@@ -4399,7 +4411,7 @@ mod tests {
             for row in arrival.iter().unwrap() {
                 let (seq, key) = row.unwrap();
                 let stamp = codec::decode_oplog_key(key.value()).unwrap();
-                if stamp.hlc > delivered.get(stamp.node) {
+                if stamp.hlc > delivered.get(stamp.origin()) {
                     return seq.value();
                 }
             }
@@ -4451,7 +4463,8 @@ mod tests {
             for row in oplog.iter().unwrap() {
                 let (key, _) = row.unwrap();
                 let stamp = codec::decode_oplog_key(key.value()).unwrap();
-                if stamp.hlc > servable.get(stamp.node) && held.get(key.value()).unwrap().is_none()
+                if stamp.hlc > servable.get(stamp.origin())
+                    && held.get(key.value()).unwrap().is_none()
                 {
                     return Err(format!("I is broken at {stamp:?}: above V and not held"));
                 }
@@ -4566,7 +4579,8 @@ mod tests {
                         let mut granted = VersionVector::new();
                         for (i, origin) in self.origins.iter().enumerate() {
                             if mask & (1 << i) != 0 {
-                                granted.insert(*origin, Hlc::new(wall, 0));
+                                granted
+                                    .insert(Origin::new(*origin, Epoch::ZERO), Hlc::new(wall, 0));
                             }
                         }
                         self.engine().absorb_version_vector(&granted).unwrap();
@@ -4637,10 +4651,11 @@ mod tests {
                 let entries = engine
                     .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                     .unwrap();
-                let mut all_origins: Vec<NodeId> = self.origins.to_vec();
-                all_origins.push(engine.node_id());
-                let of = |o: NodeId| -> Vec<Hlc> {
-                    entries.iter().filter(|e| e.stamp.node == o).map(|e| e.stamp.hlc).collect()
+                let mut all_origins: Vec<Origin> =
+                    self.origins.iter().map(|n| Origin::new(*n, Epoch::ZERO)).collect();
+                all_origins.push(engine.origin());
+                let of = |o: Origin| -> Vec<Hlc> {
+                    entries.iter().filter(|e| e.stamp.origin() == o).map(|e| e.stamp.hlc).collect()
                 };
                 let mut out = vec![VersionVector::new(), servable.clone(), witnessed];
                 for &o in &all_origins {

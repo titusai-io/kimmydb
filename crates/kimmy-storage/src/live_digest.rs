@@ -27,10 +27,9 @@
 //! shared mark would let a build that keeps the counts and not the digests keep
 //! it current.
 
-use kimmy_core::Epoch;
 use std::collections::BTreeMap;
 
-use kimmy_core::{Hlc, NodeId, Stamp};
+use kimmy_core::{Hlc, Origin, Stamp};
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::error::{Result, StorageError};
@@ -48,7 +47,7 @@ pub(crate) const THROUGH: &str = "arrival";
 pub(crate) const WALK: &str = "walk";
 
 /// The row layout's own version.
-const ROW_VERSION: u8 = 1;
+const ROW_VERSION: u8 = 2;
 
 /// A collection's cut digest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,10 +55,10 @@ pub struct DigestRow {
     /// The XOR of [`term`] over the live records.
     pub digest: u128,
     /// The highest record stamp per origin, live or tombstone. Never falls.
-    pub maxw: BTreeMap<NodeId, Hlc>,
+    pub maxw: BTreeMap<Origin, Hlc>,
     /// The highest stamp per origin of a tombstone written with no oplog entry
     /// behind it.
-    pub bare_max: BTreeMap<NodeId, Hlc>,
+    pub bare_max: BTreeMap<Origin, Hlc>,
 }
 
 impl DigestRow {
@@ -80,22 +79,22 @@ impl DigestRow {
 
     /// Merge `other`'s highest stamps into this row's.
     fn raise_from(&mut self, other: &DigestRow) {
-        for (node, hlc) in &other.maxw {
-            raise(&mut self.maxw, &Stamp::new(*hlc, *node, Epoch::ZERO));
+        for (origin, hlc) in &other.maxw {
+            raise(&mut self.maxw, &Stamp::new(*hlc, origin.node, origin.epoch));
         }
-        for (node, hlc) in &other.bare_max {
-            raise(&mut self.bare_max, &Stamp::new(*hlc, *node, Epoch::ZERO));
+        for (origin, hlc) in &other.bare_max {
+            raise(&mut self.bare_max, &Stamp::new(*hlc, origin.node, origin.epoch));
         }
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 16 + 2 + 26 * (self.maxw.len() + self.bare_max.len()));
+        let mut out = Vec::with_capacity(1 + 16 + 2 + 44 * (self.maxw.len() + self.bare_max.len()));
         out.push(ROW_VERSION);
         out.extend_from_slice(&self.digest.to_be_bytes());
         for map in [&self.maxw, &self.bare_max] {
             out.extend_from_slice(&(map.len() as u16).to_be_bytes());
-            for (node, hlc) in map {
-                out.extend_from_slice(&node.to_bytes());
+            for (origin, hlc) in map {
+                out.extend_from_slice(&origin.to_bytes());
                 out.extend_from_slice(&hlc.to_bytes());
             }
         }
@@ -112,9 +111,11 @@ impl DigestRow {
         for map in &mut maps {
             let n = u16::from_be_bytes(take(&mut input, 2)?.try_into().expect("2 bytes"));
             for _ in 0..n {
-                let node = NodeId::from_bytes(take(&mut input, 16)?.try_into().expect("16 bytes"));
+                let origin = Origin::from_bytes(
+                    take(&mut input, Origin::LEN)?.try_into().expect("an origin's bytes"),
+                );
                 let hlc = Hlc::from_bytes(take(&mut input, 10)?.try_into().expect("10 bytes"));
-                map.insert(node, hlc);
+                map.insert(origin, hlc);
             }
         }
         if !input.is_empty() {
@@ -134,8 +135,8 @@ fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     Ok(head)
 }
 
-fn raise(map: &mut BTreeMap<NodeId, Hlc>, stamp: &Stamp) {
-    let slot = map.entry(stamp.node).or_insert(Hlc::ZERO);
+fn raise(map: &mut BTreeMap<Origin, Hlc>, stamp: &Stamp) {
+    let slot = map.entry(stamp.origin()).or_insert(Hlc::ZERO);
     if stamp.hlc > *slot {
         *slot = stamp.hlc;
     }
@@ -323,6 +324,7 @@ pub(crate) fn fold_walked(
 mod tests {
     use super::*;
     use kimmy_core::Epoch;
+    use kimmy_core::NodeId;
 
     fn k(bytes: &[u8]) -> Vec<u8> {
         bytes.to_vec()
@@ -384,7 +386,11 @@ mod tests {
         let mut row = DigestRow::default();
         row.raise_maxw(&stamp(9, 1));
         row.raise_maxw(&stamp(3, 1));
-        assert_eq!(row.maxw[&NodeId::from_bytes([1; 16])], Hlc::new(9, 0));
+        assert_eq!(
+            row.maxw
+                [&kimmy_core::Origin::new(NodeId::from_bytes([1; 16]), kimmy_core::Epoch::ZERO)],
+            Hlc::new(9, 0)
+        );
     }
 
     #[test]

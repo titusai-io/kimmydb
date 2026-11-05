@@ -3091,10 +3091,10 @@ mod tests {
         engine.apply_remote(&coll, &merged).unwrap();
 
         let mut delivered = engine.witnessed_vector().unwrap();
-        delivered.insert(unsent.stamp.node, kimmy_core::Hlc::ZERO);
+        delivered.insert(unsent.stamp.origin(), kimmy_core::Hlc::ZERO);
         let token = kimmy_core::ResumeToken::issued(
             merged.stamp,
-            kimmy_core::NodeId::generate(),
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO),
             delivered,
         );
         let mut stream = engine

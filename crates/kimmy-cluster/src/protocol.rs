@@ -863,6 +863,21 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
     bool::from(expected.ct_eq(tag)).then_some(payload)
 }
 
+/// The highest position `vector` holds for any epoch of `node`.
+///
+/// **By node across epochs, deliberately**, and used only by the own-origin replay: the entries
+/// a restored member lost sit in the epochs before its current one, so its replay asks for all
+/// of them and a position of any one of its origins says whether a peer holds something of it.
+/// Everything else in the cluster reads a vector by origin.
+pub(crate) fn node_position(vector: &VersionVector, node: kimmy_core::NodeId) -> kimmy_core::Hlc {
+    vector
+        .iter()
+        .filter(|(origin, _)| origin.node == node)
+        .map(|(_, hlc)| hlc)
+        .max()
+        .unwrap_or(kimmy_core::Hlc::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,7 +1008,7 @@ mod tests {
                 limit: 10,
                 held: Some(populated_vector()),
                 marked: vec![kimmy_storage::MarkedRange {
-                    origin: NodeId::generate(),
+                    origin: kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
                     from: Hlc::new(3, 0),
                     through: Hlc::new(5, 2),
                 }],
@@ -1526,8 +1541,8 @@ mod tests {
     /// with none and never as a zero horizon.
     #[tokio::test]
     async fn a_snapshot_page_needs_its_lists_and_reads_an_absent_horizon_as_none() {
-        let node = NodeId::from_bytes([3; 16]);
-        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node, Epoch::ZERO);
+        let node = kimmy_core::Origin::new(NodeId::from_bytes([3; 16]), kimmy_core::Epoch::ZERO);
+        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node.node, node.epoch);
         let mut versions = VersionVector::new();
         versions.insert(node, Hlc::new(900, 0));
         let page = SnapshotPage {
@@ -1587,7 +1602,12 @@ mod tests {
             buffer
         };
         let ask = kimmy_storage::DigestAsk {
-            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
             uncovered: vec![kimmy_storage::Uncovered {
                 collection: CollectionId(u64::MAX),
                 keys: vec![serde_bytes::ByteBuf::from(vec![1, 2])],

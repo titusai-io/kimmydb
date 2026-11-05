@@ -497,18 +497,22 @@ pub fn restore_with(
                 let mut vector = kimmy_core::VersionVector::new();
                 for row in redb::ReadableTable::iter(&versions)? {
                     let (node, hlc) = row?;
-                    let node: [u8; 16] = node.value().try_into().map_err(|_| {
-                        StorageError::Database(
-                            "a version vector key in the backup is not a node id".into(),
-                        )
-                    })?;
+                    let origin: [u8; kimmy_core::Origin::LEN] =
+                        node.value().try_into().map_err(|_| {
+                            StorageError::Database(
+                                "a version vector key in the backup is not an origin".into(),
+                            )
+                        })?;
                     let hlc: [u8; kimmy_core::HLC_ENCODED_LEN] =
                         hlc.value().try_into().map_err(|_| {
                             StorageError::Database(
                                 "a version vector value in the backup is not a stamp".into(),
                             )
                         })?;
-                    vector.insert(NodeId::from_bytes(node), kimmy_core::Hlc::from_bytes(hlc));
+                    vector.insert(
+                        kimmy_core::Origin::from_bytes(origin),
+                        kimmy_core::Hlc::from_bytes(hlc),
+                    );
                 }
                 vector
             };
@@ -516,7 +520,7 @@ pub fn restore_with(
             for row in redb::ReadableTable::iter(&oplog)? {
                 let (key, _) = row?;
                 let stamp = crate::codec::decode_oplog_key(key.value())?;
-                if stamp.hlc > vector.get(stamp.node) {
+                if stamp.hlc > vector.get(stamp.origin()) {
                     held.insert(key.value(), ())?;
                     marked += 1;
                 }
@@ -992,7 +996,7 @@ mod tests {
             .map(|row| row.unwrap().0.value().to_vec())
             .filter(|key| {
                 let stamp = crate::codec::decode_oplog_key(key).unwrap();
-                stamp.hlc > vector.get(stamp.node)
+                stamp.hlc > vector.get(stamp.origin())
             })
             .collect()
     }
@@ -1026,7 +1030,7 @@ mod tests {
         // A stale mark, on the entry at D's vector of B, which withholds nothing.
         {
             let covered = window.entries.last().unwrap().stamp;
-            assert!(covered.hlc <= d.version_vector().unwrap().get(b.node_id()));
+            assert!(covered.hlc <= d.version_vector().unwrap().get(b.origin()));
             let txn = d.db().begin_write().unwrap();
             txn.open_table(tables::OPLOG_HELD)
                 .unwrap()

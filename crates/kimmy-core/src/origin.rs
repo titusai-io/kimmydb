@@ -46,6 +46,18 @@ impl Epoch {
         Self(b)
     }
 
+    /// The start HLC an epoch was minted with: its first ten bytes. No entry of the epoch is
+    /// older (a restore mints its epoch at the HLC of the restore's open). An epoch built from
+    /// an integer ([`Epoch::from_u64`]) or [`Epoch::ZERO`] starts at [`Hlc::ZERO`].
+    ///
+    /// Read in one place only: the threshold of `VersionVector::behind`, as an optimisation
+    /// (see there). A coverage claim never reads it.
+    pub fn start_hlc(self) -> Hlc {
+        let mut bytes = [0u8; 10];
+        bytes.copy_from_slice(&self.0[..10]);
+        Hlc::from_bytes(bytes)
+    }
+
     /// The text form: 36 lowercase hex digits. The one printer; [`Epoch::from_hex`] is the one
     /// parser.
     pub fn to_hex(self) -> String {

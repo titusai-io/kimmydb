@@ -835,9 +835,9 @@ mod tests {
             txn.commit().unwrap();
         }
         let row = kept(&engine);
-        assert_eq!(row.bare_max.get(&stamp.node), Some(&stamp.hlc));
+        assert_eq!(row.bare_max.get(&stamp.origin()), Some(&stamp.hlc));
         assert_eq!(
-            row.maxw.get(&stamp.node),
+            row.maxw.get(&stamp.origin()),
             Some(&stamp.hlc),
             "a tombstone's stamp is a record stamp"
         );
@@ -861,7 +861,7 @@ mod tests {
             txn.commit().unwrap();
         }
         let row = kept(&engine);
-        assert_eq!(row.maxw.get(&stamp.node), Some(&later.hlc), "maxw never falls");
+        assert_eq!(row.maxw.get(&stamp.origin()), Some(&later.hlc), "maxw never falls");
     }
 
     #[test]

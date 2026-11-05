@@ -8,6 +8,7 @@
 //! count of entries examined and not served.
 
 use kimmy_core::Epoch;
+use kimmy_core::Origin;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -106,7 +107,7 @@ fn both(engine: &Engine, ask: &Ask) -> (Read, std::result::Result<Read, KeyWalkF
     let run = |keys: bool| {
         let passed = Cell::new(0u64);
         let skip = |stamp: &Stamp| {
-            let skip = stamp.hlc <= ask.held.get(stamp.node)
+            let skip = stamp.hlc <= ask.held.get(stamp.origin())
                 && !ask.marked.iter().any(|span| span.contains(stamp));
             passed.set(passed.get() + u64::from(skip));
             skip
@@ -161,14 +162,18 @@ fn held_of(offsets: &[Option<u64>; ORIGINS]) -> VersionVector {
     let mut held = VersionVector::new();
     for (origin, offset) in offsets.iter().enumerate() {
         if let Some(offset) = offset {
-            held.insert(node(origin), at(*offset));
+            held.insert(Origin::new(node(origin), Epoch::ZERO), at(*offset));
         }
     }
     held
 }
 
 fn span_of(origin: usize, from: u64, len: u64) -> MarkedRange {
-    MarkedRange { origin: node(origin), from: at(from), through: at(from + len) }
+    MarkedRange {
+        origin: Origin::new(node(origin), Epoch::ZERO),
+        from: at(from),
+        through: at(from + len),
+    }
 }
 
 fn rows_strategy() -> impl Strategy<Value = Vec<Row>> {
@@ -297,7 +302,7 @@ fn a_corrupt_body_is_the_same_error_at_the_same_row_and_skipped_rows_raise_none(
     let held = held_of(&[Some(10), Some(5), Some(5), None]);
     let run = |keys: bool| -> std::result::Result<usize, String> {
         let txn = engine.db().begin_read().unwrap();
-        let skip = |s: &Stamp| s.hlc <= held.get(s.node);
+        let skip = |s: &Stamp| s.hlc <= held.get(s.origin());
         let keep = |_: &OplogEntry| true;
         if keys {
             match engine
@@ -578,7 +583,7 @@ fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
         Hlc::ZERO,
         1000,
         WalkScope::Request,
-        |s: &Stamp| s.hlc <= ask.held.get(s.node),
+        |s: &Stamp| s.hlc <= ask.held.get(s.origin()),
         |_: &OplogEntry| true,
         None,
     );
@@ -598,7 +603,7 @@ fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
                 1000,
                 WalkScope::Background,
                 |s: &Stamp| {
-                    let skip = s.hlc <= ask.held.get(s.node);
+                    let skip = s.hlc <= ask.held.get(s.origin());
                     passed.set(passed.get() + u64::from(skip));
                     skip
                 },

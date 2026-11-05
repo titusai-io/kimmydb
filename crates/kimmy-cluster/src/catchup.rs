@@ -947,8 +947,8 @@ impl CatchUp {
             replay.first_contact_at.get_or_insert(now);
         }
         for peer in tick.reached.iter().filter(|peer| peer.node != me) {
-            replay.origins.extend(peer.servable.iter().map(|(node, _)| node));
-            replay.origins.extend(peer.witnessed.iter().map(|(node, _)| node));
+            replay.origins.extend(peer.servable.iter().map(|(origin, _)| origin.node));
+            replay.origins.extend(peer.witnessed.iter().map(|(origin, _)| origin.node));
         }
         replay.origins.remove(&me);
         replay.present.extend(present.iter().copied());
@@ -1200,8 +1200,8 @@ impl CatchUp {
             seen_now.extend(live.iter().copied());
         }
         for peer in tick.reached {
-            seen_now.extend(peer.servable.iter().map(|(node, _)| node));
-            seen_now.extend(peer.witnessed.iter().map(|(node, _)| node));
+            seen_now.extend(peer.servable.iter().map(|(origin, _)| origin.node));
+            seen_now.extend(peer.witnessed.iter().map(|(origin, _)| origin.node));
         }
         seen_now.remove(&tick.me);
         for id in seen_now {
@@ -1242,7 +1242,8 @@ impl CatchUp {
         // own origin than this member holds of it).
         let counts = |peer: &Reached| {
             !peer.facts.as_deref().is_some_and(|f| f.catching_up)
-                && tick.mine_witnessed.get(peer.node) <= peer.servable.get(peer.node)
+                && crate::protocol::node_position(tick.mine_witnessed, peer.node)
+                    <= crate::protocol::node_position(&peer.servable, peer.node)
         };
         // The latch drops when nothing is owed (ADR-212): the member is then
         // judged as any marked member is, and gated if no rule clears it.
@@ -1683,7 +1684,10 @@ mod tests {
     fn vector(entries: &[(u8, u64)]) -> VersionVector {
         let mut v = VersionVector::new();
         for (n, at) in entries {
-            v.insert(node(*n), kimmy_core::Hlc::new(*at, 0));
+            v.insert(
+                kimmy_core::Origin::new(node(*n), kimmy_core::Epoch::ZERO),
+                kimmy_core::Hlc::new(*at, 0),
+            );
         }
         v
     }
@@ -1995,7 +1999,10 @@ mod tests {
         for i in 0..(MAX_SEEN as u64 + 5) {
             let mut bytes = [0u8; 16];
             bytes[..8].copy_from_slice(&(i + 1).to_be_bytes());
-            big.insert(NodeId::from_bytes(bytes), kimmy_core::Hlc::new(1, 0));
+            big.insert(
+                kimmy_core::Origin::new(NodeId::from_bytes(bytes), kimmy_core::Epoch::ZERO),
+                kimmy_core::Hlc::new(1, 0),
+            );
         }
         let live: BTreeSet<NodeId> = [node(1)].into();
         let peer = [reached(1, big.clone(), Some(big.clone()), seeded)];

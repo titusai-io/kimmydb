@@ -611,7 +611,7 @@ impl Confirmer {
                 }
                 if waiter.node != their_node {
                     waiter.resolve(other_member(addr));
-                } else if held.get(waiter.entry.stamp.node) >= waiter.entry.stamp.hlc {
+                } else if held.get(waiter.entry.stamp.origin()) >= waiter.entry.stamp.hlc {
                     // Processed already, by a pull or an earlier push: today's
                     // early exit (ADR-143).
                     waiter.resolve(Resolution::Confirmed);
@@ -917,7 +917,7 @@ fn resolve_answered(waiter: &Waiter, answer: &Answer) -> Option<Resolution> {
             Resolution::pending(ConfirmOutcome::Unreached, "the window did not carry the change")
         });
     };
-    if stamp.hlc > answer.versions.get(stamp.node) {
+    if stamp.hlc > answer.versions.get(stamp.origin()) {
         // In the window, above what it was introduced with: the member left it
         // for its next pull (ADR-148). Only an arrival can be here.
         return waiter.pre_queued.then(|| {
@@ -1428,7 +1428,7 @@ mod tests {
             let covered_by_versions = |i: usize| {
                 let mut vector = VersionVector::new();
                 for at in &versions { vector.observe(*at); }
-                stamps[i].hlc <= vector.get(stamps[i].node)
+                stamps[i].hlc <= vector.get(stamps[i].origin())
             };
             // The member's walk: deferred entries skipped, a stop ends it.
             let stop = stop.filter(|(at, _)| *at < n && covered_by_versions(*at));

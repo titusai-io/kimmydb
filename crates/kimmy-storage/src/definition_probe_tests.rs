@@ -5,6 +5,7 @@
 
 use bson::doc;
 use kimmy_core::Epoch;
+use kimmy_core::Origin;
 use kimmy_core::{CollectionId, Hlc, IndexField, NodeId, Stamp, VersionVector};
 use serde_bytes::ByteBuf;
 
@@ -215,9 +216,9 @@ fn a_vector_shadow_is_not_a_collection_to_compare() {
 // -- The stamp the cut must cover ---------------------------------------------------
 
 /// The cut where `node`'s component is `at` and everything else is the pair's.
-fn cut_with(base: &VersionVector, node: NodeId, at: Hlc) -> VersionVector {
+fn cut_with(base: &VersionVector, origin: Origin, at: Hlc) -> VersionVector {
     let mut cut = base.clone();
-    cut.insert(node, at);
+    cut.insert(origin, at);
     cut
 }
 
@@ -227,11 +228,11 @@ fn an_index_stamped_above_the_cut_defers_the_collection_and_one_at_the_cut_does_
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
     let base = cut_of(&a, &b);
     // At the cut: processed by both, compared.
-    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.node, stamp.hlc), &[]);
+    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.origin(), stamp.hlc), &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "a stamp at the cut: {verdicts:?}");
     // One below the stamp: not yet covered, on both sides.
     let below = Hlc::new(stamp.hlc.wall_ms - 1, 0);
-    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.node, below), &[]);
+    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.origin(), below), &[]);
     assert_eq!(
         deferred(&verdicts, orders),
         Some(DefinitionDefer::DefinitionAboveCut),
@@ -1189,7 +1190,7 @@ fn every_dropped_index_row_is_judged_against_the_cut() {
         // The cut covers the earlier drop and not the later one.
         let earliest = stamps.iter().map(|stamp| stamp.hlc).min().unwrap();
         let mut cut = VersionVector::new();
-        cut.insert(a.node_id(), earliest);
+        cut.insert(a.origin(), earliest);
         let verdicts = exchange_at(&a, &b, cut, &[]);
         assert_eq!(
             deferred(&verdicts, orders),
@@ -1208,7 +1209,7 @@ fn a_stamp_is_judged_against_the_cut_at_its_own_origin() {
     b.create_index("shop", "orders", fields("by_b"), false, Some("by_b".into())).unwrap();
     sync(&a, &b);
     let mut cut = VersionVector::new();
-    cut.insert(a.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    cut.insert(a.origin(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
     let verdicts = exchange_at(&a, &b, cut.clone(), &[]);
     assert_eq!(
         deferred(&verdicts, orders),
@@ -1216,7 +1217,7 @@ fn a_stamp_is_judged_against_the_cut_at_its_own_origin() {
         "B's stamp is above the cut at B: {verdicts:?}"
     );
     // And covered once the cut has B's own component.
-    cut.insert(b.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    cut.insert(b.origin(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
     let verdicts = exchange_at(&a, &b, cut, &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
 }
