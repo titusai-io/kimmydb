@@ -6,13 +6,13 @@ comparing every member's state after every event, the entries each event mints, 
 Run (from any directory; no bytecode is written):
     python3 -I -B q6diff_gen.py scripted OUTDIR                       every scripted scenario, on the base and its mutants
     python3 -I -B q6diff_gen.py random OUTDIR --mode v6 --count 100   random runs of the model (grid of 36 configurations, seed = index)
-        [--seed0 N] [--delete-bias] [--heavy]
+        [--seed0 N] [--delete-bias] [--heavy] [--f 0.3 --routes hold|repair|hold,repair]   (the model's route probes, Q6_F / Q6_ROUTES)
     python3 -I -B q6diff_gen.py seed OUTDIR --mode M --seed S --members 3 --outs 2 --keys 4     one run
 
 Trace format (one JSON object per line). Header: {"v":1,"model":"swapmodel6a.py","sha256_16":..,"flags":<mode>,"members":
 [[name,skew],..],"D":..,"field_safe":<bool: no delete and no concurrent same-key writes, so the field policy can be replayed exactly>}. Then one line per top-level model call: {"k": kind, "step", "clock", ..arguments.., "res": result,
 "new": [the entries the call minted], "ms": [the state of the acting member after the call, of every member every 20 calls and at the structural events]}. Kinds: local, ldrop, lcreate, out, bind,
-take_from, take, take_quiesce, check_inv (the per-step invariants, compact), set_pages (a script's reorder of a join's pages), snap_begin (with the shuffled page order), land_page, relay_tomb (with the chosen physical), settle,
+take_from, take, hold (the hold route: take_hold), repair_ev (the repair route: one register event handed over as information), take_quiesce, steps_end (the run's steps are over: the replay computes the D10 state counters there), check_inv (the per-step invariants, compact), set_pages (a script's reorder of a join's pages), snap_begin (with the shuffled page order), land_page, relay_tomb (with the chosen physical), settle,
 vanish (a scripted vanish), lost (the quiescence's lost set), pre_finish (the counters before `finish`), final (the verdict).
 
 NOT in the traces, Rust-only: the sender-dies-mid-join scenario and its fresh-pull supersession (the model never abandons a join),
@@ -94,6 +94,8 @@ def member_j(m):
         pend_tombs=sj([n, stamp_j(s)] for n, s in m.pend_tombs.items()),
         held_n=len(m.held), held_h=fnv(sorted(m.held)), appended_n=len(m.appended), appended_h=fnv(sorted(m.appended)),
         dochist_n=len(m.dochist), dochist_h=fnv(list(m.dochist)), hist_kept_h=fnv(sorted(m.hist_kept)),
+        held_oop=sorted(m.held_oop),
+        eps=sj([i, ep["start"], ep["last"], ep["n"], ep["end"], bool(ep["end_q"]), bool(ep["info"]), ep["cover"], bool(ep["cover_q"])] for i, ep in m.refusal_eps.items()),
         recv_entry_h=fnv(sorted(m.recv_entry)), deferred=[e.idx for e in m.deferred], info=sorted(m.info),
         held_records=sj([p, k, stamp_j(s)] for (p, k, s) in m.held_records),
         bare_state=sj([p, k, stamp_j(s)] for (p, k, s) in m.bare_state),
@@ -131,6 +133,7 @@ class Tracer:
         self.started = False
         self.header = None
         self.field_safe = False
+        self.steps_marked = False
         self.n = 0
 
     def open(self, path):
@@ -138,12 +141,17 @@ class Tracer:
         self.jobs = []
         self.started = False
         self.depth = 0
+        self.steps_marked = False
         self.n = 0
 
     def write(self, obj):
         self.out.write(json.dumps(obj, separators=(",", ":")) + "\n")
 
     def log(self, kind, args, res, n0, w, extra=None):
+        if getattr(w, "quiescing", False) and not self.steps_marked:
+            # the run's steps are over (a random run): the replay computes the D10 state counters of the steps' end here
+            self.steps_marked = True
+            self.write(dict(k="steps_end", step=w.steps_end - 1, clock=w.clock, steps_end=w.steps_end))
         d = dict(k=kind, step=w.step, clock=w.clock)
         d.update(args)
         d["res"] = res
@@ -176,7 +184,8 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     T.w = self
     if T.out is not None:
         T.write(dict(v=1, model="swapmodel6a.py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
-                     members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe))
+                     members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
+                     route_f=float(os.environ.get("Q6_F", "0") or 0)))
     T.started = True
 
 
@@ -232,6 +241,8 @@ _wrap("start_out", "out", lambda s, keys, kind, bind_step: dict(m=s.name, keys=l
 _wrap("do_bind", "bind", lambda s, job: dict(m=s.name, job=T.jobs.index(job)), lambda r: None if r is None else r.idx)
 _wrap("take_from", "take_from", lambda s, src, e, quiesce=False: dict(dst=s.name, src=src.name, idx=e.idx, quiesce=bool(quiesce)))
 _wrap("take", "take", lambda s, e: dict(dst=s.name, idx=e.idx))
+_wrap("take_hold", "hold", lambda s, e: dict(dst=s.name, idx=e.idx))  # the hold route (Q6_F > 0)
+_wrap("add_event", "repair_ev", lambda s, e: dict(dst=s.name, idx=e.idx))  # the repair route: a register event handed over as information
 _wrap("take_quiesce", "take_quiesce", lambda s, e: dict(dst=s.name, idx=e.idx))
 _wrap("snapshot_begin", "snap_begin", lambda s, src, lazy: dict(dst=s.name, src=src.name, lazy=bool(lazy)), lambda r: bool(r),
       lambda s, r: dict(pages=list(s.w.rng.last_shuffle) if r and s.w.rng.last_shuffle is not None else None))
@@ -574,9 +585,14 @@ def grid36():
     return [(m, o, k) for m in (2, 3, 4, 5) for o in (1, 2, 3) for k in (3, 4, 5)]
 
 
-def one_run(path, mode, seed, nm, no, nk, steps=None, delete_bias=False):
+def one_run(path, mode, seed, nm, no, nk, steps=None, delete_bias=False, route_f=0.0, routes="hold,repair"):
     T.header = mode
     T.field_safe = False
+    if route_f:
+        os.environ["Q6_F"], os.environ["Q6_ROUTES"] = str(route_f), routes
+    else:
+        os.environ.pop("Q6_F", None)
+        os.environ.pop("Q6_ROUTES", None)
     if delete_bias:
         os.environ["Q6_DELETE_BIAS"] = "1"
     else:
@@ -586,12 +602,13 @@ def one_run(path, mode, seed, nm, no, nk, steps=None, delete_bias=False):
     T.close()
 
 
-def gen_random(outdir, mode, count, seed0, delete_bias, heavy):
+def gen_random(outdir, mode, count, seed0, delete_bias, heavy, route_f=0.0, routes="hold,repair"):
     g = grid36()
     for i in range(count):
         seed = seed0 + i
         nm, no, nk = (5, 3, 5) if heavy else g[seed % 36]
-        one_run(os.path.join(outdir, f"r-{mode}-{seed}.jsonl"), mode, seed, nm, no, nk, 600 if heavy else None, delete_bias)
+        tag = f"-F{route_f}-{routes.replace(',', '+')}" if route_f else ""
+        one_run(os.path.join(outdir, f"r-{mode}{tag}-{seed}.jsonl"), mode, seed, nm, no, nk, 600 if heavy else None, delete_bias, route_f, routes)
     print(f"{count} random traces of mode {mode} in {outdir}")
 
 
@@ -613,7 +630,8 @@ def main(argv):
     if cmd == "scripted":
         gen_scripted(outdir)
     elif cmd == "random":
-        gen_random(outdir, opts.get("mode", "v6"), int(opts.get("count", 100)), int(opts.get("seed0", 0)), "delete-bias" in opts, "heavy" in opts)
+        gen_random(outdir, opts.get("mode", "v6"), int(opts.get("count", 100)), int(opts.get("seed0", 0)), "delete-bias" in opts, "heavy" in opts,
+                   float(opts.get("f", 0) or 0), opts.get("routes", "hold,repair"))
     elif cmd == "seed":
         one_run(os.path.join(outdir, f"r-{opts.get('mode', 'v6')}-{opts['seed']}.jsonl"), opts.get("mode", "v6"), int(opts["seed"]),
                 int(opts["members"]), int(opts["outs"]), int(opts["keys"]))

@@ -1,8 +1,9 @@
 //! The register and the flip machinery (`swapmodel5.py` 375-430 and 773-930): events, visibility, the bound-out
 //! burial, the orphan rules, `settle`.
 
+use crate::coverage::CoverageOf;
 use crate::entry::*;
-use crate::member::Member;
+use crate::member::{Episode, Member};
 use crate::world::{Policy, World};
 
 impl Member {
@@ -25,6 +26,14 @@ impl Member {
         }
         if self.info.remove(&e.idx).is_some() {
             w.stats.bump("info_taken_effect");
+            if let Some(ep) = self.refusal_eps.get_mut(&e.idx)
+                && ep.end.is_none()
+                && ep.info
+                && ep.cover.is_none()
+            {
+                ep.cover = Some(w.step);
+                ep.cover_q = w.quiescing; // the member covers the event: it takes effect
+            }
         }
         self.events.insert(e.idx);
         let pos = self.evl.partition_point(|&i| w.ent(i).stamp <= e.stamp);
@@ -114,8 +123,9 @@ impl Member {
         false
     }
 
-    /// M3 (D10 as corrected): refuse whenever any known valid register event supersedes the served physical.
-    pub fn refusal_cause(&self, w: &World, s: &str) -> Option<&'static str> {
+    /// M3 (D10 as corrected): refuse whenever any known valid register event supersedes the served physical. Records the D10
+    /// refusal episode of the event (`swapmodel6a.py` `refusal_cause`).
+    pub fn refusal_cause(&mut self, w: &mut World, s: &str) -> Option<&'static str> {
         let f = w.f;
         if f.pend_accepts {
             return None;
@@ -124,8 +134,94 @@ impl Member {
             return if self.pending(w) { Some("bind") } else { None };
         }
         // rule B / D10: "known" includes an event held as information ahead of its position
-        let x = self.first_superseding(w, s).or_else(|| self.info_superseding(w, s));
-        x.map(|ev| ev.kind.name())
+        let first = self.first_superseding(w, s);
+        let is_info = first.is_none();
+        let x = first.or_else(|| self.info_superseding(w, s))?;
+        match self.refusal_eps.get_mut(&x.idx) {
+            None => {
+                self.refusal_eps.insert(
+                    x.idx,
+                    Episode {
+                        start: w.step,
+                        last: w.step,
+                        n: 1,
+                        end: None,
+                        end_q: false,
+                        info: is_info,
+                        cover: None,
+                        cover_q: false,
+                    },
+                );
+                w.stats.bump("refusal_episodes");
+                if is_info {
+                    w.stats.bump("refusal_episodes_info");
+                }
+            }
+            Some(ep) => {
+                ep.last = w.step;
+                ep.n += 1;
+            }
+        }
+        Some(x.kind.name())
+    }
+
+    /// The hold route: an entry held out of position becomes servable (`appended`) once every earlier entry of its origin is held
+    /// (`swapmodel6a.py` `promote_oop`).
+    pub fn promote_oop(&mut self, w: &World) {
+        if self.held_oop.is_empty() {
+            return;
+        }
+        let ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
+        for i in ids {
+            let e = w.ent(i);
+            let ok = w.by_origin[e.origin]
+                .iter()
+                .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                .all(|&x| self.cv.has(x));
+            if ok {
+                self.held_oop.remove(&i);
+                self.appended.insert(i);
+            }
+        }
+    }
+
+    /// The hold route: an entry held out of position: known (the register and the state see it), servable only once it is in
+    /// position (`swapmodel6a.py` `take_hold`).
+    pub fn take_hold(&mut self, w: &mut World, e: &EntryRef) {
+        let was = self.cv.has(e.idx);
+        self.take(w, e);
+        if !was && e.kind != Kind::Doc {
+            self.appended.remove(&e.idx);
+            self.held_oop.insert(e.idx);
+        }
+        self.promote_oop(w);
+    }
+
+    /// End the open D10 refusal episodes whose event no longer supersedes the physical the member serves (no side effect on the
+    /// model).
+    pub fn close_refusal_eps(&mut self, w: &World) {
+        let s = self.serving();
+        let b = s.as_ref().and_then(|s| self.bmap.get(s)).copied();
+        let ids: Vec<EntryId> = self.refusal_eps.keys().copied().collect();
+        for idx in ids {
+            if self.refusal_eps.get(&idx).is_some_and(|e| e.end.is_some()) {
+                continue;
+            }
+            let x = w.ent(idx);
+            let still = match (&s, b) {
+                (Some(s), Some(b)) => {
+                    x.stamp > b
+                        && (x.kind == Kind::Ldrop || x.phys != *s)
+                        && (self.events.contains(&idx) || self.info.contains_key(&idx))
+                }
+                _ => false,
+            };
+            if !still {
+                let ep = self.refusal_eps.get_mut(&idx).unwrap();
+                ep.end = Some(w.step);
+                ep.end_q = w.quiescing;
+            }
+        }
     }
 
     // ---- R3, R4, R7, R9: the flip machinery
@@ -380,6 +476,7 @@ impl Member {
     }
 
     pub fn settle(&mut self, w: &mut World) {
+        self.promote_oop(w);
         for _ in 0..60 {
             let mut prog = false;
             if self.activate_info(w) {
@@ -411,5 +508,8 @@ impl Member {
             self.promote_pending(w);
         }
         self.enforce_k_all(w);
+        if !self.refusal_eps.is_empty() {
+            self.close_refusal_eps(w);
+        }
     }
 }

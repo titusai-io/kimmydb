@@ -30,8 +30,21 @@ pub struct Cfg {
     pub field_counters: bool,
     /// the `document` policy witnesses page versions' stamps too (the metamorphic runs; see `World::witness_pages`)
     pub witness_pages: bool,
+    /// the route probes (`Q6_F`, `Q6_ROUTES`): a share of the window steps are a route step instead (the model's hold and repair
+    /// routes); register events then travel out of position by construction, so the in-order liveness check is off
+    pub routes: Option<Routes>,
     /// a workload on which last-writer-wins and the join agree: no delete, and every document written by one member only
     pub lww_workload: Option<Writers>,
+}
+
+/// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Routes {
+    pub f: f64,
+    /// `hold`: a non-document entry of the source's held set is delivered out of position
+    pub hold: bool,
+    /// `repair`: the source's register events are handed over as information only
+    pub repair: bool,
 }
 
 /// Who writes a document in an `lww_workload`.
@@ -57,7 +70,29 @@ impl Cfg {
             k: None,
             field_counters: true,
             witness_pages: false,
+            routes: None,
             lww_workload: None,
+        }
+    }
+}
+
+/// The model's D10 state counters: member-runs whose served physical is superseded by a known register event (any cause), when the
+/// steps end (`at_end` false) and at the end of the run, and those where the event is held as information.
+pub fn count_open_refusals(w: &mut World, ms: &[Member], at_end: bool) {
+    let (all, info) = if at_end {
+        ("refusal_open_at_run_end", "refusal_open_at_run_end_info")
+    } else {
+        ("refusal_open_at_steps_end", "refusal_open_at_steps_end_info")
+    };
+    for m in ms.iter().filter(|m| !m.vanished) {
+        if let Some(s) = m.serving() {
+            let inf = m.info_superseding(w, &s).is_some();
+            if m.first_superseding(w, &s).is_some() || inf {
+                w.stats.bump(all);
+            }
+            if inf {
+                w.stats.bump(info);
+            }
         }
     }
 }
@@ -108,6 +143,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.policy = cfg.policy;
     w.q7_entries = cfg.q7_entries;
     w.k = cfg.k;
+    w.in_order = cfg.routes.is_none();
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
@@ -265,7 +301,52 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                 let (src, dst) = (active[a], active[b]);
                 // a window from the receiver's single threshold: the lowest-stamp entry the source APPENDED and the receiver lacks
                 let (d, s) = pair(&mut ms, dst, src);
-                if let Some(e) = d.next_window_entry(&w, s) {
+                let cand = d.next_window_entry(&w, s);
+                // route probes (off by default; the draw is made only when `f > 0`, as in the model)
+                let r = match cfg.routes {
+                    Some(rt) if rt.f > 0.0 => w.rng.f64(),
+                    _ => 1.0,
+                };
+                if let Some(rt) = cfg.routes.filter(|rt| rt.f > 0.0 && r < rt.f) {
+                    let kinds: Vec<bool> = [(rt.hold, true), (rt.repair, false)]
+                        .iter()
+                        .filter(|k| k.0)
+                        .map(|k| k.1)
+                        .collect();
+                    let hold = kinds[w.rng.below(kinds.len())];
+                    if hold {
+                        // the hold route: a non-document entry the source holds (any stamp, origin or kind) is delivered out of position
+                        let nd: Vec<EntryRef> = w
+                            .all
+                            .iter()
+                            .filter(|e| e.kind != Kind::Doc && s.holds(e.idx) && !d.holds(e.idx))
+                            .cloned()
+                            .collect();
+                        if !nd.is_empty() {
+                            let e = nd[w.rng.below(nd.len())].clone();
+                            w.note(format!("HOLD {} <- {}: {}", d.name, s.name, e));
+                            w.stats.bump("hold_taken");
+                            d.take_hold(&mut w, &e);
+                        }
+                    } else {
+                        // the repair route: the source's register events are handed over as information (a scoped repair that carries
+                        // the register and grants no coverage): no entry, no coverage, no clock witness
+                        let new: Vec<EntryId> =
+                            s.evl.iter().copied().filter(|i| !d.events.contains(i)).collect();
+                        if !new.is_empty() {
+                            w.note(format!(
+                                "REPAIR {} <- {}: register events {:?}",
+                                d.name, s.name, new
+                            ));
+                            for &i in &new {
+                                let e = w.ent_rc(i);
+                                d.add_event(&mut w, &e);
+                            }
+                            w.stats.add("repair_events", new.len() as i64);
+                            d.settle(&mut w);
+                        }
+                    }
+                } else if let Some(e) = cand {
                     d.take_from(&mut w, s, &e, false);
                 }
             }
@@ -274,9 +355,13 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
             m.check_inv();
         }
     }
+    // D10 measured without side effects when the steps end (member-runs still refusing, every cause)
+    count_open_refusals(&mut w, &ms, false);
     // quiescence: pending $out jobs run; entries held by no live member are lost with the vanished members; every
     // other entry is delivered to every live member in stamp order
     w.step += 1;
+    w.steps_end = w.step;
+    w.quiescing = true;
     for mut j in jobs {
         let live = ms.iter().filter(|m| !m.vanished).count();
         ms[j.writer].do_bind(&mut w, &mut j, live);
@@ -316,6 +401,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         ms[i].settle(&mut w);
         ms[i].check_inv();
     }
+    count_open_refusals(&mut w, &ms, true); // ... and at the end of the run, after the end-of-run delivery
     let res = finish(&mut w, &mut ms);
     RunOut { res, w, ms }
 }
