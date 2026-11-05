@@ -19,6 +19,21 @@ pub enum DocOp {
     Delete,
 }
 
+/// A D10 refusal episode (`swapmodel6a.py` `refusal_cause`): a member refusing writes because of one register event, from its first
+/// refused write until its served physical is no longer superseded by that event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Episode {
+    pub start: i64,
+    pub last: i64,
+    pub n: u32,
+    pub end: Option<i64>,
+    pub end_q: bool,
+    /// the first refusal was on an event held as information (known, not covered); else covered and not yet visible
+    pub info: bool,
+    pub cover: Option<i64>,
+    pub cover_q: bool,
+}
+
 pub struct Member {
     pub id: usize,
     pub name: String,
@@ -71,6 +86,10 @@ pub struct Member {
     pub carry_created: BTreeSet<String>,
     /// rule B: a register event known but not yet covered (information: it takes no effect)
     pub info: OMap<EntryId, EntryRef>,
+    /// the hold route: non-document entries held out of position (known, not appended; `promote_oop` appends them in position)
+    pub held_oop: OSet<EntryId>,
+    /// D10 refusal episodes, by the event that supersedes the served physical
+    pub refusal_eps: OMap<EntryId, Episode>,
     pub vanished: bool,
     pub refused: u32,
     pub inv: BTreeSet<&'static str>,
@@ -117,6 +136,8 @@ impl Member {
             snap_src_stale: None,
             carry_created: BTreeSet::new(),
             info: OMap::new(),
+            held_oop: OSet::new(),
+            refusal_eps: OMap::new(),
             vanished: false,
             refused: 0,
             inv: BTreeSet::new(),

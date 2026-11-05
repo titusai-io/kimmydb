@@ -18,19 +18,6 @@ use crate::rng::Rng;
 use crate::snapshot::{land_page_in, snapshot_begin_in};
 use crate::world::{Policy, World};
 
-/// Counters the model keeps and the Rust port does not carry (statistics for the refusal-duration tables and the two route
-/// probes of phase G); excluded from the counter comparison and from nothing else.
-pub const PY_ONLY_STATS: [&str; 8] = [
-    "refusal_episodes",
-    "refusal_episodes_info",
-    "refusal_open_at_steps_end",
-    "refusal_open_at_steps_end_info",
-    "refusal_open_at_run_end",
-    "refusal_open_at_run_end_info",
-    "hold_taken",
-    "repair_events",
-];
-
 /// Counters only the `field` policy keeps (the covered-entry skip, the loss records its joins produce); not in the model, so
 /// excluded from the counter comparison of a `field` replay and from nothing else.
 pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "same_write_held"];
@@ -189,6 +176,8 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         "held_records": sj(m.held_records.iter().map(|(p, k, s)| json!([p, k, stamp_v(w, s)])).collect()),
         "bare_state": sj(m.bare_state.iter().map(|(p, k, s)| json!([p, k, stamp_v(w, s)])).collect()),
         "state_held": sj(m.state_held.iter().map(|(o, h)| json!([w.name(*o), h])).collect()),
+        "held_oop": sorted_ids(m.held_oop.iter().copied()),
+        "eps": sj(m.refusal_eps.iter().map(|(i, e)| json!([i, e.start, e.last, e.n, e.end, e.end_q, e.info, e.cover, e.cover_q])).collect()),
         "join": join, "inv": m.inv.iter().collect::<Vec<_>>(), "refused": m.refused, "flips": m.flips, "last_served": m.last_served,
     })
 }
@@ -365,6 +354,8 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         head["D"].as_i64().unwrap(),
         false,
     );
+    // a trace of a run with route probes (`Q6_F` > 0): register events travel out of position, the in-order liveness check is off
+    w.in_order = head["route_f"].as_f64().unwrap_or(0.0) == 0.0;
     if rmode != ReplayMode::Document {
         if rmode == ReplayMode::FieldExact {
             assert_eq!(head["field_safe"], true, "{name}: not a field-safe trace");
@@ -389,6 +380,14 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
             }
             format!("{name}: FIRST DISAGREEMENT at event {} ({short}): {what}", lineno + 1)
         };
+        if ev["k"] == "steps_end" {
+            // the run's steps are over: the D10 state counters of the steps' end, then the end-of-run delivery
+            crate::run::count_open_refusals(&mut w, &ms, false);
+            w.steps_end = ev["steps_end"].as_i64().unwrap();
+            w.quiescing = true;
+            out.events += 1;
+            continue;
+        }
         if ev["k"] == "check_inv" {
             let i = idx(ev["m"].as_str().unwrap());
             ms[i].check_inv();
@@ -457,6 +456,18 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                 ms[idx(&s("dst"))].take(&mut w, &e);
                 Value::Null
             }
+            "hold" => {
+                let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
+                w.stats.bump("hold_taken");
+                ms[idx(&s("dst"))].take_hold(&mut w, &e);
+                Value::Null
+            }
+            "repair_ev" => {
+                let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
+                w.stats.bump("repair_events");
+                ms[idx(&s("dst"))].add_event(&mut w, &e);
+                Value::Null
+            }
             "take_quiesce" => {
                 let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
                 take_quiesce(&mut ms, idx(&s("dst")), &mut w, &e);
@@ -518,12 +529,15 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                 Value::Null
             }
             "pre_finish" => {
+                if w.quiescing {
+                    // ... and the state counters at the end of the run (a random run; a scripted one never ran the loop)
+                    crate::run::count_open_refusals(&mut w, &ms, true);
+                }
                 let py: BTreeMap<String, i64> = ev["stats"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|p| (p[0].as_str().unwrap().to_string(), p[1].as_i64().unwrap()))
-                    .filter(|(k, _)| !PY_ONLY_STATS.contains(&k.as_str()))
                     .collect();
                 let rs: BTreeMap<String, i64> = w
                     .stats
@@ -531,7 +545,6 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     .iter()
                     .filter(|(k, v)| {
                         **v != 0
-                            && !PY_ONLY_STATS.contains(&k.as_str())
                             && !(rmode != ReplayMode::Document
                                 && FIELD_ONLY_STATS.contains(&k.as_str()))
                     })

@@ -1,4 +1,4 @@
 The vendored reference model of the Q6 swap harness: the model of record, byte for byte from the model tree (kimmydb-reviews-0470-0480/q6v2-model).
 40a44c8838f55988cda48c7f296edb13a759803d1790d812888126275d948084  swapmodel6a.py  (v6 base: rule B, the product's grant, the seed-885 rule, the split oracle, the interleaved replay, the open-refusal-at-end check; REPORT6.md and REPORT6-addendum.md)
-cd5ffeb8bc28bbd3b39f47bba00b32c9378e3fe53ab8491270c7853ad7152181  q6diff_gen.py   (the tracer: wraps swapmodel6a.py unmodified and dumps the JSONL traces the Rust replay compares; written for this harness, not a model file)
+0ef4f8f914100322409062ecb3084787c2516f34256645d795b90b813b95f08c  q6diff_gen.py   (the tracer: wraps swapmodel6a.py unmodified and dumps the JSONL traces the Rust replay compares; written for this harness, not a model file)
 The sha256 of each file is checked by a Rust test (main.rs, `the_vendored_model_is_the_reviewed_one`).

@@ -391,6 +391,71 @@ mod tests {
         replay_all(&dir);
     }
 
+    /// The model's route probes (`Q6_F` 0.1 and 0.3, the hold and the repair route, with rule B on and off), traced and replayed:
+    /// the port of `take_hold` / `promote_oop` / the repair step, the D10 refusal episodes and the state counters are compared event
+    /// by event with the model's own, so the Rust route code is tied to the model (`Q6DIFF_ROUTE_RUNS` traces per row).
+    #[test]
+    fn the_differential_replays_the_route_traces_of_the_model() {
+        let runs = env_u64("Q6DIFF_ROUTE_RUNS", 12).to_string();
+        let (mut events, mut views, mut holds) = (0, 0, 0);
+        for (mode, route, f) in [
+            ("v6", "hold", "0.3"),
+            ("v6", "hold", "0.1"),
+            ("v6", "repair", "0.3"),
+            ("v6", "repair", "0.1"),
+            ("m-rule-b-off", "hold", "0.3"),
+            ("m-rule-b-off", "repair", "0.3"),
+        ] {
+            let tag = format!("routes-{mode}-{route}-{f}");
+            let dir = trace_dir(
+                &tag,
+                "random",
+                &["--mode", mode, "--count", &runs, "--f", f, "--routes", route],
+            );
+            let ((n, e, v), _, _) = replay_all_mode(&dir, crate::trace::ReplayMode::Document, &[]);
+            eprintln!("  {tag}: {n} traces, {e} events, {v} member states");
+            events += e;
+            views += v;
+            holds += n;
+        }
+        eprintln!("route traces: {holds} traces, {events} events, {views} member states compared");
+    }
+
+    /// The eight route rows (hold / repair x 0.1 / 0.3 x rule B on / off) run on the Rust harness: the routes fire, the refusal
+    /// episodes and the state counters are counted, and the table is printed (the comparison with REPORT6 is a later report).
+    #[test]
+    fn the_route_rows_exercise_the_routes() {
+        let seeds = env_u64("Q6_ROUTE_RUNS", 20);
+        for rule_b in [true, false] {
+            for (hold, repair, route) in [(true, false, "hold"), (false, true, "repair")] {
+                for f in [0.3, 0.1] {
+                    let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+                    for c in cfgs.iter_mut() {
+                        c.routes = Some(crate::run::Routes { f, hold, repair });
+                    }
+                    let mode = if rule_b { "v6" } else { "m-rule-b-off" };
+                    let s = run_grid(mode, "v6", &cfgs, 0, seeds, threads());
+                    let p = s.problems();
+                    eprintln!(
+                        "{route} {f} rule B {}: {} runs; hold_taken {} repair_events {} info_parked {} refusal episodes {} (info {}); open at steps end {} / run end {}; problems {:?}",
+                        if rule_b { "on " } else { "off" },
+                        s.runs,
+                        s.get("cnt_hold_taken"),
+                        s.get("cnt_repair_events"),
+                        s.get("cnt_info_parked"),
+                        s.get("cnt_refusal_episodes"),
+                        s.get("cnt_refusal_episodes_info"),
+                        s.get("cnt_refusal_open_at_steps_end"),
+                        s.get("cnt_refusal_open_at_run_end"),
+                        p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
+                    );
+                    assert!(s.get(if hold { "cnt_hold_taken" } else { "cnt_repair_events" }) > 0);
+                    assert!(s.get("cnt_refusal_episodes") > 0);
+                }
+            }
+        }
+    }
+
     /// The differential has teeth: a trace with one changed value (a member's clock after the third event) is reported at that
     /// event, with the path of the field.
     #[test]
@@ -423,7 +488,7 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6a.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "swapmodel6a.py");
-        let tracer = "cd5ffeb8bc28bbd3b39f47bba00b32c9378e3fe53ab8491270c7853ad7152181";
+        let tracer = "0ef4f8f914100322409062ecb3084787c2516f34256645d795b90b813b95f08c";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");

@@ -454,6 +454,42 @@ mod tests {
         );
     }
 
+    /// The hold route (`swapmodel6a.py` `take_hold`, `promote_oop`): a non-document entry taken out of position is known to the member
+    /// (its register sees it) but is not appended, so not served onward, until every earlier entry of its origin is held; a
+    /// document entry is taken as usual. The repair route hands a register event over as information only.
+    #[test]
+    fn a_held_entry_is_known_but_served_only_once_it_is_in_position() {
+        let mut sc = Sc::new("v6", &[("W", 0), ("D", 0), ("R", 0)], 60);
+        let (w_, d, r) = (sc.idx("W"), sc.idx("D"), sc.idx("R"));
+        sc.advance(1);
+        let seed = sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        sc.advance(10);
+        let job = sc.ms[w_].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+        let create =
+            sc.w.all.iter().find(|e| e.kind == Kind::Create).cloned().expect("the stage's create");
+        assert!(create.hlc > seed.hlc);
+        // D takes the create ahead of its position: the seed (an earlier entry of W) is not held at D
+        sc.ms[d].take_hold(&mut sc.w, &create);
+        assert!(sc.ms[d].holds(create.idx) && sc.ms[d].held_oop.contains(&create.idx));
+        assert!(!sc.ms[d].appended.contains(&create.idx), "held out of position: not appended");
+        // the seed arrives: the create is in position and servable
+        sc.ms[d].take(&mut sc.w, &seed);
+        sc.ms[d].settle(&mut sc.w);
+        assert!(sc.ms[d].appended.contains(&create.idx) && sc.ms[d].held_oop.is_empty());
+        // the repair route: W binds, R is handed W's register events as information
+        sc.advance(12);
+        let mut job = job;
+        let bind = sc.ms[w_].do_bind(&mut sc.w, &mut job, 3).expect("the bind");
+        let evs: Vec<EntryId> = sc.ms[w_].evl.clone();
+        for i in evs {
+            let e = sc.w.ent_rc(i);
+            sc.ms[r].add_event(&mut sc.w, &e);
+        }
+        assert!(sc.ms[r].info.contains_key(&bind.idx), "ahead of its position: information");
+        assert!(!sc.ms[r].holds(bind.idx) && !sc.ms[r].events.contains(&bind.idx));
+        assert_eq!(sc.w.stats.get("info_parked"), 1);
+    }
+
     fn a_late_delete_held_only_as_snapshot_state_is_reported_once_everywhere_under(pre: &str) {
         let (recs, problems) = late_delete_only_as_state(&format!("{pre}v6"));
         assert_eq!(recs, vec![true, true, true], "one record and one event on W, Y and N");
