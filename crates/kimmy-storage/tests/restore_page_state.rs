@@ -293,7 +293,8 @@ fn a_restored_members_own_position_does_not_rise_over_its_own_rows_held_as_state
     pull_all(&b, &d);
     let mut older = Vec::new();
     d.backup_to(&mut older, WalkScope::Background).unwrap();
-    let position = d.version_vector().unwrap().get(d.origin());
+    let old_origin = d.origin();
+    let position = d.version_vector().unwrap().get(old_origin);
     // Two writes of D's own after that backup, which B takes and the old backup lacks.
     let items = d.get_collection("shop", "items").unwrap();
     d.insert(&items, doc! { "_id": 8i64 }).unwrap();
@@ -315,7 +316,8 @@ fn a_restored_members_own_position_does_not_rise_over_its_own_rows_held_as_state
         position,
         "the restored member's own position rose over its own write held as state"
     );
-    assert_eq!(d.version_vector().unwrap().get(d.origin()), position);
+    // under the epoch it was written in: the restores since gave it new ones
+    assert_eq!(d.version_vector().unwrap().get(old_origin), position);
 }
 
 /// The backup's vector names two origins at different positions: D holds B far ahead

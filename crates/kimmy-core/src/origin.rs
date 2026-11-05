@@ -391,6 +391,25 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_epoch_is_its_start_hlc_and_64_random_bits() {
+        let start = Hlc::new(1_700_000_000_123, 7);
+        let one = Epoch::generate(start);
+        let other = Epoch::generate(start);
+        assert_eq!(one.start_hlc(), start);
+        assert_eq!(&one.0[..10], &start.to_bytes());
+        assert_ne!(one, other, "two mints at one HLC differ in their random half");
+        // the random half is not a constant and not the version bits of a UUID alone
+        let halves: std::collections::BTreeSet<[u8; 8]> =
+            (0..32).map(|_| Epoch::generate(start).0[10..].try_into().unwrap()).collect();
+        assert_eq!(halves.len(), 32);
+        // a later start sorts later whatever the random half: the epoch order is start-first
+        assert!(Epoch::generate(Hlc::new(start.wall_ms + 1, 0)) > Epoch::generate(start));
+        // a test epoch starts at zero
+        assert_eq!(Epoch::from_u64(9).start_hlc(), Hlc::ZERO);
+        assert_eq!(Epoch::ZERO.start_hlc(), Hlc::ZERO);
+    }
+
+    #[test]
     fn the_extremes_are_the_all_zero_and_all_one_epochs() {
         assert_eq!(Epoch::ZERO, Epoch::default());
         assert!(Epoch::ZERO < Epoch::from_u64(1));

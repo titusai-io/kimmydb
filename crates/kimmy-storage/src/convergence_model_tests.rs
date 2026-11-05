@@ -1164,7 +1164,7 @@ impl Cluster {
                 e.witnessed_vector().map_err(|e| err("witnessed_vector", e))?
             );
         }
-        Ok(out)
+        Ok(epochs_by_first_appearance(&out))
     }
 
     fn quiesce(&mut self, route: Route) -> Res<bool> {
@@ -1761,6 +1761,27 @@ fn one_route(ops: &[Op], route: Route, base: u64) -> (Vec<RouteOutcome>, String)
 
 /// Run `ops` twice from the same templates, quiescing once by entries and once by
 /// pages, and check that the two pre-states were the same.
+/// The fingerprint with each epoch named by the order it first appears in, not by its bytes. A
+/// member that reopens after a rewind mints a new epoch (a random one, started at the clock of
+/// the open), which two runs of one schedule cannot share; what they must share is which
+/// origins stand where, and which stamps sit under which of them.
+fn epochs_by_first_appearance(fingerprint: &str) -> String {
+    let (mut out, mut seen) = (String::new(), Vec::<&str>::new());
+    let mut rest = fingerprint;
+    while let Some(at) = rest.find("Epoch([") {
+        let Some(len) = rest[at..].find("])") else { break };
+        let epoch = &rest[at..at + len + 2];
+        let n = seen.iter().position(|e| *e == epoch).unwrap_or_else(|| {
+            seen.push(epoch);
+            seen.len() - 1
+        });
+        let _ = write!(out, "{}Epoch#{n}", &rest[..at]);
+        rest = &rest[at + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) fn check(ops: &[Op]) -> Vec<RouteOutcome> {
     check_routes(ops, &[Route::Entries, Route::Pages])
 }
