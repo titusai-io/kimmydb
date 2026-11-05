@@ -525,7 +525,10 @@ fn the_sentinel_is_an_ordinary_drop_collection_entry() {
     )
     .unwrap();
     let encoded = crate::codec::encode_oplog_entry(&entry);
-    assert_eq!(crate::codec::decode_oplog_entry(&encoded).unwrap(), entry);
+    assert_eq!(
+        crate::codec::decode_oplog_entry(&crate::codec::oplog_key(&entry.stamp), &encoded).unwrap(),
+        entry
+    );
 
     b.apply_batch(std::slice::from_ref(&entry)).unwrap();
     assert_eq!(b.collection_dropped_at(id).unwrap(), Some(entry.stamp));

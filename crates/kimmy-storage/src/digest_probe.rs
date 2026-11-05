@@ -789,7 +789,7 @@ impl Engine {
             }
             // A DDL entry has no document id; a unique violation names a
             // document but writes no record, which over-includes, safely.
-            if let Some(doc_id) = codec::decode_oplog_entry(value)?.doc_id {
+            if let Some(doc_id) = codec::decode_oplog_entry(key, value)?.doc_id {
                 found.entry(collection).or_default().insert(crate::docs::doc_key(&doc_id)?);
             }
         }

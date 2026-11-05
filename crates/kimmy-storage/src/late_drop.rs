@@ -1759,7 +1759,7 @@ mod tests {
     fn a_definition_tied_at_the_drop_is_swept_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.create_index("shop", "orders", by_from(), false, Some("tied".into())).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.indexes[0].created = Some(above));
         let id = b.get_collection("shop", "orders").unwrap().id;
@@ -1783,7 +1783,7 @@ mod tests {
     fn a_vector_configuration_tied_at_the_drop_is_turned_off_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.configure_vectors("shop", "orders", byo_config()).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.vector_changed = Some(above));
         pull(&b, &a);
@@ -2100,7 +2100,7 @@ mod tests {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         let b = std::sync::Arc::new(b);
         b.configure_vectors("shop", "orders", byo_config()).unwrap();
-        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         edit_meta(&b, |meta| meta.vector_changed = Some(above));
         let competing = std::sync::Arc::clone(&b);
         let ((), made) = crate::sync::race_hooks::race(

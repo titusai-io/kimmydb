@@ -571,11 +571,8 @@ fn a_replicated_index_in_the_drops_hlc_between_two_sweep_chunks_is_history() {
                 let held = d.collection_dropped_at(CollectionId::derive("shop", "orders"));
                 let dropped = held.unwrap().expect("the tombstone is recorded first");
                 let mut tied = create[0].clone();
-                tied.stamp = Stamp::new(
-                    dropped.hlc,
-                    kimmy_core::NodeId::from_bytes([0xff; 16]),
-                    Epoch::ZERO,
-                );
+                tied.stamp =
+                    Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
                 d.apply_batch(std::slice::from_ref(&tied)).unwrap();
             },
         );

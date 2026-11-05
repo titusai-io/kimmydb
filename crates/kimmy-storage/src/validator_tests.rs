@@ -606,7 +606,7 @@ fn the_oplog_kind_round_trips_through_its_tag() {
         .into_iter()
         .find(|entry| entry.kind == OpKind::ConfigureValidator)
         .unwrap();
-    let back = crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(&entry)).unwrap();
+    let back = crate::codec::oplog_round_trip(&entry).unwrap();
     assert_eq!(back, entry);
     assert!(entry.kind.is_ddl() && !entry.kind.is_document());
     let body: kimmy_core::ValidatorSet =
@@ -741,9 +741,7 @@ fn a_typed_schema_survives_an_entry_a_snapshot_page_and_a_restart_on_a_replica()
             .unwrap()
             .entries
             .iter()
-            .map(|entry| {
-                crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(entry)).unwrap()
-            })
+            .map(|entry| crate::codec::oplog_round_trip(entry).unwrap())
             .collect();
         let body = entries
             .iter()
@@ -876,9 +874,7 @@ fn a_member_never_holds_a_collection_created_with_a_validator_without_it() {
         // The entry alone, each through its stored byte form, as a peer is served it.
         let entries: Vec<_> = entries_of(&a)
             .iter()
-            .map(|entry| {
-                crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(entry)).unwrap()
-            })
+            .map(|entry| crate::codec::oplog_round_trip(entry).unwrap())
             .collect();
         assert_eq!(entries.len(), 1);
         // What applying a plain creation costs, for comparison.

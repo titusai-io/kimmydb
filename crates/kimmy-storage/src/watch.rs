@@ -759,7 +759,7 @@ impl Engine {
                 warn!("arrival index points at a missing oplog entry");
                 continue;
             };
-            out.push(codec::decode_oplog_entry(raw.value())?);
+            out.push(codec::decode_oplog_entry(key.value(), raw.value())?);
             if out.len() >= limit {
                 break;
             }
@@ -800,7 +800,7 @@ impl Engine {
                     warn!("arrival index points at a missing oplog entry");
                     continue;
                 };
-                out.push(codec::decode_oplog_entry(raw.value())?);
+                out.push(codec::decode_oplog_entry(key.value(), raw.value())?);
                 if out.len() >= limit {
                     reached_tail = arrival.range(seq.value() + 1..)?.next().transpose()?.is_none();
                     break;
@@ -955,7 +955,7 @@ impl Engine {
             if skip(&stamp) {
                 window.scanned_to = stamp.hlc;
             } else {
-                let entry = codec::decode_oplog_entry(value.value())?;
+                let entry = codec::decode_oplog_entry(key.value(), value.value())?;
                 // Every entry the scan *examines* moves the window's end, kept or
                 // not: the peer has read past it either way, and a stamp it will
                 // never ship must not be able to hold the window open.
@@ -1036,7 +1036,7 @@ impl Engine {
                 let Some(body) = oplog.get(key.value())? else {
                     return Ok(Err(KeyWalkFallback::MissingBody));
                 };
-                let entry = codec::decode_oplog_entry(body.value())?;
+                let entry = codec::decode_oplog_entry(key.value(), body.value())?;
                 window.scanned_to = entry.stamp.hlc;
                 if keep(&entry) {
                     window.entries.push(entry);
@@ -2131,8 +2131,7 @@ mod tests {
     async fn a_drop_in_the_lifes_own_hlc_ends_a_stream_on_it() {
         let (engine, coll, _dir) = setup();
         let mut stream = engine.watch(WatchScope::Collection(coll.id), Default::default()).unwrap();
-        let tied =
-            Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+        let tied = Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         let drop = crate::engine::ddl_entry(
             tied,
             OpKind::DropCollection,

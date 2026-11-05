@@ -5642,7 +5642,7 @@ impl Engine {
         let oplog = txn.open_table(tables::OPLOG)?;
         let key = codec::oplog_key(stamp);
         match oplog.get(key.as_slice())? {
-            Some(raw) => Ok(Some(codec::decode_oplog_entry(raw.value())?)),
+            Some(raw) => Ok(Some(codec::decode_oplog_entry(key.as_slice(), raw.value())?)),
             None => Ok(None),
         }
     }

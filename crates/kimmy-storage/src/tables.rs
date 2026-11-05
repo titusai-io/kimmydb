@@ -84,13 +84,14 @@ pub type IndexKey<'a> = (u64, u32, &'a [u8], &'a [u8]);
 pub const INDEX_ENTRIES: TableDefinition<IndexKey<'static>, ()> =
     TableDefinition::new("index_entries");
 
-/// `(hlc || node) -> OplogEntry`.
+/// `(hlc || node || epoch) -> OplogEntry`.
 ///
-/// A flat byte key rather than a tuple, because the 26-byte concatenation
-/// already sorts in exactly the total write order.
+/// A flat byte key rather than a tuple, because the 44-byte concatenation
+/// already sorts in exactly the total write order. The value is the entry
+/// without its stamp, which is the key (`codec::encode_oplog_entry`).
 pub const OPLOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog");
 
-/// `arrival sequence -> (hlc || node)`.
+/// `arrival sequence -> (hlc || node || epoch)`.
 ///
 /// The oplog is keyed by *origin* stamp, because that is what last-writer-wins
 /// and anti-entropy compare. A replicated entry therefore lands at its original
@@ -106,7 +107,7 @@ pub const OPLOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog");
 /// `Engine::rebuild_arrival_index`. Nothing is lost if they are discarded.
 pub const OPLOG_ARRIVAL: TableDefinition<u64, &[u8]> = TableDefinition::new("oplog_arrival");
 
-/// `(hlc || node) -> arrival sequence`. The reverse of [`OPLOG_ARRIVAL`].
+/// `(hlc || node || epoch) -> arrival sequence`. The reverse of [`OPLOG_ARRIVAL`].
 ///
 /// Exists so that resuming a stream stays a point lookup. A resume token names
 /// an entry by stamp — it is a public, opaque contract that predates this index
@@ -161,7 +162,7 @@ pub const COLLECTIONS_DROPPED: TableDefinition<u64, &[u8]> =
 pub const INDEXES_DROPPED: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("indexes_dropped");
 
-/// `node id (16 bytes) -> highest Hlc held from that node`.
+/// `origin (node id 16 bytes || epoch 18 bytes) -> highest Hlc held from that origin`.
 ///
 /// The version vector, maintained incrementally rather than computed. Deriving
 /// it on demand would mean scanning the whole oplog for a max-per-node, which
@@ -183,7 +184,8 @@ pub const INDEXES_DROPPED: TableDefinition<(u64, u32), &[u8]> =
 /// a source guard (`verified::tests`).
 pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_versions");
 
-/// Newest stamp this node has **processed** per origin, appended or not.
+/// Newest stamp this node has **processed** per origin (`node || epoch`, 34 bytes), appended or
+/// not.
 ///
 /// [`OPLOG_VERSIONS`] answers "what can I serve a peer"; this answers "what
 /// have I already seen". They differ for everything a node handles correctly
@@ -254,7 +256,7 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// [`VECTOR_VERIFIED`] either.
 pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
 
-/// `collection id (8) || stamp key (26) -> ()`: one row per retained
+/// `collection id (8) || stamp key (44) -> ()`: one row per retained
 /// `UniqueViolation` oplog entry, so `/violations` reads its own records and not
 /// the whole oplog (ADR-200, `crate::violations_table`). The one-byte key
 /// `[0x00]` is the sentinel and holds `through`, a stamp key: every violation
@@ -307,7 +309,7 @@ pub const META_FORMAT_VERSION: &str = "format_version";
 /// written by an older build still round-trips rather than losing a key.
 pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
 
-/// One row per origin, `state_held:<node id>`: the highest stamp a whole-database
+/// One row per origin, `state_held:<node uuid>/<36 hex epoch>` (the origin's wire string): the highest stamp a whole-database
 /// snapshot granted this node over history it holds as state and has no entries
 /// for (ADR-224).
 ///
@@ -351,7 +353,8 @@ pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";
 /// rewind is a few dozen bytes.
 pub const META_REWOUND: &str = "rewound";
 
-/// `node id (16 bytes) -> highest Hlc retention has removed from that origin`.
+/// `origin (node id 16 bytes || epoch 18 bytes) -> highest Hlc retention has removed from that
+/// origin`.
 ///
 /// [`META_OPLOG_COLLECTED_THROUGH`] split by origin. It answers the question
 /// the single stamp cannot: *does this peer lack anything I have collected?*

@@ -78,7 +78,7 @@ const PINNED: Hlc = Hlc::new(1 << 44, 0);
 fn build(path: &std::path::Path, documents: usize, violations: usize) {
     let engine = Engine::open(path).unwrap();
     engine
-        .witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]), Epoch::ZERO))
+        .witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]), Epoch::MAX))
         .unwrap();
     engine.create_collection("app", "docs").unwrap();
     let field = IndexField { path: "email".into(), descending: false };

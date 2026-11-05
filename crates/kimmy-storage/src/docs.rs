@@ -1694,7 +1694,7 @@ impl Engine {
                         Ok((OpKind::UniqueViolation, id)) if id == coll.id
                     );
                     if named {
-                        let entry = codec::decode_oplog_entry(value.value())?;
+                        let entry = codec::decode_oplog_entry(stamp, value.value())?;
                         if let Some(body) = &entry.body {
                             details.push(bson::deserialize_from_slice(body)?);
                         }
@@ -1755,7 +1755,7 @@ impl Engine {
                         let (kind, collection) =
                             codec::decode_oplog_kind_and_collection(value.value())?;
                         if kind == OpKind::UniqueViolation && collection == coll.id {
-                            let entry = codec::decode_oplog_entry(value.value())?;
+                            let entry = codec::decode_oplog_entry(key.value(), value.value())?;
                             if let Some(body) = &entry.body {
                                 let detail: kimmy_core::UniqueViolationDetail =
                                     bson::deserialize_from_slice(body)?;
@@ -3502,7 +3502,10 @@ mod tests {
         };
         let mut bytes = codec::encode_oplog_entry(&entry);
         bytes.truncate(bytes.len() - 8);
-        assert!(codec::decode_oplog_entry(&bytes).is_err(), "the fixture must be undecodable");
+        assert!(
+            codec::decode_oplog_entry(&codec::oplog_key(&entry.stamp), &bytes).is_err(),
+            "the fixture must be undecodable"
+        );
         bytes
     }
 

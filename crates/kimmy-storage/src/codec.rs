@@ -251,10 +251,14 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
     })
 }
 
+/// An oplog entry as the `OPLOG` table stores it: `FORMAT_VERSION ‖ kind ‖ collection ‖ …`.
+///
+/// **The stamp is not in the value.** It is the row's key ([`oplog_key`]), and a copy in the
+/// value was 44 bytes of the same thing; [`decode_oplog_entry`] takes the key and puts the
+/// stamp back. The entry on the wire (serde) keeps its stamp.
 pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.push(FORMAT_VERSION);
-    put_stamp(&entry.stamp, &mut out);
     out.push(op_kind_tag(entry.kind));
     out.extend_from_slice(&entry.collection.0.to_be_bytes());
 
@@ -279,16 +283,17 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
 /// [`decode_oplog_entry`] and the copy of its body.
 pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, CollectionId)> {
     check_version(&mut input)?;
-    take(&mut input, STAMP_LEN)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
     Ok((kind, collection))
 }
 
-pub fn decode_oplog_entry(mut input: &[u8]) -> Result<OplogEntry> {
+/// The entry stored under `key` with value `input`: the stamp is the key's
+/// ([`decode_oplog_key`]), the rest is the value ([`encode_oplog_entry`]).
+pub fn decode_oplog_entry(key: &[u8], mut input: &[u8]) -> Result<OplogEntry> {
+    let stamp = decode_oplog_key(key)?;
     check_version(&mut input)?;
-    let stamp = take_stamp(&mut input)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
@@ -300,6 +305,13 @@ pub fn decode_oplog_entry(mut input: &[u8]) -> Result<OplogEntry> {
     let body = take_opt_bytes(&mut input)?.map(<[u8]>::to_vec);
 
     Ok(OplogEntry { stamp, kind, collection, doc_id, body })
+}
+
+/// An entry encoded for the `OPLOG` table and read back under its own key: the round trip a
+/// test wants.
+#[cfg(test)]
+pub(crate) fn oplog_round_trip(entry: &OplogEntry) -> Result<OplogEntry> {
+    decode_oplog_entry(&oplog_key(&entry.stamp), &encode_oplog_entry(entry))
 }
 
 /// The oplog's primary key: `(hlc, node, epoch)` encoded so that `memcmp` yields the
@@ -421,7 +433,7 @@ mod tests {
             },
         ];
         for entry in entries {
-            let decoded = decode_oplog_entry(&encode_oplog_entry(&entry)).unwrap();
+            let decoded = oplog_round_trip(&entry).unwrap();
             assert_eq!(decoded, entry);
         }
     }
@@ -439,8 +451,8 @@ mod tests {
         };
         let none = OplogEntry { body: None, ..base.clone() };
         assert_ne!(encode_oplog_entry(&base), encode_oplog_entry(&none));
-        assert_eq!(decode_oplog_entry(&encode_oplog_entry(&base)).unwrap().body, Some(Vec::new()));
-        assert_eq!(decode_oplog_entry(&encode_oplog_entry(&none)).unwrap().body, None);
+        assert_eq!(oplog_round_trip(&base).unwrap().body, Some(Vec::new()));
+        assert_eq!(oplog_round_trip(&none).unwrap().body, None);
     }
 
     #[test]
@@ -477,17 +489,21 @@ mod tests {
 
     #[test]
     fn truncated_records_error_rather_than_panic() {
-        let full = encode_oplog_entry(&OplogEntry {
+        let entry = OplogEntry {
             stamp: stamp(1, 1),
             kind: OpKind::Insert,
             collection: CollectionId(1),
             doc_id: Some(DocId::String("abc".into())),
             body: Some(b"xyz".to_vec()),
-        });
+        };
+        let key = oplog_key(&entry.stamp);
+        let full = encode_oplog_entry(&entry);
         for cut in 1..full.len() {
             // Every truncation must be a clean error; a panic here would take
             // down the server on a single corrupt page.
-            assert!(decode_oplog_entry(&full[..cut]).is_err(), "no error at cut {cut}");
+            assert!(decode_oplog_entry(&key, &full[..cut]).is_err(), "no error at cut {cut}");
         }
+        // and so is a key that is not a stamp's
+        assert!(decode_oplog_entry(&key[..43], &full).is_err());
     }
 }

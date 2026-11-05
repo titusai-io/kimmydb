@@ -38,7 +38,7 @@ use crate::tables;
 /// The digest format: what is hashed, and how a row is laid out. A build that
 /// changes either changes this, which moves the mark, so rows written under
 /// the old format are rebuilt rather than trusted.
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = 2;
 
 /// The key of the digest mark in [`tables::LIVE_DIGESTS_THROUGH`].
 pub(crate) const THROUGH: &str = "arrival";
@@ -143,13 +143,14 @@ fn raise(map: &mut BTreeMap<Origin, Hlc>, stamp: &Stamp) {
 }
 
 /// The term one live record contributes to its collection's digest:
-/// `xxh3_128(key || stamp)`, over the record's key. The stamp is fixed width and
-/// last, so the pair encodes unambiguously.
+/// `xxh3_128(key || stamp)`, over the record's key, the stamp being its full
+/// 44-byte key form `hlc || node || epoch`. The stamp is fixed width and
+/// last, so the pair encodes unambiguously. It is the resolved stamp, never a
+/// store-local value: two members must hash the same bytes for the same write.
 pub fn term(key: &[u8], stamp: &Stamp) -> u128 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     hasher.update(key);
-    hasher.update(&stamp.hlc.to_bytes());
-    hasher.update(&stamp.node.to_bytes());
+    hasher.update(&stamp.to_key_bytes());
     hasher.digest128()
 }
 
@@ -363,6 +364,12 @@ mod tests {
             term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]), Epoch::ZERO))
         );
         assert_eq!(base, term(&k(b"k"), &stamp(5, 1)));
+        // the epoch is part of the stamp: the same write by another epoch of the node is
+        // another write (a restored member's new writes must not hash like the lost ones)
+        let at_epoch = |epoch: u64| {
+            Stamp::new(Hlc::new(5, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(epoch))
+        };
+        assert_ne!(term(&k(b"k"), &at_epoch(1)), term(&k(b"k"), &at_epoch(2)));
         // The stamp is fixed width and last: moving a byte between the key
         // and the stamp cannot give the same input.
         assert_ne!(term(&k(b"ab"), &stamp(5, 1)), term(&k(b"a"), &stamp(5, 1)));
@@ -391,6 +398,37 @@ mod tests {
                 [&kimmy_core::Origin::new(NodeId::from_bytes([1; 16]), kimmy_core::Epoch::ZERO)],
             Hlc::new(9, 0)
         );
+    }
+
+    /// A node's epochs are separate origins in the row: one entry each, in origin order,
+    /// and they survive the row's encoding.
+    #[test]
+    fn two_epochs_of_one_node_are_two_entries_of_the_row() {
+        let at = |wall: u64, epoch: u64| {
+            Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(epoch))
+        };
+        let mut row = DigestRow::default();
+        row.raise_maxw(&at(9, 2));
+        row.raise_maxw(&at(3, 1));
+        row.raise_bare(&at(4, 2));
+        assert_eq!(row.maxw.len(), 2);
+        assert_eq!(row.maxw[&at(3, 1).origin()], Hlc::new(3, 0));
+        assert_eq!(row.maxw[&at(9, 2).origin()], Hlc::new(9, 0));
+        let bytes = row.encode();
+        // version, digest, then per map a u16 count and 44 bytes an entry
+        assert_eq!(bytes.len(), 1 + 16 + (2 + 2 * 44) + (2 + 44));
+        assert_eq!(DigestRow::decode(&bytes).unwrap(), row);
+    }
+
+    /// The digest changed under this format: its terms hash the 44-byte stamp and its rows
+    /// hold origins, so a store of the earlier format is rebuilt, not trusted.
+    #[test]
+    fn the_format_and_the_row_version_moved_with_the_stamp() {
+        assert_eq!(FORMAT, 2);
+        assert_eq!(ROW_VERSION, 2);
+        let mut old = DigestRow::default().encode();
+        old[0] = 1;
+        assert!(DigestRow::decode(&old).is_err(), "a row of the earlier version is refused");
     }
 
     #[test]

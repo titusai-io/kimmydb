@@ -156,8 +156,8 @@ impl Engine {
             }
             let oplog = txn.open_table(tables::OPLOG)?;
             for entry in oplog.iter()? {
-                let (_, value) = entry?;
-                let entry = codec::decode_oplog_entry(value.value())?;
+                let (key, value) = entry?;
+                let entry = codec::decode_oplog_entry(key.value(), value.value())?;
                 let after = entry.stamp.hlc > until;
                 if after {
                     discardable += 1;
@@ -393,7 +393,7 @@ impl Engine {
             let mut doomed = Vec::new();
             for entry in oplog.iter()? {
                 let (key, value) = entry?;
-                if codec::decode_oplog_entry(value.value())?.stamp.hlc > until {
+                if codec::decode_oplog_entry(key.value(), value.value())?.stamp.hlc > until {
                     doomed.push(key.value().to_vec());
                 }
             }
@@ -423,7 +423,7 @@ impl Engine {
                 if let Some(old) = oplog.remove(key.as_slice())? {
                     let header = codec::decode_oplog_kind_and_collection(old.value());
                     if let Ok((kimmy_core::OpKind::UnkeyedDocument, collection)) = header {
-                        let report = codec::decode_oplog_entry(old.value())?;
+                        let report = codec::decode_oplog_entry(key.as_slice(), old.value())?;
                         if let Some(body) = &report.body {
                             let detail: kimmy_core::UnkeyedDocumentDetail =
                                 bson::deserialize_from_slice(body)?;
@@ -1736,8 +1736,8 @@ mod tests {
                 .iter()
                 .unwrap()
                 .map(|row| row.unwrap())
-                .filter(|(_, value)| {
-                    codec::decode_oplog_entry(value.value()).unwrap().stamp.hlc
+                .filter(|(key, value)| {
+                    codec::decode_oplog_entry(key.value(), value.value()).unwrap().stamp.hlc
                         > Hlc::new(base + 150, 0)
                 })
                 .map(|(key, _)| key.value().to_vec())

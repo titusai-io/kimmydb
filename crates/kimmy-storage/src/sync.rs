@@ -3493,7 +3493,94 @@ mod tests {
     /// `coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node`
     /// pins on its own.
     fn window_end(wall: u64) -> Stamp {
-        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO)
+        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX)
+    }
+
+    /// The tie at a window's last HLC, by epoch (the Step 1 point of the review, D2): the entry
+    /// of `(n, e2)` at the last HLC sorts after the window's last key `(h, n, e1)` when `e2 > e1`,
+    /// so it was not examined and is raised only to the predecessor; `(n, e0)`, `e0 < e1`, sorts
+    /// before it and was.
+    #[test]
+    fn a_tie_at_a_windows_end_is_decided_by_the_epoch_in_oplog_key_order() {
+        let node = kimmy_core::NodeId::from_bytes([5; 16]);
+        let at = Hlc::new(1_000, 3);
+        let (e0, e1, e2) = (Epoch::from_u64(1), Epoch::from_u64(2), Epoch::from_u64(3));
+        let (before, last, after) =
+            (Origin::new(node, e0), Origin::new(node, e1), Origin::new(node, e2));
+        let later_node = Origin::new(kimmy_core::NodeId::from_bytes([6; 16]), e0);
+        let mut theirs = VersionVector::new();
+        for origin in [before, last, after, later_node] {
+            theirs.insert(origin, Hlc::new(5_000, 0));
+        }
+
+        let stop = Stamp::new(at, node, e1);
+        let through = coverage_up_to(&theirs, WindowEnd::Through(stop));
+        assert_eq!(through.get(before), at, "an earlier epoch's entry at the stamp was examined");
+        assert_eq!(through.get(last), at, "the entry itself was delivered");
+        assert_eq!(through.get(after), at.predecessor(), "a later epoch's tie was not examined");
+        assert_eq!(through.get(later_node), at.predecessor(), "nor a later node's");
+
+        let before_it = coverage_up_to(&theirs, WindowEnd::Before(stop));
+        assert_eq!(before_it.get(before), at);
+        assert_eq!(before_it.get(last), at.predecessor(), "the entry itself was not taken");
+        assert_eq!(before_it.get(after), at.predecessor());
+    }
+
+    /// A node-only comparison would read the three epochs alike; whole origins do not, and
+    /// the order of origins is the order of the oplog's keys.
+    mod coverage_order {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn any_stamp() -> impl Strategy<Value = Stamp> {
+            // few values on every axis, so ties at the same HLC and the same node are common
+            (1u64..6, 0u16..2, 0u8..3, 0u64..3).prop_map(|(wall, counter, node, epoch)| {
+                Stamp::new(
+                    Hlc::new(wall * 100, counter),
+                    kimmy_core::NodeId::from_bytes([node; 16]),
+                    Epoch::from_u64(epoch),
+                )
+            })
+        }
+
+        proptest! {
+            /// Against a brute-force served set: serve the first `limit` entries of a log in key
+            /// order; every entry served is covered by the answer and no entry left out is.
+            /// An entry the answer covered and the window left out would be skipped for good.
+            #[test]
+            fn a_window_covers_exactly_the_entries_it_served(
+                stamps in prop::collection::btree_set(any_stamp(), 1..24),
+                limit in 1usize..24,
+                before in any::<bool>(),
+            ) {
+                let log: Vec<Stamp> = stamps.into_iter().collect(); // key order
+                let mut theirs = VersionVector::new();
+                for stamp in &log {
+                    theirs.observe(*stamp);
+                }
+                let limit = limit.min(log.len());
+                let (served, rest) = log.split_at(limit);
+                // `Through` the last entry served, or `Before` the first one left out
+                let end = match (before, rest.first()) {
+                    (true, Some(next)) => WindowEnd::Before(*next),
+                    _ => WindowEnd::Through(*served.last().unwrap()),
+                };
+                let covered = coverage_up_to(&theirs, end);
+                for stamp in served {
+                    prop_assert!(
+                        stamp.hlc <= covered.get(stamp.origin()),
+                        "served {stamp:?} is not covered by {covered:?}"
+                    );
+                }
+                for stamp in rest {
+                    prop_assert!(
+                        stamp.hlc > covered.get(stamp.origin()),
+                        "{stamp:?} was not served but {covered:?} covers it: a skip"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -8433,7 +8520,7 @@ mod tests {
             .collection_dropped_at(CollectionId::derive("shop", &shadow))
             .unwrap()
             .expect("the shadow's drop");
-        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         let entry = crate::engine::ddl_entry(
             tied,
             OpKind::ConfigureVectors,
@@ -8550,7 +8637,7 @@ mod tests {
             .cloned()
             .expect("the index's entry");
         index.stamp =
-            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
+            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
         let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
         assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
