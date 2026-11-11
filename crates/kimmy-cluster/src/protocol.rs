@@ -113,11 +113,45 @@ fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opti
 
 /// A digest request, read leniently (B3): one that does not decode is none, so a
 /// field of another shape costs the field and never the frame.
+///
+/// **One case is not silent.** A request whose `cut` is present and is not a version
+/// vector (a key that is not an origin, such as a node alone) is also none, because
+/// failing the frame would end the connection and the count half of the divergence
+/// check with it, on every round the requester repeats it (ADR-139: an error inside
+/// replication must never wedge it). It is flagged for the read's caller
+/// ([`take_malformed_digest_cut`]), which says so once per peer and counts it.
 fn lenient_digest_ask<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<kimmy_storage::DigestAsk>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+    Ok(raw.and_then(|raw| {
+        let cut_malformed = matches!(&raw, bson::Bson::Document(ask)
+        if ask.get("cut").is_some_and(|cut| {
+            bson::deserialize_from_bson::<VersionVector>(cut.clone()).is_err()
+        }));
+        match bson::deserialize_from_bson(raw) {
+            Ok(ask) => Some(ask),
+            Err(_) => {
+                if cut_malformed {
+                    MALFORMED_DIGEST_CUT.with(|flag| flag.set(true));
+                }
+                None
+            }
+        }
+    }))
+}
+
+thread_local! {
+    /// Set by [`lenient_digest_ask`] when the frame being decoded on this thread
+    /// carried a digest request whose `cut` did not decode. The decode and the
+    /// caller's next line run in one poll, as `facts::take_undecodable`'s do.
+    static MALFORMED_DIGEST_CUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the frame just decoded on this thread carried a digest request with a
+/// malformed `cut`; clears the flag.
+pub(crate) fn take_malformed_digest_cut() -> bool {
+    MALFORMED_DIGEST_CUT.with(|flag| flag.replace(false))
 }
 
 /// A digest answer, read leniently, as the request is.
@@ -679,6 +713,7 @@ pub(crate) async fn read_frame_noting_facts_within<R: AsyncRead + Unpin>(
 ) -> Result<(Message, bool, u64), ProtocolError> {
     let body = read_body_within(reader, Some(waits)).await?;
     crate::facts::take_undecodable();
+    take_malformed_digest_cut();
     let message = decode(&body)?;
     let seq = crate::facts::next_decoded_seq();
     Ok((message, crate::facts::take_undecodable(), seq))
@@ -1708,6 +1743,72 @@ mod tests {
         }
         let old: OldAnswer = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
         assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
+    }
+
+    /// A digest request is read leniently, with one case that is loud: a `cut` that is
+    /// not a version vector (a key naming a node and no epoch) reads as no digest and
+    /// is flagged for the read's caller, where any other shape that does not decode
+    /// is no digest and no flag; and a good cut, after either, is read whole.
+    #[test]
+    fn a_digest_request_with_a_malformed_cut_reads_as_none_and_is_flagged() {
+        let ask = kimmy_storage::DigestAsk {
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
+            uncovered: Vec::new(),
+            busy: None,
+        };
+        let good = bson::serialize_to_document(&Message::AskDivergence {
+            probe: None,
+            digest: Some(ask.clone()),
+            definitions: None,
+        })
+        .unwrap();
+        let decode_flagged = |body: &bson::Document| {
+            take_malformed_digest_cut();
+            let message = decode(&bson::serialize_to_vec(body).unwrap()).unwrap();
+            (message, take_malformed_digest_cut())
+        };
+
+        // A cut keyed by a node alone.
+        let mut node_only = good.clone();
+        let cut = node_only
+            .get_document_mut("AskDivergence")
+            .unwrap()
+            .get_document_mut("digest")
+            .unwrap()
+            .get_document_mut("cut")
+            .unwrap();
+        let (key, value) = cut.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        cut.remove(&key);
+        cut.insert(key.split('/').next().unwrap().to_string(), value);
+        let (message, flagged) = decode_flagged(&node_only);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: None, definitions: None },
+            "read as no digest, the frame still decodes"
+        );
+        assert!(flagged, "and the malformed cut is flagged");
+
+        // A digest of some other shape: no digest, no flag (the lenient reading).
+        let other_shape = bson::doc! { "AskDivergence": { "digest": "not a request" } };
+        let (message, flagged) = decode_flagged(&other_shape);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: None, definitions: None }
+        );
+        assert!(!flagged, "another shape is the old lenient reading");
+
+        // A good cut is read whole, and not flagged.
+        let (message, flagged) = decode_flagged(&good);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: Some(ask), definitions: None }
+        );
+        assert!(!flagged);
     }
 
     /// B3 half 2: the definition digest crosses the version line in both
