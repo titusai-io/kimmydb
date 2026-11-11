@@ -445,6 +445,7 @@ mod tests {
     #[test]
     fn the_route_rows_against_report6() {
         let seeds = env_u64("Q6_ROUTE_RUNS", 20);
+        let mut violations: Vec<String> = Vec::new();
         for (route, f, rule_b, r6, r6d) in REPORT6_ROWS {
             let (hold, repair) = (route == "hold", route == "repair");
             let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
@@ -505,10 +506,28 @@ mod tests {
                 g("cnt_page_above_coverage"),
                 p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
             );
-            assert!(g(if hold { "cnt_hold_taken" } else { "cnt_repair_events" }) > 0);
-            assert!(g("cnt_refusal_episodes") > 0);
-            assert_eq!(g("cnt_grant_above_coverage"), 0);
-            assert_eq!(g("cnt_page_above_coverage"), 0);
+            // collected, not asserted one by one: every row runs, every violation is kept with its row and the first seed that
+            // showed it (`first` is the lowest seed over the row's configurations, where the check counts runs; none for the
+            // counters), and the test fails at the end if any was recorded
+            let row = format!("{route} {f} rule B {}", if rule_b { "on" } else { "off" });
+            let seed_of = |k: &str| match s.first.get(k) {
+                Some(seed) => format!(" (lowest failing seed {seed})"),
+                None => String::new(),
+            };
+            let mut viol = |ok: bool, what: String| {
+                if !ok {
+                    violations.push(format!("{row}: {what}"));
+                }
+            };
+            let hk = if hold { "cnt_hold_taken" } else { "cnt_repair_events" };
+            viol(g(hk) > 0, format!("{hk} = {} is not > 0", g(hk)));
+            viol(
+                g("cnt_refusal_episodes") > 0,
+                format!("cnt_refusal_episodes = {} is not > 0", g("cnt_refusal_episodes")),
+            );
+            for k in ["cnt_grant_above_coverage", "cnt_page_above_coverage"] {
+                viol(g(k) == 0, format!("{k} = {} is not 0", g(k)));
+            }
             if rule_b {
                 for k in [
                     "inv_partial_flip",
@@ -518,22 +537,37 @@ mod tests {
                     "inv_orphan_with_valid_binding",
                     "inv_serve_not_alive",
                 ] {
-                    assert_eq!(g(k), 0, "{route} {f}, rule B on: {k}");
+                    viol(g(k) == 0, format!("rule B on: {k} = {} is not 0{}", g(k), seed_of(k)));
                 }
                 if repair {
-                    assert!(p.is_empty(), "the repair route with rule B on is clean: {p:?}");
+                    viol(
+                        p.is_empty(),
+                        format!("the repair route with rule B on is clean: {p:?}; first seeds {:?}", s.first),
+                    );
                 }
             } else if s.runs >= 7_200 {
-                assert!(
+                viol(
                     g("inv_partial_flip") > 0,
-                    "{route} {f}: rule B off must fire partial flips"
+                    "rule B off must fire partial flips (inv_partial_flip = 0)".into(),
                 );
-                assert!(
+                viol(
                     g("inv_bury_without_newer_visible") > 0,
-                    "{route} {f}: rule B off must fire premature burials"
+                    "rule B off must fire premature burials (inv_bury_without_newer_visible = 0)"
+                        .into(),
                 );
             }
         }
+        if !violations.is_empty() {
+            eprintln!("{} violation(s) over the eight rows:", violations.len());
+            for v in &violations {
+                eprintln!("  VIOLATION {v}");
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} violation(s) over the eight rows: {violations:#?}",
+            violations.len()
+        );
     }
 
     /// The product's out-of-order routes (design note, phase G addition; no model counterpart): document entries held out of position
