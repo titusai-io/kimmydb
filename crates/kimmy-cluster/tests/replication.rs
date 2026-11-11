@@ -8963,10 +8963,14 @@ async fn a_peer_with_a_hole_at_the_restored_members_origin(scenario: &LostTail) 
     age_out_fully(&scenario.peer.engine);
     let hole = node().await;
     sync_once(&hole.engine, scenario.peer.addr, SECRET, None).await.unwrap();
+    // The lost writes sit in the OLD epoch (the restored member writes under a new
+    // one), so the premise is read there: under the new origin both sides are zero.
+    let peer_holds = scenario.peer.engine.version_vector().unwrap().get(scenario.old);
+    assert!(peer_holds > Hlc::ZERO, "premise: the peer holds the member's old-epoch writes");
     assert_eq!(
-        hole.engine.state_held().unwrap().get(scenario.restored.engine.origin()),
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin()),
-        "premise: its hole reaches the restored member's newest write"
+        hole.engine.state_held().unwrap().get(scenario.old),
+        peer_holds,
+        "premise: its hole reaches the restored member's newest lost write"
     );
     hole
 }
@@ -9428,8 +9432,9 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
     let peer_only = scenario.peer.engine.create_collection("shop", "peer_only").unwrap();
     let me = scenario.restored.engine.origin();
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    // A write the member made and lost sits in the epoch it was made under: the old one.
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me.node, me.epoch),
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), scenario.old.node, scenario.old.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection: peer_only.id,
         doc_id: Some(DocId::String("lost".into())),
