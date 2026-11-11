@@ -873,6 +873,32 @@ mod tests {
         (dir, path)
     }
 
+    /// [`an_unclean_store`], after ten more documents and 250 deletes: the
+    /// deletes free pages, and the freed table is where a cut of the file's
+    /// last two blocks reaches a page past the end of its region.
+    fn an_unclean_store_with_freed_pages() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.redb");
+        let path = dir.path().join("data").join("kimmy.redb");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let engine = Engine::open(&live).unwrap();
+        fill(&engine);
+        let c = engine.get_collection("shop", "orders").unwrap();
+        let pad = "y".repeat(300);
+        let docs =
+            (0..10).map(|i| bson::doc! { "_id": format!("x{i}"), "pad": pad.clone() }).collect();
+        engine.insert_many(&c, docs).unwrap();
+        for i in 0..250 {
+            engine.delete(&c, &kimmy_core::DocId::String(format!("d{i}"))).unwrap();
+        }
+        std::fs::copy(&live, &path).unwrap();
+        std::fs::copy(crate::format::sidecar_path(&live), crate::format::sidecar_path(&path))
+            .unwrap();
+        drop(engine);
+        assert!(!crate::format::closed_cleanly(&path).unwrap());
+        (dir, path)
+    }
+
     /// Flip the low bit of a byte inside every copy of `needle` in the file,
     /// leaving the checksums as they were. Returns how many it found.
     fn flip(path: &Path, needle: &str) -> usize {
@@ -1214,17 +1240,20 @@ mod tests {
         assert!(report.detail.contains("kimmyd restore"), "{report:?}");
     }
 
-    /// The same cut of a store whose last page is nearer the end of the file:
-    /// redb's own layout check refuses it first, as damage with the same exit.
+    /// The same cut of a store whose freed table names a page nearer the end
+    /// of the file: redb's own layout check, which is the only place those
+    /// page numbers are validated, refuses it first, as damage with the same
+    /// exit. The deletes are what put pages in the freed table, so a store
+    /// without them has nothing there for the cut to pass.
     #[test]
     fn a_killed_store_cut_into_its_last_region_is_damaged_by_redb() {
-        let (_dir, path) = an_unclean_store();
+        let (_dir, path) = an_unclean_store_with_freed_pages();
         let len = std::fs::metadata(&path).unwrap().len();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(len - 8 * BLOCK)
+            .set_len(len - 2 * BLOCK)
             .unwrap();
         let report = check_untouched(&path, PreviousRun::NotClean);
         assert_eq!(report.verdict, Verdict::Damaged, "{report:?}");

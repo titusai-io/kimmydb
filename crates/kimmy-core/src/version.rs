@@ -496,4 +496,65 @@ mod tests {
         // a key that is not an origin's wire form is refused, not read as another origin
         assert!(serde_json::from_str::<VersionVector>(&format!("{{\"{id}\": {{}}}}")).is_err());
     }
+
+    /// Switching the start-HLC rule off changes the size of the first window and nothing else.
+    /// A small pull loop over a log: the requester asks from `behind()`'s threshold, takes the
+    /// entries at or above it, and raises its vector by what it took (and, once the window
+    /// reaches the tail, to the sender's vector). Run once with the epochs the engine mints (a
+    /// start HLC) and once with the same origins under start-less epochs: the final vectors
+    /// agree, the entries taken agree, and only the first window differs.
+    #[test]
+    fn the_start_hlc_rule_changes_the_first_window_and_not_the_final_vectors() {
+        let node = NodeId::from_bytes([3; 16]);
+        // an old epoch with a long history, and a restore's new epoch started at 9_000
+        let old = (Origin::new(node, Epoch::from_u64(1)), Origin::new(node, Epoch::from_u64(2)));
+        let started = Origin::new(node, Epoch::new(Hlc::new(9_000, 0), [4; 8]));
+        let log = |new: Origin, old: Origin| -> Vec<Stamp> {
+            let mut log: Vec<Stamp> = (1..=50u64)
+                .map(|n| Stamp::new(Hlc::new(n * 100, 0), old.node, old.epoch))
+                .collect();
+            log.extend((1..=3u64).map(|n| Stamp::new(Hlc::new(9_000 + n, 0), new.node, new.epoch)));
+            log.sort();
+            log
+        };
+        let pull = |new: Origin, old: Origin| -> (VersionVector, Vec<Stamp>, usize) {
+            let log = log(new, old);
+            let mut theirs = VersionVector::new();
+            for stamp in &log {
+                theirs.observe(*stamp);
+            }
+            // the requester already holds the old epoch's history
+            let mut mine = VersionVector::new();
+            for stamp in log.iter().filter(|s| s.origin() == old) {
+                mine.observe(*stamp);
+            }
+            let (mut taken, mut first) = (Vec::new(), None);
+            while let Some(from) = mine.behind(&theirs) {
+                let window: Vec<Stamp> = log.iter().filter(|s| s.hlc >= from).copied().collect();
+                first.get_or_insert(window.len());
+                for stamp in &window {
+                    mine.observe(*stamp);
+                    taken.push(*stamp);
+                }
+                mine.merge(&theirs);
+            }
+            (mine, taken, first.unwrap_or(0))
+        };
+        let (with_rule, taken_with, first_with) = pull(started, old.0);
+        // the same origins, the new one with an epoch that carries no start
+        let unstarted = Origin::new(node, Epoch::from_u64(7));
+        let (without, taken_without, first_without) = pull(unstarted, old.0);
+
+        assert_eq!(first_with, 3, "the rule asks from the epoch's start: the three new entries");
+        assert_eq!(first_without, 53, "without it the threshold is zero: the whole log");
+        // the same entries (as stamps of the same hlc) were taken, and the vectors agree
+        let hlcs = |taken: &[Stamp]| -> std::collections::BTreeSet<Hlc> {
+            taken.iter().filter(|s| s.hlc.wall_ms >= 9_000).map(|s| s.hlc).collect()
+        };
+        assert_eq!(hlcs(&taken_with), hlcs(&taken_without));
+        let positions = |v: &VersionVector| -> Vec<Hlc> { v.iter().map(|(_, h)| h).collect() };
+        assert_eq!(positions(&with_rule), positions(&without));
+        assert_eq!(with_rule.get(started), Hlc::new(9_003, 0));
+        assert_eq!(without.get(unstarted), Hlc::new(9_003, 0));
+    }
 }

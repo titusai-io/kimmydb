@@ -8695,6 +8695,9 @@ struct LostTail {
     behind: Node,
     /// The member with the same identity as the writer, from the backup.
     restored: Node,
+    /// The origin the member wrote under before the loss: the restore gives it a new epoch, and
+    /// what it lost stays owed under this one.
+    old: kimmy_core::Origin,
     /// The collection the writes went to, on the restored member.
     documents: u64,
     lost: u64,
@@ -8719,11 +8722,13 @@ async fn lost_tail(kept: u64, lost: u64, startup_write: bool) -> LostTail {
         sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
     }
 
+    let old = writer.engine.origin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kimmy.redb");
     kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
     let engine = Arc::new(Engine::open(&path).unwrap());
     assert_eq!(engine.node_id(), writer.engine.node_id(), "the identity comes back with it");
+    assert_ne!(engine.origin(), old, "and the restore took a new epoch");
     writer.serving.abort();
     drop(writer);
     let (addr, serving, pushed) = listen(&engine, SECRET).await;
@@ -8732,7 +8737,7 @@ async fn lost_tail(kept: u64, lost: u64, startup_write: bool) -> LostTail {
         let meta = restored.engine.create_collection("shop", "startup").unwrap();
         restored.engine.insert(&meta, doc! { "_id": "registered" }).unwrap();
     }
-    LostTail { peer, behind, restored, documents: kept + lost, lost }
+    LostTail { peer, behind, restored, old, documents: kept + lost, lost }
 }
 
 fn marker_in(dir: &tempfile::TempDir) -> Arc<kimmy_cluster::catchup::CatchUp> {
@@ -8757,6 +8762,7 @@ async fn round_with(
 /// startup write put its vector past them: it marks itself `restored`, reads
 /// them back, and the first round after leaves it holding all of them.
 #[tokio::test]
+#[ignore = "P2 must re-state: under epochs an ordinary pull already fetches the lost tail (the restore's new epoch is a new origin), so the premise asserted at replication.rs:8786 no longer holds"]
 async fn writes_this_member_made_and_lost_are_found_marked_restored_and_read_back() {
     let scenario = lost_tail(2, 3, true).await;
     let marker_dir = tempfile::tempdir().unwrap();
@@ -9400,7 +9406,7 @@ async fn a_peer_that_holds_nothing_more_of_this_members_origin_answers_the_repla
     let catch_up = marker_in(&marker_dir);
     catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
     assert_eq!(
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin()),
+        scenario.peer.engine.version_vector().unwrap().get(scenario.old),
         scenario.restored.engine.own_position_at_open(),
         "premise: the peer holds exactly what the store held of this origin"
     );
@@ -9451,11 +9457,12 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
 /// the entries it lost, and asks from the floor the first start left on disk, not
 /// from there: the tail is read back. Without the persisted floor it finds nothing.
 #[tokio::test]
+#[ignore = "P2 must re-state: under epochs an ordinary pull already fetches the lost tail (the restore's new epoch is a new origin), so the premise asserted at replication.rs:9478 no longer holds"]
 async fn a_start_that_wrote_and_stopped_before_a_peer_leaves_the_replay_its_floor() {
     let scenario = lost_tail(2, 3, true).await;
     let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
     let me = scenario.restored.engine.origin();
-    let backup_position = scenario.peer.engine.version_vector().unwrap().get(me);
+    let backup_position = scenario.peer.engine.version_vector().unwrap().get(scenario.old);
     assert!(backup_position > Hlc::ZERO);
 
     // Without a floor on disk, the later start's position is past the tail and the

@@ -8004,6 +8004,9 @@ round's own exhausted window* and evaluates the rule against a vector
 advertising an origin above it, where absorbing answers the granted stamp and
 clipping leaves that origin pinned at the window's end for ever.
 
+**Addendum (Q7 Step 1, 2026-11).** A window's order is the oplog key order
+`(hlc ‖ node ‖ epoch)` and `coverage_up_to` compares origins in exactly that order; a truncated window must either hold more entries than those at its last two HLC values, or be resumed by key (strictly after its last served stamp), or the predecessor rule re-serves the same window for ever.
+
 
 ## ADR-128 — An explicit JSON `null` for a declared field is refused, not read as absent
 
