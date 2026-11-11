@@ -2528,6 +2528,13 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
 > rewind every node.
 
+**A resume token issued before a rewind may redeliver events after the member is reopened.**
+A rewind clears the member's epoch, and the open that follows mints a new one, so the member
+is no longer the one that issued the token (a plain restart would keep the epoch, and the
+token would resume exactly). A change stream or a consumer that resumes with such a token is
+served at-least-once: events it had already seen may arrive again. The same holds for a token
+issued before a restore.
+
 **When one member refuses during an every-member rewind**, bring up none of the
 rewound members: a cluster's rewind is all or none, and a member that was not
 rewound sends the undone writes back to the others. Either pick a target every
@@ -2798,8 +2805,8 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 ## Upgrades
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
-data. The on-disk **storage schema** is checked on open, and 0.58.0 and later open only
-schema **7**:
+data. The on-disk **storage schema** is checked on open, and 0.61.0 and later open only
+schema **8** (0.58.0 to 0.60.x open only schema 7):
 
 | Stored version | Behaviour |
 |---|---|
@@ -2819,6 +2826,13 @@ cannot know that a layout it never wrote is safe to guess at.
 and older), at the handshake: it sends a fault naming both protocols and logs
 the refusal naming the peer: its address on the accepting member, its node id
 on the dialling one. Every member must run one release.
+
+**Cluster protocol 3.** 0.61.0 speaks 3, and refuses a peer that speaks 2 at the handshake as
+protocol 2 did one that spoke none. A stamp now carries an epoch, and the frames that name a
+node in a version vector, a window's marks or a snapshot page name an origin (a node and an
+epoch) instead, so a member of another protocol could not read them. A version vector
+travels as a document keyed by the origin's text, `<node uuid>/<36 hex digits of the epoch>`.
+Every member must run one release.
 
 **Upgrading from 0.52.x or older to 0.53.0: stop all, wipe, start all, reseed.**
 1. Stop every member.
@@ -2878,6 +2892,33 @@ more. An aggregation over a collection above the per-request limit is answered
 now when its first stage is a `$count`, `$group`, `$bucket`, `$sortByCount`,
 `$sample`, a `$sort` with a `$limit`, or a stage that streams. **Rolling back:**
 stop every member, then start 0.59.0 on the same data directories.
+
+**Upgrading from 0.60.x to 0.61.0: stop all, wipe, start all, reseed.** 0.61.0 keys every
+stamp, oplog row, version vector and resume token by an origin, a node and an epoch
+([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)),
+and a stamp is 44 bytes where it was 26. **The storage schema is 8 and the cluster protocol is
+3, so 0.61.0 refuses a 0.60 store and a 0.60 backup by name, and writes nothing to them: wipe
+first.** There is no migration code, and (ADR-127) no mixed-version cluster: stop every member
+before starting any on 0.61.0.
+1. Stop every member.
+2. Move each data directory aside (it is the rollback) and create an empty one
+   with the same owner.
+3. Start every member on 0.61.0, check `/readyz` on each and that `/v1/topology`
+   lists every member live, then reseed from your source of truth.
+
+The stamps and the resume tokens that clients hold change with it: a stamp (`if_stamp`, an
+`etag`) is 60 characters and a resume token on a three-member cluster 284, and a value from
+0.60 is refused as malformed, naming what was sent. A client that keeps a stamp or a token
+across the upgrade must discard it. **Rolling back:** stop every member, then start 0.60.x on
+the data directories moved aside at the upgrade.
+
+**Each start keeps the member's epoch; a restore and a rewind do not.** A plain restart finds
+the epoch the store holds and keeps it, so a resume token the member issued still resumes
+exactly. A restore does not carry the epoch (a backup omits it), and a rewind clears it; the
+next open of that store mints a new one. **A resume token issued before the rewind or the
+restore may then redeliver events** once the member is reopened: the member is no longer the
+one that issued it, so the token resumes at-least-once, as on any other member, and a stream
+may deliver again what it had already delivered. See [Change streams](change-streams.md).
 
 ### Rolling back, and `kimmy.format`
 
