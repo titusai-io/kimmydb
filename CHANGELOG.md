@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## 0.61.0 - unreleased
+## Unreleased
 
 **Read before upgrading: 0.61.0 is a wipe release. Stop every member, move the data directories aside, and start them all on 0.61.0 on empty ones, then reseed.** The storage schema is 8 and the cluster protocol is 3: 0.61.0 refuses a store or a backup written by 0.60 or older, by name, and a peer that speaks protocol 2. There is no migration code and no mixed-version cluster (ADR-127's one-version rule). See [Upgrades](docs/operations.md#upgrades).
 
