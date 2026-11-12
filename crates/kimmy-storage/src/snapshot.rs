@@ -976,10 +976,13 @@ impl Engine {
     /// Whether the caps of a client write apply (always, outside a test).
     pub(crate) fn caps_apply(&self) -> bool {
         #[cfg(any(test, feature = "test-hooks"))]
-        if self.caps_lifted_for_test.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+        {
+            !self.caps_lifted_for_test.load(std::sync::atomic::Ordering::Relaxed)
         }
-        true
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            true
+        }
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
