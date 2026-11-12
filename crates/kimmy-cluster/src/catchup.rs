@@ -1249,14 +1249,20 @@ impl CatchUp {
         // no block counts), and not one that has lost data (it holds less of one of
         // its own origins than this member holds of it). Origin by origin: a peer
         // that lost an old epoch's tail and has written further under a new one
-        // has still lost data, whatever its node's highest position.
+        // has still lost data, whatever its node's highest position. How far it
+        // holds an origin is what it has witnessed of it: a write that lost on
+        // arrival there (superseded) is witnessed and never appended, so its
+        // servable position can stay below for good. The witnessed vector is at or
+        // above the servable one by construction (ADR-054, the `Vectors` answer in
+        // transport.rs), so the larger of the two is the witnessed one from a
+        // current peer; taking it guards a peer that sent the servable one alone.
         let counts = |peer: &Reached| {
             !peer.facts.as_deref().is_some_and(|f| f.catching_up)
-                && tick
-                    .mine_witnessed
-                    .iter()
-                    .filter(|(origin, _)| origin.node == peer.node)
-                    .all(|(origin, hlc)| hlc <= peer.servable.get(origin))
+                && tick.mine_witnessed.iter().filter(|(origin, _)| origin.node == peer.node).all(
+                    |(origin, hlc)| {
+                        hlc <= peer.servable.get(origin).max(peer.witnessed.get(origin))
+                    },
+                )
         };
         // The latch drops when nothing is owed (ADR-212): the member is then
         // judged as any marked member is, and gated if no rule clears it.
