@@ -3158,16 +3158,16 @@ mod tests {
         };
         let mut n = 1_700u64;
         for class in 0..3 {
-            for kind in 0..3 {
-                y.faults[class][kind] = n;
+            for slot in &mut y.faults[class] {
+                *slot = n;
                 n += 1;
             }
-            for direction in 0..3 {
-                y.transitions[class][direction] = n;
+            for slot in &mut y.transitions[class] {
+                *slot = n;
                 n += 1;
             }
-            for verdict in 0..5 {
-                y.observations[class][verdict] = n;
+            for slot in &mut y.observations[class] {
+                *slot = n;
                 n += 1;
             }
         }
