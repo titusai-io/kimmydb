@@ -1222,6 +1222,14 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
 /// the new one it writes under now. The server holds every other node's origins at
 /// `Hlc::MAX` and every epoch of the asker's node at `from`, so the page it serves
 /// holds exactly the asker's old-epoch writes and nothing of the third node's.
+///
+/// What this test pins is the `held` vector (transport.rs `serve_replay`, the loop over
+/// `ours`): with the node match broken there the old-epoch writes are held at `Hlc::MAX`
+/// and not served. The final `entry.stamp.node == their_node` filter on the served entries
+/// is a second line of defence that this test cannot reach: every origin the server holds
+/// is in `ours`, read at the top of the same loop, so `held` already puts every other
+/// node's origin at `Hlc::MAX` and the walk never returns one. Only an origin applied
+/// between that read and the walk could, which a single-threaded test cannot arrange.
 #[tokio::test]
 async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_other() {
     let f = fixture_with_tail(5, 0, 3);
