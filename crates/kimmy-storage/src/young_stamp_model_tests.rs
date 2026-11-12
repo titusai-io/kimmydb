@@ -446,6 +446,24 @@ fn template(id: u8) -> PathBuf {
     path
 }
 
+/// A directory for one member's store: in memory, on the host's `tmpfs` at `/dev/shm`, when
+/// there is one, else the ordinary temporary directory. Every step commits on every member it
+/// touches, and each commit waits for an fsync: on a disk shared with a whole workspace's
+/// tests those waits, not the model, were most of the run, and a slow step is a run thrown
+/// away and repeated at a larger time scale (`check`). What a schedule means does not depend
+/// on where its stores live: no step reads the disk's own durability (a killed start's
+/// fsync failure is injected, not the disk's). The templates stay where they are: made once
+/// per process and only copied from.
+fn store_dir() -> tempfile::TempDir {
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir()
+        && let Ok(dir) = tempfile::Builder::new().prefix("kimmy-ysm-").tempdir_in(shm)
+    {
+        return dir;
+    }
+    tempfile::tempdir().unwrap()
+}
+
 fn identity(m: usize, generation: u8) -> u8 {
     if generation == 0 { 0x11 * (m as u8 + 1) } else { 0x40 + 0x10 * m as u8 + generation }
 }
@@ -919,7 +937,7 @@ impl Cluster {
     fn new(cfg: &Config, k: u64) -> Self {
         let members = (0..3)
             .map(|m| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = store_dir();
                 let path = dir.path().join("kimmy.redb");
                 Member {
                     _dir: dir,
@@ -2020,8 +2038,23 @@ impl Outcome {
     }
 }
 
+thread_local! {
+    /// The time scale this thread's next [`check`] starts at, and how many runs in a row
+    /// have needed no retry. A run whose wall clock overtakes a local step is thrown away
+    /// and run again at twice the scale, so starting every schedule at 1 ran most of them
+    /// three or four times over (a debug build needs 8 or 16 on a busy host), each time on
+    /// three freshly opened stores. The scale changes nothing in what a schedule means
+    /// (the module's **Clocks**), so the next schedule starts where the last one ended; after
+    /// [`EASE_AFTER`] runs in a row with no retry it starts at half, so the scale comes back
+    /// down when the host does.
+    static START_K: Cell<(u64, u32)> = const { Cell::new((1, 0)) };
+}
+
+/// See [`START_K`].
+const EASE_AFTER: u32 = 4;
+
 pub(crate) fn check(schedule: &Schedule) -> Outcome {
-    let mut k = 1;
+    let mut k = START_K.with(|start| start.get().0);
     let mut retries = 0;
     loop {
         let mut cluster = Cluster::new(&schedule.cfg, k);
@@ -2031,6 +2064,10 @@ pub(crate) fn check(schedule: &Schedule) -> Outcome {
             retries += 1;
             continue;
         }
+        START_K.with(|next| {
+            let streak = if retries == 0 { next.get().1 + 1 } else { 0 };
+            next.set(if streak >= EASE_AFTER { ((k / 2).max(1), 0) } else { (k, streak) });
+        });
         let mut findings = std::mem::take(&mut cluster.findings);
         if let Err(e) = result {
             findings.push(Finding::plain(Cat::Error, e));
@@ -2701,16 +2738,30 @@ fn young_stamp_third_member_window() {
 }
 
 /// A short seeded run and every family at depth two, for the ordinary suite.
+///
+/// One pool over every schedule, the seeded ones first: a pool per family left the
+/// workers idle behind each family's last schedule, ten times over.
 #[test]
 fn young_stamp_smoke() {
+    const SEEDED: usize = 16;
     let started = std::time::Instant::now();
-    let (mut stats, mut failures) = run_all(&|i| generate(0x5eed_0000 + i as u64, 40), 16);
-    for family in families() {
-        let shallow = Family { depth: 2, ..family };
-        let (s, f) = run_all(&|i| shallow.schedule(i), shallow.size());
-        stats.add(&s);
-        failures.extend(f);
-    }
+    let shallow: Vec<Family> =
+        families().into_iter().map(|family| Family { depth: 2, ..family }).collect();
+    let rows: Vec<(usize, usize)> = shallow
+        .iter()
+        .enumerate()
+        .flat_map(|(f, family)| (0..family.size()).map(move |i| (f, i)))
+        .collect();
+    let (stats, failures) = run_all(
+        &|i| match i.checked_sub(SEEDED) {
+            None => generate(0x5eed_0000 + i as u64, 40),
+            Some(row) => {
+                let (f, i) = rows[row];
+                shallow[f].schedule(i)
+            }
+        },
+        SEEDED + rows.len(),
+    );
     let failed = !failures.is_empty();
     let text = report("smoke", &stats, failures, started.elapsed());
     eprintln!("{text}");
@@ -2745,6 +2796,26 @@ pub(crate) fn rows_named() -> Vec<(&'static str, Schedule)> {
         // is buried, and the burial's purge removes the tombstone. Nothing moves A's horizon:
         // C's row is young on A and the repair writes back a document A deleted.
         ("ys1", ys1(Converge { to: A, from: C, c: O })),
+        // The sender clause (design 13.3): B deletes 1 and collects the tombstone, so its
+        // horizon is above 1's stamp; a whole-database page from A brings 1 back to B. C never
+        // held 1 and its own horizon is below it. Judged by C's horizon alone, 1 is young on C
+        // and the repair from B writes back what B deleted; the sender's horizon keeps it out.
+        (
+            "sender-clause",
+            Schedule {
+                cfg: Config { retention: [5, 0, 5], ..Config::default() },
+                steps: vec![
+                    Create { m: A, c: O },
+                    Pull { to: C, from: A },
+                    Write { m: A, c: O, d: 1 },
+                    Pull { to: B, from: A },
+                    Delete { m: B, c: O, d: 1 },
+                    Gc { m: B },
+                    Whole { to: B, from: A },
+                    Converge { to: C, from: B, c: O },
+                ],
+            },
+        ),
         // YS1's control: the count repair's scoped page brings the same row back (not judged:
         // the oracle looks at what the divergence repair creates only).
         ("ys1-control-scoped", ys1(Scoped { to: A, from: C, c: O })),
@@ -2859,6 +2930,16 @@ fn finding(name: &str) {
     let (_, schedule) = rows_named().into_iter().find(|(n, _)| *n == name).expect("a named row");
     let outcome = check(&schedule);
     assert!(outcome.findings.is_empty(), "finding {name}:\n{}", render(&schedule, &outcome));
+}
+
+/// The sender clause: the young rule judges a row against the higher of the requester's
+/// horizon and the sender's, so a sender that deleted a row, collected the delete and had the
+/// row brought back does not hand it to a requester whose own horizon is below it. The smoke
+/// run's schedules never reach this; the row was found by the three-members family at depth
+/// four with the sender's horizon dropped from the rule.
+#[test]
+fn finding_sender_clause_a_row_the_sender_deleted_and_collected_is_not_written_back() {
+    finding("sender-clause");
 }
 
 /// YS1, fixed: a burial raises the horizon to the highest stamp the life held, so the young rule
