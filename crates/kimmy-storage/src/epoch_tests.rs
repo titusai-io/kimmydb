@@ -60,6 +60,44 @@ fn a_first_open_mints_an_epoch_and_a_restart_keeps_it() {
     });
 }
 
+/// An epoch minted at T, then an open on a clock behind T (a data directory moved to a host whose
+/// clock is behind, a boot before the clock was stepped forward, or `kimmyd restore` and then a
+/// start on such a host): nothing of the epoch was written yet, so the oplog tail and the vectors
+/// are all below T. A peer that never witnessed this origin asks for it from T (`behind`'s
+/// start-HLC rule), so a write of this origin stamped below T would never be asked for.
+#[test]
+fn an_open_on_a_clock_behind_its_epochs_start_stamps_every_write_at_or_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    drop(open(&path));
+    let start = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+    let epoch = Epoch::new(start, [7; 8]);
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::META)
+            .unwrap()
+            .insert(tables::META_EPOCH, epoch.0.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let engine = open(&path);
+    assert_eq!(engine.epoch(), epoch, "the open keeps the stored epoch");
+    let coll = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+    let stamps: Vec<_> = engine
+        .read_oplog_from(Hlc::ZERO, usize::MAX, WalkScope::Request)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.stamp)
+        .collect();
+    assert_eq!(stamps.len(), 2, "the collection and the insert: {stamps:?}");
+    for stamp in stamps {
+        assert_eq!(stamp.epoch, epoch);
+        assert!(stamp.hlc >= start, "{:?} is below the epoch's start {start:?}", stamp.hlc);
+    }
+}
+
 #[test]
 fn an_open_that_finds_no_row_mints_at_or_above_every_stamp_the_store_holds() {
     let dir = tempfile::tempdir().unwrap();

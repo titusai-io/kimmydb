@@ -8680,6 +8680,71 @@ async fn an_address_that_answered_as_this_node_is_dialled_again_after_the_rechec
 }
 
 // ---------------------------------------------------------------------------
+// An epoch's start HLC and a clock behind it
+// ---------------------------------------------------------------------------
+
+/// A member whose epoch was minted at T, reopened on a clock behind T with nothing written under
+/// it: the epoch row a mint on a host whose clock read an hour ahead left (a data directory moved
+/// to a host whose clock is behind, a boot before the clock was stepped forward, `kimmyd restore`
+/// on one host and a start on another). A peer that never witnessed the origin asks for it from T
+/// (`behind`'s start-HLC rule), and a push serves from there too, so a write stamped below T is
+/// neither pulled nor pushed, and the peer still comes to witness the origin through it: write
+/// concern would confirm a write the peer never received.
+#[tokio::test]
+async fn a_write_on_a_clock_behind_its_epochs_start_is_pulled_and_confirmed_only_once_held() {
+    let writer = node().await;
+    let start = Hlc::new(kimmy_storage::engine::physical_now_ms() + 3_600_000, 0);
+    let epoch = Epoch::new(start, [7; 8]);
+    writer.engine.set_epoch_row_for_test(epoch);
+    let writer = writer.restart().await;
+    assert_eq!(writer.engine.epoch(), epoch, "the restart reads the epoch back");
+    let meta = writer.engine.create_collection("shop", "orders").unwrap();
+    writer.engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    let origin = writer.engine.origin();
+    let stamp = kimmy_core::Stamp::new(
+        writer.engine.version_vector().unwrap().get(origin),
+        origin.node,
+        origin.epoch,
+    );
+    let entry = writer.engine.oplog_entry(&stamp).unwrap().expect("the insert");
+    let held = |node: &Node| {
+        node.engine
+            .get_collection("shop", "orders")
+            .ok()
+            .and_then(|c| node.engine.get(&c, &DocId::Int64(1)).unwrap())
+            .is_some()
+    };
+
+    // A push to a peer that has never heard of the origin: confirmed only once it holds the write.
+    let pushed_to = node().await;
+    let (pushed, windows) = confirm(&writer, &pushed_to, &entry).await;
+    let pushed_held = held(&pushed_to);
+
+    // A pull: the peer asks from the epoch's start and must be handed the write. Then write
+    // concern against that peer: it witnesses the origin through the write, so a confirmation
+    // is only right if it holds it.
+    let puller = node().await;
+    let outcome = sync_once(&puller.engine, writer.addr, SECRET, None).await.unwrap();
+    let pulled = held(&puller);
+    let witnessed = puller.engine.witnessed_vector().unwrap().get(origin);
+    let (after_pull, _) = confirm(&writer, &puller, &entry).await;
+    let pulled_then_held = held(&puller);
+
+    let seen = format!(
+        "write {:?} under an epoch starting at {start:?}; push: {pushed:?}, held {pushed_held}, \
+         windows {windows:?}; pull: {outcome:?}, held {pulled}, witnessed through {witnessed:?}; \
+         confirm after the pull: {after_pull:?}, held {pulled_then_held}",
+        entry.stamp.hlc
+    );
+    assert!(entry.stamp.hlc >= start, "{seen}");
+    assert_eq!(pushed, kimmy_cluster::Resolution::Confirmed, "{seen}");
+    assert!(pushed_held, "{seen}");
+    assert!(!outcome.truncated && pulled, "{seen}");
+    assert_eq!(after_pull, kimmy_cluster::Resolution::Confirmed, "{seen}");
+    assert!(pulled_then_held, "a confirmed write is on the peer: {seen}");
+}
+
+// ---------------------------------------------------------------------------
 // A member that lost writes it made, and a member that fell behind the horizon
 // (ADR-202)
 // ---------------------------------------------------------------------------
