@@ -3709,7 +3709,7 @@ impl Engine {
     /// an origin only ever moves up.
     ///
     /// Purely a raise: whether any of it was *this batch's own* progress on
-    /// an origin other than this node's own is `SyncOutcome::coverage_raised`'s
+    /// an origin other than this node's current one is `SyncOutcome::coverage_raised`'s
     /// question, answered separately by comparing this batch's own witnessed
     /// vector against `mine` — not by anything this function returns.
     pub(crate) fn absorb_witnessed_in_txn(

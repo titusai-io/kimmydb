@@ -263,7 +263,8 @@ pub struct SyncOutcome {
     pub advanced: bool,
     /// Whether this batch's own coverage rose above `mine` -- the `held`
     /// this pull's own `AskEntries` sent -- for an origin *other than this
-    /// node's own*: an applied
+    /// node's current one* (an earlier epoch of this node counts: after a
+    /// restore a peer serves it the tail it lost): an applied
     /// entry, a schema change, a released held mark or a superseded entry
     /// all count, since each is real progress on that origin whether or not
     /// it left its own row in `OPLOG_WITNESSED` to raise (`applied`,
@@ -1414,17 +1415,18 @@ impl Engine {
         run.last_committed = true;
         // Whether this batch's own coverage rose above `mine` -- the `held`
         // this pull's own `AskEntries` sent -- for an origin other than
-        // this node's own: an applied entry, a schema change, a released
-        // held mark and a superseded entry all count alike (ADR-157's
+        // this node's current one (its earlier epochs are origins like any
+        // other here: a peer serves it what it lost of them): an applied
+        // entry, a schema change, a released held mark and a superseded
+        // entry all count alike (ADR-157's
         // ceiling). Set only now, after the commit above succeeded
         // (ADR-177). Skipped when there is no `mine` to compare against: a
         // push, a repair replay, or any other caller that does not read
         // `coverage_raised`.
         if let Some(Introduced { mine: Some(mine), .. }) = introduced {
-            let local = self.node_id();
-            outcome.coverage_raised |= witnessed
-                .iter()
-                .any(|(origin, hlc)| origin.node != local && hlc > mine.get(origin));
+            let local = self.origin();
+            outcome.coverage_raised |=
+                witnessed.iter().any(|(origin, hlc)| origin != local && hlc > mine.get(origin));
         }
 
         if let Some(unknown) = &outcome.unknown {
