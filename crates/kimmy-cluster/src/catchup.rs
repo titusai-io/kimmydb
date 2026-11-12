@@ -1856,6 +1856,40 @@ mod tests {
         assert_eq!(f.catchup.evaluate(&tick(&lost, &mine, None, now)), Decision::Kept);
     }
 
+    /// A peer that lost its old epoch's tail and has written under a new one since (a volume
+    /// rollback, a crash under coalesced durability after a minting open) holds less of that
+    /// old origin than this member holds of it: it has lost data, and does not count, however
+    /// far its new epoch has gone. Compared origin by origin, never by the node's highest.
+    #[test]
+    fn a_peer_that_lost_an_old_epochs_tail_does_not_count_whatever_its_new_epoch_holds() {
+        let f = marked(CatchUpReason::Restored);
+        let now = Instant::now();
+        let at = |epoch: u64, ms: u64| {
+            (
+                kimmy_core::Origin::new(node(1), kimmy_core::Epoch::from_u64(epoch)),
+                kimmy_core::Hlc::new(ms, 0),
+            )
+        };
+        let of = |entries: &[(kimmy_core::Origin, kimmy_core::Hlc)]| {
+            let mut v = VersionVector::new();
+            for (origin, hlc) in entries {
+                v.insert(*origin, *hlc);
+            }
+            v
+        };
+        // This member holds the old epoch to 100 and the new one to 200; the peer holds the
+        // old one only to 10. Its highest position, 200, is not less than this member's.
+        let mine = of(&[at(1, 100), at(2, 200)]);
+        let lost = [reached(1, of(&[at(1, 10), at(2, 200)]), None, block(None))];
+        assert_eq!(f.catchup.evaluate(&tick(&lost, &mine, None, now)), Decision::Kept);
+        // The same peer holding the old epoch's tail counts, and clears by dominance.
+        let whole = [reached(1, of(&[at(1, 100), at(2, 200)]), None, block(None))];
+        assert_eq!(
+            f.catchup.evaluate(&tick(&whole, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
+    }
+
     #[test]
     fn a_peer_that_sends_no_block_counts() {
         let f = marked(CatchUpReason::SeededEmpty);
