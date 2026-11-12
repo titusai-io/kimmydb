@@ -1532,6 +1532,14 @@ impl Engine {
         // After the clock resumed, so a minted epoch starts at or above every stamp the store
         // holds. A first open, a restored store and a rewound one all find no row and mint.
         let (epoch, minted) = Self::load_or_mint_epoch(&db, &mut clock)?;
+        // No entry of an epoch is older than its start: a peer that has never witnessed this
+        // origin asks for it from there (`VersionVector::behind`), and a write stamped below it
+        // would never be asked for. A kept epoch may have been minted on a clock ahead of this
+        // one (a moved data directory, a boot before the clock was stepped forward, a restore on
+        // another host) with nothing written under it since, so the store's stamps are all below
+        // its start: resume at or above it. The row is this member's own mint, never a value a
+        // restore carried (a restore skips it).
+        clock.witness(epoch.start_hlc());
 
         if resumed != Hlc::ZERO {
             debug!(hlc = %resumed, "resumed logical clock from the oplog tail");
