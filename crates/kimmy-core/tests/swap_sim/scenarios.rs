@@ -297,6 +297,7 @@ fn join_from_another_peer(mode: &str) -> (bool, bool, Vec<(String, i64)>) {
 /// write while holding it, the bind took effect later, C partially flipped, the run's problems).
 fn rule_b_shape(mode: &str) -> (bool, bool, bool, bool, Vec<(String, i64)>) {
     let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0)], 60);
+    sc.w.reg_in_position_check = false; // the scenario delivers a bind out of position on purpose (rule B's shape)
     sc.advance(1);
     let seed = sc.ms[0].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
     for m in ["B", "C"] {
@@ -438,6 +439,7 @@ struct Twin {
 /// information at C, C mints its own record when it finds x late, and E gets that by a window.
 fn seed_1434_twin(mode: &str) -> Twin {
     let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("E", 0)], 60);
+    sc.w.reg_in_position_check = false; // the hold route hands a loss entry out of position on purpose (the seed-1434 shape)
     sc.advance(1);
     let s6 = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
     let s7 = sc.ms[0].local_doc(&mut sc.w, 7, DocOp::Insert).unwrap();
