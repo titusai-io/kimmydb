@@ -45,6 +45,15 @@ pub struct Flags {
     pub grant_prefix: bool,
     /// v6 (seed 885): a snapshot page's versions of a physical buried on the receiver are history on arrival: retained
     pub dead_page_retained: bool,
+    /// 6r (seed 1434, rule B for loss records): a loss entry enters the member's state only in position; ahead of it, it is
+    /// information (`loss_info`) until the member covers its origin up to it
+    pub loss_in_position: bool,
+    /// 6r: a snapshot carries a record only if some entry of that record is within the grant
+    pub loss_grant_filter: bool,
+    /// 6b (the companion clause): the sender's loss records are read when the LAST page lands, not at the first page
+    pub paged_loss_read: bool,
+    /// Rust-only mutant of the step check: a loss entry received from another member enters the state but is not appended
+    pub fm_loss_not_appended: bool,
     /// Rust-only mutants of the `field` policy's apply and loss path (point 4; read only under `Policy::Field`, no-ops otherwise)
     pub fm_always_append: bool,
     pub fm_stale_body: bool,
@@ -95,7 +104,7 @@ pub const BASES: [&str; 4] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
-pub const MUTANTS: [&str; 32] = [
+pub const MUTANTS: [&str; 35] = [
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -127,6 +136,12 @@ pub const MUTANTS: [&str; 32] = [
     "m-no-pending-dedup",
     "m-rule-b-off",
     "m-dead-page-dropped",
+    // 6r: rule B for loss records off (a loss entry received ahead of its position enters the state at once), with the grant filter
+    "m-loss-out-of-position",
+    // 6b: the paged read of the records at the last page without the grant clause
+    "m-snap-record-no-grant-filter",
+    // Rust-only: the step check's own mutant: a received loss entry is in the state but not appended
+    "m-loss-received-not-appended",
     // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
     "m-stale-src",
 ];
@@ -155,6 +170,8 @@ pub fn base(name: &str) -> Option<Flags> {
             f.rule_b = true;
             f.grant_prefix = true;
             f.dead_page_retained = true;
+            f.loss_in_position = true;
+            f.loss_grant_filter = true;
         }
         "v5-late-register" => f.register_grant_filter = false,
         "v5-late-register-literal" => {
@@ -203,6 +220,18 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-no-pending-dedup" => f.pending_dedup = false,
         "m-rule-b-off" => f.rule_b = false,
         "m-dead-page-dropped" => f.dead_page_retained = false,
+        "m-loss-out-of-position" => {
+            f.loss_in_position = false;
+            f.loss_grant_filter = false;
+        }
+        // 6b: the paged read of the sender's records at the last page: `v6-paged-loss` is the control (the clause applies),
+        // `m-snap-record-no-grant-filter` reads them without the clause
+        "v6-paged-loss" => f.paged_loss_read = true,
+        "m-snap-record-no-grant-filter" => {
+            f.paged_loss_read = true;
+            f.loss_grant_filter = false;
+        }
+        "m-loss-received-not-appended" => f.fm_loss_not_appended = true,
         "m-stale-src" => f.stale_src_bug = true,
         "m-field-always-append" => f.fm_always_append = true,
         "m-field-stale-body" => f.fm_stale_body = true,
@@ -235,6 +264,8 @@ pub fn flags_for(mode: &str, base_name: &str) -> Flags {
             f.rule_b = b.rule_b;
             f.grant_prefix = b.grant_prefix;
             f.dead_page_retained = b.dead_page_retained;
+            f.loss_in_position = b.loss_in_position;
+            f.loss_grant_filter = b.loss_grant_filter;
         } else if !apply_mutant(&mut f, name, arg) {
             panic!("unknown mode {mode}");
         }

@@ -691,7 +691,7 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6b.py")).unwrap();
         let got6b: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got6b, record, "swapmodel6b.py");
-        let tracer = "0ef4f8f914100322409062ecb3084787c2516f34256645d795b90b813b95f08c";
+        let tracer = "4e999f68aac8622bdf32aaf5413f1b9aa616806d0732ee5f90192191a6f1ad04";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");
@@ -1107,7 +1107,8 @@ mod tests {
     /// deterministic set, asserted below; phase D grades each mutant against its expected killer. The survivors at this
     /// size are the mutants the random runs cannot kill and a scripted scenario does (or that are equivalent):
     /// `m-visible-newest` (equivalent in order; the route probes kill it), `m-rule-b-off` (rule B never fires in order;
-    /// `rule_b_a_held_bind_is_information_until_covered` kills it), `m-dead-page-dropped` (0 in 28,800 in-order runs in
+    /// `rule_b_a_held_bind_is_information_until_covered` kills it), `m-loss-out-of-position` (a record is ahead of its position
+    /// only on a route; `seed_1434_shape...` kills it), `m-dead-page-dropped` (0 in 28,800 in-order runs in
     /// the model; `seed_885_shape...` kills it), `m-loss-outside-prefix` (the model: fails nothing).
     #[test]
     fn the_mutants_on_the_snapshot_grid() {
@@ -1133,6 +1134,7 @@ mod tests {
             let allowed_survivors = [
                 "m-visible-newest",
                 "m-rule-b-off",
+                "m-loss-out-of-position",
                 "m-dead-page-dropped",
                 "m-loss-outside-prefix",
                 "m-pending-narrow",
