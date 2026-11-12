@@ -388,11 +388,18 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                                 w.note(format!("DOC-HOLD {} <- {}: {}", d.name, s.name, e));
                                 w.stats.bump("doc_hold_taken");
                                 if e.is_q6_kind() {
-                                    // R1: the hold relog carries no Q6 kind
+                                    w.stats.bump("route_picked_q6_kind"); // counted only: the check below is on the consequence
+                                }
+                                // R1 (M2 of the harness review): the hold relog carries no Q6 kind, judged by its CONSEQUENCE on the
+                                // receiver's state, as the scoped repair's: the Q6 entries it knows (stage creates, abandons, register
+                                // events in effect or held as information, records held as information) did not grow. (Not the whole
+                                // Q6 surface: a held document entry legitimately triggers burials and flips through `settle`.)
+                                let before = d.q6_known();
+                                d.take_hold(&mut w, &e);
+                                if d.q6_known_grew_from(&before) {
                                     w.stats.bump("route_carries_q6_kind");
                                     d.inv.insert("route_carries_q6_kind");
                                 }
-                                d.take_hold(&mut w, &e);
                             }
                         }
                         _ => {
