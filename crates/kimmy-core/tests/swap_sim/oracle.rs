@@ -94,6 +94,24 @@ impl Member {
         {
             self.step_inv.insert("held_entry_servable");
         }
+        // D9's safety net on the product routes (HB-2's two-replay sub-case): a stage this member orphan-buried without the
+        // writer's abandon is buried only once the member covers the writer past the deadline with a COVERED witness entry above
+        // it (an entry held out of position raises no vector). Computed here from the member's coverage and held set, apart
+        // from `covers_past`
+        if w.held_uncovered && !self.vanished {
+            for (name, p) in self.phys.iter() {
+                if !p.orphan || p.kind != PKind::Stage || self.abandoned.contains(name) {
+                    continue;
+                }
+                let Some(cr) = self.creates.get(name) else { continue };
+                let witness = w.by_origin[cr.origin].iter().any(|&id| {
+                    w.ent(id).hlc > cr.dl && self.cv.has(id) && !self.held_oop.contains(&id)
+                });
+                if !(witness && self.covers_servable(w, cr.origin, cr.dl)) {
+                    self.step_inv.insert("orphan_burial_without_covered_witness");
+                }
+            }
+        }
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
             for (k, v) in self.served() {
@@ -282,6 +300,43 @@ pub fn oracle(w: &mut World) -> Oracle {
 
 pub type Res = BTreeMap<String, i64>;
 
+/// HB-2's structural set (B1 classification; a HARNESS class, the manager's ruling): on the product routes, the stages that
+/// - were created by a writer that has vanished (its create is in the write log, its member is gone for good),
+/// - have no valid binding anywhere in the write log (never validly bound: D9's rule, a pure function of the stamps), and
+/// - no live member serves or has ever served (`serving`, `last_served`): no client can see them.
+///
+/// Defined from the write log and the members' states only, never from a divergence. D9 calls such a stage "lingering and
+/// unserved"; its clean-up is the age fallback, which the model of record does not model (D9: "not modelled"), so the harness
+/// cannot apply the real rule: a divergence confined to these stages is excluded from the oracle, by name, and counted on every
+/// run (`cnt_hb2_excluded`). Empty off the product routes and with `World::hb2_exclusion` off.
+pub fn hb2_stages(w: &World, ms: &[Member]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !w.held_uncovered || !w.hb2_exclusion {
+        return out;
+    }
+    for c in w.all.iter().filter(|e| e.kind == Kind::Create) {
+        let vanished_writer = ms.get(c.origin).is_some_and(|m| m.vanished);
+        let validly_bound =
+            w.all.iter().any(|b| b.kind == Kind::Bind && b.phys == c.phys && w.valid(b));
+        let seen = ms
+            .iter()
+            .filter(|m| !m.vanished)
+            .any(|m| m.serving().as_deref() == Some(c.phys.as_str()) || m.last_served == c.phys);
+        if vanished_writer && !validly_bound && !seen {
+            out.insert(c.phys.clone());
+        }
+    }
+    out
+}
+
+/// A state without the physicals of `skip`.
+fn without(st: &State, skip: &BTreeSet<String>) -> State {
+    State {
+        serving: st.serving.clone(),
+        alive: st.alive.iter().filter(|(n, _)| !skip.contains(n)).cloned().collect(),
+    }
+}
+
 fn bk(m: &Member) -> HashSet<HeadKey> {
     m.loss.keys().map(|k| k.head()).collect()
 }
@@ -421,12 +476,20 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         res.insert("k_exceeded".into(), over as i64);
     }
     let m0state = ms[first].state();
-    let div_replay = replays.iter().any(|(st, recs)| {
-        *st != m0state
+    // HB-2: the verdicts are taken with the structural set's stages left out; when that changes a verdict the run is counted
+    let hb2 = hb2_stages(w, ms);
+    res.insert("cnt_hb2_stages".into(), hb2.len() as i64);
+    let m0p = without(&m0state, &hb2);
+    let replay_bad = |st: &State, recs: &HashSet<HeadKey>, m0: &State| {
+        *st != *m0
             || heads.iter().any(|h| !recs.contains(h))
             || recs.iter().any(|r| !allowed.contains(r))
-    });
-    let states_differ = live.iter().any(|&i| ms[i].state() != m0state);
+    };
+    let div_replay_raw = replays.iter().any(|(st, recs)| replay_bad(st, recs, &m0state));
+    let div_replay = replays.iter().any(|(st, recs)| replay_bad(&without(st, &hb2), recs, &m0p));
+    let states_differ_raw = live.iter().any(|&i| ms[i].state() != m0state);
+    let states_differ = live.iter().any(|&i| without(&ms[i].state(), &hb2) != m0p);
+    let mut hb2_excluded = (div_replay_raw && !div_replay) || (states_differ_raw && !states_differ);
     let loss_sets: Vec<BTreeSet<LKey>> =
         live.iter().map(|&i| ms[i].loss.keys().copied().collect()).collect();
     let loss_differ = loss_sets.iter().any(|s| *s != loss_sets[0]);
@@ -435,11 +498,24 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     res.insert("div_state".into(), states_differ as i64);
     res.insert("div_loss".into(), loss_differ as i64);
     let served_mismatch = live.iter().any(|&i| ms[i].served() != o.served);
-    let alive_mismatch = live.iter().any(|&i| {
-        let a: BTreeSet<String> =
-            ms[i].phys.iter().filter(|(_, p)| p.alive).map(|(n, _)| n.clone()).collect();
-        a != o.alive
+    let alive_of = |i: usize, skip: &BTreeSet<String>| -> (BTreeSet<String>, BTreeSet<String>) {
+        let a: BTreeSet<String> = ms[i]
+            .phys
+            .iter()
+            .filter(|(n, p)| p.alive && !skip.contains(*n))
+            .map(|(n, _)| n.clone())
+            .collect();
+        (a, o.alive.iter().filter(|n| !skip.contains(*n)).cloned().collect())
+    };
+    let alive_mismatch_raw = live.iter().any(|&i| {
+        let (a, b) = alive_of(i, &BTreeSet::new());
+        a != b
     });
+    let alive_mismatch = live.iter().any(|&i| {
+        let (a, b) = alive_of(i, &hb2);
+        a != b
+    });
+    hb2_excluded |= alive_mismatch_raw && !alive_mismatch;
     res.insert("served_mismatch".into(), served_mismatch as i64);
     res.insert("alive_mismatch".into(), alive_mismatch as i64);
     res.insert("oracle_state".into(), (served_mismatch || alive_mismatch) as i64);
@@ -815,6 +891,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     // the interleaved replay: each origin's order kept, a random interleaving across origins, each entry served by a
     // random live member that appended it (witnessed if none did)
     let mut div_interleaved = false;
+    let mut div_interleaved_raw = false;
     for i in 0..2 {
         let mut z = Member::new(ms.len() + 2 + i, &format!("Y{i}"), 0);
         let mut per: Vec<Vec<EntryRef>> = vec![Vec::new(); ms.len()];
@@ -833,6 +910,13 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             let servers: Vec<usize> =
                 live.iter().copied().filter(|&j| ms[j].appended.contains(&e.idx)).collect();
             if servers.is_empty() {
+                if w.held_uncovered && live.iter().any(|&j| ms[j].held_oop.contains(&e.idx)) {
+                    // as `take_quiesce_replica`: a live member holds it out of position, so it is not witnessed away. HB-2's
+                    // two-replay sub-case (seeds 101, 730): this replay witnessed it while the stamp-order one did not; by the
+                    // design text (FIX-1: a held entry raises no vector; the FIX-5 ruling: no member downstream witnesses a held
+                    // entry away) the stamp-order replay is right
+                    continue;
+                }
                 z.cv.add(e.idx);
                 z.witness(&e);
             } else {
@@ -842,14 +926,19 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         }
         z.settle(w);
         let recs = bk(&z);
-        if z.state() != m0state
-            || heads.iter().any(|h| !recs.contains(h))
-            || recs.iter().any(|r| !allowed.contains(r))
-        {
+        let raw = replay_bad(&z.state(), &recs, &m0state);
+        div_interleaved_raw |= raw;
+        if replay_bad(&without(&z.state(), &hb2), &recs, &m0p) {
             div_interleaved = true;
+        } else if raw {
+            hb2_excluded = true;
         }
     }
     res.insert("div_replay_interleaved".into(), div_interleaved as i64);
+    res.insert("cnt_hb2_excluded".into(), hb2_excluded as i64);
+    // the verdicts of the two replays before the exclusion (HB-2's two-replay sub-case: they must agree)
+    res.insert("raw_div_replay".into(), div_replay_raw as i64);
+    res.insert("raw_div_replay_interleaved".into(), div_interleaved_raw as i64);
     w.k_final = k_final;
     res
 }

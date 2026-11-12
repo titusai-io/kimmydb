@@ -68,6 +68,10 @@ pub struct World {
     /// the product routes: an entry held out of position is not covered (the servable vector skips it); the model's hold route
     /// counts a held entry as covered, and the differential is made with this off
     pub held_uncovered: bool,
+    /// HB-2 (B1 classification, the manager's ruling): on the product routes the oracle excludes, by name and with a count
+    /// (`cnt_hb2_excluded`), a divergence confined to the stages of `hb2_stages` (see `oracle::hb2_stages`). Off only in the
+    /// test that shows the exclusion is what clears HB-2's seeds.
+    pub hb2_exclusion: bool,
     pub steps_end: i64,
     /// replay hooks: the page order and the tombstone choice the traced model drew (consumed by the next call)
     pub forced_pages: Option<Vec<String>>,
@@ -113,6 +117,7 @@ impl World {
             quiescing: false,
             reg_in_position_check: false,
             held_uncovered: false,
+            hb2_exclusion: true,
             steps_end: 0,
             forced_pages: None,
             forced_choice: None,

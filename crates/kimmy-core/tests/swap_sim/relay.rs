@@ -97,15 +97,19 @@ impl Member {
             w.stats.bump("held_released_in_window");
             return Taken::Received;
         }
-        self.take(w, e);
-        if w.held_uncovered
+        // the servable position cannot pass an entry held out of position (docs/oplog.md:489-491: held entries sit above it): an
+        // entry that arrives behind one is itself held until its predecessors are released. It is marked before it is applied, so
+        // the `settle` inside `take` never counts it as covered (see `take_hold`)
+        let behind = w.held_uncovered
             && w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
-                .any(|x| self.held_oop.contains(x))
-        {
-            // the servable position cannot pass an entry held out of position (docs/oplog.md:489-491: held entries sit above it):
-            // an entry that arrives behind one is itself held until its predecessors are released
+                .any(|x| self.held_oop.contains(x));
+        if behind && !w.f.fm_held_witness {
+            self.held_oop.insert(e.idx);
+        }
+        self.take(w, e);
+        if behind {
             self.appended.remove(&e.idx);
             self.held_oop.insert(e.idx);
             w.stats.bump("held_behind_held");

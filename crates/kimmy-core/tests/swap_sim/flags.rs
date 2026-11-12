@@ -81,11 +81,15 @@ pub struct Flags {
     /// Rust-only mutant of the product routes (HB-1, B1 classification): a held document entry whose physical was not known at
     /// hold time is appended (servable) when the deferred apply runs, while it is still held out of position
     pub fm_held_servable: bool,
+    /// Rust-only mutant of the product routes (HB-2's two-replay sub-case): an entry held out of position counts as D9's witness
+    /// entry above a stage's deadline (the safety net's "covers past the deadline")
+    pub fm_held_witness: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 8] = [
+pub const ROUTE_MUTANTS: [&str; 9] = [
     "m-held-servable-on-deferred-apply",
+    "m-held-entry-witnesses-the-deadline",
     "m-restore-replay-raise",
     "m-restore-own-mark-parked",
     "m-register-ahead",
@@ -273,6 +277,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-repair-carries-events" => f.fm_repair_events = true,
         "m-repair-dropped-answer" => f.fm_repair_dropped = true,
         "m-held-servable-on-deferred-apply" => f.fm_held_servable = true,
+        "m-held-entry-witnesses-the-deadline" => f.fm_held_witness = true,
         _ => return false,
     }
     true

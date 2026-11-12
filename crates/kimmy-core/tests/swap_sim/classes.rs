@@ -3,11 +3,47 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::coverage::CoverageOf;
     use crate::run::run_product;
     use crate::world::Policy;
 
     /// (class, policy, members/outs/keys, doc_hold, doc_repair, f, seed): one run of the B1 classification.
     type B1Seed = (&'static str, Policy, (usize, usize, usize), bool, bool, f64, u64);
+
+    /// The B1 classification's seeds, by class.
+    const B1_SEEDS: &[B1Seed] = &[
+        ("HB-1", Policy::Document, (3, 1, 3), true, false, 0.3, 860),
+        ("HB-1", Policy::Document, (3, 3, 5), true, false, 0.3, 277),
+        ("HB-1", Policy::Document, (3, 2, 5), true, false, 0.3, 344),
+        ("HB-1", Policy::Document, (3, 3, 4), true, false, 0.3, 360),
+        ("DF-1", Policy::Document, (3, 1, 3), true, false, 0.1, 295),
+        ("DF-1", Policy::Document, (3, 1, 3), true, false, 0.1, 1043),
+        ("DF-1", Policy::Document, (3, 2, 5), true, false, 0.3, 468),
+        ("DF-1", Policy::Document, (4, 3, 3), true, false, 0.1, 89),
+        ("DF-1", Policy::Document, (4, 3, 4), false, true, 0.3, 1068),
+        ("DF-1", Policy::Document, (4, 3, 5), false, true, 0.1, 44),
+        ("DF-1", Policy::Document, (5, 2, 3), false, true, 0.3, 746),
+        ("DF-2", Policy::Document, (2, 1, 3), false, true, 0.3, 391),
+        ("DF-2", Policy::Document, (2, 1, 5), false, true, 0.3, 35),
+        ("DF-2", Policy::Document, (2, 1, 3), false, true, 0.1, 1182),
+        ("DF-2", Policy::Document, (4, 1, 4), false, true, 0.1, 426),
+        ("DF-2", Policy::Document, (3, 1, 4), false, true, 0.3, 179),
+        ("DF-2", Policy::Document, (5, 1, 3), true, false, 0.3, 135),
+        ("DF-2", Policy::Document, (3, 2, 5), true, false, 0.1, 1),
+        ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.1, 201),
+        ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.1, 559),
+        ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.3, 386),
+        ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.3, 166),
+        ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.1, 166),
+        ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.3, 188),
+        ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.3, 101),
+        ("HB-2r", Policy::Document, (2, 2, 3), true, false, 0.1, 730),
+        ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.1, 730),
+        ("O-F1", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
+        ("O-F1", Policy::Field, (4, 2, 5), true, false, 0.3, 1361),
+        ("O-F1", Policy::Field, (3, 2, 3), false, true, 0.1, 1365),
+        ("O-F1", Policy::Field, (4, 3, 5), false, true, 0.1, 1046),
+    ];
 
     fn nonzero_problems(r: &crate::run::RunOut) -> Vec<String> {
         let mut s = crate::run::Summary::default();
@@ -55,50 +91,157 @@ mod tests {
         }
     }
 
+    /// HB-2 (B1 classification, the manager's ruling: a harness class): a divergence confined to a vanished writer's never validly
+    /// bound stage that no client can see. The oracle excludes it by the structural set `oracle::hb2_stages` (from the write log
+    /// and the members' states) and counts it (`cnt_hb2_excluded`). On each of HB-2's seeds the run is clean only BECAUSE of the
+    /// exclusion: with it off the divergence is back, and the set is not empty.
+    #[test]
+    fn hb2_a_divergence_confined_to_a_vanished_writers_unbound_unseen_stage_is_excluded_by_name_and_counted()
+     {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "HB-2") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let p = nonzero_problems(&r);
+            assert!(p.is_empty(), "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: {p:?}");
+            assert_eq!(r.res["cnt_hb2_excluded"], 1, "{cls} seed {seed}: the exclusion is counted");
+            assert!(r.res["cnt_hb2_stages"] > 0);
+            let mut c = crate::run::product_cfg(pol, mok, dh, dr, f);
+            c.hb2_exclusion = false;
+            let off = crate::run::run("v6", "v6", seed, c, false);
+            let p = nonzero_problems(&off);
+            eprintln!("HB-2 seed {seed} {mok:?} dh {dh} dr {dr} f {f}, exclusion off: {p:?}");
+            assert!(
+                p.iter().any(|k| k == "diverged"),
+                "seed {seed}: without the exclusion the run diverges: {p:?}"
+            );
+            assert_eq!(off.res["cnt_hb2_excluded"], 0);
+        }
+    }
+
+    /// HB-2's two-replay sub-case (seeds 101, 730; signature `div_replay` without `div_replay_interleaved`): a live member held an
+    /// entry no live member appended; the stamp-order replay did not witness it (`take_quiesce_replica`), the interleaved replay
+    /// did. DECIDED by the design text: the stamp-order replay is right (FIX-1: a held entry raises no vector; the FIX-5 ruling:
+    /// no member downstream can witness a held entry away). The interleaved replay now skips it too, and the member's own D9
+    /// safety net no longer takes a held entry as its witness above a deadline (that was why the member buried a stage the
+    /// replica kept). Asserted: the two replays agree on each seed (before the HB-2 exclusion), the run is clean, and the mutant
+    /// `m-held-entry-witnesses-the-deadline` trips the step check `orphan_burial_without_covered_witness`.
+    #[test]
+    fn hb2_the_two_replays_agree_and_a_held_entry_is_no_deadline_witness() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "HB-2r") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let p = nonzero_problems(&r);
+            assert!(p.is_empty(), "{cls} seed {seed} {mok:?}: {p:?}");
+            assert_eq!(
+                r.res["raw_div_replay"], r.res["raw_div_replay_interleaved"],
+                "{cls} seed {seed} {mok:?}: the two replays agree"
+            );
+            let m = run_product(
+                "m-held-entry-witnesses-the-deadline",
+                pol,
+                mok,
+                dh,
+                dr,
+                f,
+                seed,
+                false,
+            );
+            let p = nonzero_problems(&m);
+            eprintln!("m-held-entry-witnesses-the-deadline seed {seed} {mok:?}: {p:?}");
+            assert!(
+                p.iter().any(|k| k == "inv_orphan_burial_without_covered_witness"),
+                "seed {seed}: {p:?}"
+            );
+        }
+    }
+
+    /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
+    #[test]
+    #[ignore = "debug aid: Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed prints one product-route run"]
+    fn show_b1_one() {
+        let spec = std::env::var("Q6_ONE").expect("Q6_ONE");
+        let t: Vec<&str> = spec.split(',').collect();
+        let pol = if t[0] == "field" { Policy::Field } else { Policy::Document };
+        let p = |i: usize| t[i].parse::<usize>().unwrap();
+        let mode = std::env::var("Q6_MODE").unwrap_or("v6".into());
+        let r = run_product(
+            &mode,
+            pol,
+            (p(1), p(2), p(3)),
+            t[4] == "1",
+            t[5] == "1",
+            t[6].parse().unwrap(),
+            t[7].parse().unwrap(),
+            true,
+        );
+        for l in &r.w.log {
+            eprintln!("{l}");
+        }
+        for m in &r.ms {
+            eprintln!(
+                "MEMBER {} vanished {} serving {:?} oop {:?} info {:?}",
+                m.name,
+                m.vanished,
+                m.serving(),
+                m.held_oop.iter().map(|&i| r.w.ent(i).to_string()).collect::<Vec<_>>(),
+                m.info.keys().map(|&i| r.w.ent(i).to_string()).collect::<Vec<_>>()
+            );
+            for (n, ph) in m.phys.iter() {
+                eprintln!(
+                    "    {n} alive {} missing {} orphan {} docs {:?}",
+                    ph.alive,
+                    ph.missing,
+                    ph.orphan,
+                    ph.docs
+                        .iter()
+                        .map(|(k, v)| (*k, crate::entry::hlc_of(&v.stamp), v.body.is_some()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for m in r.ms.iter().filter(|m| !m.vanished) {
+            eprintln!("STEPINV {} {:?} {:?}", m.name, m.step_inv, m.inv);
+            for (n, ph) in m.phys.iter().filter(|(_, p)| p.orphan) {
+                if let Some(cr) = m.creates.get(n) {
+                    let wit: Vec<String> = r.w.by_origin[cr.origin]
+                        .iter()
+                        .filter(|&&id| r.w.ent(id).hlc > cr.dl && m.cv.has(id))
+                        .map(|&id| {
+                            format!(
+                                "{}{}",
+                                r.w.ent(id),
+                                if m.held_oop.contains(&id) { "(oop)" } else { "" }
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "ORPHAN {} {n} kind {:?} abandoned {} dl {} covers_servable {} witnesses {wit:?}",
+                        m.name,
+                        ph.kind,
+                        m.abandoned.contains(n),
+                        cr.dl,
+                        m.covers_servable(&r.w, cr.origin, cr.dl)
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "LOST {:?}",
+            r.w.lost.iter().map(|&i| r.w.ent(i).to_string()).collect::<Vec<_>>()
+        );
+        eprintln!("RES {:?}", nonzero_problems(&r));
+    }
+
     /// Debug aid: the B1 seeds under a mode (`Q6_MODE`), with the problems of each.
     #[test]
     #[ignore = "debug aid: prints the problems of the B1 classification's seeds"]
     fn show_b1_seeds() {
         let mode = std::env::var("Q6_MODE").unwrap_or("v6".into());
-        // (class, policy, m/o/k, doc_hold, doc_repair, f, seed)
-        let seeds: &[B1Seed] = &[
-            ("HB-1", Policy::Document, (3, 1, 3), true, false, 0.3, 860),
-            ("HB-1", Policy::Document, (3, 3, 5), true, false, 0.3, 277),
-            ("HB-1", Policy::Document, (3, 2, 5), true, false, 0.3, 344),
-            ("HB-1", Policy::Document, (3, 3, 4), true, false, 0.3, 360),
-            ("DF-1", Policy::Document, (3, 1, 3), true, false, 0.1, 295),
-            ("DF-1", Policy::Document, (3, 1, 3), true, false, 0.1, 1043),
-            ("DF-1", Policy::Document, (3, 2, 5), true, false, 0.3, 468),
-            ("DF-1", Policy::Document, (4, 3, 3), true, false, 0.1, 89),
-            ("DF-1", Policy::Document, (4, 3, 4), false, true, 0.3, 1068),
-            ("DF-1", Policy::Document, (4, 3, 5), false, true, 0.1, 44),
-            ("DF-1", Policy::Document, (5, 2, 3), false, true, 0.3, 746),
-            ("DF-2", Policy::Document, (2, 1, 3), false, true, 0.3, 391),
-            ("DF-2", Policy::Document, (2, 1, 5), false, true, 0.3, 35),
-            ("DF-2", Policy::Document, (2, 1, 3), false, true, 0.1, 1182),
-            ("DF-2", Policy::Document, (4, 1, 4), false, true, 0.1, 426),
-            ("DF-2", Policy::Document, (3, 1, 4), false, true, 0.3, 179),
-            ("DF-2", Policy::Document, (5, 1, 3), true, false, 0.3, 135),
-            ("DF-2", Policy::Document, (3, 2, 5), true, false, 0.1, 1),
-            ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.1, 201),
-            ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.1, 559),
-            ("HB-2", Policy::Document, (2, 1, 3), true, false, 0.3, 386),
-            ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.3, 166),
-            ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.1, 166),
-            ("HB-2", Policy::Document, (2, 1, 3), false, true, 0.3, 188),
-            ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.3, 101),
-            ("HB-2r", Policy::Document, (2, 2, 3), true, false, 0.1, 730),
-            ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.1, 730),
-            ("O-F1", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
-            ("O-F1", Policy::Field, (4, 2, 5), true, false, 0.3, 1361),
-            ("O-F1", Policy::Field, (3, 2, 3), false, true, 0.1, 1365),
-            ("O-F1", Policy::Field, (4, 3, 5), false, true, 0.1, 1046),
-        ];
-        for &(cls, pol, mok, dh, dr, f, seed) in seeds {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS {
             let r = run_product(&mode, pol, mok, dh, dr, f, seed, false);
             eprintln!(
-                "{cls:5} {pol:?} {mok:?} dh {dh} dr {dr} f {f} seed {seed}: {:?}",
-                nonzero_problems(&r)
+                "{cls:5} {pol:?} {mok:?} dh {dh} dr {dr} f {f} seed {seed}: {:?} hb2 stages {} excluded {}",
+                nonzero_problems(&r),
+                r.res["cnt_hb2_stages"],
+                r.res["cnt_hb2_excluded"]
             );
         }
     }

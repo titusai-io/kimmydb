@@ -35,6 +35,8 @@ pub struct Cfg {
     pub routes: Option<Routes>,
     /// a workload on which last-writer-wins and the join agree: no delete, and every document written by one member only
     pub lww_workload: Option<Writers>,
+    /// the oracle's HB-2 exclusion (`World::hb2_exclusion`; on by default, off only to show what it clears)
+    pub hb2_exclusion: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -77,6 +79,7 @@ impl Cfg {
             witness_pages: false,
             routes: None,
             lww_workload: None,
+            hb2_exclusion: true,
         }
     }
 }
@@ -151,6 +154,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.in_order = cfg.routes.is_none_or(|rt| !rt.hold && !rt.repair);
     w.reg_in_position_check = w.in_order;
     w.held_uncovered = cfg.routes.is_some_and(|rt| rt.doc_hold || rt.doc_repair);
+    w.hb2_exclusion = cfg.hb2_exclusion;
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
@@ -455,23 +459,34 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     RunOut { res, w, ms }
 }
 
-/// One run of the product routes (`doc_hold`, `doc_repair`; the model's routes off) at one configuration: the B1 classification's
-/// seeds are named this way (`<policy> m/o/k doc_hold doc_repair f seed`).
+/// A configuration of the product routes (`doc_hold`, `doc_repair`; the model's routes off): the B1 classification's seeds are named
+/// this way (`<policy> m/o/k doc_hold doc_repair f seed`).
+pub fn product_cfg(
+    policy: Policy,
+    (members, outs, keys): (usize, usize, usize),
+    doc_hold: bool,
+    doc_repair: bool,
+    f: f64,
+) -> Cfg {
+    let mut c = Cfg::new(members, outs, keys);
+    c.policy = policy;
+    c.routes = Some(Routes { f, hold: false, repair: false, doc_hold, doc_repair });
+    c
+}
+
+/// One run of the product routes at one configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn run_product(
     mode: &str,
     policy: Policy,
-    (members, outs, keys): (usize, usize, usize),
+    mok: (usize, usize, usize),
     doc_hold: bool,
     doc_repair: bool,
     f: f64,
     seed: u64,
     trace: bool,
 ) -> RunOut {
-    let mut c = Cfg::new(members, outs, keys);
-    c.policy = policy;
-    c.routes = Some(Routes { f, hold: false, repair: false, doc_hold, doc_repair });
-    run(mode, "v6", seed, c, trace)
+    run(mode, "v6", seed, product_cfg(policy, mok, doc_hold, doc_repair, f), trace)
 }
 
 // ----------------------------------------------------------------------------- batch
