@@ -86,6 +86,14 @@ impl Member {
                 self.step_inv.insert("unbacked_state_record");
             }
         }
+        // product invariant (i) on the product routes (HB-1): an entry held out of position is neither served nor granted before
+        // it is released in position
+        if w.held_uncovered
+            && !self.vanished
+            && self.held_oop.iter().any(|i| self.appended.contains(i))
+        {
+            self.step_inv.insert("held_entry_servable");
+        }
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
             for (k, v) in self.served() {
@@ -782,6 +790,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "doc_hold_taken",
         "held_behind_held",
         "held_released_in_window",
+        "held_kept_unservable",
         "page_carries_held_state",
         "doc_repair",
         "route_carries_q6_kind",

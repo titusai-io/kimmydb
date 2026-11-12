@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 mod apply;
+mod classes;
 mod coverage;
 mod entry;
 mod field;
