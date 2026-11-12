@@ -83,6 +83,8 @@ pub struct World {
     pub stats: Counter,
     /// (phys, key, stamp) -> the document entry
     pub rec_index: HashMap<(String, u32, Stamp), EntryId>,
+    /// record key -> the loss entries of that key, in the order made (the step check and the grant filter read it)
+    pub loss_by_key: HashMap<crate::entry::LKey, Vec<EntryId>>,
     /// entries held only by vanished members: lost with them
     pub lost: HashSet<EntryId>,
     pub lost_late: HashSet<(u32, Stamp)>,
@@ -123,6 +125,7 @@ impl World {
             stage_docs: HashMap::new(),
             stats: Counter::default(),
             rec_index: HashMap::new(),
+            loss_by_key: HashMap::new(),
             lost: HashSet::new(),
             lost_late: HashSet::new(),
             snap_carried: Vec::new(),
@@ -151,9 +154,19 @@ impl World {
         if e.kind == Kind::Doc {
             self.rec_index.insert((e.phys.clone(), e.key, e.stamp), e.idx);
         }
+        if e.kind == Kind::Loss
+            && let Some(k) = e.lkey
+        {
+            self.loss_by_key.entry(k).or_default().push(e.idx);
+        }
         let rc = Rc::new(e);
         self.all.push(Rc::clone(&rc));
         rc
+    }
+
+    /// The loss entries (`Kind::Loss`) of one record key.
+    pub fn loss_entries_of(&self, k: &crate::entry::LKey) -> &[EntryId] {
+        self.loss_by_key.get(k).map_or(&[], |v| v.as_slice())
     }
 
     /// R9: a binding stamped above its stage's deadline is invalid; a pure function of the stamps.

@@ -393,7 +393,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
             }
         }
         for m in ms.iter_mut() {
-            m.check_inv();
+            m.check_inv(&w);
         }
     }
     // D10 measured without side effects when the steps end (member-runs still refusing, every cause)
@@ -440,7 +440,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.k_final = true;
     for &i in &live {
         ms[i].settle(&mut w);
-        ms[i].check_inv();
+        ms[i].check_inv(&w);
     }
     count_open_refusals(&mut w, &ms, true); // ... and at the end of the run, after the end-of-run delivery
     let res = finish(&mut w, &mut ms);

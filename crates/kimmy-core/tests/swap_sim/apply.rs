@@ -59,7 +59,10 @@ impl Member {
             && self.would_be_ignored(w, e);
         self.cv.add(e.idx);
         self.witness(e);
-        if e.kind != Kind::Doc && !ignored {
+        if e.kind != Kind::Doc
+            && !ignored
+            && !(f.fm_loss_not_appended && e.kind == Kind::Loss && e.origin != self.id)
+        {
             self.appended.insert(e.idx); // register events, creates, abandons and loss entries are always appended and served onward
         }
         if e.kind == Kind::Doc {
@@ -107,7 +110,17 @@ impl Member {
                     Extra::Phys(p) => p.clone(),
                     _ => String::new(),
                 };
-                self.merge_loss(w, k, e.body.clone(), &phys);
+                if f.loss_in_position && !self.covers(w, e.origin, e.hlc) {
+                    // 6r (seed 1434): a record ahead of its position is information, like a register event under rule B: it
+                    // does not enter the state (no event, no snapshot carry, no dedup of this member's own mint) until the
+                    // member covers its origin up to it
+                    if !self.loss_info.contains_key(&e.idx) {
+                        self.loss_info.insert(e.idx, w.ent_rc(e.idx));
+                        w.stats.bump("loss_info_parked");
+                    }
+                } else {
+                    self.merge_loss(w, k, e.body.clone(), &phys);
+                }
             }
             Kind::LossQ7 => self.apply_loss_q7(w, e),
             Kind::Doc => self.apply_doc(w, e),

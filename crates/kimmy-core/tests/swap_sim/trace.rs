@@ -173,6 +173,7 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         "recv_entry_h": fnv(sorted_ids(m.recv_entry.iter().copied())),
         "deferred": m.deferred.iter().map(|e| e.idx).collect::<Vec<_>>(),
         "info": sorted_ids(m.info.keys().copied()),
+        "loss_info": sorted_ids(m.loss_info.keys().copied()),
         "held_records": sj(m.held_records.iter().map(|(p, k, s)| json!([p, k, stamp_v(w, s)])).collect()),
         "bare_state": sj(m.bare_state.iter().map(|(p, k, s)| json!([p, k, stamp_v(w, s)])).collect()),
         "state_held": sj(m.state_held.iter().map(|(o, h)| json!([w.name(*o), h])).collect()),
@@ -338,7 +339,7 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     let head: Value =
         serde_json::from_str(lines.next().ok_or("empty trace")?).map_err(|e| e.to_string())?;
     let name = path.file_name().unwrap().to_string_lossy().to_string();
-    assert_eq!(head["sha256_16"], "40a44c8838f55988", "{name}: the trace is of the vendored model");
+    assert_eq!(head["sha256_16"], "4343f5208763266f", "{name}: the trace is of the vendored model");
     let members: Vec<(String, i64)> = head["members"]
         .as_array()
         .unwrap()
@@ -390,7 +391,7 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         }
         if ev["k"] == "check_inv" {
             let i = idx(ev["m"].as_str().unwrap());
-            ms[i].check_inv();
+            ms[i].check_inv(&w);
             let rs: Vec<&&str> = ms[i].inv.iter().collect();
             if json!(rs) != ev["inv"] {
                 return Err(format!(

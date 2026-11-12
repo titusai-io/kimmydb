@@ -123,12 +123,7 @@ impl Member {
             }
             m
         };
-        let mut loss: OMap<LKey, (Body, String)> = OMap::new();
-        if !f.snap_no_loss {
-            for (k, b) in self.loss_pending.iter().chain(self.loss.iter()) {
-                loss.insert(*k, (b.clone(), self.loss_phys[k].clone()));
-            }
-        }
+        let loss = if f.snap_no_loss { OMap::new() } else { self.loss_records() };
         let dochist: Vec<EntryId> = if f.snap_late_entries {
             self.dochist
                 .iter()
@@ -160,6 +155,15 @@ impl Member {
             dochist,
             vec: BTreeMap::new(),
         }
+    }
+
+    /// The records of this member's state (pending ones too), with the physical of the lost write: what a snapshot carries.
+    pub fn loss_records(&self) -> OMap<LKey, (Body, String)> {
+        let mut loss: OMap<LKey, (Body, String)> = OMap::new();
+        for (k, b) in self.loss_pending.iter().chain(self.loss.iter()) {
+            loss.insert(*k, (b.clone(), self.loss_phys[k].clone()));
+        }
+        loss
     }
 
     /// Begin a snapshot join from `src`. Returns false (with no side effect on the join) when this member already has
@@ -223,6 +227,19 @@ impl Member {
                 .collect();
             w.stats.add("grant_entries_withheld_above_coverage", (pl.held.len() - g.len()) as i64);
             pl.appended = pl.appended.intersection(&g).copied().collect();
+            if f.loss_grant_filter && !pl.loss.is_empty() {
+                // 6r: a snapshot carries a record only if some entry of that record is within the grant (D3's register-event
+                // rule, for records)
+                let mut keep: OMap<LKey, (Body, String)> = OMap::new();
+                for (k, v) in pl.loss.iter() {
+                    if w.loss_entries_of(k).iter().any(|i| g.contains(i)) {
+                        keep.insert(*k, v.clone());
+                    } else {
+                        w.stats.bump("snap_records_not_carried_above_grant");
+                    }
+                }
+                pl.loss = keep;
+            }
             pl.held = g;
         } else {
             for &i in &pl.held {
@@ -279,7 +296,7 @@ impl Member {
             bare_ids: HashSet::new(),
             repair: false,
         });
-        let src_evl = src.evl.clone();
+        let src_evl = GrantRead { evl: src.evl.clone(), loss: src.loss_records() };
         if f.grant_before_pages {
             let mut j = self.join.take().unwrap();
             self.apply_grant(w, &mut j, &src_evl); // MUTANT: the grant lands before the pages
@@ -336,7 +353,7 @@ impl Member {
             repair: true,
         });
         for _ in 0..n {
-            self.land_page(w, &[]);
+            self.land_page(w, &GrantRead::default());
         }
         self.join = None;
         true
@@ -350,7 +367,7 @@ impl Member {
 
     /// Land the next page of the join in progress. `src_evl`: the register events of `grant_source()` (read when the
     /// last page lands). Returns false when there is no join.
-    pub fn land_page(&mut self, w: &mut World, src_evl: &[EntryId]) -> bool {
+    pub fn land_page(&mut self, w: &mut World, src_evl: &GrantRead) -> bool {
         let Some(mut j) = self.join.take() else { return false };
         if j.pages.is_empty() {
             self.join = Some(j);
@@ -500,14 +517,14 @@ impl Member {
 
     /// The grant lands: one step with the register events, the loss records, the retained entries and the receiver's
     /// own D4 evaluation. D3: the register events are the sender's own, stamped at or below the first page's vector.
-    fn apply_grant(&mut self, w: &mut World, j: &mut Join, src_evl: &[EntryId]) {
+    fn apply_grant(&mut self, w: &mut World, j: &mut Join, src_evl: &GrantRead) {
         let f = w.f;
         if j.granted {
             return;
         }
         j.granted = true;
         if f.paged_register_read && !f.snap_no_events && !f.grant_before_pages {
-            let cand: Vec<EntryId> = src_evl.to_vec();
+            let cand: Vec<EntryId> = src_evl.evl.clone();
             if f.stale_src_bug && self.grant_source_for(w, j) != j.src {
                 w.stats.bump("register_read_from_a_member_that_is_not_the_sender");
                 w.note(format!(
@@ -539,6 +556,26 @@ impl Member {
                 w.stats.bump("bind_between_first_and_last_page");
             }
             j.pl.events = carried;
+        }
+        if f.paged_loss_read && !f.snap_no_loss && !f.grant_before_pages {
+            // 6b (companion clause): the sender's loss records are read when the LAST page lands. Clause: a record is carried
+            // only if some entry of it is within the grant (`j.pl.held`, the first page's granted set); a record whose entries
+            // are all above it reaches this member by windows.
+            let cand = &src_evl.loss;
+            w.stats.add("loss_records_read_late", cand.len() as i64);
+            let mut ok: OMap<LKey, (Body, String)> = OMap::new();
+            for (k, v) in cand.iter() {
+                if w.loss_entries_of(k).iter().any(|i| j.pl.held.contains(i)) {
+                    ok.insert(*k, v.clone());
+                }
+            }
+            w.stats.add("loss_records_above_grant", (cand.len() - ok.len()) as i64);
+            if f.loss_grant_filter {
+                j.pl.loss = ok;
+            } else {
+                w.stats.add("loss_records_read_above_grant", (cand.len() - ok.len()) as i64);
+                j.pl.loss = cand.clone();
+            }
         }
         let mut rows: HashMap<usize, i64> = HashMap::new();
         for &i in j.pl.held.iter().filter(|&&i| !self.cv.has(i)) {
@@ -630,7 +667,7 @@ impl Member {
 
     /// The grant is recorded when the LAST page lands, in one step with the register events and the receiver's own D4
     /// evaluation.
-    pub fn complete_join(&mut self, w: &mut World, src_evl: &[EntryId]) {
+    pub fn complete_join(&mut self, w: &mut World, src_evl: &GrantRead) {
         let Some(mut j) = self.join.take() else { return };
         self.apply_grant(w, &mut j, src_evl);
         for n in &j.created {
@@ -724,11 +761,19 @@ pub fn land_page_in(ms: &mut [Member], dst: usize, w: &mut World) -> bool {
     ms[dst].land_page(w, &evl)
 }
 
-/// The register events the grant of `dst`'s join reads (empty without a join).
-pub fn grant_evl(ms: &[Member], dst: usize, w: &World) -> Vec<EntryId> {
-    match ms[dst].grant_source(w) {
-        Some(s) => ms[s].evl.clone(),
-        None => Vec::new(),
+/// What the sender (and, with `stale_src_bug`, the member the register is read from) offers at the last page: the register
+/// events of `grant_source()` and the loss records of the sender (the paged loss read).
+#[derive(Default)]
+pub struct GrantRead {
+    pub evl: Vec<EntryId>,
+    pub loss: OMap<LKey, (Body, String)>,
+}
+
+/// The grant's reads of `dst`'s join (empty without a join).
+pub fn grant_evl(ms: &[Member], dst: usize, w: &World) -> GrantRead {
+    match (ms[dst].grant_source(w), ms[dst].join.as_ref()) {
+        (Some(s), Some(j)) => GrantRead { evl: ms[s].evl.clone(), loss: ms[j.src].loss_records() },
+        _ => GrantRead::default(),
     }
 }
 

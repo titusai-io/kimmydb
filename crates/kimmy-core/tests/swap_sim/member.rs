@@ -86,6 +86,8 @@ pub struct Member {
     pub carry_created: BTreeSet<String>,
     /// rule B: a register event known but not yet covered (information: it takes no effect)
     pub info: OMap<EntryId, EntryRef>,
+    /// 6r rule B for records: a loss entry held ahead of its position: information, not in the state, until covered
+    pub loss_info: OMap<EntryId, EntryRef>,
     /// the hold route: non-document entries held out of position (known, not appended; `promote_oop` appends them in position)
     pub held_oop: OSet<EntryId>,
     /// D10 refusal episodes, by the event that supersedes the served physical
@@ -93,6 +95,9 @@ pub struct Member {
     pub vanished: bool,
     pub refused: u32,
     pub inv: BTreeSet<&'static str>,
+    /// the step check (the reviewer's `backcheck.py`): kept apart from `inv`, which the differential compares with the
+    /// model's, and added to the run's invariants by `finish`
+    pub step_inv: BTreeSet<&'static str>,
     pub flips: u32,
     pub last_served: String,
 }
@@ -136,11 +141,13 @@ impl Member {
             snap_src_stale: None,
             carry_created: BTreeSet::new(),
             info: OMap::new(),
+            loss_info: OMap::new(),
             held_oop: OSet::new(),
             refusal_eps: OMap::new(),
             vanished: false,
             refused: 0,
             inv: BTreeSet::new(),
+            step_inv: BTreeSet::new(),
             flips: 0,
             last_served: L.to_string(),
         }

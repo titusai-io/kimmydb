@@ -50,7 +50,7 @@ impl Member {
         State { serving: self.serving(), alive }
     }
 
-    pub fn check_inv(&mut self) {
+    pub fn check_inv(&mut self, w: &World) {
         if let Some(s) = self.serving() {
             match self.phys.get(&s) {
                 Some(p) if p.alive && !p.missing => {}
@@ -73,6 +73,18 @@ impl Member {
         }
         if bury_bad {
             self.inv.insert("bury_without_newer_visible");
+        }
+        // the step check (the reviewer's `backcheck.py`, invariant B): every record in a live member's state is backed by a
+        // loss entry of that key which the SAME member has appended (serves onward)
+        if !self.vanished {
+            let unbacked = self
+                .loss
+                .keys()
+                .chain(self.loss_pending.keys())
+                .any(|k| !w.loss_entries_of(k).iter().any(|i| self.appended.contains(i)));
+            if unbacked {
+                self.step_inv.insert("unbacked_state_record");
+            }
         }
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
@@ -550,7 +562,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     }
     for &i in &live {
         let m = &ms[i];
-        for k in &m.inv {
+        for k in m.inv.iter().chain(m.step_inv.iter()) {
             inv.insert((*k).to_string());
         }
         let differs = match (&m.cur, &o.top) {
@@ -750,6 +762,12 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         res.insert(format!("cnt_{kk}"), st.get(kk));
     }
     for kk in [
+        "loss_info_parked",
+        "loss_info_taken_effect",
+        "snap_records_not_carried_above_grant",
+        "loss_records_read_late",
+        "loss_records_above_grant",
+        "loss_records_read_above_grant",
         "info_parked",
         "info_taken_effect",
         "accepted_while_info_superseded",

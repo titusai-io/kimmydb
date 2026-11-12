@@ -405,6 +405,182 @@ fn sender_dies_mid_join(mode: &str) -> Supersede {
     }
 }
 
+/// The step check after an action, on every member (the scripted twins check as the random run does, after each step).
+fn step(sc: &mut Sc) {
+    for i in 0..sc.ms.len() {
+        sc.ms[i].check_inv(&sc.w);
+    }
+}
+
+fn loss_entries(sc: &Sc, origin: &str, key: u32, stamp: Stamp) -> Vec<EntryRef> {
+    let o = sc.idx(origin);
+    sc.w.all
+        .iter()
+        .filter(|e| {
+            e.kind == Kind::Loss
+                && e.origin == o
+                && e.lkey.is_some_and(|k| k.key == key && k.stamp == Some(stamp))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What a twin reports: the record for the lost write at E (the member that pulls only live members), whether the step check
+/// fired on any member, and the run's problems.
+struct Twin {
+    step_check: bool,
+    e_has_record: bool,
+    problems: Vec<(String, i64)>,
+}
+
+/// `probe1434b.py` (the seed-1434 shape): a LOSS entry handed out of position by the hold route (C has neither x nor y),
+/// then x by a window; B vanishes with y and r_y, so r_x is never in position anywhere. Rule B for records: r_x is
+/// information at C, C mints its own record when it finds x late, and E gets that by a window.
+fn seed_1434_twin(mode: &str) -> Twin {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("E", 0)], 60);
+    sc.advance(1);
+    let s6 = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
+    let s7 = sc.ms[0].local_doc(&mut sc.w, 7, DocOp::Insert).unwrap();
+    for m in ["B", "C", "E"] {
+        sc.window(m, "A", &s6);
+        sc.window(m, "A", &s7);
+    }
+    sc.advance(10);
+    let mut job = sc.ms[0].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+    sc.advance(12);
+    sc.ms[0].do_bind(&mut sc.w, &mut job, 4);
+    sc.advance(14);
+    sc.pull("C", "A");
+    sc.pull("E", "A");
+    sc.advance(20);
+    let x = sc.ms[1].local_doc(&mut sc.w, 6, DocOp::Update).unwrap();
+    sc.advance(22);
+    sc.ms[1].local_doc(&mut sc.w, 7, DocOp::Update).unwrap();
+    sc.advance(24);
+    sc.pull("B", "A"); // B learns the bind: L buried at B, B mints r_x and r_y
+    let rx = loss_entries(&sc, "B", x.key, x.stamp);
+    assert!(!rx.is_empty(), "B did not mint r_x");
+    step(&mut sc);
+    sc.advance(26);
+    let c = sc.idx("C");
+    sc.ms[c].take_hold(&mut sc.w, &rx[0]); // the hold route: r_x out of position at C
+    step(&mut sc);
+    sc.advance(28);
+    sc.window("C", "B", &x); // x by a window, in position at C: history, retained, late
+    step(&mut sc);
+    sc.advance(30);
+    sc.vanish(&["B"]);
+    sc.advance(32);
+    sc.pull("E", "C");
+    sc.w.step += 1;
+    step(&mut sc);
+    sc.quiesce();
+    step(&mut sc);
+    let res = finish(&mut sc.w, &mut sc.ms);
+    let e = sc.idx("E");
+    Twin {
+        step_check: sc.ms.iter().any(|m| m.step_inv.contains("unbacked_state_record")),
+        e_has_record: sc.ms[e].loss.keys().any(|k| k.key == x.key && k.stamp == Some(x.stamp)),
+        problems: nonzero(&res),
+    }
+}
+
+/// `probes7.py` (companion clause (3), the paged join): R begins a LAZY snapshot join from C; the first page grants neither x
+/// nor r_x; C then finds x late and mints r_C above the grant; the last page lands at R. Without the clause R reads C's
+/// records at the last page and holds a record for x with no entry of it: R does not mint, and when B and C vanish nobody
+/// serves the record.
+fn paged_join_twin(mode: &str) -> Twin {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("R", 0), ("E", 0)], 60);
+    sc.advance(1);
+    let s6 = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
+    for m in ["B", "C", "E"] {
+        sc.window(m, "A", &s6);
+    }
+    sc.advance(10);
+    let mut job = sc.ms[0].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+    sc.advance(12);
+    sc.ms[0].do_bind(&mut sc.w, &mut job, 5);
+    sc.advance(14);
+    sc.pull("C", "A");
+    sc.pull("E", "A");
+    sc.advance(20);
+    let x = sc.ms[1].local_doc(&mut sc.w, 6, DocOp::Update).unwrap();
+    sc.advance(24);
+    sc.pull("B", "A"); // B learns the bind and mints r_x
+    sc.advance(26);
+    assert!(sc.snapshot("R", "C", true), "R begins a paged join");
+    let r = sc.idx("R");
+    assert!(
+        sc.ms[r].join.as_ref().is_some_and(|j| !j.pages.is_empty()),
+        "the join is paged: pages remain after the grant"
+    );
+    step(&mut sc);
+    sc.advance(28);
+    sc.window("C", "B", &x); // history at C: C mints r_C, above R's grant
+    assert!(!loss_entries(&sc, "C", x.key, x.stamp).is_empty(), "C did not mint r_C");
+    step(&mut sc);
+    sc.advance(30);
+    while sc.land("R") {
+        if sc.ms[r].join.is_none() {
+            break;
+        }
+    }
+    step(&mut sc);
+    sc.advance(32);
+    sc.window("R", "B", &x); // x in position at R: history, found late
+    step(&mut sc);
+    sc.advance(34);
+    sc.vanish(&["B", "C"]);
+    sc.advance(36);
+    sc.pull("E", "R");
+    sc.pull("E", "A");
+    sc.w.step += 1;
+    sc.quiesce();
+    step(&mut sc);
+    let res = finish(&mut sc.w, &mut sc.ms);
+    let e = sc.idx("E");
+    Twin {
+        step_check: sc.ms.iter().any(|m| m.step_inv.contains("unbacked_state_record")),
+        e_has_record: sc.ms[e].loss.keys().any(|k| k.key == x.key && k.stamp == Some(x.stamp)),
+        problems: nonzero(&res),
+    }
+}
+
+/// The step check's own mutant: B receives A's record entry by a window; with `m-loss-received-not-appended` it holds the
+/// record in its state without an entry it serves onward. Nothing but the step check sees it on this script.
+fn received_record_twin(mode: &str) -> Twin {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0)], 60);
+    sc.advance(1);
+    let s6 = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
+    for m in ["B", "C"] {
+        sc.window(m, "A", &s6);
+    }
+    sc.advance(10);
+    let mut job = sc.ms[2].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+    sc.advance(12);
+    sc.ms[2].do_bind(&mut sc.w, &mut job, 3);
+    sc.advance(20);
+    let x = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Update).unwrap(); // A, not having heard, writes a late update
+    sc.advance(24);
+    sc.pull("A", "C"); // A learns the bind: x is history, A mints r_x
+    assert!(!loss_entries(&sc, "A", x.key, x.stamp).is_empty(), "A did not mint r_x");
+    step(&mut sc);
+    sc.advance(26);
+    sc.pull_origins("B", "A", &["A"]); // B, not having heard of the bind, takes x (current at B), then r_x (deferred: L is not buried at B)
+    step(&mut sc);
+    let b = sc.idx("B");
+    let has = (sc.ms[b].loss.keys().chain(sc.ms[b].loss_pending.keys()))
+        .any(|k| k.key == x.key && k.stamp == Some(x.stamp));
+    sc.quiesce();
+    step(&mut sc);
+    let res = finish(&mut sc.w, &mut sc.ms);
+    Twin {
+        step_check: sc.ms.iter().any(|m| m.step_inv.contains("unbacked_state_record")),
+        e_has_record: has,
+        problems: nonzero(&res),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +804,76 @@ mod tests {
         for pre in ["", "field:"] {
             a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies_under(
                 pre,
+            );
+        }
+    }
+
+    fn names(t: &Twin) -> Vec<&str> {
+        t.problems.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Rule B for loss records (the seed-1434 shape): a record out of position is information; off, C holds r_x in its state
+    /// with no entry it serves, never mints, and E never gets a record for x.
+    #[test]
+    fn seed_1434_shape_a_loss_record_ahead_of_its_position_is_information() {
+        for pre in ["", "field:"] {
+            let t = seed_1434_twin(&format!("{pre}v6"));
+            assert!(t.problems.is_empty(), "{:?}", t.problems);
+            assert!(!t.step_check && t.e_has_record, "E gets a record for x by a window");
+            assert!(t.problems.is_empty());
+            let m = seed_1434_twin(&format!("{pre}m-loss-out-of-position"));
+            eprintln!(
+                "m-loss-out-of-position: step check {} E record {} {:?}",
+                m.step_check, m.e_has_record, m.problems
+            );
+            assert!(!m.e_has_record, "the mutant: E has no record for x");
+            assert!(m.step_check, "the step check sees the unbacked record at C");
+            assert!(names(&m).contains(&"loss_missing"), "{:?}", m.problems);
+        }
+    }
+
+    /// Clause (3) and the paged read (the scripted paged join): the sender's records are read at the last page, a record is
+    /// carried only if an entry of it is within the grant.
+    #[test]
+    fn a_paged_join_carries_a_record_only_if_an_entry_of_it_is_within_the_grant() {
+        for pre in ["", "field:"] {
+            for mode in ["v6", "v6-paged-loss"] {
+                let t = paged_join_twin(&format!("{pre}{mode}"));
+                assert!(t.problems.is_empty(), "{mode}: {:?}", t.problems);
+                assert!(t.e_has_record && !t.step_check, "{mode}: E gets R's record by a window");
+            }
+            let m = paged_join_twin(&format!("{pre}m-snap-record-no-grant-filter"));
+            eprintln!(
+                "m-snap-record-no-grant-filter: step check {} E record {} {:?}",
+                m.step_check, m.e_has_record, m.problems
+            );
+            assert!(!m.e_has_record, "the mutant: R holds the record alone, E never gets one");
+            assert!(m.step_check, "the step check sees the record R holds without an entry of it");
+            let n = names(&m);
+            assert!(n.contains(&"loss_missing") && n.contains(&"div_loss"), "{:?}", m.problems);
+        }
+    }
+
+    /// The step check's own mutant: a received record entry that is not appended. Only the step check sees it here.
+    #[test]
+    fn the_step_check_sees_a_record_in_the_state_without_an_entry_the_member_serves() {
+        for pre in ["", "field:"] {
+            let t = received_record_twin(&format!("{pre}v6"));
+            assert!(t.e_has_record && !t.step_check && t.problems.is_empty(), "{:?}", t.problems);
+            let m = received_record_twin(&format!("{pre}m-loss-received-not-appended"));
+            assert!(
+                m.e_has_record && m.step_check,
+                "the record is in B state, unbacked: {} {} {:?}",
+                m.e_has_record,
+                m.step_check,
+                m.problems
+            );
+            eprintln!("m-loss-received-not-appended: {:?}", m.problems);
+            assert_eq!(
+                names(&m),
+                vec!["inv_unbacked_state_record", "invariant"],
+                "{:?}",
+                m.problems
             );
         }
     }

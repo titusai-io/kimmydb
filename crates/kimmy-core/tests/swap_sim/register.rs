@@ -107,6 +107,24 @@ impl Member {
         prog
     }
 
+    /// 6r: a record held as information whose origin the member now covers enters the state (an ordinary arrival, `merge_loss`).
+    pub fn activate_loss_info(&mut self, w: &mut World) {
+        let mut xs: Vec<EntryRef> = self.loss_info.values().cloned().collect();
+        xs.sort_by_key(|x| x.stamp);
+        for e in xs {
+            if self.covers(w, e.origin, e.hlc) {
+                self.loss_info.remove(&e.idx);
+                w.stats.bump("loss_info_taken_effect");
+                let k = e.lkey.expect("a loss entry has a key");
+                let phys = match &e.extra {
+                    Extra::Phys(p) => p.clone(),
+                    _ => String::new(),
+                };
+                self.merge_loss(w, k, e.body.clone(), &phys);
+            }
+        }
+    }
+
     /// v2.1's R5 (kept for m-pending-narrow): a valid binding above the visible event whose stage is not buried.
     pub fn pending(&self, w: &World) -> bool {
         let curst = self.cur.as_ref().map_or_else(neg, |c| c.stamp);
@@ -480,6 +498,9 @@ impl Member {
 
     pub fn settle(&mut self, w: &mut World) {
         self.promote_oop(w);
+        if !self.loss_info.is_empty() {
+            self.activate_loss_info(w);
+        }
         for _ in 0..60 {
             let mut prog = false;
             if self.activate_info(w) {

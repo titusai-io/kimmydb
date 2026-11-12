@@ -1,5 +1,5 @@
-"""q6diff_gen.py: the tracer of the Q6 swap harness' differential. It wraps the vendored, unmodified `swapmodel6a.py` (the model of
-record, sha256 40a44c88...) and dumps JSONL traces that the Rust harness (`tests/swap_sim/trace.rs`) replays event by event,
+"""q6diff_gen.py: the tracer of the Q6 swap harness' differential. It wraps the vendored, unmodified `swapmodel6b.py` (the model of
+record, sha256 4343f520...; `Q6DIFF_MODEL=swapmodel6a` wraps the previous one) and dumps JSONL traces that the Rust harness (`tests/swap_sim/trace.rs`) replays event by event,
 comparing every member's state after every event, the entries each event mints, the counters before `finish`, and the verdict of
 `finish`. Python decides: a disagreement is a finding about the port (or the model), never an exclusion.
 
@@ -9,7 +9,7 @@ Run (from any directory; no bytecode is written):
         [--seed0 N] [--delete-bias] [--heavy] [--f 0.3 --routes hold|repair|hold,repair]   (the model's route probes, Q6_F / Q6_ROUTES)
     python3 -I -B q6diff_gen.py seed OUTDIR --mode M --seed S --members 3 --outs 2 --keys 4     one run
 
-Trace format (one JSON object per line). Header: {"v":1,"model":"swapmodel6a.py","sha256_16":..,"flags":<mode>,"members":
+Trace format (one JSON object per line). Header: {"v":1,"model":"swapmodel6b.py","sha256_16":..,"flags":<mode>,"members":
 [[name,skew],..],"D":..,"field_safe":<bool: no delete and no concurrent same-key writes, so the field policy can be replayed exactly>}. Then one line per top-level model call: {"k": kind, "step", "clock", ..arguments.., "res": result,
 "new": [the entries the call minted], "ms": [the state of the acting member after the call, of every member every 20 calls and at the structural events]}. Kinds: local, ldrop, lcreate, out, bind,
 take_from, take, hold (the hold route: take_hold), repair_ev (the repair route: one register event handed over as information), take_quiesce, steps_end (the run's steps are over: the replay computes the D10 state counters there), check_inv (the per-step invariants, compact), set_pages (a script's reorder of a join's pages), snap_begin (with the shuffled page order), land_page, relay_tomb (with the chosen physical), settle,
@@ -26,7 +26,10 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import swapmodel6a as sm  # noqa: E402
+import importlib  # noqa: E402
+
+MODEL = os.environ.get("Q6DIFF_MODEL", "swapmodel6b")
+sm = importlib.import_module(MODEL)
 
 MASK = (1 << 64) - 1
 FULL_EVERY = 20
@@ -96,7 +99,7 @@ def member_j(m):
         dochist_n=len(m.dochist), dochist_h=fnv(list(m.dochist)), hist_kept_h=fnv(sorted(m.hist_kept)),
         held_oop=sorted(m.held_oop),
         eps=sj([i, ep["start"], ep["last"], ep["n"], ep["end"], bool(ep["end_q"]), bool(ep["info"]), ep["cover"], bool(ep["cover_q"])] for i, ep in m.refusal_eps.items()),
-        recv_entry_h=fnv(sorted(m.recv_entry)), deferred=[e.idx for e in m.deferred], info=sorted(m.info),
+        recv_entry_h=fnv(sorted(m.recv_entry)), deferred=[e.idx for e in m.deferred], info=sorted(m.info), loss_info=sorted(getattr(m, "loss_info", {})),
         held_records=sj([p, k, stamp_j(s)] for (p, k, s) in m.held_records),
         bare_state=sj([p, k, stamp_j(s)] for (p, k, s) in m.bare_state),
         state_held=sj([o, h] for o, h in m.state_held.items()), join=j, inv=sorted(m.inv), refused=m.refused, flips=m.flips,
@@ -183,7 +186,7 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     _orig_world_init(self, members, flags, rec, D, trace)
     T.w = self
     if T.out is not None:
-        T.write(dict(v=1, model="swapmodel6a.py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
+        T.write(dict(v=1, model=MODEL + ".py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
                      members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
                      route_f=float(os.environ.get("Q6_F", "0") or 0)))
     T.started = True
@@ -550,6 +553,80 @@ def sc_rule_b(mode):
     s.finish()
 
 
+def sc_seed1434(mode):
+    """probe1434b.py: a LOSS entry out of position by the hold route (the seed-1434 shape)"""
+    s = Sc(mode, [("A", 0), ("B", 0), ("C", 0), ("E", 0)])
+    A, B, C, E = (s.m[n] for n in "ABCE")
+    s.adv(1)
+    s6 = A.local_doc(6, "insert")
+    s7 = A.local_doc(7, "insert")
+    for m in (B, C, E):
+        m.take_from(A, s6)
+        m.take_from(A, s7)
+    s.adv(10)
+    job = A.start_out([0], "good", 12)
+    s.adv(12)
+    A.do_bind(job)
+    s.adv(14)
+    s.pull("C", "A")
+    s.pull("E", "A")
+    s.adv(20)
+    x = B.local_doc(6, "update")
+    s.adv(22)
+    B.local_doc(7, "update")
+    s.adv(24)
+    s.pull("B", "A")
+    rx = [e for e in s.w.all if e.kind == "loss" and e.origin == "B" and e.key[:2] == (x.key, x.stamp)]
+    s.adv(26)
+    C.take_hold(rx[0])
+    s.w.stats["hold_taken"] += 1  # the model counts it in its route step; the replay counts it at a "hold" event
+    s.adv(28)
+    C.take_from(B, x)
+    s.adv(30)
+    s.vanish("B")
+    s.adv(32)
+    s.pull("E", "C")
+    s.quiesce()
+    s.finish()
+
+
+def sc_paged_join(mode):
+    """probes7.py: the companion clause (3) as a scripted paged join"""
+    s = Sc(mode, [("A", 0), ("B", 0), ("C", 0), ("R", 0), ("E", 0)])
+    A, B, C, R, E = (s.m[n] for n in "ABCRE")
+    s.adv(1)
+    s6 = A.local_doc(6, "insert")
+    for m in (B, C, E):
+        m.take_from(A, s6)
+    s.adv(10)
+    job = A.start_out([0], "good", 12)
+    s.adv(12)
+    A.do_bind(job)
+    s.adv(14)
+    s.pull("C", "A")
+    s.pull("E", "A")
+    s.adv(20)
+    x = B.local_doc(6, "update")
+    s.adv(24)
+    s.pull("B", "A")
+    s.adv(26)
+    R.snapshot_begin(C, lazy=True)
+    s.adv(28)
+    C.take_from(B, x)
+    s.adv(30)
+    while R.join is not None:
+        R.land_page()
+    s.adv(32)
+    R.take_from(B, x)
+    s.adv(34)
+    s.vanish("B", "C")
+    s.adv(36)
+    s.pull("E", "R")
+    s.pull("E", "A")
+    s.quiesce()
+    s.finish()
+
+
 # (name, script, modes, field_safe): `field_safe` marks a scenario with no delete and no concurrent writes to one key, on which the
 # model's last-writer-wins and the `field` join agree, so the Rust replay under the `field` policy compares it exactly (design
 # note q6-phaseF-design.md, section 3). `late-delete` has a delete: it is replayed under `document` only.
@@ -563,6 +640,8 @@ SCRIPTED = [
     ("append-in-position", sc_append_in_position, ["v6", "m-no-append-in-position"], True),
     ("join-other-peer", sc_join_other_peer, ["v6"], True),
     ("rule-b", sc_rule_b, ["v6", "m-rule-b-off"], True),
+    ("seed1434", sc_seed1434, ["v6", "m-loss-out-of-position"], True),
+    ("paged-join", sc_paged_join, ["v6", "v6-paged-loss", "m-snap-record-no-grant-filter"], True),
 ]
 
 
