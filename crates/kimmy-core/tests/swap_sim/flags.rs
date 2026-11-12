@@ -74,10 +74,16 @@ pub struct Flags {
     pub fm_repair_creates: bool,
     pub fm_repair_events: bool,
     pub fm_repair_dropped: bool,
+    /// Rust-only mutants of the restore scenarios: the own-origin replay is a plain take of what a peer appended (no window, no
+    /// skip-rule witness; Q6 v2.5 R3 option 2); an own-origin mark is never released
+    pub fm_restore_raise: bool,
+    pub fm_restore_mark_parked: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 5] = [
+pub const ROUTE_MUTANTS: [&str; 7] = [
+    "m-restore-replay-raise",
+    "m-restore-own-mark-parked",
     "m-register-ahead",
     "m-doc-hold-q6-kinds",
     "m-repair-carries-creates",
@@ -256,6 +262,8 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-field-k-plus-one" => f.fm_k_plus_one = true,
         "m-field-k-ignore-q7" => f.fm_k_ignore_q7 = true,
         "m-register-ahead" => f.fm_register_ahead = true,
+        "m-restore-replay-raise" => f.fm_restore_raise = true,
+        "m-restore-own-mark-parked" => f.fm_restore_mark_parked = true,
         "m-doc-hold-q6-kinds" => f.fm_doc_hold_q6 = true,
         "m-repair-carries-creates" => f.fm_repair_creates = true,
         "m-repair-carries-events" => f.fm_repair_events = true,

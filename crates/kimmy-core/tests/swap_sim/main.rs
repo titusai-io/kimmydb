@@ -31,6 +31,7 @@ mod omap;
 mod oracle;
 mod register;
 mod relay;
+mod restore;
 #[path = "../merge_state_sim/rng.rs"]
 mod rng;
 mod run;
