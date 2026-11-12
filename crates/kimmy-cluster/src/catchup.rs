@@ -1895,6 +1895,38 @@ mod tests {
         );
     }
 
+    /// A peer that has caught up on an old epoch of its own whose last write lost on arrival
+    /// there (superseded by a newer write, so nothing was appended): its servable position on
+    /// that origin stays below this member's, but it has witnessed the whole origin. It has not
+    /// lost data and counts; its witnessed vector is what says how far it holds an origin.
+    #[test]
+    fn a_caught_up_peer_whose_old_epochs_last_write_was_superseded_counts() {
+        let f = marked(CatchUpReason::Restored);
+        let now = Instant::now();
+        let at = |epoch: u64, ms: u64| {
+            (
+                kimmy_core::Origin::new(node(1), kimmy_core::Epoch::from_u64(epoch)),
+                kimmy_core::Hlc::new(ms, 0),
+            )
+        };
+        let of = |entries: &[(kimmy_core::Origin, kimmy_core::Hlc)]| {
+            let mut v = VersionVector::new();
+            for (origin, hlc) in entries {
+                v.insert(*origin, *hlc);
+            }
+            v
+        };
+        let mine = of(&[at(1, 100), at(2, 200)]);
+        // The old epoch's write at 100 was superseded on arrival: served through 90 only.
+        let servable = of(&[at(1, 90), at(2, 200)]);
+        let witnessed = of(&[at(1, 100), at(2, 200)]);
+        let caught_up = [reached(1, servable, Some(witnessed), block(None))];
+        assert_eq!(
+            f.catchup.evaluate(&tick(&caught_up, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
+    }
+
     #[test]
     fn a_peer_that_sends_no_block_counts() {
         let f = marked(CatchUpReason::SeededEmpty);
