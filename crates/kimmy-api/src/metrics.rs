@@ -53,6 +53,11 @@ pub const BACKUP_BUCKETS_US: [u64; 10] = [
 const LATENCY_BUCKETS_US: [u64; 12] =
     [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000];
 
+/// The `kimmy_epoch_origins` help line. A constant rather than text in the page's
+/// format string: the configuration-message scan in `kimmyd` reads a sentence that
+/// ends in a section name and is followed by that string's newline escape as a setting.
+const EPOCH_ORIGINS_HELP: &str = "Origins (node and epoch) in this member's own version vector.";
+
 /// Every counter as a plain value, for a reader that is not the renderer.
 ///
 /// A value struct rather than an accessor per counter: the OTLP bridge wants
@@ -1793,7 +1798,7 @@ impl Metrics {
              # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.\n\
              # TYPE kimmy_oplog_entries gauge\n\
              kimmy_oplog_entries {oplog_entries}\n\
-             # HELP kimmy_epoch_origins Origins (node and epoch) in this member's own version vector.\n\
+             # HELP kimmy_epoch_origins {epoch_origins_help}\n\
              # TYPE kimmy_epoch_origins gauge\n\
              kimmy_epoch_origins {epoch_origins}\n\
              # HELP kimmy_oplog_verified_entries Oplog entries read by the walk that last verified the version vector, at an open or a rewind. 0 with no record, and then the next open walks.\n\
@@ -2081,6 +2086,7 @@ impl Metrics {
             storage = readings.storage_bytes,
             oplog_entries = readings.oplog_entries,
             epoch_origins = readings.epoch_origins,
+            epoch_origins_help = EPOCH_ORIGINS_HELP,
             repairs_kept = readings.store_repairs.kept,
             repairs_rolled_back = readings.store_repairs.rolled_back,
             oplog_verified_entries = readings.oplog_verified.rows,
