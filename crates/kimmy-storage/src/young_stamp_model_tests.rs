@@ -2796,6 +2796,26 @@ pub(crate) fn rows_named() -> Vec<(&'static str, Schedule)> {
         // is buried, and the burial's purge removes the tombstone. Nothing moves A's horizon:
         // C's row is young on A and the repair writes back a document A deleted.
         ("ys1", ys1(Converge { to: A, from: C, c: O })),
+        // The sender clause (design 13.3): B deletes 1 and collects the tombstone, so its
+        // horizon is above 1's stamp; a whole-database page from A brings 1 back to B. C never
+        // held 1 and its own horizon is below it. Judged by C's horizon alone, 1 is young on C
+        // and the repair from B writes back what B deleted; the sender's horizon keeps it out.
+        (
+            "sender-clause",
+            Schedule {
+                cfg: Config { retention: [5, 0, 5], ..Config::default() },
+                steps: vec![
+                    Create { m: A, c: O },
+                    Pull { to: C, from: A },
+                    Write { m: A, c: O, d: 1 },
+                    Pull { to: B, from: A },
+                    Delete { m: B, c: O, d: 1 },
+                    Gc { m: B },
+                    Whole { to: B, from: A },
+                    Converge { to: C, from: B, c: O },
+                ],
+            },
+        ),
         // YS1's control: the count repair's scoped page brings the same row back (not judged:
         // the oracle looks at what the divergence repair creates only).
         ("ys1-control-scoped", ys1(Scoped { to: A, from: C, c: O })),
@@ -2910,6 +2930,16 @@ fn finding(name: &str) {
     let (_, schedule) = rows_named().into_iter().find(|(n, _)| *n == name).expect("a named row");
     let outcome = check(&schedule);
     assert!(outcome.findings.is_empty(), "finding {name}:\n{}", render(&schedule, &outcome));
+}
+
+/// The sender clause: the young rule judges a row against the higher of the requester's
+/// horizon and the sender's, so a sender that deleted a row, collected the delete and had the
+/// row brought back does not hand it to a requester whose own horizon is below it. The smoke
+/// run's schedules never reach this; the row was found by the three-members family at depth
+/// four with the sender's horizon dropped from the rule.
+#[test]
+fn finding_sender_clause_a_row_the_sender_deleted_and_collected_is_not_written_back() {
+    finding("sender-clause");
 }
 
 /// YS1, fixed: a burial raises the horizon to the highest stamp the life held, so the young rule
