@@ -1650,3 +1650,59 @@ async fn a_replay_position_of_another_member_is_refused() {
         "{outcome:?}"
     );
 }
+
+/// The holder's walk is cut by its budget at a row of another node at the HLC of A's two tied
+/// entries, which sorts just before them: the page is empty, and the walk examined nothing of
+/// A's at that HLC. The position the page leaves must be where that row leaves A's node, the HLC
+/// before, so both tied entries are still served; read as "past that HLC in every epoch" it
+/// would pass over them.
+#[tokio::test]
+async fn a_budget_cut_just_before_two_epochs_at_one_hlc_drops_neither() {
+    // No lost write before the tie, so the page the budget cuts holds no entry.
+    let (f, ids) = tied_fixture(0, 0, 0);
+    let c = f.c.node_id();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let tie =
+        f.c.read_oplog_from(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Request).unwrap();
+    let tie = tie.iter().find(|e| e.doc_id == Some(kimmy_core::DocId::String(ids[0].clone())));
+    let tie = tie.expect("the first tied entry").stamp.hlc;
+    let lowest = NodeId::from_bytes([0; 16]);
+    assert!(lowest < f.a.node_id(), "premise: the other node's row sorts before A's at the tie");
+    f.c.apply_batch(&[OplogEntry {
+        stamp: Stamp::new(tie, lowest, Epoch::ZERO),
+        kind: OpKind::Insert,
+        collection: orders.id,
+        doc_id: Some(kimmy_core::DocId::String("lowest".into())),
+        body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "lowest" }).unwrap()),
+    }])
+    .unwrap();
+    // The walk starts at the replay's floor, and the budget is the rows up to and including
+    // the other node's row at the tie, so the cut lands on it.
+    let floor = f.catch_up.replay_from(c, f.a.node_id()).hlc;
+    let rows = f.c.read_oplog_from(floor, usize::MAX, kimmy_storage::WalkScope::Request).unwrap();
+    let cut = rows.iter().position(|e| e.stamp.node == lowest).expect("the other node's row");
+    assert_eq!(rows[cut + 1].stamp.hlc, tie, "premise: A's tied entries follow it: {rows:?}");
+    assert!(
+        rows[..cut].iter().all(|e| e.stamp.hlc == floor),
+        "premise: nothing the walk would serve comes before the cut: {rows:?}"
+    );
+    TEST_REPLAY_EXAMINE_ROWS.with(|r| r.set(Some(cut as u64 + 1)));
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(Some(Duration::from_secs(3600))));
+    let mut contacts = 0;
+    let mut errors = Vec::new();
+    while !f.catch_up.replay_answered(c) && contacts < 5 {
+        if let Err(e) = f.round().await {
+            errors.push(e.to_string());
+        }
+        contacts += 1;
+    }
+    TEST_REPLAY_EXAMINE_ROWS.with(|r| r.set(None));
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(None));
+    assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts: {errors:?}");
+    let held: Vec<bool> = ids.iter().map(|id| f.holds(id)).collect();
+    assert_eq!(
+        held,
+        [true, true],
+        "both tied writes are back after {contacts} contacts: {errors:?}"
+    );
+}
