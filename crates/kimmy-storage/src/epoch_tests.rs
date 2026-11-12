@@ -147,6 +147,55 @@ fn an_open_that_finds_no_row_mints_at_or_above_every_stamp_the_store_holds() {
     assert_eq!(last.last().unwrap().stamp.epoch, second);
 }
 
+/// `kimmyd restore` opens the restored store, which mints the epoch, and writes the floor from
+/// that open; the first real start opens it again and finds the row. Nothing has been written
+/// under the new epoch, so that start lost no write of it, and what it may have lost sits under
+/// the old epochs, as at the mint: it asks from the same position, whether or not the minting
+/// open's floor reached the file (a crash between the mint and the floor's write).
+#[test]
+fn a_reopen_before_the_first_write_of_a_minted_epoch_asks_from_the_old_epochs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = open(&dir.path().join("source.redb"));
+    let coll = source.create_collection("shop", "orders").unwrap();
+    source.insert(&coll, doc! { "_id": 1 }).unwrap();
+    let backed_up = source.version_vector().unwrap().get(source.origin());
+    let backup = backup_of(&source);
+    let path = dir.path().join("restored.redb");
+    restore(&path, &mut backup.as_slice()).unwrap();
+
+    let minted = {
+        let engine = open(&path);
+        assert_eq!(engine.own_position_at_open(), backed_up, "the minting open asks from B");
+        engine.epoch()
+    };
+    let engine = open(&path);
+    assert_eq!(engine.epoch(), minted, "premise: the reopen keeps the epoch");
+    assert_eq!(
+        engine.own_position_at_open(),
+        backed_up,
+        "the first start after the restore asks from the backup's position"
+    );
+    let coll = engine.get_collection("shop", "orders").unwrap();
+    engine.insert(&coll, doc! { "_id": 2 }).unwrap();
+    let written = engine.version_vector().unwrap().get(engine.origin());
+    drop(engine);
+    assert_eq!(
+        open(&path).own_position_at_open(),
+        written,
+        "once it has written under the epoch, a start asks from its own position under it"
+    );
+}
+
+/// A store that minted its first epoch and wrote nothing has no old epoch to ask from: a start
+/// asks from the epoch's start, since no entry of it is older.
+#[test]
+fn a_reopen_of_a_new_store_that_wrote_nothing_asks_from_its_epochs_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let epoch = open(&path).epoch();
+    assert_eq!(open(&path).own_position_at_open(), epoch.start_hlc());
+}
+
 #[test]
 fn a_restore_does_not_carry_the_epoch_so_each_restore_mints_its_own() {
     let dir = tempfile::tempdir().unwrap();

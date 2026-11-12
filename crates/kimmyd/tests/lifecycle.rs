@@ -2756,6 +2756,15 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     let client = reqwest::Client::new();
     let (backup, config) = backup_and_config(dir.path());
     restore(&config, &backup);
+    let data = dir.path().join("data");
+    let restored_floor = kimmy_cluster::catchup::replay_floor_on_disk(&data);
+    let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
+    assert_eq!(
+        restored_floor,
+        Some(source.version_vector().unwrap().get(source.origin())),
+        "premise: the restore leaves the backup's own-origin position as the floor"
+    );
+    drop(source);
 
     let mut run = Run::spawn_clustered(dir.path(), "restored-with-peers", dead_port(), 3);
     let deadline = Instant::now() + PATIENCE;
@@ -2783,6 +2792,13 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     assert!(
         dir.path().join("data").join("kimmy.replay-floor").exists(),
         "the replay floor is kept until every member that can answer has"
+    );
+    // The start found the epoch the restore minted, with nothing written under it: the replay
+    // still asks from the backup's position, not from the bottom of what the peers keep.
+    assert_eq!(
+        kimmy_cluster::catchup::replay_floor_on_disk(&data),
+        restored_floor,
+        "the first start keeps the restore's floor"
     );
     run.signal("TERM");
     assert!(run.wait_exit().success());
