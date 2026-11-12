@@ -446,6 +446,24 @@ fn template(id: u8) -> PathBuf {
     path
 }
 
+/// A directory for one member's store: in memory, on the host's `tmpfs` at `/dev/shm`, when
+/// there is one, else the ordinary temporary directory. Every step commits on every member it
+/// touches, and each commit waits for an fsync: on a disk shared with a whole workspace's
+/// tests those waits, not the model, were most of the run, and a slow step is a run thrown
+/// away and repeated at a larger time scale (`check`). What a schedule means does not depend
+/// on where its stores live: no step reads the disk's own durability (a killed start's
+/// fsync failure is injected, not the disk's). The templates stay where they are: made once
+/// per process and only copied from.
+fn store_dir() -> tempfile::TempDir {
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir()
+        && let Ok(dir) = tempfile::Builder::new().prefix("kimmy-ysm-").tempdir_in(shm)
+    {
+        return dir;
+    }
+    tempfile::tempdir().unwrap()
+}
+
 fn identity(m: usize, generation: u8) -> u8 {
     if generation == 0 { 0x11 * (m as u8 + 1) } else { 0x40 + 0x10 * m as u8 + generation }
 }
@@ -919,7 +937,7 @@ impl Cluster {
     fn new(cfg: &Config, k: u64) -> Self {
         let members = (0..3)
             .map(|m| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = store_dir();
                 let path = dir.path().join("kimmy.redb");
                 Member {
                     _dir: dir,
@@ -2020,8 +2038,23 @@ impl Outcome {
     }
 }
 
+thread_local! {
+    /// The time scale this thread's next [`check`] starts at, and how many runs in a row
+    /// have needed no retry. A run whose wall clock overtakes a local step is thrown away
+    /// and run again at twice the scale, so starting every schedule at 1 ran most of them
+    /// three or four times over (a debug build needs 8 or 16 on a busy host), each time on
+    /// three freshly opened stores. The scale changes nothing in what a schedule means
+    /// (the module's **Clocks**), so the next schedule starts where the last one ended; after
+    /// [`EASE_AFTER`] runs in a row with no retry it starts at half, so the scale comes back
+    /// down when the host does.
+    static START_K: Cell<(u64, u32)> = const { Cell::new((1, 0)) };
+}
+
+/// See [`START_K`].
+const EASE_AFTER: u32 = 4;
+
 pub(crate) fn check(schedule: &Schedule) -> Outcome {
-    let mut k = 1;
+    let mut k = START_K.with(|start| start.get().0);
     let mut retries = 0;
     loop {
         let mut cluster = Cluster::new(&schedule.cfg, k);
@@ -2031,6 +2064,10 @@ pub(crate) fn check(schedule: &Schedule) -> Outcome {
             retries += 1;
             continue;
         }
+        START_K.with(|next| {
+            let streak = if retries == 0 { next.get().1 + 1 } else { 0 };
+            next.set(if streak >= EASE_AFTER { ((k / 2).max(1), 0) } else { (k, streak) });
+        });
         let mut findings = std::mem::take(&mut cluster.findings);
         if let Err(e) = result {
             findings.push(Finding::plain(Cat::Error, e));
@@ -2701,16 +2738,30 @@ fn young_stamp_third_member_window() {
 }
 
 /// A short seeded run and every family at depth two, for the ordinary suite.
+///
+/// One pool over every schedule, the seeded ones first: a pool per family left the
+/// workers idle behind each family's last schedule, ten times over.
 #[test]
 fn young_stamp_smoke() {
+    const SEEDED: usize = 16;
     let started = std::time::Instant::now();
-    let (mut stats, mut failures) = run_all(&|i| generate(0x5eed_0000 + i as u64, 40), 16);
-    for family in families() {
-        let shallow = Family { depth: 2, ..family };
-        let (s, f) = run_all(&|i| shallow.schedule(i), shallow.size());
-        stats.add(&s);
-        failures.extend(f);
-    }
+    let shallow: Vec<Family> =
+        families().into_iter().map(|family| Family { depth: 2, ..family }).collect();
+    let rows: Vec<(usize, usize)> = shallow
+        .iter()
+        .enumerate()
+        .flat_map(|(f, family)| (0..family.size()).map(move |i| (f, i)))
+        .collect();
+    let (stats, failures) = run_all(
+        &|i| match i.checked_sub(SEEDED) {
+            None => generate(0x5eed_0000 + i as u64, 40),
+            Some(row) => {
+                let (f, i) = rows[row];
+                shallow[f].schedule(i)
+            }
+        },
+        SEEDED + rows.len(),
+    );
     let failed = !failures.is_empty();
     let text = report("smoke", &stats, failures, started.elapsed());
     eprintln!("{text}");
