@@ -1287,3 +1287,134 @@ async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_ot
         "and they are the old epoch's writes, not the new one's"
     );
 }
+
+/// Two lost writes of A's node at one HLC under two of its earlier epochs, put on C after `before`
+/// lost writes of `big` bytes each: the shape a restored member's clock behind its lost writes
+/// gives (Q7 Step 1 review, F3). Returns the fixture and the two ids.
+fn tied_fixture(before: i64, big: usize, tied_big: usize) -> (Fixture, [String; 2]) {
+    let f = fixture(before, big);
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    let old =
+        f.a.version_vector()
+            .unwrap()
+            .iter()
+            .map(|(origin, _)| origin)
+            .find(|origin| origin.node == node && *origin != f.a.origin())
+            .expect("premise: A's vector names the epoch the backup was written under");
+    let other = Epoch::new(Hlc::new(1, 0), [9; 8]);
+    assert_ne!(other, old.epoch);
+    // Above every lost write C holds and below anything A writes later.
+    let tie = Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0);
+    let pad = "y".repeat(tied_big);
+    let ids = [format!("tied-{}", 0), format!("tied-{}", 1)];
+    let entries: Vec<OplogEntry> = [other, old.epoch]
+        .into_iter()
+        .zip(&ids)
+        .map(|(epoch, id)| OplogEntry {
+            stamp: Stamp::new(tie, node, epoch),
+            kind: OpKind::Insert,
+            collection: orders.id,
+            doc_id: Some(kimmy_core::DocId::String(id.clone())),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id, "pad": &pad }).unwrap()),
+        })
+        .collect();
+    for entry in &entries {
+        f.c.apply_batch(std::slice::from_ref(entry)).unwrap();
+    }
+    assert_eq!(f.c.read_oplog_from(tie, 10, kimmy_storage::WalkScope::Request).unwrap().len(), 2);
+    (f, ids)
+}
+
+impl Fixture {
+    fn holds(&self, id: &str) -> bool {
+        let held = self.a.get_collection("shop", "orders").unwrap();
+        self.a.get(&held, &kimmy_core::DocId::String(id.into())).unwrap().is_some()
+    }
+}
+
+/// Two epochs of A's node at one HLC in one page of the replay C serves: the page is in
+/// stamp order, not refused as out of order, and both writes come back.
+#[tokio::test]
+async fn a_page_with_two_epochs_of_the_members_node_at_one_hlc_is_applied_whole() {
+    let (f, ids) = tied_fixture(5, 0, 0);
+    let c = f.c.node_id();
+    let mut contacts = 0;
+    let mut errors = Vec::new();
+    while !f.catch_up.replay_answered(c) && contacts < 5 {
+        if let Err(e) = f.round().await {
+            errors.push(e.to_string());
+        }
+        contacts += 1;
+    }
+    assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts: {errors:?}");
+    assert!(ids.iter().all(|id| f.holds(id)), "both tied writes are back: {errors:?}");
+    assert_eq!(f.orders(), 2 + 5 + 2);
+}
+
+/// The same tie with a page boundary between the two, on the replay C serves on its own
+/// contact: entries of 14 MiB, four to a frame, three before the tie, so the holder's first
+/// page holds the three and the first of the tie. The second is after the cursor the first left,
+/// and is served.
+#[tokio::test]
+async fn a_page_boundary_between_two_epochs_at_one_hlc_drops_neither_inbound() {
+    const BIG: usize = 14 * 1024 * 1024;
+    let (f, ids) = tied_fixture(3, BIG, BIG);
+    let c = f.c.node_id();
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(Some(Duration::from_secs(3600))));
+    let mut contacts = 0;
+    let mut errors = Vec::new();
+    while !f.catch_up.replay_answered(c) && contacts < 10 {
+        if let Err(e) = f.round().await {
+            errors.push(e.to_string());
+        }
+        contacts += 1;
+    }
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(None));
+    assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts: {errors:?}");
+    let held: Vec<bool> = ids.iter().map(|id| f.holds(id)).collect();
+    assert_eq!(
+        held,
+        [true, true],
+        "both tied writes are back after {contacts} contacts: {errors:?}"
+    );
+}
+
+/// The same tie on the replay A asks for itself (`replay_own_origin`), with a page boundary
+/// between the two: entries of 14 MiB, four to a frame, three before the tie. The page holds
+/// the three and the first of the tie, and the next ask must still be served the second.
+#[tokio::test]
+async fn a_page_boundary_between_two_epochs_at_one_hlc_drops_neither_outbound() {
+    const BIG: usize = 14 * 1024 * 1024;
+    let (f, ids) = tied_fixture(3, BIG, BIG);
+    let c = f.c.node_id();
+    let theirs = f.c.version_vector().unwrap();
+    let mut contacts = 0;
+    while !f.catch_up.replay_answered(c) && contacts < 10 {
+        let (mut ours, served) = tokio::io::duplex(MAX_FRAME);
+        let serving =
+            serve_peer(&f.c, served, SECRET, BINDING, None, ServeBudgets::serving(), None);
+        let asking = async {
+            open_handshake(&f.a, &mut ours, SECRET, BINDING).await.unwrap();
+            let done = replay_own_origin(
+                &f.a,
+                &mut ours,
+                addr(),
+                c,
+                &theirs,
+                &f.catch_up,
+                Instant::now() + Duration::from_secs(3600),
+                &RoundClock::default(),
+            )
+            .await;
+            drop(ours);
+            done
+        };
+        let (_, done) = tokio::join!(serving, asking);
+        done.unwrap();
+        contacts += 1;
+    }
+    assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts");
+    let held: Vec<bool> = ids.iter().map(|id| f.holds(id)).collect();
+    assert_eq!(held, [true, true], "both tied writes are back after {contacts} contacts");
+}
