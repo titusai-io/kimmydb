@@ -10,6 +10,10 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**Fixed:** a member that took a scoped definitions repair or a scoped restore of a collection logs the entry behind each index it restored as held state, and that entry's later delivery in a window never released the mark, so the member asked its peers for it again about every 5 minutes for as long as the entry stayed in its oplog, and until the origin wrote again advertised a servable position below it. The delivery now releases the mark and raises the servable position, and no ask is repeated.
+
 ## 0.60.0 - 2026-11-03
 
 **Read before upgrading: 0.60.0 opens a store and a backup 0.59.0 wrote, with no wipe. Stop every member and start them all on 0.60.0.** Nothing stored changes (the storage schema is still 7 and the cluster protocol still 2), but what the query layer holds and answers does, and some requests that ran can now be refused; the **Breaking** lines below are the list. Read these first: an `update`, `delete` or `find_and_modify` over an index range, a `find` with a filter that rejects most of a very large inexact range, and a filtered vector search are held to `aggregate.memory_limit_bytes` and the node's pool (`413`, or `503` when the pool is full); a `$sort` with no `$limit` after it charges its sort keys, so a large one can be refused sooner; a memory refusal of an aggregation names the state it holds (`the buckets of $group`, `the heap of $sort`) and not the input; `{$limit: 0}` and a pipeline of more than 1,000 stages are `400`. An aggregation that begins with `$count`, `$group`, `$bucket`, `$sortByCount`, `$sample`, a `$sort` with a `$limit`, or a stage that streams is answered over a collection above the per-request limit, and an error in a document past a full `$limit` is no longer raised.
