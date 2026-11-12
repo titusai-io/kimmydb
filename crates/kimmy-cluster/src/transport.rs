@@ -414,7 +414,8 @@ where
 pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 
 /// Called on the serving side once per peer connection that ended in an
-/// error on this side, with why, for `kimmy_sync_serve_failures_total`.
+/// error on this side, with why, for `kimmy_sync_serve_failures_total`; and once
+/// for a frame read leniently whose bad field was dropped (`malformed`).
 pub type ServeFailHook = Arc<dyn Fn(ServeFailure) + Send + Sync>;
 
 /// Called once per accept error that is the listener's own, with which
@@ -1007,7 +1008,10 @@ async fn serve_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed, budgets, members).await
+    let Err(e) = serve_peer_counting(
+        engine, stream, secret, binding, on_pushed, on_failed, budgets, members,
+    )
+    .await
     else {
         return;
     };
@@ -1060,6 +1064,21 @@ struct ServeWalk {
     peer: NodeId,
 }
 
+/// Says, once for each peer in this process, that its digest request carried a cut
+/// that is not a version vector and was answered as if it had asked for no digest.
+fn say_malformed_digest_cut(peer: NodeId) {
+    static SAID: std::sync::Mutex<Vec<NodeId>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !said.contains(&peer) {
+        said.push(peer);
+        warn!(
+            %peer,
+            "the peer's digest request carried a cut that is not a version vector; it is \
+             answered as a request for no digest, and the rest of the divergence check goes on"
+        );
+    }
+}
+
 impl ServeWalk {
     fn begin(peer: NodeId) -> Self {
         debug!(?peer, "a serve walk started for a peer's pull");
@@ -1082,6 +1101,25 @@ async fn serve_peer<S>(
     secret: &str,
     binding: &[u8],
     on_pushed: Option<&PushHook>,
+    budgets: ServeBudgets,
+    members: Option<&Members>,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    serve_peer_counting(engine, stream, secret, binding, on_pushed, None, budgets, members).await
+}
+
+/// [`serve_peer`], with the hook a failure that does not end the connection is
+/// counted through (a digest request whose cut is malformed).
+#[allow(clippy::too_many_arguments)]
+async fn serve_peer_counting<S>(
+    engine: &Engine,
+    stream: S,
+    secret: &str,
+    binding: &[u8],
+    on_pushed: Option<&PushHook>,
+    on_failed: Option<&ServeFailHook>,
     budgets: ServeBudgets,
     members: Option<&Members>,
 ) -> Result<(), ProtocolError>
@@ -1403,6 +1441,15 @@ where
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
             Message::AskDivergence { probe, digest, definitions } => {
+                // A digest request whose cut did not decode reads as none, so the
+                // count half is answered and the connection goes on (ADR-139): said
+                // once for each peer, and counted with the other malformed frames.
+                if crate::protocol::take_malformed_digest_cut() {
+                    say_malformed_digest_cut(peer);
+                    if let Some(hook) = on_failed {
+                        hook(ServeFailure::Malformed);
+                    }
+                }
                 // Metadata only, whatever `probe` is — see
                 // `Engine::all_collection_ids`. One walk answers both halves
                 // of what this node holds: the ids, and the incarnation each
@@ -12476,6 +12523,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A digest request whose `cut` is not a version vector (a key that names a node
+    /// and no epoch, as a build before epochs wrote it) is answered as a request
+    /// for no digest: the count half is answered, the connection goes on, the
+    /// failure is counted once as `malformed` and said once for the peer, and the
+    /// next request on the same connection with a good cut is answered with
+    /// digests (ADR-139: an error inside replication must never wedge it).
+    #[tokio::test]
+    async fn a_digest_request_with_a_malformed_cut_is_answered_without_digests_and_the_contact_goes_on()
+     {
+        use tokio::io::AsyncWriteExt;
+        const SECRET: &str = "a-malformed-cut-secret";
+        const BINDING: &[u8] = b"a-malformed-cut-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Engine::open(&other_dir.path().join("kimmy.redb")).unwrap();
+        let good = kimmy_storage::DigestAsk {
+            cut: engine.witnessed_vector().unwrap(),
+            uncovered: Vec::new(),
+            busy: None,
+        };
+        assert!(!good.cut.is_empty(), "premise: the cut names an origin");
+        // The same request with its first cut key rewritten to a node alone.
+        let mut bad = bson::serialize_to_document(&Message::AskDivergence {
+            probe: Some(orders.id),
+            digest: Some(good.clone()),
+            definitions: None,
+        })
+        .unwrap();
+        let cut = bad
+            .get_document_mut("AskDivergence")
+            .unwrap()
+            .get_document_mut("digest")
+            .unwrap()
+            .get_document_mut("cut")
+            .unwrap();
+        let (key, value) = cut.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        cut.remove(&key);
+        cut.insert(key.split('/').next().unwrap().to_string(), value);
+        let bad = bson::serialize_to_vec(&bad).unwrap();
+
+        let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let failures = Arc::clone(&failures);
+            Arc::new(move |failure| failures.lock().unwrap().push(failure))
+        };
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = serve_peer_counting(
+            &engine,
+            theirs,
+            SECRET,
+            BINDING,
+            None,
+            Some(&hook),
+            ServeBudgets::serving(),
+            None,
+        );
+        let (other, good, bad) = (&other, &good, &bad);
+        let asking = async move {
+            open_handshake(other, &mut ours, SECRET, BINDING).await.unwrap();
+            ours.write_all(&(bad.len() as u32).to_be_bytes()).await.unwrap();
+            ours.write_all(bad).await.unwrap();
+            let first = read_frame(&mut ours).await;
+            write_frame(
+                &mut ours,
+                &Message::AskDivergence {
+                    probe: None,
+                    digest: Some(good.clone()),
+                    definitions: None,
+                },
+            )
+            .await
+            .unwrap();
+            let second = read_frame(&mut ours).await;
+            (first, second)
+        };
+        let (served, (first, second)) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(serving, asking) })
+                .await
+                .expect("the contact ended");
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(
+            matches!(
+                first,
+                Ok(Message::Divergence {
+                    digests: None,
+                    digest_busy: false,
+                    probe_count: Some(1),
+                    ..
+                })
+            ),
+            "the count half is answered, with no digests: {first:?}"
+        );
+        assert!(
+            matches!(second, Ok(Message::Divergence { digests: Some(_), .. })),
+            "and the next request, with a good cut, is answered with digests: {second:?}"
+        );
+        assert_eq!(*failures.lock().unwrap(), vec![ServeFailure::Malformed], "counted once");
     }
 
     /// B3 half 2: what a responder says to a divergence request, by raw frames.

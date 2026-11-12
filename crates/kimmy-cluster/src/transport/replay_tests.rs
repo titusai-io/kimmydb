@@ -1216,3 +1216,74 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     f.catch_up.arm_replay(f.a.own_position_at_open(), None).unwrap();
     assert!(f.catch_up.replay_first_loss_from(c), "armed afresh, it is the first again");
 }
+
+/// The serving side of the replay matches the asker **by node, across epochs**: the
+/// writes a restored member lost sit in its old epoch, while its vector also names
+/// the new one it writes under now. The server holds every other node's origins at
+/// `Hlc::MAX` and every epoch of the asker's node at `from`, so the page it serves
+/// holds exactly the asker's old-epoch writes and nothing of the third node's.
+///
+/// What this test pins is the `held` vector: `ours` is read at transport.rs:2464 and
+/// every origin of another node is put at `Hlc::MAX` in `held` at transport.rs:2470, so
+/// with the node match broken there the old-epoch writes are not served.
+///
+/// It does not reach the final `entry.stamp.node == their_node` filter on the served
+/// entries (transport.rs:2511), and that filter is **not** redundant. `ours` and the
+/// walk are separate reads: the version vector is read in its own read transaction
+/// (`Engine::read_versions`, kimmy-storage engine.rs:2903, which begins and ends within
+/// that call) and the walk of `serve_entries_to_peer` (transport.rs:2501) opens another
+/// (kimmy-storage sync.rs:998, in `entries_for_peer_counting`). An entry of an origin
+/// that another contact applies to the server between the two is in the walk's snapshot
+/// and not in `held`, so only the filter keeps it off the page. A single-task test
+/// cannot interleave an apply between those two calls, so none reaches it.
+#[tokio::test]
+async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_other() {
+    let f = fixture_with_tail(5, 0, 3);
+    let theirs = f.a.version_vector().unwrap();
+    let new_origin = f.a.origin();
+    let epochs_of_a = theirs.iter().filter(|(o, _)| o.node == f.a.node_id()).count();
+    assert!(
+        epochs_of_a >= 2 && theirs.get(new_origin) > Hlc::ZERO,
+        "premise: the asker's vector names its old epoch and the one it writes under now"
+    );
+    let from = f.a.own_position_at_open();
+    let held_by_server = f.c.version_vector().unwrap();
+    assert!(
+        held_by_server.iter().any(|(o, _)| o.node != f.a.node_id()),
+        "premise: the server holds a third node's origin"
+    );
+    assert_eq!(
+        held_by_server.get(new_origin),
+        Hlc::ZERO,
+        "premise: the server lacks the new epoch"
+    );
+
+    let (mut server_end, mut client_end) = tokio::io::duplex(MAX_FRAME);
+    let serving = serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, from);
+    let asking = async {
+        let Message::ReplayEntries { entries, exhausted, horizon, scanned_to, .. } =
+            read_frame(&mut client_end).await.unwrap()
+        else {
+            panic!("a page of the replay")
+        };
+        write_frame(
+            &mut client_end,
+            &Message::ReplayAck { next_from: scanned_to, done: exhausted, stalled: None },
+        )
+        .await
+        .unwrap();
+        (entries, exhausted, horizon)
+    };
+    let (served, (entries, exhausted, horizon)) = tokio::join!(serving, asking);
+    served.unwrap();
+    assert!(!horizon && exhausted, "the whole answer in one page");
+    assert_eq!(entries.len(), 5, "the five writes the backup lacks: {entries:?}");
+    assert!(
+        entries.iter().all(|e| e.stamp.node == f.a.node_id() && e.stamp.hlc > from),
+        "only the asker's node, above where it asked"
+    );
+    assert!(
+        entries.iter().all(|e| e.stamp.origin() != new_origin),
+        "and they are the old epoch's writes, not the new one's"
+    );
+}
