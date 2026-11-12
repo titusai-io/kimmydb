@@ -106,13 +106,36 @@ fn lenient_generation<'de, D: serde::Deserializer<'de>>(
 
 /// A replay position on a frame, read leniently: anything that is not a whole stamp (an
 /// HLC, a node id and an 18-byte epoch) reads as absent, so a field of another shape costs the
-/// field and never the frame. A stamp that decodes and names another member than the sender is
+/// field and never the frame. Lenient because the dialler reads it in `Vectors`, the first answer
+/// of every round: failing the frame would fail every round with that peer, and the pull with it
+/// (ADR-139: an error inside replication must never wedge it). **Not silent**: a value present
+/// and not a position is flagged for the read's caller ([`take_malformed_replay_from`]), which
+/// says so once per peer. A stamp that decodes and names another member than the sender is
 /// refused where it is used.
 fn lenient_stamp<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<kimmy_core::Stamp>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<kimmy_core::Stamp>(raw).ok()))
+    Ok(raw.and_then(|raw| match bson::deserialize_from_bson::<kimmy_core::Stamp>(raw) {
+        Ok(stamp) => Some(stamp),
+        Err(_) => {
+            MALFORMED_REPLAY_FROM.with(|flag| flag.set(true));
+            None
+        }
+    }))
+}
+
+thread_local! {
+    /// Set by [`lenient_stamp`] when the frame being decoded on this thread carried a
+    /// `replay_from` that is not a replay position. The decode and the caller's next line run
+    /// in one poll, as [`take_malformed_digest_cut`]'s do.
+    static MALFORMED_REPLAY_FROM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the frame just decoded on this thread carried a malformed `replay_from`; clears
+/// the flag.
+pub(crate) fn take_malformed_replay_from() -> bool {
+    MALFORMED_REPLAY_FROM.with(|flag| flag.replace(false))
 }
 
 /// A digest request, read leniently (B3): one that does not decode is none, so a
@@ -679,6 +702,7 @@ pub(crate) async fn read_frame_noting_facts<R: AsyncRead + Unpin>(
 ) -> Result<(Message, bool, u64), ProtocolError> {
     let body = read_body(reader).await?;
     crate::facts::take_undecodable();
+    take_malformed_replay_from();
     let message = decode(&body)?;
     let seq = crate::facts::next_decoded_seq();
     Ok((message, crate::facts::take_undecodable(), seq))

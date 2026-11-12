@@ -1080,12 +1080,30 @@ fn say_malformed_digest_cut(peer: NodeId) {
     }
 }
 
+/// Says, once for each peer in this process (up to [`MALFORMED_CUT_SAID_MAX`] peers), that its
+/// `Vectors` answer carried a `replay_from` that is not a replay position and was read as no
+/// ask, so the round went on and no replay was served to it.
+fn say_malformed_replay_from(peer: NodeId) {
+    static SAID: std::sync::Mutex<Vec<NodeId>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if first_malformed_cut_report(&mut said, peer) {
+        warn!(
+            %peer,
+            "the peer's answer asked for a replay from a replay_from that is not a replay \
+             position (a stamp of its own node); it is read as no ask, and the round goes on"
+        );
+    } else {
+        debug!(%peer, "another answer whose replay_from is not a replay position");
+    }
+}
+
 /// How many peers are remembered as told about a malformed cut. A bound, so a stream of
 /// distinct authenticated peer ids cannot grow the list without end: past it a peer is said at
 /// `debug` only, as the webhook progress faults are past theirs.
 const MALFORMED_CUT_SAID_MAX: usize = 1024;
 
-/// Whether `peer`'s malformed cut is said now: the first time it is seen, recorded in `said`,
+/// Whether `peer`'s malformed field (a digest cut, a `replay_from`) is said now: the first time
+/// it is seen, recorded in `said`,
 /// while fewer than [`MALFORMED_CUT_SAID_MAX`] peers are.
 fn first_malformed_cut_report(said: &mut Vec<NodeId>, peer: NodeId) -> bool {
     if said.len() >= MALFORMED_CUT_SAID_MAX || said.contains(&peer) {
@@ -2708,7 +2726,12 @@ where
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("the first reply".into()))??;
+    // In the poll that decoded the frame, as the facts flag is.
+    let malformed_ask = crate::protocol::take_malformed_replay_from();
     clock.heard_now();
+    if malformed_ask {
+        say_malformed_replay_from(their_node);
+    }
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
         Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
             if undecodable {
