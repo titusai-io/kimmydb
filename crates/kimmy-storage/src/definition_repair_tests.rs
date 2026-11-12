@@ -981,3 +981,21 @@ fn the_origins_entry_over_a_held_rebuild_with_other_bytes_replaces_it_and_releas
     no_mark_is_left(&b);
     assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
 }
+
+/// The collection the held entry names is gone here when the entry arrives in a window: the
+/// creation is history (the drop is later than it), and the entry is in position all the same.
+#[test]
+fn a_relogged_definition_of_a_collection_dropped_here_since_is_released_by_its_delivery() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the drop leaves the held entry marked");
+
+    deliver_in_window(&b, &a);
+    assert!(b.get_collection("shop", "orders").is_err(), "the collection stays dropped");
+    no_mark_is_left(&b);
+}
