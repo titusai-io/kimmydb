@@ -654,6 +654,11 @@ pub fn event_id(entry: &OplogEntry) -> String {
     format!("{}-{}", entry.stamp.hlc, entry.stamp.node)
 }
 
+/// The `X-Kimmy-Event-Id` of a batch: the id of its first event, empty for none.
+fn first_event_id(stamps: &[Stamp]) -> String {
+    stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default()
+}
+
 /// `HMAC-SHA256(secret, timestamp || "." || body)`, hex.
 ///
 /// The timestamp is inside the signature so a captured delivery cannot be
@@ -1349,8 +1354,7 @@ async fn deliver_within(
     // so the timestamp a receiver checks against replay is the send time.
     let timestamp = kimmy_storage::physical_now_ms();
     let signature = sign(&job.secret, timestamp, &delivery.body);
-    let first =
-        delivery.stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default();
+    let first = first_event_id(&delivery.stamps);
 
     let mut request = client
         .post(&job.url)
@@ -2383,6 +2387,20 @@ pub(crate) mod tests {
         let e = entry(OpKind::Insert, 1, 100);
         assert_eq!(event_id(&e), event_id(&e), "must be stable");
         assert_ne!(event_id(&e), event_id(&entry(OpKind::Insert, 1, 101)));
+    }
+
+    #[test]
+    fn two_epochs_of_one_node_at_one_hlc_give_two_event_ids() {
+        // A restored member's new epoch can stamp a write at an HLC its old epoch already used
+        // (a clock behind the lost writes): two changes, which a receiver deduplicating on the
+        // id must not collapse into one.
+        let old = entry(OpKind::Insert, 1, 100);
+        let mut new = old.clone();
+        new.stamp.epoch = Epoch::new(old.stamp.hlc, [1; 8]);
+        assert_ne!(event_id(&old), event_id(&new));
+        let header = |e: &OplogEntry| super::first_event_id(&[e.stamp]);
+        assert_ne!(header(&old), header(&new), "nor the X-Kimmy-Event-Id header");
+        assert_eq!(header(&new), event_id(&new), "the header is the first event's id");
     }
 
     #[test]
