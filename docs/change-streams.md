@@ -382,6 +382,13 @@ A token therefore carries two things ([ADR-173](decisions.md)):
 | The member that issued the token | Just after the token's entry | **Exact**: every event the stream had not sent, once each |
 | Any other member | At its first entry above the vector | **At-least-once**: every event the stream had not sent, and possibly some it had |
 
+**A token issued before a rewind or a restore is another member's token once the member is
+reopened.** The issuer in a token is an origin, a node and its epoch. A plain restart keeps
+the epoch, so the token still resumes exactly. A rewind clears the epoch and a restore does not
+carry it, so the open that follows mints a new one: the member is no longer the one that
+issued the token, and the token resumes as on any other member, at-least-once. A stream
+resumed this way may deliver again events it had already delivered.
+
 **What can repeat, precisely.** The vector moves only once the stream has
 handed over everything up to the end of the arrival index as one read found it.
 The events it sent after that read — at most one read, up to 1,024 events, or

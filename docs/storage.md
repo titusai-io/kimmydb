@@ -85,14 +85,14 @@ erDiagram
 | `collections` | `(&str, &str)` — (db, name) | `CollectionMeta` as JSON |
 | `docs` | `(u64, &[u8])` — (collection id, encoded `_id`) | `DocRecord` |
 | `index_entries` | `(u64, u32, &[u8], &[u8])` | `()` |
-| `oplog` | `&[u8]` — 26 bytes (hlc \|\| node) | `OplogEntry` |
+| `oplog` | `&[u8]` — 44 bytes (hlc \|\| node \|\| epoch) | `OplogEntry` (its stamp is the key, not repeated in the value since 0.61.0) |
 | `oplog_arrival` | `u64` — local arrival sequence | oplog key |
 | `oplog_arrival_seq` | oplog key | `u64` |
-| `oplog_versions` | node id (16 bytes) | highest `Hlc` covered from that node — **not** purely oplog-derived; a snapshot grants coverage too |
+| `oplog_versions` | origin (node id and epoch, 34 bytes) | highest `Hlc` covered from that node — **not** purely oplog-derived; a snapshot grants coverage too |
 | `collections_dropped` | collection id | `Stamp` of the drop |
 | `indexes_dropped` | `(u64, u32)` — (collection id, index id) | `Stamp` of the drop |
-| `oplog_witnessed` | node id (16 bytes) | newest `Hlc` **processed** from that node, appended or not (ADR-054) |
-| `oplog_collected` | node id (16 bytes) | highest `Hlc` retention has removed for that origin |
+| `oplog_witnessed` | origin (34 bytes) | newest `Hlc` **processed** from that node, appended or not (ADR-054) |
+| `oplog_collected` | origin (34 bytes) | highest `Hlc` retention has removed for that origin |
 | `oplog_held` | oplog key | `()` — the entry was appended as **state**, not history (ADR-160) |
 | `live_counts` | collection id | The collection's live document count, moved by every document write |
 | `live_counts_through` | `&str` | Where the counts are current through, so a start can tell when it may not trust them |
@@ -155,9 +155,10 @@ are in key order, and a read that wants `_id` order across them keeps the
 sorted. Documents are fetched in the same read transaction as the entries, so
 a query is one snapshot ([ADR-098](decisions.md)).
 
-**The oplog key is a flat 26-byte slice, not a tuple.** `hlc(10) || node(16)`
+**The oplog key is a flat 44-byte slice, not a tuple.** `hlc(10) || node(16) || epoch(18)`
 already sorts by `memcmp` in exactly the total write order, so no structure is
-needed.
+needed. The epoch is minted at the open that finds no `epoch` row in `META`, is
+not carried by a backup, and is cleared by a rewind (ADR-273).
 
 ---
 

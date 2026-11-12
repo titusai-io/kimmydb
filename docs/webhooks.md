@@ -87,6 +87,17 @@ computes independently, so there is no leader, no election, and no coordination.
 progress, so nothing is lost and nothing is sent five times.
 [ADR-045](decisions.md) has the reasoning.
 
+Progress is kept in the system collection `__webhook_progress`, one record per
+subscription and node (`_id` = `{subscription}:{node}`), whose `delivered` document is
+keyed by origin, `<node uuid>/<36 hex digits of the epoch>`, with the position as 10
+bytes of HLC. **An entry the reader cannot use counts as nothing delivered**: a key that
+is not an origin (for example the bare node id written before 0.61.0), a value that is
+not binary, or a value that is not 10 bytes. The events it covered are sent again
+(at-least-once, as before), not skipped. The node logs it once per process for each
+subscription and key, at `WARN`, naming the subscription, the record and the key and
+what is wrong with it (`a webhook progress entry cannot be read`); further hits are
+`DEBUG`. No metric counts it.
+
 **Moving a node does not move its subscriptions.** Ownership follows the node
 id, which lives in the database file — so a pod rescheduled onto a new IP, a
 changed port, or a renumbered host keeps every subscription it had. Until M8

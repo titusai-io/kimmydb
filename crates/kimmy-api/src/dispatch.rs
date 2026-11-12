@@ -245,6 +245,13 @@ impl Backoff {
 /// included: a union of the ones that were would be lower than the truth, and
 /// a subscription planned from it could be invalidated as fallen behind.
 ///
+/// An entry of a record that cannot be read (a key that is not an origin, such
+/// as the node-only form written before epochs, or a value that is not an HLC)
+/// counts as nothing delivered, so the events it covered are sent again
+/// (at-least-once, as before). It is reported with a `warn!` naming the
+/// subscription, the record and the key, once per process for each
+/// (subscription, key); later hits log at `debug`. No metric counts it.
+///
 /// A walk of every node's progress records: the dispatcher calls it inside the
 /// plan's `blocking` (ADR-199).
 pub fn union_progress(
@@ -264,31 +271,118 @@ pub fn union_progress(
     };
     let prefix = format!("{subscription}:");
     state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
-        if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
+        if let Ok(record) = document.get_str("_id")
+            && record.starts_with(&prefix)
             && let Ok(vector) = document.get_document("delivered")
         {
-            for (node, hlc) in vector {
-                // The HLC is stored as its own byte encoding rather than a
-                // string: it has no `FromStr`, and its wall clock is a `u64`
-                // that BSON cannot hold as an integer above `i64::MAX` — the
-                // bug that once stopped half of all collections replicating.
-                let bson::Bson::Binary(binary) = hlc else {
-                    continue;
-                };
-                let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
-                    continue;
-                };
-                let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
-                    continue;
-                };
-                let mut one = VersionVector::new();
-                one.insert(node, Hlc::from_bytes(bytes));
-                union.merge(&one);
-            }
+            read_delivered(subscription, record, vector, &mut union);
         }
         Ok(true)
     })?;
     Ok(union)
+}
+
+/// What is wrong with one entry of a progress record's `delivered` document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressFault {
+    /// The key is a bare node id, the form written before epochs.
+    NodeOnlyKey,
+    /// The key is not an origin and not a node id.
+    MalformedKey,
+    /// The value is not a binary.
+    ValueNotBinary,
+    /// The value is binary but not an encoded HLC.
+    ValueWrongLength,
+}
+
+impl ProgressFault {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NodeOnlyKey => "key is a node id with no epoch (the form written before epochs)",
+            Self::MalformedKey => "key is not an origin (`<node uuid>/<36 hex epoch>`)",
+            Self::ValueNotBinary => "value is not binary",
+            Self::ValueWrongLength => "value is not a 10-byte HLC",
+        }
+    }
+}
+
+/// How many (subscription, key) pairs are remembered as already reported. A
+/// bound, so a record full of invented keys cannot grow the set without end:
+/// past it a fault is logged at `debug` only.
+const REPORTED_FAULTS_MAX: usize = 1024;
+
+/// Whether this fault has been reported at `warn` in this process.
+///
+/// `true` the first time a (subscription, key) pair is seen. The reader runs
+/// every pass, so a bad entry would otherwise log on every pass.
+fn first_report(subscription: &str, key: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<parking_lot::Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock();
+    seen.len() < REPORTED_FAULTS_MAX && seen.insert((subscription.to_string(), key.to_string()))
+}
+
+/// Report an entry of a progress record the reader cannot use.
+///
+/// The entry counts as nothing delivered, as it always has: the events it
+/// would have covered are sent again (at-least-once). The report is the log
+/// line, once per process for each (subscription, key); later hits are `debug`.
+fn report_progress_fault(subscription: &str, record: &str, key: &str, fault: ProgressFault) {
+    if first_report(subscription, key) {
+        warn!(
+            subscription,
+            record,
+            key,
+            fault = fault.describe(),
+            "a webhook progress entry cannot be read; it counts as nothing delivered, so the \
+             events it covered are sent again"
+        );
+    } else {
+        debug!(
+            subscription,
+            record,
+            key,
+            fault = fault.describe(),
+            "webhook progress entry unreadable"
+        );
+    }
+}
+
+/// Merge one progress record's `delivered` document into `union`.
+fn read_delivered(
+    subscription: &str,
+    record: &str,
+    delivered: &Document,
+    union: &mut VersionVector,
+) {
+    for (key, hlc) in delivered {
+        let Ok(origin) = key.parse::<kimmy_core::Origin>() else {
+            let fault = if key.parse::<NodeId>().is_ok() {
+                ProgressFault::NodeOnlyKey
+            } else {
+                ProgressFault::MalformedKey
+            };
+            report_progress_fault(subscription, record, key, fault);
+            continue;
+        };
+        // The HLC is stored as its own byte encoding rather than a
+        // string: it has no `FromStr`, and its wall clock is a `u64`
+        // that BSON cannot hold as an integer above `i64::MAX` — the
+        // bug that once stopped half of all collections replicating.
+        let bson::Bson::Binary(binary) = hlc else {
+            report_progress_fault(subscription, record, key, ProgressFault::ValueNotBinary);
+            continue;
+        };
+        let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(binary.bytes.as_slice())
+        else {
+            report_progress_fault(subscription, record, key, ProgressFault::ValueWrongLength);
+            continue;
+        };
+        let mut one = VersionVector::new();
+        one.insert(origin, Hlc::from_bytes(bytes));
+        union.merge(&one);
+    }
 }
 
 /// Drop every node's progress record for a subscription that is gone.
@@ -351,6 +445,15 @@ pub(crate) fn progress_record(
     subscription: &str,
     progress: &VersionVector,
 ) -> (kimmy_core::DocId, Document) {
+    progress_record_of(state.engine.node_id(), subscription, progress)
+}
+
+/// [`progress_record`] for a named node: the record `node` writes.
+fn progress_record_of(
+    node_id: NodeId,
+    subscription: &str,
+    progress: &VersionVector,
+) -> (kimmy_core::DocId, Document) {
     let mut delivered = Document::new();
     for (node, hlc) in progress.iter() {
         delivered.insert(
@@ -361,7 +464,7 @@ pub(crate) fn progress_record(
             },
         );
     }
-    let id = format!("{subscription}:{}", state.engine.node_id());
+    let id = format!("{subscription}:{node_id}");
     let document = doc! { "_id": id.clone(), "delivered": delivered };
     (kimmy_core::DocId::String(id), document)
 }
@@ -2136,6 +2239,110 @@ pub(crate) mod tests {
             sign("webhook-secret", 1_725_000_000_000, "{\"a\":1}"),
             "681e8c00c9729c98988c22dfd6baeba0507b96d7f87ae2d4a0e3466439a84fc7"
         );
+    }
+
+    /// A writer a test can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` and return the log lines it wrote at `warn` or above.
+    fn warnings_of(body: impl FnOnce()) -> Vec<String> {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let out = String::from_utf8(sink.0.lock().clone()).expect("utf-8");
+        out.lines().map(str::to_string).collect()
+    }
+
+    /// Progress written by `progress_record_of` is read back whole, and a union of two
+    /// records keeps the higher position of each origin.
+    #[test]
+    fn progress_written_with_origin_keys_reads_back() {
+        let (a, b) = (node(1), node(2));
+        let epoch = Epoch::new(Hlc::new(7, 0), [9; 8]);
+        let mut written = VersionVector::new();
+        written.insert(kimmy_core::Origin::new(a, Epoch::ZERO), Hlc::new(100, 3));
+        written.insert(kimmy_core::Origin::new(a, epoch), Hlc::new(200, 0));
+        written.insert(kimmy_core::Origin::new(b, epoch), Hlc::new(50, 1));
+        let (_, document) = progress_record_of(a, "wh_round", &written);
+        assert_eq!(document.get_str("_id").unwrap(), format!("wh_round:{a}"));
+
+        let mut read = VersionVector::new();
+        let warnings = warnings_of(|| {
+            read_delivered(
+                "wh_round",
+                "wh_round:x",
+                document.get_document("delivered").unwrap(),
+                &mut read,
+            )
+        });
+        assert_eq!(read, written, "every origin comes back with its own position");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Each unusable shape is reported at `warn` once across two reads of the record, counts
+    /// as nothing delivered, and does not stop a good entry beside it.
+    #[test]
+    fn each_unusable_progress_shape_warns_once() {
+        let good = kimmy_core::Origin::new(node(5), Epoch::ZERO);
+        let hlc = |ms: u64| bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: Hlc::new(ms, 0).to_bytes().to_vec(),
+        };
+        // One record per shape, with a good entry under another key.
+        let other = kimmy_core::Origin::new(node(7), Epoch::ZERO);
+        let cases: [(&str, String, bson::Bson, &str); 4] = [
+            ("wh_old", node(6).to_string(), hlc(10).into(), "no epoch"),
+            ("wh_bad", "not-an-origin".to_string(), hlc(10).into(), "not an origin"),
+            ("wh_text", good.to_string(), bson::Bson::String("x".into()), "not binary"),
+            (
+                "wh_short",
+                good.to_string(),
+                bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2, 3] }
+                    .into(),
+                "not a 10-byte",
+            ),
+        ];
+        for (subscription, key, value, needle) in cases {
+            let mut delivered = Document::new();
+            delivered.insert(key.clone(), value);
+            delivered.insert(other.to_string(), hlc(99));
+            let record = format!("{subscription}:n");
+            let mut union = VersionVector::new();
+            let warnings = warnings_of(|| {
+                read_delivered(subscription, &record, &delivered, &mut union);
+                read_delivered(subscription, &record, &delivered, &mut union);
+            });
+            assert_eq!(warnings.len(), 1, "{subscription}: {warnings:?}");
+            let line = &warnings[0];
+            for named in [subscription, record.as_str(), key.as_str(), needle] {
+                assert!(line.contains(named), "{subscription}: {named:?} not in {line}");
+            }
+            assert_eq!(union.len(), 1, "{subscription}: only the good entry counts");
+            assert_eq!(union.get(other), Hlc::new(99, 0));
+        }
     }
 
     fn entry(kind: OpKind, collection: u64, ms: u64) -> OplogEntry {
