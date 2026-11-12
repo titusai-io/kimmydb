@@ -157,8 +157,11 @@ a query is one snapshot ([ADR-098](decisions.md)).
 
 **The oplog key is a flat 44-byte slice, not a tuple.** `hlc(10) || node(16) || epoch(18)`
 already sorts by `memcmp` in exactly the total write order, so no structure is
-needed. The epoch is minted at the open that finds no `epoch` row in `META`, is
-not carried by a backup, and is cleared by a rewind (ADR-273).
+needed. The epoch is minted at the open that finds no `epoch` row in `META`. A
+backup writes the row (it copies `META` whole) and a restore skips it, so a
+restored store mints its own; a rewind clears it; a volume rolled back by other
+means keeps it (ADR-273). Every open resumes the clock at or above its epoch's
+start, so no entry of an epoch is older than its start.
 
 ---
 

@@ -109,11 +109,14 @@ picks the same winner regardless of the order updates arrive in.
 The node and the epoch together are an **origin**, and an origin is what a
 version vector is keyed by. An epoch is 18 bytes, the start HLC of the open that
 minted it and 8 random bytes. A member mints one at the first open of a store,
-and again after a restore or a rewind, because neither carries the epoch. The
-point is the restored member's new writes: they cannot be taken as covered by a
-peer's record of the old life's writes under the same node id, so the writes the
-restored member lost stay owed by peers and come back through the replay of its
-own origin ([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)).
+and again after `kimmyd restore` or a rewind, because neither keeps the epoch (a
+volume rolled back by other means does). The point is the restored member's new
+writes: they cannot be taken as covered by a peer's record of the old life's
+writes under the same node id, so the writes the restored member lost stay owed
+under the old origin, and its ordinary pull from a peer brings them back like
+any other origin's. The replay of its own origin, which matches on the node
+across every epoch, is what marks it `restored` while it reads them back
+([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)).
 A stamp is 44 bytes as a key and 45 bytes as the token a client sees (a format
 byte `0x01`, then the key); the token is opaque, as before.
 
