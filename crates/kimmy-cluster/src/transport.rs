@@ -1075,12 +1075,20 @@ fn say_malformed_digest_cut(peer: NodeId) {
             "the peer's digest request carried a cut that is not a version vector; it is \
              answered as a request for no digest, and the rest of the divergence check goes on"
         );
+    } else {
+        debug!(%peer, "another digest request whose cut is not a version vector");
     }
 }
 
-/// Whether `peer`'s malformed cut is said now: the first time it is seen, recorded in `said`.
+/// How many peers are remembered as told about a malformed cut. A bound, so a stream of
+/// distinct authenticated peer ids cannot grow the list without end: past it a peer is said at
+/// `debug` only, as the webhook progress faults are past theirs.
+const MALFORMED_CUT_SAID_MAX: usize = 1024;
+
+/// Whether `peer`'s malformed cut is said now: the first time it is seen, recorded in `said`,
+/// while fewer than [`MALFORMED_CUT_SAID_MAX`] peers are.
 fn first_malformed_cut_report(said: &mut Vec<NodeId>, peer: NodeId) -> bool {
-    if said.contains(&peer) {
+    if said.len() >= MALFORMED_CUT_SAID_MAX || said.contains(&peer) {
         return false;
     }
     said.push(peer);
@@ -1106,7 +1114,8 @@ mod malformed_cut_report_tests {
         for n in 1..3_000 {
             first_malformed_cut_report(&mut said, peer(n));
         }
-        assert!(said.len() <= 1024, "{} peers remembered", said.len());
+        assert_eq!(said.len(), MALFORMED_CUT_SAID_MAX, "{} peers remembered", said.len());
+        assert!(!first_malformed_cut_report(&mut said, peer(5_000)), "past the bound: not said");
         assert!(!first_malformed_cut_report(&mut said, peer(0)), "an early one is still said once");
     }
 }
