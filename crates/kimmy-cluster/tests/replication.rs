@@ -8850,6 +8850,13 @@ async fn round_with(
 /// epochs): the restored member writes under a new epoch, a new origin, so its
 /// coverage of the old origin stays at the backup's position, and the peer holds
 /// the tail above it. No replay is armed, and nothing marks the member.
+///
+/// The round is handed a catch-up state, as the replication loop hands it, that is
+/// not armed: the round's own-origin replay runs only on an armed state, and the
+/// replay is what marks a member `restored` on finding the tail. So the last check
+/// fails if the ordinary round marks the member, or runs the replay unarmed (shown
+/// by deleting the `replay_armed()` guard in `sync_round`: the replay asks
+/// from the bottom, finds the lost tail and marks the member).
 #[tokio::test]
 async fn an_ordinary_pull_recovers_the_tail_a_restore_lost_and_marks_nothing() {
     let scenario = lost_tail(2, 3, true).await;
@@ -8874,6 +8881,7 @@ async fn an_ordinary_pull_recovers_the_tail_a_restore_lost_and_marks_nothing() {
 
     let control_dir = tempfile::tempdir().unwrap();
     let control = marker_in(&control_dir);
+    assert!(!control.replay_armed() && !control.is_set(), "premise: handed in, not armed");
     round_with(&scenario.restored, &scenario.peer, &control).await;
     assert_eq!(
         restored.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
@@ -8886,7 +8894,11 @@ async fn an_ordinary_pull_recovers_the_tail_a_restore_lost_and_marks_nothing() {
         peer.get(scenario.old),
         "and they are covered under the old origin"
     );
-    assert!(!control.is_set(), "no replay was armed, so nothing marked the member");
+    assert!(
+        !control.is_set(),
+        "the ordinary round marks nothing, and an unarmed replay does not run: {:?}",
+        control.reason()
+    );
 }
 
 /// What the replay still gives that the ordinary pull does not: it finds the writes
@@ -9594,6 +9606,12 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
 /// floor gives is the replay: without it the later start's replay has nothing to
 /// ask for and the member is never marked `restored`; with it the replay reads the
 /// tail back and marks.
+///
+/// The second half pins a **limitation**, not a wanted behaviour: with the floor
+/// file lost and a write already made under the new epoch, the loss goes unseen
+/// (the data still comes back by the ordinary pull). Losing the file alone no
+/// longer does this: until the new epoch has written, the open's own position is
+/// the lowest over the earlier epochs (`Engine::own_position_at_open`).
 #[tokio::test]
 async fn a_start_that_wrote_and_stopped_before_a_peer_leaves_the_replay_its_floor() {
     let scenario = lost_tail(2, 3, true).await;
