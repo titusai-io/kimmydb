@@ -2172,6 +2172,12 @@ impl Engine {
                             if !defines_a_later_life(entry, dropped)
                                 || self.answered_by_a_page(entry) =>
                         {
+                            // History, and taken: the entry may be held here (a
+                            // restore re-logged it, ADR-180, before the drop), and
+                            // arriving in position it is released all the same.
+                            // Not on the `Unknown` arm below: that entry is left,
+                            // so it has not arrived.
+                            self.release_ddl_mark_if_held(&entry.stamp, position)?;
                             outcome.superseded += 1;
                         }
                         _ => return Ok(Step::Unknown(Some(name))),
