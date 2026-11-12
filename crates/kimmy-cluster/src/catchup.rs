@@ -1246,12 +1246,17 @@ impl CatchUp {
         let marker = grown;
 
         // A counting peer: reached, not itself catching up (a peer that has sent
-        // no block counts), and not one that has lost data (it holds less of its
-        // own origin than this member holds of it).
+        // no block counts), and not one that has lost data (it holds less of one of
+        // its own origins than this member holds of it). Origin by origin: a peer
+        // that lost an old epoch's tail and has written further under a new one
+        // has still lost data, whatever its node's highest position.
         let counts = |peer: &Reached| {
             !peer.facts.as_deref().is_some_and(|f| f.catching_up)
-                && crate::protocol::node_position(tick.mine_witnessed, peer.node)
-                    <= crate::protocol::node_position(&peer.servable, peer.node)
+                && tick
+                    .mine_witnessed
+                    .iter()
+                    .filter(|(origin, _)| origin.node == peer.node)
+                    .all(|(origin, hlc)| hlc <= peer.servable.get(origin))
         };
         // The latch drops when nothing is owed (ADR-212): the member is then
         // judged as any marked member is, and gated if no rule clears it.

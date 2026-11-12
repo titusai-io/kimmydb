@@ -907,21 +907,6 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
     bool::from(expected.ct_eq(tag)).then_some(payload)
 }
 
-/// The highest position `vector` holds for any epoch of `node`.
-///
-/// **By node across epochs, deliberately**, and used only by the own-origin replay: the entries
-/// a restored member lost sit in the epochs before its current one, so its replay asks for all
-/// of them and a position of any one of its origins says whether a peer holds something of it.
-/// Everything else in the cluster reads a vector by origin.
-pub(crate) fn node_position(vector: &VersionVector, node: kimmy_core::NodeId) -> kimmy_core::Hlc {
-    vector
-        .iter()
-        .filter(|(origin, _)| origin.node == node)
-        .map(|(_, hlc)| hlc)
-        .max()
-        .unwrap_or(kimmy_core::Hlc::ZERO)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
