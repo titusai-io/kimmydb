@@ -78,10 +78,14 @@ pub struct Flags {
     /// skip-rule witness; Q6 v2.5 R3 option 2); an own-origin mark is never released
     pub fm_restore_raise: bool,
     pub fm_restore_mark_parked: bool,
+    /// Rust-only mutant of the product routes (HB-1, B1 classification): a held document entry whose physical was not known at
+    /// hold time is appended (servable) when the deferred apply runs, while it is still held out of position
+    pub fm_held_servable: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 7] = [
+pub const ROUTE_MUTANTS: [&str; 8] = [
+    "m-held-servable-on-deferred-apply",
     "m-restore-replay-raise",
     "m-restore-own-mark-parked",
     "m-register-ahead",
@@ -268,6 +272,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-repair-carries-creates" => f.fm_repair_creates = true,
         "m-repair-carries-events" => f.fm_repair_events = true,
         "m-repair-dropped-answer" => f.fm_repair_dropped = true,
+        "m-held-servable-on-deferred-apply" => f.fm_held_servable = true,
         _ => return false,
     }
     true

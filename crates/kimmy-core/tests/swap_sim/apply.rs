@@ -251,9 +251,25 @@ impl Member {
         }
     }
 
+    /// Apply a document entry and make the append decision. Product invariant (i) (HB-1 of the B1 classification): an entry
+    /// held out of position (`held_oop`, the product's OPLOG_HELD mark) is never servable before it is released in position
+    /// (`promote_oop`, the in-window release of `take_from`): when the entry's physical was not known at hold time, `take_hold`'s
+    /// removal from `appended` ran before the apply, and the deferred apply (`retry_deferred`) would otherwise append a winner
+    /// that is still held. `m-held-servable-on-deferred-apply` keeps that append.
+    pub fn apply_doc(&mut self, w: &mut World, e: &EntryRef) {
+        self.apply_doc_decide(w, e);
+        if w.held_uncovered
+            && !w.f.fm_held_servable
+            && self.held_oop.contains(&e.idx)
+            && self.appended.remove(&e.idx)
+        {
+            w.stats.bump("held_kept_unservable");
+        }
+    }
+
     /// The append decision (the product's relay): a document entry is appended iff it won last-writer-wins on
     /// arrival, or it is the gap-1 case (superseded only by a record held as an unfinished join's page state).
-    pub fn apply_doc(&mut self, w: &mut World, e: &EntryRef) {
+    fn apply_doc_decide(&mut self, w: &mut World, e: &EntryRef) {
         if e.kind == Kind::LossQ7 {
             return self.apply_loss_q7(w, e); // a deferred Q7 loss entry
         }

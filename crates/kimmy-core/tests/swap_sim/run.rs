@@ -455,6 +455,25 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     RunOut { res, w, ms }
 }
 
+/// One run of the product routes (`doc_hold`, `doc_repair`; the model's routes off) at one configuration: the B1 classification's
+/// seeds are named this way (`<policy> m/o/k doc_hold doc_repair f seed`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_product(
+    mode: &str,
+    policy: Policy,
+    (members, outs, keys): (usize, usize, usize),
+    doc_hold: bool,
+    doc_repair: bool,
+    f: f64,
+    seed: u64,
+    trace: bool,
+) -> RunOut {
+    let mut c = Cfg::new(members, outs, keys);
+    c.policy = policy;
+    c.routes = Some(Routes { f, hold: false, repair: false, doc_hold, doc_repair });
+    run(mode, "v6", seed, c, trace)
+}
+
 // ----------------------------------------------------------------------------- batch
 
 /// Counters summed over runs (the model's `SUMS`); every other key counts the runs where it is non-zero.
