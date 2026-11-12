@@ -2147,7 +2147,7 @@ impl Engine {
             // Whatever the batch knew about collections may be wrong after
             // this, whether or not the change turns out to apply.
             *memo = Memo::default();
-            match self.apply_ddl(entry)? {
+            match self.apply_ddl(entry, position)? {
                 DdlOutcome::Applied => outcome.ddl += 1,
                 DdlOutcome::Held => outcome.ddl_held += 1,
                 DdlOutcome::AppliedThenFailed(e) => {
@@ -2322,7 +2322,11 @@ impl Engine {
     /// error; `Refused` means this node's current state cannot take the
     /// definition, which is a divergence to count rather than a round to fail
     /// — see [`settle`] for both. Neither appends the originating entry.
-    fn apply_ddl(&self, entry: &OplogEntry) -> Result<DdlOutcome> {
+    fn apply_ddl(
+        &self,
+        entry: &OplogEntry,
+        position: crate::engine::Position,
+    ) -> Result<DdlOutcome> {
         let Some(body) = &entry.body else {
             // A legacy `Collection` entry, which names nothing.
             return Ok(DdlOutcome::Applied);
@@ -2383,7 +2387,7 @@ impl Engine {
                     // tombstone and serves no entry for it (pages never relay a
                     // drop, as before), and the creator serves the creation
                     // anyway: this relay adds a route, not that gap.
-                    return self.append_replicated_ddl(entry);
+                    return self.append_replicated_ddl(entry, position);
                 }
 
                 match self.get_collection(&target.db, &target.name) {
@@ -2485,7 +2489,7 @@ impl Engine {
                     self.bury_under_database_tombstones()?;
                     // Held and served onward like every drop: the members that
                     // learn of it from this one learn it from the entry.
-                    return self.append_replicated_ddl(entry);
+                    return self.append_replicated_ddl(entry, position);
                 }
                 // A drop is the one arm that destroys state, so it is the one
                 // arm that has to know *which* incarnation it was aimed at. A
@@ -2533,7 +2537,7 @@ impl Engine {
                                 // Every receiver judges the entry for itself
                                 // (`aims_at_a_previous_incarnation`, the sweep),
                                 // so relaying it is harmless.
-                                return self.append_replicated_ddl(entry);
+                                return self.append_replicated_ddl(entry, position);
                             }
                         }
                     }
@@ -2883,7 +2887,7 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        self.append_replicated_ddl_recording(entry, &recorded_with_the_append)
+        self.append_replicated_ddl_recording(entry, &recorded_with_the_append, position)
     }
 
     /// Append a replicated schema change's originating entry, unless this
@@ -2912,10 +2916,14 @@ impl Engine {
     /// appended as it always was.
     ///
     /// **Held marks.** An append releases a held mark (ADR-169) only under
-    /// `Position::InWindow`. Every replicated schema change is appended under
-    /// `Position::Raise`, over an existing key a pure rewrite of its value,
-    /// so skipping it cannot swallow a release. Should a schema change ever
-    /// be appended `InWindow`, this check must consult `OPLOG_HELD` first.
+    /// `Position::InWindow`. A schema change can be held: a restore re-logs
+    /// the entry behind an index definition it built (`CreateIndex`, ADR-180)
+    /// under `Position::Hold`. So the batch's `position` is passed on. When the
+    /// entry arrives `InWindow` and is already held as sent, the first look
+    /// also asks `OPLOG_HELD` and, if marked, releases it under the writer
+    /// ([`Self::release_ddl_mark`]); an unmarked entry still takes no writer.
+    /// The append of a different value over a held key goes through
+    /// `append_oplog_at` with the same `position`, which releases it.
     ///
     /// **Why twice.** The first look is a read transaction and takes no
     /// writer, which is the point. It can race: a push and a pull applying the
@@ -2930,8 +2938,12 @@ impl Engine {
     /// Held, the entry is still witnessed and published: both are in memory
     /// and cost nothing, and the publish covers an arrival whose first apply
     /// committed and then failed before it woke the streams.
-    fn append_replicated_ddl(&self, entry: &OplogEntry) -> Result<DdlOutcome> {
-        self.append_replicated_ddl_recording(entry, &[])
+    fn append_replicated_ddl(
+        &self,
+        entry: &OplogEntry,
+        position: crate::engine::Position,
+    ) -> Result<DdlOutcome> {
+        self.append_replicated_ddl_recording(entry, &[], position)
     }
 
     /// [`Self::append_replicated_ddl`], also writing `tombstones` (each only if
@@ -2943,6 +2955,7 @@ impl Engine {
         &self,
         entry: &OplogEntry,
         tombstones: &[(CollectionId, Stamp)],
+        position: crate::engine::Position,
     ) -> Result<DdlOutcome> {
         let mut owed = Vec::new();
         for (id, stamp) in tombstones {
@@ -2952,12 +2965,20 @@ impl Engine {
         }
         let key = crate::codec::oplog_key(&entry.stamp);
         let sent = crate::codec::encode_oplog_entry(entry);
-        let held = {
+        let (held, marked) = {
             let txn = self.db().begin_read()?;
-            held_as_sent(&txn.open_table(crate::tables::OPLOG)?, &key, &sent)?
+            let held = held_as_sent(&txn.open_table(crate::tables::OPLOG)?, &key, &sent)?;
+            // Read only for an entry in position: nothing else may release it.
+            let marked = held
+                && position == crate::engine::Position::InWindow
+                && txn.open_table(crate::tables::OPLOG_HELD)?.get(key.as_slice())?.is_some();
+            (held, marked)
         };
         let outcome = if held {
             self.record_collection_drops(&owed)?;
+            if marked {
+                self.release_ddl_mark(&entry.stamp)?;
+            }
             DdlOutcome::Held
         } else {
             #[cfg(test)]
@@ -2968,6 +2989,9 @@ impl Engine {
                 #[cfg(test)]
                 race_hooks::absorbed(race_hooks::Race::DdlAppend);
                 self.record_collection_drops(&owed)?;
+                if position == crate::engine::Position::InWindow {
+                    self.release_ddl_mark(&entry.stamp)?;
+                }
                 DdlOutcome::Held
             } else {
                 if !owed.is_empty() {
@@ -2983,7 +3007,9 @@ impl Engine {
                         }
                     }
                 }
-                crate::engine::append_oplog(&txn, entry)?;
+                // Over an existing key, in position, this also releases a mark
+                // (`append_oplog_at`); a new key is raised and unmarked either way.
+                crate::engine::append_oplog_at(&txn, entry, position)?;
                 txn.commit()?;
                 DdlOutcome::Applied
             }
@@ -3001,6 +3027,19 @@ impl Engine {
         // thing that could have: a single node applies its own drop directly.
         self.publish(vec![entry.clone()]);
         Ok(outcome)
+    }
+
+    /// Release the held mark on a schema change's entry, which has just arrived
+    /// in position ([`crate::engine::release_held_in_position`]). A no-op, with
+    /// no commit, when the entry carries no mark.
+    fn release_ddl_mark(&self, stamp: &Stamp) -> Result<()> {
+        let txn = self.begin_write(WriterHolder::Replication)?;
+        if crate::engine::release_held_in_position(&txn, stamp)? {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(())
     }
 
     /// Create a replicated index from the `entry` that carried it.
@@ -4689,7 +4728,10 @@ mod tests {
         let mut published = b.subscribe();
         let commits = b.commits();
         let writes = race_hooks::replication_writes_opened();
-        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert!(matches!(
+            b.apply_ddl(&index, crate::engine::Position::Raise).unwrap(),
+            DdlOutcome::Applied
+        ));
         assert_eq!(b.commits() - commits, 1, "the build carries the entry");
         assert_eq!(
             race_hooks::replication_writes_opened() - writes,
@@ -4717,7 +4759,14 @@ mod tests {
         let commits = b.commits();
         let writes = race_hooks::replication_writes_opened();
         for entry in [&collection, &index] {
-            assert!(matches!(b.apply_ddl(entry).unwrap(), DdlOutcome::Held), "{:?}", entry.kind);
+            assert!(
+                matches!(
+                    b.apply_ddl(entry, crate::engine::Position::Raise).unwrap(),
+                    DdlOutcome::Held
+                ),
+                "{:?}",
+                entry.kind
+            );
             // Still woken: an earlier apply may have committed and failed
             // before it published, and every later arrival is held.
             assert_eq!(published.try_recv().unwrap().stamp, entry.stamp);
@@ -4737,7 +4786,10 @@ mod tests {
         b.apply_batch(std::slice::from_ref(&collection)).unwrap();
         hold_without_entry(&b, &index);
         let commits = b.commits();
-        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert!(matches!(
+            b.apply_ddl(&index, crate::engine::Position::Raise).unwrap(),
+            DdlOutcome::Applied
+        ));
         assert_eq!(b.commits() - commits, 1, "the append");
         assert_eq!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
     }
@@ -4765,7 +4817,10 @@ mod tests {
         assert_ne!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
 
         let commits = b.commits();
-        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert!(matches!(
+            b.apply_ddl(&index, crate::engine::Position::Raise).unwrap(),
+            DdlOutcome::Applied
+        ));
         assert_eq!(b.commits() - commits, 1);
         assert_eq!(
             held_bytes(&b, &index.stamp),
@@ -4783,7 +4838,7 @@ mod tests {
         let (collection, index) = index_entries(&a);
         b.apply_batch(std::slice::from_ref(&collection)).unwrap();
         crate::index::append_hooks::fail_next();
-        assert!(b.apply_ddl(&index).is_err());
+        assert!(b.apply_ddl(&index, crate::engine::Position::Raise).is_err());
         assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_none());
         assert_eq!(held_bytes(&b, &index.stamp), None);
         assert!(b.witnessed_vector().unwrap().get(index.stamp.node) < index.stamp.hlc);
@@ -4803,7 +4858,10 @@ mod tests {
         let held = b.get_collection("shop", "orders").unwrap().index("by_email").unwrap().created;
         assert!(index.stamp.wins_over(&held.unwrap()), "premise: the arriving stamp is later");
         let commits = b.commits();
-        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert!(matches!(
+            b.apply_ddl(&index, crate::engine::Position::Raise).unwrap(),
+            DdlOutcome::Applied
+        ));
         assert_eq!(b.commits() - commits, 1, "one commit settles the stamp and logs the entry");
         assert_eq!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
         let settled =
@@ -4832,7 +4890,14 @@ mod tests {
         let mut published = b.subscribe();
         for entry in &replays {
             let writes = race_hooks::replication_writes_opened();
-            assert!(matches!(b.apply_ddl(entry).unwrap(), DdlOutcome::Held), "{:?}", entry.kind);
+            assert!(
+                matches!(
+                    b.apply_ddl(entry, crate::engine::Position::Raise).unwrap(),
+                    DdlOutcome::Held
+                ),
+                "{:?}",
+                entry.kind
+            );
             assert_eq!(
                 race_hooks::replication_writes_opened() - writes,
                 0,
@@ -4904,8 +4969,8 @@ mod tests {
         let competing = (Arc::clone(&b), collection.clone());
         let (outer, competitor) = race_hooks::race(
             race_hooks::Race::DdlAppend,
-            move || competing.0.apply_ddl(&competing.1).unwrap(),
-            || b.apply_ddl(&collection).unwrap(),
+            move || competing.0.apply_ddl(&competing.1, crate::engine::Position::Raise).unwrap(),
+            || b.apply_ddl(&collection, crate::engine::Position::Raise).unwrap(),
         );
         assert!(matches!(competitor, DdlOutcome::Applied), "{competitor:?}");
         assert!(matches!(outer, DdlOutcome::Held), "{outer:?}");
