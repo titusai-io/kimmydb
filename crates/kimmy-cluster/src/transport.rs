@@ -2209,6 +2209,22 @@ pub(crate) fn replay_held_at(origin: kimmy_core::Origin, cursor: kimmy_core::Sta
     if origin.epoch <= cursor.epoch { cursor.hlc } else { cursor.hlc.predecessor() }
 }
 
+/// The replay position of `node` after a walk that examined every row through `p`, the
+/// last row it examined (a row of any node): `p` itself when it is `node`'s; for a row of a
+/// node that sorts before `node`, the HLC before `p`'s with the largest epoch, since none of
+/// `node`'s rows at `p`'s HLC was examined; for one that sorts after, `p`'s HLC with the
+/// largest epoch, since all of them were.
+pub(crate) fn replay_position_through(
+    p: kimmy_core::Stamp,
+    node: kimmy_core::NodeId,
+) -> kimmy_core::Stamp {
+    match p.node.cmp(&node) {
+        std::cmp::Ordering::Equal => p,
+        std::cmp::Ordering::Less => crate::catchup::replay_after(p.hlc.predecessor(), node),
+        std::cmp::Ordering::Greater => crate::catchup::replay_after(p.hlc, node),
+    }
+}
+
 /// Whether `vector` names an entry of `cursor`'s node after the cursor, in any epoch.
 pub(crate) fn holds_after(vector: &VersionVector, cursor: kimmy_core::Stamp) -> bool {
     vector
@@ -2592,7 +2608,12 @@ where
                         entries,
                         exhausted,
                         false,
-                        crate::catchup::replay_after(window.scanned_to, their_node),
+                        // An empty page that is not the end was cut by the budget at
+                        // `passed_through`, the exact last row the walk examined.
+                        window.passed_through.map_or(
+                            crate::catchup::replay_after(window.scanned_to, their_node),
+                            |p| replay_position_through(p, their_node),
+                        ),
                     )
                 }
             };

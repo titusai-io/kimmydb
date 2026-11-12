@@ -1706,3 +1706,32 @@ async fn a_budget_cut_just_before_two_epochs_at_one_hlc_drops_neither() {
         "both tied writes are back after {contacts} contacts: {errors:?}"
     );
 }
+
+/// Where a walk that examined through `p` leaves the node it serves: every entry of that node
+/// at or below `p` in stamp order is before the position, and every one after `p` is after it.
+#[test]
+fn the_position_a_cut_walk_leaves_is_exact_in_stamp_order() {
+    let node = NodeId::from_bytes([5; 16]);
+    let at = Hlc::new(1_000, 3);
+    let rows = [
+        Stamp::new(at, NodeId::from_bytes([1; 16]), Epoch::ZERO),
+        Stamp::new(at, node, Epoch::from_u64(1)),
+        Stamp::new(at, node, Epoch::from_u64(2)),
+        Stamp::new(at, NodeId::from_bytes([9; 16]), Epoch::MAX),
+    ];
+    let mine = [
+        Stamp::new(at.predecessor(), node, Epoch::MAX),
+        Stamp::new(at, node, Epoch::ZERO),
+        Stamp::new(at, node, Epoch::from_u64(1)),
+        Stamp::new(at, node, Epoch::from_u64(2)),
+        Stamp::new(at, node, Epoch::MAX),
+        Stamp::new(at.successor(), node, Epoch::ZERO),
+    ];
+    for p in rows {
+        let position = replay_position_through(p, node);
+        assert_eq!(position.node, node, "a position of the served node");
+        for entry in mine {
+            assert_eq!(entry > position, entry > p, "{entry:?} against the cut at {p:?}");
+        }
+    }
+}
