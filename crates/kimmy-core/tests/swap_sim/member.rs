@@ -34,6 +34,7 @@ pub struct Episode {
     pub cover_q: bool,
 }
 
+#[derive(Clone)]
 pub struct Member {
     pub id: usize,
     pub name: String,
