@@ -18,9 +18,9 @@
 //!
 //! Progress advances **after** a delivery succeeds, so a crash mid-flight
 //! redelivers rather than skipping. Exactly-once is not achievable over a
-//! network by any design, so every delivery carries the originating `Stamp` as
-//! a globally unique `X-Kimmy-Event-Id`, and deduplicating is a set-membership
-//! test on the receiver.
+//! network by any design, so every delivery carries the originating `Stamp`
+//! (hlc, node and epoch) as a globally unique `X-Kimmy-Event-Id`, and
+//! deduplicating is a set-membership test on the receiver.
 //!
 //! # The egress policy is re-checked before every delivery
 //!
@@ -647,16 +647,22 @@ struct Delivery {
 
 /// A globally unique id for one change.
 ///
-/// The originating stamp: `(hlc, node)`. Unique without coordination, identical
-/// on every node that holds the entry, and stable across redeliveries — which
-/// is exactly what a receiver needs to deduplicate.
+/// The originating stamp: `{hlc}-{node}-{epoch}`, the epoch as its 36 lowercase hex
+/// digits. Unique without coordination (two epochs of one node can share an HLC, so the
+/// epoch is part of it), identical on every node that holds the entry, and stable across
+/// redeliveries — which is exactly what a receiver needs to deduplicate.
 pub fn event_id(entry: &OplogEntry) -> String {
-    format!("{}-{}", entry.stamp.hlc, entry.stamp.node)
+    stamp_event_id(&entry.stamp)
+}
+
+/// [`event_id`] of the change stamped `stamp`.
+fn stamp_event_id(stamp: &Stamp) -> String {
+    format!("{}-{}-{}", stamp.hlc, stamp.node, stamp.epoch.to_hex())
 }
 
 /// The `X-Kimmy-Event-Id` of a batch: the id of its first event, empty for none.
 fn first_event_id(stamps: &[Stamp]) -> String {
-    stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default()
+    stamps.first().map(stamp_event_id).unwrap_or_default()
 }
 
 /// `HMAC-SHA256(secret, timestamp || "." || body)`, hex.

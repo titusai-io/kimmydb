@@ -47,7 +47,7 @@ The body is a batch:
 
 ```json
 { "subscription": "wh_…",
-  "events": [ { "eventId": "1786…-ec4c…", "operationType": "insert",
+  "events": [ { "eventId": "1786…-ec4c…-0193…", "operationType": "insert",
                 "database": "shop", "collection": "orders",
                 "clusterTime": "1786…", "documentKey": {"_id": 1},
                 "fullDocument": {"_id": 1, "item": "widget"} } ] }
@@ -62,7 +62,11 @@ subscriptions routes on the body rather than on which URL was called.
 
 **Deduplicate on `eventId`.** Exactly-once is not achievable over a network by
 any design, so the id is stable across redeliveries and identical on every node
-— a set-membership test is all a receiver needs.
+— a set-membership test is all a receiver needs. The id is the change's stamp,
+`<hlc>-<node id>-<epoch>` (the epoch as 36 lowercase hex digits, since 0.61.0):
+a node's epoch changes when it is restored or rewound, and a change made after
+that can share an HLC with one made before, so the epoch is what keeps the two
+ids apart. Treat the id as an opaque string.
 
 Duplicates should be rare rather than routine: a crash mid-delivery, or a brief
 disagreement about cluster membership. Answer `2xx` and the batch is marked
