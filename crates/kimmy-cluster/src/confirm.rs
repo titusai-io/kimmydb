@@ -1810,10 +1810,9 @@ mod tests {
     }
 
     /// How many confirmations [`the_driver_set_stays_bounded`] makes: enough
-    /// that a set which keeps every driver ends far above the bound of 2 (it
-    /// grows by one per confirmation), few enough that a loaded runner is not
-    /// asked for hundreds of pushes, each under the push's own timeout.
-    const ROUNDS: usize = 16;
+    /// that a prune which misses only now and then still leaves the set above
+    /// the bound of 2 at some round, not only one that never prunes.
+    const ROUNDS: usize = 200;
 
     /// The driver set holds live drivers, not every driver that ever ran.
     ///
