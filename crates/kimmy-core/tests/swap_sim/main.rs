@@ -719,15 +719,41 @@ mod tests {
                     });
                 }
                 let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+                // M2: the route assertion is judged by its consequence (the receiver's Q6 surface changed), not at the injection
+                // site; the oracle-level failures it leads to are counted beside it
+                let oracle_level: i64 = [
+                    "diverged",
+                    "oracle_state",
+                    "loss_mismatch",
+                    "inv_partial_flip",
+                    "inv_q6_kind_out_of_position",
+                ]
+                .iter()
+                .map(|k| s.get(k))
+                .sum();
                 eprintln!(
-                    "{m} {policy:?}: {} runs, route_carries_q6_kind {} in {} runs",
+                    "{m} {policy:?}: {} runs, a Q6 kind picked {} times, the Q6 surface changed {} times in {} runs; oracle-level \
+                     (diverged, oracle_state, loss_mismatch, partial flip, invariant (ii)) {:?}",
                     s.runs,
+                    s.get("cnt_route_picked_q6_kind"),
                     s.get("cnt_route_carries_q6_kind"),
-                    s.get("inv_route_carries_q6_kind")
+                    s.get("inv_route_carries_q6_kind"),
+                    [
+                        "diverged",
+                        "oracle_state",
+                        "loss_mismatch",
+                        "inv_partial_flip",
+                        "inv_q6_kind_out_of_position"
+                    ]
+                    .map(|k| (k, s.get(k)))
                 );
                 assert!(
                     s.get("inv_route_carries_q6_kind") > 0,
                     "{m} {policy:?}: the route assertion must trip"
+                );
+                assert!(
+                    oracle_level > 0,
+                    "{m} {policy:?}: the mutant must have an oracle-level consequence"
                 );
             }
         }

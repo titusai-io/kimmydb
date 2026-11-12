@@ -436,6 +436,33 @@ impl Member {
             .collect()
     }
 
+    /// The Q6 entries this member knows: the stages it has a create for, the stages it knows abandoned, the register events in
+    /// effect or held as information, the records held as information (M2: what a route that carries no Q6 kind cannot make grow).
+    #[allow(clippy::type_complexity)]
+    pub fn q6_known(
+        &self,
+    ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<EntryId>, BTreeSet<EntryId>) {
+        (
+            self.creates.keys().cloned().collect(),
+            self.abandoned.iter().cloned().collect(),
+            self.events.iter().copied().chain(self.info.keys().copied()).collect(),
+            self.loss_info.keys().copied().collect(),
+        )
+    }
+
+    /// Some set of `q6_known` grew since `before`.
+    #[allow(clippy::type_complexity)]
+    pub fn q6_known_grew_from(
+        &self,
+        before: &(BTreeSet<String>, BTreeSet<String>, BTreeSet<EntryId>, BTreeSet<EntryId>),
+    ) -> bool {
+        let now = self.q6_known();
+        !now.0.is_subset(&before.0)
+            || !now.1.is_subset(&before.1)
+            || !now.2.is_subset(&before.2)
+            || !now.3.is_subset(&before.3)
+    }
+
     /// The member whose register the grant reads (the sender; `stale_src_bug` reads the source of the last begin call).
     pub fn grant_source(&self, w: &World) -> Option<usize> {
         let j = self.join.as_ref()?;
@@ -715,6 +742,8 @@ impl Member {
         // own register (D4), never by a page. The two mutants apply them: `m-page-drop-by-page-versions` a drop stamped above the
         // grant (route B: gated by the page's own versions), `m-page-drop-flag-ignored` every one (the receiver reads the drop as a
         // never-swapped name's, ADR-231)
+        // (R1, M2: judged by the consequence, the receiver's Q6 surface before and after)
+        let before = self.q6_surface();
         for (name, kill) in &src_evl.dead {
             if !self.phys.get(name).is_some_and(|p| p.alive) {
                 continue;
@@ -726,6 +755,10 @@ impl Member {
             } else {
                 w.stats.bump("page_drop_information_only");
             }
+        }
+        if self.q6_surface() != before {
+            w.stats.bump("route_carries_q6_kind");
+            self.inv.insert("route_carries_q6_kind");
         }
         if !f.snap_no_orphan_burials {
             for a in &j.pl.abandoned {
