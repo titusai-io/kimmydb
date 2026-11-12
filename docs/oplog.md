@@ -432,10 +432,11 @@ that entry's origin; observing it would raise the receiver's position for that
 origin over everything of it the window never carried. Such an entry is left
 where it is: not applied, not witnessed, taken by the next window, and counted
 on `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`. The window's
-end is a full `Stamp` for the same reason — the oplog sorts by `(hlc, node)`,
-so an origin sorting after the end's node is raised only to the end's
-predecessor, its entry at that same `Hlc` never having been examined
-([ADR-148](decisions.md)).
+end is a full `Stamp` for the same reason — the oplog sorts by the whole stamp,
+`(hlc, node, epoch)`, so an origin (a node and an epoch) sorting after the end's
+origin is raised only to the end's predecessor, its entry at that same `Hlc`
+never having been examined ([ADR-148](decisions.md),
+[ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)).
 
 **A collection the receiver has no record of stops the batch.** A replicated
 entry naming a collection this node neither holds nor has a tombstone for is
