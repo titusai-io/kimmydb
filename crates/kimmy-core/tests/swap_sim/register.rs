@@ -201,6 +201,7 @@ impl Member {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
                 self.vc.raise(e.origin, e.hlc); // released in position: the vector rises
+                self.retire_repair(i);
             }
         }
     }

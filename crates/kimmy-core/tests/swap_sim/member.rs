@@ -49,6 +49,12 @@ pub struct Member {
     pub pos_hold: bool,
     /// the end-of-run delivery's shortcut witnessed an entry here that no live member appended (`take_quiesce`)
     pub quiesce_witnessed: bool,
+    /// H-Q6-L1's repair ledger (an emulation: the product's `repair_ledger.rs` is not modelled): the held marks a Definitions repair is
+    /// planned for, and the marks released since (a released mark's repair is retired, never planned again)
+    pub repairs_planned: std::collections::BTreeSet<EntryId>,
+    pub repairs_retired: std::collections::BTreeSet<EntryId>,
+    /// `m-repair-replanned` (copied from the flags by the L1 scenario)
+    pub f_replanned: bool,
     pub phys: OMap<String, Phys>,
     /// the valid bind / lcreate / ldrop entries held, and the same sorted by stamp
     pub events: OSet<EntryId>,
@@ -125,6 +131,9 @@ impl Member {
             vc: VectorCoverage::new(),
             pos_hold: false,
             quiesce_witnessed: false,
+            repairs_planned: Default::default(),
+            repairs_retired: Default::default(),
+            f_replanned: false,
             phys,
             events: OSet::new(),
             evl: Vec::new(),
@@ -218,6 +227,55 @@ impl Member {
             }
         }
         None
+    }
+
+    /// H-Q6-V1: the `AskVersions` reply: the member's servable vector (OPLOG_VERSIONS), which a held entry does not raise.
+    /// `m-askversions-counts-held` counts the entries held out of position as well.
+    pub fn ask_versions(&self, w: &World) -> std::collections::BTreeMap<usize, i64> {
+        let mut v = std::collections::BTreeMap::new();
+        for o in 0..w.by_origin.len() {
+            let mut h = self.vc.max_of(o);
+            if w.f.fm_askversions_held {
+                for &i in self.held_oop.iter() {
+                    if w.ent(i).origin == o {
+                        h = h.max(w.ent(i).hlc);
+                    }
+                }
+            }
+            if h >= 0 {
+                v.insert(o, h);
+            }
+        }
+        v
+    }
+
+    /// H-Q6-L1: plan a Definitions repair for every held mark that has none and whose mark was not released; returns how many were
+    /// planned now. A release retires the mark's repair (`retire_repair`). `m-repair-replanned`: the planner reads its own open
+    /// plans as outstanding marks and does not consult the retired set.
+    pub fn plan_definition_repairs(&mut self) -> usize {
+        let mut n = 0;
+        let marks: Vec<EntryId> = if self.f_replanned {
+            self.held_oop.iter().copied().chain(self.repairs_retired.iter().copied()).collect()
+        } else {
+            self.held_oop.iter().copied().collect()
+        };
+        for i in marks {
+            if self.repairs_planned.contains(&i)
+                || (!self.f_replanned && self.repairs_retired.contains(&i))
+            {
+                continue;
+            }
+            self.repairs_planned.insert(i);
+            n += 1;
+        }
+        n
+    }
+
+    /// A held mark is released: its planned repair is retired.
+    pub fn retire_repair(&mut self, i: EntryId) {
+        if self.repairs_planned.remove(&i) {
+            self.repairs_retired.insert(i);
+        }
     }
 
     pub fn holds(&self, id: EntryId) -> bool {
@@ -452,7 +510,9 @@ impl Member {
         let h0 = self.next_hlc(w);
         let stage = format!("S.{}.{}", self.name, h0);
         let dl = h0 + w.d;
-        let c = w.record(Entry::new(self.id, h0, Kind::Create).phys(&stage).dl(dl), true);
+        let mut c = Entry::new(self.id, h0, Kind::Create).phys(&stage).dl(dl);
+        c.merge_policy = Some(w.policy);
+        let c = w.record(c, true);
         self.take(w, &c);
         let mut recs: Vec<(u32, Stamp)> = Vec::new();
         for &k in &keys {

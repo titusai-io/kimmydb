@@ -22,6 +22,18 @@ use crate::world::{Policy, World};
 /// excluded from the counter comparison of a `field` replay and from nothing else.
 pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "same_write_held"];
 
+/// The counters of the Rust-only emulations (the route tests' live page read, `Repair::Replay`, the push, the product routes' held
+/// entries and DF-1's marker): the model has none of them, so they are left out of the counter comparison (they count, they decide
+/// nothing the model decides).
+pub const RUST_ONLY_STATS: [&str; 6] = [
+    "page_drop_information_only",
+    "replay_entries",
+    "push_without_window",
+    "push_carries_q6_kind_out_of_position",
+    "held_kept_unservable",
+    "df1_loser_superseded_by_uncovered",
+];
+
 /// FNV-1a over entry ids (each id + 1 is one input): the tracer's `fnv`.
 pub fn fnv<I: IntoIterator<Item = usize>>(ids: I) -> u64 {
     let mut x: u64 = 1469598103934665603;
@@ -546,6 +558,7 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     .iter()
                     .filter(|(k, v)| {
                         **v != 0
+                            && !RUST_ONLY_STATS.contains(&k.as_str())
                             && !(rmode != ReplayMode::Document
                                 && FIELD_ONLY_STATS.contains(&k.as_str()))
                     })
