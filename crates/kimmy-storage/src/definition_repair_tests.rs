@@ -900,3 +900,43 @@ fn a_definition_a_scoped_restore_relogged_is_released_by_its_delivery_in_a_windo
     no_mark_is_left(&b);
     assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
 }
+
+/// The held entry's creation is history here when the index was dropped, or the life of the
+/// collection ended, after the repair re-logged it: the delivery is judged history and appends
+/// nothing, but the entry is in position all the same, and its mark goes.
+#[test]
+fn a_relogged_definition_dropped_here_since_is_released_by_its_delivery_in_a_window() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    assert!(b.drop_index("shop", "orders", "by_v").unwrap());
+    let ours = b.held_len().unwrap();
+    assert_eq!(ours, 1, "premise: dropping the index leaves the held entry marked");
+
+    deliver_in_window(&b, &a);
+    assert!(names(&b).is_empty(), "the creation was history and built nothing");
+    no_mark_is_left(&b);
+    assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
+}
+
+#[test]
+fn a_relogged_definition_of_a_life_that_ended_here_is_released_by_its_delivery_in_a_window() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    b.drop_collection("shop", "orders").unwrap();
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the held entry outlives the life");
+
+    deliver_in_window(&b, &a);
+    assert!(names(&b).is_empty(), "the creation of a past life built nothing");
+    no_mark_is_left(&b);
+}
