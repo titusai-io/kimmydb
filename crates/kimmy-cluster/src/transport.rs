@@ -1069,13 +1069,45 @@ struct ServeWalk {
 fn say_malformed_digest_cut(peer: NodeId) {
     static SAID: std::sync::Mutex<Vec<NodeId>> = std::sync::Mutex::new(Vec::new());
     let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !said.contains(&peer) {
-        said.push(peer);
+    if first_malformed_cut_report(&mut said, peer) {
         warn!(
             %peer,
             "the peer's digest request carried a cut that is not a version vector; it is \
              answered as a request for no digest, and the rest of the divergence check goes on"
         );
+    }
+}
+
+/// Whether `peer`'s malformed cut is said now: the first time it is seen, recorded in `said`.
+fn first_malformed_cut_report(said: &mut Vec<NodeId>, peer: NodeId) -> bool {
+    if said.contains(&peer) {
+        return false;
+    }
+    said.push(peer);
+    true
+}
+
+#[cfg(test)]
+mod malformed_cut_report_tests {
+    use super::*;
+
+    /// The peers already told about are remembered so each is said once, and the memory is
+    /// bounded: a stream of distinct authenticated peer ids cannot grow it without end.
+    #[test]
+    fn the_peers_said_once_are_remembered_up_to_a_bound() {
+        let mut said = Vec::new();
+        let peer = |n: u32| {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            NodeId::from_bytes(bytes)
+        };
+        assert!(first_malformed_cut_report(&mut said, peer(0)), "the first time is said");
+        assert!(!first_malformed_cut_report(&mut said, peer(0)), "and not again");
+        for n in 1..3_000 {
+            first_malformed_cut_report(&mut said, peer(n));
+        }
+        assert!(said.len() <= 1024, "{} peers remembered", said.len());
+        assert!(!first_malformed_cut_report(&mut said, peer(0)), "an early one is still said once");
     }
 }
 
