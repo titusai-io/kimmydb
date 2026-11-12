@@ -8758,11 +8758,55 @@ async fn round_with(
         .unwrap()
 }
 
-/// The replay finds writes this member made and no longer holds, though its own
-/// startup write put its vector past them: it marks itself `restored`, reads
-/// them back, and the first round after leaves it holding all of them.
+/// The ordinary pull now recovers the lost tail by itself (the new truth under
+/// epochs): the restored member writes under a new epoch, a new origin, so its
+/// coverage of the old origin stays at the backup's position, and the peer holds
+/// the tail above it. No replay is armed, and nothing marks the member.
 #[tokio::test]
-#[ignore = "P2 must re-state: under epochs an ordinary pull already fetches the lost tail (the restore's new epoch is a new origin), so the premise asserted at replication.rs:8786 no longer holds"]
+async fn an_ordinary_pull_recovers_the_tail_a_restore_lost_and_marks_nothing() {
+    let scenario = lost_tail(2, 3, true).await;
+    let restored = &scenario.restored.engine;
+    let orders = restored.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        restored.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "premise: the backup lacks the tail"
+    );
+    let held = restored.version_vector().unwrap();
+    let peer = scenario.peer.engine.version_vector().unwrap();
+    assert!(
+        peer.get(scenario.old) > held.get(scenario.old),
+        "premise: the peer holds the old origin above the restored member"
+    );
+    assert!(
+        held.get(restored.origin()) > peer.get(scenario.old),
+        "premise: the restored member's own newest stamp (the new origin) is past the tail, \
+         which under node-only keying would have hidden it"
+    );
+
+    let control_dir = tempfile::tempdir().unwrap();
+    let control = marker_in(&control_dir);
+    round_with(&scenario.restored, &scenario.peer, &control).await;
+    assert_eq!(
+        restored.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "the ordinary pull fetched the {} lost writes",
+        scenario.lost
+    );
+    assert_eq!(
+        restored.version_vector().unwrap().get(scenario.old),
+        peer.get(scenario.old),
+        "and they are covered under the old origin"
+    );
+    assert!(!control.is_set(), "no replay was armed, so nothing marked the member");
+}
+
+/// What the replay still gives that the ordinary pull does not: it finds the writes
+/// this member made and no longer holds **by node, across epochs** (they sit in the
+/// old epoch, not the one this run writes under), marks the member `restored`
+/// until it has caught up, and reads them back, though its own startup write put
+/// its vector past them.
+#[tokio::test]
 async fn writes_this_member_made_and_lost_are_found_marked_restored_and_read_back() {
     let scenario = lost_tail(2, 3, true).await;
     let marker_dir = tempfile::tempdir().unwrap();
@@ -8774,21 +8818,19 @@ async fn writes_this_member_made_and_lost_are_found_marked_restored_and_read_bac
         2,
         "premise: the backup lacks the tail"
     );
-
-    // Without the replay the ordinary round never serves them: the restored
-    // member's own vector is past them.
-    let control_dir = tempfile::tempdir().unwrap();
-    let control = marker_in(&control_dir);
-    round_with(&scenario.restored, &scenario.peer, &control).await;
-    assert_eq!(
-        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
-        2,
-        "premise: an ordinary pull does not fetch them"
+    assert_ne!(
+        scenario.restored.engine.origin(),
+        scenario.old,
+        "premise: the lost writes are in the old epoch, not the one this run writes under"
     );
-    assert!(!control.is_set());
+    assert!(!catch_up.is_set(), "premise: nothing has marked the member yet");
 
     round_with(&scenario.restored, &scenario.peer, &catch_up).await;
-    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert_eq!(
+        catch_up.reason(),
+        Some(kimmy_cluster::CatchUpReason::Restored),
+        "the replay found writes it made and lost, and marked the member"
+    );
     assert!(
         catch_up.replay_answered(scenario.peer.engine.node_id()),
         "the peer has answered the replay"
@@ -8963,10 +9005,14 @@ async fn a_peer_with_a_hole_at_the_restored_members_origin(scenario: &LostTail) 
     age_out_fully(&scenario.peer.engine);
     let hole = node().await;
     sync_once(&hole.engine, scenario.peer.addr, SECRET, None).await.unwrap();
+    // The lost writes sit in the OLD epoch (the restored member writes under a new
+    // one), so the premise is read there: under the new origin both sides are zero.
+    let peer_holds = scenario.peer.engine.version_vector().unwrap().get(scenario.old);
+    assert!(peer_holds > Hlc::ZERO, "premise: the peer holds the member's old-epoch writes");
     assert_eq!(
-        hole.engine.state_held().unwrap().get(scenario.restored.engine.origin()),
-        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.origin()),
-        "premise: its hole reaches the restored member's newest write"
+        hole.engine.state_held().unwrap().get(scenario.old),
+        peer_holds,
+        "premise: its hole reaches the restored member's newest lost write"
     );
     hole
 }
@@ -9428,8 +9474,9 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
     let peer_only = scenario.peer.engine.create_collection("shop", "peer_only").unwrap();
     let me = scenario.restored.engine.origin();
     let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    // A write the member made and lost sits in the epoch it was made under: the old one.
     let lost = kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me.node, me.epoch),
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), scenario.old.node, scenario.old.epoch),
         kind: kimmy_core::OpKind::Insert,
         collection: peer_only.id,
         doc_id: Some(DocId::String("lost".into())),
@@ -9455,42 +9502,70 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
 /// The first run after a loss writes (a topology record, client writes) and stops
 /// before it reaches a peer. The next start opens with an own-origin position past
 /// the entries it lost, and asks from the floor the first start left on disk, not
-/// from there: the tail is read back. Without the persisted floor it finds nothing.
+/// from there. Under epochs the ordinary pull fetches the tail either way; what the
+/// floor gives is the replay: without it the later start's replay has nothing to
+/// ask for and the member is never marked `restored`; with it the replay reads the
+/// tail back and marks.
 #[tokio::test]
-#[ignore = "P2 must re-state: under epochs an ordinary pull already fetches the lost tail (the restore's new epoch is a new origin), so the premise asserted at replication.rs:9478 no longer holds"]
 async fn a_start_that_wrote_and_stopped_before_a_peer_leaves_the_replay_its_floor() {
     let scenario = lost_tail(2, 3, true).await;
-    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
     let me = scenario.restored.engine.origin();
     let backup_position = scenario.peer.engine.version_vector().unwrap().get(scenario.old);
     assert!(backup_position > Hlc::ZERO);
-
-    // Without a floor on disk, the later start's position is past the tail and the
-    // replay has nothing to ask for.
+    let at_open = scenario.restored.engine.own_position_at_open();
     let later = scenario.restored.engine.version_vector().unwrap().get(me);
-    let forgetful_dir = tempfile::tempdir().unwrap();
-    let forgetful = marker_in(&forgetful_dir);
-    forgetful.arm_replay(later, None).unwrap();
-    round_with(&scenario.restored, &scenario.peer, &forgetful).await;
-    assert_eq!(
-        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
-        2,
-        "premise: from the later position the tail is never asked for"
+    assert!(
+        at_open < later,
+        "premise: the later start's position ({later:?}) is past the first start's ({at_open:?})"
     );
 
     // With the floor the first start persisted, the second start reads it back.
     let dir = tempfile::tempdir().unwrap();
     let first = marker_in(&dir);
-    first.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    first.arm_replay(at_open, None).unwrap();
+    assert_eq!(
+        kimmy_cluster::catchup::replay_floor_on_disk(dir.path()),
+        Some(at_open),
+        "the first start left its position as the floor on disk"
+    );
     let second = kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
     second.arm_replay(later, None).unwrap();
+    assert_eq!(
+        second.replay_floor(),
+        at_open,
+        "the second start asks from the floor, not from its own later position"
+    );
     round_with(&scenario.restored, &scenario.peer, &second).await;
-    assert_eq!(second.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert_eq!(
+        second.reason(),
+        Some(kimmy_cluster::CatchUpReason::Restored),
+        "the replay from the floor found the tail and marked the member"
+    );
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(
         scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
         scenario.documents,
         "the tail is back"
     );
+
+    // Without a floor on disk, the later start's replay has nothing to ask for. The
+    // ordinary pull still brings the tail (the new truth), and the member is never
+    // marked: the loss goes unseen.
+    let other = lost_tail(2, 3, true).await;
+    let other_orders = other.restored.engine.get_collection("shop", "orders").unwrap();
+    let other_later =
+        other.restored.engine.version_vector().unwrap().get(other.restored.engine.origin());
+    let forgetful_dir = tempfile::tempdir().unwrap();
+    let forgetful = marker_in(&forgetful_dir);
+    forgetful.arm_replay(other_later, None).unwrap();
+    assert_eq!(forgetful.replay_floor(), other_later, "premise: no floor, so the later position");
+    round_with(&other.restored, &other.peer, &forgetful).await;
+    assert_eq!(
+        other.restored.engine.count(&other_orders, kimmy_storage::WalkScope::Request).unwrap(),
+        other.documents,
+        "the ordinary pull brought the tail"
+    );
+    assert!(!forgetful.is_set(), "but from the later position the replay never marked the member");
 }
 
 /// A peer that is behind on this member's origin answers the replay with nothing,
@@ -10808,5 +10883,161 @@ async fn a_whole_database_snapshot_across_an_a2_boundary_lands_every_delete_on_i
     assert_eq!(
         b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
         (ids.len() - deleted.len()) as u64
+    );
+}
+
+// -- Epochs: restore, restore twice, and membership (Q7 Step 1, L26 and L32) ---
+
+/// A node restored from `backup` into a fresh directory, serving: it keeps the backed-up
+/// identity and takes a new epoch at its first open.
+async fn restored_from(backup: &[u8]) -> Node {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut &backup[..]).unwrap();
+    let engine = Arc::new(Engine::open(&path).unwrap());
+    let (addr, serving, pushed) = listen(&engine, SECRET).await;
+    Node { engine, addr, serving, pushed, path, _dir: dir }
+}
+
+fn orders_count(node: &Node) -> u64 {
+    let orders = node.engine.get_collection("shop", "orders").unwrap();
+    node.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap()
+}
+
+/// L26 on a `document` collection: restore the same backup twice. Each restore is a
+/// new epoch of the same node, so the second restored member's writes are not covered
+/// by anything a peer witnessed of the first's: 100 in the backup, 20 more the peer
+/// holds, 5 written after the first restore and 5 after the second read 130 on
+/// every member, none lost (the counter form of this, 125 and never 105, needs the
+/// merge state of Step 2).
+#[tokio::test]
+async fn restoring_the_same_backup_twice_loses_no_write_of_either_restore() {
+    let writer = node().await;
+    let peer = node().await;
+    let meta = writer.engine.create_collection("shop", "orders").unwrap();
+    writer.engine.insert_many(&meta, (0..100i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    let mut backup = Vec::new();
+    writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    writer.engine.insert_many(&meta, (100..120i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    sync(&peer, &writer).await;
+    assert_eq!(orders_count(&peer), 120, "premise: the peer holds the backup and the 20 after it");
+    let old = writer.engine.origin();
+    writer.serving.abort();
+
+    let first = restored_from(&backup).await;
+    assert_eq!(first.engine.node_id(), old.node, "the identity comes back");
+    assert_ne!(first.engine.origin(), old, "and the first restore took a new epoch");
+    let meta = first.engine.get_collection("shop", "orders").unwrap();
+    first.engine.insert_many(&meta, (1000..1005i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    sync(&peer, &first).await;
+    assert_eq!(orders_count(&peer), 125, "the 5 written after the first restore, none lost");
+    assert_eq!(orders_count(&first), 125, "and the first restored member holds the 20 it lost");
+    first.serving.abort();
+
+    let second = restored_from(&backup).await;
+    assert_eq!(second.engine.node_id(), old.node);
+    assert_ne!(second.engine.origin(), old);
+    assert_ne!(second.engine.origin(), first.engine.origin(), "a second restore is a third epoch");
+    let meta = second.engine.get_collection("shop", "orders").unwrap();
+    second.engine.insert_many(&meta, (2000..2005i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    sync(&peer, &second).await;
+    assert_eq!(
+        orders_count(&peer),
+        130,
+        "the second restore's 5 writes are not covered by the first's"
+    );
+    assert_eq!(
+        orders_count(&second),
+        130,
+        "and it holds the first restore's writes and the 20 lost"
+    );
+    let epochs_of_the_node = peer
+        .engine
+        .version_vector()
+        .unwrap()
+        .iter()
+        .filter(|(origin, _)| origin.node == old.node)
+        .count();
+    assert_eq!(epochs_of_the_node, 3, "the peer's vector names all three epochs of the node");
+}
+
+/// L26, the delete-and-restore half: a backup; the member deletes after it; a peer
+/// pulls the delete; the member is restored (it holds the document again, under a new
+/// epoch), writes, and a third member pulls from it. All converge, and the delete
+/// stands: the restored member's old-epoch delete is read back from the peer by an
+/// ordinary pull.
+#[tokio::test]
+async fn a_delete_made_after_the_backup_stands_when_the_member_is_restored() {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let meta = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert_many(&meta, (0..3i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    converge(&a, &b, &c).await;
+    let mut backup = Vec::new();
+    a.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    // A deletes after the backup; C pulls the delete; B never sees it from A.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(a.engine.delete(&meta, &DocId::Int64(0)).unwrap());
+    sync(&c, &a).await;
+    let old = a.engine.origin();
+    a.serving.abort();
+    drop(a);
+
+    let restored = restored_from(&backup).await;
+    assert_ne!(restored.engine.origin(), old, "the restore took a new epoch");
+    let meta = restored.engine.get_collection("shop", "orders").unwrap();
+    assert!(
+        restored.engine.get(&meta, &DocId::Int64(0)).unwrap().is_some(),
+        "premise: the restored member holds the document again"
+    );
+    restored.engine.insert(&meta, doc! { "_id": "after-restore" }).unwrap();
+    converge(&restored, &b, &c).await;
+    for (name, member) in [("restored", &restored), ("b", &b), ("c", &c)] {
+        let coll = member.engine.get_collection("shop", "orders").unwrap();
+        assert!(
+            member.engine.get(&coll, &DocId::Int64(0)).unwrap().is_none(),
+            "{name} still holds the deleted document"
+        );
+        assert!(
+            member.engine.get(&coll, &DocId::String("after-restore".into())).unwrap().is_some(),
+            "{name} lacks the write made after the restore"
+        );
+        assert_eq!(orders_count(member), 3, "{name}: two of the three, and the new one");
+    }
+}
+
+/// L32 at Step 1, on a `document` collection: a fourth member joins after a restore
+/// and holds every epoch of the restored node, and the others cover its vector. (The
+/// retirement half of L32 is a later piece.)
+#[tokio::test]
+async fn a_fourth_member_joining_after_a_restore_holds_every_epoch_of_the_node() {
+    let a = node().await;
+    let b = node().await;
+    let meta = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert_many(&meta, (0..4i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    let mut backup = Vec::new();
+    a.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    a.engine.insert_many(&meta, (4..6i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    sync(&b, &a).await;
+    let old = a.engine.origin();
+    a.serving.abort();
+    drop(a);
+
+    let restored = restored_from(&backup).await;
+    let meta = restored.engine.get_collection("shop", "orders").unwrap();
+    restored.engine.insert(&meta, doc! { "_id": "after" }).unwrap();
+    sync(&restored, &b).await;
+
+    let d = node().await;
+    sync_once(&d.engine, b.addr, SECRET, None).await.unwrap();
+    sync_once(&d.engine, restored.addr, SECRET, None).await.unwrap();
+    assert_eq!(orders_count(&d), 7, "the four, the two lost, and the one after the restore");
+    let held = d.engine.version_vector().unwrap();
+    assert!(held.get(old) > Hlc::ZERO, "the joiner holds the old epoch");
+    assert!(held.get(restored.engine.origin()) > Hlc::ZERO, "and the new one");
+    assert!(
+        b.engine.version_vector().unwrap().covers(&held),
+        "and the member that had both covers what the joiner holds"
     );
 }
