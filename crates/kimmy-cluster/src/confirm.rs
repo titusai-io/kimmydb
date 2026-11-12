@@ -1618,41 +1618,49 @@ mod tests {
 
     /// T13: a push that times out after its window was sent backs off, and
     /// the driver does not wedge; a push that times out before sending (a
-    /// listener that never speaks TLS) fails within the push's bound and
+    /// listener that never speaks TLS) fails at the push's own bound and
     /// backs off nothing.
+    ///
+    /// Ordered by events, not by the clock: the member holds its answer on
+    /// its gate until the test opens it, so the push can end only at its own
+    /// timeout, however slow the runner; the back-off is longer than the
+    /// test, so the change sent during it is inside it, and it ends when SWIM
+    /// sees the member up again (T21), after which the next push confirms.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_push_that_times_out_backs_off_and_the_driver_does_not_wedge() {
         let b = member().await;
-        // `after` below is an ordinary exchange run under this same timeout,
-        // so it is a second, not the few hundred milliseconds one pause on a
-        // loaded host can use up.
-        let hold = Duration::from_millis(2000);
-        *b.served.hold.lock() = hold;
-        let config = ConfirmConfig { request_timeout: Duration::from_millis(1000), ..wide() };
+        b.served.gate.store(true, Ordering::SeqCst);
+        let config = ConfirmConfig { first_backoff: HELD, max_backoff: HELD * 2, ..quick() };
         let a = pusher_for(&b, config);
         let node = b.engine.node_id();
-        let pushed_at = Instant::now();
-        let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
+        let one = answer(&a.confirmer, b.addr, node, create(&a.engine, "e1")).await;
         assert_eq!(one.outcome(), ConfirmOutcome::Failed, "{one:?}");
-        // Failed at the timeout, not when the member finally answered: a driver
-        // that waited out the held answer before settling would pass the rest.
-        assert!(
-            pushed_at.elapsed() < hold,
-            "the push outlasted the held answer: {:?}",
-            pushed_at.elapsed()
-        );
+        // Failed at the timeout, not when the member answered: its gate is
+        // still shut, so no answer had been read. A driver that waited out the
+        // held answer would have none to give until the gate opened.
+        assert_eq!(a.confirmer.answered.load(Ordering::SeqCst), 0, "no answer was read");
+        let timed_out = format!("no answer within {:?}", quick().request_timeout);
+        assert_eq!(one, Resolution::pending(ConfirmOutcome::Failed, timed_out));
+        windows_reached(&b, 1).await;
         assert!(a.confirmer.backing_off(b.addr), "the window was sent");
-        let during = a.confirmer.confirm(b.addr, node, create(&a.engine, "e2"), DEADLINE).await;
-        assert_eq!(during.outcome(), ConfirmOutcome::Backoff);
-        *b.served.hold.lock() = Duration::ZERO;
-        // Past the back-off, and past the member's held answer (2 s from
-        // when the window arrived, 1 s after the timeout): lower bounds.
-        tokio::time::sleep(WIDE_BACKOFF + Duration::from_millis(50)).await;
-        let after = a.confirmer.confirm(b.addr, node, create(&a.engine, "e3"), DEADLINE).await;
+
+        let pushed = a.pushes.load(Ordering::SeqCst);
+        let during = answer(&a.confirmer, b.addr, node, create(&a.engine, "e2")).await;
+        assert_eq!(during.outcome(), ConfirmOutcome::Backoff, "{during:?}");
+        assert_eq!(a.pushes.load(Ordering::SeqCst), pushed, "nothing sent during the back-off");
+
+        // The member answers the held window, and SWIM sees it up again,
+        // which ends the back-off: the next push dials, and confirms.
+        b.served.gate.store(false, Ordering::SeqCst);
+        a.members.remove_for_test(&b.addr);
+        a.members.insert_for_test(b.addr, node);
+        let after = answer(&a.confirmer, b.addr, node, create(&a.engine, "e3")).await;
         assert_eq!(after, Resolution::Confirmed);
 
         // A listener that accepts and never speaks: the dial is inside the
-        // push's timeout, and nothing was sent.
+        // push's timeout, which ends it (the dial's own bounds are 5 s), and
+        // nothing was sent. Its own pusher, with a short timeout: no window
+        // can be sent here, so its length decides nothing.
         let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent_addr = silent.local_addr().unwrap();
         let _held = tokio::spawn(async move {
@@ -1661,13 +1669,16 @@ mod tests {
                 kept.push(socket);
             }
         });
-        a.members.insert_for_test(silent_addr, node);
-        let started = Instant::now();
-        let failed =
-            a.confirmer.confirm(silent_addr, node, create(&a.engine, "e4"), DEADLINE).await;
-        assert_eq!(failed.outcome(), ConfirmOutcome::Failed, "{failed:?}");
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
-        assert!(!a.confirmer.backing_off(silent_addr), "nothing was sent");
+        let bound = Duration::from_millis(1000);
+        let s =
+            pusher_to(&b.engine, silent_addr, ConfirmConfig { request_timeout: bound, ..wide() });
+        let failed = answer(&s.confirmer, silent_addr, node, create(&s.engine, "e4")).await;
+        assert_eq!(
+            failed,
+            Resolution::pending(ConfirmOutcome::Failed, format!("no answer within {bound:?}"))
+        );
+        assert!(!s.confirmer.backing_off(silent_addr), "nothing was sent");
+        assert_eq!(s.pushes.load(Ordering::SeqCst), 0, "nothing was sent");
     }
 
     /// T19: a back-off outlives its driver, and doubles on the next push the
