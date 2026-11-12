@@ -1509,27 +1509,45 @@ mod tests {
     /// pending at once, with nothing dialled; after it, the next confirms.
     /// And once the back-off has expired and a confirmation has run since,
     /// nothing of the member is held (T8).
+    ///
+    /// Ordered, not timed: "during" needs a back-off still in force when the
+    /// change arrives, which only a back-off longer than the test can promise
+    /// a loaded runner, and "after" needs one that has run out, which a wait
+    /// on the back-off itself ending promises however slow the runner. So
+    /// each half has its own member and pusher: one backing off for
+    /// [`HELD`], one for `quick()`'s 200 ms.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failed_push_leaves_its_window_pending_and_the_member_backs_off() {
         let b = member().await;
-        b.served.break_next.store(1, Ordering::SeqCst);
-        let a = pusher_for(&b, wide());
         let node = b.engine.node_id();
-        let first = create(&a.engine, "e1");
-        let one = a.confirmer.confirm(b.addr, node, first, DEADLINE).await;
-        assert_eq!(one.outcome(), ConfirmOutcome::Failed, "{one:?}");
-        assert!(a.confirmer.backing_off(b.addr));
 
+        // During: a back-off that outlasts the test.
+        b.served.break_next.store(1, Ordering::SeqCst);
+        let held = ConfirmConfig { first_backoff: HELD, max_backoff: HELD * 2, ..quick() };
+        let a = pusher_for(&b, held);
+        let one = answer(&a.confirmer, b.addr, node, create(&a.engine, "e1")).await;
+        assert_eq!(one.outcome(), ConfirmOutcome::Failed, "{one:?}");
+        assert!(a.confirmer.backing_off(b.addr), "the window was taken");
         let pushed = a.pushes.load(Ordering::SeqCst);
-        let during = a.confirmer.confirm(b.addr, node, create(&a.engine, "e2"), DEADLINE).await;
-        assert_eq!(during.outcome(), ConfirmOutcome::Backoff);
+        let during = answer(&a.confirmer, b.addr, node, create(&a.engine, "e2")).await;
+        assert_eq!(during.outcome(), ConfirmOutcome::Backoff, "{during:?}");
         assert_eq!(a.pushes.load(Ordering::SeqCst), pushed, "nothing sent during the back-off");
 
-        // Past the back-off: a lower bound, which a slow runner only lengthens.
-        tokio::time::sleep(WIDE_BACKOFF + Duration::from_millis(50)).await;
-        let after = a.confirmer.confirm(b.addr, node, create(&a.engine, "e3"), DEADLINE).await;
+        // After: a short back-off, waited out by watching it end.
+        let d = member().await;
+        let node = d.engine.node_id();
+        d.served.break_next.store(1, Ordering::SeqCst);
+        let c = pusher_for(&d, quick());
+        let one = answer(&c.confirmer, d.addr, node, create(&c.engine, "e1")).await;
+        assert_eq!(one.outcome(), ConfirmOutcome::Failed, "{one:?}");
+        // The step, not the pause: the step outlives a 200 ms pause a slow
+        // runner may already have passed.
+        let step = Some(quick().first_backoff);
+        assert_eq!(c.confirmer.backoff_step(d.addr), step, "the window was taken");
+        eventually("the back-off ran out", || !c.confirmer.backing_off(d.addr)).await;
+        let after = answer(&c.confirmer, d.addr, node, create(&c.engine, "e3")).await;
         assert_eq!(after, Resolution::Confirmed);
-        eventually("the member's queue emptied", || a.confirmer.members_waiting().is_empty()).await;
+        eventually("the member's queue emptied", || c.confirmer.members_waiting().is_empty()).await;
     }
 
     // --- T9, T15 ---
