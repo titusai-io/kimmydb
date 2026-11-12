@@ -87,10 +87,27 @@ pub struct Flags {
     /// Rust-only mutant of B2 / H-Q6-P1: a push without an introduced window applies its entry under `Position::Raise` (the vector
     /// rises over the hole) instead of keeping a Q6 kind as information (or refusing a create / abandon)
     pub fm_q6_under_raise: bool,
+    /// Rust-only mutants of the route tests (B3, the design's ASSUMED table): `Repair::Replay` skips an entry of a served origin
+    /// inside its range (H-Q6-R2); a whole-database page's drop read above the grant is applied, gated by the page's own versions
+    /// (H-Q6-R4); the sender's once-swapped flag is ignored and a flagged drop is applied as a never-swapped name's (H-Q6-R4b);
+    /// `AskVersions` answers with held entries counted (H-Q6-V1); the repair ledger re-plans a repair whose mark was released
+    /// (H-Q6-L1); the stage's create decodes as a non-DDL kind (H-Q6-K1)
+    pub fm_replay_skip: bool,
+    pub fm_page_drop_by_versions: bool,
+    pub fm_page_drop_flag_ignored: bool,
+    pub fm_askversions_held: bool,
+    pub fm_repair_replanned: bool,
+    pub fm_create_not_ddl: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 10] = [
+pub const ROUTE_MUTANTS: [&str; 16] = [
+    "m-replay-skips-an-entry",
+    "m-page-drop-by-page-versions",
+    "m-page-drop-flag-ignored",
+    "m-askversions-counts-held",
+    "m-repair-replanned",
+    "m-stage-create-not-ddl",
     "m-q6-kind-under-raise",
     "m-held-servable-on-deferred-apply",
     "m-held-entry-witnesses-the-deadline",
@@ -283,6 +300,12 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-held-servable-on-deferred-apply" => f.fm_held_servable = true,
         "m-held-entry-witnesses-the-deadline" => f.fm_held_witness = true,
         "m-q6-kind-under-raise" => f.fm_q6_under_raise = true,
+        "m-replay-skips-an-entry" => f.fm_replay_skip = true,
+        "m-page-drop-by-page-versions" => f.fm_page_drop_by_versions = true,
+        "m-page-drop-flag-ignored" => f.fm_page_drop_flag_ignored = true,
+        "m-askversions-counts-held" => f.fm_askversions_held = true,
+        "m-repair-replanned" => f.fm_repair_replanned = true,
+        "m-stage-create-not-ddl" => f.fm_create_not_ddl = true,
         _ => return false,
     }
     true

@@ -308,7 +308,11 @@ impl Member {
             bare_ids: HashSet::new(),
             repair: false,
         });
-        let src_evl = GrantRead { evl: src.evl.clone(), loss: src.loss_records() };
+        let src_evl = GrantRead {
+            evl: src.evl.clone(),
+            loss: src.loss_records(),
+            dead: src.dead_physicals(),
+        };
         if f.grant_before_pages {
             let mut j = self.join.take().unwrap();
             self.apply_grant(w, &mut j, &src_evl); // MUTANT: the grant lands before the pages
@@ -420,6 +424,16 @@ impl Member {
                 self.cur.as_ref().map(|c| c.idx),
             )
         )
+    }
+
+    /// The physicals this member has buried by a register event (a drop or a bind out), with the stamp that buried them: what a
+    /// page read now conveys about them (H-Q6-R4 / R4b).
+    pub fn dead_physicals(&self) -> Vec<(String, Stamp)> {
+        self.phys
+            .iter()
+            .filter(|(_, p)| !p.alive && !p.orphan && p.kill.is_some())
+            .map(|(n, p)| (n.clone(), p.kill.unwrap()))
+            .collect()
     }
 
     /// The member whose register the grant reads (the sender; `stale_src_bug` reads the source of the last begin call).
@@ -697,6 +711,22 @@ impl Member {
                 *e = *v;
             }
         }
+        // H-Q6-R4 / R4b: the sender's drops and bound-out physicals read on a page are information only: the receiver buries by its
+        // own register (D4), never by a page. The two mutants apply them: `m-page-drop-by-page-versions` a drop stamped above the
+        // grant (route B: gated by the page's own versions), `m-page-drop-flag-ignored` every one (the receiver reads the drop as a
+        // never-swapped name's, ADR-231)
+        for (name, kill) in &src_evl.dead {
+            if !self.phys.get(name).is_some_and(|p| p.alive) {
+                continue;
+            }
+            let above =
+                hlc_of(kill) > j.pl.vec.get(&origin_of_stamp(w, kill)).copied().unwrap_or(-1);
+            if (f.fm_page_drop_by_versions && above) || f.fm_page_drop_flag_ignored {
+                self.bury(w, name, *kill, "page_drop");
+            } else {
+                w.stats.bump("page_drop_information_only");
+            }
+        }
         if !f.snap_no_orphan_burials {
             for a in &j.pl.abandoned {
                 self.abandoned.insert(a.clone());
@@ -814,6 +844,12 @@ impl Member {
     }
 }
 
+/// The origin (member index) of a stamp's writer.
+pub fn origin_of_stamp(w: &World, s: &Stamp) -> usize {
+    let o = s.writer.node.to_bytes()[0].wrapping_sub(b'A') as usize;
+    o.min(w.by_origin.len().saturating_sub(1))
+}
+
 /// `random.shuffle`.
 pub fn shuffle<T>(rng: &mut crate::rng::Rng, v: &mut [T]) {
     for i in (1..v.len()).rev() {
@@ -834,12 +870,20 @@ pub fn land_page_in(ms: &mut [Member], dst: usize, w: &mut World) -> bool {
 pub struct GrantRead {
     pub evl: Vec<EntryId>,
     pub loss: OMap<LKey, (Body, String)>,
+    /// H-Q6-R4 / R4b: the sender's buried physicals as a later page reads them (pages are read live over rounds in the product;
+    /// the harness' pages are otherwise frozen at the first page): (name, the stamp that buried it). Each is a drop or a bound-out
+    /// physical of a once-swapped name, flagged as such by the sender; it is INFORMATION only here (the register governs burials).
+    pub dead: Vec<(String, Stamp)>,
 }
 
 /// The grant's reads of `dst`'s join (empty without a join).
 pub fn grant_evl(ms: &[Member], dst: usize, w: &World) -> GrantRead {
     match (ms[dst].grant_source(w), ms[dst].join.as_ref()) {
-        (Some(s), Some(j)) => GrantRead { evl: ms[s].evl.clone(), loss: ms[j.src].loss_records() },
+        (Some(s), Some(j)) => GrantRead {
+            evl: ms[s].evl.clone(),
+            loss: ms[j.src].loss_records(),
+            dead: ms[j.src].dead_physicals(),
+        },
         _ => GrantRead::default(),
     }
 }

@@ -92,8 +92,23 @@ impl Member {
                 }
             }
         }
+        // H-Q6-W1 / H-Q6-R2's step check: a window raises this member's coverage only past entries sent or witnessed by the
+        // sender's skip rule: every earlier entry of the origin is held here now (an entry the sender lacks cannot be witnessed); for
+        // a Q6 kind, that is invariant (ii) on the window route
+        if !release
+            && w.by_origin[e.origin]
+                .iter()
+                .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                .any(|&x| !self.cv.has(x))
+        {
+            self.step_inv.insert("window_raises_past_unsent");
+            if e.is_q6_kind() {
+                self.step_inv.insert("q6_kind_in_window_out_of_position");
+            }
+        }
         if release {
             self.held_oop.remove(&e.idx);
+            self.retire_repair(e.idx);
             self.appended.insert(e.idx);
             self.raise(w, e.idx); // the in-window release raises the vector (`release_held_in_position`)
             w.stats.bump("held_released_in_window");
@@ -148,6 +163,43 @@ impl Member {
         // a document entry is held as state, a register event or a record as information: both under OPLOG_HELD (`held_oop`), so a
         // window re-delivers them and releases them in position
         self.take_hold(w, e);
+    }
+
+    /// H-Q6-R2, `Repair::Replay` (the count repair, route C): `src` serves, for every origin of `floor`, its entries stamped above the
+    /// floor (`min(behind, floor)`), contiguously per origin and applied InWindow; an entry it holds but did not append is witnessed by
+    /// the skip rule; it stops an origin at the first entry it does not hold. `m-replay-skips-an-entry` skips the first appended entry
+    /// of each origin's range (neither sent nor witnessed). Returns the entries sent.
+    pub fn replay_from(
+        &mut self,
+        w: &mut World,
+        src: &Member,
+        floor: &std::collections::BTreeMap<usize, i64>,
+    ) -> Vec<EntryId> {
+        let mut sent = Vec::new();
+        for (&o, &from) in floor {
+            let mut skipped = false;
+            let ids: Vec<EntryId> = w.by_origin[o].clone();
+            for id in ids {
+                let e = w.ent_rc(id);
+                if e.hlc <= from {
+                    continue;
+                }
+                if !src.cv.has(id) {
+                    break;
+                }
+                if !src.appended.contains(&id) {
+                    continue; // witnessed by the next entry's window
+                }
+                if w.f.fm_replay_skip && !skipped {
+                    skipped = true; // MUTANT: an entry of a served origin inside the range is skipped
+                    continue;
+                }
+                w.stats.bump("replay_entries");
+                self.take_from(w, src, &e, true);
+                sent.push(id);
+            }
+        }
+        sent
     }
 
     /// R4: `src` relays the tombstone of a bound-out physical to this member.

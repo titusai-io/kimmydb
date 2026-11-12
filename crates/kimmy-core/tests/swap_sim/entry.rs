@@ -70,6 +70,25 @@ impl Entry {
     }
 }
 
+impl Entry {
+    /// The product's `OpKind` this entry is written as (H-Q6-K1, FIX-2 item 4: the stage's create is ASSUMED to be a
+    /// `CreateCollection`; the harness has no product oplog, so this is the mapping the build must confirm by decoding a real
+    /// replacing `$out`). Register events and records have no product kind yet (no code path today): `None`.
+    pub fn product_op_kind(&self, f: &crate::flags::Flags) -> Option<kimmy_core::OpKind> {
+        use kimmy_core::OpKind;
+        match self.kind {
+            Kind::Create if f.fm_create_not_ddl => Some(OpKind::Insert), // MUTANT
+            Kind::Create => Some(OpKind::CreateCollection),
+            Kind::Doc => Some(match self.opk {
+                Some(Opk::Insert) => OpKind::Insert,
+                Some(Opk::Replace) => OpKind::Replace,
+                _ => OpKind::Delete,
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl Kind {
     /// A register event (the swap register's: a binding, a recreate or a logical drop).
     pub fn is_register_event(self) -> bool {
@@ -154,6 +173,8 @@ pub struct Entry {
     pub fstate: Option<Rc<MergeState>>,
     /// a `LossQ7` entry: the record and its value
     pub q7: Option<(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)>,
+    /// a stage's create: the `mergePolicy` it carries (D8)
+    pub merge_policy: Option<crate::world::Policy>,
 }
 
 impl Entry {
@@ -174,6 +195,7 @@ impl Entry {
             extra: Extra::None,
             fstate: None,
             q7: None,
+            merge_policy: None,
         }
     }
     pub fn phys(mut self, p: &str) -> Self {

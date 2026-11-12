@@ -35,6 +35,7 @@ mod relay;
 mod restore;
 #[path = "../merge_state_sim/rng.rs"]
 mod rng;
+mod routes;
 mod run;
 mod scenario;
 mod scenarios;
