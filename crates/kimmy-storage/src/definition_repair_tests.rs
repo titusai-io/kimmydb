@@ -940,3 +940,44 @@ fn a_relogged_definition_of_a_life_that_ended_here_is_released_by_its_delivery_i
     assert!(names(&b).is_empty(), "the creation of a past life built nothing");
     no_mark_is_left(&b);
 }
+
+/// What a restore's rebuild and the origin's own entry differ by is the bytes (an entry an
+/// origin logged before ADR-180 carries the `multikey` it observed). Delivered in a window over
+/// the held rebuild, the origin's entry replaces it and releases the mark.
+#[test]
+fn the_origins_entry_over_a_held_rebuild_with_other_bytes_replaces_it_and_releases_the_mark() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+
+    let rebuilt = b.oplog_entry(&stamp).unwrap().expect("the rebuild is logged");
+    let mut body: kimmy_core::IndexCreate =
+        bson::deserialize_from_slice(rebuilt.body.as_ref().unwrap()).unwrap();
+    assert!(!body.index.multikey);
+    body.index.multikey = true;
+    let origin =
+        crate::engine::ddl_entry(stamp, kimmy_core::OpKind::CreateIndex, rebuilt.collection, &body)
+            .unwrap();
+    assert_ne!(origin.body, rebuilt.body, "premise: the bytes differ");
+
+    let mut window = a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    for e in &mut window.entries {
+        if e.stamp == stamp {
+            *e = origin.clone();
+        }
+    }
+    b.apply_peer_batch(
+        &a.witnessed_vector().unwrap(),
+        &window.entries,
+        window.scanned_to,
+        window.exhausted,
+    )
+    .unwrap();
+
+    assert_eq!(b.oplog_entry(&stamp).unwrap().unwrap().body, origin.body, "the origin's bytes");
+    no_mark_is_left(&b);
+    assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
+}
