@@ -362,11 +362,14 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                             // position: applied, not appended, released once every earlier entry of its origin is held.
                             // `m-register-ahead` lets a register event be picked as well (invariant (ii) broken on purpose)
                             let ahead = w.f.fm_register_ahead;
+                            let q6 = w.f.fm_doc_hold_q6;
                             let nd: Vec<EntryRef> = w
                                 .all
                                 .iter()
                                 .filter(|e| {
-                                    (e.kind == Kind::Doc || (ahead && e.kind.is_register_event()))
+                                    (e.kind == Kind::Doc
+                                        || (ahead && e.kind.is_register_event())
+                                        || (q6 && e.is_q6_kind()))
                                         && s.holds(e.idx)
                                         && !d.holds(e.idx)
                                 })
@@ -376,6 +379,11 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                                 let e = nd[w.rng.below(nd.len())].clone();
                                 w.note(format!("DOC-HOLD {} <- {}: {}", d.name, s.name, e));
                                 w.stats.bump("doc_hold_taken");
+                                if e.is_q6_kind() {
+                                    // R1: the hold relog carries no Q6 kind
+                                    w.stats.bump("route_carries_q6_kind");
+                                    d.inv.insert("route_carries_q6_kind");
+                                }
                                 d.take_hold(&mut w, &e);
                             }
                         }
