@@ -169,7 +169,7 @@ impl Member {
     /// The product routes' coverage (ASSUMED, design note phase G addition): an entry held out of position (`held_oop`) is not
     /// covered, as the servable vector skips the entries appended as state (`docs/oplog.md:473, 477`, `engine.rs:5630-5660`): the
     /// contiguous prefix of the origin's entries held and not held out of position.
-    fn covers_servable(&self, w: &World, origin: usize, hlc: i64) -> bool {
+    pub fn covers_servable(&self, w: &World, origin: usize, hlc: i64) -> bool {
         for &id in &w.by_origin[origin] {
             if w.ent(id).hlc > hlc {
                 return true;
@@ -192,8 +192,15 @@ impl Member {
     }
     pub fn covers_past(&self, w: &World, origin: usize, hlc: i64) -> bool {
         if w.held_uncovered && !self.held_oop.is_empty() {
+            // the witness above `hlc` is a COVERED entry: an entry held out of position raises no vector (FIX-1; HB-2's two-replay
+            // sub-case, seeds 101 and 730: a held entry was the D9 safety net's witness, so the member orphan-buried a stage that
+            // a fresh replica, which never covers the held entry, keeps)
             return self.covers_servable(w, origin, hlc)
-                && w.by_origin[origin].iter().any(|&id| w.ent(id).hlc > hlc && self.cv.has(id));
+                && w.by_origin[origin].iter().any(|&id| {
+                    w.ent(id).hlc > hlc
+                        && self.cv.has(id)
+                        && (w.f.fm_held_witness || !self.held_oop.contains(&id))
+                });
         }
         self.cv.covers_past(w, origin, hlc)
     }

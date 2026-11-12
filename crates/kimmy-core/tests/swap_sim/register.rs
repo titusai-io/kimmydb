@@ -208,6 +208,18 @@ impl Member {
     /// position (`swapmodel6a.py` `take_hold`).
     pub fn take_hold(&mut self, w: &mut World, e: &EntryRef) {
         let was = self.cv.has(e.idx);
+        if w.held_uncovered && !was && !w.f.fm_held_witness {
+            // the product routes: the entry is marked held BEFORE it is applied, so the `settle` inside `take` never sees it as a
+            // covered entry (HB-2's two-replay sub-case, seed 101: D9's safety net took the entry, momentarily in `cv` and not
+            // yet in `held_oop`, as its witness above a deadline). `m-held-entry-witnesses-the-deadline` keeps the old order.
+            self.held_oop.insert(e.idx);
+            self.take(w, e);
+            if self.held_oop.contains(&e.idx) {
+                self.appended.remove(&e.idx);
+            }
+            self.promote_oop(w);
+            return;
+        }
         self.take(w, e);
         // every entry a route passes is held: the model's hold route passes non-document entries only, the product's `doc_hold`
         // route document entries (or, in `m-register-ahead`, register events as well)

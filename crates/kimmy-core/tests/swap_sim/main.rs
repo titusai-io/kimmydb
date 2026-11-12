@@ -602,11 +602,12 @@ mod tests {
                     let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
                     let p = s.problems();
                     eprintln!(
-                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; problems {:?}",
+                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; HB-2 excluded (runs) {}; problems {:?}",
                         s.runs,
                         s.get("cnt_doc_hold_taken"),
                         s.get("cnt_doc_repair"),
                         s.get("cnt_register_event_out_of_position"),
+                        s.get("cnt_hb2_excluded"),
                         p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
                     );
                     if doc_hold {
