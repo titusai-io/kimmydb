@@ -949,7 +949,7 @@ impl EmbeddingWorker {
     }
 
     async fn run_loop(&mut self) -> Result<()> {
-        let mut resume = self.engine.consumer_position(CONSUMER)?;
+        let mut resume = stored_position(&self.engine)?;
         let mut recovering = false;
         // What the last run left owed: its held and skipped batches were
         // recorded as marks before the position passed them, so a start finds
@@ -3005,6 +3005,25 @@ enum StreamEnd {
     Invalidated(kimmy_storage::InvalidateReason),
 }
 
+/// The position this worker stored, if any. A stored value that is not a token of the
+/// current single-stamp form (44 bytes, `hlc ‖ node ‖ epoch`) is a named
+/// [`VectorError::StoredPositionUnusable`], not a silent restart from nothing.
+fn stored_position(engine: &Engine) -> Result<Option<kimmy_core::ResumeToken>> {
+    named_position(engine.consumer_position(CONSUMER))
+}
+
+/// [`stored_position`]'s answer for what the store returned.
+fn named_position(
+    read: kimmy_storage::Result<Option<kimmy_core::ResumeToken>>,
+) -> Result<Option<kimmy_core::ResumeToken>> {
+    match read {
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::MalformedResumeToken)) => {
+            Err(VectorError::StoredPositionUnusable { consumer: CONSUMER.to_string() })
+        }
+        other => Ok(other?),
+    }
+}
+
 /// Whether opening a stream failed because its resume position has been
 /// collected from the oplog — the one open-time failure the worker recovers
 /// from rather than reports.
@@ -3102,9 +3121,10 @@ impl VectorError {
             {
                 Fault::Tenant
             }
-            VectorError::Storage(_) | VectorError::Core(_) | VectorError::Snapshot(_) => {
-                Fault::Local
-            }
+            VectorError::Storage(_)
+            | VectorError::Core(_)
+            | VectorError::Snapshot(_)
+            | VectorError::StoredPositionUnusable { .. } => Fault::Local,
             // A search's own deadline; the worker never searches under one.
             VectorError::DeadlineExceeded => Fault::Local,
             // The node's own lookups were busy: its state, not the provider's, and
@@ -4304,6 +4324,51 @@ pub(crate) mod tests {
     }
 
     /// The pure form of the rule above, with no clock to wait on.
+    /// A stored position that is not a token of the current form is a named refusal; one that
+    /// is, and none at all, pass through; any other storage error is not renamed.
+    #[test]
+    fn a_stored_position_of_another_form_is_refused_by_name() {
+        let refused = named_position(Err(kimmy_storage::StorageError::Core(
+            kimmy_core::Error::MalformedResumeToken,
+        )))
+        .unwrap_err();
+        assert!(matches!(refused, VectorError::StoredPositionUnusable { .. }), "{refused}");
+        let text = refused.to_string();
+        assert!(text.contains(&kimmy_core::Stamp::KEY_LEN.to_string()), "{text}");
+        assert!(text.contains(CONSUMER), "{text}");
+
+        assert!(named_position(Ok(None)).unwrap().is_none());
+        let token = kimmy_core::ResumeToken::new(
+            Hlc::new(5, 0),
+            kimmy_core::Origin::new(
+                kimmy_core::NodeId::from_bytes([3; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+        );
+        assert_eq!(named_position(Ok(Some(token.clone()))).unwrap(), Some(token));
+        let other = named_position(Err(kimmy_storage::StorageError::Corrupt("x".into())));
+        assert!(matches!(other, Err(VectorError::Storage(_))));
+    }
+
+    /// The single-stamp position the worker stores is 44 bytes, and `decode` refuses the
+    /// 26-byte form from before epochs.
+    #[test]
+    fn the_stored_position_is_the_44_byte_form() {
+        let token = kimmy_core::ResumeToken::new(
+            Hlc::new(5, 0),
+            kimmy_core::Origin::new(
+                kimmy_core::NodeId::from_bytes([3; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+        );
+        // 44 bytes are 59 base64url characters; 26 bytes are 35, 45 bytes are 60.
+        assert_eq!(kimmy_core::Stamp::KEY_LEN, 44);
+        assert_eq!(token.encode().len(), 59);
+        assert_eq!(kimmy_core::ResumeToken::decode(&token.encode()).unwrap(), token);
+        assert!(kimmy_core::ResumeToken::decode(&"A".repeat(35)).is_err());
+        assert!(kimmy_core::ResumeToken::decode(&"A".repeat(60)).is_err());
+    }
+
     #[test]
     fn the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait() {
         let wait = Duration::from_millis(100);
