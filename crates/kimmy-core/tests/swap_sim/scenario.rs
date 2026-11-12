@@ -96,6 +96,12 @@ impl Sc {
         let d = self.idx(dst);
         land_page_in(&mut self.ms, d, &mut self.w)
     }
+    /// The per-step checks (`check_inv`, the step checks included) on every live member, as the random run makes after each step.
+    pub fn check(&mut self) {
+        for m in self.ms.iter_mut().filter(|m| !m.vanished) {
+            m.check_inv(&self.w);
+        }
+    }
     /// `dst` marks a member vanished (it acts, relays and joins no more).
     pub fn vanish(&mut self, names: &[&str]) {
         for n in names {

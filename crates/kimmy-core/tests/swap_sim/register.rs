@@ -200,6 +200,7 @@ impl Member {
             if ok {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
+                self.vc.raise(e.origin, e.hlc); // released in position: the vector rises
             }
         }
     }
@@ -213,14 +214,18 @@ impl Member {
             // covered entry (HB-2's two-replay sub-case, seed 101: D9's safety net took the entry, momentarily in `cv` and not
             // yet in `held_oop`, as its witness above a deadline). `m-held-entry-witnesses-the-deadline` keeps the old order.
             self.held_oop.insert(e.idx);
+            self.pos_hold = true;
             self.take(w, e);
+            self.pos_hold = false;
             if self.held_oop.contains(&e.idx) {
                 self.appended.remove(&e.idx);
             }
             self.promote_oop(w);
             return;
         }
+        self.pos_hold = true;
         self.take(w, e);
+        self.pos_hold = false;
         // every entry a route passes is held: the model's hold route passes non-document entries only, the product's `doc_hold`
         // route document entries (or, in `m-register-ahead`, register events as well)
         if !was {

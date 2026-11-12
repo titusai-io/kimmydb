@@ -84,10 +84,14 @@ pub struct Flags {
     /// Rust-only mutant of the product routes (HB-2's two-replay sub-case): an entry held out of position counts as D9's witness
     /// entry above a stage's deadline (the safety net's "covers past the deadline")
     pub fm_held_witness: bool,
+    /// Rust-only mutant of B2 / H-Q6-P1: a push without an introduced window applies its entry under `Position::Raise` (the vector
+    /// rises over the hole) instead of keeping a Q6 kind as information (or refusing a create / abandon)
+    pub fm_q6_under_raise: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 9] = [
+pub const ROUTE_MUTANTS: [&str; 10] = [
+    "m-q6-kind-under-raise",
     "m-held-servable-on-deferred-apply",
     "m-held-entry-witnesses-the-deadline",
     "m-restore-replay-raise",
@@ -278,6 +282,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-repair-dropped-answer" => f.fm_repair_dropped = true,
         "m-held-servable-on-deferred-apply" => f.fm_held_servable = true,
         "m-held-entry-witnesses-the-deadline" => f.fm_held_witness = true,
+        "m-q6-kind-under-raise" => f.fm_q6_under_raise = true,
         _ => return false,
     }
     true

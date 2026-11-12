@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::coverage::{CoverageOf, PrefixCoverage};
+use crate::coverage::{CoverageOf, PrefixCoverage, VectorCoverage};
 use crate::entry::*;
 use crate::omap::{OMap, OSet};
 use crate::snapshot::Join;
@@ -42,6 +42,13 @@ pub struct Member {
     pub hlc: i64,
     /// `held`: the entries taken (the coverage claim, including whatever a snapshot grant adds)
     pub cv: PrefixCoverage,
+    /// B2: the product's coverage, a per-origin maximum raised by Raise / InWindow / a grant, never by Hold (read when
+    /// `World::vector_cov`)
+    pub vc: VectorCoverage,
+    /// the apply in progress is under `Position::Hold` (it raises no vector): set by the hold routes around `take`
+    pub pos_hold: bool,
+    /// the end-of-run delivery's shortcut witnessed an entry here that no live member appended (`take_quiesce`)
+    pub quiesce_witnessed: bool,
     pub phys: OMap<String, Phys>,
     /// the valid bind / lcreate / ldrop entries held, and the same sorted by stamp
     pub events: OSet<EntryId>,
@@ -115,6 +122,9 @@ impl Member {
             skew,
             hlc: 0,
             cv: PrefixCoverage::new(),
+            vc: VectorCoverage::new(),
+            pos_hold: false,
+            quiesce_witnessed: false,
             phys,
             events: OSet::new(),
             evl: Vec::new(),
@@ -181,16 +191,51 @@ impl Member {
         true
     }
 
+    /// Raise the product's vector (an apply under Raise or InWindow, a release, a grant).
+    pub fn raise(&mut self, w: &World, id: EntryId) {
+        let e = w.ent(id);
+        self.vc.raise(e.origin, e.hlc);
+    }
+
+    /// The step check of B2: the vector and the prefix agree, at every entry of every origin: the vector covers exactly the entries
+    /// of the member's contiguous servable prefix (an entry held out of position is not in it). Returns the first origin where they
+    /// disagree.
+    pub fn vector_prefix_disagreement(&self, w: &World) -> Option<usize> {
+        for (o, lst) in w.by_origin.iter().enumerate() {
+            let mut i = self.cv.prefix_len(w, o);
+            for &h in self.held_oop.iter() {
+                if w.ent(h).origin == o
+                    && let Ok(j) = lst.binary_search_by_key(&w.ent(h).hlc, |&x| w.ent(x).hlc)
+                {
+                    i = i.min(j);
+                }
+            }
+            let v = self.vc.max_of(o);
+            let low_ok = i == 0 || v >= w.ent(lst[i - 1]).hlc;
+            let high_ok = i == lst.len() || v < w.ent(lst[i]).hlc;
+            if !(low_ok && high_ok) {
+                return Some(o);
+            }
+        }
+        None
+    }
+
     pub fn holds(&self, id: EntryId) -> bool {
         self.cv.has(id)
     }
     pub fn covers(&self, w: &World, origin: usize, hlc: i64) -> bool {
+        if w.vector_cov {
+            return self.vc.covers(w, origin, hlc);
+        }
         if w.held_uncovered && !self.held_oop.is_empty() {
             return self.covers_servable(w, origin, hlc);
         }
         self.cv.covers(w, origin, hlc)
     }
     pub fn covers_past(&self, w: &World, origin: usize, hlc: i64) -> bool {
+        if w.vector_cov {
+            return self.vc.covers_past(w, origin, hlc);
+        }
         if w.held_uncovered && !self.held_oop.is_empty() {
             // the witness above `hlc` is a COVERED entry: an entry held out of position raises no vector (FIX-1; HB-2's two-replay
             // sub-case, seeds 101 and 730: a held entry was the D9 safety net's witness, so the member orphan-buried a stage that
