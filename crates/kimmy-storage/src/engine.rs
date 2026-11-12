@@ -61,9 +61,9 @@ pub struct Engine {
     /// This member's epoch, minted at the open that found none (`tables::META_EPOCH`). With
     /// the node it is the origin of every local write.
     epoch: Epoch,
-    /// The highest stamp of this node's own origin in the oplog when the store
-    /// was opened, before this run wrote anything (ADR-202): the position a
-    /// replay of this node's own origin asks a peer from.
+    /// Where a replay of this node's own origin asks a peer from (ADR-202), read
+    /// when the store was opened, before this run wrote anything: see
+    /// [`Engine::own_position_at_open`].
     own_position_at_open: Hlc,
     /// The repair redb made when this engine opened the store, if it made one
     /// (ADR-204).

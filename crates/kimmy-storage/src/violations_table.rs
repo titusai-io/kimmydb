@@ -8,10 +8,10 @@
 //! oplog through redb's page cache on every call (a value lives in the leaf
 //! page of its key, so reading a header reads the page).
 //!
-//! **The table** is keyed by `collection id (8 bytes) || stamp key (26)` with an
+//! **The table** is keyed by `collection id (8 bytes) || stamp key (44)` with an
 //! empty value: one row per retained violation entry, no body, so it cannot
 //! disagree with the entry about what the violation says. **A sentinel row**,
-//! key `[0x00]` (one byte, which sorts before every 34-byte row), holds
+//! key `[0x00]` (one byte, which sorts before every 52-byte row), holds
 //! `through`, a stamp key: **every violation entry at or below it is in the
 //! table.** The marker lives in the table it describes, so the two cannot be
 //! separated. **A backup does not carry the table** (`verified.rs` names the
