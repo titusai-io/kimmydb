@@ -104,11 +104,15 @@ fn lenient_generation<'de, D: serde::Deserializer<'de>>(
     crate::facts::lenient_millis(deserializer)
 }
 
-/// A position on a frame, read leniently: anything that is not one reads as
-/// absent, so a field of another shape costs the field and never the frame.
-fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Hlc>, D::Error> {
+/// A replay position on a frame, read leniently: anything that is not a whole stamp (an
+/// HLC, a node id and an 18-byte epoch) reads as absent, so a field of another shape costs the
+/// field and never the frame. A stamp that decodes and names another member than the sender is
+/// refused where it is used.
+fn lenient_stamp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_core::Stamp>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<kimmy_core::Stamp>(raw).ok()))
 }
 
 /// A digest request, read leniently (B3): one that does not decode is none, so a
@@ -288,15 +292,16 @@ pub enum Message {
         )]
         echo: Option<Echo>,
         /// This member's replay of its own origin is armed and the requester has
-        /// not answered it: the position the replay asks from, so the requester
-        /// serves it on this connection (ADR-212's addendum). Absent when there
-        /// is nothing to ask.
+        /// not answered it: the position the replay asks after, a stamp of this
+        /// member's (its floor `H` as `(H, node, the largest epoch)`, or the last
+        /// entry it read), so the requester serves it on this connection
+        /// (ADR-212's addendum). Absent when there is nothing to ask.
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_hlc"
+            deserialize_with = "lenient_stamp"
         )]
-        replay_from: Option<Hlc>,
+        replay_from: Option<kimmy_core::Stamp>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -385,22 +390,25 @@ pub enum Message {
     /// served the entry (ADR-097).
     BeyondHorizon {},
     /// A page of the entries the requester holds of the **answerer's own origin**
-    /// above `from`, sent on a connection whose `Vectors` asked for them
-    /// (`replay_from`). `exhausted` says the sender holds nothing more above this
-    /// page; `horizon` says it has collected the oplog below `from` and cannot
-    /// say. Only ever sent to a peer that asked.
+    /// after `from`, sent on a connection whose `Vectors` asked for them
+    /// (`replay_from`). `from` and `scanned_to` are stamps of the answerer's, compared
+    /// in stamp order, since two epochs of one node can hold one HLC. `exhausted`
+    /// says the sender holds nothing more after this page; `horizon` says it has
+    /// collected the oplog below `from` and cannot say. Only ever sent to a peer
+    /// that asked.
     ReplayEntries {
-        from: Hlc,
+        from: kimmy_core::Stamp,
         entries: Vec<OplogEntry>,
         exhausted: bool,
         horizon: bool,
-        /// How far the sender's walk got. It is at least the last entry's stamp (a
-        /// page that says less is refused); a value below `from` is read as `from`.
-        /// On an empty page that is not the end, the requester moves its cursor
-        /// here, as `Entries::scanned_to` moves a pull's. A walk the sender's budget
-        /// cut short before it reached the requester's entries therefore still
-        /// makes progress at every contact.
-        scanned_to: Hlc,
+        /// How far the sender's walk got, as a stamp of the answerer's node (its walk's
+        /// HLC with the largest epoch, or the last entry). It is at least the last
+        /// entry's stamp (a page that says less, or names another node, is refused); a
+        /// value below `from` is read as `from`. On an empty page that is not the end,
+        /// the requester moves its cursor here, as `Entries::scanned_to` moves a pull's.
+        /// A walk the sender's budget cut short before it reached the requester's
+        /// entries therefore still makes progress at every contact.
+        scanned_to: kimmy_core::Stamp,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has
@@ -408,7 +416,8 @@ pub enum Message {
     /// must first receive by the ordinary pull, so the replay stops for this
     /// contact and goes on at the next, with nothing answered.
     ReplayAck {
-        next_from: Hlc,
+        /// A stamp of the acking member's own node; another node's ends the contact.
+        next_from: kimmy_core::Stamp,
         done: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stalled: Option<ReplayStall>,

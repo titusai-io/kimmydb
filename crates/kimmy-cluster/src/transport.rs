@@ -1146,7 +1146,7 @@ where
     // running cursor a page is validated against. Advanced only from this side's
     // own ack, never from the shared cursor the outbound path moves (ADR-212's
     // addendum).
-    let mut replay_cursor: Option<kimmy_core::Hlc> = None;
+    let mut replay_cursor: Option<kimmy_core::Stamp> = None;
     loop {
         let (frame, undecodable, decoded_seq) =
             crate::protocol::read_frame_noting_facts_within(&mut stream, budgets.waits).await?;
@@ -1194,7 +1194,7 @@ where
                 let catch_up = members.and_then(Members::catch_up);
                 replay_cursor = catch_up
                     .filter(|c| c.replay_armed() && !c.replay_answered(peer))
-                    .map(|c| c.replay_from(peer));
+                    .map(|c| c.replay_from(peer, engine.node_id()));
                 write_frame(
                     &mut stream,
                     &Message::Vectors {
@@ -1261,14 +1261,18 @@ where
                 if entries.len() > MAX_BATCH {
                     return Err(refuse("it carries more entries than a batch"));
                 }
+                if scanned_to.node != me {
+                    return Err(refuse("the position it reached is not one of this member's"));
+                }
+                // In stamp order: two epochs of this member can hold one HLC.
                 let mut previous = from;
                 for entry in &entries {
-                    if entry.stamp.node != me || entry.stamp.hlc <= previous {
+                    if entry.stamp.node != me || entry.stamp <= previous {
                         return Err(refuse(
                             "its entries are not this member's own, in order, above its start",
                         ));
                     }
-                    previous = entry.stamp.hlc;
+                    previous = entry.stamp;
                 }
                 if scanned_to < previous {
                     return Err(refuse("it scanned to before its own last entry"));
@@ -2057,26 +2061,27 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let me = engine.node_id();
-    let mut from = catch_up.replay_from(their_node);
-    // The peer's highest stamp of this origin is at or below where the replay
-    // starts: it holds nothing of ours that this store lacks.
-    if crate::protocol::node_position(theirs, me) <= from {
+    let mut from = catch_up.replay_from(their_node, me);
+    // The peer holds nothing of this member's node after where the replay starts:
+    // nothing of ours that this store lacks.
+    if !holds_after(theirs, from) {
         catch_up.replay_finished(their_node);
         return Ok(());
     }
     let mut limit = MAX_BATCH;
     loop {
         // Everything of every other origin is "held", so the peer's walk passes
-        // over it and serves only this origin's entries above `from`.
-        // by node across epochs (the lost writes sit in the epochs before this one)
+        // over it and serves only this node's entries after `from`: by node across
+        // epochs (the lost writes sit in the epochs before this one), each epoch
+        // held to where `from` leaves it in stamp order.
         let mut held = theirs.clone();
         for (origin, _) in theirs.iter().filter(|(origin, _)| origin.node == me) {
-            held.insert(origin, from);
+            held.insert(origin, replay_held_at(origin, from));
         }
         write_frame(
             stream,
             &Message::AskEntries {
-                from,
+                from: from.hlc,
                 limit,
                 held: Some(held),
                 marked: Vec::new(),
@@ -2122,6 +2127,7 @@ where
         };
         clock.heard_now();
         let (entries, exhausted, scanned_to) = entries;
+        let scanned_to = crate::catchup::replay_after(scanned_to, me);
         match replay_apply(
             engine,
             catch_up,
@@ -2153,6 +2159,22 @@ where
     }
 }
 
+/// Where a replay cursor leaves `origin`, an epoch of the cursor's node, as a position a
+/// walk's `held` names: the walk serves that origin's entries above it. An epoch at or before
+/// the cursor's has been read through the cursor's HLC; one after it has not yet been read at
+/// that HLC (its entry there sorts after the cursor), so it is held to the HLC before. The same
+/// rule as `coverage_up_to` for a window that ends `Through` the cursor.
+pub(crate) fn replay_held_at(origin: kimmy_core::Origin, cursor: kimmy_core::Stamp) -> Hlc {
+    if origin.epoch <= cursor.epoch { cursor.hlc } else { cursor.hlc.predecessor() }
+}
+
+/// Whether `vector` names an entry of `cursor`'s node after the cursor, in any epoch.
+pub(crate) fn holds_after(vector: &VersionVector, cursor: kimmy_core::Stamp) -> bool {
+    vector
+        .iter()
+        .any(|(origin, hlc)| origin.node == cursor.node && hlc > replay_held_at(origin, cursor))
+}
+
 /// What applying one page of a replay came to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReplayPage {
@@ -2160,11 +2182,11 @@ pub(crate) enum ReplayPage {
     /// pull: nothing was advanced, and nothing is answered.
     Stalled(crate::protocol::ReplayStall),
     /// The replay reached the end of what the peer holds: it is answered.
-    Done { next: kimmy_core::Hlc },
-    /// More may follow, from `next`.
-    Advanced { next: kimmy_core::Hlc },
+    Done { next: kimmy_core::Stamp },
+    /// More may follow, after `next`.
+    Advanced { next: kimmy_core::Stamp },
     /// No entry of this member's origin in the page, and not the end.
-    Empty { next: kimmy_core::Hlc },
+    Empty { next: kimmy_core::Stamp },
 }
 
 /// Which way a replay page travelled, for the counters and the log.
@@ -2188,17 +2210,16 @@ pub(crate) fn replay_apply(
     catch_up: &crate::catchup::CatchUp,
     peer: &dyn std::fmt::Display,
     their_node: kimmy_core::NodeId,
-    from: kimmy_core::Hlc,
+    from: kimmy_core::Stamp,
     entries: Vec<kimmy_core::OplogEntry>,
-    scanned_to: kimmy_core::Hlc,
+    scanned_to: kimmy_core::Stamp,
     exhausted: bool,
     via: Via,
 ) -> Result<ReplayPage, ProtocolError> {
     let me = engine.node_id();
-    let own: Vec<_> = entries
-        .into_iter()
-        .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
-        .collect();
+    // After `from` in stamp order: an entry of another epoch at `from`'s HLC is after it.
+    let own: Vec<_> =
+        entries.into_iter().filter(|entry| entry.stamp.node == me && entry.stamp > from).collect();
     for entry in &own {
         engine.advance_clock_past(&entry.stamp);
     }
@@ -2265,7 +2286,7 @@ pub(crate) fn replay_apply(
         );
         catch_up.replay_finished(their_node);
     };
-    let Some(last) = own.last().map(|entry| entry.stamp.hlc) else {
+    let Some(last) = own.last().map(|entry| entry.stamp) else {
         if exhausted {
             finish();
             return Ok(ReplayPage::Done { next: from });
@@ -2442,7 +2463,7 @@ async fn serve_replay<S>(
     peer: SocketAddr,
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
-    asked: kimmy_core::Hlc,
+    asked: kimmy_core::Stamp,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2464,14 +2485,19 @@ where
         let ours = engine.version_vector().map_err(|e| from_storage(e, ProtocolError::Local))?;
         let mut held = theirs.clone();
         for (origin, _) in ours.iter() {
-            // by node across epochs: the peer's lost writes sit in its earlier epochs
+            // by node across epochs: the peer's lost writes sit in its earlier epochs,
+            // each held to where `from` leaves it in stamp order
             held.insert(
                 origin,
-                if origin.node == their_node { from } else { kimmy_core::Hlc::MAX },
+                if origin.node == their_node {
+                    replay_held_at(origin, from)
+                } else {
+                    kimmy_core::Hlc::MAX
+                },
             );
         }
         for (origin, _) in theirs.iter().filter(|(origin, _)| origin.node == their_node) {
-            held.insert(origin, from);
+            held.insert(origin, replay_held_at(origin, from));
         }
         let verdict =
             engine.serve_verdict(&held).map_err(|e| from_storage(e, ProtocolError::Local))?;
@@ -2481,45 +2507,55 @@ where
             engine.note_state_held_refusal();
             say_state_held_refusal(engine, their_node);
         }
-        let (entries, exhausted, horizon, scanned_to) = if verdict
-            != kimmy_storage::ServeVerdict::Serve
-        {
-            (Vec::new(), false, true, from)
-        } else {
-            if crate::protocol::node_position(&ours, their_node) <= from {
-                // Nothing held above where the replay asks: the whole answer.
-                (Vec::new(), true, false, from)
+        let (entries, exhausted, horizon, scanned_to) =
+            if verdict != kimmy_storage::ServeVerdict::Serve {
+                (Vec::new(), false, true, from)
             } else {
-                let budget = kimmy_storage::ExamineBudget {
-                    time: replay_examine_time(
-                        replay_serve_time().saturating_sub(started.elapsed()),
-                    ),
-                    rows: replay_examine_rows(),
-                };
-                let window = match kimmy_storage::blocking(|| {
-                    let _walk = ServeWalk::begin(their_node);
-                    engine.serve_entries_to_peer(from, MAX_BATCH, Some(&held), &[], Some(budget))
-                }) {
-                    Ok(window) => window,
-                    // This node's own stop is neither the peer's failure nor the
-                    // round's: it ends the contact quietly (`ProtocolError::Stopping`).
-                    Err(e) => return Err(from_storage(e, ProtocolError::Local)),
-                };
-                let mut entries: Vec<_> = window
-                    .entries
-                    .into_iter()
-                    .filter(|entry| entry.stamp.node == their_node && entry.stamp.hlc > from)
-                    .collect();
-                let mut exhausted = window.exhausted && window.passed_through.is_none();
-                if let Fits::Only(fits) = how_many_fit(&entries) {
-                    // This side sizes the page: the peer cannot negotiate a limit.
-                    entries.truncate(fits.max(1).min(entries.len()));
-                    exhausted = false;
+                if !holds_after(&ours, from) {
+                    // Nothing held after where the replay asks: the whole answer.
+                    (Vec::new(), true, false, from)
+                } else {
+                    let budget = kimmy_storage::ExamineBudget {
+                        time: replay_examine_time(
+                            replay_serve_time().saturating_sub(started.elapsed()),
+                        ),
+                        rows: replay_examine_rows(),
+                    };
+                    let window = match kimmy_storage::blocking(|| {
+                        let _walk = ServeWalk::begin(their_node);
+                        engine.serve_entries_to_peer(
+                            from.hlc,
+                            MAX_BATCH,
+                            Some(&held),
+                            &[],
+                            Some(budget),
+                        )
+                    }) {
+                        Ok(window) => window,
+                        // This node's own stop is neither the peer's failure nor the
+                        // round's: it ends the contact quietly (`ProtocolError::Stopping`).
+                        Err(e) => return Err(from_storage(e, ProtocolError::Local)),
+                    };
+                    let mut entries: Vec<_> = window
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.stamp.node == their_node && entry.stamp > from)
+                        .collect();
+                    let mut exhausted = window.exhausted && window.passed_through.is_none();
+                    if let Fits::Only(fits) = how_many_fit(&entries) {
+                        // This side sizes the page: the peer cannot negotiate a limit.
+                        entries.truncate(fits.max(1).min(entries.len()));
+                        exhausted = false;
+                    }
+                    (
+                        entries,
+                        exhausted,
+                        false,
+                        crate::catchup::replay_after(window.scanned_to, their_node),
+                    )
                 }
-                (entries, exhausted, false, window.scanned_to)
-            }
-        };
-        let last_sent = entries.last().map(|entry| entry.stamp.hlc);
+            };
+        let last_sent = entries.last().map(|entry| entry.stamp);
         // The cursor after this page is this member's own: the last stamp sent, or
         // where an empty page's walk reached.
         let after = last_sent.unwrap_or(scanned_to).max(from);
@@ -2547,6 +2583,11 @@ where
         match ack {
             Message::ReplayAck { next_from, done, stalled } => {
                 info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
+                if next_from.node != their_node {
+                    return Err(ProtocolError::Malformed(
+                        "a replay ack names a position that is not the peer's own".into(),
+                    ));
+                }
                 if done || stalled.is_some() || horizon || exhausted {
                     return Ok(ReplayServed::InStep);
                 }
@@ -2651,6 +2692,13 @@ where
     // would otherwise stop at an unknown collection. A read only, time-boxed, and it
     // never costs the round: when it ends the ordinary round goes on, unless an ack
     // did not come and the stream may still hold it, which ends the round quietly.
+    if let Some(asked) = asked_replay
+        && asked.node != their_node
+    {
+        return Err(ProtocolError::Malformed(
+            "Vectors asks for a replay from a position that is not the peer's own".into(),
+        ));
+    }
     if let Some(asked) = asked_replay
         && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
             == ReplayServed::OutOfStep
@@ -13113,7 +13161,11 @@ mod tests {
         round(spent()).await;
         assert!(!catch_up.replay_answered(peer.node_id()), "one window is not the tail");
         let at_open = member.own_position_at_open();
-        assert!(catch_up.replay_from(peer.node_id()) > at_open, "the cursor moved");
+        assert!(
+            catch_up.replay_from(peer.node_id(), member.node_id())
+                > crate::catchup::replay_after(at_open, member.node_id()),
+            "the cursor moved"
+        );
         let first = member.count(&held, kimmy_storage::WalkScope::Request).unwrap();
         assert!(first > 2 && first < 2 + lost as u64, "part of the tail is back: {first}");
 

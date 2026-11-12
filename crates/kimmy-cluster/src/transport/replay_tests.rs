@@ -162,7 +162,7 @@ where
 /// Nothing: the hook point every scripted test starts from.
 async fn f_script(_stream: &mut tokio::io::DuplexStream, _f: &Fixture) {}
 
-async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
+async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Stamp> {
     write_frame(stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
         .await
         .unwrap();
@@ -170,6 +170,11 @@ async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
         Message::Vectors { replay_from, .. } => replay_from,
         other => panic!("{other:?}"),
     }
+}
+
+/// The replay position just after `hlc` on A's node, in every epoch.
+fn pos(f: &Fixture, hlc: Hlc) -> Stamp {
+    crate::catchup::replay_after(hlc, f.a.node_id())
 }
 
 /// An entry of A's origin above `hlc`, in a collection A has, to build pages by hand.
@@ -224,7 +229,7 @@ async fn an_armed_member_with_no_marker_asks() {
 async fn the_ask_is_made_only_while_armed_and_unanswered() {
     let f = fixture(5, 0);
     let c = f.c.node_id();
-    let cursor = f.catch_up.replay_from(c);
+    let cursor = f.catch_up.replay_from(c, f.a.node_id());
     scripted(&f, |mut stream| async move {
         assert_eq!(ask_versions(&mut stream).await, Some(cursor));
     })
@@ -251,7 +256,7 @@ async fn the_ask_is_made_only_while_armed_and_unanswered() {
 #[tokio::test]
 async fn pages_that_were_not_asked_for_are_refused() {
     let f = fixture(5, 0);
-    let from = f.catch_up.replay_from(f.c.node_id());
+    let from = f.catch_up.replay_from(f.c.node_id(), f.a.node_id());
     let refused_before = replay_counters().get(true, ReplayResult::Refused);
     // No ask on this connection.
     let r = scripted(&f, |mut stream| async move {
@@ -271,16 +276,16 @@ async fn pages_that_were_not_asked_for_are_refused() {
     .await;
     assert!(matches!(r, Err(ProtocolError::Malformed(_))), "{r:?}");
 
-    let at = |n: u64| Hlc::new(from.wall_ms + n, 0);
+    let at = |n: u64| Hlc::new(from.hlc.wall_ms + n, 0);
     let pages: Vec<(&str, Message)> = vec![
         (
             "a different start",
             Message::ReplayEntries {
-                from: at(1),
+                from: pos(&f, at(1)),
                 entries: Vec::new(),
                 exhausted: true,
                 horizon: false,
-                scanned_to: at(1),
+                scanned_to: pos(&f, at(1)),
             },
         ),
         (
@@ -290,7 +295,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 entries: vec![own_entry(&f, at(5), "a")],
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(4),
+                scanned_to: pos(&f, at(4)),
             },
         ),
         (
@@ -300,17 +305,17 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 entries: vec![own_entry(&f, at(5), "b"), own_entry(&f, at(4), "a")],
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(9),
+                scanned_to: pos(&f, at(9)),
             },
         ),
         (
             "at or below where it began",
             Message::ReplayEntries {
                 from,
-                entries: vec![own_entry(&f, from, "a")],
+                entries: vec![own_entry(&f, from.hlc, "a")],
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(9),
+                scanned_to: pos(&f, at(9)),
             },
         ),
         (
@@ -323,7 +328,43 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 }],
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(9),
+                scanned_to: pos(&f, at(9)),
+            },
+        ),
+        (
+            "the same start's HLC in another epoch",
+            Message::ReplayEntries {
+                from: Stamp { epoch: Epoch::ZERO, ..from },
+                entries: Vec::new(),
+                exhausted: true,
+                horizon: false,
+                scanned_to: pos(&f, at(9)),
+            },
+        ),
+        (
+            "two epochs at one HLC out of stamp order",
+            Message::ReplayEntries {
+                from,
+                entries: vec![
+                    own_entry(&f, at(5), "b"),
+                    OplogEntry {
+                        stamp: Stamp::new(at(5), f.a.node_id(), Epoch::ZERO),
+                        ..own_entry(&f, at(5), "a")
+                    },
+                ],
+                exhausted: false,
+                horizon: false,
+                scanned_to: pos(&f, at(9)),
+            },
+        ),
+        (
+            "scanned to another member's position",
+            Message::ReplayEntries {
+                from,
+                entries: vec![own_entry(&f, at(5), "a")],
+                exhausted: false,
+                horizon: false,
+                scanned_to: Stamp::new(at(9), NodeId::generate(), Epoch::ZERO),
             },
         ),
         (
@@ -335,7 +376,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                     .collect(),
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(MAX_BATCH as u64 + 9),
+                scanned_to: pos(&f, at(MAX_BATCH as u64 + 9)),
             },
         ),
     ];
@@ -348,7 +389,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
         assert!(matches!(r, Err(ProtocolError::Malformed(_))), "{what}: {r:?}");
         assert!(!f.catch_up.replay_answered(f.c.node_id()), "{what}: nothing is answered");
     }
-    assert!(replay_counters().get(true, ReplayResult::Refused) >= refused_before + 6);
+    assert!(replay_counters().get(true, ReplayResult::Refused) >= refused_before + 9);
 }
 
 /// **An empty page that is not the end answers nothing.** A budget cut or a batch
@@ -357,7 +398,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
 async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
     let f = fixture(5, 0);
     let c = f.c.node_id();
-    let from = f.catch_up.replay_from(c);
+    let from = f.catch_up.replay_from(c, f.a.node_id());
     scripted(&f, |mut stream| async move {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
@@ -407,7 +448,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
 async fn a_horizon_page_is_recorded_and_answers_nothing() {
     let f = fixture(5, 0);
     let c = f.c.node_id();
-    let from = f.catch_up.replay_from(c);
+    let from = f.catch_up.replay_from(c, f.a.node_id());
     scripted(&f, |mut stream| async move {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
@@ -536,17 +577,19 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
 #[test]
 fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
     use serde::Deserialize;
+    let node = NodeId::from_bytes([4; 16]);
+    let tied = Stamp::new(Hlc::new(4, 0), node, Epoch::new(Hlc::new(2, 0), [7; 8]));
     let frames = vec![
         Message::ReplayEntries {
-            from: Hlc::new(3, 1),
+            from: crate::catchup::replay_after(Hlc::new(3, 1), node),
             entries: Vec::new(),
             exhausted: true,
             horizon: false,
-            scanned_to: Hlc::new(3, 1),
+            scanned_to: Stamp::new(Hlc::new(3, 1), node, Epoch::from_u64(5)),
         },
-        Message::ReplayAck { next_from: Hlc::new(4, 0), done: false, stalled: None },
+        Message::ReplayAck { next_from: tied, done: false, stalled: None },
         Message::ReplayAck {
-            next_from: Hlc::new(4, 0),
+            next_from: tied,
             done: false,
             stalled: Some(ReplayStall::PurgePending),
         },
@@ -572,8 +615,11 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
         facts: None,
         facts_gen: None,
         echo: None,
-        replay_from: Some(Hlc::new(9, 0)),
+        replay_from: Some(tied),
     };
+    let back: Message =
+        bson::deserialize_from_document(bson::serialize_to_document(&with_ask).unwrap()).unwrap();
+    assert_eq!(back, with_ask, "the ask round-trips as the whole stamp");
     let doc = bson::serialize_to_document(&with_ask).unwrap();
     assert!(matches!(bson::deserialize_from_document::<Before>(doc), Ok(Before::Vectors { .. })));
     // A frame with no ask has no key at all.
@@ -598,12 +644,13 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
 }
 
 fn frames_page() -> Message {
+    let zero = Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]), Epoch::ZERO);
     Message::ReplayEntries {
-        from: Hlc::ZERO,
+        from: zero,
         entries: Vec::new(),
         exhausted: true,
         horizon: false,
-        scanned_to: Hlc::ZERO,
+        scanned_to: zero,
     }
 }
 
@@ -614,7 +661,7 @@ async fn an_ack_that_does_not_advance_ends_the_replay_for_the_contact() {
     // More than one page, so that a dialler that kept going would send a second.
     let f = fixture(MAX_BATCH as i64 * 2 + 5, 0);
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let from = Hlc::new(1, 0);
+    let from = crate::catchup::replay_after(Hlc::new(1, 0), f.a.node_id());
     // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
     let scripted = tokio::spawn(async move {
         let mut pages = 0usize;
@@ -658,7 +705,7 @@ async fn a_missing_ack_ends_the_contact_without_failing_it() {
         addr(),
         f.a.node_id(),
         &kimmy_core::VersionVector::default(),
-        Hlc::new(1, 0),
+        crate::catchup::replay_after(Hlc::new(1, 0), f.a.node_id()),
     )
     .await
     .unwrap();
@@ -725,9 +772,9 @@ fn the_replay_is_served_while_the_holders_writer_is_held() {
 fn applying_a_page_twice_and_at_once_is_safe() {
     let f = fixture(40, 0);
     let c = f.c.node_id();
-    let from = f.catch_up.replay_from(c);
+    let from = f.catch_up.replay_from(c, f.a.node_id());
     let window =
-        f.c.entries_for_peer(from, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
+        f.c.entries_for_peer(from.hlc, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
     let page: Vec<_> =
         window.entries.iter().filter(|e| e.stamp.node == f.a.node_id()).cloned().collect();
     assert!(!page.is_empty());
@@ -804,9 +851,11 @@ async fn a_holder_past_its_horizon_does_not_answer_the_replay() {
 async fn the_ack_names_the_cursor_the_page_reached() {
     let f = fixture(5, 0);
     let c = f.c.node_id();
-    let from = f.catch_up.replay_from(c);
-    let at = |n: u64| Hlc::new(from.wall_ms + n, 0);
+    let from = f.catch_up.replay_from(c, f.a.node_id());
+    let at = |n: u64| Hlc::new(from.hlc.wall_ms + n, 0);
     let page = vec![own_entry(&f, at(1), "p1"), own_entry(&f, at(2), "p2")];
+    let reached = pos(&f, at(2));
+    let last = page[1].stamp;
     scripted(&f, |mut stream| async move {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
@@ -816,14 +865,17 @@ async fn the_ack_names_the_cursor_the_page_reached() {
                 entries: page,
                 exhausted: false,
                 horizon: false,
-                scanned_to: at(2),
+                scanned_to: reached,
             },
         )
         .await
         .unwrap();
         match read_frame(&mut stream).await.unwrap() {
             Message::ReplayAck { next_from, done, stalled } => {
-                assert_eq!(next_from, at(2), "the ack names the last entry applied");
+                assert_eq!(
+                    next_from, last,
+                    "the ack names the last entry applied, its whole stamp"
+                );
                 assert!(!done && stalled.is_none());
             }
             other => panic!("{other:?}"),
@@ -845,10 +897,10 @@ async fn a_walk_cut_short_by_the_budget_still_finishes_over_contacts() {
     let mut contacts = 0;
     let mut advanced_each_time = true;
     while !f.catch_up.replay_answered(c) && contacts < 600 {
-        let before = f.catch_up.replay_from(c);
+        let before = f.catch_up.replay_from(c, f.a.node_id());
         f.round().await.unwrap();
         contacts += 1;
-        if !f.catch_up.replay_answered(c) && f.catch_up.replay_from(c) <= before {
+        if !f.catch_up.replay_answered(c) && f.catch_up.replay_from(c, f.a.node_id()) <= before {
             advanced_each_time = false;
         }
     }
@@ -939,7 +991,7 @@ async fn a_stop_during_the_serve_ends_the_contact_as_a_stop() {
     let f = fixture(10, 0);
     f.c.set_stopping();
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let from = f.catch_up.replay_from(f.c.node_id());
+    let from = f.catch_up.replay_from(f.c.node_id(), f.a.node_id());
     let served = serve_replay(
         &f.c,
         &mut ours,
@@ -967,20 +1019,30 @@ fn framed(doc: &bson::Document) -> Vec<u8> {
 /// the field, never the frame, and a later well-formed ask still reads.
 #[tokio::test]
 async fn a_malformed_replay_from_decodes_as_absent_through_the_real_decoder() {
+    let ask = Stamp::new(Hlc::new(9, 0), NodeId::from_bytes([4; 16]), Epoch::from_u64(3));
     let mut sent = bson::serialize_to_document(&Message::Vectors {
         servable: Default::default(),
         witnessed: Default::default(),
         facts: None,
         facts_gen: None,
         echo: None,
-        replay_from: Some(Hlc::new(9, 0)),
+        replay_from: Some(ask),
     })
     .unwrap();
+    let mut short_epoch = bson::serialize_to_document(&ask).unwrap();
+    short_epoch.insert(
+        "epoch",
+        bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1; 17] },
+    );
     for bad in [
         bson::Bson::String("not a position".into()),
         bson::Bson::Int32(7),
         bson::Bson::Document(bson::doc! { "wall_ms": "x" }),
         bson::Bson::Array(vec![]),
+        // An HLC alone, the form before a replay position was a stamp.
+        bson::serialize_to_bson(&Hlc::new(9, 0)).unwrap(),
+        // A stamp whose epoch is not 18 bytes.
+        bson::Bson::Document(short_epoch),
     ] {
         sent.get_document_mut("Vectors").unwrap().insert("replay_from", bad.clone());
         let bytes = framed(&sent);
@@ -993,11 +1055,11 @@ async fn a_malformed_replay_from_decodes_as_absent_through_the_real_decoder() {
     }
     sent.get_document_mut("Vectors")
         .unwrap()
-        .insert("replay_from", bson::serialize_to_bson(&Hlc::new(9, 0)).unwrap());
+        .insert("replay_from", bson::serialize_to_bson(&ask).unwrap());
     let bytes = framed(&sent);
     assert!(matches!(
         read_frame(&mut &bytes[..]).await.unwrap(),
-        Message::Vectors { replay_from: Some(h), .. } if h == Hlc::new(9, 0)
+        Message::Vectors { replay_from: Some(h), .. } if h == ask
     ));
 }
 
@@ -1022,10 +1084,10 @@ async fn a_frame_a_build_does_not_know_is_malformed_through_the_real_decoder() {
 async fn another_origins_collected_entries_do_not_put_the_replay_out_of_reach() {
     let f = fixture_with_tail(10, 0, 50);
     let c = f.c.node_id();
-    let backup_at = f.catch_up.replay_from(c);
+    let backup_at = f.catch_up.replay_from(c, f.a.node_id());
     // A cutoff between the third origin's entries (just after the backup) and the
     // member's lost writes (fifteen milliseconds later).
-    let now = backup_at.wall_ms + 6 + 1_000;
+    let now = backup_at.hlc.wall_ms + 6 + 1_000;
     f.c.collect_garbage_at(now, kimmy_storage::RetentionPolicy::new(1, 1)).unwrap();
     f.round().await.unwrap();
     assert!(f.catch_up.replay_answered(c), "answered, not put beyond the horizon");
@@ -1161,12 +1223,12 @@ impl tracing::Subscriber for Seen {
 async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     let f = fixture(10, 0);
     let c = f.c.node_id();
-    let from = f.catch_up.replay_from(c);
-    let at = |n: u64| Hlc::new(from.wall_ms + n, 0);
-    let pages: Vec<(Vec<OplogEntry>, bool, Hlc)> = vec![
-        ((1..=3).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, at(3)),
-        ((4..=6).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, at(6)),
-        ((7..=9).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), true, at(9)),
+    let from = f.catch_up.replay_from(c, f.a.node_id());
+    let at = |n: u64| Hlc::new(from.hlc.wall_ms + n, 0);
+    let pages: Vec<(Vec<OplogEntry>, bool, Stamp)> = vec![
+        ((1..=3).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, pos(&f, at(3))),
+        ((4..=6).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, pos(&f, at(6))),
+        ((7..=9).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), true, pos(&f, at(9))),
     ];
     let seen = Seen::default();
     let log = Arc::clone(&seen.0);
@@ -1220,18 +1282,18 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
 /// The serving side of the replay matches the asker **by node, across epochs**: the
 /// writes a restored member lost sit in its old epoch, while its vector also names
 /// the new one it writes under now. The server holds every other node's origins at
-/// `Hlc::MAX` and every epoch of the asker's node at `from`, so the page it serves
-/// holds exactly the asker's old-epoch writes and nothing of the third node's.
+/// `Hlc::MAX` and every epoch of the asker's node where `from` leaves it, so the page it
+/// serves holds exactly the asker's old-epoch writes and nothing of the third node's.
 ///
-/// What this test pins is the `held` vector: `ours` is read at transport.rs:2464 and
-/// every origin of another node is put at `Hlc::MAX` in `held` at transport.rs:2470, so
+/// What this test pins is the `held` vector: `ours` is read at transport.rs:2485 and
+/// every origin of another node is put at `Hlc::MAX` in `held` at transport.rs:2495, so
 /// with the node match broken there the old-epoch writes are not served.
 ///
 /// It does not reach the final `entry.stamp.node == their_node` filter on the served
-/// entries (transport.rs:2511), and that filter is **not** redundant. `ours` and the
+/// entries (transport.rs:2542), and that filter is **not** redundant. `ours` and the
 /// walk are separate reads: the version vector is read in its own read transaction
 /// (`Engine::read_versions`, kimmy-storage engine.rs:2903, which begins and ends within
-/// that call) and the walk of `serve_entries_to_peer` (transport.rs:2501) opens another
+/// that call) and the walk of `serve_entries_to_peer` (transport.rs:2526) opens another
 /// (kimmy-storage sync.rs:998, in `entries_for_peer_counting`). An entry of an origin
 /// that another contact applies to the server between the two is in the walk's snapshot
 /// and not in `held`, so only the filter keeps it off the page. A single-task test
@@ -1259,7 +1321,8 @@ async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_ot
     );
 
     let (mut server_end, mut client_end) = tokio::io::duplex(MAX_FRAME);
-    let serving = serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, from);
+    let asked = crate::catchup::replay_after(from, f.a.node_id());
+    let serving = serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, asked);
     let asking = async {
         let Message::ReplayEntries { entries, exhausted, horizon, scanned_to, .. } =
             read_frame(&mut client_end).await.unwrap()
@@ -1417,4 +1480,173 @@ async fn a_page_boundary_between_two_epochs_at_one_hlc_drops_neither_outbound() 
     assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts");
     let held: Vec<bool> = ids.iter().map(|id| f.holds(id)).collect();
     assert_eq!(held, [true, true], "both tied writes are back after {contacts} contacts");
+}
+
+/// A replay cursor leaves each epoch of its node where a window that ends `Through` it leaves it
+/// (`coverage_up_to`): an epoch at or before the cursor's read through its HLC, one after it
+/// through the HLC before, so the walk the `held` drives serves an entry of a later epoch at
+/// the cursor's HLC. The floor as a cursor holds every epoch at the floor.
+#[test]
+fn the_held_a_replay_cursor_names_is_the_coverage_of_a_window_through_it() {
+    let me = NodeId::from_bytes([5; 16]);
+    let epochs = [Epoch::from_u64(1), Epoch::from_u64(2), Epoch::from_u64(3)];
+    let tie = Hlc::new(1_000, 4);
+    let mut theirs = kimmy_core::VersionVector::new();
+    for epoch in epochs {
+        theirs.insert(kimmy_core::Origin::new(me, epoch), Hlc::new(2_000, 0));
+    }
+    for cursor in [
+        Stamp::new(tie, me, epochs[0]),
+        Stamp::new(tie, me, epochs[1]),
+        Stamp::new(tie, me, epochs[2]),
+        crate::catchup::replay_after(tie, me),
+    ] {
+        let window = kimmy_storage::sync::coverage_up_to(
+            &theirs,
+            kimmy_storage::sync::WindowEnd::Through(cursor),
+        );
+        for epoch in epochs {
+            let origin = kimmy_core::Origin::new(me, epoch);
+            assert_eq!(
+                replay_held_at(origin, cursor),
+                window.get(origin),
+                "{epoch:?} under the cursor {cursor:?}"
+            );
+            assert_eq!(
+                Stamp::new(tie, me, epoch) > cursor,
+                replay_held_at(origin, cursor) < tie,
+                "an entry at the cursor's HLC is served exactly when it is after the cursor"
+            );
+        }
+        assert!(holds_after(&theirs, cursor), "every epoch holds more above the tie");
+    }
+    let mut at_tie = kimmy_core::VersionVector::new();
+    at_tie.insert(kimmy_core::Origin::new(me, epochs[2]), tie);
+    assert!(holds_after(&at_tie, Stamp::new(tie, me, epochs[1])), "a later epoch at the tie");
+    assert!(!holds_after(&at_tie, Stamp::new(tie, me, epochs[2])), "read through it");
+    assert!(!holds_after(&at_tie, crate::catchup::replay_after(tie, me)));
+}
+
+/// **Decode is the trust boundary.** Every replay position on the wire is a whole stamp: a
+/// page or an ack whose position is not one (an HLC alone, an epoch of the wrong length) is
+/// refused by the real decoder as malformed, with nothing applied; it cannot reach the cursor.
+#[tokio::test]
+async fn a_replay_position_that_is_not_a_stamp_is_refused_by_the_decoder() {
+    let node = NodeId::from_bytes([4; 16]);
+    let at = Stamp::new(Hlc::new(9, 0), node, Epoch::from_u64(3));
+    let frames = [
+        (
+            "ReplayEntries",
+            "from",
+            Message::ReplayEntries {
+                from: at,
+                entries: Vec::new(),
+                exhausted: false,
+                horizon: false,
+                scanned_to: at,
+            },
+        ),
+        (
+            "ReplayEntries",
+            "scanned_to",
+            Message::ReplayEntries {
+                from: at,
+                entries: Vec::new(),
+                exhausted: false,
+                horizon: false,
+                scanned_to: at,
+            },
+        ),
+        (
+            "ReplayAck",
+            "next_from",
+            Message::ReplayAck { next_from: at, done: false, stalled: None },
+        ),
+    ];
+    for (variant, field, frame) in frames {
+        let good = bson::serialize_to_document(&frame).unwrap();
+        assert!(read_frame(&mut &framed(&good)[..]).await.is_ok(), "premise: {variant} reads");
+        let mut short_epoch = bson::serialize_to_document(&at).unwrap();
+        short_epoch.insert(
+            "epoch",
+            bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1; 17] },
+        );
+        for bad in [
+            bson::serialize_to_bson(&Hlc::new(9, 0)).unwrap(),
+            bson::Bson::Document(short_epoch),
+            bson::Bson::String("not a position".into()),
+        ] {
+            let mut sent = good.clone();
+            sent.get_document_mut(variant).unwrap().insert(field, bad.clone());
+            let read = read_frame(&mut &framed(&sent)[..]).await;
+            assert!(
+                matches!(read, Err(ProtocolError::Malformed(_))),
+                "{variant}.{field} = {bad:?}: {read:?}"
+            );
+        }
+    }
+}
+
+/// A replay position that decodes and names another member is refused where it is used: an
+/// ack of a page that names a position of another node than the one being served ends the
+/// serve as malformed, and so does an ask on `Vectors` for a replay of another node's origin.
+#[tokio::test]
+async fn a_replay_position_of_another_member_is_refused() {
+    let f = fixture(30, 0);
+    let from = crate::catchup::replay_after(Hlc::new(1, 0), f.a.node_id());
+    let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+    // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+    let scripted = tokio::spawn(async move {
+        if let Ok(Message::ReplayEntries { scanned_to, .. }) = read_frame(&mut theirs).await {
+            let elsewhere = Stamp { node: NodeId::from_bytes([8; 16]), ..scanned_to };
+            write_frame(
+                &mut theirs,
+                &Message::ReplayAck { next_from: elsewhere, done: false, stalled: None },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let served = serve_replay(
+        &f.c,
+        &mut ours,
+        addr(),
+        f.a.node_id(),
+        &kimmy_core::VersionVector::default(),
+        from,
+    )
+    .await;
+    drop(ours);
+    scripted.await.unwrap();
+    assert!(
+        matches!(&served, Err(ProtocolError::Malformed(why)) if why.contains("not the peer's own")),
+        "{served:?}"
+    );
+
+    // The ask: A's `Vectors` asks C for a replay from a position of a third node.
+    let (ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+    let third = Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([8; 16]), Epoch::ZERO);
+    // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+    let answering = tokio::spawn(async move {
+        while let Ok(frame) = read_frame(&mut theirs).await {
+            if let Message::AskVersions { .. } = frame {
+                let vectors = Message::Vectors {
+                    servable: Default::default(),
+                    witnessed: Default::default(),
+                    facts: None,
+                    facts_gen: None,
+                    echo: None,
+                    replay_from: Some(third),
+                };
+                write_frame(&mut theirs, &vectors).await.unwrap();
+            }
+        }
+    });
+    let mut stalls = PeerStalls::new();
+    let outcome = sync_over(&f.c, ours, addr(), f.a.node_id(), None, &mut stalls).await;
+    answering.await.unwrap();
+    assert!(
+        matches!(&outcome, Err(ProtocolError::Malformed(why)) if why.contains("not the peer's own")),
+        "{outcome:?}"
+    );
 }
