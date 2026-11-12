@@ -300,6 +300,67 @@ pub fn oracle(w: &mut World) -> Oracle {
 
 pub type Res = BTreeMap<String, i64>;
 
+/// The named classes of the product-route grid (the B1 classification and the manager's rulings) that a run's problems fall in,
+/// and the problems no class explains (a failure). Every class is defined by a structural marker, not by its symptom alone:
+/// - `DF-1` (open design finding, atomicity): a partial flip in a run where a member treated as a loser an entry superseded only
+///   by a version it does not cover (`cnt_df1_loser_superseded_by_uncovered`); explains `inv_partial_flip`.
+/// - `DF-2` (open design finding, convergence): a live member holds state above its coverage behind a permanently lost entry on a
+///   physical outside HB-2's set (`cnt_df2_held_above_coverage_behind_lost`); explains the divergence and oracle-state checks.
+/// - `O-F1` (open item, `field` only; the model of record has no field policy): `q7_records_diverged`, and a missing head with its
+///   record/event-count invariants. Printed and counted, never passed silently.
+///
+/// HB-2 is not here: the oracle excludes it by name (`cnt_hb2_excluded`).
+pub fn product_classes(res: &Res, field: bool) -> (Vec<&'static str>, Vec<String>) {
+    let on = |k: &str| res.get(k).copied().unwrap_or(0) != 0;
+    let mut classes = Vec::new();
+    let mut explained: BTreeSet<&str> = BTreeSet::new();
+    if on("inv_partial_flip") && on("cnt_df1_loser_superseded_by_uncovered") {
+        classes.push("DF-1");
+        explained.insert("inv_partial_flip");
+    }
+    let df2_keys = [
+        "diverged",
+        "div_state",
+        "div_replay",
+        "div_replay_interleaved",
+        "oracle_state",
+        "served_mismatch",
+        "alive_mismatch",
+    ];
+    // (a class is counted only for a run where it explains a problem)
+    if on("cnt_df2_held_above_coverage_behind_lost") && df2_keys.iter().any(|k| on(k)) {
+        classes.push("DF-2");
+        explained.extend(df2_keys);
+    }
+    if field
+        && ["q7_records_diverged", "loss_missing", "inv_head_not_exactly_one_record_and_event"]
+            .iter()
+            .any(|k| on(k))
+    {
+        classes.push("O-F1");
+        explained.extend([
+            "q7_records_diverged",
+            "loss_missing",
+            "loss_mismatch",
+            "inv_head_not_exactly_one_record_and_event",
+            "inv_vanish_replicated_late_write_not_exactly_one_record_and_event",
+        ]);
+    }
+    let mut s = crate::run::Summary::default();
+    s.add(0, res);
+    let p = s.problems();
+    let all_inv_explained =
+        p.keys().filter(|k| k.starts_with("inv_")).all(|k| explained.contains(k.as_str()));
+    let residual: Vec<String> = p
+        .keys()
+        .filter(|k| {
+            !explained.contains(k.as_str()) && !(k.as_str() == "invariant" && all_inv_explained)
+        })
+        .cloned()
+        .collect();
+    (classes, residual)
+}
+
 /// HB-2's structural set (B1 classification; a HARNESS class, the manager's ruling): on the product routes, the stages that
 /// - were created by a writer that has vanished (its create is in the write log, its member is gone for good),
 /// - have no valid binding anywhere in the write log (never validly bound: D9's rule, a pure function of the stamps), and
@@ -480,6 +541,37 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let hb2 = hb2_stages(w, ms);
     res.insert("cnt_hb2_stages".into(), hb2.len() as i64);
     let m0p = without(&m0state, &hb2);
+    // DF-2's structural marker (B1 classification, an open design finding): a live member holds, in a physical outside HB-2's
+    // set, a document version whose entry it does not cover, and an entry of that origin at or below it is lost for good
+    let mut df2 = 0;
+    for &i in &live {
+        let m = &ms[i];
+        for (n, p) in m.phys.iter().filter(|(n, p)| p.alive && !hb2.contains(*n)) {
+            for (k, v) in p.docs.iter() {
+                // the writes the version holds: `document`, the entry of its stamp; `field`, every writer of its version vector up
+                // to the HLC merged (the state holds those writes, whichever entry carried them)
+                let mut held: Vec<(usize, i64)> = Vec::new();
+                if let Some(st) = &v.state {
+                    for (wid, h) in st.vv.iter() {
+                        let o = wid.node.to_bytes()[0].wrapping_sub(b'A') as usize;
+                        if o < w.by_origin.len() {
+                            held.push((o, h.wall_ms as i64));
+                        }
+                    }
+                } else if let Some(&id) = w.rec_index.get(&(n.clone(), *k, v.stamp)) {
+                    held.push((w.ent(id).origin, w.ent(id).hlc));
+                }
+                for (o, h) in held {
+                    if !m.covers(w, o, h)
+                        && w.by_origin[o].iter().any(|&x| w.lost.contains(&x) && w.ent(x).hlc <= h)
+                    {
+                        df2 += 1;
+                    }
+                }
+            }
+        }
+    }
+    res.insert("cnt_df2_held_above_coverage_behind_lost".into(), df2);
     let replay_bad = |st: &State, recs: &HashSet<HeadKey>, m0: &State| {
         *st != *m0
             || heads.iter().any(|h| !recs.contains(h))
@@ -867,6 +959,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "held_behind_held",
         "held_released_in_window",
         "held_kept_unservable",
+        "df1_loser_superseded_by_uncovered",
         "page_carries_held_state",
         "doc_repair",
         "route_carries_q6_kind",
