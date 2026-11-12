@@ -285,6 +285,13 @@ impl Member {
         let wins = cur.is_none_or(|c| e.stamp >= c); // an equal stamp is the same entry, held as a snapshot's state
         let held_state = p.missing
             || cur.is_some_and(|c| self.held_records.contains(&(e.phys.clone(), e.key, c)));
+        let loser_by_uncovered = !wins
+            && !(f.append_in_position && held_state)
+            && w.held_uncovered
+            && cur.is_some_and(|c| self.superseded_by_uncovered(w, &e.phys, e.key, c));
+        if loser_by_uncovered {
+            w.stats.bump("df1_loser_superseded_by_uncovered");
+        }
         self.apply_doc_orig(w, e);
         if wins {
             self.appended.insert(e.idx);
@@ -299,12 +306,23 @@ impl Member {
         }
     }
 
+    /// DF-1's structural marker (B1 classification, an open design finding): the version that supersedes an arriving entry is
+    /// one this member does not cover (held above its coverage: a held document entry not yet released, or a page version whose
+    /// entry is not covered), so the arriving entry is treated as a loser on the strength of a version the member does not cover.
+    pub fn superseded_by_uncovered(&self, w: &World, phys: &str, key: u32, stamp: Stamp) -> bool {
+        match w.rec_index.get(&(phys.to_string(), key, stamp)) {
+            Some(&i) => !self.covers(w, w.ent(i).origin, w.ent(i).hlc),
+            None => false,
+        }
+    }
+
     /// The `field` policy: the entry's state is joined into the document's (Q7 D11: "if unchanged only witness"); the entry
     /// is appended iff the join changed the state, or (the gap-1 analogue) iff the state of an unfinished join's pages
     /// already covers it; the covered-entry skip decides "witnessed only" before the join.
     fn apply_doc_field(&mut self, w: &mut World, e: &EntryRef) {
         let f = w.f;
         let p = self.phys.get(&e.phys).expect("the physical is alive here");
+        let cur_stamp = p.docs.get(&e.key).map(|v| v.stamp);
         let mut a = crate::field::apply_entry(
             p.docs.get(&e.key),
             e,
@@ -330,6 +348,15 @@ impl Member {
         if !e.staging {
             self.dochist.insert(e.idx); // m1: retained while the physical is alive here
             self.check_late(w, e);
+        }
+        if !(a.changed
+            || f.fm_always_append
+            || a.same_write
+            || (f.append_in_position && a.held_state))
+            && w.held_uncovered
+            && cur_stamp.is_some_and(|c| self.superseded_by_uncovered(w, &e.phys, e.key, c))
+        {
+            w.stats.bump("df1_loser_superseded_by_uncovered");
         }
         if a.changed || f.fm_always_append {
             self.appended.insert(e.idx);

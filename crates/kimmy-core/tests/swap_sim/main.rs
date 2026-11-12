@@ -581,10 +581,19 @@ mod tests {
     /// assertion that no register event is ever taken out of position (`register_event_out_of_position`, invariant (ii)) is part
     /// of the invariants (the routes keep `w.in_order`). The mutant `m-register-ahead` (`doc_hold` also delivers register events
     /// ahead of their position) trips it.
+    ///
+    /// THE GRID IS ASSERTED (B1): every run with a problem falls in a named class (`oracle::product_classes`) or the test fails:
+    /// - DF-1 and DF-2, open design findings under review, are EXPECTED classes, each with a pinning test in `classes.rs` that
+    ///   fails once the class disappears (then the pin becomes a required-zero);
+    /// - O-F1 (`field` only: the record-set and head classes the model of record cannot judge) is an OPEN ITEM, printed and
+    ///   counted here, never passed silently;
+    /// - HB-2 is excluded by the oracle by name and counted (`cnt_hb2_excluded`); HB-1 is fixed.
     #[test]
     fn the_product_routes_keep_register_events_in_position_on_both_policies() {
         let seeds = env_u64("Q6_PRODUCT_RUNS", 20);
         let mut total = 0;
+        let mut residual_all: Vec<String> = Vec::new();
+        let mut totals: std::collections::BTreeMap<String, i64> = Default::default();
         for policy in [crate::world::Policy::Document, crate::world::Policy::Field] {
             for (doc_hold, doc_repair) in [(true, false), (false, true), (true, true)] {
                 for f in [0.3, 0.1] {
@@ -599,15 +608,18 @@ mod tests {
                             doc_repair,
                         });
                     }
-                    let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
+                    let (s, classes, residual) =
+                        crate::run::run_grid_classified("v6", &cfgs, 0, seeds, threads());
                     let p = s.problems();
                     eprintln!(
-                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; HB-2 excluded (runs) {}; problems {:?}",
+                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; HB-2 excluded (runs) {}; classes (runs) {:?}; UNCLASSIFIED runs {}; problems {:?}",
                         s.runs,
                         s.get("cnt_doc_hold_taken"),
                         s.get("cnt_doc_repair"),
                         s.get("cnt_register_event_out_of_position"),
                         s.get("cnt_hb2_excluded"),
+                        classes,
+                        residual.len(),
                         p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
                     );
                     if doc_hold {
@@ -622,12 +634,30 @@ mod tests {
                     // R1: neither route carries a Q6 kind
                     assert_eq!(s.get("cnt_route_carries_q6_kind"), 0);
                     assert_eq!(s.get("inv_route_carries_q6_kind"), 0);
-                    // FINDING F-G-1 (report 2): the rest is not clean when `doc_hold` is on; printed above, not asserted
+                    *totals.entry("HB-2 excluded".into()).or_insert(0) += s.get("cnt_hb2_excluded");
+                    for (k, v) in classes {
+                        *totals.entry(k).or_insert(0) += v;
+                    }
+                    residual_all.extend(residual);
                     total += s.runs;
                 }
             }
         }
-        eprintln!("product routes: {total} runs");
+        eprintln!("product routes: {total} runs; named classes (runs): {totals:?}");
+        if totals.get("O-F1").copied().unwrap_or(0) > 0 {
+            eprintln!(
+                "OPEN ITEM O-F1 (field only, unclassified: the model of record has no field policy): {} runs, listed in the class counts above",
+                totals["O-F1"]
+            );
+        }
+        for r in &residual_all {
+            eprintln!("  UNCLASSIFIED {r}");
+        }
+        assert!(
+            residual_all.is_empty(),
+            "{} product-route run(s) with a problem no named class explains: {residual_all:#?}",
+            residual_all.len()
+        );
     }
 
     /// `m-register-ahead` trips the assertion on the product routes (and so has teeth).

@@ -153,6 +153,73 @@ mod tests {
         }
     }
 
+    /// The named classes of one run (`oracle::product_classes`).
+    fn classes_of(r: &crate::run::RunOut, pol: Policy) -> (Vec<&'static str>, Vec<String>) {
+        crate::oracle::product_classes(&r.res, pol == Policy::Field)
+    }
+
+    /// PIN of DF-1 (open design finding, UNDER REVIEW: atomicity, a partial flip on the product-shaped document routes: a member
+    /// treats as a loser an entry superseded only by a version it does not cover). The class must OCCUR on each listed seed, with
+    /// nothing else unexplained. This pin FAILS LOUDLY once the class disappears: when the design rule lands, convert it to a
+    /// required-zero (and drop DF-1 from `oracle::product_classes`, so the grid fails on it).
+    #[test]
+    fn df1_pin_the_partial_flip_class_occurs_on_its_seeds() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "DF-1") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!(
+                "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: classes {classes:?} residual {residual:?}"
+            );
+            assert!(
+                classes.contains(&"DF-1"),
+                "DF-1 DISAPPEARED at seed {seed} {mok:?} dh {dh} dr {dr} f {f}: convert this pin to a required-zero and drop the \
+                 class from oracle::product_classes ({:?})",
+                nonzero_problems(&r)
+            );
+            assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");
+        }
+    }
+
+    /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
+    /// entry on a served collection). As DF-1's pin: the class must occur on each listed seed and the pin fails loudly once it
+    /// disappears.
+    #[test]
+    fn df2_pin_the_stranded_held_state_class_occurs_on_its_seeds() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "DF-2") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!(
+                "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: classes {classes:?} residual {residual:?}"
+            );
+            assert!(
+                classes.contains(&"DF-2"),
+                "DF-2 DISAPPEARED at seed {seed} {mok:?} dh {dh} dr {dr} f {f}: convert this pin to a required-zero and drop the \
+                 class from oracle::product_classes ({:?})",
+                nonzero_problems(&r)
+            );
+            assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");
+        }
+    }
+
+    /// O-F1 (open item, `field` only; the model of record has no field policy): its seeds are counted as O-F1, never clean and never
+    /// unexplained; a change in either direction fails here.
+    #[test]
+    fn of1_the_field_only_classes_stay_counted_as_an_open_item() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "O-F1") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!(
+                "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: classes {classes:?} residual {residual:?}"
+            );
+            assert!(
+                classes.contains(&"O-F1"),
+                "O-F1 is gone at seed {seed}: report it ({:?})",
+                nonzero_problems(&r)
+            );
+            assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");
+        }
+    }
+
     /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
     #[test]
     #[ignore = "debug aid: Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed prints one product-route run"]

@@ -645,3 +645,62 @@ pub fn run_grid(
     });
     out.into_inner().unwrap()
 }
+
+/// The product-route grid with every run classified (`oracle::product_classes`): the summary, the runs per named class, and every
+/// run with a problem no class explains (`<cfg> seed <s>: <residual>`).
+pub fn run_grid_classified(
+    mode: &str,
+    cfgs: &[Cfg],
+    seed0: u64,
+    seeds: u64,
+    threads: usize,
+) -> (Summary, BTreeMap<String, i64>, Vec<String>) {
+    let jobs: Vec<(Cfg, u64)> =
+        cfgs.iter().flat_map(|c| (seed0..seed0 + seeds).map(move |s| (*c, s))).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new((Summary::default(), BTreeMap::new(), Vec::new()));
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| {
+                let mut local =
+                    (Summary::default(), BTreeMap::<String, i64>::new(), Vec::<String>::new());
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= jobs.len() {
+                        break;
+                    }
+                    let (c, s) = jobs[i];
+                    let r = run(mode, "v6", s, c, false);
+                    local.0.add(s, &r.res);
+                    let (classes, residual) =
+                        crate::oracle::product_classes(&r.res, c.policy == Policy::Field);
+                    for k in classes {
+                        *local.1.entry(k.to_string()).or_insert(0) += 1;
+                    }
+                    if !residual.is_empty() {
+                        let rt = c.routes.unwrap_or(Routes {
+                            f: 0.0,
+                            hold: false,
+                            repair: false,
+                            doc_hold: false,
+                            doc_repair: false,
+                        });
+                        local.2.push(format!(
+                            "{:?} {}/{}/{} doc_hold {} doc_repair {} f {} seed {s}: {residual:?}",
+                            c.policy, c.members, c.outs, c.keys, rt.doc_hold, rt.doc_repair, rt.f
+                        ));
+                    }
+                }
+                let mut o = out.lock().unwrap();
+                o.0.merge(&local.0);
+                for (k, v) in local.1 {
+                    *o.1.entry(k).or_insert(0) += v;
+                }
+                o.2.extend(local.2);
+            });
+        }
+    });
+    let (s, c, mut r) = out.into_inner().unwrap();
+    r.sort();
+    (s, c, r)
+}

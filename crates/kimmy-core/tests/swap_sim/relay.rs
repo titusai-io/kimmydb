@@ -109,7 +109,8 @@ impl Member {
             self.held_oop.insert(e.idx);
         }
         self.take(w, e);
-        if behind {
+        // (released already if the `settle` inside `take` released its predecessors: then it stays released)
+        if behind && (w.f.fm_held_witness || self.held_oop.contains(&e.idx)) {
             self.appended.remove(&e.idx);
             self.held_oop.insert(e.idx);
             w.stats.bump("held_behind_held");
