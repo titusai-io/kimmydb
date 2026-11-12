@@ -3855,7 +3855,7 @@ pub(crate) mod tests {
             .read_oplog_from(Hlc::ZERO, 1, kimmy_storage::WalkScope::Background)
             .unwrap()
             .remove(0);
-        let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
+        let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.origin());
         engine.put_consumer_position(CONSUMER, stale.clone()).unwrap();
         let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
         engine
@@ -3916,7 +3916,7 @@ pub(crate) mod tests {
         let (engine, _coll, _worker, _dir) = setup().await;
         assert!(engine.consumer_position(CONSUMER).unwrap().is_none());
 
-        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
+        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.origin());
         engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
         assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
     }
@@ -4308,7 +4308,7 @@ pub(crate) mod tests {
     fn the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait() {
         let wait = Duration::from_millis(100);
         let now = Instant::now();
-        let node = kimmy_core::NodeId::generate();
+        let node = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
         let token = kimmy_core::ResumeToken::new(Hlc::new(1, 1), node);
 
         let mut pending = Pending::default();
@@ -4371,7 +4371,7 @@ pub(crate) mod tests {
             assert!(!pending.push(item, now, &worker.batching), "the batch is not full");
         }
         let latest = last_entry(engine);
-        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         pending.hold(token.clone(), now);
         (pending, token)
     }
@@ -4469,7 +4469,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_held_position_with_no_batch_is_still_one_commit() {
         let (engine, _coll, mut worker, _dir) = setup().await;
-        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
+        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.origin());
         let mut pending = Pending::default();
         pending.hold(token.clone(), Instant::now());
 
@@ -4754,7 +4754,7 @@ pub(crate) mod tests {
     /// finds it all already on disk, back to back, as a backlog is.
     fn position_at_latest(engine: &Engine) {
         let latest = last_entry(engine);
-        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
     }
 
@@ -5623,7 +5623,7 @@ pub(crate) mod tests {
             written.push(id);
         }
         let latest = last_entry(engine);
-        pending.hold(kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node), now);
+        pending.hold(kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin()), now);
         written
     }
 
@@ -5987,7 +5987,7 @@ pub(crate) mod tests {
             .map(|i| engine.insert(&a, doc! { "_id": i as i64, "title": "late" }).unwrap())
             .collect();
         let latest = last_entry(&engine);
-        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         let running = tokio::spawn(async move { worker.run().await });
 
         let landed = |engine: &Engine| {
@@ -6278,7 +6278,7 @@ pub(crate) mod tests {
             ids_b.push(engine.insert(&b, doc! { "_id": i as i64, "title": "lands" }).unwrap());
         }
         let latest = last_entry(&engine);
-        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         let running = tokio::spawn(async move { worker.run().await });
 
         let moved = |engine: &Engine| {

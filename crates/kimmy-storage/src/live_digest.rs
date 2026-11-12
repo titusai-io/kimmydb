@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use kimmy_core::{Hlc, NodeId, Stamp};
+use kimmy_core::{Hlc, Origin, Stamp};
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::error::{Result, StorageError};
@@ -38,7 +38,7 @@ use crate::tables;
 /// The digest format: what is hashed, and how a row is laid out. A build that
 /// changes either changes this, which moves the mark, so rows written under
 /// the old format are rebuilt rather than trusted.
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = 2;
 
 /// The key of the digest mark in [`tables::LIVE_DIGESTS_THROUGH`].
 pub(crate) const THROUGH: &str = "arrival";
@@ -47,7 +47,7 @@ pub(crate) const THROUGH: &str = "arrival";
 pub(crate) const WALK: &str = "walk";
 
 /// The row layout's own version.
-const ROW_VERSION: u8 = 1;
+const ROW_VERSION: u8 = 2;
 
 /// A collection's cut digest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -55,10 +55,10 @@ pub struct DigestRow {
     /// The XOR of [`term`] over the live records.
     pub digest: u128,
     /// The highest record stamp per origin, live or tombstone. Never falls.
-    pub maxw: BTreeMap<NodeId, Hlc>,
+    pub maxw: BTreeMap<Origin, Hlc>,
     /// The highest stamp per origin of a tombstone written with no oplog entry
     /// behind it.
-    pub bare_max: BTreeMap<NodeId, Hlc>,
+    pub bare_max: BTreeMap<Origin, Hlc>,
 }
 
 impl DigestRow {
@@ -79,22 +79,22 @@ impl DigestRow {
 
     /// Merge `other`'s highest stamps into this row's.
     fn raise_from(&mut self, other: &DigestRow) {
-        for (node, hlc) in &other.maxw {
-            raise(&mut self.maxw, &Stamp::new(*hlc, *node));
+        for (origin, hlc) in &other.maxw {
+            raise(&mut self.maxw, &Stamp::new(*hlc, origin.node, origin.epoch));
         }
-        for (node, hlc) in &other.bare_max {
-            raise(&mut self.bare_max, &Stamp::new(*hlc, *node));
+        for (origin, hlc) in &other.bare_max {
+            raise(&mut self.bare_max, &Stamp::new(*hlc, origin.node, origin.epoch));
         }
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 16 + 2 + 26 * (self.maxw.len() + self.bare_max.len()));
+        let mut out = Vec::with_capacity(1 + 16 + 2 + 44 * (self.maxw.len() + self.bare_max.len()));
         out.push(ROW_VERSION);
         out.extend_from_slice(&self.digest.to_be_bytes());
         for map in [&self.maxw, &self.bare_max] {
             out.extend_from_slice(&(map.len() as u16).to_be_bytes());
-            for (node, hlc) in map {
-                out.extend_from_slice(&node.to_bytes());
+            for (origin, hlc) in map {
+                out.extend_from_slice(&origin.to_bytes());
                 out.extend_from_slice(&hlc.to_bytes());
             }
         }
@@ -111,9 +111,11 @@ impl DigestRow {
         for map in &mut maps {
             let n = u16::from_be_bytes(take(&mut input, 2)?.try_into().expect("2 bytes"));
             for _ in 0..n {
-                let node = NodeId::from_bytes(take(&mut input, 16)?.try_into().expect("16 bytes"));
+                let origin = Origin::from_bytes(
+                    take(&mut input, Origin::LEN)?.try_into().expect("an origin's bytes"),
+                );
                 let hlc = Hlc::from_bytes(take(&mut input, 10)?.try_into().expect("10 bytes"));
-                map.insert(node, hlc);
+                map.insert(origin, hlc);
             }
         }
         if !input.is_empty() {
@@ -133,21 +135,22 @@ fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     Ok(head)
 }
 
-fn raise(map: &mut BTreeMap<NodeId, Hlc>, stamp: &Stamp) {
-    let slot = map.entry(stamp.node).or_insert(Hlc::ZERO);
+fn raise(map: &mut BTreeMap<Origin, Hlc>, stamp: &Stamp) {
+    let slot = map.entry(stamp.origin()).or_insert(Hlc::ZERO);
     if stamp.hlc > *slot {
         *slot = stamp.hlc;
     }
 }
 
 /// The term one live record contributes to its collection's digest:
-/// `xxh3_128(key || stamp)`, over the record's key. The stamp is fixed width and
-/// last, so the pair encodes unambiguously.
+/// `xxh3_128(key || stamp)`, over the record's key, the stamp being its full
+/// 44-byte key form `hlc || node || epoch`. The stamp is fixed width and
+/// last, so the pair encodes unambiguously. It is the resolved stamp, never a
+/// store-local value: two members must hash the same bytes for the same write.
 pub fn term(key: &[u8], stamp: &Stamp) -> u128 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     hasher.update(key);
-    hasher.update(&stamp.hlc.to_bytes());
-    hasher.update(&stamp.node.to_bytes());
+    hasher.update(&stamp.to_key_bytes());
     hasher.digest128()
 }
 
@@ -321,13 +324,15 @@ pub(crate) fn fold_walked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
+    use kimmy_core::NodeId;
 
     fn k(bytes: &[u8]) -> Vec<u8> {
         bytes.to_vec()
     }
 
     fn stamp(wall: u64, node: u8) -> Stamp {
-        Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]))
+        Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO)
     }
 
     #[test]
@@ -354,8 +359,17 @@ mod tests {
         assert_ne!(base, term(&k(b"j"), &stamp(5, 1)));
         assert_ne!(base, term(&k(b"k"), &stamp(6, 1)));
         assert_ne!(base, term(&k(b"k"), &stamp(5, 2)));
-        assert_ne!(base, term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]))));
+        assert_ne!(
+            base,
+            term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]), Epoch::ZERO))
+        );
         assert_eq!(base, term(&k(b"k"), &stamp(5, 1)));
+        // the epoch is part of the stamp: the same write by another epoch of the node is
+        // another write (a restored member's new writes must not hash like the lost ones)
+        let at_epoch = |epoch: u64| {
+            Stamp::new(Hlc::new(5, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(epoch))
+        };
+        assert_ne!(term(&k(b"k"), &at_epoch(1)), term(&k(b"k"), &at_epoch(2)));
         // The stamp is fixed width and last: moving a byte between the key
         // and the stamp cannot give the same input.
         assert_ne!(term(&k(b"ab"), &stamp(5, 1)), term(&k(b"a"), &stamp(5, 1)));
@@ -379,7 +393,42 @@ mod tests {
         let mut row = DigestRow::default();
         row.raise_maxw(&stamp(9, 1));
         row.raise_maxw(&stamp(3, 1));
-        assert_eq!(row.maxw[&NodeId::from_bytes([1; 16])], Hlc::new(9, 0));
+        assert_eq!(
+            row.maxw
+                [&kimmy_core::Origin::new(NodeId::from_bytes([1; 16]), kimmy_core::Epoch::ZERO)],
+            Hlc::new(9, 0)
+        );
+    }
+
+    /// A node's epochs are separate origins in the row: one entry each, in origin order,
+    /// and they survive the row's encoding.
+    #[test]
+    fn two_epochs_of_one_node_are_two_entries_of_the_row() {
+        let at = |wall: u64, epoch: u64| {
+            Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(epoch))
+        };
+        let mut row = DigestRow::default();
+        row.raise_maxw(&at(9, 2));
+        row.raise_maxw(&at(3, 1));
+        row.raise_bare(&at(4, 2));
+        assert_eq!(row.maxw.len(), 2);
+        assert_eq!(row.maxw[&at(3, 1).origin()], Hlc::new(3, 0));
+        assert_eq!(row.maxw[&at(9, 2).origin()], Hlc::new(9, 0));
+        let bytes = row.encode();
+        // version, digest, then per map a u16 count and 44 bytes an entry
+        assert_eq!(bytes.len(), 1 + 16 + (2 + 2 * 44) + (2 + 44));
+        assert_eq!(DigestRow::decode(&bytes).unwrap(), row);
+    }
+
+    /// The digest changed under this format: its terms hash the 44-byte stamp and its rows
+    /// hold origins, so a store of the earlier format is rebuilt, not trusted.
+    #[test]
+    fn the_format_and_the_row_version_moved_with_the_stamp() {
+        assert_eq!(FORMAT, 2);
+        assert_eq!(ROW_VERSION, 2);
+        let mut old = DigestRow::default().encode();
+        old[0] = 1;
+        assert!(DigestRow::decode(&old).is_err(), "a row of the earlier version is refused");
     }
 
     #[test]

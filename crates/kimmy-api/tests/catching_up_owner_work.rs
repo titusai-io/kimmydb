@@ -245,9 +245,9 @@ fn into_owed_replay(catch_up: &CatchUp) {
     members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
     let live = members.node_ids();
     let mut servable = VersionVector::new();
-    servable.insert(b, Hlc::new(100, 0));
+    servable.insert(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO), Hlc::new(100, 0));
     let mut mine = servable.clone();
-    mine.insert(me, Hlc::new(200, 0));
+    mine.insert(kimmy_core::Origin::new(me, kimmy_core::Epoch::ZERO), Hlc::new(200, 0));
     let reached =
         [Reached { node: b, servable, witnessed: kimmy_core::VersionVector::new(), facts: None }];
     let t0 = std::time::Instant::now();

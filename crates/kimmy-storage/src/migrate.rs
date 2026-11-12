@@ -27,14 +27,21 @@ use crate::tables;
 /// through.** A schema-6 store holds index entries for documents the new rule
 /// files unkeyed, and a later write to one would leave them behind. Nothing
 /// rewrites them: this build refuses a schema-6 store and backup by name.
-pub const SCHEMA_VERSION: u8 = 7;
+///
+/// **8 (Q7 step 1) puts the epoch in the stamp.** A stamp is `(hlc, node, epoch)`, 44 bytes in
+/// every key and value that held 26, and the version vectors, the tables behind them, the
+/// digest rows, the resume tokens and the rewind record are keyed by origin (node and epoch).
+/// The `OPLOG` value no longer carries its stamp, and a new `epoch` META row holds the member's
+/// current epoch. Nothing rewrites an older store: this build refuses a schema-7 store and
+/// backup by name.
+pub const SCHEMA_VERSION: u8 = 8;
 
 /// What a refusal of a store or backup of an older schema tells the operator.
 pub(crate) fn no_upgrade() -> String {
     format!(
         "{} does not upgrade stores; stop every member, wipe this data directory, start on an \
          empty one and reseed.",
-        kimmy_core::build::SCHEMA_7_RELEASE
+        kimmy_core::build::SCHEMA_8_RELEASE
     )
 }
 
@@ -306,7 +313,7 @@ mod tests {
             Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                 assert!(why.contains("0.57.0"), "{why}");
                 assert!(why.contains("storage schema 6"), "{why}");
-                assert!(why.contains("0.58.0 does not upgrade stores"), "{why}");
+                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a schema 6 store"),
@@ -357,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         drop(Engine::open(&path).unwrap());
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
         let db = Database::create(&path).unwrap();
         assert_eq!(stored_version(&db).unwrap(), Some(SCHEMA_VERSION));
     }

@@ -5,6 +5,7 @@
 //! the signature a receiver has to verify, the headers it reads, whether the
 //! egress policy lets it out at all — only exists on the wire.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1161,9 +1162,9 @@ async fn progress_from_a_peer_that_is_ahead_does_not_invalidate_this_node() {
         .create_system_collection("__kimmy", "__webhook_progress")
         .unwrap_or_else(|_| state.engine.get_collection("__kimmy", "__webhook_progress").unwrap());
     let mut delivered = bson::Document::new();
-    for node in [peer, state.engine.node_id()] {
+    for origin in [kimmy_core::Origin::new(peer, kimmy_core::Epoch::ZERO), state.engine.origin()] {
         delivered.insert(
-            node.to_string(),
+            origin.to_string(),
             bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: ahead.to_bytes().to_vec(),
@@ -1246,7 +1247,7 @@ fn foreign(
     n: i64,
 ) -> kimmy_core::OplogEntry {
     kimmy_core::OplogEntry {
-        stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), origin),
+        stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), origin, Epoch::ZERO),
         kind: kimmy_core::OpKind::Insert,
         collection,
         doc_id: Some(kimmy_core::DocId::Int64(n)),
@@ -1268,7 +1269,7 @@ fn progress_covering(
     let mut delivered = bson::Document::new();
     for (node, through) in covered {
         delivered.insert(
-            node.to_string(),
+            kimmy_core::Origin::new(*node, kimmy_core::Epoch::ZERO).to_string(),
             bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: through.to_bytes().to_vec(),
@@ -1460,7 +1461,7 @@ async fn sparse_wanted_entries_among_another_origins_history_do_not_pin_the_scan
     // wanted in the window was raised with the rest, so the next scan starts past it.
     let progress = dispatch::union_progress(&state, &id).unwrap();
     assert!(
-        progress.get(z) > kimmy_core::Hlc::ZERO,
+        progress.get(kimmy_core::Origin::new(z, kimmy_core::Epoch::ZERO)) > kimmy_core::Hlc::ZERO,
         "the origin with nothing wanted in it was raised with the rest"
     );
     // Three windows hold the 600 entries; one pass each, and one to spare.

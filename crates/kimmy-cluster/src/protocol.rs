@@ -53,7 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The cluster protocol this build speaks. Every member must run one
 /// release: a `Hello` or `Welcome` that does not name this protocol is refused
 /// ([`release_fault`]).
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// What a member says to a peer whose handshake named `theirs` instead of
 /// [`PROTOCOL`], naming both.
@@ -64,7 +64,7 @@ pub fn release_fault(theirs: Option<u32>) -> String {
     };
     format!(
         "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}); the peer speaks {peer}; every member must run one release",
-        kimmy_core::build::SCHEMA_6_RELEASE
+        kimmy_core::build::SCHEMA_8_RELEASE
     )
 }
 
@@ -863,9 +863,25 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
     bool::from(expected.ct_eq(tag)).then_some(payload)
 }
 
+/// The highest position `vector` holds for any epoch of `node`.
+///
+/// **By node across epochs, deliberately**, and used only by the own-origin replay: the entries
+/// a restored member lost sit in the epochs before its current one, so its replay asks for all
+/// of them and a position of any one of its origins says whether a peer holds something of it.
+/// Everything else in the cluster reads a vector by origin.
+pub(crate) fn node_position(vector: &VersionVector, node: kimmy_core::NodeId) -> kimmy_core::Hlc {
+    vector
+        .iter()
+        .filter(|(origin, _)| origin.node == node)
+        .map(|(_, hlc)| hlc)
+        .max()
+        .unwrap_or(kimmy_core::Hlc::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -965,7 +981,7 @@ mod tests {
     /// did not.
     fn populated_vector() -> VersionVector {
         let mut v = VersionVector::new();
-        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate()));
+        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate(), Epoch::ZERO));
         v
     }
 
@@ -992,7 +1008,7 @@ mod tests {
                 limit: 10,
                 held: Some(populated_vector()),
                 marked: vec![kimmy_storage::MarkedRange {
-                    origin: NodeId::generate(),
+                    origin: kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
                     from: Hlc::new(3, 0),
                     through: Hlc::new(5, 2),
                 }],
@@ -1081,10 +1097,15 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
-                refused: vec![kimmy_core::Stamp::new(Hlc::new(3, 1), NodeId::from_bytes([7; 16]))],
+                refused: vec![kimmy_core::Stamp::new(
+                    Hlc::new(3, 1),
+                    NodeId::from_bytes([7; 16]),
+                    Epoch::ZERO,
+                )],
                 stopped_at: Some(kimmy_core::Stamp::new(
                     Hlc::new(4, 0),
                     NodeId::from_bytes([8; 16]),
+                    Epoch::ZERO,
                 )),
             },
             Message::Fault("nope".into()),
@@ -1520,8 +1541,8 @@ mod tests {
     /// with none and never as a zero horizon.
     #[tokio::test]
     async fn a_snapshot_page_needs_its_lists_and_reads_an_absent_horizon_as_none() {
-        let node = NodeId::from_bytes([3; 16]);
-        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node);
+        let node = kimmy_core::Origin::new(NodeId::from_bytes([3; 16]), kimmy_core::Epoch::ZERO);
+        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node.node, node.epoch);
         let mut versions = VersionVector::new();
         versions.insert(node, Hlc::new(900, 0));
         let page = SnapshotPage {
@@ -1581,7 +1602,12 @@ mod tests {
             buffer
         };
         let ask = kimmy_storage::DigestAsk {
-            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
             uncovered: vec![kimmy_storage::Uncovered {
                 collection: CollectionId(u64::MAX),
                 keys: vec![serde_bytes::ByteBuf::from(vec![1, 2])],

@@ -2013,7 +2013,7 @@ where
     let mut from = catch_up.replay_from(their_node);
     // The peer's highest stamp of this origin is at or below where the replay
     // starts: it holds nothing of ours that this store lacks.
-    if theirs.get(me) <= from {
+    if crate::protocol::node_position(theirs, me) <= from {
         catch_up.replay_finished(their_node);
         return Ok(());
     }
@@ -2021,8 +2021,11 @@ where
     loop {
         // Everything of every other origin is "held", so the peer's walk passes
         // over it and serves only this origin's entries above `from`.
+        // by node across epochs (the lost writes sit in the epochs before this one)
         let mut held = theirs.clone();
-        held.insert(me, from);
+        for (origin, _) in theirs.iter().filter(|(origin, _)| origin.node == me) {
+            held.insert(origin, from);
+        }
         write_frame(
             stream,
             &Message::AskEntries {
@@ -2413,10 +2416,16 @@ where
         // told the replay is out of reach).
         let ours = engine.version_vector().map_err(|e| from_storage(e, ProtocolError::Local))?;
         let mut held = theirs.clone();
-        for (node, _) in ours.iter().filter(|(node, _)| *node != their_node) {
-            held.insert(node, kimmy_core::Hlc::MAX);
+        for (origin, _) in ours.iter() {
+            // by node across epochs: the peer's lost writes sit in its earlier epochs
+            held.insert(
+                origin,
+                if origin.node == their_node { from } else { kimmy_core::Hlc::MAX },
+            );
         }
-        held.insert(their_node, from);
+        for (origin, _) in theirs.iter().filter(|(origin, _)| origin.node == their_node) {
+            held.insert(origin, from);
+        }
         let verdict =
             engine.serve_verdict(&held).map_err(|e| from_storage(e, ProtocolError::Local))?;
         if verdict == kimmy_storage::ServeVerdict::StateHeld {
@@ -2430,7 +2439,7 @@ where
         {
             (Vec::new(), false, true, from)
         } else {
-            if ours.get(their_node) <= from {
+            if crate::protocol::node_position(&ours, their_node) <= from {
                 // Nothing held above where the replay asks: the whole answer.
                 (Vec::new(), true, false, from)
             } else {
@@ -2964,7 +2973,7 @@ where
             let now_ms = kimmy_storage::physical_now_ms();
             let oldest_lacked = entries
                 .iter()
-                .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
+                .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.origin()))
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
             let mut outcome = SyncOutcome::default();
             // Off the async worker. An apply takes as long as the work its
@@ -3627,13 +3636,13 @@ pub struct PeerStalls {
     snapshots: HashMap<NodeId, SnapshotProgress>,
     /// Where each held span resumes against each peer (ADR-172), keyed by
     /// peer and origin: see [`PeerStalls::marks_to_ask`].
-    marks_asked: HashMap<(NodeId, NodeId), SpanAsked>,
+    marks_asked: HashMap<(NodeId, kimmy_core::Origin), SpanAsked>,
     /// The spans the last request to each peer named, with how many marks
     /// each covered, until [`PeerStalls::marks_served`] records the answer.
     marks_pending: HashMap<NodeId, Vec<(kimmy_storage::MarkedRange, Vec<Hlc>)>>,
     /// The spans each peer was last named in the log, by origin and upper
     /// bound, so the line is written when they change and not on every pull.
-    marks_logged: HashMap<NodeId, Vec<(NodeId, Hlc)>>,
+    marks_logged: HashMap<NodeId, Vec<(kimmy_core::Origin, Hlc)>>,
     /// The timing of the last window this node applied, until the loop takes
     /// it (ADR-175). The only place a pull's timing is carried, and not on the
     /// outcome: the batch is committed before the round's fallible tail — the
@@ -4354,7 +4363,7 @@ pub const REPAIR_ATTEMPTS: u32 = 3;
 struct Stall {
     /// The peer's processed position, as of the last checked contact, on
     /// every origin it then trailed this node on.
-    trailing: BTreeMap<NodeId, Hlc>,
+    trailing: BTreeMap<kimmy_core::Origin, Hlc>,
     /// Consecutive checked contacts on which every remembered position came
     /// back unchanged.
     unchanged: u32,
@@ -4644,7 +4653,9 @@ impl PeerStalls {
                 span.through.successor()
             } else {
                 match last {
-                    Some(last) if span.origin <= last.node => last.hlc.successor().max(span.from),
+                    Some(last) if span.origin <= last.origin() => {
+                        last.hlc.successor().max(span.from)
+                    }
                     Some(last) => last.hlc.max(span.from),
                     None => span.from,
                 }
@@ -4662,7 +4673,7 @@ impl PeerStalls {
         peer: NodeId,
         named: &[kimmy_storage::MarkedRange],
     ) -> bool {
-        let now: Vec<(NodeId, Hlc)> =
+        let now: Vec<(kimmy_core::Origin, Hlc)> =
             named.iter().map(|span| (span.origin, span.through)).collect();
         let before = self.marks_logged.insert(peer, now.clone()).unwrap_or_default();
         before != now
@@ -5639,7 +5650,7 @@ impl PeerStalls {
             self.by_self.remove(&peer);
             return PeerPosition::CaughtUp;
         };
-        let trailing: BTreeMap<NodeId, Hlc> = servable
+        let trailing: BTreeMap<kimmy_core::Origin, Hlc> = servable
             .iter()
             .filter(|(origin, theirs_at)| mine_at.get(*origin) < *theirs_at)
             .map(|(origin, _)| (origin, mine_at.get(origin)))
@@ -5690,7 +5701,7 @@ impl PeerStalls {
         theirs: &VersionVector,
         mine: &VersionVector,
     ) -> PeerPosition {
-        let trailing: BTreeMap<NodeId, Hlc> = mine
+        let trailing: BTreeMap<kimmy_core::Origin, Hlc> = mine
             .iter()
             .filter(|(origin, mine_at)| theirs.get(*origin) < *mine_at)
             .map(|(origin, _)| (origin, theirs.get(origin)))
@@ -6654,6 +6665,7 @@ mod repair_review_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
 
     fn emfile() -> io::Error {
         io::Error::from_raw_os_error(24)
@@ -7033,7 +7045,7 @@ mod tests {
         // A partial window this node asked for (ADR-194): empty and not
         // exhausted is what the sender's budget makes of a stretch this node
         // holds all of.
-        let p = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), node(1)));
+        let p = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), node(1), Epoch::ZERO));
         assert!(
             !is_unreachable_from_a_correct_sender(0, false, p),
             "a partial window that passed over only what this node holds"
@@ -7073,7 +7085,8 @@ mod tests {
     /// refused as malformed.
     #[test]
     fn a_partial_windows_end_is_checked_against_its_entries_its_scan_and_its_floor() {
-        let at = |wall, node_id| kimmy_core::Stamp::new(Hlc::new(wall, 0), node(node_id));
+        let at =
+            |wall, node_id| kimmy_core::Stamp::new(Hlc::new(wall, 0), node(node_id), Epoch::ZERO);
         let entry = |stamp: kimmy_core::Stamp| OplogEntry {
             stamp,
             kind: kimmy_core::OpKind::Insert,
@@ -7095,7 +7108,7 @@ mod tests {
             partial_window_holds(at_the_floor, &[], at_the_floor.hlc, start).is_err(),
             "not past the floor"
         );
-        let floor = kimmy_core::Stamp::new(start.successor(), node(5));
+        let floor = kimmy_core::Stamp::new(start.successor(), node(5), Epoch::ZERO);
         assert!(partial_window_holds(floor, &[], floor.hlc, start).is_err(), "at the floor itself");
     }
 
@@ -7104,7 +7117,12 @@ mod tests {
     }
 
     fn vector(entries: &[(NodeId, u64)]) -> VersionVector {
-        entries.iter().map(|&(origin, wall)| (origin, Hlc::new(wall, 0))).collect()
+        entries
+            .iter()
+            .map(|&(node, wall)| {
+                (kimmy_core::Origin::new(node, kimmy_core::Epoch::ZERO), Hlc::new(wall, 0))
+            })
+            .collect()
     }
 
     fn probe() -> Option<DivergenceProbe> {
@@ -7130,7 +7148,7 @@ mod tests {
         let other = node(2);
         let origin = node(3);
         let span = |from: Hlc, through: u64| kimmy_storage::MarkedRange {
-            origin,
+            origin: kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO),
             from,
             through: Hlc::new(through, 0),
         };
@@ -7139,7 +7157,7 @@ mod tests {
             let marks: Vec<Hlc> = walls.iter().map(|&w| at(w)).collect();
             vec![(span(marks[0], *walls.last().unwrap()), marks)]
         };
-        let stamp = |wall: u64, n: u128| kimmy_core::Stamp::new(at(wall), node(n));
+        let stamp = |wall: u64, n: u128| kimmy_core::Stamp::new(at(wall), node(n), Epoch::ZERO);
         let t0 = std::time::Instant::now();
         let mut stalls = PeerStalls::new();
 
@@ -7210,7 +7228,7 @@ mod tests {
     fn the_spans_named_are_logged_when_they_change() {
         let peer = node(1);
         let span = |from: u64, through: u64| kimmy_storage::MarkedRange {
-            origin: node(3),
+            origin: kimmy_core::Origin::new(node(3), kimmy_core::Epoch::ZERO),
             from: Hlc::new(from, 0),
             through: Hlc::new(through, 0),
         };
@@ -7230,7 +7248,7 @@ mod tests {
         let me = node(1);
         let peer = node(2);
         let span = [kimmy_storage::MarkedRange {
-            origin: me,
+            origin: kimmy_core::Origin::new(me, kimmy_core::Epoch::ZERO),
             from: Hlc::new(1, 0),
             through: Hlc::new(2, 0),
         }];
@@ -7680,7 +7698,7 @@ mod tests {
         let orders = engine.create_collection("shop", "orders").unwrap();
         engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
         let mine = engine.witnessed_vector().unwrap();
-        let me = engine.node_id();
+        let me = engine.origin();
         assert!(mine.get(me) > Hlc::ZERO, "this node has something a peer can trail");
         let probe = Some(DivergenceProbe { id: orders.id, mine_count: Some(1), mine_at: None });
         let their_node = node(9);
@@ -7968,7 +7986,7 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
         let mut ahead = VersionVector::new();
-        ahead.insert(node(7), Hlc::new(5_000, 0));
+        ahead.insert(kimmy_core::Origin::new(node(7), kimmy_core::Epoch::ZERO), Hlc::new(5_000, 0));
 
         async fn fake_peer(mut stream: DuplexStream, servable: VersionVector) {
             match read_frame(&mut stream).await.unwrap() {
@@ -8014,9 +8032,9 @@ mod tests {
         let origin = node(3);
         let advertised = Hlc::new(5_000, 0);
         let mut theirs = VersionVector::new();
-        theirs.insert(origin, advertised);
+        theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), advertised);
         let entry = |wall: u64, id: i32| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
@@ -8089,12 +8107,16 @@ mod tests {
         );
         assert_eq!(engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(), 1);
         let mine = engine.witnessed_vector().unwrap();
-        assert_eq!(mine.get(origin), advertised, "witnessed exactly what was advertised");
+        assert_eq!(
+            mine.get(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO)),
+            advertised,
+            "witnessed exactly what was advertised"
+        );
         assert_eq!(mine.behind(&theirs), None);
         // The peer advertises them next round, and this node asks from its
         // own position, below them.
         let mut later = VersionVector::new();
-        later.insert(origin, Hlc::new(8_000, 0));
+        later.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(8_000, 0));
         assert_eq!(mine.behind(&later), Some(advertised));
     }
 
@@ -8121,17 +8143,20 @@ mod tests {
         // Later than the local drop, so the creation is one and not history.
         let base = kimmy_storage::physical_now_ms() + 60_000;
         let mut theirs = VersionVector::new();
-        theirs.insert(origin, Hlc::new(base + 9_000, 0));
+        theirs.insert(
+            kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO),
+            Hlc::new(base + 9_000, 0),
+        );
         engine.absorb_witnessed(&theirs).unwrap();
         let insert = |wall: u64, id: i32| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
         };
         let create = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::CreateCollection,
             collection: CollectionId::derive("shop", "gone"),
             doc_id: None,
@@ -8369,12 +8394,12 @@ mod tests {
         let orders = engine.create_collection("shop", "orders").unwrap();
         let origin = node(3);
         let mut theirs = VersionVector::new();
-        theirs.insert(origin, Hlc::new(9_000, 0));
+        theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(9_000, 0));
         // The hole: the position claims the origin through 9_000 while
         // nothing of it was ever applied.
         engine.absorb_witnessed(&theirs).unwrap();
         let entry = |wall: u64, id: i32| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
@@ -8511,7 +8536,7 @@ mod tests {
             .map(|&wall| kimmy_storage::SnapshotDoc {
                 collection,
                 id: kimmy_core::DocId::Int64(wall as i64),
-                stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+                stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
                 body: Some(bson::serialize_to_vec(&bson::doc! { "_id": wall as i64 }).unwrap()),
             })
             .collect();
@@ -8669,7 +8694,10 @@ mod tests {
         let meta = engine.collection_by_id(orders).unwrap().expect("the definition arrived");
         assert_eq!(engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(), 2);
         assert_eq!(
-            engine.witnessed_vector().unwrap().get(origin),
+            engine
+                .witnessed_vector()
+                .unwrap()
+                .get(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO)),
             Hlc::ZERO,
             "nothing is witnessed until the snapshot completes"
         );
@@ -9829,8 +9857,8 @@ mod tests {
         for _ in 0..16 {
             ordinary.tick_opened();
             sync_once_with(&b, addr, secret, None, &mut ordinary).await.unwrap();
-            if b.version_vector().unwrap().get(a.node_id())
-                == a.version_vector().unwrap().get(a.node_id())
+            if b.version_vector().unwrap().get(a.origin())
+                == a.version_vector().unwrap().get(a.origin())
             {
                 break;
             }
@@ -10567,7 +10595,7 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "this member speaks cluster protocol 2 (KimmyDB 0.53.0); the peer speaks none \
+            "this member speaks cluster protocol 3 (KimmyDB 0.61.0); the peer speaks none \
              (0.52.x or older); every member must run one release"
         );
         assert_eq!(answer, Message::Fault(reason));
@@ -10586,7 +10614,7 @@ mod tests {
         let asking = async {
             write_frame(
                 &mut ours,
-                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(3) },
+                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(2) },
             )
             .await
             .unwrap();
@@ -10595,7 +10623,7 @@ mod tests {
         let (refused, answer) = tokio::join!(refusing, asking);
         assert!(matches!(refused, Err(ProtocolError::Release(_))), "{refused:?}");
         let Message::Fault(reason) = answer else { panic!("expected a Fault, got {answer:?}") };
-        assert!(reason.contains("protocol 2") && reason.contains("cluster protocol 3"), "{reason}");
+        assert!(reason.contains("protocol 3") && reason.contains("cluster protocol 2"), "{reason}");
     }
 
     /// A `Welcome` that names no protocol is refused by the initiator, which
@@ -10765,7 +10793,7 @@ mod tests {
     /// `into` witnesses of each origin.
     fn re_served(into: &Engine, window: &[OplogEntry]) -> Vec<OplogEntry> {
         let held = into.witnessed_vector().unwrap();
-        window.iter().filter(|e| e.stamp.hlc > held.get(e.stamp.node)).cloned().collect()
+        window.iter().filter(|e| e.stamp.hlc > held.get(e.stamp.origin())).cloned().collect()
     }
 
     /// A drop declined in a push that then fails is counted by the push, once:
@@ -10795,11 +10823,14 @@ mod tests {
         b.apply_peer_batch(&theirs, std::slice::from_ref(&recreate), recreate.stamp.hlc, false)
             .unwrap();
         let mut broken = whole.entries[0].clone();
-        broken.stamp =
-            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.stamp = kimmy_core::Stamp::new(
+            Hlc::new(drop.stamp.hlc.wall_ms + 1, 0),
+            drop.stamp.node,
+            drop.stamp.epoch,
+        );
         broken.body = Some(vec![0xde, 0xad]);
         let mut versions = theirs.clone();
-        versions.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+        versions.insert(a.origin(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
 
         let (pushed, failed) = push_counted(&b, versions, vec![drop.clone(), broken]).await;
         assert!(failed, "the push fails after the decline");
@@ -10835,9 +10866,11 @@ mod tests {
         create.index.unique = false;
         create.index.enforcement = kimmy_core::Enforcement::Local;
         applied.body = Some(bson::serialize_to_vec(&create).unwrap());
-        applied.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 1, 0), origin);
+        applied.stamp =
+            kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 1, 0), origin, Epoch::ZERO);
         let mut broken = applied.clone();
-        broken.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 2, 0), origin);
+        broken.stamp =
+            kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 2, 0), origin, Epoch::ZERO);
         broken.body = Some(vec![0xde, 0xad]);
         let versions = vector(&[(origin, 9_000)]);
         let window = vec![refused, applied, broken];
@@ -10894,7 +10927,7 @@ mod tests {
         origin: NodeId,
     ) -> (VersionVector, Vec<OplogEntry>) {
         let insert = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(1)),
@@ -10916,14 +10949,14 @@ mod tests {
             },
         };
         let create = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(5_000, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(5_000, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::CreateIndex,
             collection: orders.id,
             doc_id: None,
             body: Some(bson::serialize_to_vec(&refused).unwrap()),
         };
         let mut theirs = VersionVector::new();
-        theirs.insert(origin, Hlc::new(5_000, 0));
+        theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(5_000, 0));
         (theirs, vec![insert, create])
     }
 
@@ -11028,14 +11061,14 @@ mod tests {
         let orders = engine.create_collection("shop", "orders").unwrap();
         let origin = node(3);
         let insert = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
         };
         let mut theirs = VersionVector::new();
-        theirs.insert(origin, Hlc::new(4_000, 0));
+        theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(4_000, 0));
 
         let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(a_prompt_peer(peer_end, theirs, vec![insert], true));
@@ -11111,7 +11144,8 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         engine.create_collection("shop", "orders").unwrap();
         let mut theirs = VersionVector::new();
-        theirs.insert(node(3), Hlc::new(5_000, 0));
+        theirs
+            .insert(kimmy_core::Origin::new(node(3), kimmy_core::Epoch::ZERO), Hlc::new(5_000, 0));
 
         let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(async move {
@@ -11225,7 +11259,7 @@ mod tests {
             multikey: false,
             expire_after_secs: None,
             partial_filter: None,
-            created: Some(kimmy_core::Stamp::new(Hlc::new(500, 0), origin)),
+            created: Some(kimmy_core::Stamp::new(Hlc::new(500, 0), origin, Epoch::ZERO)),
         });
 
         let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
@@ -11326,8 +11360,11 @@ mod tests {
             .unwrap();
         // An entry that cannot be applied, after the drop in the same batch.
         let mut broken = whole.entries[0].clone();
-        broken.stamp =
-            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.stamp = kimmy_core::Stamp::new(
+            Hlc::new(drop.stamp.hlc.wall_ms + 1, 0),
+            drop.stamp.node,
+            drop.stamp.epoch,
+        );
         broken.body = Some(vec![0xde, 0xad]);
 
         async fn serve_once(
@@ -11358,7 +11395,7 @@ mod tests {
         }
         // B has witnessed everything A wrote; A advertises further, so B asks.
         let mut theirs = theirs;
-        theirs.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+        theirs.insert(a.origin(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut stalls = PeerStalls::new();
         let mut declined = 0;
@@ -12037,7 +12074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let mut ahead = VersionVector::new();
-        ahead.insert(node(7), Hlc::new(5_000, 0));
+        ahead.insert(kimmy_core::Origin::new(node(7), kimmy_core::Epoch::ZERO), Hlc::new(5_000, 0));
 
         async fn freezing_peer(mut stream: DuplexStream, servable: VersionVector) {
             match read_frame(&mut stream).await.unwrap() {
@@ -12468,7 +12505,13 @@ mod tests {
         let digest = || kimmy_storage::DigestAsk { cut: cut.clone(), ..Default::default() };
         let definitions = |cut: &VersionVector| kimmy_storage::DefinitionAsk::new(cut.clone(), []);
         let mut other_cut = cut.clone();
-        other_cut.insert(kimmy_core::NodeId::from_bytes([42; 16]), kimmy_core::Hlc::new(1, 0));
+        other_cut.insert(
+            kimmy_core::Origin::new(
+                kimmy_core::NodeId::from_bytes([42; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+            kimmy_core::Hlc::new(1, 0),
+        );
         let cases: Vec<(&str, Message, bool)> = vec![
             (
                 "not asked",
@@ -12672,7 +12715,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
-        let me = engine.node_id();
+        let me = engine.origin();
         // The collection the lost entries name was dropped here, and its purge is
         // still to run.
         let old = engine.create_collection("shop", "gone").unwrap();
@@ -12682,7 +12725,7 @@ mod tests {
         // Writes this member made and lost, later than the local drop.
         let base = kimmy_storage::physical_now_ms() + 60_000;
         let create = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), me),
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), me.node, me.epoch),
             kind: kimmy_core::OpKind::CreateCollection,
             collection: CollectionId::derive("shop", "gone"),
             doc_id: None,
@@ -12691,7 +12734,7 @@ mod tests {
             ),
         };
         let insert = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_000, 0), me),
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_000, 0), me.node, me.epoch),
             kind: kimmy_core::OpKind::Insert,
             collection: CollectionId::derive("shop", "gone"),
             doc_id: Some(kimmy_core::DocId::Int64(7)),
@@ -12699,7 +12742,11 @@ mod tests {
         };
         let served = std::cell::RefCell::new(vec![create, insert]);
         // This member's own startup write, above the lost ones.
-        engine.advance_clock_past(&kimmy_core::Stamp::new(Hlc::new(base + 5_000, 0), me));
+        engine.advance_clock_past(&kimmy_core::Stamp::new(
+            Hlc::new(base + 5_000, 0),
+            me.node,
+            me.epoch,
+        ));
         let startup = engine.create_collection("shop", "startup").unwrap();
         engine.insert(&startup, bson::doc! { "_id": "registered" }).unwrap();
 
@@ -12768,7 +12815,7 @@ mod tests {
                 },
             ];
             catch_up.replay_note_members(&ReplayTick {
-                me,
+                me: me.node,
                 members: Some(&members),
                 reached: &reached,
                 expected_members: None,
@@ -12778,7 +12825,7 @@ mod tests {
             let mine = engine.witnessed_vector().unwrap();
             let servable = engine.version_vector().unwrap();
             catch_up.evaluate(&Tick {
-                me,
+                me: me.node,
                 reached: &reached,
                 mine_witnessed: &mine,
                 mine_servable: &servable,
@@ -12812,7 +12859,7 @@ mod tests {
         // proof's stamp is the highest of the lost entries, not the lowest (which
         // is still the one already proven).
         served.borrow_mut().push(OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_500, 0), me),
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_500, 0), me.node, me.epoch),
             kind: kimmy_core::OpKind::Insert,
             collection: CollectionId::derive("shop", "gone"),
             doc_id: Some(kimmy_core::DocId::Int64(8)),
@@ -12952,7 +12999,7 @@ mod tests {
         let elsewhere = peer.create_collection("shop", "peer_only").unwrap();
         let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
         let lost = kimmy_core::OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id()),
+            stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id(), writer.epoch()),
             kind: kimmy_core::OpKind::Insert,
             collection: elsewhere.id,
             doc_id: Some(kimmy_core::DocId::String("lost".into())),
@@ -12997,7 +13044,7 @@ mod tests {
         assert!(member.get_collection("shop", "peer_only").is_err(), "premise: not applied");
 
         member.insert(&orders, bson::doc! { "_id": "after" }).unwrap();
-        let mine = member.version_vector().unwrap().get(member.node_id());
+        let mine = member.version_vector().unwrap().get(member.origin());
         assert!(mine > lost.stamp.hlc, "stamped above the lost write: {mine:?}");
     }
 
@@ -13011,7 +13058,7 @@ mod tests {
     fn a_full_batch_of_entries_leaves_the_budgets_slack_for_the_arrays_framing() {
         let origin = kimmy_core::NodeId::from_bytes([3; 16]);
         let entry = |wall: u64| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: kimmy_core::CollectionId(1),
             doc_id: Some(kimmy_core::DocId::Int64(1)),
@@ -13073,6 +13120,7 @@ mod tests {
 mod partial_windows_never_skip {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{DocId, IndexField, OpKind, Stamp};
     use proptest::prelude::*;
     use tokio::io::AsyncWriteExt;
@@ -13163,10 +13211,10 @@ mod partial_windows_never_skip {
         ) -> OplogEntry {
             let node = self.node(write);
             let mut hlc = Hlc::new(self.base + write.wall, write.counter);
-            while hlc <= floor || self.used.contains(&Stamp::new(hlc, node)) {
+            while hlc <= floor || self.used.contains(&Stamp::new(hlc, node, Epoch::ZERO)) {
                 hlc = hlc.successor();
             }
-            self.used.insert(Stamp::new(hlc, node));
+            self.used.insert(Stamp::new(hlc, node, Epoch::ZERO));
             let u = if write.collides && self.last_u > 0 {
                 self.last_u
             } else {
@@ -13176,7 +13224,7 @@ mod partial_windows_never_skip {
             self.last_u = u;
             let id = format!("{node}-{}-{}", hlc.wall_ms, hlc.counter);
             OplogEntry {
-                stamp: Stamp::new(hlc, node),
+                stamp: Stamp::new(hlc, node, Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: coll.id,
                 doc_id: Some(DocId::String(id.clone())),
@@ -13187,7 +13235,10 @@ mod partial_windows_never_skip {
         /// Land `write` on the sender, above what it holds of the origin.
         fn land(&mut self, sender: &Engine, write: &Write) {
             let coll = sender.get_collection("db", "c").unwrap();
-            let floor = sender.version_vector().unwrap().get(self.node(write));
+            let floor = sender
+                .version_vector()
+                .unwrap()
+                .get(kimmy_core::Origin::new(self.node(write), Epoch::ZERO));
             let entry = self.entry(&coll, write, floor);
             sender.apply_remote(&coll, &entry).unwrap();
         }
@@ -13234,15 +13285,17 @@ mod partial_windows_never_skip {
         for pick in &case.marks {
             let grant = inserts[pick % inserts.len()].stamp;
             let mine = requester.witnessed_vector().unwrap();
-            if grant.hlc <= mine.get(grant.node) {
+            if grant.hlc <= mine.get(grant.origin()) {
                 continue;
             }
             for entry in inserts.iter().filter(|e| {
-                e.stamp.node == grant.node && e.stamp.hlc > mine.get(grant.node) && e.stamp <= grant
+                e.stamp.node == grant.node
+                    && e.stamp.hlc > mine.get(grant.origin())
+                    && e.stamp <= grant
             }) {
                 requester.apply_held_for_test(&coll, entry).unwrap();
             }
-            let granted: VersionVector = [(grant.node, grant.hlc)].into_iter().collect();
+            let granted: VersionVector = [(grant.origin(), grant.hlc)].into_iter().collect();
             requester.absorb_witnessed(&granted).unwrap();
         }
         (requester, dir)
@@ -13401,13 +13454,13 @@ mod partial_windows_never_skip {
         let mine = requester.witnessed_vector().unwrap();
         let coll = requester.get_collection("db", "c").unwrap();
         for entry in oplog(sender).into_iter().filter(|e| e.kind == OpKind::Insert) {
-            if entry.stamp.hlc <= mine.get(entry.stamp.node) {
+            if entry.stamp.hlc <= mine.get(entry.stamp.origin()) {
                 let id = entry.doc_id.clone().unwrap();
                 if requester.get(&coll, &id).unwrap().is_none() {
                     return Err(format!(
                         "{:?} is at or below the position {:?} and was never delivered",
                         entry.stamp,
-                        mine.get(entry.stamp.node)
+                        mine.get(entry.stamp.origin())
                     ));
                 }
             }
@@ -13417,7 +13470,7 @@ mod partial_windows_never_skip {
 
     /// What a requester ends with, for (c): its documents, and its position
     /// and oplog on every origin but its own.
-    fn held(requester: &Engine) -> (Vec<String>, Vec<(kimmy_core::NodeId, Hlc)>, Vec<Stamp>) {
+    fn held(requester: &Engine) -> (Vec<String>, Vec<(kimmy_core::Origin, Hlc)>, Vec<Stamp>) {
         let coll = requester.get_collection("db", "c").unwrap();
         let mut docs = Vec::new();
         requester
@@ -13429,7 +13482,7 @@ mod partial_windows_never_skip {
         docs.sort();
         let me = requester.node_id();
         let position =
-            requester.witnessed_vector().unwrap().iter().filter(|(n, _)| *n != me).collect();
+            requester.witnessed_vector().unwrap().iter().filter(|(o, _)| o.node != me).collect();
         let stamps =
             oplog(requester).into_iter().map(|e| e.stamp).filter(|s| s.node != me).collect();
         (docs, position, stamps)
@@ -13848,7 +13901,10 @@ mod partial_windows_never_skip {
     #[tokio::test]
     async fn the_request_names_the_busy_collection_and_is_made_without_a_count_probe() {
         let named = kimmy_core::CollectionId(77);
-        let origin = kimmy_core::NodeId::from_bytes([3; 16]);
+        let origin = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([3; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         let me = kimmy_core::NodeId::from_bytes([9; 16]);
         let probe = || Some(DivergenceProbe { id: named, mine_count: None, mine_at: None });
         for (pulled, capable) in [(false, true), (true, true), (false, false), (true, false)] {
@@ -13865,7 +13921,7 @@ mod partial_windows_never_skip {
             let window = if pulled {
                 theirs.insert(origin, Hlc::new(4_000, 0));
                 vec![OplogEntry {
-                    stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+                    stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin.node, origin.epoch),
                     kind: kimmy_core::OpKind::Insert,
                     collection: orders.id,
                     doc_id: Some(kimmy_core::DocId::Int64(1)),

@@ -66,9 +66,9 @@ fn setup() -> (Engine, Engine, std::path::PathBuf, tempfile::TempDir) {
     let items = b.create_collection("shop", "items").unwrap();
     b.insert(&orders, doc! { "_id": 0i64, "n": 0i64 }).unwrap();
     pull_all(&d, &b);
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 120, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 120, 0), b.node_id(), b.epoch()));
     b.insert(&orders, doc! { "_id": 1i64, "n": 1i64 }).unwrap();
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 190, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 190, 0), b.node_id(), b.epoch()));
     b.insert(&items, doc! { "_id": 101i64, "u": 1i64 }).unwrap();
     scoped(&d, &b, items.id);
     (b, d, d_path, dir)
@@ -119,9 +119,9 @@ fn a_member_pulls_the_writes_a_scoped_page_jumped_over() {
 #[test]
 fn a_restored_member_pulls_the_writes_a_scoped_page_jumped_over() {
     let (b, d, d_path, _dir) = setup();
-    let before = d.witnessed_vector().unwrap().get(b.node_id());
+    let before = d.witnessed_vector().unwrap().get(b.origin());
     let d = backed_up_and_restored(d, &d_path);
-    let after = d.witnessed_vector().unwrap().get(b.node_id());
+    let after = d.witnessed_vector().unwrap().get(b.origin());
     pull_all(&d, &b);
     assert!(
         holds_the_write(&d),
@@ -140,7 +140,7 @@ fn a_restored_member_claims_the_backups_vector_and_no_more() {
     let d = backed_up_and_restored(d, &d_path);
     assert_eq!(d.version_vector().unwrap(), servable, "the servable vector rose");
     assert_eq!(d.witnessed_vector().unwrap(), servable, "the witnessed vector rose");
-    assert!(servable.get(b.node_id()) < b.version_vector().unwrap().get(b.node_id()));
+    assert!(servable.get(b.origin()) < b.version_vector().unwrap().get(b.origin()));
 }
 
 /// The key-less form, on the real clock: a document B writes once, below the page's row,
@@ -250,7 +250,7 @@ fn a_restore_until_does_not_claim_a_row_held_as_state() {
     let items = b.create_collection("shop", "items").unwrap();
     b.insert(&orders, doc! { "_id": 0i64 }).unwrap();
     pull_all(&d, &b);
-    let servable = d.version_vector().unwrap().get(b.node_id());
+    let servable = d.version_vector().unwrap().get(b.origin());
     b.insert(&orders, doc! { "_id": 1i64 }).unwrap();
     b.insert(&items, doc! { "_id": 101i64 }).unwrap();
     scoped(&d, &b, items.id);
@@ -269,7 +269,7 @@ fn a_restore_until_does_not_claim_a_row_held_as_state() {
     }
     let d = Engine::open(&d_path).unwrap();
     assert_eq!(
-        d.version_vector().unwrap().get(b.node_id()),
+        d.version_vector().unwrap().get(b.origin()),
         servable,
         "the rewound member claims B's origin over the page's row"
     );
@@ -293,7 +293,8 @@ fn a_restored_members_own_position_does_not_rise_over_its_own_rows_held_as_state
     pull_all(&b, &d);
     let mut older = Vec::new();
     d.backup_to(&mut older, WalkScope::Background).unwrap();
-    let position = d.version_vector().unwrap().get(d.node_id());
+    let old_origin = d.origin();
+    let position = d.version_vector().unwrap().get(old_origin);
     // Two writes of D's own after that backup, which B takes and the old backup lacks.
     let items = d.get_collection("shop", "items").unwrap();
     d.insert(&items, doc! { "_id": 8i64 }).unwrap();
@@ -315,7 +316,8 @@ fn a_restored_members_own_position_does_not_rise_over_its_own_rows_held_as_state
         position,
         "the restored member's own position rose over its own write held as state"
     );
-    assert_eq!(d.version_vector().unwrap().get(d.node_id()), position);
+    // under the epoch it was written in: the restores since gave it new ones
+    assert_eq!(d.version_vector().unwrap().get(old_origin), position);
 }
 
 /// The backup's vector names two origins at different positions: D holds B far ahead
@@ -338,20 +340,20 @@ fn a_restore_judges_each_entry_against_its_own_origins_position() {
     pull_all(&d, &c);
     // B far ahead, and D holds B there.
     let b_orders = b.get_collection("shop", "orders").unwrap();
-    b.advance_clock_past(&Stamp::new(Hlc::new(t + 500, 0), b.node_id()));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 500, 0), b.node_id(), b.epoch()));
     b.insert(&b_orders, doc! { "_id": 900i64 }).unwrap();
     pull_all(&d, &b);
     // C writes once at t+50 and never again, then `items` at t+100; B takes both.
-    c.advance_clock_past(&Stamp::new(Hlc::new(t + 50, 0), c.node_id()));
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 50, 0), c.node_id(), c.epoch()));
     c.insert(&orders, doc! { "_id": 1i64, "once": true }).unwrap();
-    c.advance_clock_past(&Stamp::new(Hlc::new(t + 100, 0), c.node_id()));
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 100, 0), c.node_id(), c.epoch()));
     c.insert(&items, doc! { "_id": 101i64 }).unwrap();
     pull_all(&b, &c);
     // D takes `items` from B by a scoped page: C's row at t+100, held.
     scoped(&d, &b, items.id);
     let servable = d.version_vector().unwrap();
-    assert!(servable.get(c.node_id()) < Hlc::new(t + 50, 0), "D holds C behind its write");
-    assert!(servable.get(b.node_id()) >= Hlc::new(t + 500, 0), "D holds B far ahead");
+    assert!(servable.get(c.origin()) < Hlc::new(t + 50, 0), "D holds C behind its write");
+    assert!(servable.get(b.origin()) >= Hlc::new(t + 500, 0), "D holds B far ahead");
     assert_eq!(d.held_marks().unwrap(), 1, "the page's row is held");
 
     let d = backed_up_and_restored(d, &d_path);

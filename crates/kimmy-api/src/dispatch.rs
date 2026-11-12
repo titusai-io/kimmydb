@@ -57,6 +57,7 @@
 //! it would leave a gap the receiver could never detect — the thing
 //! [`invalidate`] exists to avoid.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -712,10 +713,12 @@ fn window_end(window: &kimmy_storage::OplogWindow) -> WindowEnd {
     }
     match window.entries.last() {
         Some(last) if last.stamp.hlc <= window.scanned_to => WindowEnd::Through(last.stamp),
-        Some(last) => WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node)),
+        Some(last) => {
+            WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node, last.stamp.epoch))
+        }
         // An empty window that is not the tail cannot be: nothing was examined, so
         // nothing is claimed.
-        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]), Epoch::ZERO)),
     }
 }
 
@@ -947,12 +950,12 @@ pub async fn dispatch_once_owned(
             let undelivered_wanted = scanned
                 .iter()
                 .filter(|e| wanted(e, job.collection_id, &job.operations))
-                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .filter(|e| progress.get(e.stamp.origin()) < e.stamp.hlc)
                 .count();
             let batch: Vec<OplogEntry> = scanned
                 .iter()
                 .filter(|e| wanted(e, job.collection_id, &job.operations))
-                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .filter(|e| progress.get(e.stamp.origin()) < e.stamp.hlc)
                 .take(BATCH)
                 .cloned()
                 .collect();
@@ -1370,6 +1373,7 @@ pub async fn run(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use kimmy_core::Epoch;
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
@@ -1442,7 +1446,7 @@ pub(crate) mod tests {
         let (q, x) = (node(0x11), node(0x22));
         let base = kimmy_storage::physical_now_ms() - 600_000;
         let entry = |origin: NodeId, ms: u64, n: i64| kimmy_core::OplogEntry {
-            stamp: Stamp::new(Hlc::new(base + ms, 0), origin),
+            stamp: Stamp::new(Hlc::new(base + ms, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: watched.id,
             doc_id: Some(DocId::Int64(n)),
@@ -1467,7 +1471,10 @@ pub(crate) mod tests {
             .insert(
                 &progress,
                 bson::doc! { "_id": format!("wh_a:{q}"),
-                "delivered": { q.to_string(): bytes(299), x.to_string(): bytes(10) } },
+                "delivered": {
+                    kimmy_core::Origin::new(q, Epoch::ZERO).to_string(): bytes(299),
+                    kimmy_core::Origin::new(x, Epoch::ZERO).to_string(): bytes(10),
+                } },
             )
             .unwrap();
 
@@ -1503,20 +1510,42 @@ pub(crate) mod tests {
     fn carrying_forward_raises_to_the_lower_of_position_and_window_end_and_never_lowers() {
         let (a, b, c) = (node(1), node(2), node(3));
         let mut progress = VersionVector::new();
-        progress.insert(a, Hlc::new(900, 0)); // already past the window
-        progress.insert(b, Hlc::new(10, 0));
+        progress.insert(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO), Hlc::new(900, 0)); // already past the window
+        progress.insert(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO), Hlc::new(10, 0));
         let mut current = VersionVector::new();
-        current.insert(a, Hlc::new(1_000, 0));
-        current.insert(b, Hlc::new(1_000, 0));
-        current.insert(c, Hlc::new(50, 0)); // below the window's end: only its own position
-        carry_forward(&mut progress, &current, WindowEnd::Through(Stamp::new(Hlc::new(500, 0), c)));
-        assert_eq!(progress.get(a), Hlc::new(900, 0), "never lowered");
-        assert_eq!(progress.get(b), Hlc::new(500, 0), "raised to the window's end");
-        assert_eq!(progress.get(c), Hlc::new(50, 0), "and no further than this node held");
+        current.insert(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO), Hlc::new(1_000, 0));
+        current.insert(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO), Hlc::new(1_000, 0));
+        current.insert(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO), Hlc::new(50, 0)); // below the window's end: only its own position
+        carry_forward(
+            &mut progress,
+            &current,
+            WindowEnd::Through(Stamp::new(Hlc::new(500, 0), c, Epoch::ZERO)),
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO)),
+            Hlc::new(900, 0),
+            "never lowered"
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO)),
+            Hlc::new(500, 0),
+            "raised to the window's end"
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO)),
+            Hlc::new(50, 0),
+            "and no further than this node held"
+        );
         // The tail of the oplog: everything this node held.
         carry_forward(&mut progress, &current, WindowEnd::Exhausted);
-        assert_eq!(progress.get(b), Hlc::new(1_000, 0));
-        assert_eq!(progress.get(c), Hlc::new(50, 0));
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO)),
+            Hlc::new(1_000, 0)
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO)),
+            Hlc::new(50, 0)
+        );
     }
 
     /// A window that reached the end of the oplog is the whole tail, and one that did
@@ -1524,7 +1553,7 @@ pub(crate) mod tests {
     #[test]
     fn a_window_ends_at_the_tail_or_at_its_last_entry() {
         let entry = |ms: u64, byte: u8| kimmy_core::OplogEntry {
-            stamp: Stamp::new(Hlc::new(ms, 0), node(byte)),
+            stamp: Stamp::new(Hlc::new(ms, 0), node(byte), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId(1),
             doc_id: Some(DocId::Int64(1)),
@@ -1539,18 +1568,18 @@ pub(crate) mod tests {
         assert_eq!(window_end(&window(true, 20)), WindowEnd::Exhausted);
         assert_eq!(
             window_end(&window(false, 20)),
-            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2), Epoch::ZERO))
         );
         // The scan examined rows past the last one kept: the last entry is as far as
         // anything was delivered. And one that stopped short of it (a row withheld at
         // the end) claims only what it examined, under the last entry's origin.
         assert_eq!(
             window_end(&window(false, 25)),
-            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2), Epoch::ZERO))
         );
         assert_eq!(
             window_end(&window(false, 15)),
-            WindowEnd::Through(Stamp::new(Hlc::new(15, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(15, 0), node(2), Epoch::ZERO))
         );
     }
 
@@ -2111,7 +2140,7 @@ pub(crate) mod tests {
 
     fn entry(kind: OpKind, collection: u64, ms: u64) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::generate(), Epoch::ZERO),
             kind,
             collection: kimmy_core::ids::CollectionId(collection),
             doc_id: Some(DocId::Int64(1)),

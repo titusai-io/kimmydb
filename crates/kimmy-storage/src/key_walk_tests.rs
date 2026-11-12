@@ -7,6 +7,8 @@
 //! rests on: the entries, `scanned_to`, `exhausted`, `passed_through`, and the
 //! count of entries examined and not served.
 
+use kimmy_core::Epoch;
+use kimmy_core::Origin;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -42,7 +44,7 @@ struct Row {
 }
 
 fn stamp_of(row: &Row) -> Stamp {
-    Stamp::new(at(row.at), node(row.origin))
+    Stamp::new(at(row.at), node(row.origin), Epoch::ZERO)
 }
 
 fn entry_of(row: &Row) -> OplogEntry {
@@ -105,7 +107,7 @@ fn both(engine: &Engine, ask: &Ask) -> (Read, std::result::Result<Read, KeyWalkF
     let run = |keys: bool| {
         let passed = Cell::new(0u64);
         let skip = |stamp: &Stamp| {
-            let skip = stamp.hlc <= ask.held.get(stamp.node)
+            let skip = stamp.hlc <= ask.held.get(stamp.origin())
                 && !ask.marked.iter().any(|span| span.contains(stamp));
             passed.set(passed.get() + u64::from(skip));
             skip
@@ -160,14 +162,18 @@ fn held_of(offsets: &[Option<u64>; ORIGINS]) -> VersionVector {
     let mut held = VersionVector::new();
     for (origin, offset) in offsets.iter().enumerate() {
         if let Some(offset) = offset {
-            held.insert(node(origin), at(*offset));
+            held.insert(Origin::new(node(origin), Epoch::ZERO), at(*offset));
         }
     }
     held
 }
 
 fn span_of(origin: usize, from: u64, len: u64) -> MarkedRange {
-    MarkedRange { origin: node(origin), from: at(from), through: at(from + len) }
+    MarkedRange {
+        origin: Origin::new(node(origin), Epoch::ZERO),
+        from: at(from),
+        through: at(from + len),
+    }
 }
 
 fn rows_strategy() -> impl Strategy<Value = Vec<Row>> {
@@ -270,7 +276,7 @@ fn stamps_that_tie_at_from_are_all_read_at_a_row_budget_boundary() {
     let (_, keys) = both(&engine, &ask);
     let keys = keys.unwrap();
     let stamps: Vec<_> = keys.window.entries.iter().map(|e| e.stamp).collect();
-    assert_eq!(stamps, (0..3).map(|o| Stamp::new(at(6), node(o))).collect::<Vec<_>>());
+    assert_eq!(stamps, (0..3).map(|o| Stamp::new(at(6), node(o), Epoch::ZERO)).collect::<Vec<_>>());
 }
 
 /// A corrupt body is met, or not, in the same place by both walks: a row the
@@ -296,7 +302,7 @@ fn a_corrupt_body_is_the_same_error_at_the_same_row_and_skipped_rows_raise_none(
     let held = held_of(&[Some(10), Some(5), Some(5), None]);
     let run = |keys: bool| -> std::result::Result<usize, String> {
         let txn = engine.db().begin_read().unwrap();
-        let skip = |s: &Stamp| s.hlc <= held.get(s.node);
+        let skip = |s: &Stamp| s.hlc <= held.get(s.origin());
         let keep = |_: &OplogEntry| true;
         if keys {
             match engine
@@ -502,7 +508,7 @@ fn the_verification_walk_repairs_a_pair_the_counts_cannot_see_before_it_records(
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
             let key = codec::oplog_key(&stamp_of(&rows[20]));
             assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
-            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
             by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
         }
         txn.commit().unwrap();
@@ -577,7 +583,7 @@ fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
         Hlc::ZERO,
         1000,
         WalkScope::Request,
-        |s: &Stamp| s.hlc <= ask.held.get(s.node),
+        |s: &Stamp| s.hlc <= ask.held.get(s.origin()),
         |_: &OplogEntry| true,
         None,
     );
@@ -597,7 +603,7 @@ fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
                 1000,
                 WalkScope::Background,
                 |s: &Stamp| {
-                    let skip = s.hlc <= ask.held.get(s.node);
+                    let skip = s.hlc <= ask.held.get(s.origin());
                     passed.set(passed.get() + u64::from(skip));
                     skip
                 },
@@ -691,7 +697,7 @@ fn damaged_store(
         let lost_seq = by_stamp.remove(lost.as_slice()).unwrap().unwrap().value();
         assert!(arrival.remove(lost_seq).unwrap().is_some());
         // A position for an entry the oplog does not hold, beyond the end.
-        let gone = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+        let gone = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
         arrival.insert(5_003u64, gone.as_slice()).unwrap();
         by_stamp.insert(gone.as_slice(), 5_003u64).unwrap();
         // A second position naming a stamp that has one.
@@ -785,7 +791,7 @@ async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
         let local = engine.read_arrival_from(0, 100).unwrap().pop().unwrap().stamp;
         // Relayed after the local writes, stamped long before them.
         let relayed = OplogEntry {
-            stamp: Stamp::new(Hlc::new(1_000, 0), node(2)),
+            stamp: Stamp::new(Hlc::new(1_000, 0), node(2), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
@@ -798,7 +804,7 @@ async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
         {
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
             assert!(by_stamp.remove(codec::oplog_key(&victim).as_slice()).unwrap().is_some());
-            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
             by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
         }
         txn.commit().unwrap();
@@ -851,7 +857,7 @@ fn no_record_is_written_until_the_repair_has_committed() {
                 let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
                 let key = codec::oplog_key(&stamp_of(&rows[10]));
                 assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
-                let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+                let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3), Epoch::ZERO));
                 by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
             }
             txn.commit().unwrap();

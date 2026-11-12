@@ -2,6 +2,7 @@
 //! (ADR-212's addendum): the ask on `Vectors`, the pages and their acks, what the
 //! member accepts and refuses, and that the ordinary round goes on.
 
+use kimmy_core::Epoch;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +46,7 @@ fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
     writer.insert_many(&orders, (0..2).map(|i| bson::doc! { "_id": i }).collect()).unwrap();
     let mut backup = Vec::new();
     writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
-    let backup_at = writer.version_vector().unwrap().get(writer.node_id());
+    let backup_at = writer.version_vector().unwrap().get(writer.origin());
     // The lost writes are stamped after the third origin's entries.
     std::thread::sleep(Duration::from_millis(15));
     let pad = "x".repeat(big);
@@ -73,7 +74,7 @@ fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
         let third = NodeId::generate();
         let entries: Vec<OplogEntry> = (0..tail)
             .map(|k| OplogEntry {
-                stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, k as u16), third),
+                stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, k as u16), third, Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: orders.id,
                 doc_id: Some(kimmy_core::DocId::String(format!("third{k}"))),
@@ -175,7 +176,7 @@ async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
 fn own_entry(f: &Fixture, hlc: Hlc, id: &str) -> OplogEntry {
     let orders = f.a.get_collection("shop", "orders").unwrap();
     OplogEntry {
-        stamp: Stamp::new(hlc, f.a.node_id()),
+        stamp: Stamp::new(hlc, f.a.node_id(), f.a.epoch()),
         kind: OpKind::Insert,
         collection: orders.id,
         doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -317,7 +318,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
             Message::ReplayEntries {
                 from,
                 entries: vec![OplogEntry {
-                    stamp: Stamp::new(at(5), NodeId::generate()),
+                    stamp: Stamp::new(at(5), NodeId::generate(), Epoch::ZERO),
                     ..own_entry(&f, at(5), "a")
                 }],
                 exhausted: false,
@@ -455,9 +456,9 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     let elsewhere = c.create_collection("shop", "peer_only").unwrap();
     // Just after the backup, so that A's own later writes sort above it and C still
     // lacks them.
-    let backup_at = writer.version_vector().unwrap().get(writer.node_id());
+    let backup_at = writer.version_vector().unwrap().get(writer.origin());
     let lost = OplogEntry {
-        stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, 0), writer.node_id()),
+        stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, 0), writer.node_id(), writer.epoch()),
         kind: OpKind::Insert,
         collection: elsewhere.id,
         doc_id: Some(kimmy_core::DocId::String("lost".into())),

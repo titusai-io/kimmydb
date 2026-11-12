@@ -10,6 +10,7 @@
 //! not a life ended.
 
 use bson::doc;
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, DocId, Hlc, OpKind, Stamp};
 
 use crate::{Engine, SnapshotProgress, WalkScope};
@@ -559,7 +560,7 @@ fn a_burial_from_a_whole_page_takes_the_stamp_of_the_tombstone_it_carries() {
     assert_eq!(on_c.incarnation_floor, Some(dropped.hlc), "premise: the floor came with it");
     c.insert(&on_c, doc! { "_id": 2 }).unwrap();
     let page = c.snapshot_page(None, None).unwrap();
-    assert!(page.versions.get(a.node_id()) < dropped.hlc, "premise: C cannot vouch for A's drop");
+    assert!(page.versions.get(a.origin()) < dropped.hlc, "premise: C cannot vouch for A's drop");
 
     transfer(&b, &c);
     assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
@@ -593,7 +594,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     c.insert(&on_c, doc! { "_id": 2 }).unwrap();
     let mut page = c.snapshot_page(None, None).unwrap();
     assert!(page.next.is_none(), "premise: one page");
-    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id());
+    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id(), a.epoch());
     for (id, stamp) in page.dropped_collections.iter_mut() {
         if *id == orders_id() {
             *stamp = other;
@@ -608,7 +609,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
     assert_eq!(
         b.collection_dropped_at(orders_id()).unwrap(),
-        Some(Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0; 16]))),
+        Some(Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO)),
         "the burial took a tombstone of another drop"
     );
 }
@@ -647,7 +648,7 @@ fn the_present_life_sweep_from_a_page_takes_the_stamp_of_the_tombstone_it_carrie
     let on_c = c.get_collection("shop", "orders").unwrap();
     c.insert(&on_c, doc! { "_id": 2 }).unwrap();
     let page = c.snapshot_page(None, None).unwrap();
-    assert!(page.versions.get(a.node_id()) < dropped.hlc, "premise: C cannot vouch for A's drop");
+    assert!(page.versions.get(a.origin()) < dropped.hlc, "premise: C cannot vouch for A's drop");
 
     transfer(&b, &c);
     let on_b = b.get_collection("shop", "orders").unwrap();
@@ -1088,7 +1089,7 @@ fn the_limit_heals_on_os_next_ordinary_pull_from_the_dropper() {
             }
             assert!(has(&o, 1), "premise: the limit");
             assert!(
-                o.witnessed_vector().unwrap().get(s.node_id()) < created_floor(&s).unwrap(),
+                o.witnessed_vector().unwrap().get(s.origin()) < created_floor(&s).unwrap(),
                 "R's page granted O coverage of S past the drop"
             );
             pull_from_position(&o, &s);
@@ -1174,7 +1175,7 @@ fn the_clock_passes_an_adopted_floor() {
         state.incarnation_floor = Some(ahead);
         state.created = ahead.successor();
     }
-    page.versions.insert(a.node_id(), ahead);
+    page.versions.insert(a.origin(), ahead);
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
     assert_eq!(created_floor(&r), Some(ahead), "premise: the floor was adopted");
