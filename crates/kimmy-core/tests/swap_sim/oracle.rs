@@ -114,9 +114,14 @@ impl Member {
         }
         // B2's step check: on the routes that deliver in position (R1 windows and pushes, R4 grants; not the model's hold and repair
         // routes, which count a held entry as covered), the product's vector covers exactly the member's contiguous servable prefix
-        // (skipped while a member holds an entry the model's way: its hold route counts a held entry as covered; and once the end-of-run
-        // delivery's shortcut witnessed an entry no live member appended: it raises the vector over a hole, a model shortcut the
-        // product does not have, `witnessed_at_quiescence`)
+        // Skipped in two model-only states, neither of which the product has:
+        // - while a member holds an entry the model's way (`held_uncovered` off): the model's hold route counts a held entry as
+        //   covered, so the prefix covers it and the vector, never raised by a Hold, does not;
+        // - once the end-of-run delivery's shortcut (`take_quiesce`, `witnessed_at_quiescence`) has witnessed here an entry that no
+        //   live member appended: the shortcut raises the vector over a hole. The seed-1434 twin (`scenarios.rs`
+        //   `seed_1434_twin`) reproduces exactly this: r_x is held at C out of position, B vanishes with y, and at the end A and E
+        //   are handed r_x by the shortcut with y missing, so their vector covers r_x over the hole y. The product has no such
+        //   witness (the FIX-5 ruling), so the check does not judge it.
         if w.in_order
             && !self.vanished
             && !self.quiesce_witnessed
