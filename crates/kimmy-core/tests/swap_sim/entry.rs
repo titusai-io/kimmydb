@@ -59,6 +59,17 @@ pub enum Kind {
     LossQ7,
 }
 
+impl Entry {
+    /// A Q6 kind (Q6 v2.5 FIX-2): a binding, a recreate or a logical drop (the register events), a stage's create, an abandon
+    /// or a loss record. A document entry (and Q7's own loss entries) is not one.
+    pub fn is_q6_kind(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Bind | Kind::Lcreate | Kind::Ldrop | Kind::Create | Kind::Abandon | Kind::Loss
+        )
+    }
+}
+
 impl Kind {
     /// A register event (the swap register's: a binding, a recreate or a logical drop).
     pub fn is_register_event(self) -> bool {

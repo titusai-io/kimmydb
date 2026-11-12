@@ -616,6 +616,9 @@ mod tests {
                     assert_eq!(s.get("cnt_register_event_out_of_position"), 0);
                     assert_eq!(s.get("cnt_grant_above_coverage"), 0);
                     assert_eq!(s.get("inv_register_event_out_of_position"), 0);
+                    // R1: neither route carries a Q6 kind
+                    assert_eq!(s.get("cnt_route_carries_q6_kind"), 0);
+                    assert_eq!(s.get("inv_route_carries_q6_kind"), 0);
                     // FINDING F-G-1 (report 2): the rest is not clean when `doc_hold` is on; printed above, not asserted
                     total += s.runs;
                 }
@@ -652,6 +655,45 @@ mod tests {
                 s.get("inv_register_event_out_of_position") > 0,
                 "{policy:?}: the assertion must trip"
             );
+        }
+    }
+
+    /// R1 (Q6 v2.5 FIX-2): no excluded route carries a Q6 kind. Each route's assertion has a mutant that trips it: the hold relog
+    /// (`m-doc-hold-q6-kinds`: creates, abandons and loss entries out of position), the scoped repair (`m-repair-carries-creates`,
+    /// `m-repair-carries-events`, and `m-repair-dropped-answer`: the sender's drops).
+    #[test]
+    fn the_r1_route_mutants_trip_the_route_assertion() {
+        let seeds = env_u64("Q6_PRODUCT_RUNS", 20);
+        for (m, doc_hold, doc_repair) in [
+            ("m-doc-hold-q6-kinds", true, false),
+            ("m-repair-carries-creates", false, true),
+            ("m-repair-carries-events", false, true),
+            ("m-repair-dropped-answer", false, true),
+        ] {
+            for policy in [crate::world::Policy::Document, crate::world::Policy::Field] {
+                let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+                for c in cfgs.iter_mut() {
+                    c.policy = policy;
+                    c.routes = Some(crate::run::Routes {
+                        f: 0.3,
+                        hold: false,
+                        repair: false,
+                        doc_hold,
+                        doc_repair,
+                    });
+                }
+                let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+                eprintln!(
+                    "{m} {policy:?}: {} runs, route_carries_q6_kind {} in {} runs",
+                    s.runs,
+                    s.get("cnt_route_carries_q6_kind"),
+                    s.get("inv_route_carries_q6_kind")
+                );
+                assert!(
+                    s.get("inv_route_carries_q6_kind") > 0,
+                    "{m} {policy:?}: the route assertion must trip"
+                );
+            }
         }
     }
 

@@ -67,10 +67,23 @@ pub struct Flags {
     pub fm_k_ignore_q7: bool,
     /// Rust-only mutant of the product routes: `doc_hold` also delivers register events out of position
     pub fm_register_ahead: bool,
+    /// Rust-only mutants of the product routes (R1: no excluded route carries a Q6 kind): `doc_hold` also delivers creates,
+    /// abandons and loss entries out of position; the scoped repair also carries the stage creates and abandons, the
+    /// sender's register events, or the sender's drops (the `dropped` answer)
+    pub fm_doc_hold_q6: bool,
+    pub fm_repair_creates: bool,
+    pub fm_repair_events: bool,
+    pub fm_repair_dropped: bool,
 }
 
 /// The Rust-only mutant of the product routes (invariant (ii) broken on purpose; graded on the product-route rows).
-pub const ROUTE_MUTANTS: [&str; 1] = ["m-register-ahead"];
+pub const ROUTE_MUTANTS: [&str; 5] = [
+    "m-register-ahead",
+    "m-doc-hold-q6-kinds",
+    "m-repair-carries-creates",
+    "m-repair-carries-events",
+    "m-repair-dropped-answer",
+];
 
 /// The Rust-only mutants of the `K` bound (graded on the `K = 4` grid).
 pub const K_MUTANTS: [&str; 3] = [
@@ -243,6 +256,10 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-field-k-plus-one" => f.fm_k_plus_one = true,
         "m-field-k-ignore-q7" => f.fm_k_ignore_q7 = true,
         "m-register-ahead" => f.fm_register_ahead = true,
+        "m-doc-hold-q6-kinds" => f.fm_doc_hold_q6 = true,
+        "m-repair-carries-creates" => f.fm_repair_creates = true,
+        "m-repair-carries-events" => f.fm_repair_events = true,
+        "m-repair-dropped-answer" => f.fm_repair_dropped = true,
         _ => return false,
     }
     true

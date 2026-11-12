@@ -323,6 +323,9 @@ impl Member {
             return false;
         }
         let mut pl = src.make_payload(w);
+        // R1: the scoped repair carries none of the Q6 kinds: the receiver's creates, abandons, register, burials and
+        // visible event are what they were
+        let before = self.q6_surface();
         let pages: Vec<String> = pl
             .phys
             .iter()
@@ -337,6 +340,8 @@ impl Member {
         pl.held = BTreeSet::new();
         pl.appended = BTreeSet::new();
         pl.events = Vec::new();
+        pl.creates = Vec::new();
+        pl.abandoned = HashSet::new();
         pl.loss = OMap::new();
         pl.dochist = Vec::new();
         pl.page_states = Vec::new();
@@ -356,7 +361,53 @@ impl Member {
             self.land_page(w, &GrantRead::default());
         }
         self.join = None;
+        if w.f.fm_repair_creates {
+            // MUTANT (`m-repair-carries-creates`): the sender's stage creates and abandons ride along
+            for (k, v) in &src.creates {
+                self.creates.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            self.abandoned.extend(src.abandoned.iter().cloned());
+        }
+        if w.f.fm_repair_events {
+            // MUTANT (`m-repair-carries-events`): the sender's register is handed over
+            for &i in &src.evl {
+                let e = w.ent_rc(i);
+                self.add_event(w, &e);
+            }
+        }
+        if w.f.fm_repair_dropped {
+            // MUTANT (`m-repair-dropped-answer`): the sender's `dropped` answer buries what it holds dead
+            for (n, pd) in src.phys.iter() {
+                if !pd.alive
+                    && let Some(p) = self.phys.get_mut(n)
+                {
+                    p.alive = false;
+                }
+            }
+        }
+        if self.q6_surface() != before {
+            w.stats.bump("route_carries_q6_kind");
+            self.inv.insert("route_carries_q6_kind");
+        }
         true
+    }
+
+    /// What a route that carries no Q6 kind leaves alone: the creates and abandons, the register (events and the ones held as
+    /// information), the records held as information, the physicals' burials and births, and the visible event.
+    pub fn q6_surface(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                self.creates.keys().cloned().collect::<BTreeSet<_>>(),
+                self.abandoned.iter().cloned().collect::<BTreeSet<_>>(),
+                self.events.iter().copied().collect::<BTreeSet<_>>(),
+                self.info.keys().copied().collect::<BTreeSet<_>>(),
+                self.loss_info.keys().copied().collect::<BTreeSet<_>>(),
+                self.phys.iter().map(|(n, p)| (n.clone(), p.alive)).collect::<BTreeSet<_>>(),
+                self.bmap.iter().map(|(n, s)| (n.clone(), *s)).collect::<BTreeSet<_>>(),
+                self.cur.as_ref().map(|c| c.idx),
+            )
+        )
     }
 
     /// The member whose register the grant reads (the sender; `stale_src_bug` reads the source of the last begin call).
