@@ -1735,3 +1735,93 @@ fn the_position_a_cut_walk_leaves_is_exact_in_stamp_order() {
         }
     }
 }
+
+/// A `Vectors` answer whose `replay_from` is not a replay position is read as no ask: the
+/// dialler's round goes on (failing it would fail every round with that peer, and the pull with
+/// it), and the dialler says so once for that peer, not once a round. A later answer with a
+/// well-formed ask is served as before.
+#[tokio::test]
+async fn a_malformed_replay_from_is_no_ask_said_once_per_peer_and_the_round_goes_on() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    let their = NodeId::generate();
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+
+    let vectors = |replay_from: bson::Bson| {
+        let mut doc = bson::serialize_to_document(&Message::Vectors {
+            servable: Default::default(),
+            witnessed: Default::default(),
+            facts: None,
+            facts_gen: None,
+            echo: None,
+            replay_from: None,
+        })
+        .unwrap();
+        doc.get_document_mut("Vectors").unwrap().insert("replay_from", replay_from);
+        doc
+    };
+    // A peer that answers the round with `answer` for its vectors and serves nothing; returns
+    // how many replay pages it was sent.
+    async fn peer(mut stream: tokio::io::DuplexStream, answer: bson::Document) -> usize {
+        let mut pages = 0;
+        while let Ok(frame) = read_frame(&mut stream).await {
+            match frame {
+                Message::AskVersions { .. } => stream.write_all(&framed(&answer)).await.unwrap(),
+                Message::ReplayEntries { scanned_to, .. } => {
+                    pages += 1;
+                    let ack =
+                        Message::ReplayAck { next_from: scanned_to, done: true, stalled: None };
+                    write_frame(&mut stream, &ack).await.unwrap();
+                }
+                Message::AskDivergence { .. } => {
+                    let none = Message::Divergence {
+                        collections: Vec::new(),
+                        probe_count: None,
+                        incarnations: Vec::new(),
+                        digests: None,
+                        digest_busy: false,
+                        definitions: None,
+                    };
+                    write_frame(&mut stream, &none).await.unwrap();
+                }
+                other => panic!("an empty peer is asked nothing else: {other:?}"),
+            }
+        }
+        pages
+    }
+    let round = |answer: bson::Document| {
+        let engine = &engine;
+        async move {
+            let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+            // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+            let answering = tokio::spawn(peer(theirs, answer));
+            let mut stalls = PeerStalls::new();
+            let outcome = sync_over(engine, ours, addr(), their, None, &mut stalls).await;
+            (outcome, answering.await.unwrap())
+        }
+    };
+
+    let bad = bson::Bson::String("not a position".into());
+    for n in 0..2 {
+        let (outcome, pages) = round(vectors(bad.clone())).await;
+        assert!(outcome.is_ok(), "round {n} goes on: {outcome:?}");
+        assert_eq!(pages, 0, "round {n}: no ask, so no replay is served");
+    }
+    let said = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(level, m)| *level == tracing::Level::WARN && m.contains("not a replay position"))
+        .count();
+    assert_eq!(said, 1, "said once for the peer across two rounds: {:?}", log.lock().unwrap());
+
+    let good =
+        bson::serialize_to_bson(&crate::catchup::replay_after(Hlc::new(1, 0), their)).unwrap();
+    let (outcome, pages) = round(vectors(good)).await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(pages, 1, "a well-formed ask is served as before");
+}
