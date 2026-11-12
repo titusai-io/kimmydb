@@ -37,6 +37,8 @@ pub struct Cfg {
     pub lww_workload: Option<Writers>,
     /// the oracle's HB-2 exclusion (`World::hb2_exclusion`; on by default, off only to show what it clears)
     pub hb2_exclusion: bool,
+    /// B2: the members' coverage is the product's per-origin vector (`World::vector_cov`)
+    pub vector_cov: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -80,6 +82,7 @@ impl Cfg {
             routes: None,
             lww_workload: None,
             hb2_exclusion: true,
+            vector_cov: false,
         }
     }
 }
@@ -155,6 +158,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.reg_in_position_check = w.in_order;
     w.held_uncovered = cfg.routes.is_some_and(|rt| rt.doc_hold || rt.doc_repair);
     w.hb2_exclusion = cfg.hb2_exclusion;
+    w.vector_cov = cfg.vector_cov;
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);

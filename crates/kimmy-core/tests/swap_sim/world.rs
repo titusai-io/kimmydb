@@ -72,6 +72,9 @@ pub struct World {
     /// (`cnt_hb2_excluded`), a divergence confined to the stages of `hb2_stages` (see `oracle::hb2_stages`). Off only in the
     /// test that shows the exclusion is what clears HB-2's seeds.
     pub hb2_exclusion: bool,
+    /// B2: the members' coverage predicate reads their `VectorCoverage` (the product's per-origin maximum) instead of the prefix;
+    /// the vector is kept in every run, and compared with the prefix by the step check `vector_disagrees_with_prefix`
+    pub vector_cov: bool,
     pub steps_end: i64,
     /// replay hooks: the page order and the tombstone choice the traced model drew (consumed by the next call)
     pub forced_pages: Option<Vec<String>>,
@@ -118,6 +121,7 @@ impl World {
             reg_in_position_check: false,
             held_uncovered: false,
             hb2_exclusion: true,
+            vector_cov: false,
             steps_end: 0,
             forced_pages: None,
             forced_choice: None,

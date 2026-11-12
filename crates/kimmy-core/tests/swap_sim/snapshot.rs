@@ -209,11 +209,17 @@ impl Member {
             // its held set is granted; an entry the sender holds out of position is neither claimed nor served
             for (o, lst) in w.by_origin.iter().enumerate() {
                 let mut top = -1;
-                for &x in lst {
-                    if !pl.held.contains(&x) {
-                        break;
+                if w.vector_cov {
+                    // B2: the product's grant is the sender's servable VECTOR as served with the first page; invariant (i) is then
+                    // CHECKED below against the sender's true contiguous coverage, not given by construction
+                    top = src.vc.max_of(o);
+                } else {
+                    for &x in lst {
+                        if !pl.held.contains(&x) {
+                            break;
+                        }
+                        top = w.ent(x).hlc;
                     }
-                    top = w.ent(x).hlc;
                 }
                 if top >= 0 {
                     vec.insert(o, top);
@@ -252,9 +258,13 @@ impl Member {
         pl.vec = vec;
         // invariant (i), checked against the sender's own coverage (`covers`, not the prefix loop above): no grant and
         // no page names an entry above the sender's contiguous coverage
-        if pl.held.iter().any(|&i| !src.covers(w, w.ent(i).origin, w.ent(i).hlc))
-            || pl.vec.iter().any(|(&o, &h)| !src.covers(w, o, h))
-        {
+        // (with the vector coverage, against the sender's contiguous servable prefix: the vector is what is being checked)
+        let truth = |w: &World, o: usize, h: i64| {
+            if w.vector_cov { src.covers_servable(w, o, h) } else { src.covers(w, o, h) }
+        };
+        let grant_above = pl.held.iter().any(|&i| !truth(w, w.ent(i).origin, w.ent(i).hlc))
+            || pl.vec.iter().any(|(&o, &h)| !truth(w, o, h));
+        if grant_above {
             w.stats.bump("grant_above_coverage");
         }
         // a page version whose entry the sender does not cover: in the model's routes a violation of invariant (i); on the product
@@ -263,9 +273,11 @@ impl Member {
         let mut page_above = false;
         for (n, pd) in pl.phys.iter() {
             for (k, v) in pd.docs.iter() {
-                if let Some(&i) = w.rec_index.get(&(n.clone(), *k, v.stamp))
-                    && !src.covers(w, w.ent(i).origin, w.ent(i).hlc)
-                {
+                let uncovered = w
+                    .rec_index
+                    .get(&(n.clone(), *k, v.stamp))
+                    .is_some_and(|&i| !truth(w, w.ent(i).origin, w.ent(i).hlc));
+                if uncovered {
                     if w.held_uncovered {
                         w.stats.bump("page_carries_held_state");
                     } else {
@@ -647,6 +659,10 @@ impl Member {
         }
         for &i in &j.pl.held {
             self.cv.add(i);
+            self.vc.add(i);
+        }
+        for (&o, &h) in &j.pl.vec {
+            self.vc.raise(o, h); // the completed grant raises the vector to the first page's
         }
         self.hlc = self.hlc.max(j.pl.hlc);
         for (k, v) in &j.pl.creates {

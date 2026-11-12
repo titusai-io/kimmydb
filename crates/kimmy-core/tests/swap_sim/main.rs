@@ -40,6 +40,8 @@ mod scenario;
 mod scenarios;
 mod snapshot;
 mod trace;
+#[cfg(test)]
+mod vector;
 mod world;
 
 fn env_u64(name: &str, default: u64) -> u64 {

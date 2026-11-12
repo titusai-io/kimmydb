@@ -38,6 +38,8 @@ impl Member {
                 break; // an earlier entry the store does not hold: the replay stops below it
             }
             self.cv.add(id);
+            self.vc.add(id);
+            self.raise(w, id);
             self.appended.insert(id);
             prog = true;
         }
@@ -206,6 +208,7 @@ pub fn restore_own_mark(mode: &str) -> Restored {
     for i in backup.cv.iter().filter(|i| !marked.contains(i)) {
         cv.add(i);
     }
+    backup.vc = crate::coverage::VectorCoverage::from_prefix(&sc.w, &cv);
     backup.cv = cv;
     for i in &marked {
         backup.appended.remove(i); // the marked entries are not served

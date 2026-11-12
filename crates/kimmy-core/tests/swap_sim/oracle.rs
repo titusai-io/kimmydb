@@ -112,6 +112,19 @@ impl Member {
                 }
             }
         }
+        // B2's step check: on the routes that deliver in position (R1 windows and pushes, R4 grants; not the model's hold and repair
+        // routes, which count a held entry as covered), the product's vector covers exactly the member's contiguous servable prefix
+        // (skipped while a member holds an entry the model's way: its hold route counts a held entry as covered; and once the end-of-run
+        // delivery's shortcut witnessed an entry no live member appended: it raises the vector over a hole, a model shortcut the
+        // product does not have, `witnessed_at_quiescence`)
+        if w.in_order
+            && !self.vanished
+            && !self.quiesce_witnessed
+            && (w.held_uncovered || self.held_oop.is_empty())
+            && self.vector_prefix_disagreement(w).is_some()
+        {
+            self.step_inv.insert("vector_disagrees_with_prefix");
+        }
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
             for (k, v) in self.served() {
@@ -1011,6 +1024,8 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
                     continue;
                 }
                 z.cv.add(e.idx);
+                z.vc.add(e.idx);
+                z.raise(w, e.idx);
                 z.witness(&e);
             } else {
                 let src = servers[w.rng.below(servers.len())];

@@ -59,6 +59,81 @@ impl PrefixCoverage {
     }
 }
 
+impl PrefixCoverage {
+    /// How many of the origin's entries (in the world's per-origin order) form the contiguous held prefix (the cursor of `covers`).
+    pub fn prefix_len(&self, w: &World, origin: usize) -> usize {
+        let mut cursor = self.cursor.borrow_mut();
+        if cursor.len() <= origin {
+            cursor.resize(origin + 1, 0);
+        }
+        let lst = &w.by_origin[origin];
+        let mut i = cursor[origin];
+        while i < lst.len() && self.has(lst[i]) {
+            i += 1;
+        }
+        cursor[origin] = i;
+        i
+    }
+}
+
+/// The product's coverage (B2 of the harness review; FIX-1): a per-origin (node, epoch) MAXIMUM, `vector.get(stamp.node) >=
+/// stamp.hlc`. It is raised by an apply under `Position::Raise` or `InWindow` (and by a completed grant, to the grant's vector), never
+/// by `Position::Hold`. It is not a prefix: a `Raise` over a hole, a push applied under `Raise`, or a replay that skips an entry make
+/// it cover an entry the member never received, which the prefix cannot represent. `has`/`add` keep the ids the member holds.
+#[derive(Clone, Debug, Default)]
+pub struct VectorCoverage {
+    max: Vec<i64>,
+    ids: PrefixCoverage,
+}
+
+impl VectorCoverage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Raise the origin's maximum to `hlc` (an apply under Raise or InWindow, a grant).
+    pub fn raise(&mut self, origin: usize, hlc: i64) {
+        if self.max.len() <= origin {
+            self.max.resize(origin + 1, -1);
+        }
+        if self.max[origin] < hlc {
+            self.max[origin] = hlc;
+        }
+    }
+    /// The origin's maximum (-1: nothing).
+    pub fn max_of(&self, origin: usize) -> i64 {
+        self.max.get(origin).copied().unwrap_or(-1)
+    }
+    /// The vector a coverage prefix implies (a restore from a backup whose vector is its own contiguous prefix).
+    pub fn from_prefix(w: &World, cv: &PrefixCoverage) -> Self {
+        let mut v = Self::new();
+        for o in 0..w.by_origin.len() {
+            let n = cv.prefix_len(w, o);
+            if n > 0 {
+                v.raise(o, w.ent(w.by_origin[o][n - 1]).hlc);
+            }
+        }
+        for i in cv.iter() {
+            v.ids.add(i);
+        }
+        v
+    }
+}
+
+impl CoverageOf for VectorCoverage {
+    fn covers(&self, _w: &World, origin: usize, hlc: i64) -> bool {
+        self.max_of(origin) >= hlc
+    }
+    fn covers_past(&self, _w: &World, origin: usize, hlc: i64) -> bool {
+        self.max_of(origin) > hlc
+    }
+    fn has(&self, id: EntryId) -> bool {
+        self.ids.has(id)
+    }
+    fn add(&mut self, id: EntryId) {
+        self.ids.add(id);
+    }
+}
+
 impl CoverageOf for PrefixCoverage {
     fn covers(&self, w: &World, origin: usize, hlc: i64) -> bool {
         let mut cursor = self.cursor.borrow_mut();

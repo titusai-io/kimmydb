@@ -64,6 +64,8 @@ impl Member {
         e.body = body;
         let e = w.record(e, !f.loss_outside_prefix);
         self.cv.add(e.idx);
+        self.vc.add(e.idx);
+        self.raise(w, e.idx);
         self.appended.insert(e.idx);
         w.stats.bump("loss_records_made");
         if !f.loss_outside_prefix {

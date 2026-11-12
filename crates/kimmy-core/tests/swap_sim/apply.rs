@@ -58,6 +58,10 @@ impl Member {
             && e.origin != self.id
             && self.would_be_ignored(w, e);
         self.cv.add(e.idx);
+        self.vc.add(e.idx);
+        if !self.pos_hold {
+            self.raise(w, e.idx); // Position::Raise or InWindow (a hold route sets `pos_hold`)
+        }
         self.witness(e);
         if e.kind != Kind::Doc
             && !ignored
@@ -151,6 +155,8 @@ impl Member {
             en.q7 = Some((lk.clone(), lv.clone()));
             let en = w.record(en, true);
             self.cv.add(en.idx);
+            self.vc.add(en.idx);
+            self.raise(w, en.idx);
             self.appended.insert(en.idx);
             w.stats.bump("q7_loss_entries_minted");
             w.stats.bump("q7_events_emitted");

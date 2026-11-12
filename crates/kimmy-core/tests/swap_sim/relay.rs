@@ -81,6 +81,7 @@ impl Member {
             }
             if src.cv.has(xid) && !src.appended.contains(&xid) && !self.cv.has(xid) {
                 self.cv.add(xid);
+                self.vc.add(xid);
                 self.witness(&x);
                 w.stats.bump("witnessed_without_receiving");
                 if w.trace {
@@ -94,7 +95,12 @@ impl Member {
         if release {
             self.held_oop.remove(&e.idx);
             self.appended.insert(e.idx);
+            self.raise(w, e.idx); // the in-window release raises the vector (`release_held_in_position`)
             w.stats.bump("held_released_in_window");
+            if e.kind != Kind::Doc {
+                // build item (a): a released Q6 entry takes effect in the releasing transaction (rule B reads the raised coverage)
+                self.settle(w);
+            }
             return Taken::Received;
         }
         // the servable position cannot pass an entry held out of position (docs/oplog.md:489-491: held entries sit above it): an
@@ -108,7 +114,9 @@ impl Member {
         if behind && !w.f.fm_held_witness {
             self.held_oop.insert(e.idx);
         }
+        self.pos_hold = behind; // behind a held entry the apply raises no vector
         self.take(w, e);
+        self.pos_hold = false;
         // (released already if the `settle` inside `take` released its predecessors: then it stays released)
         if behind && (w.f.fm_held_witness || self.held_oop.contains(&e.idx)) {
             self.appended.remove(&e.idx);
@@ -116,6 +124,30 @@ impl Member {
             w.stats.bump("held_behind_held");
         }
         Taken::Received
+    }
+
+    /// A push WITHOUT an introduced window (H-Q6-P1; FIX-1's table): the entry is not known to be contiguous from this member's
+    /// threshold, so it is applied under `Position::Hold` and raises no vector. A register event or a loss record is then information
+    /// only until covered (rule B); a stage create or an abandon is refused by the debug assertion of invariant (ii)
+    /// (`push_carries_q6_kind_out_of_position`) and not applied; a document entry is held as state. `m-q6-kind-under-raise` applies
+    /// it under `Position::Raise`: the product's vector rises over the hole.
+    pub fn push_take(&mut self, w: &mut World, e: &EntryRef) {
+        if self.cv.has(e.idx) {
+            return;
+        }
+        w.stats.bump("push_without_window");
+        if w.f.fm_q6_under_raise {
+            self.take(w, e); // MUTANT: Position::Raise
+            return;
+        }
+        if matches!(e.kind, Kind::Create | Kind::Abandon) {
+            w.stats.bump("push_carries_q6_kind_out_of_position");
+            self.inv.insert("push_carries_q6_kind_out_of_position");
+            return;
+        }
+        // a document entry is held as state, a register event or a record as information: both under OPLOG_HELD (`held_oop`), so a
+        // window re-delivers them and releases them in position
+        self.take_hold(w, e);
     }
 
     /// R4: `src` relays the tombstone of a bound-out physical to this member.
@@ -194,6 +226,9 @@ pub fn take_quiesce(ms: &mut [Member], dst: usize, w: &mut World, e: &EntryRef) 
                 ));
             }
             ms[dst].cv.add(e.idx); // no live member appended it: it is only witnessed
+            ms[dst].vc.add(e.idx);
+            ms[dst].raise(w, e.idx);
+            ms[dst].quiesce_witnessed = true;
             ms[dst].witness(e);
             w.stats.bump("witnessed_at_quiescence");
         }
@@ -214,6 +249,9 @@ pub fn take_quiesce_replica(replica: &mut Member, ms: &[Member], w: &mut World, 
                 return;
             }
             replica.cv.add(e.idx);
+            replica.vc.add(e.idx);
+            replica.raise(w, e.idx);
+            replica.quiesce_witnessed = true;
             replica.witness(e);
             w.stats.bump("witnessed_at_quiescence");
         }
