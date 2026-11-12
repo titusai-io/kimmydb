@@ -7639,6 +7639,29 @@ async fn only_self_coverage_is_not_coverage_raised() {
     assert!(outcome.coverage_raised, "another origin rose: {outcome:?}");
 }
 
+/// An earlier epoch of this node is not its own origin: after a restore, what a peer serves of
+/// it is the tail this node lost, and a window that raises it is progress like any other origin's
+/// (ADR-157's ceiling). Only the current epoch, the one this node writes under, is excluded.
+#[tokio::test]
+async fn an_earlier_epoch_of_this_node_rising_is_coverage_raised() {
+    let b = node().await;
+    let local = b.engine.origin();
+    let earlier = kimmy_core::Origin::new(local.node, kimmy_core::Epoch::ZERO);
+    assert_ne!(earlier, local);
+    let mine = b.engine.witnessed_vector().unwrap();
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(earlier, Hlc::new(5, 0));
+    let mut outcome = kimmy_storage::SyncOutcome::default();
+    let window = kimmy_storage::PeerWindow {
+        scanned_to: Hlc::ZERO,
+        exhausted: true,
+        passed_through: None,
+        asked_partial: false,
+    };
+    b.engine.apply_peer_window_into(&theirs, Some(&mine), &[], window, &mut outcome).unwrap();
+    assert!(outcome.coverage_raised, "this node's earlier epoch rose: {outcome:?}");
+}
+
 /// [`wedged_fake`], with every `AskEntries` answer delayed: a wedged peer
 /// whose own cost, against a short sync interval, is large enough that
 /// `Contact::fits_before` (ADR-157) refuses a second pull well short of
