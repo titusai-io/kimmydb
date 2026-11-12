@@ -1550,20 +1550,26 @@ impl Engine {
         info!(node = %node_id, path = %path.display(), "storage engine open");
 
         // Read before anything of this run can write under this origin. A start that kept its
-        // epoch asks from its own position under it. A start that minted one (a restore, a
-        // rewind, the first open) lost writes it may have made under any earlier epoch of this
+        // epoch and has written under it asks from its own position under it. A start whose
+        // epoch has written nothing yet (the open that minted it after a restore, a rewind or on
+        // a new store, and any later open before the first write, such as the first real start
+        // after `kimmyd restore`) lost writes it may have made under any earlier epoch of this
         // node, so it asks from the lowest position of them: that over-asks, never under-asks,
-        // and an entry already held is dropped by the replay's `has_oplog_entry`.
+        // and an entry already held is dropped by the replay's `has_oplog_entry`. Read from the
+        // store at every such open, so it does not depend on the minting open's floor reaching
+        // the floor file. With no earlier epoch, a kept epoch asks from its start, since no entry
+        // of it is older.
         let positions = Self::read_versions(&db, tables::OPLOG_VERSIONS)?;
-        let own_position_at_open = if minted {
+        let current = Origin::new(node_id, epoch);
+        let own_position_at_open = if positions.iter().any(|(origin, _)| origin == current) {
+            positions.get(current)
+        } else {
             positions
                 .iter()
                 .filter(|(origin, _)| origin.node == node_id)
                 .map(|(_, hlc)| hlc)
                 .min()
-                .unwrap_or(Hlc::ZERO)
-        } else {
-            positions.get(Origin::new(node_id, epoch))
+                .unwrap_or(if minted { Hlc::ZERO } else { epoch.start_hlc() })
         };
         let engine = Self {
             db,
@@ -3823,10 +3829,11 @@ impl Engine {
         }
     }
 
-    /// The highest stamp of this node's own origin the oplog held when the store
-    /// was opened, before this run's first write: `Hlc::ZERO` for a store that
-    /// had none. What a replay of this node's own origin asks a peer from
-    /// (ADR-202).
+    /// Where a replay of this node's own origin asks a peer from (ADR-202), read
+    /// when the store was opened, before this run's first write: the position
+    /// under the current epoch once anything was written under it; before that,
+    /// the lowest position under this node's earlier epochs, or, with none, the
+    /// epoch's start (`Hlc::ZERO` at the open that minted a new store's first).
     pub fn own_position_at_open(&self) -> Hlc {
         self.own_position_at_open
     }
