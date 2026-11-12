@@ -48,11 +48,9 @@ impl Member {
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
                 .all(|&x| self.cv.has(x));
-            if !in_position {
-                if w.reg_in_position_check {
-                    w.stats.bump("register_event_out_of_position");
-                    self.inv.insert("register_event_out_of_position");
-                }
+            if !in_position && w.reg_in_position_check {
+                w.stats.bump("register_event_out_of_position");
+                self.inv.insert("register_event_out_of_position");
             }
         }
         let ignored = f.ignored_not_served

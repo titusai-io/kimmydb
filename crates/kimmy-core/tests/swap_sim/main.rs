@@ -542,7 +542,10 @@ mod tests {
                 if repair {
                     viol(
                         p.is_empty(),
-                        format!("the repair route with rule B on is clean: {p:?}; first seeds {:?}", s.first),
+                        format!(
+                            "the repair route with rule B on is clean: {p:?}; first seeds {:?}",
+                            s.first
+                        ),
                     );
                 }
             } else if s.runs >= 7_200 {
@@ -684,12 +687,16 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6a.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "swapmodel6a.py");
+        let record = "4343f5208763266f091c7f607335820bff22baea94110cf2d9c8f5fb727a07e2";
+        let bytes = std::fs::read(dir.join("swapmodel6b.py")).unwrap();
+        let got6b: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got6b, record, "swapmodel6b.py");
         let tracer = "0ef4f8f914100322409062ecb3084787c2516f34256645d795b90b813b95f08c";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");
         let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-        assert!(recorded.contains(want) && recorded.contains(tracer));
+        assert!(recorded.contains(want) && recorded.contains(tracer) && recorded.contains(record));
     }
 
     /// The model's seed-fixed run is deterministic: the same seed gives the same figures (the harness' own PRNG).
