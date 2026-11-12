@@ -2611,7 +2611,14 @@ impl Engine {
                     // whether it was applied or ignored (ADR-236), is what
                     // carries the ordering to a third member; nothing is lost
                     // by withholding the create.
-                    Ddl::Applied(RemoteIndex::History) => return Ok(DdlOutcome::Applied),
+                    //
+                    // The entry may still be held here, a restore having re-logged
+                    // it (ADR-180) before the drop: arriving in position, it is
+                    // released all the same.
+                    Ddl::Applied(RemoteIndex::History) => {
+                        self.release_ddl_mark_if_held(&entry.stamp, position)?;
+                        return Ok(DdlOutcome::Applied);
+                    }
                     Ddl::Gone => {
                         return Ok(DdlOutcome::UnknownCollection(format!(
                             "{}.{}",
@@ -3027,6 +3034,24 @@ impl Engine {
         // thing that could have: a single node applies its own drop directly.
         self.publish(vec![entry.clone()]);
         Ok(outcome)
+    }
+
+    /// [`Self::release_ddl_mark`] for an entry that arrived `InWindow` and is
+    /// marked; a read says so first, so an unmarked entry takes no writer.
+    fn release_ddl_mark_if_held(
+        &self,
+        stamp: &Stamp,
+        position: crate::engine::Position,
+    ) -> Result<()> {
+        if position != crate::engine::Position::InWindow {
+            return Ok(());
+        }
+        let key = crate::codec::oplog_key(stamp);
+        let marked = {
+            let txn = self.db().begin_read()?;
+            txn.open_table(crate::tables::OPLOG_HELD)?.get(key.as_slice())?.is_some()
+        };
+        if marked { self.release_ddl_mark(stamp) } else { Ok(()) }
     }
 
     /// Release the held mark on a schema change's entry, which has just arrived
