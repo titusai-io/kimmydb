@@ -22,7 +22,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Security
 
-- **RUSTSEC-2026-0462, fixed in `rmcp` 3.9.0, is not reachable here.** The advisory is unbounded response-body buffering in the Streamable HTTP client. The MCP server builds only the server half of `rmcp` (`server` and `transport-streamable-http-server`), so that client is not compiled in and no request of ours can reach it.
+- **`rmcp` is updated to 3.9.0 for RUSTSEC-2026-0462** (the affected client code is not built into kimmyd). The advisory is unbounded response-body buffering in the Streamable HTTP client. The MCP server builds only the server half of `rmcp` (`server` and `transport-streamable-http-server`), so that client is not compiled in and no request of ours can reach it.
 
 ## 0.60.0 - 2026-11-03
 
