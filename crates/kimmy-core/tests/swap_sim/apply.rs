@@ -42,15 +42,23 @@ impl Member {
             return;
         }
         let f = w.f;
-        if e.kind.is_register_event() && e.origin != self.id {
-            // invariant (ii): register events travel only in position: every earlier entry of the origin is held here
+        if e.is_q6_kind() && e.origin != self.id && w.reg_in_position_check {
+            // invariant (ii) (FIX-2, M1 of the harness review): EVERY Q6 kind (a register event, a stage's create, an abandon, a loss
+            // record) travels only in position: every earlier entry of the origin is held here (applied, witnessed or granted). The
+            // stage's create and the abandon rely on it alone (FIX-5 ruled). On in the random runs without the model's routes and in
+            // every scripted scenario (a scenario that delivers one out of position on purpose turns it off and says why)
             let in_position = w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
                 .all(|&x| self.cv.has(x));
-            if !in_position && w.reg_in_position_check {
-                w.stats.bump("register_event_out_of_position");
-                self.inv.insert("register_event_out_of_position");
+            if !in_position {
+                if e.kind.is_register_event() {
+                    w.stats.bump("register_event_out_of_position");
+                    self.inv.insert("register_event_out_of_position");
+                } else {
+                    w.stats.bump("q6_kind_out_of_position");
+                    self.inv.insert("q6_kind_out_of_position");
+                }
             }
         }
         let ignored = f.ignored_not_served

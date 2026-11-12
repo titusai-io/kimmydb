@@ -26,6 +26,7 @@ mod tests {
         let mut sc = Sc::new(mode, &[("W", 0), ("X", 0), ("Y", 0)], 60);
         sc.w.vector_cov = true;
         sc.w.held_uncovered = true; // the product's routes: a held entry is not covered and a window re-delivers it
+        sc.w.reg_in_position_check = false; // the push delivers the bind out of position on purpose (P1 asserts the check names it)
         let (w_, x) = (sc.idx("W"), sc.idx("X"));
         sc.advance(1);
         sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();

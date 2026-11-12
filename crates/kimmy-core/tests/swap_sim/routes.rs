@@ -197,6 +197,9 @@ mod tests {
         sc.advance(12);
         let b = sc.ms[w_].do_bind(&mut sc.w, &mut job, 2).unwrap();
         sc.ms[x].push_take(&mut sc.w, &b);
+        // invariant (ii)'s debug assertion names the out-of-position delivery (M1); it is then cleared so the run's checks judge the rest
+        let named = sc.ms[x].inv.remove("register_event_out_of_position");
+        assert!(named, "{mode}: invariant (ii) names the pushed bind");
         let info = sc.ms[x].info.contains_key(&b.idx) && !sc.ms[x].events.contains(&b.idx);
         sc.advance(13);
         let refused = sc.ms[x].local_doc(&mut sc.w, 0, DocOp::Update).is_none()
@@ -339,6 +342,74 @@ mod tests {
     fn h_q6_v1_askversions_answers_the_servable_vector() {
         assert!(v1("v6"));
         assert!(!v1("m-askversions-counts-held"), "the mutant answers a held entry");
+    }
+
+    /// M1 of the harness review: invariant (ii) is checked for EVERY Q6 kind (the stage's create, the abandon and the loss record, not
+    /// only the register events), and it is on in scripted scenarios. A scripted delivery of each kind ahead of its position is named
+    /// (seed 750's shape for the abandon); the same delivery in position is not. On the product-route grid, `m-doc-hold-q6-kinds`
+    /// (the hold relog carries creates, abandons and loss entries) trips the general check, not only the route's own flag.
+    #[test]
+    fn m1_invariant_ii_names_every_q6_kind_delivered_out_of_position() {
+        for kind in [Kind::Create, Kind::Abandon, Kind::Loss] {
+            for in_position in [false, true] {
+                let mut sc = Sc::new("v6", &[("W", 0), ("X", 0), ("Y", 0)], 60);
+                let (w_, x, y) = (sc.idx("W"), sc.idx("X"), sc.idx("Y"));
+                sc.advance(1);
+                sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+                sc.pull("Y", "W");
+                sc.advance(2);
+                if kind == Kind::Loss {
+                    // the record's origin is Y: Y drops the name (X lacks this entry of Y's), then W, which has not heard of the
+                    // drop, writes; the write is late at Y, which mints its record
+                    sc.ms[y].local_ldrop(&mut sc.w).unwrap();
+                    sc.advance(3);
+                    let d = sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Update).unwrap();
+                    sc.window("Y", "W", &d);
+                } else {
+                    sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Update).unwrap(); // the entry of W's that X lacks
+                }
+                sc.advance(4);
+                let job = sc.ms[w_].start_out(&mut sc.w, vec![1], JobKind::CrashAbandon, 0);
+                if kind == Kind::Abandon {
+                    sc.ms[w_].abandon_stage(&mut sc.w, &job.stage);
+                }
+                let e =
+                    sc.w.all
+                        .iter()
+                        .rev()
+                        .find(|e| e.kind == kind && (kind == Kind::Loss || e.phys == job.stage))
+                        .unwrap_or_else(|| panic!("no {kind:?} entry"))
+                        .clone();
+                if in_position {
+                    let src = if e.origin == w_ { "W" } else { "Y" };
+                    sc.pull("X", src);
+                } else {
+                    sc.take("X", &e); // ahead of its position: X lacks an earlier entry of the origin
+                }
+                let named = sc.ms[x].inv.contains("q6_kind_out_of_position");
+                assert_eq!(
+                    named, !in_position,
+                    "{kind:?} in position {in_position}: named {named}"
+                );
+            }
+        }
+        let mut cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            *c = crate::run::product_cfg(
+                crate::world::Policy::Document,
+                (c.members, c.outs, c.keys),
+                true,
+                false,
+                0.3,
+            );
+        }
+        let s = crate::run::run_grid("m-doc-hold-q6-kinds", "v6", &cfgs, 0, 10, crate::threads());
+        eprintln!(
+            "m-doc-hold-q6-kinds: inv_q6_kind_out_of_position in {} of {} runs",
+            s.get("inv_q6_kind_out_of_position"),
+            s.runs
+        );
+        assert!(s.get("inv_q6_kind_out_of_position") > 0);
     }
 
     /// H-Q6-L1: a Definitions (or count) repair is not re-planned after its mark is released. EMULATION: a repair ledger per member

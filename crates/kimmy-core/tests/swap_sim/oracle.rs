@@ -977,6 +977,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "doc_repair",
         "route_carries_q6_kind",
         "register_event_out_of_position",
+        "q6_kind_out_of_position",
         "repair_events",
         "refusal_episodes",
         "refusal_episodes_info",

@@ -26,6 +26,9 @@ impl Sc {
         let names: Vec<String> = members.iter().map(|(n, _)| n.to_string()).collect();
         let mut w = World::new(names, flags_for(mode, "v6"), Rng::new(0), d, false);
         w.policy = policy;
+        // invariant (ii) over every Q6 kind is ON in scripted scenarios (M1); a scenario that delivers one out of position on purpose
+        // turns it off and says why
+        w.reg_in_position_check = true;
         let ms = members.iter().enumerate().map(|(i, (n, s))| Member::new(i, n, *s)).collect();
         Self { w, ms }
     }
