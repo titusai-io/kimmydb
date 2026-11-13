@@ -197,9 +197,6 @@ impl Member {
         let mut ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
         ids.sort_unstable(); // per origin, ids are in stamp order: one pass releases a whole run
         for i in ids {
-            if self.arriving == Some(i) {
-                continue;
-            }
             let e = w.ent(i);
             let ok = w.by_origin[e.origin]
                 .iter()
