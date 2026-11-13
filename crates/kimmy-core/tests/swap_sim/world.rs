@@ -114,6 +114,10 @@ pub struct World {
     pub loss_by_key: HashMap<crate::entry::LKey, Vec<EntryId>>,
     /// entries held only by vanished members: lost with them
     pub lost: HashSet<EntryId>,
+    /// 6e's STRUCTURAL lost set (`Q6_LOSTSTRUCT=1`, OFF by default: item P compares against 6d's oracle): an entry counts as held by a live member only if that
+    /// member applied it (`appended`), holds it out of position (`held_oop`) or received it as an entry (`recv_entry`), never if only witnessed. Used by the
+    /// oracle for DOCUMENT entries (late writes, heads, loss records); `lost` stays the trajectory and the events' coverage-lost set. `None` = `lost`.
+    pub lost_struct: Option<HashSet<EntryId>>,
     pub lost_late: HashSet<(u32, Stamp)>,
     pub snap_carried: Vec<usize>,
     pub pend_acked: HashSet<EntryId>,
@@ -163,6 +167,7 @@ impl World {
             rec_index: HashMap::new(),
             loss_by_key: HashMap::new(),
             lost: HashSet::new(),
+            lost_struct: None,
             lost_late: HashSet::new(),
             snap_carried: Vec::new(),
             pend_acked: HashSet::new(),

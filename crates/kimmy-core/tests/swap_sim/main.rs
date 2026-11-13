@@ -566,6 +566,25 @@ mod tests {
                 s.get("cnt_dead_sender_join_open_at_end")
             );
             assert!(s.get("cnt_join_restarted_dead_sender") > 0, "vacuous: no join was restarted");
+            // M5: a refusal is never open-ended while a live peer is reachable: the restart gives every join a live sender, so no member
+            // ends the run still refusing writes (in order the invariant is the model's own D10 liveness check; on the routes the
+            // count is printed and asserted at the run's end)
+            eprintln!(
+                "restart_joins routes {routes}: refusals open at run end {}",
+                s.get("refusal_open_at_run_end")
+            );
+            assert_eq!(
+                s.get("inv_open_refusal_at_run_end"),
+                0,
+                "a refusal is open-ended at the end of a restart-joins run"
+            );
+            if !routes {
+                assert_eq!(
+                    s.get("refusal_open_at_run_end"),
+                    0,
+                    "a member still refuses at the end of an in-order restart-joins run"
+                );
+            }
             assert!(residual.is_empty(), "unclassified: {residual:?}");
         }
     }

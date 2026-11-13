@@ -53,6 +53,8 @@ pub struct Cfg {
     pub product_marks: bool,
     /// ITEM Q, the Q6 build item: with `product_marks`, covered held marks of LATE entries are dropped too
     pub drop_late_marks: bool,
+    /// the oracle's structural lost set (`Q6_LOSTSTRUCT=1` of the model, see `World::lost_struct`); off by default
+    pub lost_struct: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -103,6 +105,7 @@ impl Cfg {
             end_repair: false,
             product_marks: false,
             drop_late_marks: false,
+            lost_struct: false,
         }
     }
 }
@@ -548,6 +551,21 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         })
         .map(|e| e.idx)
         .collect();
+    if cfg.lost_struct {
+        w.lost_struct = Some(
+            w.all
+                .iter()
+                .filter(|e| {
+                    !live.iter().any(|&i| {
+                        ms[i].appended.contains(&e.idx)
+                            || ms[i].held_oop.contains(&e.idx)
+                            || ms[i].recv_entry.contains(&e.idx)
+                    })
+                })
+                .map(|e| e.idx)
+                .collect(),
+        );
+    }
     for _ in 0..12 {
         for &i in &live {
             finish_joins(&mut ms, i, &mut w, cfg.restart_joins);

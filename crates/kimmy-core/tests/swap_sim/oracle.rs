@@ -233,7 +233,14 @@ pub struct Oracle {
 /// after one of them (its coverage can never complete).
 pub fn oracle(w: &mut World) -> Oracle {
     let lost = w.lost.clone();
-    let allx: Vec<EntryRef> = w.all.iter().filter(|e| !lost.contains(&e.idx)).cloned().collect();
+    // 6e: for DOCUMENT entries the structural set (`Q6_LOSTSTRUCT=1`); events, reachability and the D9 witness keep the coverage-lost set
+    let slost = w.lost_struct.clone().unwrap_or_else(|| lost.clone());
+    let allx: Vec<EntryRef> = w
+        .all
+        .iter()
+        .filter(|e| !lost.contains(&e.idx) && !(e.kind == Kind::Doc && slost.contains(&e.idx)))
+        .cloned()
+        .collect();
     let unreachable = |w: &World, e: &Entry| {
         w.by_origin[e.origin].iter().any(|&i| lost.contains(&i) && w.ent(i).hlc < e.hlc)
     };
@@ -446,7 +453,7 @@ pub fn product_classes(res: &Res, field: bool) -> (Vec<&'static str>, Vec<String
 /// HB-2's structural set (B1 classification; a HARNESS class, the manager's ruling): on the product routes, the stages that
 /// - were created by a writer that has vanished (its create is in the write log, its member is gone for good),
 /// - have no valid binding anywhere in the write log (never validly bound: D9's rule, a pure function of the stamps), and
-/// - no live member serves or has ever served (`serving`, `last_served`): no client can see them.
+/// - no live member serves or has ever served (`serving`, `ever_served`): no client can see them.
 ///
 /// Defined from the write log and the members' states only, never from a divergence. D9 calls such a stage "lingering and
 /// unserved"; its clean-up is the age fallback, which the model of record does not model (D9: "not modelled"), so the harness
@@ -461,10 +468,9 @@ pub fn hb2_stages(w: &World, ms: &[Member]) -> BTreeSet<String> {
         let vanished_writer = ms.get(c.origin).is_some_and(|m| m.vanished);
         let validly_bound =
             w.all.iter().any(|b| b.kind == Kind::Bind && b.phys == c.phys && w.valid(b));
-        let seen = ms
-            .iter()
-            .filter(|m| !m.vanished)
-            .any(|m| m.serving().as_deref() == Some(c.phys.as_str()) || m.last_served == c.phys);
+        let seen = ms.iter().filter(|m| !m.vanished).any(|m| {
+            m.serving().as_deref() == Some(c.phys.as_str()) || m.ever_served.contains(&c.phys)
+        });
         if vanished_writer && !validly_bound && !seen {
             out.insert(c.phys.clone());
         }
@@ -511,7 +517,10 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let allowed: HashSet<HeadKey> = o.allowed.iter().map(|(k, p, s)| (*k, *p, Some(*s))).collect();
     let mut newest: HashMap<(String, u32), Stamp> = HashMap::new();
     for x in w.all.iter() {
-        if x.kind == Kind::Doc && !x.staging && !w.lost.contains(&x.idx) {
+        if x.kind == Kind::Doc
+            && !x.staging
+            && !w.lost_struct.as_ref().unwrap_or(&w.lost).contains(&x.idx)
+        {
             let kk = (x.phys.clone(), x.key);
             if newest.get(&kk).is_none_or(|&n| x.stamp > n) {
                 newest.insert(kk, x.stamp);

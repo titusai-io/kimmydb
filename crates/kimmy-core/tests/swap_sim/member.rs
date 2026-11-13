@@ -116,6 +116,8 @@ pub struct Member {
     pub step_inv: BTreeSet<&'static str>,
     pub flips: u32,
     pub last_served: String,
+    /// every physical this member has ever served (HB-2's "has served"; `last_served` is only the latest)
+    pub ever_served: BTreeSet<String>,
 }
 
 impl Member {
@@ -173,6 +175,7 @@ impl Member {
             step_inv: BTreeSet::new(),
             flips: 0,
             last_served: L.to_string(),
+            ever_served: BTreeSet::new(),
         }
     }
 
