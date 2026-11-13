@@ -62,20 +62,7 @@ impl Member {
     /// ADR-224: `src` refuses a window below a row it holds only as a COMPLETED snapshot's state.
     pub fn take_from(&mut self, w: &mut World, src: &Member, e: &EntryRef, quiesce: bool) -> Taken {
         // ADR-169: an entry held as state that arrives in a window contiguous from the receiver's position is released
-        let mut release = w.held_uncovered && self.held_oop.contains(&e.idx);
-        if release
-            && !w.f.fm_release_behind_held
-            && w.by_origin[e.origin]
-                .iter()
-                .take_while(|&&x| w.ent(x).hlc < e.hlc)
-                .any(|x| self.held_oop.contains(x))
-        {
-            // ADR-169: a window releases a mark only when it is contiguous from the receiver's position; an earlier entry of the
-            // origin still held here keeps this one held (the vector must not rise over a hold: the step check
-            // `vector_disagrees_with_prefix`, seeds 25, 138, 154 of the 250-seed grid). `m-release-behind-held` is the old behaviour
-            release = false;
-            w.stats.bump("release_blocked_behind_held");
-        }
+        let release = w.held_uncovered && self.held_oop.contains(&e.idx);
         if self.cv.has(e.idx) && !release {
             return Taken::AlreadyHeld;
         }
@@ -126,7 +113,14 @@ impl Member {
             self.held_oop.remove(&e.idx);
             self.retire_repair(e.idx);
             self.appended.insert(e.idx);
-            self.raise(w, e.idx); // the in-window release raises the vector (`release_held_in_position`)
+            // the in-window release raises the vector (`release_held_in_position`) to the servable PREFIX: the model (6d, `take_from`)
+            // releases the entry even behind a still-held earlier one, and its coverage stays below that hold. `m-release-behind-held`
+            // raises the vector to the released entry over the hold (the old harness behaviour)
+            if w.f.fm_release_behind_held {
+                self.raise(w, e.idx);
+            } else {
+                self.raise_servable(w, e.origin);
+            }
             w.stats.bump("held_released_in_window");
             if e.kind != Kind::Doc {
                 // build item (a): a released Q6 entry takes effect in the releasing transaction (rule B reads the raised coverage)

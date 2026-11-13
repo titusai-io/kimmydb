@@ -366,10 +366,11 @@ mod tests {
     }
 
     /// The vector step check's finding at 250 seeds (`inv_vector_disagrees_with_prefix`, Document 3/1/4 seed 25 and 3/3/3 seed 138 with
-    /// `doc_hold`, 3/2/5 seed 154 with both routes, f 0.3): a window RELEASED a held mark although an earlier entry of the origin was
-    /// still held at the receiver, so the receiver's vector rose over a hold. ADR-169: a mark is released only by a window contiguous
-    /// from the receiver's position. Fixed in `take_from`; the mutant `m-release-behind-held` is the old behaviour. Pinned: clean
-    /// (nothing unexplained) with the fix, and the mutant trips the step check on each seed.
+    /// `doc_hold`, 3/2/5 seed 154 with both routes, f 0.3): a window RELEASED a held mark (as the model, 6d `take_from`, does) although
+    /// an earlier entry of the origin was still held, and the harness raised the receiver's VECTOR to the released entry, over the
+    /// hold. The model's coverage never passes a hold (`covers` stops at a held-out-of-position entry). Fixed: a release raises the
+    /// vector to the servable prefix only (`Member::raise_servable`); the mutant `m-release-behind-held` is the old behaviour. Pinned:
+    /// clean (nothing unexplained) with the fix, and the mutant trips the step check on each seed.
     #[test]
     fn a_window_does_not_release_a_mark_past_an_earlier_held_entry_seeds_25_138_154() {
         type Pin = ((usize, usize, usize), bool, bool, u64);
@@ -524,6 +525,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Debug aid: the draws of one product-route run, for the Python replay (`Q6_X=pol,m,o,k,dh,dr,f,seed`, mode `Q6_MODE`, output
+    /// `Q6_OUT`): `B n v` / `F x` / `P order` lines as `replay8.py` reads them.
+    #[test]
+    #[ignore = "debug aid: Q6_X, Q6_MODE and Q6_OUT export one run's random draws"]
+    fn export_draws() {
+        let spec = std::env::var("Q6_X").expect("Q6_X");
+        let t: Vec<&str> = spec.split(',').collect();
+        let pol = if t[0] == "field" { Policy::Field } else { Policy::Document };
+        let p = |i: usize| t[i].parse::<usize>().unwrap();
+        let mode = std::env::var("Q6_MODE").unwrap_or("v6".into());
+        crate::rng::LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        let r = run_product(
+            &mode,
+            pol,
+            (p(1), p(2), p(3)),
+            t[4] == "1",
+            t[5] == "1",
+            t[6].parse().unwrap(),
+            t[7].parse().unwrap(),
+            false,
+        );
+        let lines = crate::rng::LOG.with(|l| l.borrow_mut().take().unwrap());
+        std::fs::write(std::env::var("Q6_OUT").expect("Q6_OUT"), lines.join("\n") + "\n").unwrap();
+        eprintln!("EXPORTED {} draws; RES {:?}", lines.len(), nonzero_problems(&r));
     }
 
     /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
