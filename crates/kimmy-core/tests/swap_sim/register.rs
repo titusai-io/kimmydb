@@ -189,9 +189,10 @@ impl Member {
 
     /// The hold route: an entry held out of position becomes servable (`appended`) once every earlier entry of its origin is held
     /// (`swapmodel6a.py` `promote_oop`).
-    pub fn promote_oop(&mut self, w: &World) {
+    pub fn promote_oop(&mut self, w: &World) -> bool {
+        let mut released_event = false;
         if self.held_oop.is_empty() {
-            return;
+            return false;
         }
         let mut ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
         ids.sort_unstable(); // per origin, ids are in stamp order: one pass releases a whole run
@@ -206,8 +207,10 @@ impl Member {
                 self.appended.insert(i);
                 self.vc.raise(e.origin, e.hlc); // released in position: the vector rises
                 self.retire_repair(i);
+                released_event |= e.kind != Kind::Doc;
             }
         }
+        released_event
     }
 
     /// The hold route: an entry held out of position: known (the register and the state see it), servable only once it is in
@@ -519,13 +522,14 @@ impl Member {
     }
 
     pub fn settle(&mut self, w: &mut World) {
-        self.promote_oop(w);
+        // build item (a): a released event takes effect in the releasing transaction. `m-release-without-effect` leaves it one settle late
+        let late = self.promote_oop(w) && w.f.fm_release_without_effect;
         if !self.loss_info.is_empty() {
             self.activate_loss_info(w);
         }
         for _ in 0..60 {
             let mut prog = false;
-            if self.activate_info(w) {
+            if !late && self.activate_info(w) {
                 prog = true;
             }
             if self.retry_deferred(w) {

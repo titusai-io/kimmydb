@@ -255,6 +255,37 @@ fn append_in_position(mode: &str) -> (bool, bool, bool) {
     (appended, partial, serving == stage)
 }
 
+/// Item R / build item (a), seed 1251's shape: A holds B's bind as information (route 3, a parked bind); B's rows arrive in position,
+/// so the bind is RELEASED (covered, served); a snapshot R takes from A right then. With `m-release-without-effect` the bind takes
+/// effect at A only at a later settle, so the snapshot carries the coverage without the event, and R covers the writer past the bind
+/// and never learns it. Returns the run's problems.
+fn release_effect_twin(mode: &str) -> Vec<(String, i64)> {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("R", 0)], 60);
+    sc.w.reg_in_position_check = false; // the bind is delivered out of position on purpose (rule B's shape)
+    sc.advance(1);
+    let seed = sc.ms[0].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+    for m in ["B", "C"] {
+        sc.window(m, "A", &seed);
+    }
+    sc.advance(10);
+    let mut job = sc.ms[1].start_out(&mut sc.w, vec![1, 2], JobKind::Good, 0);
+    sc.advance(12);
+    let bind = sc.ms[1].do_bind(&mut sc.w, &mut job, 3).unwrap();
+    let create =
+        sc.w.all.iter().find(|e| e.kind == Kind::Create && e.phys == job.stage).unwrap().clone();
+    sc.window("A", "B", &create);
+    sc.take("A", &bind); // held out of position, before the rows: a parked bind
+    sc.advance(14);
+    sc.pull("A", "B"); // the rows arrive in position: the bind is released
+    assert!(sc.snapshot("R", "A", false), "R joins from A between release and effect");
+    step(&mut sc);
+    sc.advance(16);
+    sc.quiesce();
+    step(&mut sc);
+    let res = finish(&mut sc.w, &mut sc.ms);
+    nonzero(&res)
+}
+
 /// A join resumed only from its own sending peer: N is mid-join from X, a begin from Y is refused with no side effect,
 /// the register read when the last page lands is X's. Returns (the refused begin changed nothing, N serves the output,
 /// the run's problems).
@@ -755,6 +786,19 @@ mod tests {
             names.contains(&"inv_register_read_from_a_member_that_is_not_the_sender"),
             "{problems:?}"
         );
+    }
+
+    /// Item R: a release that takes effect one settle late (`m-release-without-effect`) lets a snapshot carry the coverage without the
+    /// event; build item (a) (the release takes effect in the releasing transaction) keeps the run clean.
+    #[test]
+    fn a_snapshot_between_release_and_effect_needs_build_item_a() {
+        for pre in ["", "field:"] {
+            let p = release_effect_twin(&format!("{pre}v6"));
+            assert!(p.is_empty(), "{pre}v6: {p:?}");
+            let m = release_effect_twin(&format!("{pre}m-release-without-effect"));
+            eprintln!("{pre}m-release-without-effect: {m:?}");
+            assert!(!m.is_empty(), "{pre}: the mutant must be killed by the scripted scenario");
+        }
     }
 
     fn rule_b_a_held_bind_is_information_until_covered_under(pre: &str) {
