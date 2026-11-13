@@ -183,7 +183,7 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         }).collect()),
         "pend_tombs": sj(m.pend_tombs.iter().map(|(n, s)| json!([n, stamp_v(w, s)])).collect()),
         "held_n": m.cv.count(), "held_h": fnv(m.cv.iter()),
-        "appended_n": m.appended.len(), "appended_h": fnv(m.appended.iter().copied()),
+        "appended": m.appended.iter().copied().collect::<Vec<_>>(), "appended_n": m.appended.len(), "appended_h": fnv(m.appended.iter().copied()),
         "dochist_n": m.dochist.len(), "dochist_h": fnv(m.dochist.iter().copied()),
         "hist_kept_h": fnv(sorted_ids(m.hist_kept.iter().copied())),
         "recv_entry_h": fnv(sorted_ids(m.recv_entry.iter().copied())),
@@ -472,7 +472,19 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                 let (d, sr) = (idx(&s("dst")), idx(&s("src")));
                 let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
                 let (dm, sm) = pair(&mut ms, d, sr);
+                let before: BTreeSet<EntryId> = dm.appended.clone();
                 dm.take_from(&mut w, sm, &e, ev["quiesce"].as_bool().unwrap());
+                if std::env::var("Q6DIFF_DEBUG").is_ok() {
+                    let added: Vec<String> =
+                        dm.appended.difference(&before).map(|&i| w.ent(i).to_string()).collect();
+                    eprintln!(
+                        "DEBUG event {} take_from {} <- {} idx {}: appended {added:?}",
+                        lineno + 1,
+                        dm.name,
+                        sm.name,
+                        e.idx
+                    );
+                }
                 Value::Null
             }
             "take" => {

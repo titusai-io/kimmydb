@@ -95,7 +95,7 @@ def member_j(m):
         loss_phys=sj([lk_j(k), p] for k, p in m.loss_phys.items()),
         events_emitted=sj([[k[0], stamp_j(k[1]) if len(k) > 1 else None], n] for k, n in m.events_emitted.items() if n),
         pend_tombs=sj([n, stamp_j(s)] for n, s in m.pend_tombs.items()),
-        held_n=len(m.held), held_h=fnv(sorted(m.held)), appended_n=len(m.appended), appended_h=fnv(sorted(m.appended)),
+        held_n=len(m.held), held_h=fnv(sorted(m.held)), appended=sorted(m.appended), appended_n=len(m.appended), appended_h=fnv(sorted(m.appended)),
         dochist_n=len(m.dochist), dochist_h=fnv(list(m.dochist)), hist_kept_h=fnv(sorted(m.hist_kept)),
         held_oop=sorted(m.held_oop),
         eps=sj([i, ep["start"], ep["last"], ep["n"], ep["end"], bool(ep["end_q"]), bool(ep["info"]), ep["cover"], bool(ep["cover_q"])] for i, ep in m.refusal_eps.items()),

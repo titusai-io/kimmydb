@@ -140,13 +140,29 @@ impl Member {
             self.held_oop.insert(e.idx);
         }
         self.pos_hold = behind; // behind a held entry the apply raises no vector
+        self.arriving = if behind && !w.f.fm_held_witness { Some(e.idx) } else { None };
         self.take(w, e);
+        self.arriving = None;
         self.pos_hold = false;
-        // (released already if the `settle` inside `take` released its predecessors: then it stays released)
-        if behind && (w.f.fm_held_witness || self.held_oop.contains(&e.idx)) {
+        // The model decides AFTER the take (`take_from` of 6d): if the `settle` inside `take` released the predecessors, the entry is
+        // not held and keeps the append decision of its apply (a winner is served, a history arrival is not); otherwise it is held
+        // too. The mark above only keeps the settle from counting it as covered: `promote_oop` and the HB-1 guard skip `arriving`.
+        if behind && w.f.fm_held_witness {
             self.appended.remove(&e.idx);
             self.held_oop.insert(e.idx);
             w.stats.bump("held_behind_held");
+        } else if behind {
+            let still = w.by_origin[e.origin]
+                .iter()
+                .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                .any(|x| self.held_oop.contains(x));
+            if still {
+                self.appended.remove(&e.idx);
+                self.held_oop.insert(e.idx);
+                w.stats.bump("held_behind_held");
+            } else {
+                self.held_oop.remove(&e.idx);
+            }
         }
         Taken::Received
     }

@@ -274,6 +274,7 @@ impl Member {
         self.apply_doc_decide(w, e);
         if w.held_uncovered
             && !w.f.fm_held_servable
+            && self.arriving != Some(e.idx)
             && self.held_oop.contains(&e.idx)
             && self.appended.remove(&e.idx)
         {
