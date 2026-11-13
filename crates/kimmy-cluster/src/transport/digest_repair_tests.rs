@@ -379,7 +379,10 @@ fn the_findings_cut_reaches_the_pull_of_its_own_repair() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     let mut cut = VersionVector::new();
-    cut.insert(node(9), kimmy_core::Hlc::new(5_000, 0));
+    cut.insert(
+        kimmy_core::Origin::new(node(9), kimmy_core::Epoch::ZERO),
+        kimmy_core::Hlc::new(5_000, 0),
+    );
     assert_eq!(stalls.plan_digest_repair(p, C, cut.clone()), DigestPlan::Planned);
     assert_eq!(due(&mut stalls, p), Some((C, Repair::Converge)));
     let progress = stalls.snapshot_progress(p, Some(C), kimmy_storage::SnapshotPolicy::Converge);

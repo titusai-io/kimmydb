@@ -2991,6 +2991,7 @@ pub(crate) fn index_id_range(
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
 
     use super::*;
     use crate::meta::IndexField;
@@ -3268,6 +3269,7 @@ mod tests {
         let later = Stamp::new(
             kimmy_core::Hlc::new(u64::MAX / 2, 0),
             kimmy_core::NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
         );
         crate::engine::definition_hooks::assert_exhausted("app.docs", || {
             arriving(&engine, CreateOrigin::Replicated { created: Some(later), logged: None })
@@ -3588,7 +3590,11 @@ mod tests {
                 as u64;
         let wall = now + 10_000_000 + WALL.fetch_add(1, Ordering::Relaxed);
         let entry = kimmy_core::OplogEntry {
-            stamp: Stamp::new(kimmy_core::Hlc::new(wall, 0), kimmy_core::NodeId::generate()),
+            stamp: Stamp::new(
+                kimmy_core::Hlc::new(wall, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: kimmy_core::OpKind::Replace,
             collection: coll.id,
             doc_id: Some(id),
@@ -3601,7 +3607,8 @@ mod tests {
     /// documents already here, whatever they hold, where a local create over
     /// documents it cannot key is refused (ADR-258).
     fn create_replicated(engine: &Engine, fields: Vec<IndexField>, name: &str) {
-        let created = Stamp::new(kimmy_core::Hlc::new(5, 0), kimmy_core::NodeId::generate());
+        let created =
+            Stamp::new(kimmy_core::Hlc::new(5, 0), kimmy_core::NodeId::generate(), Epoch::ZERO);
         engine
             .create_index_inner(
                 "app",
@@ -5729,6 +5736,7 @@ mod tests {
 mod clearing {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
 
     const ENTRIES: i64 = 5_000;
 
@@ -5867,8 +5875,11 @@ mod clearing {
         // A peer's definition under `name`, created after this node's.
         fn rival(engine: &crate::Engine, name: &str) -> kimmy_core::OplogEntry {
             let t = engine.get_collection("shop", "t").unwrap();
-            let later =
-                Stamp::new(engine.next_stamp().hlc, kimmy_core::NodeId::from_bytes([9; 16]));
+            let later = Stamp::new(
+                engine.next_stamp().hlc,
+                kimmy_core::NodeId::from_bytes([9; 16]),
+                Epoch::ZERO,
+            );
             let create = kimmy_core::IndexCreate {
                 db: "shop".into(),
                 collection: "t".into(),
@@ -5948,7 +5959,11 @@ mod clearing {
         // the transaction writes is the loser's clear and little else.
         let (engine, _dir, path) = indexed();
         let t = engine.get_collection("shop", "t").unwrap();
-        let later = Stamp::new(engine.next_stamp().hlc, kimmy_core::NodeId::from_bytes([9; 16]));
+        let later = Stamp::new(
+            engine.next_stamp().hlc,
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
+        );
         let rival = kimmy_core::IndexCreate {
             db: "shop".into(),
             collection: "t".into(),

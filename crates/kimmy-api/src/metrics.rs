@@ -53,6 +53,11 @@ pub const BACKUP_BUCKETS_US: [u64; 10] = [
 const LATENCY_BUCKETS_US: [u64; 12] =
     [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000];
 
+/// The `kimmy_epoch_origins` help line. A constant rather than text in the page's
+/// format string: the configuration-message scan in `kimmyd` reads a sentence that
+/// ends in a section name and is followed by that string's newline escape as a setting.
+const EPOCH_ORIGINS_HELP: &str = "Origins (node and epoch) in this member's own version vector.";
+
 /// Every counter as a plain value, for a reader that is not the renderer.
 ///
 /// A value struct rather than an accessor per counter: the OTLP bridge wants
@@ -81,6 +86,10 @@ pub struct StorageReadings {
     /// record: the next open walks (`Engine::version_vector_verified`,
     /// ADR-173's addendum of 2026-09-26).
     pub oplog_entries: u64,
+    /// Origins (node and epoch) in this member's own version vector: its length
+    /// at the moment of the reading (`Engine::version_vector`). A restore adds
+    /// one, because the restored member writes under a new epoch.
+    pub epoch_origins: u64,
     pub oplog_verified: kimmy_storage::VerifiedWalk,
     /// The repair redb made when the store was opened, by whether it rolled
     /// back the latest commit (`Engine::repairs_at_open`, ADR-204).
@@ -367,6 +376,8 @@ pub struct MetricsSnapshot {
     pub storage_bytes: u64,
     /// As [`StorageReadings::oplog_entries`] and [`StorageReadings::oplog_verified`].
     pub oplog_entries: u64,
+    /// As [`StorageReadings::epoch_origins`].
+    pub epoch_origins: u64,
     pub oplog_verified: kimmy_storage::VerifiedWalk,
     /// As [`StorageReadings::store_repairs`].
     pub store_repairs: kimmy_storage::RepairsAtOpen,
@@ -1446,6 +1457,7 @@ impl Metrics {
             commits_grouped: readings.commits_grouped,
             storage_bytes: readings.storage_bytes,
             oplog_entries: readings.oplog_entries,
+            epoch_origins: readings.epoch_origins,
             oplog_verified: readings.oplog_verified,
             store_repairs: readings.store_repairs,
             storage_cache: readings.storage_cache,
@@ -1786,6 +1798,9 @@ impl Metrics {
              # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.\n\
              # TYPE kimmy_oplog_entries gauge\n\
              kimmy_oplog_entries {oplog_entries}\n\
+             # HELP kimmy_epoch_origins {epoch_origins_help}\n\
+             # TYPE kimmy_epoch_origins gauge\n\
+             kimmy_epoch_origins {epoch_origins}\n\
              # HELP kimmy_oplog_verified_entries Oplog entries read by the walk that last verified the version vector, at an open or a rewind. 0 with no record, and then the next open walks.\n\
              # TYPE kimmy_oplog_verified_entries gauge\n\
              kimmy_oplog_verified_entries {oplog_verified_entries}\n\
@@ -2070,6 +2085,8 @@ impl Metrics {
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
             oplog_entries = readings.oplog_entries,
+            epoch_origins = readings.epoch_origins,
+            epoch_origins_help = EPOCH_ORIGINS_HELP,
             repairs_kept = readings.store_repairs.kept,
             repairs_rolled_back = readings.store_repairs.rolled_back,
             oplog_verified_entries = readings.oplog_verified.rows,
@@ -3141,16 +3158,16 @@ mod tests {
         };
         let mut n = 1_700u64;
         for class in 0..3 {
-            for kind in 0..3 {
-                y.faults[class][kind] = n;
+            for slot in &mut y.faults[class] {
+                *slot = n;
                 n += 1;
             }
-            for direction in 0..3 {
-                y.transitions[class][direction] = n;
+            for slot in &mut y.transitions[class] {
+                *slot = n;
                 n += 1;
             }
-            for verdict in 0..5 {
-                y.observations[class][verdict] = n;
+            for slot in &mut y.observations[class] {
+                *slot = n;
                 n += 1;
             }
         }
@@ -3185,6 +3202,7 @@ mod tests {
             storage_bytes: 47,
             // Values of their own, so no other series' line can match them.
             oplog_entries: 1_301,
+            epoch_origins: 1_305,
             oplog_verified: kimmy_storage::VerifiedWalk {
                 rows: 1_302,
                 logical_bytes: 1_303,
@@ -3668,6 +3686,9 @@ kimmy_store_repairs_total{rolled_back=\"true\"} 1402
 # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.
 # TYPE kimmy_oplog_entries gauge
 kimmy_oplog_entries 1301
+# HELP kimmy_epoch_origins Origins (node and epoch) in this member's own version vector.
+# TYPE kimmy_epoch_origins gauge
+kimmy_epoch_origins 1305
 # HELP kimmy_oplog_verified_entries Oplog entries read by the walk that last verified the version vector, at an open or a rewind. 0 with no record, and then the next open walks.
 # TYPE kimmy_oplog_verified_entries gauge
 kimmy_oplog_verified_entries 1302
@@ -4416,6 +4437,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             ));
         }
         expect(&format!("kimmy_oplog_entries {}\n", s.oplog_entries));
+        expect(&format!("kimmy_epoch_origins {}\n", s.epoch_origins));
         expect(&format!("kimmy_oplog_verified_entries {}\n", s.oplog_verified.rows));
         expect(&format!("kimmy_oplog_verified_logical_bytes {}\n", s.oplog_verified.logical_bytes));
         expect(&format!(
@@ -4982,7 +5004,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // decide them, went with ADR-238.)
         assert_eq!(
             samples,
-            108 + 6 + 17
+            // Since Q7 Step 1, `kimmy_epoch_origins`.
+            1 + 108 + 6 + 17
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT

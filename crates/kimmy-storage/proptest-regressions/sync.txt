@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1178e711222cce813dde09b6ba8767609cefea45cce48d008763dcd6669cb5ef # shrinks to stamps = {Stamp { hlc: Hlc(100.1), node: Node(00000000000000000000000000000000), epoch: Epoch([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) }, Stamp { hlc: Hlc(100.1), node: Node(00000000000000000000000000000000), epoch: Epoch([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) }}, limit = 1, before = false

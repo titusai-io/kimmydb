@@ -3320,7 +3320,13 @@ paths:
           in: query
           required: false
           schema: { type: string }
-          description: Resume immediately after this token.
+          description: |
+            Resume immediately after this token. A token is opaque; since 0.61.0
+            it is about 284 characters on a three-member cluster (it was 164),
+            and one from 0.60 or older is refused as malformed, naming the
+            length and first byte that were sent. A token issued before the
+            serving member was rewound or restored may redeliver events once the
+            member is reopened (at-least-once).
         - name: from_start
           in: query
           required: false
@@ -4264,7 +4270,9 @@ components:
         and as the `ETag` of a read by id; passed back as `if_stamp` to make a
         write conditional on the document still being at that version
         (ADR-084). Compare for equality only — nothing about its shape is
-        promised.
+        promised. Since 0.61.0 it is 60 characters (it was 35), and a stamp
+        from 0.60 or older is refused as malformed, naming the length and
+        format byte that were sent.
 
     Explain:
       type: object
@@ -4779,7 +4787,10 @@ components:
               enum: [insert, update, replace, delete]
             resumeToken:
               type: string
-              description: Portable across nodes. Send it as `resume_after` to continue.
+              description: |
+                Portable across nodes. Send it as `resume_after` to continue.
+                A token issued before a rewind or a restore of the member may
+                redeliver events after the member is reopened.
             clusterTime:
               type: string
               description: The originating node's HLC.

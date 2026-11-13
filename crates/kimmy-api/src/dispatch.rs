@@ -18,9 +18,9 @@
 //!
 //! Progress advances **after** a delivery succeeds, so a crash mid-flight
 //! redelivers rather than skipping. Exactly-once is not achievable over a
-//! network by any design, so every delivery carries the originating `Stamp` as
-//! a globally unique `X-Kimmy-Event-Id`, and deduplicating is a set-membership
-//! test on the receiver.
+//! network by any design, so every delivery carries the originating `Stamp`
+//! (hlc, node and epoch) as a globally unique `X-Kimmy-Event-Id`, and
+//! deduplicating is a set-membership test on the receiver.
 //!
 //! # The egress policy is re-checked before every delivery
 //!
@@ -57,6 +57,7 @@
 //! it would leave a gap the receiver could never detect — the thing
 //! [`invalidate`] exists to avoid.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,6 +245,13 @@ impl Backoff {
 /// included: a union of the ones that were would be lower than the truth, and
 /// a subscription planned from it could be invalidated as fallen behind.
 ///
+/// An entry of a record that cannot be read (a key that is not an origin, such
+/// as the node-only form written before epochs, or a value that is not an HLC)
+/// counts as nothing delivered, so the events it covered are sent again
+/// (at-least-once, as before). It is reported with a `warn!` naming the
+/// subscription, the record and the key, once per process for each
+/// (subscription, key); later hits log at `debug`. No metric counts it.
+///
 /// A walk of every node's progress records: the dispatcher calls it inside the
 /// plan's `blocking` (ADR-199).
 pub fn union_progress(
@@ -263,31 +271,118 @@ pub fn union_progress(
     };
     let prefix = format!("{subscription}:");
     state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
-        if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
+        if let Ok(record) = document.get_str("_id")
+            && record.starts_with(&prefix)
             && let Ok(vector) = document.get_document("delivered")
         {
-            for (node, hlc) in vector {
-                // The HLC is stored as its own byte encoding rather than a
-                // string: it has no `FromStr`, and its wall clock is a `u64`
-                // that BSON cannot hold as an integer above `i64::MAX` — the
-                // bug that once stopped half of all collections replicating.
-                let bson::Bson::Binary(binary) = hlc else {
-                    continue;
-                };
-                let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
-                    continue;
-                };
-                let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
-                    continue;
-                };
-                let mut one = VersionVector::new();
-                one.insert(node, Hlc::from_bytes(bytes));
-                union.merge(&one);
-            }
+            read_delivered(subscription, record, vector, &mut union);
         }
         Ok(true)
     })?;
     Ok(union)
+}
+
+/// What is wrong with one entry of a progress record's `delivered` document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressFault {
+    /// The key is a bare node id, the form written before epochs.
+    NodeOnlyKey,
+    /// The key is not an origin and not a node id.
+    MalformedKey,
+    /// The value is not a binary.
+    ValueNotBinary,
+    /// The value is binary but not an encoded HLC.
+    ValueWrongLength,
+}
+
+impl ProgressFault {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NodeOnlyKey => "key is a node id with no epoch (the form written before epochs)",
+            Self::MalformedKey => "key is not an origin (`<node uuid>/<36 hex epoch>`)",
+            Self::ValueNotBinary => "value is not binary",
+            Self::ValueWrongLength => "value is not a 10-byte HLC",
+        }
+    }
+}
+
+/// How many (subscription, key) pairs are remembered as already reported. A
+/// bound, so a record full of invented keys cannot grow the set without end:
+/// past it a fault is logged at `debug` only.
+const REPORTED_FAULTS_MAX: usize = 1024;
+
+/// Whether this fault has been reported at `warn` in this process.
+///
+/// `true` the first time a (subscription, key) pair is seen. The reader runs
+/// every pass, so a bad entry would otherwise log on every pass.
+fn first_report(subscription: &str, key: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<parking_lot::Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock();
+    seen.len() < REPORTED_FAULTS_MAX && seen.insert((subscription.to_string(), key.to_string()))
+}
+
+/// Report an entry of a progress record the reader cannot use.
+///
+/// The entry counts as nothing delivered, as it always has: the events it
+/// would have covered are sent again (at-least-once). The report is the log
+/// line, once per process for each (subscription, key); later hits are `debug`.
+fn report_progress_fault(subscription: &str, record: &str, key: &str, fault: ProgressFault) {
+    if first_report(subscription, key) {
+        warn!(
+            subscription,
+            record,
+            key,
+            fault = fault.describe(),
+            "a webhook progress entry cannot be read; it counts as nothing delivered, so the \
+             events it covered are sent again"
+        );
+    } else {
+        debug!(
+            subscription,
+            record,
+            key,
+            fault = fault.describe(),
+            "webhook progress entry unreadable"
+        );
+    }
+}
+
+/// Merge one progress record's `delivered` document into `union`.
+fn read_delivered(
+    subscription: &str,
+    record: &str,
+    delivered: &Document,
+    union: &mut VersionVector,
+) {
+    for (key, hlc) in delivered {
+        let Ok(origin) = key.parse::<kimmy_core::Origin>() else {
+            let fault = if key.parse::<NodeId>().is_ok() {
+                ProgressFault::NodeOnlyKey
+            } else {
+                ProgressFault::MalformedKey
+            };
+            report_progress_fault(subscription, record, key, fault);
+            continue;
+        };
+        // The HLC is stored as its own byte encoding rather than a
+        // string: it has no `FromStr`, and its wall clock is a `u64`
+        // that BSON cannot hold as an integer above `i64::MAX` — the
+        // bug that once stopped half of all collections replicating.
+        let bson::Bson::Binary(binary) = hlc else {
+            report_progress_fault(subscription, record, key, ProgressFault::ValueNotBinary);
+            continue;
+        };
+        let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(binary.bytes.as_slice())
+        else {
+            report_progress_fault(subscription, record, key, ProgressFault::ValueWrongLength);
+            continue;
+        };
+        let mut one = VersionVector::new();
+        one.insert(origin, Hlc::from_bytes(bytes));
+        union.merge(&one);
+    }
 }
 
 /// Drop every node's progress record for a subscription that is gone.
@@ -350,6 +445,15 @@ pub(crate) fn progress_record(
     subscription: &str,
     progress: &VersionVector,
 ) -> (kimmy_core::DocId, Document) {
+    progress_record_of(state.engine.node_id(), subscription, progress)
+}
+
+/// [`progress_record`] for a named node: the record `node` writes.
+fn progress_record_of(
+    node_id: NodeId,
+    subscription: &str,
+    progress: &VersionVector,
+) -> (kimmy_core::DocId, Document) {
     let mut delivered = Document::new();
     for (node, hlc) in progress.iter() {
         delivered.insert(
@@ -360,7 +464,7 @@ pub(crate) fn progress_record(
             },
         );
     }
-    let id = format!("{subscription}:{}", state.engine.node_id());
+    let id = format!("{subscription}:{node_id}");
     let document = doc! { "_id": id.clone(), "delivered": delivered };
     (kimmy_core::DocId::String(id), document)
 }
@@ -543,11 +647,22 @@ struct Delivery {
 
 /// A globally unique id for one change.
 ///
-/// The originating stamp: `(hlc, node)`. Unique without coordination, identical
-/// on every node that holds the entry, and stable across redeliveries — which
-/// is exactly what a receiver needs to deduplicate.
+/// The originating stamp: `{hlc}-{node}-{epoch}`, the epoch as its 36 lowercase hex
+/// digits. Unique without coordination (two epochs of one node can share an HLC, so the
+/// epoch is part of it), identical on every node that holds the entry, and stable across
+/// redeliveries — which is exactly what a receiver needs to deduplicate.
 pub fn event_id(entry: &OplogEntry) -> String {
-    format!("{}-{}", entry.stamp.hlc, entry.stamp.node)
+    stamp_event_id(&entry.stamp)
+}
+
+/// [`event_id`] of the change stamped `stamp`.
+fn stamp_event_id(stamp: &Stamp) -> String {
+    format!("{}-{}-{}", stamp.hlc, stamp.node, stamp.epoch.to_hex())
+}
+
+/// The `X-Kimmy-Event-Id` of a batch: the id of its first event, empty for none.
+fn first_event_id(stamps: &[Stamp]) -> String {
+    stamps.first().map(stamp_event_id).unwrap_or_default()
 }
 
 /// `HMAC-SHA256(secret, timestamp || "." || body)`, hex.
@@ -712,10 +827,12 @@ fn window_end(window: &kimmy_storage::OplogWindow) -> WindowEnd {
     }
     match window.entries.last() {
         Some(last) if last.stamp.hlc <= window.scanned_to => WindowEnd::Through(last.stamp),
-        Some(last) => WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node)),
+        Some(last) => {
+            WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node, last.stamp.epoch))
+        }
         // An empty window that is not the tail cannot be: nothing was examined, so
         // nothing is claimed.
-        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]), Epoch::ZERO)),
     }
 }
 
@@ -947,12 +1064,12 @@ pub async fn dispatch_once_owned(
             let undelivered_wanted = scanned
                 .iter()
                 .filter(|e| wanted(e, job.collection_id, &job.operations))
-                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .filter(|e| progress.get(e.stamp.origin()) < e.stamp.hlc)
                 .count();
             let batch: Vec<OplogEntry> = scanned
                 .iter()
                 .filter(|e| wanted(e, job.collection_id, &job.operations))
-                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .filter(|e| progress.get(e.stamp.origin()) < e.stamp.hlc)
                 .take(BATCH)
                 .cloned()
                 .collect();
@@ -1243,8 +1360,7 @@ async fn deliver_within(
     // so the timestamp a receiver checks against replay is the send time.
     let timestamp = kimmy_storage::physical_now_ms();
     let signature = sign(&job.secret, timestamp, &delivery.body);
-    let first =
-        delivery.stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default();
+    let first = first_event_id(&delivery.stamps);
 
     let mut request = client
         .post(&job.url)
@@ -1370,6 +1486,7 @@ pub async fn run(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use kimmy_core::Epoch;
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
@@ -1442,7 +1559,7 @@ pub(crate) mod tests {
         let (q, x) = (node(0x11), node(0x22));
         let base = kimmy_storage::physical_now_ms() - 600_000;
         let entry = |origin: NodeId, ms: u64, n: i64| kimmy_core::OplogEntry {
-            stamp: Stamp::new(Hlc::new(base + ms, 0), origin),
+            stamp: Stamp::new(Hlc::new(base + ms, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: watched.id,
             doc_id: Some(DocId::Int64(n)),
@@ -1467,7 +1584,10 @@ pub(crate) mod tests {
             .insert(
                 &progress,
                 bson::doc! { "_id": format!("wh_a:{q}"),
-                "delivered": { q.to_string(): bytes(299), x.to_string(): bytes(10) } },
+                "delivered": {
+                    kimmy_core::Origin::new(q, Epoch::ZERO).to_string(): bytes(299),
+                    kimmy_core::Origin::new(x, Epoch::ZERO).to_string(): bytes(10),
+                } },
             )
             .unwrap();
 
@@ -1503,20 +1623,42 @@ pub(crate) mod tests {
     fn carrying_forward_raises_to_the_lower_of_position_and_window_end_and_never_lowers() {
         let (a, b, c) = (node(1), node(2), node(3));
         let mut progress = VersionVector::new();
-        progress.insert(a, Hlc::new(900, 0)); // already past the window
-        progress.insert(b, Hlc::new(10, 0));
+        progress.insert(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO), Hlc::new(900, 0)); // already past the window
+        progress.insert(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO), Hlc::new(10, 0));
         let mut current = VersionVector::new();
-        current.insert(a, Hlc::new(1_000, 0));
-        current.insert(b, Hlc::new(1_000, 0));
-        current.insert(c, Hlc::new(50, 0)); // below the window's end: only its own position
-        carry_forward(&mut progress, &current, WindowEnd::Through(Stamp::new(Hlc::new(500, 0), c)));
-        assert_eq!(progress.get(a), Hlc::new(900, 0), "never lowered");
-        assert_eq!(progress.get(b), Hlc::new(500, 0), "raised to the window's end");
-        assert_eq!(progress.get(c), Hlc::new(50, 0), "and no further than this node held");
+        current.insert(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO), Hlc::new(1_000, 0));
+        current.insert(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO), Hlc::new(1_000, 0));
+        current.insert(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO), Hlc::new(50, 0)); // below the window's end: only its own position
+        carry_forward(
+            &mut progress,
+            &current,
+            WindowEnd::Through(Stamp::new(Hlc::new(500, 0), c, Epoch::ZERO)),
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(a, kimmy_core::Epoch::ZERO)),
+            Hlc::new(900, 0),
+            "never lowered"
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO)),
+            Hlc::new(500, 0),
+            "raised to the window's end"
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO)),
+            Hlc::new(50, 0),
+            "and no further than this node held"
+        );
         // The tail of the oplog: everything this node held.
         carry_forward(&mut progress, &current, WindowEnd::Exhausted);
-        assert_eq!(progress.get(b), Hlc::new(1_000, 0));
-        assert_eq!(progress.get(c), Hlc::new(50, 0));
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(b, kimmy_core::Epoch::ZERO)),
+            Hlc::new(1_000, 0)
+        );
+        assert_eq!(
+            progress.get(kimmy_core::Origin::new(c, kimmy_core::Epoch::ZERO)),
+            Hlc::new(50, 0)
+        );
     }
 
     /// A window that reached the end of the oplog is the whole tail, and one that did
@@ -1524,7 +1666,7 @@ pub(crate) mod tests {
     #[test]
     fn a_window_ends_at_the_tail_or_at_its_last_entry() {
         let entry = |ms: u64, byte: u8| kimmy_core::OplogEntry {
-            stamp: Stamp::new(Hlc::new(ms, 0), node(byte)),
+            stamp: Stamp::new(Hlc::new(ms, 0), node(byte), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId(1),
             doc_id: Some(DocId::Int64(1)),
@@ -1539,18 +1681,18 @@ pub(crate) mod tests {
         assert_eq!(window_end(&window(true, 20)), WindowEnd::Exhausted);
         assert_eq!(
             window_end(&window(false, 20)),
-            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2), Epoch::ZERO))
         );
         // The scan examined rows past the last one kept: the last entry is as far as
         // anything was delivered. And one that stopped short of it (a row withheld at
         // the end) claims only what it examined, under the last entry's origin.
         assert_eq!(
             window_end(&window(false, 25)),
-            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2), Epoch::ZERO))
         );
         assert_eq!(
             window_end(&window(false, 15)),
-            WindowEnd::Through(Stamp::new(Hlc::new(15, 0), node(2)))
+            WindowEnd::Through(Stamp::new(Hlc::new(15, 0), node(2), Epoch::ZERO))
         );
     }
 
@@ -2109,9 +2251,113 @@ pub(crate) mod tests {
         );
     }
 
+    /// A writer a test can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` and return the log lines it wrote at `warn` or above.
+    fn warnings_of(body: impl FnOnce()) -> Vec<String> {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let out = String::from_utf8(sink.0.lock().clone()).expect("utf-8");
+        out.lines().map(str::to_string).collect()
+    }
+
+    /// Progress written by `progress_record_of` is read back whole, and a union of two
+    /// records keeps the higher position of each origin.
+    #[test]
+    fn progress_written_with_origin_keys_reads_back() {
+        let (a, b) = (node(1), node(2));
+        let epoch = Epoch::new(Hlc::new(7, 0), [9; 8]);
+        let mut written = VersionVector::new();
+        written.insert(kimmy_core::Origin::new(a, Epoch::ZERO), Hlc::new(100, 3));
+        written.insert(kimmy_core::Origin::new(a, epoch), Hlc::new(200, 0));
+        written.insert(kimmy_core::Origin::new(b, epoch), Hlc::new(50, 1));
+        let (_, document) = progress_record_of(a, "wh_round", &written);
+        assert_eq!(document.get_str("_id").unwrap(), format!("wh_round:{a}"));
+
+        let mut read = VersionVector::new();
+        let warnings = warnings_of(|| {
+            read_delivered(
+                "wh_round",
+                "wh_round:x",
+                document.get_document("delivered").unwrap(),
+                &mut read,
+            )
+        });
+        assert_eq!(read, written, "every origin comes back with its own position");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Each unusable shape is reported at `warn` once across two reads of the record, counts
+    /// as nothing delivered, and does not stop a good entry beside it.
+    #[test]
+    fn each_unusable_progress_shape_warns_once() {
+        let good = kimmy_core::Origin::new(node(5), Epoch::ZERO);
+        let hlc = |ms: u64| bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: Hlc::new(ms, 0).to_bytes().to_vec(),
+        };
+        // One record per shape, with a good entry under another key.
+        let other = kimmy_core::Origin::new(node(7), Epoch::ZERO);
+        let cases: [(&str, String, bson::Bson, &str); 4] = [
+            ("wh_old", node(6).to_string(), hlc(10).into(), "no epoch"),
+            ("wh_bad", "not-an-origin".to_string(), hlc(10).into(), "not an origin"),
+            ("wh_text", good.to_string(), bson::Bson::String("x".into()), "not binary"),
+            (
+                "wh_short",
+                good.to_string(),
+                bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2, 3] }
+                    .into(),
+                "not a 10-byte",
+            ),
+        ];
+        for (subscription, key, value, needle) in cases {
+            let mut delivered = Document::new();
+            delivered.insert(key.clone(), value);
+            delivered.insert(other.to_string(), hlc(99));
+            let record = format!("{subscription}:n");
+            let mut union = VersionVector::new();
+            let warnings = warnings_of(|| {
+                read_delivered(subscription, &record, &delivered, &mut union);
+                read_delivered(subscription, &record, &delivered, &mut union);
+            });
+            assert_eq!(warnings.len(), 1, "{subscription}: {warnings:?}");
+            let line = &warnings[0];
+            for named in [subscription, record.as_str(), key.as_str(), needle] {
+                assert!(line.contains(named), "{subscription}: {named:?} not in {line}");
+            }
+            assert_eq!(union.len(), 1, "{subscription}: only the good entry counts");
+            assert_eq!(union.get(other), Hlc::new(99, 0));
+        }
+    }
+
     fn entry(kind: OpKind, collection: u64, ms: u64) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::generate(), Epoch::ZERO),
             kind,
             collection: kimmy_core::ids::CollectionId(collection),
             doc_id: Some(DocId::Int64(1)),
@@ -2147,6 +2393,20 @@ pub(crate) mod tests {
         let e = entry(OpKind::Insert, 1, 100);
         assert_eq!(event_id(&e), event_id(&e), "must be stable");
         assert_ne!(event_id(&e), event_id(&entry(OpKind::Insert, 1, 101)));
+    }
+
+    #[test]
+    fn two_epochs_of_one_node_at_one_hlc_give_two_event_ids() {
+        // A restored member's new epoch can stamp a write at an HLC its old epoch already used
+        // (a clock behind the lost writes): two changes, which a receiver deduplicating on the
+        // id must not collapse into one.
+        let old = entry(OpKind::Insert, 1, 100);
+        let mut new = old.clone();
+        new.stamp.epoch = Epoch::new(old.stamp.hlc, [1; 8]);
+        assert_ne!(event_id(&old), event_id(&new));
+        let header = |e: &OplogEntry| super::first_event_id(&[e.stamp]);
+        assert_ne!(header(&old), header(&new), "nor the X-Kimmy-Event-Id header");
+        assert_eq!(header(&new), event_id(&new), "the header is the first event's id");
     }
 
     #[test]

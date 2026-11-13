@@ -2099,6 +2099,9 @@ mod tests {
                 Err(other) => format!("error {other}"),
             };
             // On a line of its own: libtest has already printed the test's name.
+            // One line: redb's panic text for a failed `assert_eq!` spans several, and the
+            // parent reads the first line of the probe.
+            let outcome = outcome.replace('\n', " ");
             println!("\nPROBE {} {} {outcome}", redb_time::take().as_millis(), max_rss_kib());
         } else if let Ok(path) = std::env::var(PROBE_PLAIN_REDB) {
             // Plain redb, nothing of this build's in front of it.

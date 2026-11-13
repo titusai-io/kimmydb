@@ -45,7 +45,10 @@ pub async fn watch_collection(
 
     let options = WatchOptions {
         resume_after: match &q.resume_after {
-            Some(raw) => Some(ResumeToken::decode_client(raw).map_err(ApiError::from)?),
+            Some(raw) => Some(ResumeToken::decode_client(raw).map_err(|e| match e {
+                kimmy_core::Error::MalformedResumeToken => ApiError::malformed_resume_token(raw),
+                e => ApiError::from(e),
+            })?),
             None => None,
         },
         start_at: q.from_start.then_some(Hlc::ZERO),
@@ -223,6 +226,7 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use std::sync::Arc;
 
     use kimmy_core::{DocId, NodeId, OpKind, OplogEntry, Stamp, UniqueViolationDetail};
@@ -240,7 +244,7 @@ mod tests {
 
     fn entry(kind: OpKind, id: DocId, body: Option<Vec<u8>>) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(5, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(5, 0), NodeId::generate(), Epoch::ZERO),
             kind,
             collection: kimmy_core::ids::CollectionId(1),
             doc_id: Some(id),

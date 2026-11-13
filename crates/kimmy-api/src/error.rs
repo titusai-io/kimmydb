@@ -732,6 +732,33 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, message)
     }
 
+    /// A stamp (`if_stamp`) that does not decode, with what was sent set against what is
+    /// accepted: a stamp is [`kimmy_core::Stamp::TOKEN_LEN`] bytes whose first is the format
+    /// byte `0x01`. One from before epochs is 26 bytes and is named as such.
+    pub fn malformed_stamp(raw: &str) -> Self {
+        Self::bad_request(format!(
+            "malformed stamp: expected a version 0x01 stamp of {} bytes ({} characters); {}. \
+             Pass back a stamp exactly as the server returned it",
+            kimmy_core::Stamp::TOKEN_LEN,
+            token_chars(kimmy_core::Stamp::TOKEN_LEN),
+            token_shape(raw)
+        ))
+    }
+
+    /// A change-stream `resumeAfter` that does not decode as a token this server issues. Names
+    /// what was sent: a token issued before epochs (a 26-byte stamp, or an issued token of
+    /// version 2) is refused, and says so.
+    pub fn malformed_resume_token(raw: &str) -> Self {
+        Self::bad_request(format!(
+            "malformed resume token: expected an issued token of version {} (at least {} bytes); \
+             {}. Pass back a token exactly as the server returned it; tokens from before \
+             cluster protocol 3 are not accepted",
+            ISSUED_TOKEN_VERSION,
+            ISSUED_TOKEN_MIN_LEN,
+            token_shape(raw)
+        ))
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
     }
@@ -1185,6 +1212,33 @@ impl From<AuthError> for ApiError {
     }
 }
 
+/// The version byte of an issued resume token, and the least bytes one has (its header, no
+/// origins). A test in this file holds both to what `kimmy-core` encodes.
+const ISSUED_TOKEN_VERSION: u8 = 3;
+const ISSUED_TOKEN_MIN_LEN: usize = 1 + kimmy_core::Stamp::KEY_LEN + kimmy_core::Origin::LEN + 2;
+
+/// Base64url characters (no padding) for `bytes` raw bytes.
+fn token_chars(bytes: usize) -> usize {
+    (bytes * 4).div_ceil(3)
+}
+
+/// What a refused token looks like, for the refusal text: its length in characters, and, when
+/// it is base64url, its length in bytes and first byte.
+fn token_shape(raw: &str) -> String {
+    use base64::Engine as _;
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw) {
+        Ok(bytes) => match bytes.first() {
+            Some(first) => format!(
+                "this one is {} characters, {} bytes, first byte 0x{first:02x}",
+                raw.len(),
+                bytes.len()
+            ),
+            None => "this one is empty".to_string(),
+        },
+        Err(_) => format!("this one is {} characters and is not base64url", raw.len()),
+    }
+}
+
 #[cfg(test)]
 mod writer_busy_wording_tests {
     use super::*;
@@ -1221,6 +1275,72 @@ mod writer_busy_wording_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stamp() -> kimmy_core::Stamp {
+        kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(1_700_000_000_000, 2),
+            kimmy_core::NodeId::from_bytes([4; 16]),
+            kimmy_core::Epoch::ZERO,
+        )
+    }
+
+    /// The literals the refusal text uses are what `kimmy-core` encodes.
+    #[test]
+    fn the_token_forms_the_refusals_name_are_the_ones_core_encodes() {
+        use base64::Engine as _;
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let raw = url.decode(stamp().encode()).unwrap();
+        assert_eq!(raw.len(), kimmy_core::Stamp::TOKEN_LEN);
+        assert_eq!(raw[0], 0x01);
+        assert_eq!(stamp().encode().len(), token_chars(kimmy_core::Stamp::TOKEN_LEN));
+
+        let origin = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([4; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let issued =
+            kimmy_core::ResumeToken::issued(stamp(), origin, kimmy_core::VersionVector::new());
+        let raw = url.decode(issued.encode()).unwrap();
+        assert_eq!(raw[0], ISSUED_TOKEN_VERSION);
+        assert_eq!(raw.len(), ISSUED_TOKEN_MIN_LEN, "no origins: the header alone");
+    }
+
+    /// A stamp of the wrong length or version is refused by name: what is expected, and what
+    /// was sent.
+    #[test]
+    fn a_stamp_of_another_form_is_refused_naming_it() {
+        use base64::Engine as _;
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        // Before epochs: 26 bytes, no format byte.
+        let old = url.encode([0x11u8; 26]);
+        let e = ApiError::malformed_stamp(&old);
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        for needle in ["0x01", "45 bytes", "60 characters", "26 bytes", "first byte 0x11"] {
+            assert!(e.message.contains(needle), "{needle:?} not in {}", e.message);
+        }
+        // The right length, the wrong format byte.
+        let wrong = url.encode([0x02u8; 45]);
+        assert!(ApiError::malformed_stamp(&wrong).message.contains("first byte 0x02"));
+        // Not base64url at all.
+        assert!(ApiError::malformed_stamp("a b!").message.contains("not base64url"));
+    }
+
+    /// A resume token from before epochs (a 26-byte stamp, or an issued token of version 2) is
+    /// refused naming what was sent.
+    #[test]
+    fn a_resume_token_of_another_form_is_refused_naming_it() {
+        use base64::Engine as _;
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut v2 = vec![2u8];
+        v2.extend_from_slice(&[0; 44]);
+        let e = ApiError::malformed_resume_token(&url.encode(&v2));
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        for needle in ["version 3", "first byte 0x02", "45 bytes", "cluster protocol 3"] {
+            assert!(e.message.contains(needle), "{needle:?} not in {}", e.message);
+        }
+        let single = ApiError::malformed_resume_token(&url.encode([0u8; 26]));
+        assert!(single.message.contains("26 bytes"), "{}", single.message);
+    }
 
     /// A writer a test can read back, so an assertion can be made about the
     /// line a failure produced rather than about the call that produced it.

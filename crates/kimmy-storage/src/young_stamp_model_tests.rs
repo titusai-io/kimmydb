@@ -1049,7 +1049,7 @@ impl Cluster {
         if target.max(e.clock_last().wall_ms) <= now + 2 {
             self.overrun = true;
         }
-        e.advance_clock_past(&Stamp::new(Hlc::new(target, 0), e.node_id()));
+        e.advance_clock_past(&Stamp::new(Hlc::new(target, 0), e.node_id(), e.epoch()));
     }
 
     fn start(&mut self, m: usize, kill: Option<u8>) -> Res<()> {

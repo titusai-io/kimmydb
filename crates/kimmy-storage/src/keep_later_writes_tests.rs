@@ -2,6 +2,7 @@
 //! the two commits, the vector shadow and the database's guard, one test per
 //! clause of the design.
 
+use kimmy_core::Epoch;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -570,7 +571,8 @@ fn a_replicated_index_in_the_drops_hlc_between_two_sweep_chunks_is_history() {
                 let held = d.collection_dropped_at(CollectionId::derive("shop", "orders"));
                 let dropped = held.unwrap().expect("the tombstone is recorded first");
                 let mut tied = create[0].clone();
-                tied.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+                tied.stamp =
+                    Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
                 d.apply_batch(std::slice::from_ref(&tied)).unwrap();
             },
         );
@@ -817,35 +819,35 @@ fn a_start_sweeps_the_parent_before_its_shadow() {
 #[test]
 fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
-    let reaches = |e: &Engine, node: kimmy_core::NodeId, at: Hlc, how: &str| {
+    let reaches = |e: &Engine, origin: kimmy_core::Origin, at: Hlc, how: &str| {
         let row = e.digest_row(id).unwrap().unwrap_or_else(|| panic!("{how}: no row"));
-        let held = row.maxw.get(&node).copied().unwrap_or(Hlc::ZERO);
+        let held = row.maxw.get(&origin).copied().unwrap_or(Hlc::ZERO);
         assert!(held >= at, "{how}: maxw {held:?} is below the record's {at:?}");
     };
     // A local insert and a local delete (a tombstone).
     let on_d = d.get_collection("shop", "orders").unwrap();
     later();
     let (_, inserted) = d.insert_stamped(&on_d, doc! { "_id": 7i64 }).unwrap();
-    reaches(&d, d.node_id(), inserted.hlc, "a local insert");
+    reaches(&d, d.origin(), inserted.hlc, "a local insert");
     later();
     assert!(d.delete(&on_d, &DocId::Int64(7)).unwrap());
-    let deleted = d.version_vector().unwrap().get(d.node_id());
-    reaches(&d, d.node_id(), deleted, "a local delete");
+    let deleted = d.version_vector().unwrap().get(d.origin());
+    reaches(&d, d.origin(), deleted, "a local delete");
     // A replicated insert from a peer.
     later();
     let on_a = a.get_collection("shop", "orders").unwrap();
     let (_, replicated) = a.insert_stamped(&on_a, doc! { "_id": 8i64 }).unwrap();
     sync(&a, &d);
-    reaches(&d, a.node_id(), replicated.hlc, "a replicated insert");
+    reaches(&d, a.origin(), replicated.hlc, "a replicated insert");
     // A record a snapshot page carries.
     later();
     let (_, carried) = a.insert_stamped(&on_a, doc! { "_id": 9i64 }).unwrap();
     let page = a.snapshot_page(None, None).unwrap();
     d.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-    reaches(&d, a.node_id(), carried.hlc, "a record from a snapshot page");
+    reaches(&d, a.origin(), carried.hlc, "a record from a snapshot page");
     // The tombstones a sweep writes with no entry behind them: at the drop's stamp.
     let drop_at = Hlc::new(carried.hlc.wall_ms + 50, 0);
-    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id());
+    let dropper = kimmy_core::Stamp::new(drop_at, a.node_id(), a.epoch());
     let sweeper = d.get_collection("shop", "orders").unwrap();
     let mut newer = sweeper.clone();
     newer.created = Hlc::new(drop_at.wall_ms + 1, 0);
@@ -856,7 +858,7 @@ fn maxw_is_raised_by_every_way_a_record_reaches_a_collection() {
     }
     d.record_collection_drop(id, dropper).unwrap();
     d.sweep_late_drop("shop", "orders", dropper).unwrap();
-    reaches(&d, a.node_id(), drop_at, "a sweep's tombstone at the drop");
+    reaches(&d, a.origin(), drop_at, "a sweep's tombstone at the drop");
 }
 
 // -- The owed window ----------------------------------------------------------
@@ -1196,7 +1198,7 @@ fn a_chunk_whose_document_is_not_here_stays_if_made_after_the_drop_and_goes_if_n
     // Something after the drop, so the survivors path is taken.
     d.insert(&on_d, doc! { "_id": 9i64 }).unwrap();
     let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    let after_the_drop = d.version_vector().unwrap().get(d.node_id());
+    let after_the_drop = d.version_vector().unwrap().get(d.origin());
     // Documents 7 and 8 are not in the parent here. 7's chunk was made from a
     // version before the drop, 8's from one after it.
     d.put_vectors(&shadow, &DocId::Int64(7), &[chunk_of(7, on_d.created)]).unwrap();
@@ -1275,7 +1277,7 @@ fn a_straggler_in_the_floor_s_own_hlc_is_refused_while_a_floor_burial_sweeps() {
         .expect("the straggler's entry");
     let mut low = [0u8; 16];
     low[15] = 1;
-    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low));
+    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low), Epoch::ZERO);
     assert!(straggler.stamp < dropped, "premise: the real tombstone refuses it");
     let d = Arc::new(d);
     let on_d = Arc::clone(&d);

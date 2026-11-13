@@ -4,6 +4,7 @@
 //! handlers directly, so routing, extractors, status codes, and the JSON
 //! boundary are all exercised the way a client meets them.
 
+use kimmy_core::Epoch;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -4750,6 +4751,7 @@ async fn standing_unique_violations_are_reported_until_resolved() {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(9_000, 0),
             kimmy_core::NodeId::generate(),
+            Epoch::ZERO,
         ),
         kind: kimmy_core::OpKind::Insert,
         collection: meta.id,
@@ -4824,6 +4826,7 @@ async fn a_violation_names_a_uuid_holder_with_its_subtype() {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(9_000, 0),
             kimmy_core::NodeId::generate(),
+            Epoch::ZERO,
         ),
         kind: kimmy_core::OpKind::Insert,
         collection: meta.id,
@@ -4882,6 +4885,7 @@ async fn a_rewritten_member_leaves_its_violation_group() {
             stamp: kimmy_core::Stamp::new(
                 kimmy_core::Hlc::new(hlc, 0),
                 kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
             ),
             kind: kimmy_core::OpKind::Insert,
             collection: meta.id,
@@ -5012,7 +5016,7 @@ async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_stand
     let origin = kimmy_core::NodeId::generate();
     let entry =
         |hlc: u64, kind: kimmy_core::OpKind, id: &str, email: &str| kimmy_core::OplogEntry {
-            stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(hlc, 0), origin),
+            stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(hlc, 0), origin, Epoch::ZERO),
             kind,
             collection: meta.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -11855,6 +11859,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_store_repairs_total",
         "kimmy_store_repairs_total",
         "kimmy_oplog_entries",
+        "kimmy_epoch_origins",
         "kimmy_oplog_verified_entries",
         "kimmy_oplog_verified_logical_bytes",
         "kimmy_oplog_verified_walk_seconds",
@@ -13638,6 +13643,7 @@ fn replicated_into(
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(wall, 0),
             kimmy_core::NodeId::generate(),
+            Epoch::ZERO,
         ),
         kind: kimmy_core::OpKind::Insert,
         collection: meta.id,

@@ -1715,7 +1715,7 @@ mod tests {
     fn a_scope_holding_only_a_position_commits_once() {
         let (engine, _dir) = engine();
         let mut rx = engine.subscribe();
-        let token = ResumeToken::new(Hlc::new(7, 1), engine.node_id());
+        let token = ResumeToken::new(Hlc::new(7, 1), engine.origin());
 
         let commits = engine.commits();
         engine

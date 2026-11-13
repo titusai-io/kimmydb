@@ -8,6 +8,7 @@
 //! two states depending on the route. A dated change from elsewhere now applies
 //! the implied off on both; a local change is refused as it always was.
 
+use kimmy_core::Epoch;
 use kimmy_core::{Hlc, ProviderConfig, VectorConfig};
 
 use crate::{Engine, SnapshotProgress, WalkScope};
@@ -165,7 +166,8 @@ fn an_entry_of_an_older_life_with_another_width_changes_nothing() {
     let (b, _db) = engine();
     let low = kimmy_core::NodeId::from_bytes([1; 16]);
     let id = kimmy_core::CollectionId::derive("shop", "orders");
-    b.record_collection_drop(id, kimmy_core::Stamp::new(Hlc::new(1_000, 0), low)).unwrap();
+    b.record_collection_drop(id, kimmy_core::Stamp::new(Hlc::new(1_000, 0), low, Epoch::ZERO))
+        .unwrap();
     b.create_collection("shop", "orders").unwrap();
     b.configure_vectors("shop", "orders", byo(8)).unwrap();
     {
@@ -177,7 +179,7 @@ fn an_entry_of_an_older_life_with_another_width_changes_nothing() {
         txn.commit().unwrap();
     }
     let entry = crate::engine::ddl_entry(
-        kimmy_core::Stamp::new(Hlc::new(500, 0), low),
+        kimmy_core::Stamp::new(Hlc::new(500, 0), low, Epoch::ZERO),
         kimmy_core::OpKind::ConfigureVectors,
         id,
         &kimmy_core::VectorSet {

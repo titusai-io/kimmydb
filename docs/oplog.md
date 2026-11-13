@@ -35,7 +35,7 @@ not applied. That is what makes the log trustworthy enough to build on.
 
 ```mermaid
 graph TB
-    W["Every mutation"] --> O[("Oplog<br/>(hlc ‖ node) → OplogEntry")]
+    W["Every mutation"] --> O[("Oplog<br/>(hlc ‖ node ‖ epoch) → OplogEntry")]
 
     O --> C1["<b>Change streams</b><br/>WebSocket subscribers<br/>resumable by token<br/><i>✅ working</i>"]
     O --> C2["<b>Embedding pipeline</b><br/>extract → chunk → embed<br/>an ordinary subscriber<br/><i>✅ working</i>"]
@@ -105,16 +105,22 @@ empty document* must not be applied as a *delete*. Covered by
 
 ## Keys and ordering
 
-The oplog key is a flat 26-byte slice:
+The oplog key is a flat 44-byte slice (26 bytes before 0.61.0):
 
 ```
-┌──────────────────┬─────────────────┐
-│  Hlc (10 bytes)  │  NodeId (16)    │
-└──────────────────┴─────────────────┘
+┌──────────────────┬─────────────────┬──────────────────┐
+│  Hlc (10 bytes)  │  NodeId (16)    │  Epoch (18)      │
+└──────────────────┴─────────────────┴──────────────────┘
 ```
 
-Because both halves are order-preserving big-endian encodings, `memcmp` on this
-key yields exactly the total write order `(wall_ms, counter, node_id)`. So:
+The node and the epoch together are the entry's **origin** (34 bytes). An epoch
+is minted when a member opens a store that holds none (its start HLC, 10 bytes,
+then 8 random bytes), so a node that is restored from a backup, or rewound,
+writes under a new epoch, and an old epoch's writes stay distinct from its
+new ones. See [ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both).
+
+Because every part is an order-preserving big-endian encoding, `memcmp` on this
+key yields exactly the total write order `(wall_ms, counter, node_id, epoch)`. So:
 
 - **Scanning the log forward** is a plain redb range scan.
 - **"Everything since time T"** is a range from an encoded lower bound.
@@ -135,8 +141,8 @@ So a second index maps a monotonic local counter — assigned when an entry is
 appended *here* — to its stamp:
 
 ```
-oplog_arrival:      arrival_seq -> (hlc || node)
-oplog_arrival_seq:  (hlc || node) -> arrival_seq
+oplog_arrival:      arrival_seq -> (hlc || node || epoch)
+oplog_arrival_seq:  (hlc || node || epoch) -> arrival_seq
 ```
 
 ```rust
@@ -165,16 +171,29 @@ arrival order is different ([ADR-173](decisions.md)).
 
 A resume token is opaque and URL-safe. Since 0.30.0 it names the last delivered
 entry, the member that issued it, and that member's delivered vector
-([ADR-173](decisions.md)):
+([ADR-173](decisions.md)). Since 0.61.0 the entry, the issuer and every vector
+entry carry the epoch ([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)):
 
 ```
-base64url( 0x02 ‖ hlc(10) ‖ node(16) ‖ issued-by(16) ‖ origins(u16) ‖ (node(16) ‖ hlc(10))* )
-    →   164 characters on a three-member cluster
+base64url( 0x03 ‖ hlc(10) ‖ node(16) ‖ epoch(18) ‖ issued-by(node(16) ‖ epoch(18))
+           ‖ origins(u16) ‖ (node(16) ‖ epoch(18) ‖ hlc(10))* )
+    →   284 characters on a three-member cluster (213 bytes; 164 characters before 0.61.0)
 ```
 
-A token in the pre-0.30.0 single-stamp form, `hlc ‖ node` (26 bytes, 35
-characters), is refused as malformed, as any other string that is not an issued
-token is.
+The single-stamp form, `hlc ‖ node ‖ epoch` (44 bytes, 59 characters), is a
+background consumer's stored position and is never issued to a client. A token
+in any earlier layout (the pre-0.30.0 26-byte single-stamp form, 35 characters,
+or an issued token of version 2) is refused as malformed, as any other string
+that is not an issued token is, and the refusal says what was sent (its length
+and first byte) and what is accepted.
+
+**A token issued before a rewind may redeliver events after the member reopens.**
+A plain restart keeps the member's epoch, so a token it issued still resumes
+exactly. A rewind (`kimmyd restore --until`) clears the epoch, and a restore does
+not carry it: when the member is reopened it mints a new one, so it is no longer
+the member that issued the token. Only then is the token resumed through the
+foreign-member path: at-least-once, and events the stream had already delivered
+may be delivered again.
 
 ```rust
 pub fn exclusive_start(&self) -> Hlc {
@@ -413,10 +432,11 @@ that entry's origin; observing it would raise the receiver's position for that
 origin over everything of it the window never carried. Such an entry is left
 where it is: not applied, not witnessed, taken by the next window, and counted
 on `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`. The window's
-end is a full `Stamp` for the same reason — the oplog sorts by `(hlc, node)`,
-so an origin sorting after the end's node is raised only to the end's
-predecessor, its entry at that same `Hlc` never having been examined
-([ADR-148](decisions.md)).
+end is a full `Stamp` for the same reason — the oplog sorts by the whole stamp,
+`(hlc, node, epoch)`, so an origin (a node and an epoch) sorting after the end's
+origin is raised only to the end's predecessor, its entry at that same `Hlc`
+never having been examined ([ADR-148](decisions.md),
+[ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)).
 
 **A collection the receiver has no record of stops the batch.** A replicated
 entry naming a collection this node neither holds nor has a tombstone for is

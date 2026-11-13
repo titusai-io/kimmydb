@@ -1,6 +1,7 @@
 //! A document an index cannot key (ADR-258): refused on the member that takes the
 //! write, filed unkeyed and announced when it arrives any other way.
 
+use kimmy_core::Epoch;
 use std::cmp::Ordering;
 
 use bson::{Bson, Document, doc};
@@ -101,7 +102,7 @@ impl ModifySpec for UpsertBoth {
 
 fn remote(c: &CollectionMeta, id: i64, wall: u64, body: Document) -> OplogEntry {
     OplogEntry {
-        stamp: Stamp::new(Hlc::new(wall, 0), NodeId::generate()),
+        stamp: Stamp::new(Hlc::new(wall, 0), NodeId::generate(), Epoch::ZERO),
         kind: OpKind::Insert,
         collection: c.id,
         doc_id: Some(DocId::Int64(id)),
@@ -328,7 +329,7 @@ fn a_replicated_definition_is_accepted_over_documents_it_cannot_key() {
     e.insert(&c, with_id(2, bad())).unwrap();
     e.insert(&c, doc! { "_id": 3i64, "a": 1, "b": 1 }).unwrap();
 
-    let created = Stamp::new(Hlc::new(5, 0), NodeId::generate());
+    let created = Stamp::new(Hlc::new(5, 0), NodeId::generate(), Epoch::ZERO);
     let (built, _) = e
         .create_index_inner(
             "shop",
@@ -757,7 +758,7 @@ fn remote_id(
 ) -> OplogEntry {
     body.insert("_id", id.to_bson());
     OplogEntry {
-        stamp: Stamp::new(Hlc::new(wall, 0), NodeId::generate()),
+        stamp: Stamp::new(Hlc::new(wall, 0), NodeId::generate(), Epoch::ZERO),
         kind,
         collection: c.id,
         doc_id: Some(id.clone()),

@@ -118,6 +118,7 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Epoch;
 
     #[test]
     fn payloads_round_trip_through_bson() {
@@ -158,7 +159,11 @@ mod tests {
         // rather than assumed: milliseconds since the epoch are four orders
         // of magnitude below the ceiling, and the ceiling itself encodes.
         for wall_ms in [1_756_900_000_000u64, i64::MAX as u64] {
-            let stamp = crate::Stamp::new(crate::Hlc::new(wall_ms, 7), crate::NodeId::generate());
+            let stamp = crate::Stamp::new(
+                crate::Hlc::new(wall_ms, 7),
+                crate::NodeId::generate(),
+                Epoch::ZERO,
+            );
             let create = stamped(Some(stamp));
             let bytes = bson::serialize_to_vec(&create).expect("a stamped definition must encode");
             let back: IndexCreate = bson::deserialize_from_slice(&bytes).unwrap();

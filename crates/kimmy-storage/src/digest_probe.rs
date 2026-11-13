@@ -419,7 +419,7 @@ enum ScanFor {
 /// A drop older than the retention is no longer held: that case is the
 /// horizon's (`tombstone_retention_secs >= oplog_retention_secs`).
 pub(crate) fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionVector) -> bool {
-    tombstone.is_some_and(|at| at.hlc > cut.get(at.node) || created <= at.hlc)
+    tombstone.is_some_and(|at| at.hlc > cut.get(at.origin()) || created <= at.hlc)
 }
 
 /// What subtracting a set of keys from a row came to.
@@ -780,7 +780,7 @@ impl Engine {
                 return Ok(None);
             }
             let stamp = codec::decode_oplog_key(key)?;
-            if stamp.hlc <= cut.get(stamp.node) {
+            if stamp.hlc <= cut.get(stamp.origin()) {
                 continue;
             }
             let (_, collection) = codec::decode_oplog_kind_and_collection(value)?;
@@ -789,7 +789,7 @@ impl Engine {
             }
             // A DDL entry has no document id; a unique violation names a
             // document but writes no record, which over-includes, safely.
-            if let Some(doc_id) = codec::decode_oplog_entry(value)?.doc_id {
+            if let Some(doc_id) = codec::decode_oplog_entry(key, value)?.doc_id {
                 found.entry(collection).or_default().insert(crate::docs::doc_key(&doc_id)?);
             }
         }
@@ -889,8 +889,8 @@ impl Engine {
             let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
             let mut now = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
             now.digest ^= fix;
-            for (node, hlc) in &walked.maxw {
-                now.raise_maxw(&Stamp::new(*hlc, *node));
+            for (origin, hlc) in &walked.maxw {
+                now.raise_maxw(&Stamp::new(*hlc, origin.node, origin.epoch));
             }
             rows.insert(collection.0, now.encode().as_slice())?;
         }
@@ -1014,6 +1014,7 @@ impl Drop for Flag<'_> {
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{DocId, NodeId};
 
     use super::*;
@@ -1078,8 +1079,8 @@ mod tests {
         (a, b, orders, items, [da, db])
     }
 
-    fn old_stamp(node: NodeId) -> Stamp {
-        Stamp::new(Hlc::new(1, 0), node)
+    fn old_stamp(origin: kimmy_core::Origin) -> Stamp {
+        Stamp::new(Hlc::new(1, 0), origin.node, origin.epoch)
     }
 
     #[test]
@@ -1111,7 +1112,7 @@ mod tests {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 3i64, "n": -1 }).unwrap();
-            let record = kimmy_core::DocRecord::live(old_stamp(a.node_id()), body);
+            let record = kimmy_core::DocRecord::live(old_stamp(a.origin()), body);
             crate::live_count::put_record(
                 &txn,
                 &mut docs,
@@ -1211,7 +1212,11 @@ mod tests {
     #[test]
     fn a_bare_tombstone_above_the_cut_defers_on_either_side() {
         let (a, b, orders, _items, _dirs) = converged();
-        let stamp = Stamp::new(Hlc::new(crate::physical_now_ms() + 90_000, 0), NodeId::generate());
+        let stamp = Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 90_000, 0),
+            NodeId::generate(),
+            Epoch::ZERO,
+        );
         let key = crate::docs::doc_key(&DocId::Int64(1_000)).unwrap();
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
@@ -1248,7 +1253,7 @@ mod tests {
         let (a, b, orders, items, _dirs) = converged();
         // An origin that wrote once, long ago, on both: it stays in both
         // vectors at its last stamp for ever (a reseeded member's old id).
-        let old = NodeId::generate();
+        let old = kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO);
         for e in [&a, &b] {
             // In the collection that goes busy below: the frozen origin is in
             // its row, covered, and must not pull the scan's start back.
@@ -1502,7 +1507,7 @@ mod tests {
         let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
         for node in [&e, &f] {
             let entry = kimmy_core::OplogEntry {
-                stamp: Stamp::new(at, origin),
+                stamp: Stamp::new(at, origin, Epoch::ZERO),
                 kind: kimmy_core::OpKind::Insert,
                 collection: items.id,
                 doc_id: Some(DocId::Int64(8_000)),
@@ -1514,7 +1519,7 @@ mod tests {
         e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
         sync(&e, &f);
         assert!(fresh.created > at, "premise: the life is newer than the drop");
-        e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        e.record_collection_drop(fresh.id, Stamp::new(at, origin, Epoch::ZERO)).unwrap();
         let floored = |floor: Option<Hlc>| {
             let mut meta = e.get_collection("shop", "fresh").unwrap();
             meta.incarnation_floor = floor;
@@ -1551,7 +1556,7 @@ mod tests {
         let (a, b, orders, _items, _dirs) = converged();
         // A drop stamped exactly at the creation of the life standing: the
         // life is not newer than the drop.
-        let tie = Stamp::new(orders.created, a.node_id());
+        let tie = Stamp::new(orders.created, a.node_id(), a.epoch());
         a.record_collection_drop(orders.id, tie).unwrap();
         let verdicts = exchange(&a, &b, None);
         assert_eq!(
@@ -1579,7 +1584,7 @@ mod tests {
         let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
         for node in [&e, &f] {
             let entry = kimmy_core::OplogEntry {
-                stamp: Stamp::new(at, origin),
+                stamp: Stamp::new(at, origin, Epoch::ZERO),
                 kind: kimmy_core::OpKind::Insert,
                 collection: items.id,
                 doc_id: Some(DocId::Int64(8_000)),
@@ -1591,18 +1596,25 @@ mod tests {
         e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
         sync(&e, &f);
         assert!(fresh.created > at, "premise: the life is newer than the drop");
-        e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        e.record_collection_drop(fresh.id, Stamp::new(at, origin, Epoch::ZERO)).unwrap();
         // The drop arrived after the life, so the life owes ADR-231's sweep; done
         // here, as an apply does it, before the drop is judged covered.
-        e.sweep_late_drop("shop", "fresh", Stamp::new(at, origin)).unwrap();
+        e.sweep_late_drop("shop", "fresh", Stamp::new(at, origin, Epoch::ZERO)).unwrap();
         let verdicts = exchange(&e, &f, None);
         assert_eq!(compared(&verdicts, fresh.id), Some(true), "a drop at the cut: {verdicts:?}");
-        e.record_collection_drop(fresh.id, Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
-            .unwrap();
+        e.record_collection_drop(
+            fresh.id,
+            Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin, Epoch::ZERO),
+        )
+        .unwrap();
         // Swept too, so that what defers it is the cut and not the sweep it owes
         // (h2-N5 has its own test): the drop is one above the cut component.
-        e.sweep_late_drop("shop", "fresh", Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
-            .unwrap();
+        e.sweep_late_drop(
+            "shop",
+            "fresh",
+            Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin, Epoch::ZERO),
+        )
+        .unwrap();
         let verdicts = exchange(&e, &f, None);
         assert_eq!(
             outcome_of(&verdicts, fresh.id),
@@ -1624,7 +1636,8 @@ mod tests {
         sync(&a, &b);
         // The drop lands on A alone and above everything B has witnessed: the
         // cut does not cover it, so every collection of the database defers.
-        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id());
+        let future =
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
         a.record_database_tombstone_for_test(db_drop, future).unwrap();
         let verdicts = exchange(&a, &b, None);
         for id in [orders.id, items.id, late.id] {
@@ -1746,7 +1759,12 @@ mod tests {
     #[test]
     fn a_digest_message_round_trips_through_bson() {
         let ask = DigestAsk {
-            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
             uncovered: vec![Uncovered {
                 collection: CollectionId(u64::MAX),
                 keys: vec![ByteBuf::from(vec![1, 2, 3])],
@@ -1949,7 +1967,7 @@ mod tests {
         let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
         a.record_database_tombstone_for_test(
             kimmy_core::database_drop_id("shop"),
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id()),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id(), a.epoch()),
         )
         .unwrap();
         let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();

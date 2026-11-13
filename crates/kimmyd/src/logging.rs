@@ -365,6 +365,13 @@ impl TelemetryGuard {
             "Entries in the oplog now, read from the count the table keeps.",
             oplog_entries
         );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.epoch_origins",
+            "{origin}",
+            "Origins (node and epoch) in this member's own version vector.",
+            epoch_origins
+        );
         // Whether this process's open repaired the store, and how (ADR-204).
         observe!(
             u64_observable_counter,

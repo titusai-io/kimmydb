@@ -4,6 +4,8 @@
 //! own clause is mutated and not a neighbour's.
 
 use bson::doc;
+use kimmy_core::Epoch;
+use kimmy_core::Origin;
 use kimmy_core::{CollectionId, Hlc, IndexField, NodeId, Stamp, VersionVector};
 use serde_bytes::ByteBuf;
 
@@ -214,9 +216,9 @@ fn a_vector_shadow_is_not_a_collection_to_compare() {
 // -- The stamp the cut must cover ---------------------------------------------------
 
 /// The cut where `node`'s component is `at` and everything else is the pair's.
-fn cut_with(base: &VersionVector, node: NodeId, at: Hlc) -> VersionVector {
+fn cut_with(base: &VersionVector, origin: Origin, at: Hlc) -> VersionVector {
     let mut cut = base.clone();
-    cut.insert(node, at);
+    cut.insert(origin, at);
     cut
 }
 
@@ -226,11 +228,11 @@ fn an_index_stamped_above_the_cut_defers_the_collection_and_one_at_the_cut_does_
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
     let base = cut_of(&a, &b);
     // At the cut: processed by both, compared.
-    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.node, stamp.hlc), &[]);
+    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.origin(), stamp.hlc), &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "a stamp at the cut: {verdicts:?}");
     // One below the stamp: not yet covered, on both sides.
     let below = Hlc::new(stamp.hlc.wall_ms - 1, 0);
-    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.node, below), &[]);
+    let verdicts = exchange_at(&a, &b, cut_with(&base, stamp.origin(), below), &[]);
     assert_eq!(
         deferred(&verdicts, orders),
         Some(DefinitionDefer::DefinitionAboveCut),
@@ -331,7 +333,7 @@ fn a_collection_tombstone_defers_while_the_drop_is_above_the_cut_or_the_life_is_
     let created = a.get_collection("shop", "orders").unwrap().created;
     // A drop stamped exactly at the creation of the life standing: the life is
     // not newer than the drop.
-    let tie = Stamp::new(created, a.node_id());
+    let tie = Stamp::new(created, a.node_id(), a.epoch());
     a.record_collection_drop(orders, tie).unwrap();
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(deferred(&verdicts, orders), Some(DefinitionDefer::Incarnation), "{verdicts:?}");
@@ -341,7 +343,7 @@ fn a_collection_tombstone_defers_while_the_drop_is_above_the_cut_or_the_life_is_
 fn a_covered_drop_over_a_newer_life_does_not_defer() {
     let (a, b, orders, _items, _dirs) = converged();
     let created = a.get_collection("shop", "orders").unwrap().created;
-    let before = Stamp::new(Hlc::new(created.wall_ms - 1, 0), a.node_id());
+    let before = Stamp::new(Hlc::new(created.wall_ms - 1, 0), a.node_id(), a.epoch());
     a.record_collection_drop(orders, before).unwrap();
     // The drop arrived after the life, so the life owes ADR-231's sweep; done here,
     // as an apply does it, before the drop is judged covered (the state a member
@@ -351,7 +353,7 @@ fn a_covered_drop_over_a_newer_life_does_not_defer() {
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
     // One above the cut: not covered.
-    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id());
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
     a.record_collection_drop(orders, future).unwrap();
     // Swept too, so that what defers it is the cut and not the sweep it owes.
     a.sweep_late_drop("shop", "orders", future).unwrap();
@@ -363,7 +365,7 @@ fn a_covered_drop_over_a_newer_life_does_not_defer() {
 fn a_database_tombstone_defers_its_collections_by_the_same_rule() {
     let (a, b, orders, items, _dirs) = converged();
     let db_drop = kimmy_core::database_drop_id("shop");
-    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id());
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
     a.record_database_tombstone_for_test(db_drop, future).unwrap();
     let verdicts = exchange(&a, &b, &[]);
     for id in [orders, items] {
@@ -385,7 +387,7 @@ fn a_covered_drop_defers_a_life_that_owes_the_sweep_until_its_floor_is_at_the_dr
     let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
     for node in [&e, &f] {
         let entry = kimmy_core::OplogEntry {
-            stamp: Stamp::new(at, origin),
+            stamp: Stamp::new(at, origin, Epoch::ZERO),
             kind: kimmy_core::OpKind::Insert,
             collection: items,
             doc_id: Some(kimmy_core::DocId::Int64(8_000)),
@@ -398,7 +400,7 @@ fn a_covered_drop_defers_a_life_that_owes_the_sweep_until_its_floor_is_at_the_dr
     e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
     sync(&e, &f);
     assert!(fresh.created > at, "premise: the life is newer than the drop");
-    e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+    e.record_collection_drop(fresh.id, Stamp::new(at, origin, Epoch::ZERO)).unwrap();
     let floored = |floor: Option<Hlc>| {
         let mut meta = e.get_collection("shop", "fresh").unwrap();
         meta.incarnation_floor = floor;
@@ -471,7 +473,11 @@ fn a_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_predicate() {
     let b = std::sync::Arc::new(b);
     let writer = std::sync::Arc::clone(&b);
     test_hooks::after_the_transaction(move |_| {
-        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), writer.node_id());
+        let future = Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 60_000, 0),
+            writer.node_id(),
+            writer.epoch(),
+        );
         writer.record_collection_drop(orders, future).unwrap();
     });
     let ask = DefinitionAsk::new(cut_of(&a, &b), []);
@@ -724,7 +730,7 @@ fn a_refusal_nobody_recorded_is_not_explained() {
 #[test]
 fn a_hint_round_trips_and_a_name_with_colons_is_kept_whole() {
     let (a, _b, orders, _items, _dirs) = converged();
-    let stamp = Stamp::new(Hlc::new(50, 3), NodeId::from_bytes([4; 16]));
+    let stamp = Stamp::new(Hlc::new(50, 3), NodeId::from_bytes([4; 16]), Epoch::ZERO);
     let hint = RefusalHint::new(orders, HintKind::Index, "a:b:c", stamp, 0xabcd);
     a.record_refusal_hint(&hint).unwrap();
     assert_eq!(a.refusal_hints(orders).unwrap(), vec![hint.clone()]);
@@ -733,7 +739,7 @@ fn a_hint_round_trips_and_a_name_with_colons_is_kept_whole() {
         orders,
         HintKind::Index,
         "a:b:c",
-        Stamp::new(Hlc::new(40, 0), stamp.node),
+        Stamp::new(Hlc::new(40, 0), stamp.node, stamp.epoch),
         0x1111,
     );
     a.record_refusal_hint(&older).unwrap();
@@ -746,7 +752,7 @@ fn a_hint_round_trips_and_a_name_with_colons_is_kept_whole() {
 #[test]
 fn the_hints_of_a_collection_are_cleared_with_a_prefix_range() {
     let (a, _b, orders, items, _dirs) = converged();
-    let stamp = Stamp::new(Hlc::new(50, 0), NodeId::from_bytes([4; 16]));
+    let stamp = Stamp::new(Hlc::new(50, 0), NodeId::from_bytes([4; 16]), Epoch::ZERO);
     for (collection, name) in [(orders, "x"), (orders, "y"), (items, "x")] {
         a.record_refusal_hint(&RefusalHint::new(collection, HintKind::Index, name, stamp, 1))
             .unwrap();
@@ -900,7 +906,11 @@ fn a_database_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_pred
     let b = std::sync::Arc::new(b);
     let writer = std::sync::Arc::clone(&b);
     test_hooks::after_the_transaction(move |_| {
-        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), writer.node_id());
+        let future = Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 60_000, 0),
+            writer.node_id(),
+            writer.epoch(),
+        );
         writer
             .record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), future)
             .unwrap();
@@ -1178,7 +1188,7 @@ fn every_dropped_index_row_is_judged_against_the_cut() {
         // The cut covers the earlier drop and not the later one.
         let earliest = stamps.iter().map(|stamp| stamp.hlc).min().unwrap();
         let mut cut = VersionVector::new();
-        cut.insert(a.node_id(), earliest);
+        cut.insert(a.origin(), earliest);
         let verdicts = exchange_at(&a, &b, cut, &[]);
         assert_eq!(
             deferred(&verdicts, orders),
@@ -1197,7 +1207,7 @@ fn a_stamp_is_judged_against_the_cut_at_its_own_origin() {
     b.create_index("shop", "orders", fields("by_b"), false, Some("by_b".into())).unwrap();
     sync(&a, &b);
     let mut cut = VersionVector::new();
-    cut.insert(a.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    cut.insert(a.origin(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
     let verdicts = exchange_at(&a, &b, cut.clone(), &[]);
     assert_eq!(
         deferred(&verdicts, orders),
@@ -1205,7 +1215,7 @@ fn a_stamp_is_judged_against_the_cut_at_its_own_origin() {
         "B's stamp is above the cut at B: {verdicts:?}"
     );
     // And covered once the cut has B's own component.
-    cut.insert(b.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    cut.insert(b.origin(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
     let verdicts = exchange_at(&a, &b, cut, &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
 }
@@ -1218,7 +1228,7 @@ fn a_deferred_collection_carries_no_detail() {
     let hash = hash_of(&a, "orders", "ttl");
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
     b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash)).unwrap();
-    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.node_id());
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.node_id(), b.epoch());
     b.record_collection_drop(orders, future).unwrap();
     let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
     let reply = b.definition_answer(&ask).unwrap();

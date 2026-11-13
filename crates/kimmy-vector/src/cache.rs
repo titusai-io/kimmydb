@@ -1720,6 +1720,7 @@ pub fn count_vectors(engine: &Engine, shadow: &CollectionMeta) -> Result<usize> 
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use kimmy_core::{ChunkConfig, DocId, Hlc, ProviderConfig, VectorConfig, VectorRecord};
 
     use super::*;
@@ -2129,7 +2130,11 @@ mod tests {
         let mut body = bson::serialize_to_document(&record).unwrap();
         body.insert("_id", chunk_id.to_bson());
         let entry = OplogEntry {
-            stamp: Stamp::new(Hlc::new(9_000_000_000_000, 0), NodeId::from_bytes([9; 16])),
+            stamp: Stamp::new(
+                Hlc::new(9_000_000_000_000, 0),
+                NodeId::from_bytes([9; 16]),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Replace,
             collection: shadow.id,
             doc_id: Some(chunk_id),

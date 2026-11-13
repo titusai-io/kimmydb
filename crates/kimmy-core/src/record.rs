@@ -67,11 +67,12 @@ impl DocRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Epoch;
     use crate::hlc::Hlc;
     use crate::ids::NodeId;
 
     fn stamp(ms: u64, n: u8) -> Stamp {
-        Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([n; 16]))
+        Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([n; 16]), Epoch::ZERO)
     }
 
     fn rec(ms: u64, n: u8, body: &str) -> DocRecord {

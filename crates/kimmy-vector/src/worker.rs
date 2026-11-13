@@ -949,7 +949,7 @@ impl EmbeddingWorker {
     }
 
     async fn run_loop(&mut self) -> Result<()> {
-        let mut resume = self.engine.consumer_position(CONSUMER)?;
+        let mut resume = stored_position(&self.engine)?;
         let mut recovering = false;
         // What the last run left owed: its held and skipped batches were
         // recorded as marks before the position passed them, so a start finds
@@ -3005,6 +3005,25 @@ enum StreamEnd {
     Invalidated(kimmy_storage::InvalidateReason),
 }
 
+/// The position this worker stored, if any. A stored value that is not a token of the
+/// current single-stamp form (44 bytes, `hlc ‖ node ‖ epoch`) is a named
+/// [`VectorError::StoredPositionUnusable`], not a silent restart from nothing.
+fn stored_position(engine: &Engine) -> Result<Option<kimmy_core::ResumeToken>> {
+    named_position(engine.consumer_position(CONSUMER))
+}
+
+/// [`stored_position`]'s answer for what the store returned.
+fn named_position(
+    read: kimmy_storage::Result<Option<kimmy_core::ResumeToken>>,
+) -> Result<Option<kimmy_core::ResumeToken>> {
+    match read {
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::MalformedResumeToken)) => {
+            Err(VectorError::StoredPositionUnusable { consumer: CONSUMER.to_string() })
+        }
+        other => Ok(other?),
+    }
+}
+
 /// Whether opening a stream failed because its resume position has been
 /// collected from the oplog — the one open-time failure the worker recovers
 /// from rather than reports.
@@ -3102,9 +3121,10 @@ impl VectorError {
             {
                 Fault::Tenant
             }
-            VectorError::Storage(_) | VectorError::Core(_) | VectorError::Snapshot(_) => {
-                Fault::Local
-            }
+            VectorError::Storage(_)
+            | VectorError::Core(_)
+            | VectorError::Snapshot(_)
+            | VectorError::StoredPositionUnusable { .. } => Fault::Local,
             // A search's own deadline; the worker never searches under one.
             VectorError::DeadlineExceeded => Fault::Local,
             // The node's own lookups were busy: its state, not the provider's, and
@@ -3855,7 +3875,7 @@ pub(crate) mod tests {
             .read_oplog_from(Hlc::ZERO, 1, kimmy_storage::WalkScope::Background)
             .unwrap()
             .remove(0);
-        let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
+        let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.origin());
         engine.put_consumer_position(CONSUMER, stale.clone()).unwrap();
         let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
         engine
@@ -3916,7 +3936,7 @@ pub(crate) mod tests {
         let (engine, _coll, _worker, _dir) = setup().await;
         assert!(engine.consumer_position(CONSUMER).unwrap().is_none());
 
-        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
+        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.origin());
         engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
         assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
     }
@@ -4304,11 +4324,56 @@ pub(crate) mod tests {
     }
 
     /// The pure form of the rule above, with no clock to wait on.
+    /// A stored position that is not a token of the current form is a named refusal; one that
+    /// is, and none at all, pass through; any other storage error is not renamed.
+    #[test]
+    fn a_stored_position_of_another_form_is_refused_by_name() {
+        let refused = named_position(Err(kimmy_storage::StorageError::Core(
+            kimmy_core::Error::MalformedResumeToken,
+        )))
+        .unwrap_err();
+        assert!(matches!(refused, VectorError::StoredPositionUnusable { .. }), "{refused}");
+        let text = refused.to_string();
+        assert!(text.contains(&kimmy_core::Stamp::KEY_LEN.to_string()), "{text}");
+        assert!(text.contains(CONSUMER), "{text}");
+
+        assert!(named_position(Ok(None)).unwrap().is_none());
+        let token = kimmy_core::ResumeToken::new(
+            Hlc::new(5, 0),
+            kimmy_core::Origin::new(
+                kimmy_core::NodeId::from_bytes([3; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+        );
+        assert_eq!(named_position(Ok(Some(token.clone()))).unwrap(), Some(token));
+        let other = named_position(Err(kimmy_storage::StorageError::Corrupt("x".into())));
+        assert!(matches!(other, Err(VectorError::Storage(_))));
+    }
+
+    /// The single-stamp position the worker stores is 44 bytes, and `decode` refuses the
+    /// 26-byte form from before epochs.
+    #[test]
+    fn the_stored_position_is_the_44_byte_form() {
+        let token = kimmy_core::ResumeToken::new(
+            Hlc::new(5, 0),
+            kimmy_core::Origin::new(
+                kimmy_core::NodeId::from_bytes([3; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+        );
+        // 44 bytes are 59 base64url characters; 26 bytes are 35, 45 bytes are 60.
+        assert_eq!(kimmy_core::Stamp::KEY_LEN, 44);
+        assert_eq!(token.encode().len(), 59);
+        assert_eq!(kimmy_core::ResumeToken::decode(&token.encode()).unwrap(), token);
+        assert!(kimmy_core::ResumeToken::decode(&"A".repeat(35)).is_err());
+        assert!(kimmy_core::ResumeToken::decode(&"A".repeat(60)).is_err());
+    }
+
     #[test]
     fn the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait() {
         let wait = Duration::from_millis(100);
         let now = Instant::now();
-        let node = kimmy_core::NodeId::generate();
+        let node = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
         let token = kimmy_core::ResumeToken::new(Hlc::new(1, 1), node);
 
         let mut pending = Pending::default();
@@ -4371,7 +4436,7 @@ pub(crate) mod tests {
             assert!(!pending.push(item, now, &worker.batching), "the batch is not full");
         }
         let latest = last_entry(engine);
-        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         pending.hold(token.clone(), now);
         (pending, token)
     }
@@ -4469,7 +4534,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_held_position_with_no_batch_is_still_one_commit() {
         let (engine, _coll, mut worker, _dir) = setup().await;
-        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
+        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.origin());
         let mut pending = Pending::default();
         pending.hold(token.clone(), Instant::now());
 
@@ -4754,7 +4819,7 @@ pub(crate) mod tests {
     /// finds it all already on disk, back to back, as a backlog is.
     fn position_at_latest(engine: &Engine) {
         let latest = last_entry(engine);
-        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
     }
 
@@ -5623,7 +5688,7 @@ pub(crate) mod tests {
             written.push(id);
         }
         let latest = last_entry(engine);
-        pending.hold(kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node), now);
+        pending.hold(kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin()), now);
         written
     }
 
@@ -5987,7 +6052,7 @@ pub(crate) mod tests {
             .map(|i| engine.insert(&a, doc! { "_id": i as i64, "title": "late" }).unwrap())
             .collect();
         let latest = last_entry(&engine);
-        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         let running = tokio::spawn(async move { worker.run().await });
 
         let landed = |engine: &Engine| {
@@ -6278,7 +6343,7 @@ pub(crate) mod tests {
             ids_b.push(engine.insert(&b, doc! { "_id": i as i64, "title": "lands" }).unwrap());
         }
         let latest = last_entry(&engine);
-        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.origin());
         let running = tokio::spawn(async move { worker.run().await });
 
         let moved = |engine: &Engine| {

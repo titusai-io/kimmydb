@@ -181,14 +181,14 @@ fn a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
     whole(&a, &b);
     assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
     assert!(
-        a.witnessed_vector().unwrap().get(made.node) < made.hlc,
+        a.witnessed_vector().unwrap().get(made.origin()) < made.hlc,
         "the page granted A the definition of the life it refused"
     );
     whole(&c, &a);
     let kept = c.get_collection("shop", "orders").expect("premise: C keeps its life");
     assert!(kept.is_redated(), "premise: re-dated by A's drop: {kept:?}");
     assert!(
-        c.witnessed_vector().unwrap().get(made.node) < made.hlc,
+        c.witnessed_vector().unwrap().get(made.origin()) < made.hlc,
         "A's page granted C the definition it never held"
     );
 
@@ -256,7 +256,7 @@ fn a_whole_page_grants_a_refused_lifes_definition_its_databases_later_drop_ended
     whole(&a, &b);
     assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
     assert!(
-        a.witnessed_vector().unwrap().get(made.node) >= made.hlc,
+        a.witnessed_vector().unwrap().get(made.origin()) >= made.hlc,
         "the page withheld a definition the database's drop ended"
     );
     assert!(a.witnessed_vector().unwrap().covers(&b.version_vector().unwrap()));
@@ -279,12 +279,12 @@ fn a_whole_page_grants_a_refused_lifes_definition_in_the_drops_own_hlc() {
     // The index's stamp moved into the drop's own `Hlc`, as a member whose clock tied with
     // the dropper's would have made it.
     let mut meta = b.get_collection("shop", "orders").unwrap();
-    let tied = kimmy_core::Stamp::new(dropped.hlc, b.node_id());
+    let tied = kimmy_core::Stamp::new(dropped.hlc, b.node_id(), b.epoch());
     meta.indexes[0].created = Some(tied);
     let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
     Engine::put_collection_meta(&txn, &meta).unwrap();
     txn.commit().unwrap();
-    assert!(b.version_vector().unwrap().get(b.node_id()) > tied.hlc, "premise: named, and below");
+    assert!(b.version_vector().unwrap().get(b.origin()) > tied.hlc, "premise: named, and below");
 
     whole(&a, &b);
     assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");

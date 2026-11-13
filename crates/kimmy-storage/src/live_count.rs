@@ -482,6 +482,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use std::cmp::Ordering;
 
     use bson::{Document, doc};
@@ -528,7 +529,7 @@ mod tests {
 
     fn remote(coll: &CollectionMeta, id: &str, wall_ms: u64, body: Option<Document>) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(wall_ms, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(wall_ms, 0), NodeId::generate(), Epoch::ZERO),
             kind: if body.is_some() { OpKind::Insert } else { OpKind::Delete },
             collection: coll.id,
             doc_id: Some(DocId::String(id.into())),
@@ -813,7 +814,11 @@ mod tests {
         assert!(kept(&engine).bare_max.is_empty(), "a live write is no bare tombstone");
 
         // A tombstone with no entry behind it, as a snapshot page leaves one.
-        let stamp = Stamp::new(Hlc::new(crate::physical_now_ms() + 50_000, 0), NodeId::generate());
+        let stamp = Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 50_000, 0),
+            NodeId::generate(),
+            Epoch::ZERO,
+        );
         let key = crate::docs::doc_key(&id("gone")).unwrap();
         {
             let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
@@ -830,16 +835,16 @@ mod tests {
             txn.commit().unwrap();
         }
         let row = kept(&engine);
-        assert_eq!(row.bare_max.get(&stamp.node), Some(&stamp.hlc));
+        assert_eq!(row.bare_max.get(&stamp.origin()), Some(&stamp.hlc));
         assert_eq!(
-            row.maxw.get(&stamp.node),
+            row.maxw.get(&stamp.origin()),
             Some(&stamp.hlc),
             "a tombstone's stamp is a record stamp"
         );
         assert_digests_exact(&engine, "a bare tombstone");
 
         // Removing a tombstone (retention) does not lower either.
-        let later = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 1, 0), stamp.node);
+        let later = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 1, 0), stamp.node, stamp.epoch);
         {
             let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
@@ -856,7 +861,7 @@ mod tests {
             txn.commit().unwrap();
         }
         let row = kept(&engine);
-        assert_eq!(row.maxw.get(&stamp.node), Some(&later.hlc), "maxw never falls");
+        assert_eq!(row.maxw.get(&stamp.origin()), Some(&later.hlc), "maxw never falls");
     }
 
     #[test]
@@ -1095,7 +1100,7 @@ mod tests {
             engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
             let origin = NodeId::generate();
             let entry = |wall_ms: u64, name: &str| OplogEntry {
-                stamp: Stamp::new(Hlc::new(wall_ms, 0), origin),
+                stamp: Stamp::new(Hlc::new(wall_ms, 0), origin, Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: coll.id,
                 doc_id: Some(DocId::String(name.into())),

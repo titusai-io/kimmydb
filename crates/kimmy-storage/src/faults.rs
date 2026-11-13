@@ -90,4 +90,16 @@ impl Engine {
         let key = crate::docs::doc_key(id).expect("an encodable id");
         self.store_undecodable_doc_for_test(coll, &key);
     }
+
+    /// Replace the stored epoch row, which the next open reads back instead of minting: the
+    /// row a mint on a host whose clock read `epoch.start_hlc()` left, for a test of an open on
+    /// a clock behind it. This process keeps the epoch it opened with.
+    pub fn set_epoch_row_for_test(&self, epoch: kimmy_core::Epoch) {
+        let txn = self.begin_write(WriterHolder::Ddl).expect("the writer");
+        {
+            let mut meta = txn.open_table(tables::META).expect("the table");
+            meta.insert(tables::META_EPOCH, epoch.0.as_slice()).expect("the insert");
+        }
+        txn.commit().expect("the commit");
+    }
 }

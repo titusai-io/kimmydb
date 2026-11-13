@@ -98,6 +98,10 @@ struct History {
 impl Engine {
     /// Rewind document state to `until`.
     ///
+    /// **The caller must reopen the engine afterwards.** The rewind clears the `epoch` row in its
+    /// transaction, so the next open mints a new epoch; this engine keeps writing under the
+    /// old one until it is dropped. The offline restore command already reopens.
+    ///
     /// Refuses, without writing anything, if the target predates the oplog
     /// horizon, if any schema change happened after it, or if any document's
     /// value at that instant is no longer recoverable.
@@ -156,8 +160,8 @@ impl Engine {
             }
             let oplog = txn.open_table(tables::OPLOG)?;
             for entry in oplog.iter()? {
-                let (_, value) = entry?;
-                let entry = codec::decode_oplog_entry(value.value())?;
+                let (key, value) = entry?;
+                let entry = codec::decode_oplog_entry(key.value(), value.value())?;
                 let after = entry.stamp.hlc > until;
                 if after {
                     discardable += 1;
@@ -393,7 +397,7 @@ impl Engine {
             let mut doomed = Vec::new();
             for entry in oplog.iter()? {
                 let (key, value) = entry?;
-                if codec::decode_oplog_entry(value.value())?.stamp.hlc > until {
+                if codec::decode_oplog_entry(key.value(), value.value())?.stamp.hlc > until {
                     doomed.push(key.value().to_vec());
                 }
             }
@@ -423,7 +427,7 @@ impl Engine {
                 if let Some(old) = oplog.remove(key.as_slice())? {
                     let header = codec::decode_oplog_kind_and_collection(old.value());
                     if let Ok((kimmy_core::OpKind::UnkeyedDocument, collection)) = header {
-                        let report = codec::decode_oplog_entry(old.value())?;
+                        let report = codec::decode_oplog_entry(key.as_slice(), old.value())?;
                         if let Some(body) = &report.body {
                             let detail: kimmy_core::UnkeyedDocumentDetail =
                                 bson::deserialize_from_slice(body)?;
@@ -529,6 +533,10 @@ impl Engine {
             restored_floor
         };
         Engine::lower_vectors_in(&txn, schema, until, floor)?;
+        // The writes above the target are gone: whatever this member wrote under its epoch may
+        // be among them, so the next open mints a new one, as after a restore. In this
+        // transaction, so a rewind that failed leaves the epoch as it was.
+        txn.open_table(tables::META)?.remove(tables::META_EPOCH)?;
         // After the log lost everything above the target, so these survive it,
         // and in the transaction that filed the documents.
         let unkeyed_entries = self.append_unkeyed(&txn, unkeyed)?;
@@ -568,12 +576,12 @@ impl Rewound {
     /// Whether this rewind discarded the entry stamped `stamp`, or would have
     /// had this member held it.
     pub fn discarded(&self, stamp: &Stamp) -> bool {
-        stamp.hlc > self.until && stamp.hlc <= self.through.get(stamp.node)
+        stamp.hlc > self.until && stamp.hlc <= self.through.get(stamp.origin())
     }
 }
 
-/// `until ‖ origin count (u16) ‖ (node ‖ hlc)*`, one after another per rewind.
-const REWIND_ORIGIN_LEN: usize = 16 + kimmy_core::HLC_ENCODED_LEN;
+/// `until ‖ origin count (u16) ‖ (node ‖ epoch ‖ hlc)*`, one after another per rewind.
+const REWIND_ORIGIN_LEN: usize = kimmy_core::Origin::LEN + kimmy_core::HLC_ENCODED_LEN;
 
 fn record_rewind(
     txn: &redb::WriteTransaction,
@@ -590,8 +598,8 @@ fn record_rewind(
         StorageError::Database("a rewind discarded entries from too many origins".into())
     })?;
     record.extend_from_slice(&origins.to_be_bytes());
-    for (node, hlc) in discarded.iter() {
-        record.extend_from_slice(&node.to_bytes());
+    for (origin, hlc) in discarded.iter() {
+        record.extend_from_slice(&origin.to_bytes());
         record.extend_from_slice(&hlc.to_bytes());
     }
     meta.insert(tables::META_REWOUND, record.as_slice())?;
@@ -640,9 +648,13 @@ fn decode_rewinds(mut raw: &[u8]) -> Result<Vec<Rewound>> {
         let mut through = VersionVector::new();
         for i in 0..origins {
             let at = header + i * REWIND_ORIGIN_LEN;
-            let node = kimmy_core::NodeId::from_bytes(raw[at..at + 16].try_into().unwrap());
-            let hlc = Hlc::from_bytes(raw[at + 16..at + REWIND_ORIGIN_LEN].try_into().unwrap());
-            through.insert(node, hlc);
+            let origin = kimmy_core::Origin::from_bytes(
+                raw[at..at + kimmy_core::Origin::LEN].try_into().unwrap(),
+            );
+            let hlc = Hlc::from_bytes(
+                raw[at + kimmy_core::Origin::LEN..at + REWIND_ORIGIN_LEN].try_into().unwrap(),
+            );
+            through.insert(origin, hlc);
         }
         out.push(Rewound { until, through });
         raw = &raw[end..];
@@ -957,7 +969,11 @@ mod tests {
 
     /// Move `engine`'s clock to `base + t` before a local step.
     fn at(engine: &Engine, base: u64, t: u64) {
-        engine.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), engine.node_id()));
+        engine.advance_clock_past(&Stamp::new(
+            Hlc::new(base + t, 0),
+            engine.node_id(),
+            engine.epoch(),
+        ));
     }
 
     /// One pull as the transport asks it: from what `into` has witnessed.
@@ -1001,13 +1017,13 @@ mod tests {
         pull(&b, &c);
         // Past the oplog window of all but the newest entry, which is c's.
         b.collect_garbage_at(base + 1730, crate::RetentionPolicy::new(1, 24 * 60 * 60)).unwrap();
-        let own = b.node_id();
+        let own = b.origin();
         assert!(
             b.oplog_collected().unwrap().get(own) > Hlc::ZERO
                 && b.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                     .unwrap()
                     .iter()
-                    .all(|entry| entry.stamp.node != own),
+                    .all(|entry| entry.stamp.origin() != own),
             "the fixture must collect every entry of the member's own origin"
         );
         let (servable, witnessed) = (b.version_vector().unwrap(), b.witnessed_vector().unwrap());
@@ -1036,7 +1052,7 @@ mod tests {
         let theirs = c.get_collection("shop", "orders").unwrap();
         at(&c, base, 150);
         c.insert(&theirs, doc! { "_id": 5, "v": "c" }).unwrap();
-        let until = c.version_vector().unwrap().get(c.node_id());
+        let until = c.version_vector().unwrap().get(c.origin());
         pull(&b, &c);
         at(&b, base, 300);
         b.replace(&orders, &DocId::Int64(5), doc! { "_id": 5, "v": "b" }, false).unwrap();
@@ -1055,7 +1071,7 @@ mod tests {
             (b.version_vector().unwrap(), "servable"),
             (b.witnessed_vector().unwrap(), "witnessed"),
         ] {
-            for node in [b.node_id(), c.node_id()] {
+            for node in [b.origin(), c.origin()] {
                 assert_eq!(
                     vector.get(node),
                     until,
@@ -1109,7 +1125,7 @@ mod tests {
         c.replace(&theirs, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
         pull(&a, &c);
         whole(&b, &a);
-        let granted = b.version_vector().unwrap().get(a.node_id());
+        let granted = b.version_vector().unwrap().get(a.origin());
         let entries =
             b.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
         assert!(
@@ -1124,7 +1140,7 @@ mod tests {
         pull(&b, &c);
         let (servable, witnessed) = (b.version_vector().unwrap(), b.witnessed_vector().unwrap());
         assert!(
-            witnessed.get(c.node_id()) > servable.get(c.node_id()),
+            witnessed.get(c.origin()) > servable.get(c.origin()),
             "the fixture must witness c's losing write without appending it"
         );
 
@@ -1150,7 +1166,11 @@ mod tests {
             let coll = engine.create_collection("shop", "orders").unwrap();
             engine.insert(&coll, doc! { "_id": 1 }).unwrap();
             let target = latest(&engine);
-            engine.advance_clock_past(&Stamp::new(Hlc::new(ahead, 0), engine.node_id()));
+            engine.advance_clock_past(&Stamp::new(
+                Hlc::new(ahead, 0),
+                engine.node_id(),
+                engine.epoch(),
+            ));
             engine.insert(&coll, doc! { "_id": 2 }).unwrap();
             engine.insert(&coll, doc! { "_id": 3 }).unwrap();
             let discarded = latest(&engine);
@@ -1205,7 +1225,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let far = c.version_vector().unwrap().get(c.node_id());
+            let far = c.version_vector().unwrap().get(c.origin());
             pull(&b, &c);
             let out = b.rewind_to(Hlc::new(base + 50, 0)).unwrap();
             assert_eq!(out.oplog_discarded, 1, "the peer's write");
@@ -1247,7 +1267,7 @@ mod tests {
         b.insert(&mine, doc! { "_id": 1, "v": "b" }).unwrap();
         pull(&b, &c);
         assert!(
-            b.witnessed_vector().unwrap().get(c.node_id()) >= judged.hlc,
+            b.witnessed_vector().unwrap().get(c.origin()) >= judged.hlc,
             "premise: B witnessed C's write"
         );
         assert_eq!(
@@ -1255,7 +1275,7 @@ mod tests {
             "b",
             "premise: C's write lost on B"
         );
-        let created = a.version_vector().unwrap().get(a.node_id());
+        let created = a.version_vector().unwrap().get(a.origin());
 
         let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
         assert_eq!((outcome.removed, outcome.oplog_discarded), (1, 1));
@@ -1268,9 +1288,9 @@ mod tests {
             (b.version_vector().unwrap(), "servable"),
             (b.witnessed_vector().unwrap(), "witnessed"),
         ] {
-            assert_eq!(vector.get(c.node_id()), Hlc::ZERO, "{name}: C's origin keeps nothing here");
-            assert_eq!(vector.get(b.node_id()), Hlc::ZERO, "{name}: B's own insert was discarded");
-            assert_eq!(vector.get(a.node_id()), created, "{name}: A's at the entry it keeps");
+            assert_eq!(vector.get(c.origin()), Hlc::ZERO, "{name}: C's origin keeps nothing here");
+            assert_eq!(vector.get(b.origin()), Hlc::ZERO, "{name}: B's own insert was discarded");
+            assert_eq!(vector.get(a.origin()), created, "{name}: A's at the entry it keeps");
         }
         pull(&b, &c);
         assert_eq!(
@@ -1298,14 +1318,14 @@ mod tests {
         c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 2 }).unwrap();
         pull(&b, &c);
         b.collect_garbage_at(base + 1730, crate::RetentionPolicy::new(1, 24 * 60 * 60)).unwrap();
-        let own = b.node_id();
+        let own = b.origin();
         let collected = b.oplog_collected().unwrap().get(own);
         assert!(
             collected > Hlc::ZERO
                 && b.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                     .unwrap()
                     .iter()
-                    .all(|entry| entry.stamp.node != own),
+                    .all(|entry| entry.stamp.origin() != own),
             "the fixture must collect every entry of the member's own origin"
         );
         at(&b, base, 1760);
@@ -1358,7 +1378,7 @@ mod tests {
         at(&b, base, 310);
         b.insert(&mine, doc! { "_id": 2, "v": "b" }).unwrap();
         pull(&b, &c);
-        assert!(b.witnessed_vector().unwrap().get(c.node_id()) >= judged.hlc, "premise");
+        assert!(b.witnessed_vector().unwrap().get(c.origin()) >= judged.hlc, "premise");
 
         let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
         assert_eq!((outcome.reverted, outcome.removed, outcome.oplog_discarded), (1, 1, 2));
@@ -1439,7 +1459,7 @@ mod tests {
         assert_eq!(outcome.oplog_discarded, 1);
         // The rewind removes c's insert, so c's coverage comes down to what the
         // rewind keeps of it: nothing (ADR-246).
-        assert_eq!(b.version_vector().unwrap().get(c.node_id()), Hlc::ZERO);
+        assert_eq!(b.version_vector().unwrap().get(c.origin()), Hlc::ZERO);
     }
 
     #[test]
@@ -1470,7 +1490,7 @@ mod tests {
         let restored = crate::docs::record_stamp(&a, &orders, &DocId::Int64(1)).unwrap().unwrap();
         let kept = crate::docs::record_stamp(&c, &theirs, &DocId::Int64(2)).unwrap().unwrap();
         assert!(
-            b.witnessed_vector().unwrap().get(c.node_id()) >= kept.hlc,
+            b.witnessed_vector().unwrap().get(c.origin()) >= kept.hlc,
             "the fixture must witness C's losing write below C's kept one"
         );
 
@@ -1481,13 +1501,13 @@ mod tests {
             (b.witnessed_vector().unwrap(), "witnessed"),
         ] {
             assert_eq!(
-                vector.get(b.node_id()),
+                vector.get(b.origin()),
                 restored.hlc,
                 "{name}: bounded by the restored entry"
             );
-            assert_eq!(vector.get(c.node_id()), kept.hlc, "{name}: never below an entry it keeps");
+            assert_eq!(vector.get(c.origin()), kept.hlc, "{name}: never below an entry it keeps");
             assert_eq!(
-                vector.get(a.node_id()),
+                vector.get(a.origin()),
                 restored.hlc,
                 "{name}: A's coverage is its kept entry"
             );
@@ -1723,8 +1743,8 @@ mod tests {
                 .iter()
                 .unwrap()
                 .map(|row| row.unwrap())
-                .filter(|(_, value)| {
-                    codec::decode_oplog_entry(value.value()).unwrap().stamp.hlc
+                .filter(|(key, value)| {
+                    codec::decode_oplog_entry(key.value(), value.value()).unwrap().stamp.hlc
                         > Hlc::new(base + 150, 0)
                 })
                 .map(|(key, _)| key.value().to_vec())

@@ -1694,7 +1694,7 @@ impl Engine {
                         Ok((OpKind::UniqueViolation, id)) if id == coll.id
                     );
                     if named {
-                        let entry = codec::decode_oplog_entry(value.value())?;
+                        let entry = codec::decode_oplog_entry(stamp, value.value())?;
                         if let Some(body) = &entry.body {
                             details.push(bson::deserialize_from_slice(body)?);
                         }
@@ -1755,7 +1755,7 @@ impl Engine {
                         let (kind, collection) =
                             codec::decode_oplog_kind_and_collection(value.value())?;
                         if kind == OpKind::UniqueViolation && collection == coll.id {
-                            let entry = codec::decode_oplog_entry(value.value())?;
+                            let entry = codec::decode_oplog_entry(key.value(), value.value())?;
                             if let Some(body) = &entry.body {
                                 let detail: kimmy_core::UniqueViolationDetail =
                                     bson::deserialize_from_slice(body)?;
@@ -2010,6 +2010,7 @@ pub(crate) fn record_stamp(
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{Hlc, NodeId};
 
     use super::*;
@@ -2664,7 +2665,7 @@ mod tests {
         body: Option<Document>,
     ) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([node; 16])),
+            stamp: Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO),
             kind: if body.is_some() { OpKind::Replace } else { OpKind::Delete },
             collection: coll.id,
             doc_id: Some(id.clone()),
@@ -2788,7 +2789,11 @@ mod tests {
 
     fn remote_insert(coll: &CollectionMeta, id: &str, doc: Document, wall_ms: u64) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), kimmy_core::NodeId::generate()),
+            stamp: Stamp::new(
+                kimmy_core::Hlc::new(wall_ms, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(DocId::String(id.into())),
@@ -3086,10 +3091,10 @@ mod tests {
         engine.apply_remote(&coll, &merged).unwrap();
 
         let mut delivered = engine.witnessed_vector().unwrap();
-        delivered.insert(unsent.stamp.node, kimmy_core::Hlc::ZERO);
+        delivered.insert(unsent.stamp.origin(), kimmy_core::Hlc::ZERO);
         let token = kimmy_core::ResumeToken::issued(
             merged.stamp,
-            kimmy_core::NodeId::generate(),
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO),
             delivered,
         );
         let mut stream = engine
@@ -3203,7 +3208,7 @@ mod tests {
         // A guard that declines, which is a refused expiry.
         assert!(!engine.delete_guarded(&coll, &DocId::Int64(1), |_| false).unwrap());
         // A stale stamp, and a stamp for a document that is not there.
-        let other = Stamp { hlc: stamp.hlc.successor(), node: stamp.node };
+        let other = Stamp { hlc: stamp.hlc.successor(), node: stamp.node, epoch: stamp.epoch };
         assert!(engine.delete_if(&coll, &DocId::Int64(1), Some(other)).is_err());
         assert!(engine.delete_if(&coll, &DocId::Int64(99), Some(stamp)).is_err());
 
@@ -3497,7 +3502,10 @@ mod tests {
         };
         let mut bytes = codec::encode_oplog_entry(&entry);
         bytes.truncate(bytes.len() - 8);
-        assert!(codec::decode_oplog_entry(&bytes).is_err(), "the fixture must be undecodable");
+        assert!(
+            codec::decode_oplog_entry(&codec::oplog_key(&entry.stamp), &bytes).is_err(),
+            "the fixture must be undecodable"
+        );
         bytes
     }
 
@@ -3512,7 +3520,7 @@ mod tests {
         let elsewhere = engine.create_collection("app", "other").unwrap();
         engine.insert(&coll, doc! { "_id": "a", "email": "a@x" }).unwrap();
 
-        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
+        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate(), Epoch::ZERO);
         put_raw_oplog_row(&engine, &stamp, &truncated_insert(stamp, elsewhere.id));
 
         let live = engine.live_unique_violations(&coll, None, crate::WalkScope::Request).unwrap();
@@ -3534,7 +3542,7 @@ mod tests {
         engine.create_index("app", "docs", vec![field("email")], false, None).unwrap();
         let plain = engine.get_collection("app", plain.name.as_str()).unwrap();
 
-        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
+        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate(), Epoch::ZERO);
         put_raw_oplog_row(&engine, &stamp, &[0xFF; 64]);
 
         assert!(

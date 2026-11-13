@@ -31,6 +31,7 @@
 //!    expires by.
 
 use bson::{Bson, Document, doc};
+use kimmy_core::Epoch;
 use kimmy_storage::{CandidateOrder, CollectionMeta, Engine, IndexField, IndexScan};
 
 /// Values on both sides of the filters' bounds.
@@ -238,6 +239,7 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                     stamp: kimmy_core::Stamp::new(
                         kimmy_core::Hlc::new(u64::MAX >> 20, extra as u16),
                         kimmy_core::NodeId::generate(),
+                        Epoch::ZERO,
                     ),
                     kind: kimmy_core::OpKind::Insert,
                     collection: coll.id,

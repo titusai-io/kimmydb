@@ -2,6 +2,7 @@
 //! step the table's rows are exactly the violation entries the oplog holds,
 //! and `through` never claims more than the oplog's tail.
 
+use kimmy_core::Epoch;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -34,7 +35,7 @@ fn violate(engine: &Engine, coll: &CollectionMeta, tag: &str, n: usize) {
         let email = format!("{tag}{i}@x");
         engine.insert(coll, doc! { "_id": format!("{tag}l{i}"), "email": email.clone() }).unwrap();
         let entry = OplogEntry {
-            stamp: Stamp::new(Hlc::new(9_000 + i as u64, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(9_000 + i as u64, 0), NodeId::generate(), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(format!("{tag}r{i}"))),
@@ -432,7 +433,7 @@ fn a_row_with_no_entry_is_skipped_by_the_route() {
     let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
     {
         let mut table = txn.open_table(tables::UNIQUE_VIOLATIONS).unwrap();
-        let ghost = Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([1; 16]));
+        let ghost = Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([1; 16]), Epoch::ZERO);
         table
             .insert(
                 crate::violations_table::row_key(coll.id, &codec::oplog_key(&ghost)).as_slice(),
@@ -551,7 +552,7 @@ fn a_backfill_finishes_though_a_write_overtakes_every_step() {
 fn retention_trims_a_row_an_older_build_left_behind() {
     let (engine, coll, _dir) = store();
     violate(&engine, &coll, "a", 2);
-    let ghost = Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([1; 16]));
+    let ghost = Stamp::new(Hlc::new(1, 0), NodeId::from_bytes([1; 16]), Epoch::ZERO);
     let ghost_row = crate::violations_table::row_key(coll.id, &codec::oplog_key(&ghost));
     let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
     {
@@ -926,7 +927,7 @@ fn groups_of_same_length_binary_holders_are_reported_apart() {
         let email = format!("e{n}@x");
         engine.insert(&coll, doc! { "_id": binary(mine), "email": email.clone() }).unwrap();
         let entry = OplogEntry {
-            stamp: Stamp::new(Hlc::new(9_000 + n as u64, 0), NodeId::generate()),
+            stamp: Stamp::new(Hlc::new(9_000 + n as u64, 0), NodeId::generate(), Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::try_from_bson(&binary(theirs)).unwrap()),

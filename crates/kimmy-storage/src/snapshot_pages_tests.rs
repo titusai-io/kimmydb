@@ -3,6 +3,7 @@
 //! refused by name; every page's encoding stays within a frame; a converge pull
 //! counts its rows, tombstones with documents.
 
+use kimmy_core::Epoch;
 use std::cmp::Ordering;
 
 use bson::{Bson, Document, doc};
@@ -372,7 +373,11 @@ fn the_row_overheads_bound_the_encoding() {
         id_wire_len,
     };
     let node = NodeId::from_bytes([0xab; 16]);
-    let stamp = Stamp::new(Hlc { wall_ms: u64::from(u32::MAX) * 1000, counter: u16::MAX }, node);
+    let stamp = Stamp::new(
+        Hlc { wall_ms: u64::from(u32::MAX) * 1000, counter: u16::MAX },
+        node,
+        Epoch::ZERO,
+    );
     let bare = SnapshotPage {
         collections: Vec::new(),
         documents: Vec::new(),

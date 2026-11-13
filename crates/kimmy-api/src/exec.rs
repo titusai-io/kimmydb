@@ -499,7 +499,7 @@ pub fn find(
 
 /// A caller's `if_stamp`, decoded — `None` when the write is unconditional.
 fn parse_if_stamp(raw: Option<&str>) -> Result<Option<kimmy_core::Stamp>, ApiError> {
-    raw.map(|s| kimmy_core::Stamp::decode(s).map_err(ApiError::from)).transpose()
+    raw.map(|s| kimmy_core::Stamp::decode(s).map_err(|_| ApiError::malformed_stamp(s))).transpose()
 }
 
 /// Whether a sort specification is exactly `_id` ascending.

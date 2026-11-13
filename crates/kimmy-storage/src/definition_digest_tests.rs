@@ -2,6 +2,7 @@
 //! framed, and what it must not see. Written before the hash.
 
 use bson::{Document, doc};
+use kimmy_core::Epoch;
 use kimmy_core::index_meta::stored_filter;
 use kimmy_core::{
     ChunkConfig, CollectionId, Enforcement, Hlc, IndexField, IndexMeta, Metric, NodeId,
@@ -59,7 +60,7 @@ fn config(dim: usize) -> VectorConfig {
 }
 
 fn stamp(wall: u64, node: u8) -> Stamp {
-    Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]))
+    Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO)
 }
 
 // -- The property: the digest is equal exactly when `differences` is empty -----

@@ -29,6 +29,7 @@
 //! - `put_vectors` — replace-all per document, so it does more than an insert.
 //! - `replace` and `delete` — the other two mutations.
 
+use kimmy_core::Epoch;
 use std::hint::black_box;
 
 use bson::{Document, doc};
@@ -228,7 +229,7 @@ fn background_consumer(c: &mut Criterion) {
                             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            let token = ResumeToken::new(entry.stamp.hlc, entry.stamp.node);
+                            let token = ResumeToken::new(entry.stamp.hlc, entry.stamp.origin());
                             engine.put_consumer_position("bench", token).unwrap();
                             handled.fetch_add(1, std::sync::atomic::Ordering::Release);
                         }
@@ -449,7 +450,7 @@ fn batch_apply(c: &mut Criterion) {
 /// A replicated insert of document `id`, stamped at `wall` from `origin`.
 fn entry(origin: NodeId, wall: u64, collection: kimmy_core::CollectionId, id: i64) -> OplogEntry {
     OplogEntry {
-        stamp: Stamp::new(Hlc::new(wall, 0), origin),
+        stamp: Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
         kind: OpKind::Insert,
         collection,
         doc_id: Some(DocId::Int64(id)),

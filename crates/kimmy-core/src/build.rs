@@ -26,6 +26,12 @@ pub const SCHEMA_6_RELEASE: &str = "0.53.0";
 /// name it.
 pub const SCHEMA_7_RELEASE: &str = "0.58.0";
 
+/// The release that introduced storage schema 8 and cluster protocol 3: stamps, version vectors
+/// and resume tokens name an origin (a node and its epoch) where they named a node, and the
+/// stored and wire layouts moved with them. A store, backup or peer of an earlier release is
+/// refused, by this name.
+pub const SCHEMA_8_RELEASE: &str = "0.61.0";
+
 /// Short commit hash, with no decoration; `unknown` without git.
 pub const COMMIT: &str = env!("KIMMY_BUILD_COMMIT");
 
