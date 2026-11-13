@@ -351,7 +351,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     let head: Value =
         serde_json::from_str(lines.next().ok_or("empty trace")?).map_err(|e| e.to_string())?;
     let name = path.file_name().unwrap().to_string_lossy().to_string();
-    assert_eq!(head["sha256_16"], "4343f5208763266f", "{name}: the trace is of the vendored model");
+    assert!(
+        matches!(head["sha256_16"].as_str(), Some("4343f5208763266f" | "409eb9d10f35682c")),
+        "{name}: the trace is of a vendored model"
+    );
     let members: Vec<(String, i64)> = head["members"]
         .as_array()
         .unwrap()
@@ -369,6 +372,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     );
     // a trace of a run with route probes (`Q6_F` > 0): register events travel out of position, the in-order liveness check is off
     w.in_order = head["route_f"].as_f64().unwrap_or(0.0) == 0.0;
+    // 6d: the product routes (`doc_hold`, `doc_repair`) hold entries out of position and do not cover them
+    let routes = head["routes"].as_str().unwrap_or("");
+    w.held_uncovered = routes.contains("doc_hold") || routes.contains("doc_repair");
+    // (the in-order check of register events stays off on every route run)
     if rmode != ReplayMode::Document {
         if rmode == ReplayMode::FieldExact {
             assert_eq!(head["field_safe"], true, "{name}: not a field-safe trace");
@@ -471,9 +478,22 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
             }
             "hold" => {
                 let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
-                w.stats.bump("hold_taken");
+                w.stats.bump(if w.held_uncovered && e.kind == Kind::Doc {
+                    "doc_hold_taken"
+                } else {
+                    "hold_taken"
+                });
                 ms[idx(&s("dst"))].take_hold(&mut w, &e);
                 Value::Null
+            }
+            "doc_repair" => {
+                let (d, sr) = (idx(&s("dst")), idx(&s("src")));
+                let (dm, sm) = pair(&mut ms, d, sr);
+                let r = dm.scoped_repair(&mut w, sm);
+                if r {
+                    w.stats.bump("doc_repair");
+                }
+                json!(r)
             }
             "repair_ev" => {
                 let e = w.ent_rc(ev["idx"].as_u64().unwrap() as usize);
@@ -550,7 +570,17 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|p| (p[0].as_str().unwrap().to_string(), p[1].as_i64().unwrap()))
+                    .map(|p| {
+                        let k = p[0].as_str().unwrap();
+                        // the product routes (item P, provisional mapping): the model's `page_above_coverage` (a page names a version
+                        // its sender does not cover) is the harness' `page_carries_held_state`
+                        let k = if w.held_uncovered && k == "page_above_coverage" {
+                            "page_carries_held_state"
+                        } else {
+                            k
+                        };
+                        (k.to_string(), p[1].as_i64().unwrap())
+                    })
                     .collect();
                 let rs: BTreeMap<String, i64> = w
                     .stats
@@ -601,8 +631,12 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                         bad.push(format!("{k}: python {v} <> rust {got}"));
                     }
                 }
-                let py_inv: BTreeSet<&String> =
-                    py.keys().filter(|k| k.starts_with("inv_")).collect();
+                let py_inv: BTreeSet<&String> = py
+                    .keys()
+                    .filter(|k| k.starts_with("inv_"))
+                    // (the same mapping: on the product routes the model's invariant is the harness' counted held state)
+                    .filter(|k| !(w.held_uncovered && k.as_str() == "inv_page_above_coverage"))
+                    .collect();
                 let rs_inv: BTreeSet<&String> =
                     r.keys().filter(|k| k.starts_with("inv_") && r[*k] != 0).collect();
                 if py_inv != rs_inv {

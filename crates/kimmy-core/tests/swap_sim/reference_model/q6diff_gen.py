@@ -188,7 +188,7 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     if T.out is not None:
         T.write(dict(v=1, model=MODEL + ".py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
                      members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
-                     route_f=float(os.environ.get("Q6_F", "0") or 0)))
+                     route_f=float(os.environ.get("Q6_F", "0") or 0), routes=os.environ.get("Q6_ROUTES", "")))
     T.started = True
 
 
@@ -245,6 +245,8 @@ _wrap("do_bind", "bind", lambda s, job: dict(m=s.name, job=T.jobs.index(job)), l
 _wrap("take_from", "take_from", lambda s, src, e, quiesce=False: dict(dst=s.name, src=src.name, idx=e.idx, quiesce=bool(quiesce)))
 _wrap("take", "take", lambda s, e: dict(dst=s.name, idx=e.idx))
 _wrap("take_hold", "hold", lambda s, e: dict(dst=s.name, idx=e.idx))  # the hold route (Q6_F > 0)
+if hasattr(sm.Member, "scoped_repair"):  # 6d: the doc_repair route (a scoped repair), traced as one call
+    _wrap("scoped_repair", "doc_repair", lambda s, src: dict(dst=s.name, src=src.name), lambda r: bool(r))
 _wrap("add_event", "repair_ev", lambda s, e: dict(dst=s.name, idx=e.idx))  # the repair route: a register event handed over as information
 _wrap("take_quiesce", "take_quiesce", lambda s, e: dict(dst=s.name, idx=e.idx))
 _wrap("snapshot_begin", "snap_begin", lambda s, src, lazy: dict(dst=s.name, src=src.name, lazy=bool(lazy)), lambda r: bool(r),
