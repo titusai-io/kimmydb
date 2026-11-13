@@ -15758,6 +15758,27 @@ consequence, pinned: it compares, and mismatches, without this record).
 
 ## ADR-169 — An entry held as state is released when it arrives in a contiguous window
 
+> **Amended 2026-11-12 (held mark below the vector).**
+> - **The invariant this release relies on.** A sender omits an entry from a window
+>   only when it witnessed that entry as superseded (ADR-148). So a window that
+>   reaches the entry's stamp without carrying it says the entry is history.
+> - **What was missing.** A member that held such an entry as state and then took
+>   the window was left with its mark below the servable vector, for an entry no
+>   peer would serve again. Every pull named the mark (ADR-172) and the peer could
+>   only answer that it lacked it. The record of that ask lapses after 300 s, so the
+>   member asked again until retention collected the entry. Documents were not
+>   affected.
+> - **Now.** After a window has been applied, every held mark of a document entry
+>   that the servable vector covers for its origin and whose key now holds a newer
+>   version is dropped. It raises no vector and changes no document.
+> - **Not dropped.** A covered mark whose entry is not superseded at its key is a
+>   genuine gap: it stays and is still asked for. A mark whose entry names no
+>   document (a schema change) is left to the path that releases it. A completed
+>   snapshot's grant is unchanged: it releases every mark it covers.
+> - **For rule S.** A staged row of a Q6 swap that arrives in position is appended
+>   and served onward even when superseded (the Q6 design's rule S), so that a
+>   sender never omits one: the invariant above must hold for staged rows.
+
 > **Amended by [ADR-171](#adr-171--a-served-window-passes-over-what-the-puller-has-already-processed).**
 > A served window now passes over what the puller's witnessed vector covers, so a
 > held entry is re-served only while it is above the member's witnessed position

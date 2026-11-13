@@ -5927,6 +5927,67 @@ pub(crate) fn release_held_in_position(
     Ok(true)
 }
 
+/// After a window has been applied: drop every held mark (ADR-160) of a DOCUMENT entry that the servable vector
+/// already covers for its origin and that is superseded at its key by the state now held there. Returns how many.
+///
+/// A sender omits an entry from a window only when it witnessed that entry as superseded, so a member that holds the
+/// entry as state and then takes the superseder (or a later entry that raises the vector over it) is left with a mark
+/// BELOW the vector for an entry no peer will serve again. `held_marks_covered_by` names such a mark in every pull's
+/// `marked` spans (ADR-172) and the peer can only answer that it does not have it; the record of that ask lapses after
+/// `MARKS_REASK_AFTER` and the member asks again, until retention collects the entry. The entry is history now: dropping
+/// its mark raises nothing and changes no document.
+///
+/// A covered mark whose entry is NOT superseded is a genuine gap and stays (and is still asked for). DDL marks are not
+/// touched: a mark whose entry names no document is left to the path that releases it.
+pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Result<usize> {
+    let mut drop_keys: Vec<Vec<u8>> = Vec::new();
+    {
+        let held = txn.open_table(tables::OPLOG_HELD)?;
+        if held.is_empty()? {
+            return Ok(0);
+        }
+        let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        let docs = txn.open_table(tables::DOCS)?;
+        for row in held.iter()? {
+            let (key, _) = row?;
+            let Ok(stamp) = codec::decode_oplog_key(key.value()) else {
+                continue;
+            };
+            let covered = match versions.get(stamp.origin().to_bytes().as_slice())? {
+                Some(current) => decode_hlc(current.value())? >= stamp.hlc,
+                None => false,
+            };
+            if !covered {
+                continue;
+            }
+            let Some(raw) = oplog.get(key.value())? else {
+                continue;
+            };
+            let entry = codec::decode_oplog_entry(key.value(), raw.value())?;
+            let Some(id) = entry.doc_id.as_ref() else {
+                continue;
+            };
+            let doc_key = crate::docs::doc_key(id)?;
+            let superseded = match docs.get((entry.collection.0, doc_key.as_slice()))? {
+                Some(current) => codec::decode_doc_record(current.value())?.stamp.wins_over(&stamp),
+                None => false,
+            };
+            if superseded {
+                drop_keys.push(key.value().to_vec());
+            }
+        }
+    }
+    if drop_keys.is_empty() {
+        return Ok(0);
+    }
+    let mut held = txn.open_table(tables::OPLOG_HELD)?;
+    for key in &drop_keys {
+        held.remove(key.as_slice())?;
+    }
+    Ok(drop_keys.len())
+}
+
 /// Whether a live collection stands under `id`.
 ///
 /// The question [`Engine::collection_by_id`] answers, asked against a table the

@@ -17,6 +17,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 ### Fixed
 
 - A member that took a scoped definitions repair or a scoped restore of a collection logs the entry behind each index it restored as held state, and that entry's later delivery in a window never released the mark, so the member asked its peers for it again about every 5 minutes for as long as the entry stayed in its oplog, and until the origin wrote again advertised a servable position below it. The delivery now releases the mark and raises the servable position, and no ask is repeated.
+- A member that held an entry as state and then took a window that reached its stamp without carrying it, because the sender had witnessed it as superseded, kept its held mark below the servable vector and asked its peers for the entry again every 300 s until retention collected it. After a window is applied, the member now drops the held mark of a document entry that its servable vector covers and that a newer version has superseded at its key. A covered mark whose entry is not superseded is still kept and asked for ([ADR-169](docs/decisions.md#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window)).
 
 ### Changed
 
@@ -5882,7 +5883,6 @@ that the one-transaction sync batch of 0.20.0 had moved rather than removed.
   change. Found by a test round against a three-member cluster running
   0.20.0.
 
-
 ## 0.20.0 - 2026-09-02
 
 A minor when it ships, not a patch. Nothing changes on the wire between
@@ -6457,7 +6457,6 @@ whose defaults are meant to be left alone, and documentation corrections.
   is held anyway, with a warning, because a search is never refused over
   memory. `/metrics` gains `kimmy_vector_index_cache_bytes`, the resident
   total by the same estimate (ADR-103).
-
 
 - **A CycloneDX SBOM per binary per target, on every release.** Beside each
   `kimmyd-<target>.tar.xz` and `kimmy-cli-<target>.tar.xz` on the Release
