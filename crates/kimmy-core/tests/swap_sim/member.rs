@@ -49,6 +49,9 @@ pub struct Member {
     pub pos_hold: bool,
     /// the entry a `take_hold` is delivering now (the model's `_holding`): its own removal from `appended` is not counted
     pub holding: Option<EntryId>,
+    /// the entry a window is delivering behind a held predecessor (marked held for the duration of the take only): neither released
+    /// by `promote_oop` nor un-appended by the HB-1 guard until the model's after-the-take decision
+    pub arriving: Option<EntryId>,
     /// the end-of-run delivery's shortcut witnessed an entry here that no live member appended (`take_quiesce`)
     pub quiesce_witnessed: bool,
     /// H-Q6-L1's repair ledger (an emulation: the product's `repair_ledger.rs` is not modelled): the held marks a Definitions repair is
@@ -133,6 +136,7 @@ impl Member {
             vc: VectorCoverage::new(),
             pos_hold: false,
             holding: None,
+            arriving: None,
             quiesce_witnessed: false,
             repairs_planned: Default::default(),
             repairs_retired: Default::default(),
