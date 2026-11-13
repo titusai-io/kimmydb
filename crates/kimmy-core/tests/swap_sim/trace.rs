@@ -25,9 +25,6 @@ pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "s
 /// The counters of the Rust-only emulations (the route tests' live page read, `Repair::Replay`, the push, the product routes' held
 /// entries and DF-1's marker): the model has none of them, so they are left out of the counter comparison (they count, they decide
 /// nothing the model decides).
-// (Rust-only INVARIANT, not a counter, therefore not in this list: `loss_record_outside_coverage_prefix`, the Q6 design page's 'Records' rule that a loss
-// record is an ordinary entry inside its appender's coverage prefix; the Python model does not check it (next model round adds it); v6 trips it
-// on neither side, so the replay's verdict comparison is unaffected)
 pub const RUST_ONLY_STATS: [&str; 13] = [
     // item Q / rule S: counters of the harness only (the model has no such names)
     "rule_s_negative_cases",
