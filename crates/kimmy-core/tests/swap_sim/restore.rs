@@ -210,6 +210,20 @@ pub fn restore_own_mark(mode: &str) -> Restored {
     }
     backup.vc = crate::coverage::VectorCoverage::from_prefix(&sc.w, &cv);
     backup.cv = cv;
+    // ADR-244's derivation, as `restore_with` does it: every oplog entry the store holds above the restored vector for its origin
+    // is marked held. It must be exactly the entries this scenario set apart (the torn backup), computed here from the store's
+    // contents and the vector, not from the scenario's own list
+    let mut derived: Vec<EntryId> = sc
+        .w
+        .all
+        .iter()
+        .filter(|e| backup.appended.contains(&e.idx) && !backup.cv.has(e.idx))
+        .map(|e| e.idx)
+        .collect();
+    derived.sort();
+    let mut expect = marked.clone();
+    expect.sort();
+    assert_eq!(derived, expect, "ADR-244: the marks are the stored entries above the backup's vector");
     for i in &marked {
         backup.appended.remove(i); // the marked entries are not served
     }
