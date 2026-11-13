@@ -49,6 +49,8 @@ pub struct Cfg {
     pub strict_holders: bool,
     pub state_survives: bool,
     pub end_repair: bool,
+    /// ITEM Q: the product's mark mechanism (`World::product_marks`) in a grid run (default off = the model's bookkeeping)
+    pub product_marks: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -97,6 +99,7 @@ impl Cfg {
             strict_holders: false,
             state_survives: false,
             end_repair: false,
+            product_marks: false,
         }
     }
 }
@@ -245,6 +248,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.state_survives = cfg.state_survives;
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
+    w.product_marks = cfg.product_marks;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
     for k in 0..cfg.keys as u32 {
         ms[0].local_doc(&mut w, k, DocOp::Insert);
