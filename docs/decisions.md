@@ -19332,6 +19332,10 @@ are held; a report that fails after the commit counts the create once; and a
 forced race between two applies of one entry commits it once. Each of these
 fails under the mutation that removes what it tests.
 
+> **Corrected 2026-11-12:** a held `CreateIndex` mark was not released by its in-window
+> delivery (the DDL branch did not receive the position); since the fix, `InWindow`
+> releases it for every DDL apply path, including Standing and History.
+
 ---
 
 ## ADR-181 — Expiry deletes a document only if its index's filter, read as `find` reads it, still selects it

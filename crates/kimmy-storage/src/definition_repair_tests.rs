@@ -828,3 +828,182 @@ fn a_tombstone_recorded_between_the_check_and_the_build_makes_the_index_history(
     assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
     assert!(names(&b).is_empty(), "an index made before a tombstone was built");
 }
+
+/// Deliver everything `from` holds to `into` as a peer's window `into` pulled: in position, so a
+/// mark left on an entry in it is the entry reaching this member as history after all.
+fn deliver_in_window(into: &Engine, from: &Engine) {
+    let window = from.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    into.apply_peer_batch(
+        &from.witnessed_vector().unwrap(),
+        &window.entries,
+        window.scanned_to,
+        window.exhausted,
+    )
+    .unwrap();
+}
+
+fn no_mark_is_left(e: &Engine) {
+    assert_eq!(e.held_len().unwrap(), 0, "a mark outlived its entry's delivery in position");
+    assert!(
+        e.held_marks_covered_by(&e.witnessed_vector().unwrap()).unwrap().is_empty(),
+        "the member would ask its peers for the entry again"
+    );
+}
+
+/// The re-log of a definition (ADR-180) is the one way a schema change is appended held: the
+/// repair marks it, and its delivery in a window must release the mark and the servable vector.
+#[test]
+fn a_definition_the_repair_relogged_is_released_by_its_delivery_in_a_window() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    assert!(b.version_vector().unwrap().get(a.node_id()) < stamp.hlc, "premise");
+
+    deliver_in_window(&b, &a);
+    no_mark_is_left(&b);
+    assert!(
+        b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc,
+        "the servable vector stayed below the entry"
+    );
+}
+
+/// The same, when the entry reaches the member as the origin's own bytes in a window that the
+/// member's re-log already agrees with, and again when delivered twice.
+#[test]
+fn a_second_delivery_in_a_window_changes_nothing_after_the_release() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    repair(&b, &a, BIG);
+    deliver_in_window(&b, &a);
+    let after = (b.version_vector().unwrap(), b.witnessed_vector().unwrap());
+    deliver_in_window(&b, &a);
+    no_mark_is_left(&b);
+    assert_eq!(after, (b.version_vector().unwrap(), b.witnessed_vector().unwrap()));
+}
+
+/// A scoped restore of a collection the member lacks (`restore_collection`), not a repair.
+#[test]
+fn a_definition_a_scoped_restore_relogged_is_released_by_its_delivery_in_a_window() {
+    let (a, da) = engine();
+    let (b, _db) = engine();
+    let _keep = da;
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+
+    let mut progress = SnapshotProgress::of_collection(orders());
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(names(&b), vec!["by_v".to_string()]);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the restore left the entry marked");
+
+    deliver_in_window(&b, &a);
+    no_mark_is_left(&b);
+    assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
+}
+
+/// The held entry's creation is history here when the index was dropped, or the life of the
+/// collection ended, after the repair re-logged it: the delivery is judged history and appends
+/// nothing, but the entry is in position all the same, and its mark goes.
+#[test]
+fn a_relogged_definition_dropped_here_since_is_released_by_its_delivery_in_a_window() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    assert!(b.drop_index("shop", "orders", "by_v").unwrap());
+    let ours = b.held_len().unwrap();
+    assert_eq!(ours, 1, "premise: dropping the index leaves the held entry marked");
+
+    deliver_in_window(&b, &a);
+    assert!(names(&b).is_empty(), "the creation was history and built nothing");
+    no_mark_is_left(&b);
+    assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
+}
+
+#[test]
+fn a_relogged_definition_of_a_life_that_ended_here_is_released_by_its_delivery_in_a_window() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    b.drop_collection("shop", "orders").unwrap();
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the held entry outlives the life");
+
+    deliver_in_window(&b, &a);
+    assert!(names(&b).is_empty(), "the creation of a past life built nothing");
+    no_mark_is_left(&b);
+}
+
+/// What a restore's rebuild and the origin's own entry differ by is the bytes (an entry an
+/// origin logged before ADR-180 carries the `multikey` it observed). Delivered in a window over
+/// the held rebuild, the origin's entry replaces it and releases the mark.
+#[test]
+fn the_origins_entry_over_a_held_rebuild_with_other_bytes_replaces_it_and_releases_the_mark() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+
+    let rebuilt = b.oplog_entry(&stamp).unwrap().expect("the rebuild is logged");
+    let mut body: kimmy_core::IndexCreate =
+        bson::deserialize_from_slice(rebuilt.body.as_ref().unwrap()).unwrap();
+    assert!(!body.index.multikey);
+    body.index.multikey = true;
+    let origin =
+        crate::engine::ddl_entry(stamp, kimmy_core::OpKind::CreateIndex, rebuilt.collection, &body)
+            .unwrap();
+    assert_ne!(origin.body, rebuilt.body, "premise: the bytes differ");
+
+    let mut window = a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    for e in &mut window.entries {
+        if e.stamp == stamp {
+            *e = origin.clone();
+        }
+    }
+    b.apply_peer_batch(
+        &a.witnessed_vector().unwrap(),
+        &window.entries,
+        window.scanned_to,
+        window.exhausted,
+    )
+    .unwrap();
+
+    assert_eq!(b.oplog_entry(&stamp).unwrap().unwrap().body, origin.body, "the origin's bytes");
+    no_mark_is_left(&b);
+    assert!(b.version_vector().unwrap().get(a.node_id()) >= stamp.hlc);
+}
+
+/// The collection the held entry names is gone here when the entry arrives in a window: the
+/// creation is history (the drop is later than it), and the entry is in position all the same.
+#[test]
+fn a_relogged_definition_of_a_collection_dropped_here_since_is_released_by_its_delivery() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    repair(&b, &a, BIG);
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the repair left the entry marked");
+    later();
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    assert_eq!(b.held_len().unwrap(), 1, "premise: the drop leaves the held entry marked");
+
+    deliver_in_window(&b, &a);
+    assert!(b.get_collection("shop", "orders").is_err(), "the collection stays dropped");
+    no_mark_is_left(&b);
+}
