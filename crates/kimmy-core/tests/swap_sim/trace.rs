@@ -636,6 +636,20 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
             }
             "final" => {
                 let r = finish(&mut w, &mut ms);
+                if let Ok(path) = std::env::var("Q6DIFF_O8OUT") {
+                    // item P's O8 same-trace check: the Rust marker of this trace, one line per trace
+                    use std::io::Write;
+                    let mut f =
+                        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+                    writeln!(
+                        f,
+                        "{name}\t{}\t{}\t{}",
+                        r.get("cnt_o8").copied().unwrap_or(0),
+                        r.get("cnt_o8_in_hb2").copied().unwrap_or(0),
+                        r.get("alive_mismatch").copied().unwrap_or(0)
+                    )
+                    .unwrap();
+                }
                 let py: BTreeMap<String, i64> = ev["verdict"]
                     .as_array()
                     .unwrap()

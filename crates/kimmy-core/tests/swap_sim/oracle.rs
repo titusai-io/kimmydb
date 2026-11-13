@@ -645,8 +645,9 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     // that the oracle buries, and the writer's only non-lost entries above the stage's deadline are held out of position at live
     // members, none of them a covered witness at this member. Defined from the members' states and the write log, never from
     // the mismatch itself (the reference is `o8count.py`); HB-2's stages are counted apart (`cnt_o8_in_hb2`), their mismatch is excluded by name.
-    // Definitional differences from `o8count.py`: a "covered witness" is `cv.has(id) && !held_oop` (the Rust step check's
-    // definition; the Python reads `mem.held`), and lost entries are dropped from the entries above the deadline (the Python keeps them)
+    // Definition: `o8count2.py` (the design-text classifier): a "covered witness" is a PREFIX test over the writer's entries, lost
+    // entries are dropped from the entries above the deadline, HB-2's stages are counted apart. Differences from `o8count.py`: the
+    // prefix witness (the old one read a single entry), the lost entries, the HB-2 split; and it is structural (no alive_mismatch gate)
     let (mut o8_stages, mut o8_in_hb2) = (0, 0);
     for &i in &live {
         let m = &ms[i];
@@ -663,7 +664,19 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
                 .copied()
                 .filter(|&id| w.ent(id).hlc > cr.dl && !w.lost.contains(&id))
                 .collect();
-            if above.iter().any(|&id| m.cv.has(id) && !m.held_oop.contains(&id)) {
+            // covered witness (the design text, `o8count2.py`): the writer's entries in order, EVERY one up to the first above the
+            // deadline held here and none held out of position (a lost entry is held by no one, so it blocks the prefix)
+            let mut covered_witness = false;
+            for &id in &w.by_origin[cr.origin] {
+                if !m.cv.has(id) || m.held_oop.contains(&id) {
+                    break;
+                }
+                if w.ent(id).hlc > cr.dl {
+                    covered_witness = true;
+                    break;
+                }
+            }
+            if covered_witness {
                 continue;
             }
             if above.iter().any(|&id| live.iter().any(|&j| ms[j].held_oop.contains(&id))) {
