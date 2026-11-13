@@ -954,7 +954,7 @@ mod tests {
     /// its tests read, so all three are exempt as files.
     const AUDITED_FILES: [&str; 3] =
         ["faults.rs", "key_walk_tests.rs", "violations_table_tests.rs"];
-    const AUDITED_FNS: [(&str, &str); 15] = [
+    const AUDITED_FNS: [(&str, &str); 16] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "decide_violations_ready"),
         ("violations_table.rs", "record_violations_backfill"),
@@ -963,6 +963,8 @@ mod tests {
         ("engine.rs", "raise_origin_version"),
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
+        // removes a mark only where the servable vector already covers its entry: I holds before and after
+        ("engine.rs", "drop_superseded_covered_marks"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
         ("engine.rs", "lower_vectors_in"),
         ("gc.rs", "remove_oplog_entries"),

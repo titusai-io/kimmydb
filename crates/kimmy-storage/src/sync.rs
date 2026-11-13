@@ -1404,6 +1404,14 @@ impl Engine {
             let txn = self.witness_txn(run)?;
             Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
         }
+        // A window served from this node's own position has raised the servable vector over what it carried; a held
+        // mark the vector now covers whose entry is superseded at its key is history, and is dropped (ADR-169's
+        // addendum), not asked for again every `MARKS_REASK_AFTER`.
+        if position == crate::engine::Position::InWindow
+            && let Some(txn) = run.txn.as_ref()
+        {
+            crate::engine::drop_superseded_covered_marks(txn)?;
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         if count_hooks::fails(count_hooks::Fail::BeforeLastCommit) {
             return Err(count_hooks::injected());
