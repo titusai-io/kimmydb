@@ -142,6 +142,51 @@ mod tests {
         }
     }
 
+    /// M6: the Rust-only mutants of the product routes are KILLED on the product-route grid (document policy, doc_hold + doc_repair
+    /// f 0.3, `Q6_MUTROUTE_RUNS` seeds, default 40): H-Q6-R2 (a window delivers the highest stamp: not contiguous) and the release
+    /// condition (a held entry released without its predecessors). And R4's grant gate: `m-snap-register-late` is equivalent to the
+    /// base under rule B (the review), so its kill is REQUIRED in combination with rule B off.
+    #[test]
+    fn the_product_route_mutants_and_the_grant_gate_with_rule_b_off_are_killed() {
+        let seeds = env_u64("Q6_MUTROUTE_RUNS", 40);
+        let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            c.routes = Some(crate::run::Routes {
+                f: 0.3,
+                hold: false,
+                repair: false,
+                doc_hold: true,
+                doc_repair: true,
+            });
+        }
+        let mut alive: Vec<&str> = Vec::new();
+        for m in crate::flags::PRODUCT_MUTANTS
+            .iter()
+            .copied()
+            .chain(["m-snap-register-late+m-rule-b-off"])
+        {
+            let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+            let p = s.problems();
+            eprintln!(
+                "{m:36} {} kinds: {:?}",
+                p.len(),
+                p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
+            );
+            // the base's own classified findings (DF-1, DF-2) are in every row: look at the checks the mutant adds
+            let adds = p.keys().any(|k| {
+                k.starts_with("inv_window")
+                    || k.starts_with("inv_vector")
+                    || k == "inv_partial_flip" && s.get("inv_partial_flip") > 30
+                    || k.starts_with("inv_bury")
+                    || k.starts_with("inv_orphan")
+            });
+            if !adds {
+                alive.push(m);
+            }
+        }
+        assert!(alive.is_empty(), "not killed on the product-route grid: {alive:?}");
+    }
+
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
     /// restarted from a live eligible peer (the product cannot complete a join from a dead member). The base grid and the
     /// product-route grid (document policy) stay clean (every problem classified), and the mode is not vacuous: joins are restarted.

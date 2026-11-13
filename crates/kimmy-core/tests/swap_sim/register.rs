@@ -202,7 +202,7 @@ impl Member {
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
                 .all(|&x| self.cv.has(x) && !(w.held_uncovered && self.held_oop.contains(&x)));
-            if ok {
+            if ok || w.f.fm_release_unconditional {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
                 self.vc.raise(e.origin, e.hlc); // released in position: the vector rises
