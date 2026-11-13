@@ -209,11 +209,12 @@ pub const MUTANTS: [&str; 38] = [
 ];
 
 /// The mutants of `MUTANTS` the Python model does not have (the differential's mutant traces skip them).
-pub const RUST_ONLY_MUTANTS: [&str; 4] = [
+pub const RUST_ONLY_MUTANTS: [&str; 5] = [
     "m-stale-src",
     "m-loss-received-not-appended",
     "m-snap-record-not-served",
     "m-d10-ignores-info",
+    "m-release-behind-held",
 ];
 
 fn v5() -> Flags {

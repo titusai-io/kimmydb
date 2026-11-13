@@ -1324,6 +1324,8 @@ mod tests {
                 "m-snap-no-orphan-burials",
                 // killed by the scripted rule-B scenario (`rule_b_a_held_bind_is_information_until_covered`), not by the random grid
                 "m-d10-ignores-info",
+                // killed on the product-route seeds 25, 138, 154 (`classes.rs`), not by the base grid (no routes)
+                "m-release-behind-held",
             ];
             let unexpected: Vec<&&str> =
                 survivors.iter().filter(|m| !allowed_survivors.contains(m)).collect();
