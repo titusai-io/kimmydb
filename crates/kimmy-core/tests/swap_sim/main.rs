@@ -300,6 +300,138 @@ mod tests {
         assert!(diffs.is_empty(), "item Q: {} traces differ on the document layer", diffs.len());
     }
 
+    /// ITEM Q on the GRID (not on exported traces): the product-route rows at gate size, each run twice with the same seed, once with
+    /// the model's bookkeeping (`product_marks` off) and once with the product's mark mechanism (on): in-window entries never held
+    /// for a held predecessor, the vector raised at release, covered superseded marks dropped after each window. Every key of the
+    /// result is compared per run. The DOCUMENT-LAYER keys (divergences, state/served/alive/oracle mismatches, loss records, partial
+    /// flips and the other invariants that are about documents, the named classes) must not differ: any difference is a FINDING and
+    /// fails the test. The bookkeeping keys (held marks, coverage, vector, releases, drops) may differ and are LISTED per row.
+    /// `Q6Q_ROW` (0..6) selects the row: doc_hold, doc_repair, both x f 0.3, 0.1; `Q6Q_SEEDS` (default 250) the seeds per configuration;
+    /// `Q6Q_FROM` the first seed.
+    #[test]
+    #[ignore = "item Q grid: Q6Q_ROW selects one row"]
+    fn item_q_grid_product_marks_on_and_off_agree_on_the_document_layer() {
+        let row = env_u64("Q6Q_ROW", 0) as usize;
+        let seeds = env_u64("Q6Q_SEEDS", 250);
+        let from = env_u64("Q6Q_FROM", 0);
+        let rows = [
+            (true, false, 0.3),
+            (true, false, 0.1),
+            (false, true, 0.3),
+            (false, true, 0.1),
+            (true, true, 0.3),
+            (true, true, 0.1),
+        ];
+        let (dh, dr, f) = rows[row];
+        const DOC_LAYER: [&str; 16] = [
+            "diverged",
+            "div_state",
+            "div_loss",
+            "div_replay",
+            "div_replay_raw",
+            "div_replay_stamp_order",
+            "oracle_state",
+            "served_mismatch",
+            "alive_mismatch",
+            "loss_missing",
+            "loss_extra",
+            "loss_mismatch",
+            "inv_partial_flip",
+            "inv_head_not_exactly_one_record_and_event",
+            "inv_orphan_with_valid_binding",
+            "inv_serve_not_alive",
+        ];
+        let mut runs = 0usize;
+        let mut doc_diffs: Vec<String> = Vec::new();
+        let mut class_diffs: Vec<String> = Vec::new();
+        let mut book: std::collections::BTreeMap<String, (usize, i64)> = Default::default();
+        for m in [2usize, 3, 4, 5] {
+            for o in [1usize, 2, 3] {
+                for k in [3usize, 4, 5] {
+                    for seed in from..from + seeds {
+                        let mut c_off = crate::run::product_cfg(
+                            crate::world::Policy::Document,
+                            (m, o, k),
+                            dh,
+                            dr,
+                            f,
+                        );
+                        c_off.product_marks = false;
+                        let mut c_on = c_off;
+                        c_on.product_marks = true;
+                        let off = run("v6", "v6", seed, c_off, false);
+                        let on = run("v6", "v6", seed, c_on, false);
+                        runs += 1;
+                        let keys: std::collections::BTreeSet<&String> =
+                            off.res.keys().chain(on.res.keys()).collect();
+                        for key in keys {
+                            let (a, b) = (
+                                off.res.get(key).copied().unwrap_or(0),
+                                on.res.get(key).copied().unwrap_or(0),
+                            );
+                            if a == b || key.starts_with('_') {
+                                continue;
+                            }
+                            if key == "inv_vector_disagrees_with_prefix" {
+                                eprintln!(
+                                    "VP {m}/{o}/{k} seed {seed}: OFF {a} ON {b} | doc-layer of the run: {:?} | notes ON: {:?}",
+                                    off.res
+                                        .iter()
+                                        .filter(|(k2, v)| **v != 0
+                                            && (k2.starts_with("div")
+                                                || k2.starts_with("loss_")
+                                                || k2.starts_with("oracle")
+                                                || k2.contains("mismatch")
+                                                || k2.starts_with("inv_")))
+                                        .map(|(k2, v)| format!("{k2}={v}"))
+                                        .collect::<Vec<_>>(),
+                                    on.w.vp_notes.borrow()
+                                );
+                            }
+                            // `invariant` is the OR of the `inv_*` flags: judged through them. `inv_vector_disagrees_with_prefix`
+                            // is the bookkeeping invariant (the vector against the servable prefix): listed, not judged.
+                            if key == "invariant" {
+                                continue;
+                            }
+                            if DOC_LAYER.contains(&key.as_str())
+                                || (key.starts_with("inv_")
+                                    && key != "inv_vector_disagrees_with_prefix")
+                            {
+                                doc_diffs.push(format!(
+                                    "{m}/{o}/{k} seed {seed}: {key} OFF {a} <> ON {b}"
+                                ));
+                            } else {
+                                let e = book.entry(key.clone()).or_insert((0, 0));
+                                e.0 += 1;
+                                e.1 += b - a;
+                            }
+                        }
+                        let (ca, _) = crate::oracle::product_classes(&off.res, false);
+                        let (cb, _) = crate::oracle::product_classes(&on.res, false);
+                        if ca != cb {
+                            class_diffs.push(format!(
+                                "{m}/{o}/{k} seed {seed}: classes OFF {ca:?} <> ON {cb:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "ITEM Q GRID dh={dh} dr={dr} f={f} seeds {from}..{}: {runs} runs x2; document-layer key differences {}; class differences {}; bookkeeping keys that differ (runs, sum ON-OFF): {book:?}",
+            from + seeds,
+            doc_diffs.len(),
+            class_diffs.len()
+        );
+        for d in doc_diffs.iter().chain(class_diffs.iter()).take(20) {
+            eprintln!("  DOCUMENT-LAYER DIFFERENCE {d}");
+        }
+        assert!(
+            doc_diffs.is_empty() && class_diffs.is_empty(),
+            "item Q grid: document-layer differences"
+        );
+    }
+
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
     /// restarted from a live eligible peer (the product cannot complete a join from a dead member). The base grid and the
     /// product-route grid (document policy) stay clean (every problem classified), and the mode is not vacuous: joins are restarted.

@@ -80,6 +80,9 @@ pub struct World {
     /// covered marks whose entry is superseded at its key are dropped (`drop_superseded_covered_marks`, engine.rs, #313). Implies the
     /// product's coverage, the vector (`vector_cov`)
     pub product_marks: bool,
+    /// ITEM Q: the first vector-against-prefix disagreement of each member, described (member, step, the first entry the prefix lacks,
+    /// the entries held out of position for that origin), for the report
+    pub vp_notes: std::cell::RefCell<Vec<String>>,
     /// DF measurements (off by default; `Cfg::strict_holders`, `Cfg::state_survives`): a member HOLDS an entry only if it appended,
     /// retained or holds it out of position / as information (a witnessed-only entry is not held), and the oracle's served state
     /// counts a document version held as state on a live member (`state_versions`) as surviving
@@ -134,6 +137,7 @@ impl World {
             hb2_exclusion: true,
             vector_cov: false,
             product_marks: false,
+            vp_notes: Default::default(),
             strict_holders: false,
             state_survives: false,
             state_versions: Vec::new(),

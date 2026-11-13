@@ -129,6 +129,37 @@ impl Member {
             && self.vector_prefix_disagreement(w).is_some()
         {
             self.step_inv.insert("vector_disagrees_with_prefix");
+            if w.vp_notes.borrow().len() < 40
+                && !w.vp_notes.borrow().iter().any(|n| n.starts_with(&format!("{} ", self.name)))
+            {
+                let o = self.vector_prefix_disagreement(w).unwrap_or(0);
+                let i = self.cv.prefix_len(w, o);
+                let hole = w.by_origin[o].get(i).map(|&id| {
+                    let e = w.ent(id);
+                    let p = self.phys.get(&e.phys);
+                    let late_here = self.loss.keys().any(|lk| lk.key == e.key && lk.stamp == Some(e.stamp));
+                    format!(
+                        "hole #{id} hlc {} kind {:?} staging {} phys {} (alive here {:?}) key {} loss-record-here {late_here} held_oop-here {} appended-here {}",
+                        e.hlc, e.kind, e.staging, e.phys, p.map(|p| p.alive), e.key,
+                        self.held_oop.contains(&id), self.appended.contains(&id)
+                    )
+                });
+                let held: Vec<String> = self
+                    .held_oop
+                    .iter()
+                    .filter(|&&h| w.ent(h).origin == o && w.ent(h).hlc <= self.vc.max_of(o))
+                    .map(|&h| {
+                        let e = w.ent(h);
+                        let p = self.phys.get(&e.phys);
+                        let rec = self.loss.keys().any(|lk| lk.key == e.key && lk.stamp == Some(e.stamp));
+                        format!(
+                            "COVERED-HELD #{h}@{} kind {:?} staging {} phys {:?} (alive here {:?}) key {} loss-record-here {rec} lost-with-writer {}",
+                            e.hlc, e.kind, e.staging, e.phys, p.map(|p| p.alive), e.key, w.lost.contains(&h)
+                        )
+                    })
+                    .collect();
+                w.vp_notes.borrow_mut().push(format!("{} step {} origin {o} vector {} prefix_len {i}: {} | held_oop of that origin: {held:?}", self.name, w.step, self.vc.max_of(o), hole.unwrap_or_else(|| "no hole entry".into())));
+            }
         }
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
