@@ -14,6 +14,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Read before upgrading: 0.61.0 is a wipe release. Stop every member, move the data directories aside, and start them all on 0.61.0 on empty ones, then reseed.** The storage schema is 8 and the cluster protocol is 3: 0.61.0 refuses a store or a backup written by 0.60 or older, by name, and a peer that speaks protocol 2. There is no migration code and no mixed-version cluster (ADR-127's one-version rule). See [Upgrades](docs/operations.md#upgrades).
 
+### Fixed
+
+- A member that took a scoped definitions repair or a scoped restore of a collection logs the entry behind each index it restored as held state, and that entry's later delivery in a window never released the mark, so the member asked its peers for it again about every 5 minutes for as long as the entry stayed in its oplog, and until the origin wrote again advertised a servable position below it. The delivery now releases the mark and raises the servable position, and no ask is repeated.
+
 ### Changed
 
 - **Breaking: every write is stamped with an epoch, and a stamp and a resume token are longer** ([ADR-273](docs/decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)). A member mints an epoch (18 bytes) when it opens a store that holds none, and a restore and a rewind do not carry it, so a restored member's new writes cannot be taken as covered by what its peers recorded of its earlier ones, and what it lost comes back from them. A stamp is 44 bytes as a key (26 before) and 45 bytes as a token (a format byte `0x01`, then the key): the `stamp`, `stamps` and `etag` strings, and `if_stamp`, are 60 characters (35 before). A resume token on a three-member cluster is 284 characters (164 before). Old: a stamp or a resume token of 0.60 was accepted. New: it is `400` as malformed, and the message says the length and the first byte that were sent and what is accepted. A client that treats stamps and tokens as opaque strings changes nothing; one that keeps them across the upgrade must discard them, which the wipe does anyway.
