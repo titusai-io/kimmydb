@@ -1199,7 +1199,7 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6b.py")).unwrap();
         let got6b: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got6b, record, "swapmodel6b.py");
-        let tracer = "98bbaaea4e963543b2278a83afeefe9ad9410eb439e852958b1106ef507d6476";
+        let tracer = "f7ace087eb251fe0782883917951eaece2d54a9a7cd75b9b6f14973d14063819";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");
