@@ -434,7 +434,7 @@ fn revc_clock_skew_cannot_make_a_collected_delete_young() {
     s.create_collection("shop", "orders").unwrap();
     pull(&r, &s);
     let hour = 3_600_000;
-    let fast = Stamp::new(Hlc::new(now() + hour, 0), s.node_id());
+    let fast = Stamp::new(Hlc::new(now() + hour, 0), s.node_id(), s.epoch());
     s.apply_batch(&[insert_entry(orders(), 7, fast)]).unwrap();
     pull(&r, &s);
     assert!(live(&r, 7), "premise");
@@ -452,7 +452,7 @@ fn revc_clock_skew_cannot_make_a_collected_delete_young() {
     // still stamped after what this member has seen.
     let (r2, _r2d) = engine();
     pull(&r2, &s);
-    let early = Stamp::new(Hlc::new(now() - hour, 0), s.node_id());
+    let early = Stamp::new(Hlc::new(now() - hour, 0), s.node_id(), s.epoch());
     s.apply_batch(&[insert_entry(orders(), 8, early)]).unwrap();
     r2.apply_batch(&[insert_entry(orders(), 8, early)]).unwrap();
     assert!(r2.delete(&r2.get_collection("shop", "orders").unwrap(), &DocId::Int64(8)).unwrap());
@@ -1379,7 +1379,7 @@ fn random_history(seed: u64, steps: usize) -> Seen {
                     } else if let Some((r_stamp, r_live)) = mine {
                         if *r_live && r_stamp < s_stamp {
                             let covered =
-                                members[s].e().version_vector().unwrap().get(s_stamp.node);
+                                members[s].e().version_vector().unwrap().get(s_stamp.origin());
                             if s_stamp.hlc > covered {
                                 // The sender's own coverage does not name its tombstone (it
                                 // holds it from a repair, under `Hold`): ignored by design
@@ -1396,7 +1396,7 @@ fn random_history(seed: u64, steps: usize) -> Seen {
                             // (review C m2); one the sender's coverage does not name is
                             // ignored by design, counted apart.
                             let covered =
-                                members[s].e().version_vector().unwrap().get(s_stamp.node);
+                                members[s].e().version_vector().unwrap().get(s_stamp.origin());
                             if s_stamp.hlc > covered {
                                 seen.unvouched_deletes += 1;
                             } else {

@@ -12,6 +12,7 @@
 
 #![cfg(unix)]
 
+use kimmy_core::Epoch;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -2730,7 +2731,7 @@ async fn a_standalone_start_after_a_restore_is_ready_and_unmarked() {
     let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
     assert_eq!(
         kimmy_cluster::catchup::replay_floor_on_disk(&dir.path().join("data")),
-        Some(source.version_vector().unwrap().get(source.node_id())),
+        Some(source.version_vector().unwrap().get(source.origin())),
         "the floor is the backup's own-origin position"
     );
     drop(source);
@@ -2755,6 +2756,15 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     let client = reqwest::Client::new();
     let (backup, config) = backup_and_config(dir.path());
     restore(&config, &backup);
+    let data = dir.path().join("data");
+    let restored_floor = kimmy_cluster::catchup::replay_floor_on_disk(&data);
+    let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
+    assert_eq!(
+        restored_floor,
+        Some(source.version_vector().unwrap().get(source.origin())),
+        "premise: the restore leaves the backup's own-origin position as the floor"
+    );
+    drop(source);
 
     let mut run = Run::spawn_clustered(dir.path(), "restored-with-peers", dead_port(), 3);
     let deadline = Instant::now() + PATIENCE;
@@ -2782,6 +2792,13 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     assert!(
         dir.path().join("data").join("kimmy.replay-floor").exists(),
         "the replay floor is kept until every member that can answer has"
+    );
+    // The start found the epoch the restore minted, with nothing written under it: the replay
+    // still asks from the backup's position, not from the bottom of what the peers keep.
+    assert_eq!(
+        kimmy_cluster::catchup::replay_floor_on_disk(&data),
+        restored_floor,
+        "the first start keeps the restore's floor"
     );
     run.signal("TERM");
     assert!(run.wait_exit().success());
@@ -2929,6 +2946,7 @@ async fn a_start_buries_what_a_database_drop_covers_before_it_serves() {
         let at = kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         // Recorded the way a member that predates the rule records it, and not
         // applied, so the collections are still here when the store closes.
@@ -3057,7 +3075,7 @@ async fn a_start_serves_a_store_that_holds_the_stragglers_of_a_late_drop_without
         let on_b = engine.create_collection("shop", "orders").unwrap();
         engine.insert(&on_b, bson::doc! { "_id": 2i64, "from": "b" }).unwrap();
         let node = kimmy_core::NodeId::from_bytes([7; 16]);
-        let at = |ms: u64| kimmy_core::Stamp::new(kimmy_core::Hlc::new(ms, 0), node);
+        let at = |ms: u64| kimmy_core::Stamp::new(kimmy_core::Hlc::new(ms, 0), node, Epoch::ZERO);
         let straggler = kimmy_core::OplogEntry {
             stamp: at(on_b.created.wall_ms - 20),
             kind: kimmy_core::OpKind::Insert,

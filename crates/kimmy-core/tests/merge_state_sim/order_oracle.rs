@@ -572,9 +572,21 @@ pub fn check(
                             if places.touched.contains(&q) {
                                 continue;
                             }
-                            if let Some(kg) = places.born.get(&q)
-                                && (kf < kg) != (i < j)
-                            {
+                            // every visible field has a place in the model (a leaf has one, a map with a leaf below it has
+                            // one); a sibling that is neither placed, nor touched, nor an unplaced leafless map is drift
+                            // between this oracle's restatement and the model, never skipped
+                            let Some(kg) = places.born.get(&q) else {
+                                return fail(&format!(
+                                    "a sibling the log gives no place: {} at the level of {}",
+                                    q.join("."),
+                                    if parent.is_empty() {
+                                        "the root".to_string()
+                                    } else {
+                                        parent.join(".")
+                                    }
+                                ));
+                            };
+                            if (kf < kg) != (i < j) {
                                 return fail(
                                     "a field created again is not at the place a write of the past gave it",
                                 );

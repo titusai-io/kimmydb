@@ -1496,6 +1496,9 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         V::Snapshot(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
         }
+        // The background worker's own stored position; no request reads it. Mapped
+        // anyway, as the match must be total.
+        V::StoredPositionUnusable { .. } => ApiError::internal(e.to_string()),
         // The answer a request that ran out of time gets: the search saw the
         // deadline pass itself, where the timeout layer would have.
         V::DeadlineExceeded => ApiError::timeout(

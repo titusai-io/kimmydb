@@ -209,6 +209,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use kimmy_core::Epoch;
     use std::path::{Path, PathBuf};
 
     use bson::doc;
@@ -274,7 +275,8 @@ mod tests {
         for row in oplog.iter().unwrap() {
             let (key, _) = row.unwrap();
             let stamp = codec::decode_oplog_key(key.value()).unwrap();
-            if stamp.hlc > servable.get(stamp.node) && held.get(key.value()).unwrap().is_none() {
+            if stamp.hlc > servable.get(stamp.origin()) && held.get(key.value()).unwrap().is_none()
+            {
                 return Err(format!("{stamp:?} is above the vector and not held"));
             }
         }
@@ -600,7 +602,7 @@ mod tests {
 
     fn remote(coll: &CollectionMeta, origin: NodeId, wall: u64, id: &str) -> OplogEntry {
         OplogEntry {
-            stamp: Stamp::new(Hlc::new(wall, 0), origin),
+            stamp: Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
@@ -776,13 +778,16 @@ mod tests {
                     let mut granted = VersionVector::new();
                     for (i, origin) in self.origins.iter().enumerate() {
                         if mask & (1 << i) != 0 {
-                            granted.insert(*origin, Hlc::new(wall, 0));
+                            granted.insert(
+                                kimmy_core::Origin::new(*origin, kimmy_core::Epoch::ZERO),
+                                Hlc::new(wall, 0),
+                            );
                         }
                     }
                     self.engine().absorb_version_vector(&granted).unwrap();
                 }
                 Op::Orphan { origin, wall } => {
-                    let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin]);
+                    let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin], Epoch::ZERO);
                     let db = self.engine().db();
                     let txn = db.begin_write().unwrap();
                     txn.open_table(tables::OPLOG_HELD)
@@ -949,14 +954,17 @@ mod tests {
     /// its tests read, so all three are exempt as files.
     const AUDITED_FILES: [&str; 3] =
         ["faults.rs", "key_walk_tests.rs", "violations_table_tests.rs"];
-    const AUDITED_FNS: [(&str, &str); 14] = [
+    const AUDITED_FNS: [(&str, &str); 16] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "decide_violations_ready"),
         ("violations_table.rs", "record_violations_backfill"),
         ("violations_table.rs", "advance_violations_through"),
         ("engine.rs", "raise_version"),
+        ("engine.rs", "raise_origin_version"),
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
+        // removes a mark only where the servable vector already covers its entry: I holds before and after
+        ("engine.rs", "drop_superseded_covered_marks"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
         ("engine.rs", "lower_vectors_in"),
         ("gc.rs", "remove_oplog_entries"),

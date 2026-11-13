@@ -78,10 +78,16 @@ mod key_walk_tests;
 mod database_drop_tests;
 
 #[cfg(test)]
+mod epoch_tests;
+
+#[cfg(test)]
 mod converge_tests;
 
 #[cfg(test)]
 mod definition_repair_tests;
+
+#[cfg(test)]
+mod held_gap_tests;
 
 #[cfg(test)]
 mod tombstone_horizon_tests;

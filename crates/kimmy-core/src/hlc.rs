@@ -15,6 +15,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::NodeId;
+use crate::origin::{Epoch, Origin};
 
 /// A hybrid logical timestamp.
 ///
@@ -95,20 +96,40 @@ impl fmt::Display for Hlc {
     }
 }
 
-/// A write's full ordering key: the timestamp plus the node that produced it.
+/// A write's full ordering key: the timestamp, the node that produced it and that node's epoch.
 ///
 /// Two nodes can legitimately produce the same [`Hlc`]; the node id breaks that
 /// tie so that last-writer-wins is deterministic — every replica picks the same
-/// winner regardless of the order updates arrive in.
+/// winner regardless of the order updates arrive in. The epoch is the last
+/// tie-break and, with the node, the stamp's [`Origin`]: a restored node takes a
+/// fresh epoch, so its new writes are never taken for writes it lost.
+///
+/// The derived order is `(hlc, node, epoch)`, which is the byte order of
+/// [`Stamp::to_key_bytes`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct Stamp {
     pub hlc: Hlc,
     pub node: NodeId,
+    pub epoch: Epoch,
 }
 
+/// The first byte of the [`Stamp::encode`] token: the format of what follows.
+const STAMP_TOKEN_FORMAT: u8 = 0x01;
+
 impl Stamp {
-    pub const fn new(hlc: Hlc, node: NodeId) -> Self {
-        Self { hlc, node }
+    /// Width of the key form, [`Stamp::to_key_bytes`]: `hlc ‖ node ‖ epoch`.
+    pub const KEY_LEN: usize = HLC_ENCODED_LEN + Origin::LEN;
+
+    /// Width of the [`Stamp::encode`] token before base64: the format byte, then the key form.
+    pub const TOKEN_LEN: usize = 1 + Self::KEY_LEN;
+
+    pub const fn new(hlc: Hlc, node: NodeId, epoch: Epoch) -> Self {
+        Self { hlc, node, epoch }
+    }
+
+    /// The writer incarnation that produced this stamp.
+    pub const fn origin(&self) -> Origin {
+        Origin { node: self.node, epoch: self.epoch }
     }
 
     /// True if `self` should overwrite `other` under last-writer-wins.
@@ -119,31 +140,54 @@ impl Stamp {
         self > other
     }
 
+    /// The key form: 44 bytes, the HLC's order-preserving encoding, the node id, then the
+    /// epoch. Its `memcmp` order is the order of [`Stamp`].
+    pub fn to_key_bytes(self) -> [u8; Self::KEY_LEN] {
+        let mut out = [0u8; Self::KEY_LEN];
+        out[..HLC_ENCODED_LEN].copy_from_slice(&self.hlc.to_bytes());
+        out[HLC_ENCODED_LEN..].copy_from_slice(&self.origin().to_bytes());
+        out
+    }
+
+    /// The inverse of [`Stamp::to_key_bytes`].
+    pub fn from_key_bytes(bytes: [u8; Self::KEY_LEN]) -> Self {
+        let mut hlc = [0u8; HLC_ENCODED_LEN];
+        hlc.copy_from_slice(&bytes[..HLC_ENCODED_LEN]);
+        let mut origin = [0u8; Origin::LEN];
+        origin.copy_from_slice(&bytes[HLC_ENCODED_LEN..]);
+        let origin = Origin::from_bytes(origin);
+        Self { hlc: Hlc::from_bytes(hlc), node: origin.node, epoch: origin.epoch }
+    }
+
     /// The stamp as an opaque token a client can hand back.
     ///
-    /// 26 bytes — the HLC's order-preserving encoding, then the node id —
-    /// in base64url without padding, the same alphabet cursors and resume
-    /// tokens use. Opaque on purpose: a client compares tokens for equality
-    /// and passes one back as `if_stamp`; nothing about its shape is
-    /// promised, so the encoding can change without a client noticing.
+    /// 45 bytes — a format byte (`0x01`), then the key form (the HLC's
+    /// order-preserving encoding, the node id, the epoch) — in base64url without
+    /// padding, the same alphabet cursors and resume tokens use. Opaque on
+    /// purpose: a client compares tokens for equality and passes one back as
+    /// `if_stamp`; nothing about its shape is promised, so the encoding can
+    /// change without a client noticing.
     pub fn encode(&self) -> String {
         use base64::Engine as _;
-        let mut raw = Vec::with_capacity(26);
-        raw.extend_from_slice(&self.hlc.to_bytes());
-        raw.extend_from_slice(&self.node.to_bytes());
+        let mut raw = Vec::with_capacity(Self::TOKEN_LEN);
+        raw.push(STAMP_TOKEN_FORMAT);
+        raw.extend_from_slice(&self.to_key_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
     }
 
-    /// The inverse of [`Stamp::encode`].
+    /// The inverse of [`Stamp::encode`]. Refuses any other length and any first byte but the
+    /// current format's.
     pub fn decode(token: &str) -> crate::Result<Self> {
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token)
             .map_err(|_| crate::Error::MalformedStamp)?;
-        let (hlc, node) = raw.split_at_checked(10).ok_or(crate::Error::MalformedStamp)?;
-        let hlc: [u8; 10] = hlc.try_into().map_err(|_| crate::Error::MalformedStamp)?;
-        let node: [u8; 16] = node.try_into().map_err(|_| crate::Error::MalformedStamp)?;
-        Ok(Self { hlc: Hlc::from_bytes(hlc), node: NodeId::from_bytes(node) })
+        let (format, key) = raw.split_first().ok_or(crate::Error::MalformedStamp)?;
+        if *format != STAMP_TOKEN_FORMAT {
+            return Err(crate::Error::MalformedStamp);
+        }
+        let key: [u8; Self::KEY_LEN] = key.try_into().map_err(|_| crate::Error::MalformedStamp)?;
+        Ok(Self::from_key_bytes(key))
     }
 }
 
@@ -301,18 +345,154 @@ mod tests {
     #[test]
     fn stamp_breaks_ties_by_node_id() {
         let hlc = Hlc::new(100, 0);
-        let lo = Stamp::new(hlc, node(1));
-        let hi = Stamp::new(hlc, node(2));
+        let lo = Stamp::new(hlc, node(1), Epoch::ZERO);
+        let hi = Stamp::new(hlc, node(2), Epoch::ZERO);
         assert!(hi.wins_over(&lo));
         assert!(!lo.wins_over(&hi));
         // Reapplying an identical write must be a no-op, not a flip-flop.
         assert!(!hi.wins_over(&hi));
     }
 
+    fn at(n: u8, e: u64) -> Stamp {
+        Stamp::new(Hlc::new(100, 1), node(n), Epoch::from_u64(e))
+    }
+
+    #[test]
+    fn stamp_breaks_a_node_tie_by_epoch() {
+        let lo = at(4, 1);
+        let hi = at(4, 2);
+        assert!(hi.wins_over(&lo));
+        assert!(!lo.wins_over(&hi));
+        // the epoch is the last tie-break: node outranks it
+        assert!(at(5, 0).wins_over(&at(4, 9)));
+        assert_eq!(hi.origin(), Origin::new(node(4), Epoch::from_u64(2)));
+    }
+
+    #[test]
+    fn the_key_form_is_hlc_node_epoch_in_44_bytes() {
+        let s = Stamp::new(
+            Hlc::new(0x0102_0304_0506_0708, 0x090A),
+            NodeId::from_bytes([0xBB; 16]),
+            Epoch([0xCC; 18]),
+        );
+        let key = s.to_key_bytes();
+        assert_eq!(key.len(), 44);
+        assert_eq!(Stamp::KEY_LEN, 44);
+        assert_eq!(&key[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(&key[10..26], &[0xBB; 16]);
+        assert_eq!(&key[26..], &[0xCC; 18]);
+        assert_eq!(Stamp::from_key_bytes(key), s);
+    }
+
+    #[test]
+    fn the_client_token_is_45_bytes_with_a_format_byte() {
+        use base64::Engine as _;
+        let s = at(9, 0xABCD);
+        let token = s.encode();
+        assert_eq!(token.len(), 60, "45 bytes in base64url without padding");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&token).unwrap();
+        assert_eq!(raw.len(), 45);
+        assert_eq!(raw[0], 0x01);
+        assert_eq!(&raw[1..], &s.to_key_bytes());
+        assert_eq!(Stamp::decode(&token).unwrap(), s);
+    }
+
+    #[test]
+    fn the_client_token_refuses_any_other_first_byte_or_length() {
+        use base64::Engine as _;
+        let enc = |raw: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        let key = at(9, 5).to_key_bytes();
+        let with = |first: u8| {
+            let mut raw = vec![first];
+            raw.extend_from_slice(&key);
+            raw
+        };
+        assert!(Stamp::decode(&enc(&with(0x01))).is_ok());
+        for first in [0x00, 0x02, 0x03, 0x80, 0xFF] {
+            assert!(Stamp::decode(&enc(&with(first))).is_err(), "accepted first byte {first:#x}");
+        }
+        // the bare 44-byte key form, and the old 26-byte form (hlc and node)
+        assert!(Stamp::decode(&enc(&key)).is_err());
+        assert!(Stamp::decode(&enc(&key[..26])).is_err());
+        // one byte short and one byte long, with the right first byte
+        let mut raw = with(0x01);
+        raw.pop();
+        assert!(Stamp::decode(&enc(&raw)).is_err());
+        let mut raw = with(0x01);
+        raw.push(0);
+        assert!(Stamp::decode(&enc(&raw)).is_err());
+        assert!(Stamp::decode(&enc(&[])).is_err());
+        assert!(Stamp::decode("").is_err());
+        assert!(Stamp::decode("not base64 !").is_err());
+        assert!(Stamp::decode(&format!("{}=", at(9, 5).encode())).is_err(), "padding is refused");
+    }
+
+    #[test]
+    fn a_stamp_serdes_with_its_epoch() {
+        let s = at(6, 42);
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(json["epoch"], serde_json::json!(s.epoch.to_hex()));
+        assert_eq!(serde_json::from_value::<Stamp>(json).unwrap(), s);
+        let doc = bson::serialize_to_document(&s).unwrap();
+        assert_eq!(bson::deserialize_from_document::<Stamp>(doc).unwrap(), s);
+    }
+
+    /// The bytes a stamp costs in a BSON frame, the way the cluster frames and the snapshot
+    /// pages write it (`bson::serialize_to_vec`, so the epoch is a 18-byte binary). The page
+    /// budgets in kimmy-storage (`DOCUMENT_OVERHEAD`, `TOMBSTONE_OVERHEAD`) are sized from this
+    /// number: a change in the encoding fails here first.
+    #[test]
+    fn a_stamp_costs_122_bytes_in_a_bson_frame_30_of_them_the_epoch() {
+        // 4 (length) + hlc 40 (1 + "hlc\0" 4 + document 35: wall_ms int64 17, counter int32
+        // 13, 4 + 1) + node 47 (1 + "node\0" 5 + 4 + 36 + 1) + epoch 30 (1 + "epoch\0" 6 + 4 +
+        // 1 subtype + 18) + 1 (terminator)
+        let s = Stamp::new(Hlc::new(u64::from(u32::MAX) * 1000, u16::MAX), node(0xAB), Epoch::MAX);
+        let bytes = bson::serialize_to_vec(&s).unwrap();
+        assert_eq!(bytes.len(), 122);
+        let doc: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        assert!(matches!(doc.get("epoch"), Some(bson::Bson::Binary(b)) if b.bytes.len() == 18));
+        let mut without = doc.clone();
+        without.remove("epoch");
+        assert_eq!(
+            bson::serialize_to_vec(&without).unwrap().len(),
+            92,
+            "the stamp before the epoch"
+        );
+        assert_eq!(bson::deserialize_from_slice::<Stamp>(&bytes).unwrap(), s);
+        // the human-readable forms (JSON, the document writer) carry the epoch as 36 hex digits
+        assert_eq!(
+            bson::serialize_to_document(&s).unwrap().get_str("epoch").unwrap(),
+            "f".repeat(36)
+        );
+    }
+
     mod props {
         use proptest::prelude::*;
 
         use super::*;
+
+        prop_compose! {
+            fn any_stamp()(
+                hlc in any_hlc(), node in any::<[u8; 16]>(), epoch in any::<[u8; 18]>()
+            ) -> Stamp {
+                Stamp::new(hlc, NodeId::from_bytes(node), Epoch(epoch))
+            }
+        }
+
+        proptest! {
+            /// The oplog is keyed by these bytes and sorted by `memcmp`: the key order must be
+            /// the order of the stamps, or the window rules over the log are wrong.
+            #[test]
+            fn stamp_order_is_the_byte_order_of_its_key(a in any_stamp(), b in any_stamp()) {
+                prop_assert_eq!(a.cmp(&b), a.to_key_bytes().cmp(&b.to_key_bytes()));
+            }
+
+            #[test]
+            fn stamp_round_trips_through_key_and_token(a in any_stamp()) {
+                prop_assert_eq!(Stamp::from_key_bytes(a.to_key_bytes()), a);
+                prop_assert_eq!(Stamp::decode(&a.encode()).unwrap(), a);
+            }
+        }
 
         prop_compose! {
             fn any_hlc()(wall_ms in any::<u64>(), counter in any::<u16>()) -> Hlc {
