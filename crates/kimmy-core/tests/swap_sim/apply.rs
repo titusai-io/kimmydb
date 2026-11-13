@@ -276,10 +276,9 @@ impl Member {
             && !w.f.fm_held_servable
             && self.held_oop.contains(&e.idx)
             && self.appended.remove(&e.idx)
+            && self.holding != Some(e.idx)
         {
-            if self.holding != Some(e.idx) {
-                w.stats.bump("held_kept_unservable"); // (not the doc_hold arrival itself, as the model)
-            }
+            w.stats.bump("held_kept_unservable"); // (not the doc_hold arrival itself, as the model)
         }
     }
 
