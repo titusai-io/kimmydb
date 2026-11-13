@@ -600,14 +600,14 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     // O8's structural marker (an open design finding, FIX-1's consequence): a live member keeps alive a vanished writer's stage
     // that the oracle buries, and the writer's only non-lost entries above the stage's deadline are held out of position at live
     // members, none of them a covered witness at this member. Defined from the members' states and the write log, never from
-    // the mismatch itself (the reference is `o8count.py`); HB-2's stages are left out, their mismatch is excluded by name.
+    // the mismatch itself (the reference is `o8count.py`); HB-2's stages are counted apart (`cnt_o8_in_hb2`), their mismatch is excluded by name.
     // Definitional differences from `o8count.py`: a "covered witness" is `cv.has(id) && !held_oop` (the Rust step check's
     // definition; the Python reads `mem.held`), and lost entries are dropped from the entries above the deadline (the Python keeps them)
-    let mut o8_stages = 0;
+    let (mut o8_stages, mut o8_in_hb2) = (0, 0);
     for &i in &live {
         let m = &ms[i];
         for (n, p) in m.phys.iter() {
-            if !p.alive || p.kind != PKind::Stage || o.alive.contains(n) || hb2.contains(n) {
+            if !p.alive || p.kind != PKind::Stage || o.alive.contains(n) {
                 continue;
             }
             let Some(cr) = m.creates.get(n) else { continue };
@@ -623,12 +623,18 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
                 continue;
             }
             if above.iter().any(|&id| live.iter().any(|&j| ms[j].held_oop.contains(&id))) {
-                o8_stages += 1;
+                if hb2.contains(n) {
+                    o8_in_hb2 += 1;
+                } else {
+                    o8_stages += 1;
+                }
             }
         }
     }
     res.insert("cnt_o8_stages".into(), o8_stages);
     res.insert("cnt_o8".into(), (o8_stages > 0) as i64);
+    // the same shape inside HB-2's stages (the mismatch there is excluded by name); 0 when the exclusion is off, the set being empty
+    res.insert("cnt_o8_in_hb2".into(), o8_in_hb2);
     let replay_bad = |st: &State, recs: &HashSet<HeadKey>, m0: &State| {
         *st != *m0
             || heads.iter().any(|h| !recs.contains(h))
