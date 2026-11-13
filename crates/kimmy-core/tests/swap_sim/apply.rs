@@ -316,7 +316,7 @@ impl Member {
             // servable, no change to the document
             self.appended.insert(e.idx);
             w.stats.bump("appended_in_position");
-        } else if f.staged_row && e.staging && !self.held_oop.contains(&e.idx) {
+        } else if f.staged_row && self.s_trigger(w, e) && !self.held_oop.contains(&e.idx) {
             // rule S (the v2.6 staged-row rule): a staging entry arriving in position, superseded on arrival by a version held here
             // (whatever its origin or coverage), is appended and served onward; no change to the document. Never a held (or
             // held-then-deferred) entry
@@ -418,7 +418,7 @@ impl Member {
         } else if f.append_in_position && a.held_state {
             self.appended.insert(e.idx);
             w.stats.bump("appended_in_position");
-        } else if f.staged_row && e.staging && !self.held_oop.contains(&e.idx) {
+        } else if f.staged_row && self.s_trigger(w, e) && !self.held_oop.contains(&e.idx) {
             // rule S on the `field` policy too: an UNMODELLED EXTENSION (the Python model is `document`-only, open item O6; the manager
             // confirmed it because the design text is about the staged row, not the merge policy, and leaving it off reopened an
             // unclassified partial flip, Field 5/1/5 doc_hold+doc_repair 0.3 seed 5). A staging entry arriving in position that

@@ -67,6 +67,14 @@ impl Member {
         self.vc.add(e.idx);
         self.raise(w, e.idx);
         self.appended.insert(e.idx);
+        // The design rule, as an invariant (not a test of the flag): Q6 design page, 'Records': a loss record is an ordinary replicated
+        // entry INSIDE ITS APPENDER'S COVERAGE PREFIX (minted under the reporter's own origin above everything it has witnessed and
+        // appended at the end of its own sequence): checked as 'the record is the LAST entry of its origin's sequence at mint time'. The first version
+        // asked the member's coverage instead and the mutant did not trip it (the member adds the record to its own coverage whatever the sequence),
+        // so that was not the rule. `m-loss-outside-prefix` breaks it (the Python model fails nothing on that mutant)
+        if w.by_origin[e.origin].last() != Some(&e.idx) {
+            self.inv.insert("loss_record_outside_coverage_prefix");
+        }
         w.stats.bump("loss_records_made");
         if !f.loss_outside_prefix {
             w.stats.bump("loss_records_inside_prefix");

@@ -41,6 +41,10 @@ pub struct Flags {
     /// or coverage, is appended and served onward; never a held (or held-then-deferred) entry. On in `v6` (off-switch `Q6_STAGEDROW=0`,
     /// mutant `m-staged-row-off`); a replay takes the switch from the trace header
     pub staged_row: bool,
+    /// RULE S's TRIGGER (manager ruling, S-bind-origin): a document entry addressed to a stage physical, whose origin is the origin of the
+    /// stage's creation entry, with a stamp below the stage's known valid binding (or no valid binding known here). Off (`Q6_TRIGGER=staging`):
+    /// the model's mark `e.staging` (6d)
+    pub s_bind_origin: bool,
     pub snap_versions_as_entries: bool,
     pub snap_delete_bare: bool,
     pub ignored_not_served: bool,
@@ -261,6 +265,7 @@ pub fn base(name: &str) -> Option<Flags> {
         "v6" => {
             f.rule_b = true;
             f.staged_row = std::env::var("Q6_STAGEDROW").as_deref() != Ok("0");
+            f.s_bind_origin = std::env::var("Q6_TRIGGER").as_deref() != Ok("staging");
             f.grant_prefix = true;
             f.dead_page_retained = true;
             f.loss_in_position = true;
