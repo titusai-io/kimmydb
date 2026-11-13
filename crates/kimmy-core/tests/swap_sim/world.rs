@@ -75,6 +75,11 @@ pub struct World {
     /// B2: the members' coverage predicate reads their `VectorCoverage` (the product's per-origin maximum) instead of the prefix;
     /// the vector is kept in every run, and compared with the prefix by the step check `vector_disagrees_with_prefix`
     pub vector_cov: bool,
+    /// ITEM Q: the product's mark mechanism instead of the model's bookkeeping (default off): an in-window entry is never held for a
+    /// held predecessor; a release raises the vector to the released entry (`release_held_in_position`, engine.rs); after each window the
+    /// covered marks whose entry is superseded at its key are dropped (`drop_superseded_covered_marks`, engine.rs, #313). Implies the
+    /// product's coverage, the vector (`vector_cov`)
+    pub product_marks: bool,
     /// DF measurements (off by default; `Cfg::strict_holders`, `Cfg::state_survives`): a member HOLDS an entry only if it appended,
     /// retained or holds it out of position / as information (a witnessed-only entry is not held), and the oracle's served state
     /// counts a document version held as state on a live member (`state_versions`) as surviving
@@ -128,6 +133,7 @@ impl World {
             held_uncovered: false,
             hb2_exclusion: true,
             vector_cov: false,
+            product_marks: false,
             strict_holders: false,
             state_survives: false,
             state_versions: Vec::new(),

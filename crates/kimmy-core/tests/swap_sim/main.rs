@@ -204,6 +204,90 @@ mod tests {
         assert!(sum(&both) > sum(&off), "the grant gate is not killed even with rule B off");
     }
 
+    /// ITEM Q: the product's mark mechanism (`World::product_marks`: in-window entries never held for a held predecessor, the vector
+    /// raised at release, covered superseded marks dropped after each window, engine.rs `drop_superseded_covered_marks`) against the
+    /// model's bookkeeping (OFF), on the SAME trace (`Q6DIFF_DIR`, the traces of the product-route rows). Every DOCUMENT-LAYER outcome
+    /// (what each member serves, its documents, its loss records, the events it emitted, its invariants after every event, the verdict:
+    /// divergences, mismatches, partial flips, the O8 markers) must be identical; the bookkeeping (held marks left, entries served,
+    /// marks dropped, releases) is listed. Any document-layer difference is a FINDING.
+    #[test]
+    #[ignore = "item Q: Q6DIFF_DIR selects the traces of one row"]
+    fn item_q_product_marks_on_and_off_agree_on_the_document_layer() {
+        let dir = std::env::var("Q6DIFF_DIR").expect("Q6DIFF_DIR");
+        let files = crate::trace::traces_in(std::path::Path::new(&dir));
+        assert!(!files.is_empty());
+        let run = |f: &std::path::Path, on: bool| -> Vec<String> {
+            crate::trace::COLLECT.with(|c| *c.borrow_mut() = Some((on, Vec::new())));
+            let _ = crate::trace::replay_file(f);
+            crate::trace::COLLECT.with(|c| c.borrow_mut().take().unwrap().1)
+        };
+        let (mut diffs, mut events) = (Vec::new(), 0usize);
+        let mut book = [0i64; 8]; // held_oop, appended, dropped, released: OFF then ON
+        let num = |l: &str, k: &str| -> i64 {
+            l.split(&format!("{k}="))
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0)
+        };
+        let mut differing_book = 0;
+        for f in &files {
+            let off = run(f, false);
+            let on = run(f, true);
+            let doc = |v: &Vec<String>| {
+                v.iter().filter(|l| !l.starts_with("BOOK")).cloned().collect::<Vec<_>>()
+            };
+            let (a, b) = (doc(&off), doc(&on));
+            events += a.len();
+            let first = a
+                .iter()
+                .zip(&b)
+                .position(|(x, y)| x != y)
+                .or((a.len() != b.len()).then_some(a.len().min(b.len())));
+            if let Some(i) = first {
+                diffs.push(format!(
+                    "{}: event {i}: OFF {:.200} <> ON {:.200}",
+                    f.file_name().unwrap().to_string_lossy(),
+                    a.get(i).cloned().unwrap_or_default(),
+                    b.get(i).cloned().unwrap_or_default()
+                ));
+            }
+            let (bo, bn) = (
+                off.iter().find(|l| l.starts_with("BOOK")),
+                on.iter().find(|l| l.starts_with("BOOK")),
+            );
+            if let (Some(bo), Some(bn)) = (bo, bn) {
+                if bo != bn {
+                    differing_book += 1;
+                }
+                for (j, k) in
+                    ["held_oop", "appended", "dropped", "released_in_window"].iter().enumerate()
+                {
+                    book[j] += num(bo, k);
+                    book[4 + j] += num(bn, k);
+                }
+            }
+        }
+        eprintln!(
+            "ITEM Q {dir}: {} traces, {events} events; document-layer differences {}; traces whose bookkeeping differs {differing_book}; \
+             totals OFF/ON: held marks left {}/{}, entries served {}/{}, marks dropped {}/{}, releases in window {}/{}",
+            files.len(),
+            diffs.len(),
+            book[0],
+            book[4],
+            book[1],
+            book[5],
+            book[2],
+            book[6],
+            book[3],
+            book[7]
+        );
+        for d in diffs.iter().take(10) {
+            eprintln!("  DOCUMENT-LAYER DIFFERENCE {d}");
+        }
+        assert!(diffs.is_empty(), "item Q: {} traces differ on the document layer", diffs.len());
+    }
+
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
     /// restarted from a live eligible peer (the product cannot complete a join from a dead member). The base grid and the
     /// product-route grid (document policy) stay clean (every problem classified), and the mode is not vacuous: joins are restarted.
