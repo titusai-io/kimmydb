@@ -208,6 +208,10 @@ impl Member {
 
     /// Raise the vector to the end of the member's contiguous SERVABLE prefix of `origin` (covered and not held out of position):
     /// the vector never passes a hold, whatever was released above it (the model's `covers` has the same shape).
+    ///
+    /// The harness raises the vector only over the servable prefix; the product raises at release and (after the held-gap fix) drops
+    /// superseded covered marks; these are equivalent ONLY under the invariant that a sender omits an entry from a window only when
+    /// it witnessed it as superseded.
     pub fn raise_servable(&mut self, w: &World, origin: usize) {
         let mut top = -1;
         for &x in &w.by_origin[origin] {
