@@ -359,6 +359,7 @@ mod tests {
                         c_off.product_marks = false;
                         let mut c_on = c_off;
                         c_on.product_marks = true;
+                        c_on.drop_late_marks = env_u64("Q6Q_LATE", 0) == 1;
                         let off = run("v6", "v6", seed, c_off, false);
                         let on = run("v6", "v6", seed, c_on, false);
                         runs += 1;
@@ -401,6 +402,9 @@ mod tests {
                                     "{m}/{o}/{k} seed {seed}: {key} OFF {a} <> ON {b}"
                                 ));
                             } else {
+                                if key != "inv_vector_disagrees_with_prefix" {
+                                    eprintln!("BK {m}/{o}/{k} seed {seed}: {key} OFF {a} ON {b}");
+                                }
                                 let e = book.entry(key.clone()).or_insert((0, 0));
                                 e.0 += 1;
                                 e.1 += b - a;
@@ -430,6 +434,43 @@ mod tests {
             doc_diffs.is_empty() && class_diffs.is_empty(),
             "item Q grid: document-layer differences"
         );
+    }
+
+    /// ITEM Q, one run traced: `Q6Q_ONE=m,o,k,seed,dh,dr,f` ON against OFF (`Q6Q_LATE` as in the grid); prints the first place the two logs differ.
+    #[test]
+    #[ignore = "item Q: one run, Q6Q_ONE"]
+    fn item_q_one_run_first_difference() {
+        let spec = std::env::var("Q6Q_ONE").expect("Q6Q_ONE=m,o,k,seed,dh,dr,f");
+        let v: Vec<&str> = spec.split(',').collect();
+        let (m, o, k): (usize, usize, usize) =
+            (v[0].parse().unwrap(), v[1].parse().unwrap(), v[2].parse().unwrap());
+        let seed: u64 = v[3].parse().unwrap();
+        let (dh, dr, f): (bool, bool, f64) = (v[4] == "1", v[5] == "1", v[6].parse().unwrap());
+        let mut c_off =
+            crate::run::product_cfg(crate::world::Policy::Document, (m, o, k), dh, dr, f);
+        c_off.product_marks = false;
+        let mut c_on = c_off;
+        c_on.product_marks = true;
+        c_on.drop_late_marks = env_u64("Q6Q_LATE", 0) == 1;
+        let off = run("v6", "v6", seed, c_off, true);
+        let on = run("v6", "v6", seed, c_on, true);
+        let (a, b) = (&off.w.log, &on.w.log);
+        let first = a
+            .iter()
+            .zip(b.iter())
+            .position(|(x, y)| x != y)
+            .or((a.len() != b.len()).then_some(a.len().min(b.len())));
+        eprintln!(
+            "ONE {spec}: logs {} / {} lines; first difference at {first:?}",
+            a.len(),
+            b.len()
+        );
+        if let Some(i) = first {
+            for j in i.saturating_sub(4)..(i + 6).min(a.len().max(b.len())) {
+                eprintln!("  [{j}] OFF {}", a.get(j).map(String::as_str).unwrap_or("-"));
+                eprintln!("  [{j}] ON  {}", b.get(j).map(String::as_str).unwrap_or("-"));
+            }
+        }
     }
 
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is

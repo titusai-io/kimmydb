@@ -80,6 +80,12 @@ pub struct World {
     /// covered marks whose entry is superseded at its key are dropped (`drop_superseded_covered_marks`, engine.rs, #313). Implies the
     /// product's coverage, the vector (`vector_cov`)
     pub product_marks: bool,
+    /// ITEM Q, the Q6 build item (with `product_marks`): a covered held mark is dropped also when its entry is LATE, a document entry
+    /// addressed to a physical that is buried at this member
+    pub drop_late_marks: bool,
+    /// ITEM Q: the marks dropped because their physical is buried here (not because they were superseded): (member name, physical, the
+    /// physical was alive at the window's sender), checked at the end of the run against the live members that still hold it alive
+    pub late_drops: Vec<(String, String, bool)>,
     /// ITEM Q: the first vector-against-prefix disagreement of each member, described (member, step, the first entry the prefix lacks,
     /// the entries held out of position for that origin), for the report
     pub vp_notes: std::cell::RefCell<Vec<String>>,
@@ -137,6 +143,8 @@ impl World {
             hb2_exclusion: true,
             vector_cov: false,
             product_marks: false,
+            drop_late_marks: false,
+            late_drops: Vec::new(),
             vp_notes: Default::default(),
             strict_holders: false,
             state_survives: false,

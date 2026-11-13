@@ -222,11 +222,11 @@ impl Member {
     /// servable vector already covers for its origin and that is superseded at its key by the state now held there (live or a
     /// tombstone). The entry is history: nothing is raised, no document changes. A covered mark whose entry is NOT superseded is a gap
     /// and stays. Returns how many.
-    pub fn drop_superseded_covered_marks(&mut self, w: &mut World) -> usize {
+    pub fn drop_superseded_covered_marks(&mut self, w: &mut World, src: Option<&Member>) -> usize {
         let ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
         let mut n = 0;
         for i in ids {
-            let e = w.ent(i);
+            let e = w.ent_rc(i);
             if e.kind != Kind::Doc || self.vc.max_of(e.origin) < e.hlc {
                 continue;
             }
@@ -235,7 +235,27 @@ impl Member {
                 .get(&e.phys)
                 .and_then(|p| p.docs.get(&e.key))
                 .is_some_and(|v| v.stamp > e.stamp);
-            if superseded {
+            // the Q6 build item: a LATE entry (addressed to a physical that is buried here) is omitted for cause too
+            // D11's lateness, known here (counted against `buried_here`, not used to decide): some valid in-effect register event E supersedes the physical after its birth here
+            // (`late_stamp`) and lies below the write's stamp. `buried_here` (the physical is dead here) is what the first version used.
+            let late_d11 = self.late_stamp(w, &e.phys).is_some_and(|ls| ls < e.stamp);
+            let buried_here = self.phys.get(&e.phys).is_some_and(|p| !p.alive);
+            if w.drop_late_marks && late_d11 != buried_here {
+                w.stats.bump(if late_d11 { "late_d11_not_buried" } else { "late_buried_not_d11" });
+            }
+            // the build item is 'addressed to a physical that is BURIED here' (the entry's effect is gone whether it was late or
+            // written before the register event that replaced the physical): D11's lateness alone is too narrow (the 5 runs of the
+            // item Q report where the superseding event is ABOVE the entry's stamp)
+            let late = w.drop_late_marks && buried_here;
+            if superseded || late {
+                if late && !superseded {
+                    let at_sender =
+                        src.is_some_and(|m| m.phys.get(&e.phys).is_some_and(|p| p.alive));
+                    w.late_drops.push((self.name.clone(), e.phys.clone(), at_sender));
+                    if at_sender {
+                        w.stats.bump("late_drop_phys_alive_at_sender");
+                    }
+                }
                 self.held_oop.remove(&i);
                 self.retire_repair(i);
                 n += 1;

@@ -63,7 +63,7 @@ impl Member {
     pub fn take_from(&mut self, w: &mut World, src: &Member, e: &EntryRef, quiesce: bool) -> Taken {
         let r = self.take_from_inner(w, src, e, quiesce);
         if w.product_marks {
-            self.drop_superseded_covered_marks(w); // after each window (#313)
+            self.drop_superseded_covered_marks(w, Some(src)); // after each window (#313)
         }
         r
     }
