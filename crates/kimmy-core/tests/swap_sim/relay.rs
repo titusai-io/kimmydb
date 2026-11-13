@@ -129,43 +129,27 @@ impl Member {
             return Taken::Received;
         }
         // the servable position cannot pass an entry held out of position (docs/oplog.md:489-491: held entries sit above it): an
-        // entry that arrives behind one is itself held until its predecessors are released. It is marked before it is applied, so
-        // the `settle` inside `take` never counts it as covered (see `take_hold`)
-        let behind = w.held_uncovered
+        // entry that arrives behind one is itself held until its predecessors are released. The model decides AFTER the take
+        // (6d `take_from`): the settle inside the take may release the predecessors first, and then the entry keeps the append
+        // decision of its apply. (A model/harness rule only: the product trusts the window's contiguity, engine.rs
+        // `append_oplog_at` InWindow.) `behind` tells the apply that no vector is raised for it
+        let behind_before = w.held_uncovered
             && w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
                 .any(|x| self.held_oop.contains(x));
-        if behind && !w.f.fm_held_witness {
-            self.held_oop.insert(e.idx);
-        }
-        self.pos_hold = behind; // behind a held entry the apply raises no vector
-        self.arriving = if behind && !w.f.fm_held_witness { Some(e.idx) } else { None };
+        self.pos_hold = behind_before; // behind a held entry the apply raises no vector
         self.take(w, e);
-        self.arriving = None;
         self.pos_hold = false;
-        // The model decides AFTER the take (`take_from` of 6d): if the `settle` inside `take` released the predecessors, the entry is
-        // not held and keeps the append decision of its apply (a winner is served, a history arrival is not); otherwise it is held
-        // too. The mark above only keeps the settle from counting it as covered: `promote_oop` and the HB-1 guard skip `arriving`.
-        if behind && w.f.fm_held_witness {
-            self.appended.remove(&e.idx);
-            self.held_oop.insert(e.idx);
-            w.stats.bump("held_behind_held");
-        } else if behind {
-            let still = w.by_origin[e.origin]
+        let behind_now = w.held_uncovered
+            && w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
                 .any(|x| self.held_oop.contains(x));
-            if still {
-                self.appended.remove(&e.idx);
-                self.held_oop.insert(e.idx);
-                w.stats.bump("held_behind_held");
-            } else {
-                self.held_oop.remove(&e.idx);
-                // the model's settle ran with the entry covered (it was never marked): a record or an event parked as information
-                // because of this entry's own mark takes effect now
-                self.settle(w);
-            }
+        if behind_now {
+            self.appended.remove(&e.idx);
+            self.held_oop.insert(e.idx);
+            w.stats.bump("held_behind_held");
         }
         Taken::Received
     }
