@@ -57,6 +57,8 @@ pub struct Flags {
     pub paged_loss_read: bool,
     /// Rust-only mutant of the step check: a loss entry received from another member enters the state but is not appended
     pub fm_loss_not_appended: bool,
+    /// Rust-only mutant `m-d10-ignores-info` (M6): D10 refuses only for a superseding event IN EFFECT, not one parked as information
+    pub fm_d10_ignores_info: bool,
     /// Rust-only mutants of the `field` policy's apply and loss path (point 4; read only under `Policy::Field`, no-ops otherwise)
     pub fm_always_append: bool,
     pub fm_stale_body: bool,
@@ -155,7 +157,7 @@ pub const BASES: [&str; 4] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
-pub const MUTANTS: [&str; 36] = [
+pub const MUTANTS: [&str; 37] = [
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -195,6 +197,8 @@ pub const MUTANTS: [&str; 36] = [
     "m-loss-received-not-appended",
     // Rust-only (M3): clause (3) not granted by construction: a record carried within the grant is not made a served entry
     "m-snap-record-not-served",
+    // Rust-only (M6): D10 on events parked as information
+    "m-d10-ignores-info",
     // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
     "m-stale-src",
 ];
@@ -286,6 +290,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         }
         "m-loss-received-not-appended" => f.fm_loss_not_appended = true,
         "m-snap-record-not-served" => f.snap_record_not_served = true,
+        "m-d10-ignores-info" => f.fm_d10_ignores_info = true,
         "m-stale-src" => f.stale_src_bug = true,
         "m-field-always-append" => f.fm_always_append = true,
         "m-field-stale-body" => f.fm_stale_body = true,
