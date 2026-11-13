@@ -192,19 +192,26 @@ mod tests {
     /// own trigger, so the check is a structural assertion of the trigger
     #[test]
     fn rule_s_does_not_append_an_ordinary_write_to_a_stage_physical() {
-        let (mut cases, mut bad) = (0i64, 0i64);
-        for (dh, dr) in [(true, false), (false, true), (true, true)] {
-            for m in [3usize, 4] {
-                for seed in 0..60u64 {
-                    let r =
-                        run_product("v6", Policy::Document, (m, 2, 4), dh, dr, 0.3, seed, false);
-                    cases += r.res.get("cnt_rule_s_negative_cases").copied().unwrap_or(0);
-                    bad += r.res.get("cnt_rule_s_negative_appended").copied().unwrap_or(0);
+        for policy in [Policy::Document, Policy::Field] {
+            let (mut cases, mut bad) = (0i64, 0i64);
+            for (dh, dr) in [(true, false), (false, true), (true, true)] {
+                for m in [3usize, 4] {
+                    for seed in 0..60u64 {
+                        let r = run_product("v6", policy, (m, 2, 4), dh, dr, 0.3, seed, false);
+                        cases += r.res.get("cnt_rule_s_negative_cases").copied().unwrap_or(0);
+                        bad += r.res.get("cnt_rule_s_negative_appended").copied().unwrap_or(0);
+                    }
                 }
             }
+            assert!(
+                cases > 0,
+                "{policy:?}: vacuous: no ordinary write superseded on arrival at a stage physical"
+            );
+            assert_eq!(
+                bad, 0,
+                "{policy:?}: rule S appended an ordinary write at a stage physical in {bad} runs"
+            );
         }
-        assert!(cases > 0, "vacuous: no ordinary write superseded on arrival at a stage physical");
-        assert_eq!(bad, 0, "rule S appended an ordinary write at a stage physical in {bad} runs");
     }
 
     /// Rule S on the `field` policy is an UNMODELLED extension (the Python model is `document`-only, open item O6): its only evidence is

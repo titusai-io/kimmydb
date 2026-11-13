@@ -45,6 +45,9 @@ pub struct Flags {
     /// stage's creation entry, with a stamp below the stage's known valid binding (or no valid binding known here). Off (`Q6_TRIGGER=staging`):
     /// the model's mark `e.staging` (6d)
     pub s_bind_origin: bool,
+    /// the REJECTED trigger S-bind (the S-bind-origin rule without its origin clause): mutant `m-s-bind-any-origin`, killed by the scripted
+    /// negative scenario of `scenarios.rs` (another origin's write above the binding, arriving at a member that knows no binding)
+    pub s_bind_any_origin: bool,
     pub snap_versions_as_entries: bool,
     pub snap_delete_bare: bool,
     pub ignored_not_served: bool,
@@ -313,6 +316,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         }
         "m-no-append-in-position" => f.append_in_position = false,
         "m-staged-row-off" => f.staged_row = false,
+        "m-s-bind-any-origin" => f.s_bind_any_origin = true,
         "m-snap-delete-bare" => f.snap_delete_bare = true,
         "m-ignored-event-not-served" => f.ignored_not_served = true,
         "m-no-defer-received" => f.defer_received = false,

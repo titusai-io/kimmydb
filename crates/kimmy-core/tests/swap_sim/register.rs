@@ -252,7 +252,7 @@ impl Member {
         if !bs.is_none_or(|b| e.stamp < b) {
             return false;
         }
-        self.creates.get(&e.phys).is_some_and(|cr| cr.origin == e.origin)
+        w.f.s_bind_any_origin || self.creates.get(&e.phys).is_some_and(|cr| cr.origin == e.origin)
     }
 
     /// ITEM Q, #313 (`drop_superseded_covered_marks`, engine.rs): after a window, drop every held mark of a DOCUMENT entry that the

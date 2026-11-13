@@ -171,7 +171,7 @@ mod tests {
             let adds = p.keys().any(|k| {
                 k.starts_with("inv_window")
                     || k.starts_with("inv_vector")
-                    || k == "inv_partial_flip" && s.get("inv_partial_flip") > 30
+                    || k == "inv_partial_flip"
                     || k.starts_with("inv_bury")
                     || k.starts_with("inv_orphan")
             });
@@ -1185,8 +1185,12 @@ mod tests {
                     });
                 }
                 let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+                let base = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
                 // M2: the route assertion is judged by its consequence (the receiver's Q6 surface changed), not at the injection
-                // site; the oracle-level failures it leads to are counted beside it
+                // site. The oracle-level failures are printed against the BASE row of the same grid: the base's own classified
+                // DF-2 runs satisfy any "some failure" clause, so none is asserted for the repair mutants, whose kill is the
+                // surface change; the hold mutant's kill is also invariant (ii) (its entries out of position), which the base
+                // never has.
                 let oracle_level: i64 = [
                     "diverged",
                     "oracle_state",
@@ -1217,10 +1221,35 @@ mod tests {
                     s.get("inv_route_carries_q6_kind") > 0,
                     "{m} {policy:?}: the route assertion must trip"
                 );
-                assert!(
-                    oracle_level > 0,
-                    "{m} {policy:?}: the mutant must have an oracle-level consequence"
+                let base_level: i64 = [
+                    "diverged",
+                    "oracle_state",
+                    "loss_mismatch",
+                    "inv_partial_flip",
+                    "inv_q6_kind_out_of_position",
+                ]
+                .iter()
+                .map(|k| base.get(k))
+                .sum();
+                eprintln!(
+                    "{m} {policy:?}: oracle-level total {oracle_level} against the base row's {base_level}"
                 );
+                assert_eq!(
+                    base.get("inv_route_carries_q6_kind"),
+                    0,
+                    "{m} {policy:?}: the base trips the route assertion"
+                );
+                assert_eq!(
+                    base.get("inv_q6_kind_out_of_position"),
+                    0,
+                    "{m} {policy:?}: the base has invariant (ii) runs"
+                );
+                if doc_hold {
+                    assert!(
+                        s.get("inv_q6_kind_out_of_position") > 0,
+                        "{m} {policy:?}: the hold mutant must trip invariant (ii), which the base never does"
+                    );
+                }
             }
         }
     }
