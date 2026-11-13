@@ -39,6 +39,10 @@ pub struct Cfg {
     pub hb2_exclusion: bool,
     /// B2: the members' coverage is the product's per-origin vector (`World::vector_cov`)
     pub vector_cov: bool,
+    /// M5, the abandon-and-restart mode (Rust only; the model never abandons a join): a join whose sender has vanished lands no
+    /// further page (the product reads pages from the sender); every live member with such a join restarts it with `supersede_join`
+    /// from a random live eligible peer, after each action and during the end-of-run delivery
+    pub restart_joins: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -83,7 +87,50 @@ impl Cfg {
             lww_workload: None,
             hb2_exclusion: true,
             vector_cov: false,
+            restart_joins: false,
         }
+    }
+}
+
+/// M5: every live member whose join's sender has vanished restarts it from a random live eligible peer (not itself, not the old
+/// sender); a member with no eligible peer waits (counted `dead_sender_join_waiting`) and is retried at the next call.
+fn restart_dead_joins(ms: &mut [Member], w: &mut World) {
+    for d in 0..ms.len() {
+        if ms[d].vanished {
+            continue;
+        }
+        let Some(old) = ms[d].join.as_ref().map(|j| j.src) else { continue };
+        if !ms[old].vanished {
+            continue;
+        }
+        let cands: Vec<usize> = (0..ms.len())
+            .filter(|&i| i != d && i != old && !ms[i].vanished && ms[i].eligible_source())
+            .collect();
+        if cands.is_empty() {
+            w.stats.bump("dead_sender_join_waiting");
+            continue;
+        }
+        let s = cands[w.rng.below(cands.len())];
+        let lazy = w.rng.f64() < 0.5;
+        let (dm, sm) = pair(ms, d, s);
+        if dm.supersede_join(w, sm, lazy) {
+            w.stats.bump("join_restarted_dead_sender");
+        }
+    }
+}
+
+/// Land `i`'s pages until its join completes. With `restart` a join whose sender has vanished is restarted (`restart_dead_joins`)
+/// instead of landed; one that cannot be restarted stays open (`dead_sender_join_open_at_end`).
+fn finish_joins(ms: &mut [Member], i: usize, w: &mut World, restart: bool) {
+    while ms[i].join.is_some() {
+        if restart {
+            restart_dead_joins(ms, w);
+            if ms[i].join.as_ref().is_some_and(|j| ms[j.src].vanished) {
+                w.stats.bump("dead_sender_join_open_at_end");
+                return;
+            }
+        }
+        land_page_in(ms, i, w);
     }
 }
 
@@ -292,8 +339,14 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                 }
             }
             5 => {
-                let joining: Vec<usize> =
-                    (0..ms.len()).filter(|&i| ms[i].join.is_some() && !ms[i].vanished).collect();
+                let joining: Vec<usize> = (0..ms.len())
+                    .filter(|&i| {
+                        !ms[i].vanished
+                            && ms[i].join.as_ref().is_some_and(|j| {
+                                !(cfg.restart_joins && ms[j.src].vanished)
+                            })
+                    })
+                    .collect();
                 if !joining.is_empty() {
                     let m = joining[w.rng.below(joining.len())];
                     land_page_in(&mut ms, m, &mut w);
@@ -415,6 +468,9 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                 }
             }
         }
+        if cfg.restart_joins {
+            restart_dead_joins(&mut ms, &mut w);
+        }
         for m in ms.iter_mut() {
             m.check_inv(&w);
         }
@@ -432,17 +488,13 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     }
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();
     for &i in &live {
-        while ms[i].join.is_some() {
-            land_page_in(&mut ms, i, &mut w);
-        }
+        finish_joins(&mut ms, i, &mut w, cfg.restart_joins);
     }
     w.lost =
         w.all.iter().filter(|e| !live.iter().any(|&i| ms[i].holds(e.idx))).map(|e| e.idx).collect();
     for _ in 0..12 {
         for &i in &live {
-            while ms[i].join.is_some() {
-                land_page_in(&mut ms, i, &mut w);
-            }
+            finish_joins(&mut ms, i, &mut w, cfg.restart_joins);
         }
         for &i in &live {
             let mut order: Vec<EntryRef> =
