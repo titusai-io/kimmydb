@@ -338,6 +338,9 @@ pub type Res = BTreeMap<String, i64>;
 /// - `O8` (open design finding, FIX-1's consequence): a live member keeps alive a vanished writer's stage that the oracle buries,
 ///   because the writer's only non-lost entries above the stage's deadline are held out of position at live members and none is
 ///   covered (`cnt_o8`, `cnt_o8_stages`); explains `alive_mismatch` and `oracle_state`.
+/// - `DF-2r` (the DF-2 mechanism applied to a loss record): a live member holds a document entry out of position behind a lost entry
+///   of its origin while loss entries of the run are lost with their minters (`cnt_df2r`); explains `loss_missing`, `loss_mismatch`
+///   and the head record/event-count invariants.
 /// - `O-F1` (open item, `field` only; the model of record has no field policy): `q7_records_diverged`, and a missing head with its
 ///   record/event-count invariants. Printed and counted, never passed silently.
 ///
@@ -368,10 +371,23 @@ pub fn product_classes(res: &Res, field: bool) -> (Vec<&'static str>, Vec<String
         classes.push("O8");
         explained.extend(["alive_mismatch", "oracle_state"]);
     }
+    // DF-2r (the DF-2 mechanism applied to a loss record): a held late write behind a permanently lost entry, whose records died with
+    // their minters; explains the missing head and its record/event-count invariants
+    let df2r_keys = [
+        "loss_missing",
+        "loss_mismatch",
+        "inv_head_not_exactly_one_record_and_event",
+        "inv_vanish_replicated_late_write_not_exactly_one_record_and_event",
+    ];
+    let df2r = on("cnt_df2r") && df2r_keys.iter().any(|k| on(k));
+    if df2r {
+        classes.push("DF-2r");
+        explained.extend(df2r_keys);
+    }
     if field
         && ["q7_records_diverged", "loss_missing", "inv_head_not_exactly_one_record_and_event"]
             .iter()
-            .any(|k| on(k))
+            .any(|k| on(k) && !(df2r && *k != "q7_records_diverged"))
     {
         classes.push("O-F1");
         explained.extend([
@@ -608,6 +624,23 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         }
     }
     res.insert("cnt_df2_held_above_coverage_behind_lost".into(), df2);
+    // DF-2r's structural marker (the DF-2 mechanism applied to a loss record): a live member holds a document entry out of position
+    // behind an entry of its origin that is lost for good, and loss entries of the run are lost with their minters, so the late
+    // write can neither be applied in position nor get its record (Field 336, 1361, 1365, 1046)
+    let df2r = live
+        .iter()
+        .flat_map(|&i| ms[i].held_oop.iter().copied())
+        .filter(|&h| {
+            let e = w.ent(h);
+            e.kind == Kind::Doc
+                && w.by_origin[e.origin]
+                    .iter()
+                    .any(|&x| w.lost.contains(&x) && w.ent(x).hlc < e.hlc)
+        })
+        .count() as i64;
+    let loss_entry_lost =
+        w.lost.iter().any(|&x| matches!(w.ent(x).kind, Kind::Loss | Kind::LossQ7));
+    res.insert("cnt_df2r".into(), (df2r > 0 && loss_entry_lost) as i64);
     // O8's structural marker (an open design finding, FIX-1's consequence): a live member keeps alive a vanished writer's stage
     // that the oracle buries, and the writer's only non-lost entries above the stage's deadline are held out of position at live
     // members, none of them a covered witness at this member. Defined from the members' states and the write log, never from

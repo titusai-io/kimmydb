@@ -39,7 +39,7 @@ mod tests {
         ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.3, 101),
         ("HB-2r", Policy::Document, (2, 2, 3), true, false, 0.1, 730),
         ("HB-2r", Policy::Document, (2, 3, 3), true, false, 0.1, 730),
-        ("O-F1", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
+        ("DF-2r", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
         ("O-F1", Policy::Field, (4, 2, 5), true, false, 0.3, 1361),
         ("O-F1", Policy::Field, (3, 2, 3), false, true, 0.1, 1365),
         ("O-F1", Policy::Field, (4, 3, 5), false, true, 0.1, 1046),
@@ -195,6 +195,27 @@ mod tests {
                 classes.contains(&"DF-2"),
                 "DF-2 DISAPPEARED at seed {seed} {mok:?} dh {dh} dr {dr} f {f}: convert this pin to a required-zero and drop the \
                  class from oracle::product_classes ({:?})",
+                nonzero_problems(&r)
+            );
+            assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");
+        }
+    }
+
+    /// DF-2r (the DF-2 mechanism applied to a loss record, Field 336): a late write is held out of position at live members behind
+    /// an entry lost with its writer, and its loss records died with their minters, so the head has no record. A NAMED, counted
+    /// class (`cnt_df2r`), no longer an open item: the pin fails loudly if it disappears.
+    #[test]
+    fn df2r_pin_the_held_late_write_without_a_record_class_occurs_on_field_336() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "DF-2r") {
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!(
+                "{cls} seed {seed} {mok:?}: classes {classes:?} residual {residual:?} cnt_df2r {}",
+                r.res["cnt_df2r"]
+            );
+            assert!(
+                classes.contains(&"DF-2r"),
+                "DF-2r DISAPPEARED at seed {seed}: convert this pin to a required-zero ({:?})",
                 nonzero_problems(&r)
             );
             assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");

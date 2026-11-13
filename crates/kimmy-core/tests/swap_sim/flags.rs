@@ -59,6 +59,10 @@ pub struct Flags {
     pub fm_loss_not_appended: bool,
     /// Rust-only mutant `m-d10-ignores-info` (M6): D10 refuses only for a superseding event IN EFFECT, not one parked as information
     pub fm_d10_ignores_info: bool,
+    /// Rust-only mutant `m-release-without-effect` (build item (a), item R): a held register event released in position (covered and
+    /// served) takes effect only at a LATER settle, not in the releasing one; a snapshot taken in between carries the coverage
+    /// without the event
+    pub fm_release_without_effect: bool,
     /// Rust-only mutant `m-release-behind-held`: a window releases a held mark although an earlier entry of the origin is still
     /// held here (ADR-169: a mark is released by a window CONTIGUOUS from the receiver's position); the vector then rises over a hold
     pub fm_release_behind_held: bool,
@@ -160,7 +164,7 @@ pub const BASES: [&str; 5] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule", "v6"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
-pub const MUTANTS: [&str; 38] = [
+pub const MUTANTS: [&str; 39] = [
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -204,17 +208,20 @@ pub const MUTANTS: [&str; 38] = [
     "m-d10-ignores-info",
     // Rust-only (the vector step check's finding): a window releases a mark past an earlier mark
     "m-release-behind-held",
+    // Rust-only (item R, build item (a)): a release takes effect one settle late
+    "m-release-without-effect",
     // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
     "m-stale-src",
 ];
 
 /// The mutants of `MUTANTS` the Python model does not have (the differential's mutant traces skip them).
-pub const RUST_ONLY_MUTANTS: [&str; 5] = [
+pub const RUST_ONLY_MUTANTS: [&str; 6] = [
     "m-stale-src",
     "m-loss-received-not-appended",
     "m-snap-record-not-served",
     "m-d10-ignores-info",
     "m-release-behind-held",
+    "m-release-without-effect",
 ];
 
 fn v5() -> Flags {
@@ -306,6 +313,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-snap-record-not-served" => f.snap_record_not_served = true,
         "m-d10-ignores-info" => f.fm_d10_ignores_info = true,
         "m-release-behind-held" => f.fm_release_behind_held = true,
+        "m-release-without-effect" => f.fm_release_without_effect = true,
         "m-stale-src" => f.stale_src_bug = true,
         "m-field-always-append" => f.fm_always_append = true,
         "m-field-stale-body" => f.fm_stale_body = true,
