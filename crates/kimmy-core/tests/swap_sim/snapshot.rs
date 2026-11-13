@@ -694,6 +694,9 @@ impl Member {
             *r = (*r).max(h); // ADR-224's state_held row, written at completion
         }
         for &i in &j.pl.appended {
+            if f.snap_record_not_served && matches!(w.ent(i).kind, Kind::Loss | Kind::LossQ7) {
+                continue; // m-snap-record-not-served: the carried record is state, not a served entry
+            }
             if !j.bare_ids.contains(&i) {
                 self.appended.insert(i);
             }

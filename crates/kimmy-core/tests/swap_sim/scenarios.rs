@@ -548,6 +548,51 @@ fn paged_join_twin(mode: &str) -> Twin {
     }
 }
 
+/// M3, clause (3) NOT granted by construction (within the grant): C finds x late and mints r_C BEFORE R begins its join from C, so
+/// the record is within the grant; B and C vanish; the third member E pulls ONLY by window from R (never from A, whose bind it
+/// knows). E has the record only if R made the carried record a served entry (build item clause (3), ASSUMED). The mutant
+/// `m-snap-record-not-served` carries the record as state alone: the step check names it unbacked and E never gets it.
+fn within_grant_join_twin(mode: &str) -> Twin {
+    let mut sc = Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0), ("R", 0), ("E", 0)], 60);
+    sc.advance(1);
+    let s6 = sc.ms[0].local_doc(&mut sc.w, 6, DocOp::Insert).unwrap();
+    for m in ["B", "C", "E"] {
+        sc.window(m, "A", &s6);
+    }
+    sc.advance(10);
+    let mut job = sc.ms[0].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+    sc.advance(12);
+    sc.ms[0].do_bind(&mut sc.w, &mut job, 5);
+    sc.advance(14);
+    sc.pull("C", "A");
+    sc.pull("E", "A");
+    sc.advance(20);
+    let x = sc.ms[1].local_doc(&mut sc.w, 6, DocOp::Update).unwrap();
+    sc.advance(24);
+    sc.pull("B", "A"); // B learns the bind and mints r_x
+    sc.advance(26);
+    sc.window("C", "B", &x); // history at C: C mints r_C
+    assert!(!loss_entries(&sc, "C", x.key, x.stamp).is_empty(), "C did not mint r_C");
+    step(&mut sc);
+    sc.advance(28);
+    assert!(sc.snapshot("R", "C", false), "R joins from C, whole, with the record within the grant");
+    step(&mut sc);
+    sc.advance(30);
+    sc.vanish(&["B", "C"]);
+    sc.advance(32);
+    sc.pull("E", "R"); // the only route: a window from the joiner
+    sc.w.step += 1;
+    sc.quiesce();
+    step(&mut sc);
+    let res = finish(&mut sc.w, &mut sc.ms);
+    let e = sc.idx("E");
+    Twin {
+        step_check: sc.ms.iter().any(|m| m.step_inv.contains("unbacked_state_record")),
+        e_has_record: sc.ms[e].loss.keys().any(|k| k.key == x.key && k.stamp == Some(x.stamp)),
+        problems: nonzero(&res),
+    }
+}
+
 /// The step check's own mutant: B receives A's record entry by a window; with `m-loss-received-not-appended` it holds the
 /// record in its state without an entry it serves onward. Nothing but the step check sees it on this script.
 fn received_record_twin(mode: &str) -> Twin {
@@ -853,6 +898,21 @@ mod tests {
             assert!(m.step_check, "the step check sees the record R holds without an entry of it");
             let n = names(&m);
             assert!(n.contains(&"loss_missing") && n.contains(&"div_loss"), "{:?}", m.problems);
+        }
+    }
+
+    /// M3: a record carried WITHIN the grant becomes a served entry at the joiner (clause (3)), shown with a third member that
+    /// pulls only by window from the joiner. The mutant carries it as state alone.
+    #[test]
+    fn a_record_carried_within_the_grant_is_a_served_entry_a_third_member_gets_by_window() {
+        for pre in ["", "field:"] {
+            let t = within_grant_join_twin(&format!("{pre}v6"));
+            assert!(t.problems.is_empty(), "{:?}", t.problems);
+            assert!(t.e_has_record && !t.step_check, "E gets the record from R by a window");
+            let m = within_grant_join_twin(&format!("{pre}m-snap-record-not-served"));
+            eprintln!("m-snap-record-not-served: step check {} E record {} {:?}", m.step_check, m.e_has_record, m.problems);
+            assert!(m.step_check, "the step check sees the carried record without a served entry");
+            assert!(!m.e_has_record, "the mutant: E never gets the record");
         }
     }
 

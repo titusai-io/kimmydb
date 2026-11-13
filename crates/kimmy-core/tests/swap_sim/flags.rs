@@ -25,6 +25,9 @@ pub struct Flags {
     pub snap_no_loss: bool,
     pub snap_no_events: bool,
     pub snap_no_orphan_burials: bool,
+    /// Rust-only mutant `m-snap-record-not-served`: a record carried within the grant is in the joiner's state, but its loss entry is
+    /// not made a served entry (the product's pages carry no oplog entry; build item clause (3) is what makes it one)
+    pub snap_record_not_served: bool,
     pub grant_before_pages: bool,
     pub defer_received: bool,
     pub state_scan: bool,
@@ -152,7 +155,7 @@ pub const BASES: [&str; 4] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
-pub const MUTANTS: [&str; 35] = [
+pub const MUTANTS: [&str; 36] = [
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -190,6 +193,8 @@ pub const MUTANTS: [&str; 35] = [
     "m-snap-record-no-grant-filter",
     // Rust-only: the step check's own mutant: a received loss entry is in the state but not appended
     "m-loss-received-not-appended",
+    // Rust-only (M3): clause (3) not granted by construction: a record carried within the grant is not made a served entry
+    "m-snap-record-not-served",
     // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
     "m-stale-src",
 ];
@@ -280,6 +285,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
             f.loss_grant_filter = false;
         }
         "m-loss-received-not-appended" => f.fm_loss_not_appended = true,
+        "m-snap-record-not-served" => f.snap_record_not_served = true,
         "m-stale-src" => f.stale_src_bug = true,
         "m-field-always-append" => f.fm_always_append = true,
         "m-field-stale-body" => f.fm_stale_body = true,
