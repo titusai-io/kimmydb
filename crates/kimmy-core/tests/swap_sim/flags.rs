@@ -153,8 +153,8 @@ pub const FIELD_MUTANTS: [&str; 6] = [
 ];
 
 /// Every base the harness knows.
-pub const BASES: [&str; 4] =
-    ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule"];
+pub const BASES: [&str; 5] =
+    ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule", "v6"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
 pub const MUTANTS: [&str; 37] = [
@@ -201,6 +201,14 @@ pub const MUTANTS: [&str; 37] = [
     "m-d10-ignores-info",
     // Rust-only: the reviewer's source-overwrite defect of a join (`v5-literal-with-rule`) as a mutant of the v6 base
     "m-stale-src",
+];
+
+/// The mutants of `MUTANTS` the Python model does not have (the differential's mutant traces skip them).
+pub const RUST_ONLY_MUTANTS: [&str; 4] = [
+    "m-stale-src",
+    "m-loss-received-not-appended",
+    "m-snap-record-not-served",
+    "m-d10-ignores-info",
 ];
 
 fn v5() -> Flags {

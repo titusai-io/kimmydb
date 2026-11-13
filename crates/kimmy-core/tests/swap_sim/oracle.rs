@@ -1098,6 +1098,10 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         }
     }
     res.insert("div_replay_interleaved".into(), div_interleaved as i64);
+    // N3: the model's `diverged` includes the interleaved replay
+    if div_interleaved {
+        res.insert("diverged".into(), 1);
+    }
     res.insert("cnt_hb2_excluded".into(), hb2_excluded as i64);
     // the verdicts of the two replays before the exclusion (HB-2's two-replay sub-case: they must agree)
     res.insert("raw_div_replay".into(), div_replay_raw as i64);
