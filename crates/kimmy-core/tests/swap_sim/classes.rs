@@ -322,6 +322,29 @@ mod tests {
         );
     }
 
+    /// `m-snap-no-orphan-burials` (a snapshot does not carry the sender's orphan burials) is killed on the base (in-order) grid by seeds
+    /// (found by `scan_for_a_killing_seed`, `Q6SCAN_INORDER=1`): v6 is clean on each, the mutant diverges with an oracle-state and an
+    /// alive mismatch (a live member keeps an orphan stage the oracle buries).
+    #[test]
+    fn m_snap_no_orphan_burials_is_killed_on_its_seeds() {
+        for (mok, seed) in [((3usize, 3usize, 3usize), 54u64), ((3, 3, 3), 246), ((4, 1, 3), 184)] {
+            let cfg = crate::run::Cfg::new(mok.0, mok.1, mok.2);
+            let base = crate::run::run("v6", "v6", seed, cfg, false);
+            let mutant = crate::run::run("m-snap-no-orphan-burials", "v6", seed, cfg, false);
+            for key in ["diverged", "oracle_state", "alive_mismatch"] {
+                assert_eq!(
+                    base.res.get(key).copied().unwrap_or(0),
+                    0,
+                    "{mok:?} seed {seed}: v6 is not clean on {key}"
+                );
+                assert!(
+                    mutant.res.get(key).copied().unwrap_or(0) != 0,
+                    "{mok:?} seed {seed}: m-snap-no-orphan-burials no longer shows {key}"
+                );
+            }
+        }
+    }
+
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
     /// entry on a served collection). As DF-1's pin: the class must occur on each listed seed and the pin fails loudly once it
     /// disappears.
