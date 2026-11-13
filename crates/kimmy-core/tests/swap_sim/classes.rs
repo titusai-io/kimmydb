@@ -250,6 +250,80 @@ mod tests {
         }
     }
 
+    /// R4's GRANT GATE (a snapshot's grant covers only what the sender's vector names; `m-snap-register-late`: pages read the register above
+    /// the grant) is killed by SEEDS, not by a grid margin: with rule B off alone these runs are clean, with the gate off as well each has
+    /// the named problem (found by `scan_for_a_killing_seed`: `Q6SCAN_MODE=m-snap-register-late+m-rule-b-off Q6SCAN_BASE=m-rule-b-off`).
+    #[test]
+    fn r4_the_grant_gate_is_killed_on_its_seeds() {
+        // (members, outs, keys), doc_hold, doc_repair, f, seed, the problem the mutant adds
+        type Pin = ((usize, usize, usize), bool, bool, f64, u64, &'static str);
+        const SEEDS: [Pin; 3] = [
+            ((3, 3, 4), true, true, 0.3, 222, "inv_partial_flip"),
+            ((2, 3, 4), true, true, 0.3, 85, "diverged"),
+            ((5, 2, 3), true, true, 0.3, 40, "diverged"),
+        ];
+        for (mok, dh, dr, f, seed, key) in SEEDS {
+            let base = run_product("m-rule-b-off", Policy::Document, mok, dh, dr, f, seed, false);
+            let mutant = run_product(
+                "m-snap-register-late+m-rule-b-off",
+                Policy::Document,
+                mok,
+                dh,
+                dr,
+                f,
+                seed,
+                false,
+            );
+            assert_eq!(
+                base.res.get(key).copied().unwrap_or(0),
+                0,
+                "{mok:?} seed {seed}: rule B off alone is not clean on {key}"
+            );
+            assert!(
+                mutant.res.get(key).copied().unwrap_or(0) != 0,
+                "{mok:?} seed {seed}: the grant-gate mutant no longer shows {key}"
+            );
+        }
+    }
+
+    /// M4 (a loss record is an ordinary entry of the reporter's own origin appended to the end of its sequence, so inside its coverage prefix):
+    /// `m-loss-outside-prefix` is killed by the structural check `loss_record_outside_coverage_prefix`, which v6 never trips (the Python
+    /// model fails nothing on this mutant, so the kill is the harness's). Base (in-order) grid, 36 configurations x 20 seeds.
+    #[test]
+    fn m_loss_outside_prefix_is_killed_by_the_coverage_prefix_check() {
+        let cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        let base = crate::run::run_grid("v6", "v6", &cfgs, 0, 20, 4);
+        let mutant = crate::run::run_grid("m-loss-outside-prefix", "v6", &cfgs, 0, 20, 4);
+        assert_eq!(base.get("inv_loss_record_outside_coverage_prefix"), 0);
+        assert!(
+            mutant.get("inv_loss_record_outside_coverage_prefix") > 0,
+            "m-loss-outside-prefix is not killed by the coverage-prefix check"
+        );
+    }
+
+    /// `m-snap-no-orphan-burials` (a snapshot does not carry the sender's orphan burials) is killed on the base (in-order) grid by seeds
+    /// (found by `scan_for_a_killing_seed`, `Q6SCAN_INORDER=1`): v6 is clean on each, the mutant diverges with an oracle-state and an
+    /// alive mismatch (a live member keeps an orphan stage the oracle buries).
+    #[test]
+    fn m_snap_no_orphan_burials_is_killed_on_its_seeds() {
+        for (mok, seed) in [((3usize, 3usize, 3usize), 54u64), ((3, 3, 3), 246), ((4, 1, 3), 184)] {
+            let cfg = crate::run::Cfg::new(mok.0, mok.1, mok.2);
+            let base = crate::run::run("v6", "v6", seed, cfg, false);
+            let mutant = crate::run::run("m-snap-no-orphan-burials", "v6", seed, cfg, false);
+            for key in ["diverged", "oracle_state", "alive_mismatch"] {
+                assert_eq!(
+                    base.res.get(key).copied().unwrap_or(0),
+                    0,
+                    "{mok:?} seed {seed}: v6 is not clean on {key}"
+                );
+                assert!(
+                    mutant.res.get(key).copied().unwrap_or(0) != 0,
+                    "{mok:?} seed {seed}: m-snap-no-orphan-burials no longer shows {key}"
+                );
+            }
+        }
+    }
+
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
     /// entry on a served collection). As DF-1's pin: the class must occur on each listed seed and the pin fails loudly once it
     /// disappears.

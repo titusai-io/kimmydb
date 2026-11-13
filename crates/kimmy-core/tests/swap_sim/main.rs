@@ -314,22 +314,29 @@ mod tests {
             .collect();
         let seeds = env_u64("Q6SCAN_SEEDS", 250);
         let mut found = Vec::new();
-        'outer: for (dh, dr) in [(true, true), (true, false), (false, true)] {
+        // `Q6SCAN_INORDER=1`: the base (in-order) grid, no routes, instead of the product-route rows
+        let rows: Vec<(bool, bool)> = if std::env::var("Q6SCAN_INORDER").is_ok() {
+            vec![(false, false)]
+        } else {
+            vec![(true, true), (true, false), (false, true)]
+        };
+        'outer: for (dh, dr) in rows {
             for m in [2usize, 3, 4, 5] {
                 for o in [1usize, 2, 3] {
                     for k in [3usize, 4, 5] {
                         for seed in 0..seeds {
                             let hit = |md: &str| -> Vec<String> {
-                                let r = crate::run::run_product(
-                                    md,
+                                let mut cfg = crate::run::product_cfg(
                                     crate::world::Policy::Document,
                                     (m, o, k),
                                     dh,
                                     dr,
                                     0.3,
-                                    seed,
-                                    false,
                                 );
+                                if !dh && !dr {
+                                    cfg.routes = None;
+                                }
+                                let r = crate::run::run(md, "v6", seed, cfg, false);
                                 keys.iter()
                                     .filter(|key| r.res.get(*key).copied().unwrap_or(0) != 0)
                                     .cloned()

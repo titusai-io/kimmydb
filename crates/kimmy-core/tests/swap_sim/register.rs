@@ -218,6 +218,43 @@ impl Member {
         released_event
     }
 
+    /// The lowest stamp of a valid binding of the stage that this member knows (in effect, parked as information, or held out of
+    /// position), or `None` (`swapmodel6e.py` `known_bind_stamp`).
+    pub fn known_bind_stamp(&self, w: &World, name: &str) -> Option<Stamp> {
+        let mut best: Option<Stamp> = None;
+        for id in 0..w.all.len() {
+            let b = w.ent(id);
+            if b.kind == Kind::Bind
+                && b.phys == name
+                && self.member_valid(w, b)
+                && (self.evl.contains(&id)
+                    || self.info.contains_key(&id)
+                    || self.held_oop.contains(&id))
+                && best.is_none_or(|x| b.stamp < x)
+            {
+                best = Some(b.stamp);
+            }
+        }
+        best
+    }
+
+    /// RULE S's trigger (`swapmodel6e.py` `s_trigger`): with `s_bind_origin` (S-bind-origin, the manager's ruling): an entry addressed to
+    /// a physical created as a stage, written by the origin of the stage's creation entry (the stage's own job), whose stamp is below the
+    /// stage's known valid binding or when none is known here. Otherwise the model's mark `e.staging`.
+    pub fn s_trigger(&self, w: &World, e: &Entry) -> bool {
+        if !w.f.s_bind_origin {
+            return e.staging;
+        }
+        if !self.phys.get(&e.phys).is_some_and(|p| p.kind == PKind::Stage) {
+            return false;
+        }
+        let bs = self.known_bind_stamp(w, &e.phys);
+        if !bs.is_none_or(|b| e.stamp < b) {
+            return false;
+        }
+        self.creates.get(&e.phys).is_some_and(|cr| cr.origin == e.origin)
+    }
+
     /// ITEM Q, #313 (`drop_superseded_covered_marks`, engine.rs): after a window, drop every held mark of a DOCUMENT entry that the
     /// servable vector already covers for its origin and that is superseded at its key by the state now held there (live or a
     /// tombstone). The entry is history: nothing is raised, no document changes. A covered mark whose entry is NOT superseded is a gap
