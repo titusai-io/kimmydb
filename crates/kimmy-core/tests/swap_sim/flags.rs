@@ -59,6 +59,12 @@ pub struct Flags {
     pub fm_loss_not_appended: bool,
     /// Rust-only mutant `m-d10-ignores-info` (M6): D10 refuses only for a superseding event IN EFFECT, not one parked as information
     pub fm_d10_ignores_info: bool,
+    /// Rust-only mutant `m-window-noncontiguous` (H-Q6-R2): a window delivers the HIGHEST-stamp entry the source appended and the
+    /// receiver lacks, not the lowest, so the receiver's coverage is raised past entries not sent
+    pub fm_window_noncontiguous: bool,
+    /// Rust-only mutant `m-release-unconditional` (the release condition): a held entry is released at once, without waiting for
+    /// every earlier entry of its origin to be held
+    pub fm_release_unconditional: bool,
     /// Rust-only mutant `m-release-without-effect` (build item (a), item R): a held register event released in position (covered and
     /// served) takes effect only at a LATER settle, not in the releasing one; a snapshot taken in between carries the coverage
     /// without the event
@@ -214,6 +220,9 @@ pub const MUTANTS: [&str; 39] = [
     "m-stale-src",
 ];
 
+/// Rust-only mutants of the product routes (killed on the product-route grid, `main.rs`; not in `MUTANTS`, which runs the base grid).
+pub const PRODUCT_MUTANTS: [&str; 2] = ["m-window-noncontiguous", "m-release-unconditional"];
+
 /// The mutants of `MUTANTS` the Python model does not have (the differential's mutant traces skip them).
 pub const RUST_ONLY_MUTANTS: [&str; 6] = [
     "m-stale-src",
@@ -313,6 +322,8 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-snap-record-not-served" => f.snap_record_not_served = true,
         "m-d10-ignores-info" => f.fm_d10_ignores_info = true,
         "m-release-behind-held" => f.fm_release_behind_held = true,
+        "m-window-noncontiguous" => f.fm_window_noncontiguous = true,
+        "m-release-unconditional" => f.fm_release_unconditional = true,
         "m-release-without-effect" => f.fm_release_without_effect = true,
         "m-stale-src" => f.stale_src_bug = true,
         "m-field-always-append" => f.fm_always_append = true,

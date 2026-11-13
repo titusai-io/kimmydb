@@ -51,7 +51,10 @@ impl Member {
             // an entry held out of position is not at the receiver's servable position: a window delivers it again (ADR-169)
             .filter(|&&i| !self.cv.has(i) || (w.held_uncovered && self.held_oop.contains(&i)))
             .map(|&i| w.ent_rc(i))
-            .min_by_key(|e| e.stamp)
+            .reduce(|a, b| {
+                // H-Q6-R2: the lowest stamp; `m-window-noncontiguous` takes the highest
+                if (b.stamp < a.stamp) != w.f.fm_window_noncontiguous { b } else { a }
+            })
     }
 
     /// This member receives entry `e` in a window served by `src` (which appended it). The receiver witnesses,
