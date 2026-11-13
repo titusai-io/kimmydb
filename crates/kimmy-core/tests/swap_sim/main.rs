@@ -1326,6 +1326,8 @@ mod tests {
                 "m-d10-ignores-info",
                 // killed on the product-route seeds 25, 138, 154 (`classes.rs`), not by the base grid (no routes)
                 "m-release-behind-held",
+                // killed by the scripted snapshot-between-release-and-effect scenario (`scenarios.rs`, item R)
+                "m-release-without-effect",
             ];
             let unexpected: Vec<&&str> =
                 survivors.iter().filter(|m| !allowed_survivors.contains(m)).collect();
