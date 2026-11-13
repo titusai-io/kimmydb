@@ -406,6 +406,8 @@ mod tests {
         let mut runs = 0usize;
         let mut doc_diffs: Vec<String> = Vec::new();
         let mut on_worse: Vec<String> = Vec::new();
+        let mut class_off: std::collections::BTreeMap<&str, i64> = Default::default();
+        let mut class_on: std::collections::BTreeMap<&str, i64> = Default::default();
         let mut on_unclassified: Vec<String> = Vec::new();
         let mut class_diffs: Vec<String> = Vec::new();
         let mut book: std::collections::BTreeMap<String, (usize, i64)> = Default::default();
@@ -495,6 +497,12 @@ mod tests {
                             }
                         }
                         let (ca, _) = crate::oracle::product_classes(&off.res, false);
+                        for c in &ca {
+                            *class_off.entry(*c).or_insert(0) += 1;
+                        }
+                        for c in &crate::oracle::product_classes(&on.res, false).0 {
+                            *class_on.entry(*c).or_insert(0) += 1;
+                        }
                         let (cb, rb) = crate::oracle::product_classes(&on.res, false);
                         // (the bookkeeping invariant `inv_vector_disagrees_with_prefix` is listed, not judged: as in the grid's comparison above)
                         let rb: Vec<String> = rb
@@ -540,13 +548,27 @@ mod tests {
         for d in on_worse.iter().chain(on_unclassified.iter()).take(20) {
             eprintln!("  ON WORSE / UNCLASSIFIED {d}");
         }
-        // With repair marks the two modes keep different trajectories on the repair routes (the marks change what is held, so the relay draws
-        // diverge): a seed-for-seed difference where OFF fails and ON does not is the trajectory, not the mechanism. The claim that is asserted:
-        // product_marks never ADDS a document-layer failure, and never leaves a run unclassified.
-        assert!(
-            on_worse.is_empty() && on_unclassified.is_empty(),
-            "item Q grid: ON is worse or unclassified"
+        eprintln!(
+            "ITEM Q CLASSES dh={dh} dr={dr} f={f}: runs per failure class OFF {class_off:?} / ON {class_on:?}"
         );
+        // With repair marks the two modes keep different trajectories on the repair routes (the marks change what is held, so the relay draws
+        // diverge): per-seed identity no longer applies there. ACCEPTANCE (the manager's ruling): per row ON has 0 unclassified failures and no
+        // failure CLASS above OFF's by count (an excess is traced and ruled), and the mechanism fired (the firing counters, printed above).
+        assert!(on_unclassified.is_empty(), "item Q grid: ON has unclassified failures");
+        for (c, n) in &class_on {
+            assert!(
+                *n <= class_off.get(c).copied().unwrap_or(0),
+                "item Q grid: class {c} has {n} runs ON against {} OFF: trace the excess",
+                class_off.get(c).copied().unwrap_or(0)
+            );
+        }
+        if !dr {
+            // the rows without the repair route keep per-seed identity
+            assert!(
+                on_worse.is_empty() && doc_diffs.is_empty() && class_diffs.is_empty(),
+                "item Q grid: document-layer differences"
+            );
+        }
     }
 
     /// ITEM Q, one run traced: `Q6Q_ONE=m,o,k,seed,dh,dr,f` ON against OFF (`Q6Q_LATE` as in the grid); prints the first place the two logs differ.

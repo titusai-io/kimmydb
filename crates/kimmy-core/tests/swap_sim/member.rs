@@ -118,6 +118,8 @@ pub struct Member {
     pub last_served: String,
     /// every physical this member has ever served (HB-2's "has served"; `last_served` is only the latest)
     pub ever_served: BTreeSet<String>,
+    /// entries of the scoped repair in progress whose versions are to be applied under Hold when it ends (`write_repair_marks`)
+    pub repair_marks_pending: Vec<EntryId>,
 }
 
 impl Member {
@@ -176,6 +178,7 @@ impl Member {
             flips: 0,
             last_served: L.to_string(),
             ever_served: BTreeSet::new(),
+            repair_marks_pending: Vec::new(),
         }
     }
 

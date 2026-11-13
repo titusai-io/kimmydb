@@ -345,11 +345,24 @@ impl Member {
         }
         if let Some(&i) = w.rec_index.get(&(phys.to_string(), key, *stamp))
             && !self.cv.has(i)
+            && !self.repair_marks_pending.contains(&i)
         {
-            self.cv.add(i);
-            self.held_oop.insert(i);
-            self.appended.remove(&i);
-            w.stats.bump("repair_marks_written");
+            self.repair_marks_pending.push(i);
+        }
+    }
+
+    /// F2: the marks of a repair are written after the repair's own Q6-surface check (the assertion judges what the pages carry, not what the receiver's
+    /// settle does with an entry applied under Hold). Each version is applied under Hold, as the product's `apply_remote_in_txn(.., Position::Hold)`:
+    /// the document is written (last-writer-wins decides), the entry is in the log with a mark on it, not in position, and the clock merges its stamp.
+    /// (A first version only marked the entry: the release then found no document to raise and the version was lost: key missing at the first live
+    /// member, item Q row doc_repair 0.3, 5/2/3 seed 1.) ASSUMED: the receiver settles after a held apply, as the doc_hold route does.
+    pub fn write_repair_marks(&mut self, w: &mut World) {
+        for i in std::mem::take(&mut self.repair_marks_pending) {
+            if !self.cv.has(i) {
+                let e = w.ent_rc(i);
+                self.take_hold(w, &e);
+                w.stats.bump("repair_marks_written");
+            }
         }
     }
 
@@ -429,6 +442,7 @@ impl Member {
             w.stats.bump("route_carries_q6_kind");
             self.inv.insert("route_carries_q6_kind");
         }
+        self.write_repair_marks(w);
         true
     }
 

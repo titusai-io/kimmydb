@@ -524,6 +524,23 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
             m.check_inv(&w);
         }
         note_vector_flag(&ms, &mut w);
+        if let Ok(spec) = std::env::var("Q6_DEBUG_DOC") {
+            // debug aid (item Q, F2): `phys,key`: every live member's version of that document after every step
+            let (p, k) = spec.split_once(',').unwrap();
+            let k: u32 = k.parse().unwrap();
+            let line: Vec<String> = ms
+                .iter()
+                .filter(|m| !m.vanished)
+                .map(|m| {
+                    format!(
+                        "{}={:?}",
+                        m.name,
+                        m.phys.get(p).and_then(|ph| ph.docs.get(&k)).map(|v| v.stamp.hlc)
+                    )
+                })
+                .collect();
+            eprintln!("DOC step {step}: {}", line.join(" "));
+        }
     }
     // D10 measured without side effects when the steps end (member-runs still refusing, every cause)
     count_open_refusals(&mut w, &ms, false);
