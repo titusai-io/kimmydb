@@ -615,12 +615,13 @@ mod tests {
                         crate::run::run_grid_classified("v6", &cfgs, 0, seeds, threads());
                     let p = s.problems();
                     eprintln!(
-                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; HB-2 excluded (runs) {}; classes (runs) {:?}; UNCLASSIFIED runs {}; problems {:?}",
+                        "{policy:?} doc_hold {doc_hold} doc_repair {doc_repair} f {f}: {} runs; doc_hold_taken {} doc_repair {} out-of-position register events {}; HB-2 excluded (runs) {}; O8 shape inside HB-2 (runs) {}; classes (runs) {:?}; UNCLASSIFIED runs {}; problems {:?}",
                         s.runs,
                         s.get("cnt_doc_hold_taken"),
                         s.get("cnt_doc_repair"),
                         s.get("cnt_register_event_out_of_position"),
                         s.get("cnt_hb2_excluded"),
+                        s.get("cnt_o8_in_hb2"),
                         classes,
                         residual.len(),
                         p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
@@ -638,6 +639,8 @@ mod tests {
                     assert_eq!(s.get("cnt_route_carries_q6_kind"), 0);
                     assert_eq!(s.get("inv_route_carries_q6_kind"), 0);
                     *totals.entry("HB-2 excluded".into()).or_insert(0) += s.get("cnt_hb2_excluded");
+                    *totals.entry("O8 shape inside HB-2".into()).or_insert(0) +=
+                        s.get("cnt_o8_in_hb2");
                     for (k, v) in classes {
                         *totals.entry(k).or_insert(0) += v;
                     }

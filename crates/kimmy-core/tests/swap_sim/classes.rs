@@ -220,61 +220,125 @@ mod tests {
         }
     }
 
-    /// Debug aid: the O8 scan of the document-policy product grid (`Q6_O8_RUNS` seeds per configuration, default 20 as the asserted
-    /// grid): per row, the runs with the marker `cnt_o8`, the runs with the marker AND `alive_mismatch`, every other `alive_mismatch`
-    /// run, and the (config, route, f, seed) of each marker run.
+    /// Debug aid: the O8 scan of the document-policy product grid over the seeds `Q6_O8_FROM..Q6_O8_FROM+Q6_O8_RUNS` (defaults 0 and
+    /// 20, the asserted grid's size), one row per `Q6_O8_ROW` (`h` doc_hold, `r` doc_repair, `b` both; default `hrb`) and
+    /// `Q6_O8_F` (default `0.3,0.1`): per row the runs, the runs with `cnt_o8` (outside HB-2), with `cnt_o8_in_hb2`, with
+    /// `alive_mismatch`, the marker runs with a mismatch, and the (config, seed) of each marker run. The reference size is 1,500
+    /// seeds over the 36 configurations (54,000 runs per row), chunked by seed range to bound a heavy-lock hold.
     #[test]
-    #[ignore = "debug aid: Q6_O8_RUNS=<seeds> prints the O8 counts per row of the document-policy product grid"]
+    #[ignore = "debug aid: Q6_O8_FROM / Q6_O8_RUNS / Q6_O8_ROW / Q6_O8_F select the O8 scan of the document-policy product grid"]
     fn scan_o8() {
-        let seeds: u64 = std::env::var("Q6_O8_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-        for (dh, dr) in [(true, false), (false, true), (true, true)] {
-            for f in [0.3, 0.1] {
-                let (mut runs, mut marker, mut both, mut other_am) = (0, 0, 0, 0);
-                let mut hits: Vec<String> = Vec::new();
-                for &m in &[2usize, 3, 4, 5] {
-                    for &o in &[1usize, 2, 3] {
-                        for &k in &[3usize, 4, 5] {
-                            for seed in 0..seeds {
-                                let r = run_product("v6", Policy::Document, (m, o, k), dh, dr, f, seed, false);
-                                runs += 1;
-                                let mk = r.res["cnt_o8"] != 0;
-                                let am = r.res["alive_mismatch"] != 0;
-                                marker += mk as u32;
-                                both += (mk && am) as u32;
-                                other_am += (am && !mk) as u32;
+        let ev = |k: &str, d: &str| std::env::var(k).unwrap_or(d.to_string());
+        let from: u64 = ev("Q6_O8_FROM", "0").parse().unwrap();
+        let seeds: u64 = ev("Q6_O8_RUNS", "20").parse().unwrap();
+        let rows = ev("Q6_O8_ROW", "hrb");
+        let fs: Vec<f64> =
+            ev("Q6_O8_F", "0.3,0.1").split(',').map(|x| x.parse().unwrap()).collect();
+        for row in rows.chars() {
+            let (dh, dr) = match row {
+                'h' => (true, false),
+                'r' => (false, true),
+                _ => (true, true),
+            };
+            for &f in &fs {
+                let mut cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+                for c in cfgs.iter_mut() {
+                    c.routes = Some(crate::run::Routes {
+                        f,
+                        hold: false,
+                        repair: false,
+                        doc_hold: dh,
+                        doc_repair: dr,
+                    });
+                }
+                let jobs: Vec<(crate::run::Cfg, u64)> =
+                    cfgs.iter().flat_map(|c| (from..from + seeds).map(move |s| (*c, s))).collect();
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let out =
+                    std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64, 0u64, Vec::<String>::new()));
+                let nth = std::thread::available_parallelism().map_or(4, |n| n.get());
+                std::thread::scope(|sc| {
+                    for _ in 0..nth {
+                        sc.spawn(|| {
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= jobs.len() {
+                                    break;
+                                }
+                                let (c, s) = jobs[i];
+                                let r = crate::run::run("v6", "v6", s, c, false);
+                                let (mk, ih, am) = (
+                                    r.res["cnt_o8"] != 0,
+                                    r.res["cnt_o8_in_hb2"] != 0,
+                                    r.res["alive_mismatch"] != 0,
+                                );
+                                let mut o = out.lock().unwrap();
+                                o.0 += mk as u64;
+                                o.1 += ih as u64;
+                                o.2 += am as u64;
+                                o.3 += (mk && am) as u64;
+                                o.4 += 1;
                                 if mk {
-                                    hits.push(format!("({m},{o},{k}) seed {seed} am {am} stages {}", r.res["cnt_o8_stages"]));
+                                    o.5.push(format!(
+                                        "({},{},{}) seed {s} am {am}",
+                                        c.members, c.outs, c.keys
+                                    ));
                                 }
                             }
-                        }
+                        });
                     }
-                }
+                });
+                let (mk, ih, am, both, runs, mut hits) = out.into_inner().unwrap();
+                hits.sort();
                 eprintln!(
-                    "O8 SCAN doc_hold {dh} doc_repair {dr} f {f}: runs {runs} marker {marker} marker+alive_mismatch {both} other alive_mismatch {other_am}; {hits:?}"
+                    "O8 SCAN row {row} f {f} seeds {from}..{}: runs {runs}; cnt_o8 (outside HB-2) {mk}; cnt_o8_in_hb2 {ih}; alive_mismatch {am}; marker+mismatch {both}; {hits:?}",
+                    from + seeds
                 );
             }
         }
     }
 
-    /// Debug aid: the HB-2r seeds with the HB-2 exclusion off: the problems, the alive mismatch and the O8 marker (which leaves
-    /// HB-2's stages out, so it is computed here on an empty set).
+    /// O8 (open design finding, FIX-1's consequence; `oracle::product_classes`): a live member keeps alive a vanished writer's stage
+    /// that the oracle buries, because the writer's only non-lost entries above the stage's deadline are held out of position at
+    /// live members and none is covered. The HB-2r seeds (101 and 730) show the shape inside HB-2's stages. Pinned in two
+    /// configurations (the manager's ruling): DEFAULT (HB-2 exclusion on): the run is clean, `cnt_o8_in_hb2 >= 1`, `cnt_o8 == 0`,
+    /// `cnt_hb2_excluded == 1`; EXCLUSION OFF: the run's `alive_mismatch` and `oracle_state` appear, the marker `cnt_o8` fires (the
+    /// HB-2 set is empty then) and every problem is classified O8, none unclassified.
     #[test]
-    #[ignore = "debug aid: prints the HB-2r seeds with the HB-2 exclusion off"]
-    fn show_hb2r_exclusion_off() {
+    fn o8_pin_the_uncovered_witness_shape_on_the_hb2r_seeds_inside_and_outside_the_exclusion() {
         for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "HB-2r") {
-            let on = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            assert!(
+                nonzero_problems(&r).is_empty(),
+                "{cls} seed {seed} {mok:?}: {:?}",
+                nonzero_problems(&r)
+            );
+            assert!(
+                r.res["cnt_o8_in_hb2"] >= 1,
+                "seed {seed} {mok:?}: the shape inside HB-2 is gone"
+            );
+            assert_eq!(r.res["cnt_o8"], 0, "seed {seed} {mok:?}");
+            assert_eq!(r.res["cnt_hb2_excluded"], 1, "seed {seed} {mok:?}");
             let mut c = crate::run::product_cfg(pol, mok, dh, dr, f);
             c.hb2_exclusion = false;
             let off = crate::run::run("v6", "v6", seed, c, false);
+            let (classes, residual) = classes_of(&off, pol);
+            let p = nonzero_problems(&off);
             eprintln!(
-                "{cls} seed {seed} {mok:?}: exclusion ON excluded {} hb2_stages {} o8 {}; OFF problems {:?} o8 {} o8_stages {}",
-                on.res["cnt_hb2_excluded"],
-                on.res["cnt_hb2_stages"],
-                on.res["cnt_o8"],
-                nonzero_problems(&off),
-                off.res["cnt_o8"],
-                off.res["cnt_o8_stages"]
+                "{cls} seed {seed} {mok:?}, exclusion off: problems {p:?} classes {classes:?} residual {residual:?}"
             );
+            for k in ["alive_mismatch", "oracle_state"] {
+                assert!(
+                    p.iter().any(|x| x == k),
+                    "seed {seed} {mok:?}: {k} expected with the exclusion off: {p:?}"
+                );
+            }
+            assert!(
+                off.res["cnt_o8"] == 1 && off.res["cnt_o8_stages"] > 0,
+                "seed {seed} {mok:?}: marker"
+            );
+            assert!(classes.contains(&"O8"), "seed {seed} {mok:?}: {classes:?}");
+            assert!(residual.is_empty(), "seed {seed} {mok:?}: unclassified {residual:?}");
         }
     }
 
