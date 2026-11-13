@@ -255,6 +255,41 @@ fn append_in_position(mode: &str) -> (bool, bool, bool) {
     (appended, partial, serving == stage)
 }
 
+/// Review F3 (the shape 6e found): a write by ANOTHER origin, stamped above the stage's valid binding, addressed to the stage physical,
+/// arriving in position at a member that knows no binding and is superseded on arrival by a newer version held out of position.
+/// S-bind (no origin clause) appends it; S-bind-origin must not. Returns (the write is appended at X, X holds the newer version).
+fn other_origin_write_above_the_binding(mode: &str) -> (bool, bool) {
+    let mut sc = Sc::new(mode, &[("W", 0), ("S", 0), ("X", 0)], 60);
+    sc.advance(1);
+    let seed = sc.ms[0].local_doc(&mut sc.w, 5, DocOp::Insert).unwrap();
+    for m in ["S", "X"] {
+        sc.pull(m, "W");
+    }
+    sc.advance(10);
+    let mut jw = sc.ms[0].start_out(&mut sc.w, vec![0], JobKind::Good, 0);
+    let stage = jw.stage.clone();
+    // X learns the stage's creation (and nothing of the binding): W's entries up to the creation only
+    let creates: Vec<EntryRef> =
+        sc.w.all.iter().filter(|e| e.kind == Kind::Create && e.phys == stage).cloned().collect();
+    sc.advance(12);
+    sc.ms[0].do_bind(&mut sc.w, &mut jw, 5);
+    sc.advance(13);
+    sc.pull("S", "W"); // S knows the binding and serves the stage
+    sc.advance(30);
+    let k1 = sc.ms[1].local_doc(&mut sc.w, 0, DocOp::Update).unwrap(); // a post-flip write into the output, above the binding
+    sc.advance(31);
+    let k2 = sc.ms[1].local_doc(&mut sc.w, 0, DocOp::Update).unwrap(); // a newer version of the same key
+    assert!(k1.stamp > jw.digest[0].1 && k2.stamp > k1.stamp);
+    for c in &creates {
+        sc.take("X", c); // X knows the stage's creation, no binding
+    }
+    assert!(sc.ms[2].phys.contains_key(&stage));
+    sc.take("X", &k2); // the newer version, held out of position
+    sc.window("X", "S", &k1); // the older write arrives in position: superseded on arrival
+    let _ = seed;
+    (sc.ms[2].appended.contains(&k1.idx), sc.ms[2].holds(k2.idx))
+}
+
 /// Item R / build item (a), seed 1251's shape: A holds B's bind as information (route 3, a parked bind); B's rows arrive in position,
 /// so the bind is RELEASED (covered, served); a snapshot R takes from A right then. With `m-release-without-effect` the bind takes
 /// effect at A only at a later settle, so the snapshot carries the coverage without the event, and R covers the writer past the bind
@@ -756,6 +791,22 @@ mod tests {
         let (recs, problems) = late_delete_only_as_state(&format!("{pre}m-snap-delete-bare"));
         assert_eq!(recs, vec![false, false, false]);
         assert!(!problems.is_empty());
+    }
+
+    /// Review F3: the negative case that tells S-bind from S-bind-origin. The shape is built with the REJECTED trigger as the control (it
+    /// appends the write, so the scenario can see the difference) and the ruled trigger must not.
+    #[test]
+    fn rule_s_does_not_append_another_origins_write_above_the_binding_at_a_member_that_knows_no_binding()
+     {
+        let (appended, held) = other_origin_write_above_the_binding("v6");
+        assert!(held, "the setup: X holds the newer version");
+        assert!(!appended, "S-bind-origin appended another origin's write to a stage physical");
+        let (appended, held) = other_origin_write_above_the_binding("m-s-bind-any-origin");
+        assert!(held, "the setup: X holds the newer version");
+        assert!(
+            appended,
+            "the scenario does not distinguish S-bind from S-bind-origin: it is vacuous"
+        );
     }
 
     fn the_mid_join_append_in_position_rule_under(pre: &str) {
