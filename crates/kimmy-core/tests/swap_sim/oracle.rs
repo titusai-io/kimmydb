@@ -1016,8 +1016,6 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "dead_page_versions_retained",
         "snap_completed",
         "join_superseded",
-        "gap1_nonstaging_candidates",
-        "gap1_nonstaging_not_appended",
         "join_restarted_dead_sender",
         "dead_sender_join_waiting",
         "dead_sender_join_open_at_end",
