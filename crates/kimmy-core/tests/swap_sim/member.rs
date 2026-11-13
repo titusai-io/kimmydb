@@ -278,6 +278,15 @@ impl Member {
         }
     }
 
+    /// DF: holds the entry in a way the product would (served, retained, held out of position or as information); a witnessed-only
+    /// entry is covered but not held
+    pub fn holds_strict(&self, id: EntryId) -> bool {
+        self.appended.contains(&id)
+            || self.dochist.contains(&id)
+            || self.held_oop.contains(&id)
+            || self.info.contains_key(&id)
+            || self.loss_info.contains_key(&id)
+    }
     pub fn holds(&self, id: EntryId) -> bool {
         self.cv.has(id)
     }
