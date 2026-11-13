@@ -59,7 +59,20 @@ impl Member {
     /// ADR-224: `src` refuses a window below a row it holds only as a COMPLETED snapshot's state.
     pub fn take_from(&mut self, w: &mut World, src: &Member, e: &EntryRef, quiesce: bool) -> Taken {
         // ADR-169: an entry held as state that arrives in a window contiguous from the receiver's position is released
-        let release = w.held_uncovered && self.held_oop.contains(&e.idx);
+        let mut release = w.held_uncovered && self.held_oop.contains(&e.idx);
+        if release
+            && !w.f.fm_release_behind_held
+            && w.by_origin[e.origin]
+                .iter()
+                .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                .any(|x| self.held_oop.contains(x))
+        {
+            // ADR-169: a window releases a mark only when it is contiguous from the receiver's position; an earlier entry of the
+            // origin still held here keeps this one held (the vector must not rise over a hold: the step check
+            // `vector_disagrees_with_prefix`, seeds 25, 138, 154 of the 250-seed grid). `m-release-behind-held` is the old behaviour
+            release = false;
+            w.stats.bump("release_blocked_behind_held");
+        }
         if self.cv.has(e.idx) && !release {
             return Taken::AlreadyHeld;
         }
