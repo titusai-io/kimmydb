@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use kimmy_core::merge_state::{JoinOptions, Path};
 
-use crate::entry::{Entry, EntryId, EntryRef, Kind, Stamp};
+use crate::entry::{Entry, EntryId, EntryRef, Kind, Stamp, Ver};
 use crate::flags::Flags;
 use crate::rng::Rng;
 
@@ -75,6 +75,12 @@ pub struct World {
     /// B2: the members' coverage predicate reads their `VectorCoverage` (the product's per-origin maximum) instead of the prefix;
     /// the vector is kept in every run, and compared with the prefix by the step check `vector_disagrees_with_prefix`
     pub vector_cov: bool,
+    /// DF measurements (off by default; `Cfg::strict_holders`, `Cfg::state_survives`): a member HOLDS an entry only if it appended,
+    /// retained or holds it out of position / as information (a witnessed-only entry is not held), and the oracle's served state
+    /// counts a document version held as state on a live member (`state_versions`) as surviving
+    pub strict_holders: bool,
+    pub state_survives: bool,
+    pub state_versions: Vec<(String, u32, Ver)>,
     pub steps_end: i64,
     /// replay hooks: the page order and the tombstone choice the traced model drew (consumed by the next call)
     pub forced_pages: Option<Vec<String>>,
@@ -122,6 +128,9 @@ impl World {
             held_uncovered: false,
             hb2_exclusion: true,
             vector_cov: false,
+            strict_holders: false,
+            state_survives: false,
+            state_versions: Vec::new(),
             steps_end: 0,
             forced_pages: None,
             forced_choice: None,

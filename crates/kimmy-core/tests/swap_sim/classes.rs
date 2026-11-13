@@ -342,6 +342,92 @@ mod tests {
         }
     }
 
+    /// The DF measurement switches from the environment: `Q6_DF_FLAGS` is a comma list of `strict` (a witnessed-only entry is not
+    /// held), `survive` (the oracle counts a version held as state as surviving) and `repair` (an end-of-run round of scoped repairs).
+    fn df_flags(c: &mut crate::run::Cfg) {
+        let v = std::env::var("Q6_DF_FLAGS").unwrap_or_default();
+        c.strict_holders = v.split(',').any(|x| x == "strict");
+        c.state_survives = v.split(',').any(|x| x == "survive");
+        c.end_repair = v.split(',').any(|x| x == "repair");
+    }
+
+    /// Debug aid (DF items): the missing-head seeds (Field 336, 1361, 1365, 1046; Document 858) under `Q6_DF_FLAGS`, with the
+    /// problems and classes of each.
+    #[test]
+    #[ignore = "debug aid: Q6_DF_FLAGS=strict,survive,repair selects the DF measurement switches"]
+    fn show_df_missing_head_seeds() {
+        let rows: [(&str, Policy, (usize, usize, usize), bool, bool, f64, u64); 5] = [
+            ("O-F1", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
+            ("O-F1", Policy::Field, (4, 2, 5), true, false, 0.3, 1361),
+            ("O-F1", Policy::Field, (3, 2, 3), false, true, 0.1, 1365),
+            ("O-F1", Policy::Field, (4, 3, 5), false, true, 0.1, 1046),
+            ("DOC-858", Policy::Document, (4, 3, 4), true, false, 0.3, 858),
+        ];
+        for (cls, pol, mok, dh, dr, f, seed) in rows {
+            let mut c = crate::run::product_cfg(pol, mok, dh, dr, f);
+            df_flags(&mut c);
+            let r = crate::run::run("v6", "v6", seed, c, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!(
+                "DF {cls} {pol:?} {mok:?} seed {seed} flags {:?}: problems {:?} classes {classes:?} residual {residual:?}",
+                std::env::var("Q6_DF_FLAGS").unwrap_or_default(),
+                nonzero_problems(&r)
+            );
+        }
+    }
+
+    /// Debug aid (DF items): the document-policy product grid over seeds `Q6_DF_FROM..+Q6_DF_RUNS` (defaults 0 and 20) for the rows
+    /// `Q6_DF_ROW` (`h`, `r`, `b`; default `hrb`) and `Q6_DF_F` (default `0.3,0.1`), under `Q6_DF_FLAGS`; `Q6_DF_POLICY=field`
+    /// switches the policy. Prints, per row, the runs, the problems (runs) and the named classes.
+    #[test]
+    #[ignore = "debug aid: Q6_DF_FROM / Q6_DF_RUNS / Q6_DF_ROW / Q6_DF_F / Q6_DF_FLAGS / Q6_DF_POLICY select the DF grid measurement"]
+    fn scan_df() {
+        let ev = |k: &str, d: &str| std::env::var(k).unwrap_or(d.to_string());
+        let from: u64 = ev("Q6_DF_FROM", "0").parse().unwrap();
+        let seeds: u64 = ev("Q6_DF_RUNS", "20").parse().unwrap();
+        let pol =
+            if ev("Q6_DF_POLICY", "doc") == "field" { Policy::Field } else { Policy::Document };
+        let fs: Vec<f64> =
+            ev("Q6_DF_F", "0.3,0.1").split(',').map(|x| x.parse().unwrap()).collect();
+        for row in ev("Q6_DF_ROW", "hrb").chars() {
+            let (dh, dr) = match row {
+                'h' => (true, false),
+                'r' => (false, true),
+                _ => (true, true),
+            };
+            for &f in &fs {
+                let mut cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+                for c in cfgs.iter_mut() {
+                    c.policy = pol;
+                    c.routes = Some(crate::run::Routes {
+                        f,
+                        hold: false,
+                        repair: false,
+                        doc_hold: dh,
+                        doc_repair: dr,
+                    });
+                    df_flags(c);
+                }
+                let (s, classes, residual) = crate::run::run_grid_classified(
+                    "v6",
+                    &cfgs,
+                    from,
+                    seeds,
+                    std::thread::available_parallelism().map_or(4, |n| n.get()),
+                );
+                eprintln!(
+                    "DF SCAN {pol:?} row {row} f {f} seeds {from}..{} flags {:?}: runs {}; problems {:?}; classes {classes:?}; unclassified {}; {:?}",
+                    from + seeds,
+                    ev("Q6_DF_FLAGS", ""),
+                    s.runs,
+                    s.problems().iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>(),
+                    residual.len(),
+                    &residual[..residual.len().min(12)]
+                );
+            }
+        }
+    }
+
     /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
     #[test]
     #[ignore = "debug aid: Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed prints one product-route run"]

@@ -253,6 +253,17 @@ pub fn oracle(w: &mut World) -> Oracle {
             }
         }
     }
+    // DF-2 (b): a version that survives as STATE on a live member counts as surviving (the entry may be lost with its writer)
+    if w.state_survives
+        && w.policy == Policy::Document
+        && let Some(h) = &head
+    {
+        for (ph, k, v) in w.state_versions.iter() {
+            if ph == h && docs.get(k).is_none_or(|c| v.stamp > c.stamp) {
+                docs.insert(*k, v.clone());
+            }
+        }
+    }
     let served: BTreeMap<u32, Ver> = docs.into_iter().filter(|(_, v)| v.body.is_some()).collect();
     let late = |e: &Entry, events: &[EntryRef]| -> bool {
         let Some(b) = birth.get(&e.phys) else { return false };
@@ -1016,6 +1027,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "dead_page_versions_retained",
         "snap_completed",
         "join_superseded",
+        "end_repairs",
         "join_restarted_dead_sender",
         "dead_sender_join_waiting",
         "dead_sender_join_open_at_end",

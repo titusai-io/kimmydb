@@ -43,6 +43,12 @@ pub struct Cfg {
     /// further page (the product reads pages from the sender); every live member with such a join restarts it with `supersede_join`
     /// from a random live eligible peer, after each action and during the end-of-run delivery
     pub restart_joins: bool,
+    /// DF measurements: `strict_holders` (a witnessed-only entry is not held), `state_survives` (the oracle counts a version held as
+    /// state on a live member as surviving) and `end_repair` (an end-of-run round of pairwise scoped repairs among the live members,
+    /// the product's divergence repair, before the verdicts)
+    pub strict_holders: bool,
+    pub state_survives: bool,
+    pub end_repair: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -88,6 +94,9 @@ impl Cfg {
             hb2_exclusion: true,
             vector_cov: false,
             restart_joins: false,
+            strict_holders: false,
+            state_survives: false,
+            end_repair: false,
         }
     }
 }
@@ -206,6 +215,8 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.held_uncovered = cfg.routes.is_some_and(|rt| rt.doc_hold || rt.doc_repair);
     w.hb2_exclusion = cfg.hb2_exclusion;
     w.vector_cov = cfg.vector_cov;
+    w.strict_holders = cfg.strict_holders;
+    w.state_survives = cfg.state_survives;
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
@@ -491,8 +502,17 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     for &i in &live {
         finish_joins(&mut ms, i, &mut w, cfg.restart_joins);
     }
-    w.lost =
-        w.all.iter().filter(|e| !live.iter().any(|&i| ms[i].holds(e.idx))).map(|e| e.idx).collect();
+    let strict = w.strict_holders;
+    w.lost = w
+        .all
+        .iter()
+        .filter(|e| {
+            !live
+                .iter()
+                .any(|&i| if strict { ms[i].holds_strict(e.idx) } else { ms[i].holds(e.idx) })
+        })
+        .map(|e| e.idx)
+        .collect();
     for _ in 0..12 {
         for &i in &live {
             finish_joins(&mut ms, i, &mut w, cfg.restart_joins);
@@ -512,6 +532,38 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         {
             break;
         }
+    }
+    if cfg.end_repair {
+        // the state-repair round: every live member is repaired from every other (scoped repairs: pages of document state, no grant)
+        for _ in 0..2 {
+            for &d in &live {
+                for &s in &live {
+                    if d == s {
+                        continue;
+                    }
+                    let (dm, sm) = pair(&mut ms, d, s);
+                    if dm.scoped_repair(&mut w, sm) {
+                        w.stats.bump("end_repairs");
+                    }
+                    while ms[d].join.is_some() {
+                        land_page_in(&mut ms, d, &mut w);
+                    }
+                }
+            }
+            for &i in &live {
+                ms[i].settle(&mut w);
+            }
+        }
+    }
+    if w.state_survives {
+        w.state_versions =
+            live.iter()
+                .flat_map(|&i| {
+                    ms[i].phys.iter().filter(|(_, p)| p.alive).flat_map(|(n, p)| {
+                        p.docs.iter().map(move |(k, v)| (n.clone(), *k, v.clone()))
+                    })
+                })
+                .collect();
     }
     w.k_final = true;
     for &i in &live {
