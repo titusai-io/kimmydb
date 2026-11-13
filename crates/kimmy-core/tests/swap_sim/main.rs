@@ -111,6 +111,37 @@ mod tests {
         assert_eq!(res["true_late_writes_allowed"], 1);
     }
 
+    /// `m-visible-newest` is EQUIVALENT to the base under rule B (N2, the review's reasoning, here RUN): an event enters the register
+    /// list only once covered and coverage is monotone, so the newest-applicable scan never sees an uncovered event. Asserted: on
+    /// the whole base grid (and the product routes) the mutant's results equal the base's, run for run, for every counter and check.
+    #[test]
+    fn m_visible_newest_is_equivalent_to_the_base_under_rule_b() {
+        let seeds = env_u64("Q6_EQUIV_RUNS", 20);
+        for routes in [false, true] {
+            for c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
+                let mut c = c;
+                if routes {
+                    c.routes = Some(crate::run::Routes {
+                        f: 0.3,
+                        hold: false,
+                        repair: false,
+                        doc_hold: true,
+                        doc_repair: true,
+                    });
+                }
+                for seed in 0..seeds {
+                    let a = crate::run::run("v6", "v6", seed, c, false);
+                    let b = crate::run::run("m-visible-newest", "v6", seed, c, false);
+                    assert_eq!(
+                        a.res, b.res,
+                        "routes {routes} {}/{}/{} seed {seed}",
+                        c.members, c.outs, c.keys
+                    );
+                }
+            }
+        }
+    }
+
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
     /// restarted from a live eligible peer (the product cannot complete a join from a dead member). The base grid and the
     /// product-route grid (document policy) stay clean (every problem classified), and the mode is not vacuous: joins are restarted.
@@ -395,9 +426,13 @@ mod tests {
         }
         let base_runs = env_u64("Q6DIFF_RUNS", 36).to_string();
         let dir = trace_dir("random", "random", &["--mode", "v6", "--count", &base_runs]);
-        let mutant_runs = env_u64("Q6DIFF_MUTANT_RUNS", 0);
+        // (default 3 per mutant, N3/L: the default sample includes mutant traces; `Q6DIFF_MUTANT_RUNS=0` turns them off)
+        let mutant_runs = env_u64("Q6DIFF_MUTANT_RUNS", 3);
         if mutant_runs > 0 {
-            for m in crate::flags::MUTANTS.iter().filter(|m| **m != "m-stale-src") {
+            for m in crate::flags::MUTANTS
+                .iter()
+                .filter(|m| !crate::flags::RUST_ONLY_MUTANTS.contains(m))
+            {
                 let st = std::process::Command::new("systemd-run")
                     .args([
                         "--user",
