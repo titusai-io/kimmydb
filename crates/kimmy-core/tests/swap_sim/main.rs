@@ -930,12 +930,21 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6b.py")).unwrap();
         let got6b: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got6b, record, "swapmodel6b.py");
-        let tracer = "4e999f68aac8622bdf32aaf5413f1b9aa616806d0732ee5f90192191a6f1ad04";
+        let tracer = "98bbaaea4e963543b2278a83afeefe9ad9410eb439e852958b1106ef507d6476";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");
+        let m6d = "409eb9d10f35682c3857b4e9e8adad32caa343576425a8a192f02c799a7db6fe";
+        let bytes = std::fs::read(dir.join("swapmodel6d.py")).unwrap();
+        let got6d: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got6d, m6d, "swapmodel6d.py");
         let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-        assert!(recorded.contains(want) && recorded.contains(tracer) && recorded.contains(record));
+        assert!(
+            recorded.contains(want)
+                && recorded.contains(tracer)
+                && recorded.contains(record)
+                && recorded.contains(m6d)
+        );
     }
 
     /// The model's seed-fixed run is deterministic: the same seed gives the same figures (the harness' own PRNG).
