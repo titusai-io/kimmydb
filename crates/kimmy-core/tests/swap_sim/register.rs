@@ -228,7 +228,9 @@ impl Member {
             // yet in `held_oop`, as its witness above a deadline). `m-held-entry-witnesses-the-deadline` keeps the old order.
             self.held_oop.insert(e.idx);
             self.pos_hold = true;
+            self.holding = Some(e.idx);
             self.take(w, e);
+            self.holding = None;
             self.pos_hold = false;
             if self.held_oop.contains(&e.idx) {
                 self.appended.remove(&e.idx);

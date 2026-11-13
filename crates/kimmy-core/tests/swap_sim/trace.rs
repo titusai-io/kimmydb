@@ -25,13 +25,17 @@ pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "s
 /// The counters of the Rust-only emulations (the route tests' live page read, `Repair::Replay`, the push, the product routes' held
 /// entries and DF-1's marker): the model has none of them, so they are left out of the counter comparison (they count, they decide
 /// nothing the model decides).
-pub const RUST_ONLY_STATS: [&str; 6] = [
+pub const RUST_ONLY_STATS: [&str; 10] = [
     "page_drop_information_only",
     "replay_entries",
     "push_without_window",
     "push_carries_q6_kind_out_of_position",
-    "held_kept_unservable",
     "df1_loser_superseded_by_uncovered",
+    "gap1_nonstaging_candidates",
+    "gap1_nonstaging_not_appended",
+    "join_restarted_dead_sender",
+    "dead_sender_join_waiting",
+    "dead_sender_join_open_at_end",
 ];
 
 /// FNV-1a over entry ids (each id + 1 is one input): the tracer's `fnv`.
@@ -576,12 +580,17 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                         // its sender does not cover) is the harness' `page_carries_held_state`
                         let k = if w.held_uncovered && k == "page_above_coverage" {
                             "page_carries_held_state"
+                        } else if w.held_uncovered && k == "hb1_held_not_appended" {
+                            // HB-1 removed: the model counts an entry held out of position that an apply had appended
+                            "held_kept_unservable"
                         } else {
                             k
                         };
                         (k.to_string(), p[1].as_i64().unwrap())
                     })
                     .collect();
+                // the page counter is compared as present or absent (the model counts a snapshot's pages, the harness the versions)
+                let mut py = py;
                 let rs: BTreeMap<String, i64> = w
                     .stats
                     .0
@@ -594,6 +603,14 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     })
                     .map(|(k, v)| (k.clone(), *v))
                     .collect();
+                let mut rs = rs;
+                if w.held_uncovered {
+                    for m in [&mut py, &mut rs] {
+                        if let Some(v) = m.get_mut("page_carries_held_state") {
+                            *v = 1;
+                        }
+                    }
+                }
                 if py != rs {
                     let keys: BTreeSet<&String> = py.keys().chain(rs.keys()).collect();
                     let d: Vec<String> = keys
@@ -622,11 +639,33 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     }
                 };
                 let mut bad = Vec::new();
+                // the product routes' mapping: a model run whose only invariant is `page_above_coverage` has no invariant here
+                let only_page_inv = w.held_uncovered
+                    && py.contains_key("inv_page_above_coverage")
+                    && !py
+                        .keys()
+                        .any(|k| k.starts_with("inv_") && k.as_str() != "inv_page_above_coverage");
                 for (k, v) in &py {
                     if k.starts_with("inv_") {
                         continue;
                     }
-                    let got = r.get(&rename(k)).copied().unwrap_or(0);
+                    if only_page_inv && k == "invariant" {
+                        continue;
+                    }
+                    // the product routes: the model has no HB-2 exclusion, so its stamp-order replay verdict is the harness' RAW one
+                    // (before the exclusion); the exclusion must then be counted (`cnt_hb2_excluded`) wherever the two differ
+                    let key = if w.held_uncovered && k == "div_replay_stamp_order" {
+                        "raw_div_replay".to_string()
+                    } else {
+                        rename(k)
+                    };
+                    let got = r.get(&key).copied().unwrap_or(0);
+                    if key == "raw_div_replay"
+                        && got != r.get("div_replay").copied().unwrap_or(0)
+                        && r.get("cnt_hb2_excluded").copied().unwrap_or(0) == 0
+                    {
+                        bad.push("div_replay differs from its raw verdict without a counted HB-2 exclusion".to_string());
+                    }
                     if got != *v {
                         bad.push(format!("{k}: python {v} <> rust {got}"));
                     }
