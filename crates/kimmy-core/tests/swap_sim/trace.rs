@@ -72,14 +72,17 @@ fn doc_layer_view(ms: &[Member]) -> String {
                 )
             })
             .collect();
-        let loss: Vec<String> = m.loss.keys().map(|k| format!("{k:?}")).collect();
+        let mut loss: Vec<String> = m.loss.keys().map(|k| format!("{k:?}")).collect();
+        loss.sort();
+        let mut emitted: Vec<String> = m.events_emitted.iter().map(|x| format!("{x:?}")).collect();
+        emitted.sort();
+        let mut inv: Vec<String> = m.inv.iter().map(|x| x.to_string()).collect();
+        inv.sort();
         out.push_str(&format!(
-            "{}|v{}|{:?}|{docs:?}|{loss:?}|ev{:?}|inv{:?};",
+            "{}|v{}|{:?}|{docs:?}|{loss:?}|ev{emitted:?}|inv{inv:?};",
             m.name,
             m.vanished,
-            m.serving(),
-            m.events_emitted,
-            m.inv
+            m.serving()
         ));
     }
     out
