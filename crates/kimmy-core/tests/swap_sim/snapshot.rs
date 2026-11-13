@@ -348,12 +348,13 @@ impl Member {
         // R1: the scoped repair carries none of the Q6 kinds: the receiver's creates, abandons, register, burials and
         // visible event are what they were
         let before = self.q6_surface();
-        let pages: Vec<String> = pl
+        let mut pages: Vec<String> = pl
             .phys
             .iter()
             .filter(|(n, pd)| pd.alive && self.phys.get(*n).is_some_and(|p| p.alive && !p.missing))
             .map(|(n, _)| n.clone())
             .collect();
+        pages.sort(); // (the model lands the pages in the order of `sorted(...)`, from the end)
         if pages.is_empty() {
             return false;
         }
