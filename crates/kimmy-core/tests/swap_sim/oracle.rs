@@ -324,6 +324,9 @@ pub type Res = BTreeMap<String, i64>;
 ///   by a version it does not cover (`cnt_df1_loser_superseded_by_uncovered`); explains `inv_partial_flip`.
 /// - `DF-2` (open design finding, convergence): a live member holds state above its coverage behind a permanently lost entry on a
 ///   physical outside HB-2's set (`cnt_df2_held_above_coverage_behind_lost`); explains the divergence and oracle-state checks.
+/// - `O8` (open design finding, FIX-1's consequence): a live member keeps alive a vanished writer's stage that the oracle buries,
+///   because the writer's only non-lost entries above the stage's deadline are held out of position at live members and none is
+///   covered (`cnt_o8`, `cnt_o8_stages`); explains `alive_mismatch` and `oracle_state`.
 /// - `O-F1` (open item, `field` only; the model of record has no field policy): `q7_records_diverged`, and a missing head with its
 ///   record/event-count invariants. Printed and counted, never passed silently.
 ///
@@ -349,6 +352,10 @@ pub fn product_classes(res: &Res, field: bool) -> (Vec<&'static str>, Vec<String
     if on("cnt_df2_held_above_coverage_behind_lost") && df2_keys.iter().any(|k| on(k)) {
         classes.push("DF-2");
         explained.extend(df2_keys);
+    }
+    if on("cnt_o8") && (on("alive_mismatch") || on("oracle_state")) {
+        classes.push("O8");
+        explained.extend(["alive_mismatch", "oracle_state"]);
     }
     if field
         && ["q7_records_diverged", "loss_missing", "inv_head_not_exactly_one_record_and_event"]
@@ -590,6 +597,36 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         }
     }
     res.insert("cnt_df2_held_above_coverage_behind_lost".into(), df2);
+    // O8's structural marker (an open design finding, FIX-1's consequence): a live member keeps alive a vanished writer's stage
+    // that the oracle buries, and the writer's only non-lost entries above the stage's deadline are held out of position at live
+    // members, none of them a covered witness at this member. Defined from the members' states and the write log, never from
+    // the mismatch itself (the reference is `o8count.py`); HB-2's stages are left out, their mismatch is excluded by name
+    let mut o8_stages = 0;
+    for &i in &live {
+        let m = &ms[i];
+        for (n, p) in m.phys.iter() {
+            if !p.alive || p.kind != PKind::Stage || o.alive.contains(n) || hb2.contains(n) {
+                continue;
+            }
+            let Some(cr) = m.creates.get(n) else { continue };
+            if !ms[cr.origin].vanished {
+                continue;
+            }
+            let above: Vec<EntryId> = w.by_origin[cr.origin]
+                .iter()
+                .copied()
+                .filter(|&id| w.ent(id).hlc > cr.dl && !w.lost.contains(&id))
+                .collect();
+            if above.iter().any(|&id| m.cv.has(id) && !m.held_oop.contains(&id)) {
+                continue;
+            }
+            if above.iter().any(|&id| live.iter().any(|&j| ms[j].held_oop.contains(&id))) {
+                o8_stages += 1;
+            }
+        }
+    }
+    res.insert("cnt_o8_stages".into(), o8_stages);
+    res.insert("cnt_o8".into(), (o8_stages > 0) as i64);
     let replay_bad = |st: &State, recs: &HashSet<HeadKey>, m0: &State| {
         *st != *m0
             || heads.iter().any(|h| !recs.contains(h))
