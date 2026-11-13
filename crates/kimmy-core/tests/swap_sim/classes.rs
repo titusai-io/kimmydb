@@ -220,6 +220,64 @@ mod tests {
         }
     }
 
+    /// Debug aid: the O8 scan of the document-policy product grid (`Q6_O8_RUNS` seeds per configuration, default 20 as the asserted
+    /// grid): per row, the runs with the marker `cnt_o8`, the runs with the marker AND `alive_mismatch`, every other `alive_mismatch`
+    /// run, and the (config, route, f, seed) of each marker run.
+    #[test]
+    #[ignore = "debug aid: Q6_O8_RUNS=<seeds> prints the O8 counts per row of the document-policy product grid"]
+    fn scan_o8() {
+        let seeds: u64 = std::env::var("Q6_O8_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        for (dh, dr) in [(true, false), (false, true), (true, true)] {
+            for f in [0.3, 0.1] {
+                let (mut runs, mut marker, mut both, mut other_am) = (0, 0, 0, 0);
+                let mut hits: Vec<String> = Vec::new();
+                for &m in &[2usize, 3, 4, 5] {
+                    for &o in &[1usize, 2, 3] {
+                        for &k in &[3usize, 4, 5] {
+                            for seed in 0..seeds {
+                                let r = run_product("v6", Policy::Document, (m, o, k), dh, dr, f, seed, false);
+                                runs += 1;
+                                let mk = r.res["cnt_o8"] != 0;
+                                let am = r.res["alive_mismatch"] != 0;
+                                marker += mk as u32;
+                                both += (mk && am) as u32;
+                                other_am += (am && !mk) as u32;
+                                if mk {
+                                    hits.push(format!("({m},{o},{k}) seed {seed} am {am} stages {}", r.res["cnt_o8_stages"]));
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "O8 SCAN doc_hold {dh} doc_repair {dr} f {f}: runs {runs} marker {marker} marker+alive_mismatch {both} other alive_mismatch {other_am}; {hits:?}"
+                );
+            }
+        }
+    }
+
+    /// Debug aid: the HB-2r seeds with the HB-2 exclusion off: the problems, the alive mismatch and the O8 marker (which leaves
+    /// HB-2's stages out, so it is computed here on an empty set).
+    #[test]
+    #[ignore = "debug aid: prints the HB-2r seeds with the HB-2 exclusion off"]
+    fn show_hb2r_exclusion_off() {
+        for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "HB-2r") {
+            let on = run_product("v6", pol, mok, dh, dr, f, seed, false);
+            let mut c = crate::run::product_cfg(pol, mok, dh, dr, f);
+            c.hb2_exclusion = false;
+            let off = crate::run::run("v6", "v6", seed, c, false);
+            eprintln!(
+                "{cls} seed {seed} {mok:?}: exclusion ON excluded {} hb2_stages {} o8 {}; OFF problems {:?} o8 {} o8_stages {}",
+                on.res["cnt_hb2_excluded"],
+                on.res["cnt_hb2_stages"],
+                on.res["cnt_o8"],
+                nonzero_problems(&off),
+                off.res["cnt_o8"],
+                off.res["cnt_o8_stages"]
+            );
+        }
+    }
+
     /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
     #[test]
     #[ignore = "debug aid: Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed prints one product-route run"]
