@@ -1287,6 +1287,8 @@ mod tests {
                 "m-snap-no-loss-records",
                 "m-snap-delete-bare",
                 "m-snap-no-orphan-burials",
+                // killed by the scripted rule-B scenario (`rule_b_a_held_bind_is_information_until_covered`), not by the random grid
+                "m-d10-ignores-info",
             ];
             let unexpected: Vec<&&str> =
                 survivors.iter().filter(|m| !allowed_survivors.contains(m)).collect();
