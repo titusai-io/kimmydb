@@ -736,6 +736,47 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             || heads.iter().any(|h| !recs.contains(h))
             || recs.iter().any(|r| !allowed.contains(r))
     };
+    if std::env::var("Q6_DEBUG_REPLAY").is_ok() {
+        // debug aid (item Q, F2): why a replica disagrees with the first live member
+        for (n, (st, recs)) in replays.iter().enumerate() {
+            eprintln!(
+                "REPLAY {n}: state differs {} | heads missing {:?} | records not allowed {:?}\n  replica {:?}\n  member0 {:?}",
+                *st != m0state,
+                heads.iter().filter(|h| !recs.contains(h)).collect::<Vec<_>>(),
+                recs.iter().filter(|r| !allowed.contains(r)).collect::<Vec<_>>(),
+                "(see the first difference below)",
+                "-"
+            );
+            if let Ok(h) = std::env::var("Q6_DEBUG_HLC") {
+                let h: i64 = h.parse().unwrap();
+                for x in w.all.iter().filter(|x| x.hlc == h) {
+                    for &i in &live {
+                        let m = &ms[i];
+                        eprintln!(
+                            "  ENTRY {x} idx {} at {}: cv {} appended {} held_oop {} dochist {} recv {} info {} hist_kept {}",
+                            x.idx,
+                            m.name,
+                            m.cv.has(x.idx),
+                            m.appended.contains(&x.idx),
+                            m.held_oop.contains(&x.idx),
+                            m.dochist.contains(&x.idx),
+                            m.recv_entry.contains(&x.idx),
+                            m.info.contains_key(&x.idx),
+                            m.hist_kept.contains(&x.idx)
+                        );
+                    }
+                }
+            }
+            let (a, b) = (format!("{st:?}"), format!("{m0state:?}"));
+            let p = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            let lo = p.saturating_sub(120);
+            eprintln!(
+                "  first difference at char {p}:\n  replica ...{}\n  member0 ...{}",
+                &a[lo..(p + 160).min(a.len())],
+                &b[lo..(p + 160).min(b.len())]
+            );
+        }
+    }
     let div_replay_raw = replays.iter().any(|(st, recs)| replay_bad(st, recs, &m0state));
     let div_replay = replays.iter().any(|(st, recs)| replay_bad(&without(st, &hb2), recs, &m0p));
     let states_differ_raw = live.iter().any(|&i| ms[i].state() != m0state);
