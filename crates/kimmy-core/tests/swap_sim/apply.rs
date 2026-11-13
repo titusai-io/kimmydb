@@ -296,6 +296,7 @@ impl Member {
         if w.policy == Policy::Field {
             return self.apply_doc_field(w, e);
         }
+        let was_appended = self.appended.contains(&e.idx);
         let cur = p.docs.get(&e.key).map(|c| c.stamp);
         let wins = cur.is_none_or(|c| e.stamp >= c); // an equal stamp is the same entry, held as a snapshot's state
         let held_state = p.missing
@@ -315,9 +316,31 @@ impl Member {
             // servable, no change to the document
             self.appended.insert(e.idx);
             w.stats.bump("appended_in_position");
+        } else if f.staged_row && e.staging && !self.held_oop.contains(&e.idx) {
+            // rule S (the v2.6 staged-row rule): a staging entry arriving in position, superseded on arrival by a version held here
+            // (whatever its origin or coverage), is appended and served onward; no change to the document. Never a held (or
+            // held-then-deferred) entry
+            self.appended.insert(e.idx);
+            w.stats.bump("staged_row_appended");
         } else if e.origin != self.id {
             self.dochist.remove(&e.idx); // superseded on arrival: witnessed, not in the product's oplog, never served
             w.stats.bump("lww_losers_not_kept");
+        }
+        // S1's NEGATIVE case (the manager's rule S trigger ruling): an ordinary write (not a staging write) arriving in position at a
+        // physical that was created as a stage, e.g. a post-flip write of another origin, that is superseded on arrival by a version held
+        // here (not gap 1) is NOT appended by rule S: the design text is the staging write of the stage's own job, not every entry
+        // addressed to a stage physical. Counted (non-vacuity) and checked (`rule_s_negative_appended` must stay 0)
+        if !wins
+            && !held_state
+            && !e.staging
+            && !self.held_oop.contains(&e.idx)
+            && self.phys.get(&e.phys).is_some_and(|p| p.kind == PKind::Stage)
+        {
+            w.stats.bump("rule_s_negative_cases");
+            if !was_appended && self.appended.contains(&e.idx) {
+                w.stats.bump("rule_s_negative_appended");
+                self.inv.insert("rule_s_appended_a_non_staging_write");
+            }
         }
         // gap 1's NON-STAGING half (the manager's 6d-delta ruling, `coder-gap1-check.py`): a non-staging document entry that arrives in
         // position on a live physical and is superseded ONLY by a record held as an unfinished snapshot's state is appended (servable
@@ -346,6 +369,7 @@ impl Member {
     /// is appended iff the join changed the state, or (the gap-1 analogue) iff the state of an unfinished join's pages
     /// already covers it; the covered-entry skip decides "witnessed only" before the join.
     fn apply_doc_field(&mut self, w: &mut World, e: &EntryRef) {
+        let was_appended = self.appended.contains(&e.idx);
         let f = w.f;
         let p = self.phys.get(&e.phys).expect("the physical is alive here");
         let cur_stamp = p.docs.get(&e.key).map(|v| v.stamp);
@@ -394,9 +418,32 @@ impl Member {
         } else if f.append_in_position && a.held_state {
             self.appended.insert(e.idx);
             w.stats.bump("appended_in_position");
+        } else if f.staged_row && e.staging && !self.held_oop.contains(&e.idx) {
+            // rule S on the `field` policy too: an UNMODELLED EXTENSION (the Python model is `document`-only, open item O6; the manager
+            // confirmed it because the design text is about the staged row, not the merge policy, and leaving it off reopened an
+            // unclassified partial flip, Field 5/1/5 doc_hold+doc_repair 0.3 seed 5). A staging entry arriving in position that
+            // changes nothing here is appended and served onward. Its only evidence is the field grid at gate size (`classes.rs`)
+            self.appended.insert(e.idx);
+            w.stats.bump("staged_row_appended");
         } else if e.origin != self.id {
             self.dochist.remove(&e.idx); // unchanged on arrival: witnessed, not in the oplog, never served
             w.stats.bump("lww_losers_not_kept");
+        }
+        // S1's negative case on the field policy (see `apply_doc_decide`): an ordinary write that changes nothing here, at a physical
+        // created as a stage, is not appended by rule S
+        if !a.changed
+            && !a.same_write
+            && !a.held_state
+            && !e.staging
+            && !was_appended
+            && !self.held_oop.contains(&e.idx)
+            && self.phys.get(&e.phys).is_some_and(|p| p.kind == PKind::Stage)
+        {
+            w.stats.bump("rule_s_negative_cases");
+            if self.appended.contains(&e.idx) {
+                w.stats.bump("rule_s_negative_appended");
+                self.inv.insert("rule_s_appended_a_non_staging_write");
+            }
         }
     }
 

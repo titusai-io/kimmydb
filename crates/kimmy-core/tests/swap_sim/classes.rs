@@ -158,25 +158,95 @@ mod tests {
         crate::oracle::product_classes(&r.res, pol == Policy::Field)
     }
 
-    /// PIN of DF-1 (open design finding, UNDER REVIEW: atomicity, a partial flip on the product-shaped document routes: a member
-    /// treats as a loser an entry superseded only by a version it does not cover). The class must OCCUR on each listed seed, with
-    /// nothing else unexplained. This pin FAILS LOUDLY once the class disappears: when the design rule lands, convert it to a
-    /// required-zero (and drop DF-1 from `oracle::product_classes`, so the grid fails on it).
+    /// DF-1 is REQUIRED-ZERO with rule S (v2.6, the staged-row rule, `swapmodel6d.py:833-838`): on each seed that pinned the open finding
+    /// (a partial flip on the product-shaped document routes: a member treated as a loser an entry superseded only by a version it
+    /// does not cover) the run is now clean, no run is classified DF-1 (the class is gone from `oracle::product_classes`, so the grid
+    /// fails on a partial flip), and the mutant `m-staged-row-off` brings the partial flip back on every one of them (it kills the
+    /// rule). The DF-1 counter `cnt_df1_loser_superseded_by_uncovered` still counts the structural marker.
     #[test]
-    fn df1_pin_the_partial_flip_class_occurs_on_its_seeds() {
+    fn df1_is_required_zero_with_rule_s_and_the_partial_flip_returns_without_it() {
         for &(cls, pol, mok, dh, dr, f, seed) in B1_SEEDS.iter().filter(|s| s.0 == "DF-1") {
             let r = run_product("v6", pol, mok, dh, dr, f, seed, false);
             let (classes, residual) = classes_of(&r, pol);
             eprintln!(
-                "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: classes {classes:?} residual {residual:?}"
-            );
-            assert!(
-                classes.contains(&"DF-1"),
-                "DF-1 DISAPPEARED at seed {seed} {mok:?} dh {dh} dr {dr} f {f}: convert this pin to a required-zero and drop the \
-                 class from oracle::product_classes ({:?})",
+                "{cls} seed {seed} {mok:?} dh {dh} dr {dr} f {f}: classes {classes:?} residual {residual:?} problems {:?}",
                 nonzero_problems(&r)
             );
+            assert!(
+                !nonzero_problems(&r).iter().any(|k| k == "inv_partial_flip"),
+                "DF-1 is back at seed {seed} {mok:?} dh {dh} dr {dr} f {f}"
+            );
             assert!(residual.is_empty(), "seed {seed}: unexplained {residual:?}");
+            let m = run_product("m-staged-row-off", pol, mok, dh, dr, f, seed, false);
+            assert!(
+                nonzero_problems(&m).iter().any(|k| k == "inv_partial_flip"),
+                "the rule is not needed at seed {seed} {mok:?} dh {dh} dr {dr} f {f}: m-staged-row-off stays clean"
+            );
+        }
+    }
+
+    /// S1's NEGATIVE case: rule S is about the staging write of the stage's own job. An ordinary write arriving in position at a physical
+    /// created as a stage (e.g. a post-flip write of another origin), superseded on arrival by a version held here, is NOT appended by
+    /// the rule. Non-vacuous (the cases occur on the product routes) and never violated; the mutant is the rule applied to every entry
+    /// addressed to a stage physical, which the check names (`inv_rule_s_appended_a_non_staging_write`) is not reachable from the model's
+    /// own trigger, so the check is a structural assertion of the trigger
+    #[test]
+    fn rule_s_does_not_append_an_ordinary_write_to_a_stage_physical() {
+        let (mut cases, mut bad) = (0i64, 0i64);
+        for (dh, dr) in [(true, false), (false, true), (true, true)] {
+            for m in [3usize, 4] {
+                for seed in 0..60u64 {
+                    let r =
+                        run_product("v6", Policy::Document, (m, 2, 4), dh, dr, 0.3, seed, false);
+                    cases += r.res.get("cnt_rule_s_negative_cases").copied().unwrap_or(0);
+                    bad += r.res.get("cnt_rule_s_negative_appended").copied().unwrap_or(0);
+                }
+            }
+        }
+        assert!(cases > 0, "vacuous: no ordinary write superseded on arrival at a stage physical");
+        assert_eq!(bad, 0, "rule S appended an ordinary write at a stage physical in {bad} runs");
+    }
+
+    /// Rule S on the `field` policy is an UNMODELLED extension (the Python model is `document`-only, open item O6): its only evidence is
+    /// the field product-route grid at gate size: no partial flip with the rule, partial flips without it (`m-staged-row-off`).
+    /// `Q6_FIELDS_RUNS` (default 250) seeds x 36 configurations; doc_hold and both routes at f 0.3.
+    #[test]
+    #[ignore = "gate size: 250 seeds x 36 configurations, field policy"]
+    fn rule_s_on_the_field_policy_no_partial_flip_with_it_and_flips_without_it() {
+        let seeds = crate::env_u64("Q6_FIELDS_RUNS", 250);
+        for (dh, dr) in [(true, false), (true, true)] {
+            let mut cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+            for c in cfgs.iter_mut() {
+                *c = {
+                    let mut n = crate::run::product_cfg(
+                        Policy::Field,
+                        (c.members, c.outs, c.keys),
+                        dh,
+                        dr,
+                        0.3,
+                    );
+                    n.policy = Policy::Field;
+                    n
+                };
+            }
+            let on = crate::run::run_grid("v6", "v6", &cfgs, 0, seeds, 4);
+            let off = crate::run::run_grid("m-staged-row-off", "v6", &cfgs, 0, seeds, 4);
+            eprintln!(
+                "FIELD GRID dh {dh} dr {dr}: {} runs: inv_partial_flip with rule S {} / without {}; rule S appended {} rows",
+                seeds * 36,
+                on.get("inv_partial_flip"),
+                off.get("inv_partial_flip"),
+                on.get("cnt_staged_row_appended")
+            );
+            assert_eq!(
+                on.get("inv_partial_flip"),
+                0,
+                "a partial flip with rule S on the field policy (dh {dh} dr {dr})"
+            );
+            assert!(
+                off.get("inv_partial_flip") > 0,
+                "the rule is not needed on the field policy (dh {dh} dr {dr})"
+            );
         }
     }
 

@@ -764,11 +764,23 @@ mod tests {
         assert!(!partial, "A flips with k");
         assert!(flipped);
         let (appended, partial, _) = append_in_position(&format!("{pre}m-no-append-in-position"));
-        assert!(!appended);
-        assert!(
-            partial,
-            "without the rule A witnesses the entry without receiving it and flips without k"
-        );
+        {
+            // RULE S (v2.6): on both policies a staged row arriving in position is appended whatever gap 1 does, so gap 1's
+            // mutant alone is EQUIVALENT here (the model's verdict change, REPORT8): the staged-row half is subsumed
+            assert!(appended, "rule S appends the staged row although gap 1 is off");
+            assert!(!partial);
+            let (appended, partial, _) = append_in_position(&format!("{pre}m-staged-row-off"));
+            assert!(appended, "gap 1 appends it although rule S is off");
+            assert!(!partial);
+            // the REQUIRED kill: both off
+            let (appended, partial, _) =
+                append_in_position(&format!("{pre}m-no-append-in-position+m-staged-row-off"));
+            assert!(!appended);
+            assert!(
+                partial,
+                "with gap 1 and rule S both off A witnesses the entry without receiving it and flips without k"
+            );
+        }
     }
 
     fn a_join_is_resumed_only_from_its_own_sending_peer_under(pre: &str) {

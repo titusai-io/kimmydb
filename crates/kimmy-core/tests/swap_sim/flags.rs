@@ -36,6 +36,11 @@ pub struct Flags {
     pub record_per_minter: bool,
     pub pending_dedup: bool,
     pub append_in_position: bool,
+    /// RULE S (v2.6, `swapmodel6d.py:833-838`): a STAGING write (written by the stage's own job into its stage physical before the bind)
+    /// that arrives in position on a live physical and is superseded on arrival by a version held here, whatever that version's origin
+    /// or coverage, is appended and served onward; never a held (or held-then-deferred) entry. On in `v6` (off-switch `Q6_STAGEDROW=0`,
+    /// mutant `m-staged-row-off`); a replay takes the switch from the trace header
+    pub staged_row: bool,
     pub snap_versions_as_entries: bool,
     pub snap_delete_bare: bool,
     pub ignored_not_served: bool,
@@ -255,6 +260,7 @@ pub fn base(name: &str) -> Option<Flags> {
         "v5" => {}
         "v6" => {
             f.rule_b = true;
+            f.staged_row = std::env::var("Q6_STAGEDROW").as_deref() != Ok("0");
             f.grant_prefix = true;
             f.dead_page_retained = true;
             f.loss_in_position = true;
@@ -301,6 +307,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
             f.register_grant_filter = false;
         }
         "m-no-append-in-position" => f.append_in_position = false,
+        "m-staged-row-off" => f.staged_row = false,
         "m-snap-delete-bare" => f.snap_delete_bare = true,
         "m-ignored-event-not-served" => f.ignored_not_served = true,
         "m-no-defer-received" => f.defer_received = false,
