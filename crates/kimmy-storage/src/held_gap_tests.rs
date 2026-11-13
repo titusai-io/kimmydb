@@ -179,3 +179,67 @@ fn a_grant_releases_every_mark_it_covers_so_the_sweep_has_nothing_to_judge_after
     );
     assert!(c.held_marks_covered_by(&c.witnessed_vector().unwrap()).unwrap().is_empty());
 }
+
+/// The superseder is a DELETE. A delete stands as a tombstone record under the key in `DOCS` (the same table a live
+/// version lives in), so it supersedes the held insert exactly as a replace does: the mark is dropped, not asked for.
+#[test]
+fn a_delete_that_superseded_the_held_entry_drops_its_mark_too() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let creation = a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    b.apply_batch(&creation.entries).unwrap();
+    c.apply_batch(&creation.entries).unwrap();
+    let coll_a = a.get_collection("shop", "orders").unwrap();
+    let coll_c = c.get_collection("shop", "orders").unwrap();
+    later();
+    let id1 = a.insert(&coll_a, doc! { "_id": 1, "v": 1 }).unwrap();
+    later();
+    assert!(a.delete(&coll_a, &id1).unwrap());
+    later();
+    let id2 = a.insert(&coll_a, doc! { "_id": 2, "v": 3 }).unwrap();
+    let all = a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    let after: Vec<_> = all
+        .entries
+        .iter()
+        .filter(|e| e.stamp > creation.entries.last().unwrap().stamp)
+        .cloned()
+        .collect();
+    assert_eq!(after.len(), 3, "premise: insert d1, delete d1, insert d2");
+    let (earlier, delete, last) = (after[0].clone(), after[1].clone(), after[2].clone());
+
+    b.apply_batch(std::slice::from_ref(&delete)).unwrap();
+    b.apply_batch(std::slice::from_ref(&earlier)).unwrap();
+    b.apply_batch(std::slice::from_ref(&last)).unwrap();
+    assert!(
+        b.oplog_entry(&earlier.stamp).unwrap().is_none(),
+        "premise: the sender witnessed it away"
+    );
+
+    c.apply_held_for_test(&coll_c, &earlier).unwrap();
+    c.apply_held_for_test(&coll_c, &last).unwrap();
+    assert_eq!(c.held_len().unwrap(), 2, "premise: two marks");
+
+    let window = b.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+    assert!(
+        window.entries.iter().all(|e| e.stamp != earlier.stamp),
+        "premise: the window omits the insert"
+    );
+    c.apply_peer_batch(
+        &b.witnessed_vector().unwrap(),
+        &window.entries,
+        window.scanned_to,
+        window.exhausted,
+    )
+    .unwrap();
+
+    assert_eq!(c.get(&coll_c, &id1).unwrap(), None, "the delete won");
+    assert_eq!(c.get(&coll_c, &id2).unwrap(), a.get(&coll_a, &id2).unwrap());
+    assert_eq!(
+        c.held_len().unwrap(),
+        0,
+        "the delete's tombstone superseded the held insert, so its mark is dropped"
+    );
+    assert!(c.held_marks_covered_by(&c.witnessed_vector().unwrap()).unwrap().is_empty());
+}
