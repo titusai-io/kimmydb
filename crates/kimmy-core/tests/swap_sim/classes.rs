@@ -228,7 +228,9 @@ mod tests {
     #[test]
     #[ignore = "debug aid: Q6_O8_FROM / Q6_O8_RUNS / Q6_O8_ROW / Q6_O8_F select the O8 scan of the document-policy product grid"]
     fn scan_o8() {
-        let ev = |k: &str, d: &str| std::env::var(k).unwrap_or(d.to_string());
+        let ev = |k: &str, d: &str| {
+            std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or(d.to_string())
+        };
         let from: u64 = ev("Q6_O8_FROM", "0").parse().unwrap();
         let seeds: u64 = ev("Q6_O8_RUNS", "20").parse().unwrap();
         let rows = ev("Q6_O8_ROW", "hrb");
@@ -382,7 +384,9 @@ mod tests {
     #[test]
     #[ignore = "debug aid: Q6_DF_FROM / Q6_DF_RUNS / Q6_DF_ROW / Q6_DF_F / Q6_DF_FLAGS / Q6_DF_POLICY select the DF grid measurement"]
     fn scan_df() {
-        let ev = |k: &str, d: &str| std::env::var(k).unwrap_or(d.to_string());
+        let ev = |k: &str, d: &str| {
+            std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or(d.to_string())
+        };
         let from: u64 = ev("Q6_DF_FROM", "0").parse().unwrap();
         let seeds: u64 = ev("Q6_DF_RUNS", "20").parse().unwrap();
         let pol =
