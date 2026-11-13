@@ -61,6 +61,20 @@ impl Member {
     /// without receiving them, the earlier entries of `e`'s origin that `src` holds but did not append.
     /// ADR-224: `src` refuses a window below a row it holds only as a COMPLETED snapshot's state.
     pub fn take_from(&mut self, w: &mut World, src: &Member, e: &EntryRef, quiesce: bool) -> Taken {
+        let r = self.take_from_inner(w, src, e, quiesce);
+        if w.product_marks {
+            self.drop_superseded_covered_marks(w); // after each window (#313)
+        }
+        r
+    }
+
+    fn take_from_inner(
+        &mut self,
+        w: &mut World,
+        src: &Member,
+        e: &EntryRef,
+        quiesce: bool,
+    ) -> Taken {
         // ADR-169: an entry held as state that arrives in a window contiguous from the receiver's position is released
         let release = w.held_uncovered && self.held_oop.contains(&e.idx);
         if self.cv.has(e.idx) && !release {
@@ -116,7 +130,7 @@ impl Member {
             // the in-window release raises the vector (`release_held_in_position`) to the servable PREFIX: the model (6d, `take_from`)
             // releases the entry even behind a still-held earlier one, and its coverage stays below that hold. `m-release-behind-held`
             // raises the vector to the released entry over the hold (the old harness behaviour)
-            if w.f.fm_release_behind_held {
+            if w.f.fm_release_behind_held || w.product_marks {
                 self.raise(w, e.idx);
             } else {
                 self.raise_servable(w, e.origin);
@@ -134,6 +148,7 @@ impl Member {
         // decision of its apply. (A model/harness rule only: the product trusts the window's contiguity, engine.rs
         // `append_oplog_at` InWindow.) `behind` tells the apply that no vector is raised for it
         let behind_before = w.held_uncovered
+            && !w.product_marks
             && w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)
@@ -142,6 +157,7 @@ impl Member {
         self.take(w, e);
         self.pos_hold = false;
         let behind_now = w.held_uncovered
+            && !w.product_marks
             && w.by_origin[e.origin]
                 .iter()
                 .take_while(|&&x| w.ent(x).hlc < e.hlc)

@@ -38,6 +38,53 @@ pub const RUST_ONLY_STATS: [&str; 10] = [
     "dead_sender_join_open_at_end",
 ];
 
+thread_local! {
+    /// ITEM Q: while set, a replay does not compare with the model; it runs the events under the given `product_marks` setting and
+    /// pushes the DOCUMENT-LAYER view after every event (and the verdict at the end) into the vector.
+    pub static COLLECT: std::cell::RefCell<Option<(bool, Vec<String>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn collect_mode() -> Option<bool> {
+    COLLECT.with(|c| c.borrow().as_ref().map(|x| x.0))
+}
+
+fn collect_push(line: String) {
+    COLLECT.with(|c| {
+        if let Some((_, v)) = c.borrow_mut().as_mut() {
+            v.push(line);
+        }
+    });
+}
+
+/// The document-layer outcome of every member: what it serves, the documents of its alive physicals, its loss records, the events it
+/// emitted, its invariants. Bookkeeping (held sets, coverage, the vector, `appended`) is NOT in it.
+fn doc_layer_view(ms: &[Member]) -> String {
+    let mut out = String::new();
+    for m in ms {
+        let docs: Vec<String> = m
+            .phys
+            .iter()
+            .map(|(n, p)| {
+                format!(
+                    "{n}:{}:{:?}",
+                    p.alive,
+                    p.docs.iter().map(|(k, v)| (*k, v.stamp, v.body.is_some())).collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        let loss: Vec<String> = m.loss.keys().map(|k| format!("{k:?}")).collect();
+        out.push_str(&format!(
+            "{}|v{}|{:?}|{docs:?}|{loss:?}|ev{:?}|inv{:?};",
+            m.name,
+            m.vanished,
+            m.serving(),
+            m.events_emitted,
+            m.inv
+        ));
+    }
+    out
+}
+
 /// FNV-1a over entry ids (each id + 1 is one input): the tracer's `fnv`.
 pub fn fnv<I: IntoIterator<Item = usize>>(ids: I) -> u64 {
     let mut x: u64 = 1469598103934665603;
@@ -379,6 +426,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     // 6d: the product routes (`doc_hold`, `doc_repair`) hold entries out of position and do not cover them
     let routes = head["routes"].as_str().unwrap_or("");
     w.held_uncovered = routes.contains("doc_hold") || routes.contains("doc_repair");
+    if let Some(on) = collect_mode() {
+        w.product_marks = on;
+        w.vector_cov = on;
+    }
     // (the in-order check of register events stays off on every route run)
     if rmode != ReplayMode::Document {
         if rmode == ReplayMode::FieldExact {
@@ -415,6 +466,9 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         if ev["k"] == "check_inv" {
             let i = idx(ev["m"].as_str().unwrap());
             ms[i].check_inv(&w);
+            if collect_mode().is_some() {
+                continue;
+            }
             let rs: Vec<&&str> = ms[i].inv.iter().collect();
             if json!(rs) != ev["inv"] {
                 return Err(format!(
@@ -431,6 +485,46 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         let n0 = w.all.len();
         let kind = ev["k"].as_str().unwrap();
         let s = |k: &str| ev[k].as_str().unwrap().to_string();
+        if collect_mode().is_some() && (kind == "pre_finish" || kind == "final") {
+            if kind == "pre_finish" && w.quiescing {
+                crate::run::count_open_refusals(&mut w, &ms, true);
+            }
+            if kind == "final" {
+                let r = finish(&mut w, &mut ms);
+                let keep = [
+                    "diverged",
+                    "div_state",
+                    "div_loss",
+                    "div_replay",
+                    "oracle_state",
+                    "served_mismatch",
+                    "alive_mismatch",
+                    "loss_mismatch",
+                    "loss_missing",
+                    "loss_extra",
+                    "heads_required",
+                    "cnt_o8",
+                    "cnt_o8_in_hb2",
+                    "cnt_hb2_excluded",
+                    "inv_partial_flip",
+                ];
+                let v: Vec<String> = keep
+                    .iter()
+                    .map(|k| format!("{k}={}", r.get(*k).copied().unwrap_or(0)))
+                    .collect();
+                collect_push(format!("FINAL {}", v.join(",")));
+                // bookkeeping, NOT part of the comparison: held marks left, entries served, marks dropped by the product rule
+                let live: Vec<&Member> = ms.iter().filter(|m| !m.vanished).collect();
+                collect_push(format!(
+                    "BOOK held_oop={} appended={} dropped={} released_in_window={}",
+                    live.iter().map(|m| m.held_oop.len()).sum::<usize>(),
+                    live.iter().map(|m| m.appended.len()).sum::<usize>(),
+                    w.stats.get("marks_dropped_superseded"),
+                    w.stats.get("held_released_in_window")
+                ));
+            }
+            continue;
+        }
         let res: Value = match kind {
             "local" => {
                 let m = idx(&s("m"));
@@ -714,6 +808,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
             }
             other => return Err(fail(format!("unknown event kind {other}"))),
         };
+        if collect_mode().is_some() {
+            collect_push(format!("{kind} {res} {}", doc_layer_view(&ms)));
+            continue;
+        }
         if kind != "final" && kind != "pre_finish" && kind != "lost" {
             let mut diffs: Vec<String> = Vec::new();
             if matches!(

@@ -206,7 +206,7 @@ impl Member {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
                 // released in position: the vector rises to the servable prefix (the model's coverage never passes a hold)
-                if w.f.fm_release_behind_held {
+                if w.f.fm_release_behind_held || w.product_marks {
                     self.vc.raise(e.origin, e.hlc);
                 } else {
                     self.raise_servable(w, e.origin);
@@ -216,6 +216,35 @@ impl Member {
             }
         }
         released_event
+    }
+
+    /// ITEM Q, #313 (`drop_superseded_covered_marks`, engine.rs): after a window, drop every held mark of a DOCUMENT entry that the
+    /// servable vector already covers for its origin and that is superseded at its key by the state now held there (live or a
+    /// tombstone). The entry is history: nothing is raised, no document changes. A covered mark whose entry is NOT superseded is a gap
+    /// and stays. Returns how many.
+    pub fn drop_superseded_covered_marks(&mut self, w: &mut World) -> usize {
+        let ids: Vec<EntryId> = self.held_oop.iter().copied().collect();
+        let mut n = 0;
+        for i in ids {
+            let e = w.ent(i);
+            if e.kind != Kind::Doc || self.vc.max_of(e.origin) < e.hlc {
+                continue;
+            }
+            let superseded = self
+                .phys
+                .get(&e.phys)
+                .and_then(|p| p.docs.get(&e.key))
+                .is_some_and(|v| v.stamp > e.stamp);
+            if superseded {
+                self.held_oop.remove(&i);
+                self.retire_repair(i);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            w.stats.add("marks_dropped_superseded", n as i64);
+        }
+        n
     }
 
     /// The hold route: an entry held out of position: known (the register and the state see it), servable only once it is in
