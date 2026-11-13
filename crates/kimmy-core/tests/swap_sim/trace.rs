@@ -273,7 +273,7 @@ pub fn is_doc_layer(path: &str) -> bool {
         ".docs",
         ".loss",
         ".events_emitted",
-        ".appended_",
+        ".appended",
         ".held_",
         ".dochist",
         ".hist_kept",
