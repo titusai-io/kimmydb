@@ -765,6 +765,20 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     )
                     .unwrap();
                 }
+                if let Ok(path) = std::env::var("Q6DIFF_DF2OUT") {
+                    // item P's DF-2 same-trace check: the Rust structural marker of this trace (name, DF-2 marker count, DF-2r marker, HB-2 stages), one line per trace
+                    use std::io::Write;
+                    let mut f =
+                        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+                    writeln!(
+                        f,
+                        "{name}\t{}\t{}\t{}",
+                        r.get("cnt_df2_held_above_coverage_behind_lost").copied().unwrap_or(0),
+                        r.get("cnt_df2r").copied().unwrap_or(0),
+                        r.get("cnt_hb2_stages").copied().unwrap_or(0)
+                    )
+                    .unwrap();
+                }
                 let py: BTreeMap<String, i64> = ev["verdict"]
                     .as_array()
                     .unwrap()
