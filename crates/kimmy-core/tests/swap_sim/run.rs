@@ -143,6 +143,32 @@ fn finish_joins(ms: &mut [Member], i: usize, w: &mut World, restart: bool) {
     }
 }
 
+/// Debug (trace only): the first time a member's `vector_disagrees_with_prefix` step check is set, the log says where and why.
+fn note_vector_flag(ms: &[Member], w: &mut World) {
+    if !w.trace {
+        return;
+    }
+    for m in ms.iter().filter(|m| m.step_inv.contains("vector_disagrees_with_prefix")) {
+        let tag = format!("STEPCHECK vector_disagrees_with_prefix first seen at {}", m.name);
+        if w.log.iter().any(|l| l.contains(&tag)) {
+            continue;
+        }
+        let o = m.vector_prefix_disagreement(w);
+        let detail = o.map(|o| {
+            format!(
+                "origin {o}: prefix_len {} of {}, vc max {}, next-in-list hlc {:?}, held_oop {:?}, quiesce_witnessed {}",
+                m.cv.prefix_len(w, o),
+                w.by_origin[o].len(),
+                m.vc.max_of(o),
+                w.by_origin[o].get(m.cv.prefix_len(w, o)).map(|&i| w.ent(i).to_string()),
+                m.held_oop.iter().map(|&i| w.ent(i).to_string()).collect::<Vec<_>>(),
+                m.quiesce_witnessed
+            )
+        });
+        w.note(format!("{tag}: {detail:?} (the check no longer disagrees now: {})", o.is_none()));
+    }
+}
+
 /// The model's D10 state counters: member-runs whose served physical is superseded by a known register event (any cause), when the
 /// steps end (`at_end` false) and at the end of the run, and those where the event is held as information.
 pub fn count_open_refusals(w: &mut World, ms: &[Member], at_end: bool) {
@@ -486,6 +512,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         for m in ms.iter_mut() {
             m.check_inv(&w);
         }
+        note_vector_flag(&ms, &mut w);
     }
     // D10 measured without side effects when the steps end (member-runs still refusing, every cause)
     count_open_refusals(&mut w, &ms, false);
@@ -570,6 +597,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         ms[i].settle(&mut w);
         ms[i].check_inv(&w);
     }
+    note_vector_flag(&ms, &mut w);
     count_open_refusals(&mut w, &ms, true); // ... and at the end of the run, after the end-of-run delivery
     let res = finish(&mut w, &mut ms);
     RunOut { res, w, ms }

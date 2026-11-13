@@ -344,6 +344,78 @@ mod tests {
         }
     }
 
+    /// The vector step check's finding at 250 seeds (`inv_vector_disagrees_with_prefix`, Document 3/1/4 seed 25 and 3/3/3 seed 138 with
+    /// `doc_hold`, 3/2/5 seed 154 with both routes, f 0.3): a window RELEASED a held mark although an earlier entry of the origin was
+    /// still held at the receiver, so the receiver's vector rose over a hold. ADR-169: a mark is released only by a window contiguous
+    /// from the receiver's position. Fixed in `take_from`; the mutant `m-release-behind-held` is the old behaviour. Pinned: clean
+    /// (nothing unexplained) with the fix, and the mutant trips the step check on each seed.
+    #[test]
+    fn a_window_does_not_release_a_mark_past_an_earlier_held_entry_seeds_25_138_154() {
+        let seeds: [((usize, usize, usize), bool, bool, u64); 3] = [
+            ((3, 1, 4), true, false, 25),
+            ((3, 3, 3), true, false, 138),
+            ((3, 2, 5), true, true, 154),
+        ];
+        for (mok, dh, dr, seed) in seeds {
+            let pol = Policy::Document;
+            let r = run_product("v6", pol, mok, dh, dr, 0.3, seed, false);
+            let (classes, residual) = classes_of(&r, pol);
+            eprintln!("seed {seed} {mok:?}: classes {classes:?} residual {residual:?}");
+            assert!(residual.is_empty(), "seed {seed} {mok:?}: unexplained {residual:?}");
+            assert!(
+                !nonzero_problems(&r).iter().any(|k| k == "inv_vector_disagrees_with_prefix"),
+                "seed {seed}: the vector step check fires"
+            );
+            let m = run_product("m-release-behind-held", pol, mok, dh, dr, 0.3, seed, false);
+            assert!(
+                nonzero_problems(&m).iter().any(|k| k == "inv_vector_disagrees_with_prefix"),
+                "seed {seed}: the mutant must trip the vector step check: {:?}",
+                nonzero_problems(&m)
+            );
+        }
+    }
+
+    /// GATE SIZE (the manager's ruling): the product-route grid at `Q6_GATE_RUNS` seeds (default 250) x 36 configurations on doc_hold
+    /// 0.3 and both routes 0.3, document policy, with every problem in a named class: 0 unclassified.
+    #[test]
+    #[ignore = "gate step: 250 seeds x 36 configs on two rows (set Q6_GATE_RUNS to change the size)"]
+    fn the_product_routes_at_gate_size_leave_nothing_unclassified() {
+        let seeds: u64 = std::env::var("Q6_GATE_RUNS")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250);
+        for (dh, dr) in [(true, false), (true, true)] {
+            let mut cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+            for c in cfgs.iter_mut() {
+                c.routes = Some(crate::run::Routes {
+                    f: 0.3,
+                    hold: false,
+                    repair: false,
+                    doc_hold: dh,
+                    doc_repair: dr,
+                });
+            }
+            let (s, classes, residual) = crate::run::run_grid_classified(
+                "v6",
+                &cfgs,
+                0,
+                seeds,
+                std::thread::available_parallelism().map_or(4, |n| n.get()),
+            );
+            eprintln!(
+                "GATE SIZE doc_hold {dh} doc_repair {dr}: {} runs; classes {classes:?}; unclassified {}",
+                s.runs,
+                residual.len()
+            );
+            assert!(
+                residual.is_empty(),
+                "unclassified at gate size: {:?}",
+                &residual[..residual.len().min(12)]
+            );
+        }
+    }
+
     /// The DF measurement switches from the environment: `Q6_DF_FLAGS` is a comma list of `strict` (a witnessed-only entry is not
     /// held), `survive` (the oracle counts a version held as state as surviving) and `repair` (an end-of-run round of scoped repairs).
     fn df_flags(c: &mut crate::run::Cfg) {
@@ -413,7 +485,7 @@ mod tests {
                     df_flags(c);
                 }
                 let (s, classes, residual) = crate::run::run_grid_classified(
-                    "v6",
+                    &ev("Q6_DF_MODE", "v6"),
                     &cfgs,
                     from,
                     seeds,
