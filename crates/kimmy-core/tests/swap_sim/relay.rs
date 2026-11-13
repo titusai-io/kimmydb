@@ -162,6 +162,9 @@ impl Member {
                 w.stats.bump("held_behind_held");
             } else {
                 self.held_oop.remove(&e.idx);
+                // the model's settle ran with the entry covered (it was never marked): a record or an event parked as information
+                // because of this entry's own mark takes effect now
+                self.settle(w);
             }
         }
         Taken::Received
