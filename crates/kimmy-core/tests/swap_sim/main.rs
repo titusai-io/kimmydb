@@ -143,12 +143,12 @@ mod tests {
     }
 
     /// M6: the Rust-only mutants of the product routes are KILLED on the product-route grid (document policy, doc_hold + doc_repair
-    /// f 0.3, `Q6_MUTROUTE_RUNS` seeds, default 40): H-Q6-R2 (a window delivers the highest stamp: not contiguous) and the release
+    /// f 0.3, `Q6_MUTROUTE_RUNS` seeds, default 250): H-Q6-R2 (a window delivers the highest stamp: not contiguous) and the release
     /// condition (a held entry released without its predecessors). And R4's grant gate: `m-snap-register-late` is equivalent to the
     /// base under rule B (the review), so its kill is REQUIRED in combination with rule B off.
     #[test]
     fn the_product_route_mutants_and_the_grant_gate_with_rule_b_off_are_killed() {
-        let seeds = env_u64("Q6_MUTROUTE_RUNS", 40);
+        let seeds = env_u64("Q6_MUTROUTE_RUNS", 250);
         let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
         for c in cfgs.iter_mut() {
             c.routes = Some(crate::run::Routes {
@@ -160,11 +160,7 @@ mod tests {
             });
         }
         let mut alive: Vec<&str> = Vec::new();
-        for m in crate::flags::PRODUCT_MUTANTS
-            .iter()
-            .copied()
-            .chain(["m-snap-register-late+m-rule-b-off"])
-        {
+        for m in crate::flags::PRODUCT_MUTANTS {
             let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
             let p = s.problems();
             eprintln!(
@@ -185,6 +181,28 @@ mod tests {
             }
         }
         assert!(alive.is_empty(), "not killed on the product-route grid: {alive:?}");
+        // R4's grant gate: the combination must be worse than rule B off alone (the mutant's own mechanism fires and its
+        // consequences add to the base's: more runs with a partial flip, a divergence or a served mismatch)
+        let off = run_grid("m-rule-b-off", "v6", &cfgs, 0, seeds, threads());
+        let both = run_grid("m-snap-register-late+m-rule-b-off", "v6", &cfgs, 0, seeds, threads());
+        let sum = |s: &crate::run::Summary| {
+            ["inv_partial_flip", "diverged", "served_mismatch", "inv_bury_without_newer_visible"]
+                .iter()
+                .map(|k| s.get(k))
+                .sum::<i64>()
+        };
+        eprintln!(
+            "rule B off alone: {} (read above grant {}); with the grant gate off: {} (read above grant {})",
+            sum(&off),
+            off.get("cnt_register_events_read_above_grant"),
+            sum(&both),
+            both.get("cnt_register_events_read_above_grant")
+        );
+        assert!(
+            both.get("cnt_register_events_read_above_grant") > 0,
+            "the gate-off mutant never reads above the grant"
+        );
+        assert!(sum(&both) > sum(&off), "the grant gate is not killed even with rule B off");
     }
 
     /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
