@@ -274,7 +274,8 @@ fn release_effect_twin(mode: &str) -> Vec<(String, i64)> {
     let create =
         sc.w.all.iter().find(|e| e.kind == Kind::Create && e.phys == job.stage).unwrap().clone();
     sc.window("A", "B", &create);
-    sc.take("A", &bind); // held out of position, before the rows: a parked bind
+    let a = sc.idx("A");
+    sc.ms[a].take_hold(&mut sc.w, &bind); // held out of position (OPLOG_HELD mark), before the rows: a parked bind
     sc.advance(14);
     sc.pull("A", "B"); // the rows arrive in position: the bind is released
     assert!(sc.snapshot("R", "A", false), "R joins from A between release and effect");
