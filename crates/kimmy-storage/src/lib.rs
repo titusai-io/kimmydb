@@ -84,6 +84,9 @@ mod converge_tests;
 mod definition_repair_tests;
 
 #[cfg(test)]
+mod held_gap_tests;
+
+#[cfg(test)]
 mod tombstone_horizon_tests;
 
 // The break-the-guard tests of the repair build's third review: the never-resurrect schedules

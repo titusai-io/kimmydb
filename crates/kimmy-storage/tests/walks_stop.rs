@@ -92,6 +92,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "engine::drop_superseded_covered_marks",
+        "inside a replicated window's write transaction, which does not stop (ADR-192): one row per held mark, the table `held_marks_covered_by` already reads whole on every pull (ADR-172); drops a mark only where the servable vector already covers it",
+    ),
+    (
         "backup::restore_with",
         "`kimmyd restore`, which writes a new store offline before any node opens it: the held marks are derived from the oplog it just wrote (ADR-244)",
     ),

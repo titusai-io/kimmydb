@@ -224,7 +224,10 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// being state: a completed snapshot's grant releases every stamp it covers, in
 /// the transaction that adopts it; the entry arriving in a window contiguous
 /// from this node's position releases it, whether that arrival appends the key
-/// or is superseded at it (ADR-169); retention collects the mark with the entry
+/// or is superseded at it (ADR-169); a window the vector has covered the entry through,
+/// when the entry is superseded at its key by a newer version, drops it (ADR-169's
+/// amendment of 2026-11-12: a sender omits an entry from a window only when it
+/// witnessed it as superseded); retention collects the mark with the entry
 /// it names; and a rewind removes it with the row it discards.
 ///
 /// **The table is not self-emptying, and it is worth being exact about when it
