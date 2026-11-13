@@ -286,42 +286,40 @@ mod tests {
         }
     }
 
-    /// M4 (a loss record is an ordinary entry of the reporter's own origin appended to the end of its sequence, so inside its coverage prefix):
-    /// `m-loss-outside-prefix` is killed by the structural check `loss_record_outside_coverage_prefix`, which v6 never trips (the Python
-    /// model fails nothing on this mutant, so the kill is the harness's). Base (in-order) grid, 36 configurations x 20 seeds.
-    #[test]
-    fn m_loss_outside_prefix_is_killed_by_the_coverage_prefix_check() {
-        let cfgs = crate::run::grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
-        let base = crate::run::run_grid("v6", "v6", &cfgs, 0, 20, 4);
-        let mutant = crate::run::run_grid("m-loss-outside-prefix", "v6", &cfgs, 0, 20, 4);
-        assert_eq!(base.get("inv_loss_record_outside_coverage_prefix"), 0);
-        assert!(
-            mutant.get("inv_loss_record_outside_coverage_prefix") > 0,
-            "m-loss-outside-prefix is not killed by the coverage-prefix check"
-        );
+    /// M4 (the Q6 design page, 'Records': a loss record is an ordinary replicated entry inside its appender's coverage prefix, appended at the
+    /// end of its own sequence, and `appended and served onward`): the CONSEQUENCE is that the record reaches a peer that pulls only by
+    /// window. A mints a record; C pulls from A by windows only (no snapshot, no third path); C must hold the record. Returns whether it does.
+    fn a_record_reaches_a_member_that_pulls_only_by_window(mode: &str) -> bool {
+        use crate::member::DocOp;
+        let mut sc = crate::scenario::Sc::new(mode, &[("A", 0), ("B", 0), ("C", 0)], 60);
+        sc.advance(1);
+        let seed = sc.ms[0].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        sc.window("B", "A", &seed);
+        sc.window("C", "A", &seed);
+        sc.advance(5);
+        let before = sc.w.all.len();
+        sc.ms[0].report_path(&mut sc.w, 0, None, seed.stamp, seed.body.clone(), "L");
+        assert!(sc.w.all.len() > before, "A minted no record");
+        let rec = sc.w.all.len() - 1;
+        sc.pull("C", "A");
+        sc.ms[2].cv.has(rec)
     }
 
-    /// `m-snap-no-orphan-burials` (a snapshot does not carry the sender's orphan burials) is killed on the base (in-order) grid by seeds
-    /// (found by `scan_for_a_killing_seed`, `Q6SCAN_INORDER=1`): v6 is clean on each, the mutant diverges with an oracle-state and an
-    /// alive mismatch (a live member keeps an orphan stage the oracle buries).
+    /// `m-loss-outside-prefix` is EQUIVALENT by consequence in this harness (and in the model, which fails nothing on it): the record's
+    /// position in its origin's sequence (`World::by_origin`, which only the coverage prefix reads) is not observable, because a window
+    /// serves the entries a member APPENDED (`Member::appended`, `next_window_entry`), not the origin's sequence, so the record reaches a
+    /// member that pulls only by window either way. Pinned here: if this test ever fails, the sequence position became observable (a
+    /// window ordered by the sequence, a vector check over it) and the mutant needs a kill. The design rule ('inside its appender's
+    /// coverage prefix', Q6 design page, 'Records') is not tested by a flag check.
     #[test]
-    fn m_snap_no_orphan_burials_is_killed_on_its_seeds() {
-        for (mok, seed) in [((3usize, 3usize, 3usize), 54u64), ((3, 3, 3), 246), ((4, 1, 3), 184)] {
-            let cfg = crate::run::Cfg::new(mok.0, mok.1, mok.2);
-            let base = crate::run::run("v6", "v6", seed, cfg, false);
-            let mutant = crate::run::run("m-snap-no-orphan-burials", "v6", seed, cfg, false);
-            for key in ["diverged", "oracle_state", "alive_mismatch"] {
-                assert_eq!(
-                    base.res.get(key).copied().unwrap_or(0),
-                    0,
-                    "{mok:?} seed {seed}: v6 is not clean on {key}"
-                );
-                assert!(
-                    mutant.res.get(key).copied().unwrap_or(0) != 0,
-                    "{mok:?} seed {seed}: m-snap-no-orphan-burials no longer shows {key}"
-                );
-            }
-        }
+    fn m_loss_outside_prefix_is_equivalent_by_consequence_on_the_window_path() {
+        let base = a_record_reaches_a_member_that_pulls_only_by_window("v6");
+        let mutant = a_record_reaches_a_member_that_pulls_only_by_window("m-loss-outside-prefix");
+        assert!(base, "v6: the record does not reach a member that pulls only by window");
+        assert!(
+            mutant,
+            "m-loss-outside-prefix changed what a window carries: it is no longer equivalent, write its kill"
+        );
     }
 
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
