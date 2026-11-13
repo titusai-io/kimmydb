@@ -327,12 +327,49 @@ mod tests {
         sc.ms[2].cv.has(rec)
     }
 
-    /// `m-loss-outside-prefix` is EQUIVALENT by consequence in this harness (and in the model, which fails nothing on it): the record's
+    /// D9's witness path of `m-loss-outside-prefix` (review: `by_origin` also feeds `covers_past`): A creates a stage and never binds it; after the stage's
+    /// deadline A mints a loss record, which is the ONLY entry of A's sequence above the deadline; B pulls from A by windows. In the base the record is the
+    /// witness that B covers A past the deadline, so B's coverage safety net buries the stage; without the record in the sequence there is no witness.
+    /// Returns whether B buried the stage.
+    fn a_record_is_the_d9_witness_that_buries_an_unbound_stage(mode: &str) -> bool {
+        use crate::member::DocOp;
+        let mut sc = crate::scenario::Sc::new(mode, &[("A", 0), ("B", 0)], 20);
+        sc.advance(1);
+        let seed = sc.ms[0].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        sc.window("B", "A", &seed);
+        sc.advance(2);
+        let job = sc.ms[0].start_out(&mut sc.w, vec![0], crate::entry::JobKind::Late, 0);
+        let stage = job.stage.clone();
+        sc.pull("B", "A");
+        assert!(sc.ms[1].phys.contains_key(&stage), "B does not know the stage");
+        sc.advance(60); // far past the deadline; the job never binds
+        sc.ms[0].report_path(&mut sc.w, 0, None, seed.stamp, seed.body.clone(), "L");
+        sc.pull("B", "A");
+        sc.ms[1].settle(&mut sc.w);
+        sc.ms[1].phys.get(&stage).is_none_or(|p| !p.alive)
+    }
+
+    /// On the WINDOW PATH ONLY, `m-loss-outside-prefix` is EQUIVALENT by consequence (the mutant is killed on the D9 witness path, above; the model fails nothing on it): the record's
     /// position in its origin's sequence (`World::by_origin`, which only the coverage prefix reads) is not observable, because a window
     /// serves the entries a member APPENDED (`Member::appended`, `next_window_entry`), not the origin's sequence, so the record reaches a
     /// member that pulls only by window either way. Pinned here: if this test ever fails, the sequence position became observable (a
     /// window ordered by the sequence, a vector check over it) and the mutant needs a kill. The design rule ('inside its appender's
     /// coverage prefix', Q6 design page, 'Records') is not tested by a flag check.
+    /// `m-loss-outside-prefix` is KILLED on the D9 witness path (review: the origin's sequence, `World::by_origin`, also feeds coverage): the record
+    /// is the only entry of its origin above the stage's deadline, so without it in the sequence the coverage safety net has no witness and the
+    /// orphan stage the base buries lingers. The CONSEQUENCE is an alive orphan stage; the mutant is equivalent only on the window path (next test).
+    #[test]
+    fn m_loss_outside_prefix_is_killed_on_the_d9_witness_path() {
+        assert!(
+            a_record_is_the_d9_witness_that_buries_an_unbound_stage("v6"),
+            "v6: the record is not the D9 witness (the stage was not buried)"
+        );
+        assert!(
+            !a_record_is_the_d9_witness_that_buries_an_unbound_stage("m-loss-outside-prefix"),
+            "m-loss-outside-prefix no longer changes D9's witness: it is equivalent on this path too"
+        );
+    }
+
     #[test]
     fn m_loss_outside_prefix_is_equivalent_by_consequence_on_the_window_path() {
         let base = a_record_reaches_a_member_that_pulls_only_by_window("v6");

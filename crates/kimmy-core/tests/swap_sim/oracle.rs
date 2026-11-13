@@ -1125,6 +1125,10 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "df1_loser_superseded_by_uncovered",
         "staged_row_appended",
         "rule_s_negative_cases",
+        "marks_dropped_superseded",
+        "marks_dropped_late",
+        "release_raised_over_hold",
+        "repair_marks_written",
         "rule_s_negative_appended",
         "late_d11_not_buried",
         "late_drop_phys_alive_at_sender",
@@ -1190,6 +1194,11 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
                 let src = servers[w.rng.below(servers.len())];
                 z.take_from(w, &ms[src], &e, true);
             }
+        }
+        // N3: the model's final sweep once in stamp order (`swapmodel6e.py` `finish`, the interleaved replay): whatever the interleaving left out
+        // is taken now, in stamp order
+        for e in &base_entries {
+            take_quiesce_replica(&mut z, ms, w, e);
         }
         z.settle(w);
         let recs = bk(&z);
