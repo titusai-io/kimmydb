@@ -98,12 +98,27 @@ An `Hlc` alone is not enough — two nodes can legitimately produce the same one
 struct Stamp {
     hlc: Hlc,
     node: NodeId,   // breaks ties deterministically
+    epoch: Epoch,   // which life of the node wrote it (since 0.61.0)
 }
 ```
 
-Ordering is `(wall_ms, counter, node_id)`: a **total order** over every write in
-the cluster. The node id makes ties deterministic, so every replica picks the
-same winner regardless of the order updates arrive in.
+Ordering is `(wall_ms, counter, node_id, epoch)`: a **total order** over every
+write in the cluster. The node id makes ties deterministic, so every replica
+picks the same winner regardless of the order updates arrive in.
+
+The node and the epoch together are an **origin**, and an origin is what a
+version vector is keyed by. An epoch is 18 bytes, the start HLC of the open that
+minted it and 8 random bytes. A member mints one at the first open of a store,
+and again after `kimmyd restore` or a rewind, because neither keeps the epoch (a
+volume rolled back by other means does). The point is the restored member's new
+writes: they cannot be taken as covered by a peer's record of the old life's
+writes under the same node id, so the writes the restored member lost stay owed
+under the old origin, and its ordinary pull from a peer brings them back like
+any other origin's. The replay of its own origin, which matches on the node
+across every epoch, is what marks it `restored` while it reads them back
+([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)).
+A stamp is 44 bytes as a key and 45 bytes as the token a client sees (a format
+byte `0x01`, then the key); the token is opaque, as before.
 
 > This is why node identity must survive restarts, and why it lives inside the
 > database file rather than beside it. A node that forgot its id would become a

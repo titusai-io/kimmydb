@@ -266,6 +266,7 @@ pub fn ttl_indexes(coll: &CollectionMeta) -> impl Iterator<Item = &IndexMeta> {
 mod tests {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::IndexField;
 
     fn dt(millis: i64) -> Bson {
@@ -815,6 +816,7 @@ mod tests {
         let later = kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(u64::MAX / 2, 0),
             kimmy_core::NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
         );
         engine
             .create_index_inner(

@@ -219,6 +219,9 @@ impl AppState {
             // verified the vector did read (ADR-173's addendum of 2026-09-26).
             // A count from the table's root and one `get`.
             oplog_entries: self.engine.oplog_entries()?,
+            // The origins (node, epoch) the member's own vector names: a restore
+            // adds one. Read here, per scrape and per export, as the rest are.
+            epoch_origins: self.engine.version_vector()?.len() as u64,
             oplog_verified: self.engine.version_vector_verified()?.unwrap_or_default(),
             // Fixed at the open: whether redb repaired the store, and how
             // (ADR-204).
@@ -724,6 +727,40 @@ pub(crate) mod tests {
         members.remove_for_test(&"127.0.0.1:7001".parse().unwrap());
         let out = state.metrics.render_with(&state.storage_readings().unwrap());
         assert!(out.contains("\nkimmy_cluster_members 1\n"), "{out}");
+    }
+
+    /// `kimmy_epoch_origins` is the length of the member's own version vector at
+    /// the read: a restore gives the node a new epoch, so the restored member's
+    /// first write adds one origin to the one the backup carried.
+    #[test]
+    fn a_restore_raises_the_epoch_origins_by_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
+        let meta = state.engine.create_collection("shop", "orders").unwrap();
+        state.engine.insert(&meta, bson::doc! { "_id": 1 }).unwrap();
+        let before = state.storage_readings().unwrap().epoch_origins;
+        assert_eq!(before, 1, "one node, one epoch");
+        let mut backup = Vec::new();
+        state.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+
+        let restored_dir = tempfile::tempdir().unwrap();
+        kimmy_storage::backup::restore(
+            &restored_dir.path().join("kimmy.redb"),
+            &mut backup.as_slice(),
+        )
+        .unwrap();
+        let restored = a_state(&restored_dir);
+        assert_eq!(
+            restored.storage_readings().unwrap().epoch_origins,
+            before,
+            "the backup carries the old origin and nothing else"
+        );
+        let meta = restored.engine.get_collection("shop", "orders").unwrap();
+        restored.engine.insert(&meta, bson::doc! { "_id": 2 }).unwrap();
+        let after = restored.storage_readings().unwrap().epoch_origins;
+        assert_eq!(after, before + 1, "the new epoch is a second origin");
+        let out = restored.metrics.render_with(&restored.storage_readings().unwrap());
+        assert!(out.contains("\nkimmy_epoch_origins 2\n"), "{out}");
     }
 
     /// `kimmy_ttl_collections` is read from the registry at the scrape, with or

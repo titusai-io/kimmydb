@@ -109,6 +109,17 @@ pub enum VectorError {
     #[error("embedding model {model:?} is not available: {detail}")]
     ModelUnavailable { model: String, detail: String },
 
+    /// The position a background consumer stored is not a single-stamp token of the form this
+    /// build writes: `hlc ‖ node ‖ epoch`, [`kimmy_core::Stamp::KEY_LEN`] bytes. A position
+    /// from before epochs is 26 bytes. Not guessed at: reading it as a position would resume
+    /// from the wrong place.
+    #[error(
+        "the stored position of consumer {consumer:?} is not a single-stamp token of {} bytes \
+         (hlc, node, epoch); it was written by an earlier format and cannot be resumed from",
+        kimmy_core::Stamp::KEY_LEN
+    )]
+    StoredPositionUnusable { consumer: String },
+
     #[error(transparent)]
     Storage(#[from] kimmy_storage::StorageError),
 

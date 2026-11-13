@@ -17,10 +17,13 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
+use kimmy_core::Epoch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
+use kimmy_core::{
+    CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Origin, Stamp, VersionVector,
+};
 use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -260,7 +263,8 @@ pub struct SyncOutcome {
     pub advanced: bool,
     /// Whether this batch's own coverage rose above `mine` -- the `held`
     /// this pull's own `AskEntries` sent -- for an origin *other than this
-    /// node's own*: an applied
+    /// node's current one* (an earlier epoch of this node counts: after a
+    /// restore a peer serves it the tail it lost): an applied
     /// entry, a schema change, a released held mark or a superseded entry
     /// all count, since each is real progress on that origin whether or not
     /// it left its own row in `OPLOG_WITNESSED` to raise (`applied`,
@@ -592,17 +596,19 @@ pub fn coverage_up_to(theirs: &VersionVector, end: WindowEnd) -> VersionVector {
         WindowEnd::Exhausted => theirs.clone(),
         WindowEnd::Through(last) => {
             let mut covered = VersionVector::new();
-            for (node, their_max) in theirs.iter() {
-                let reached = if node <= last.node { last.hlc } else { last.hlc.predecessor() };
-                covered.insert(node, their_max.min(reached));
+            for (origin, their_max) in theirs.iter() {
+                let reached =
+                    if origin <= last.origin() { last.hlc } else { last.hlc.predecessor() };
+                covered.insert(origin, their_max.min(reached));
             }
             covered
         }
         WindowEnd::Before(stop) => {
             let mut covered = VersionVector::new();
-            for (node, their_max) in theirs.iter() {
-                let reached = if node < stop.node { stop.hlc } else { stop.hlc.predecessor() };
-                covered.insert(node, their_max.min(reached));
+            for (origin, their_max) in theirs.iter() {
+                let reached =
+                    if origin < stop.origin() { stop.hlc } else { stop.hlc.predecessor() };
+                covered.insert(origin, their_max.min(reached));
             }
             covered
         }
@@ -618,7 +624,7 @@ pub fn coverage_up_to(theirs: &VersionVector, end: WindowEnd) -> VersionVector {
 /// between them and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkedRange {
-    pub origin: NodeId,
+    pub origin: Origin,
     pub from: Hlc,
     pub through: Hlc,
 }
@@ -626,7 +632,7 @@ pub struct MarkedRange {
 impl MarkedRange {
     /// Whether `stamp` lies inside this span.
     pub fn contains(&self, stamp: &Stamp) -> bool {
-        stamp.node == self.origin && self.from <= stamp.hlc && stamp.hlc <= self.through
+        stamp.origin() == self.origin && self.from <= stamp.hlc && stamp.hlc <= self.through
     }
 }
 
@@ -973,7 +979,7 @@ impl Engine {
         let marked = if held.is_some() { marked } else { &[] };
         let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
         let skip = |stamp: &Stamp| {
-            let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
+            let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.origin()))
                 && !marked.iter().any(|span| span.contains(stamp));
             passed.set(passed.get() + u64::from(skip));
             skip
@@ -1087,23 +1093,29 @@ impl Engine {
         let Some(highest) = witnessed.iter().map(|(_, hlc)| hlc).max() else {
             return Ok(Vec::new());
         };
-        let upper = crate::codec::oplog_key(&Stamp::new(highest, NodeId::from_bytes([0xFF; 16])));
+        // the largest key at `highest`: the largest node and the largest epoch, or the bound
+        // would sit below the last key at that HLC
+        let upper = crate::codec::oplog_key(&Stamp::new(
+            highest,
+            NodeId::from_bytes([0xFF; 16]),
+            Epoch::MAX,
+        ));
         let txn = self.db().begin_read()?;
         // Read for a pull this node makes, which no client asked for: it ends
         // at the signal.
         let held =
             open_walk_table(&txn, crate::tables::OPLOG_HELD, self.walk(WalkScope::Background))?;
-        let mut marks: HashMap<NodeId, Vec<Hlc>> = HashMap::new();
+        let mut marks: HashMap<Origin, Vec<Hlc>> = HashMap::new();
         for row in held.range(..=upper.as_slice())? {
             let (key, _) = row?;
             // not a row: a mark's key, which a newer build may write (ADR-160).
             let Ok(stamp) = crate::codec::decode_oplog_key(key.value()) else {
                 continue;
             };
-            if stamp.hlc > witnessed.get(stamp.node) {
+            if stamp.hlc > witnessed.get(stamp.origin()) {
                 continue;
             }
-            marks.entry(stamp.node).or_default().push(stamp.hlc);
+            marks.entry(stamp.origin()).or_default().push(stamp.hlc);
         }
         let mut out: Vec<(MarkedRange, Vec<Hlc>)> = marks
             .into_iter()
@@ -1263,7 +1275,7 @@ impl Engine {
                 if let Ok(covered) = self.witnessed_vector() {
                     let landed: Vec<_> = refused
                         .into_iter()
-                        .filter(|stamp| stamp.hlc <= covered.get(stamp.node))
+                        .filter(|stamp| stamp.hlc <= covered.get(stamp.origin()))
                         .collect();
                     outcome.ddl_refused += landed.len();
                     outcome.refused_at.extend(landed);
@@ -1294,7 +1306,7 @@ impl Engine {
 
         for entry in entries {
             if let Some(introduced) = introduced
-                && entry.stamp.hlc > introduced.theirs.get(entry.stamp.node)
+                && entry.stamp.hlc > introduced.theirs.get(entry.stamp.origin())
             {
                 outcome.deferred += 1;
                 continue;
@@ -1369,8 +1381,16 @@ impl Engine {
                 (None, false, Some(p)) => WindowEnd::Through(p),
                 (None, false, None) => match entries.last() {
                     Some(last) if last.stamp.hlc <= scanned_to => WindowEnd::Through(last.stamp),
-                    Some(last) => WindowEnd::Through(Stamp::new(scanned_to, last.stamp.node)),
-                    None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+                    Some(last) => WindowEnd::Through(Stamp::new(
+                        scanned_to,
+                        last.stamp.node,
+                        last.stamp.epoch,
+                    )),
+                    None => WindowEnd::Before(Stamp::new(
+                        Hlc::ZERO,
+                        NodeId::from_bytes([0; 16]),
+                        Epoch::ZERO,
+                    )),
                 },
             };
             witnessed.merge(&coverage_up_to(theirs, end));
@@ -1395,16 +1415,18 @@ impl Engine {
         run.last_committed = true;
         // Whether this batch's own coverage rose above `mine` -- the `held`
         // this pull's own `AskEntries` sent -- for an origin other than
-        // this node's own: an applied entry, a schema change, a released
-        // held mark and a superseded entry all count alike (ADR-157's
+        // this node's current one (its earlier epochs are origins like any
+        // other here: a peer serves it what it lost of them): an applied
+        // entry, a schema change, a released held mark and a superseded
+        // entry all count alike (ADR-157's
         // ceiling). Set only now, after the commit above succeeded
         // (ADR-177). Skipped when there is no `mine` to compare against: a
         // push, a repair replay, or any other caller that does not read
         // `coverage_raised`.
         if let Some(Introduced { mine: Some(mine), .. }) = introduced {
-            let local = self.node_id();
+            let local = self.origin();
             outcome.coverage_raised |=
-                witnessed.iter().any(|(node, hlc)| node != local && hlc > mine.get(node));
+                witnessed.iter().any(|(origin, hlc)| origin != local && hlc > mine.get(origin));
         }
 
         if let Some(unknown) = &outcome.unknown {
@@ -2107,7 +2129,7 @@ impl Engine {
         self.answered_absent
             .lock()
             .get(&entry.collection)
-            .is_some_and(|coverage| entry.stamp.hlc <= coverage.get(entry.stamp.node))
+            .is_some_and(|coverage| entry.stamp.hlc <= coverage.get(entry.stamp.origin()))
     }
 
     /// Record that a scoped page of `id` from a sender holding no life of it left the
@@ -3352,6 +3374,7 @@ mod tests {
     use super::*;
     use bson::doc;
     use kimmy_core::DocId;
+    use kimmy_core::Epoch;
 
     const BATCH: usize = 1024;
     const DAY: u64 = 24 * 60 * 60;
@@ -3472,13 +3495,101 @@ mod tests {
     /// `coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node`
     /// pins on its own.
     fn window_end(wall: u64) -> Stamp {
-        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]))
+        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX)
+    }
+
+    /// The tie at a window's last HLC, by epoch (the Step 1 point of the review, D2): the entry
+    /// of `(n, e2)` at the last HLC sorts after the window's last key `(h, n, e1)` when `e2 > e1`,
+    /// so it was not examined and is raised only to the predecessor; `(n, e0)`, `e0 < e1`, sorts
+    /// before it and was.
+    #[test]
+    fn a_tie_at_a_windows_end_is_decided_by_the_epoch_in_oplog_key_order() {
+        let node = kimmy_core::NodeId::from_bytes([5; 16]);
+        let at = Hlc::new(1_000, 3);
+        let (e0, e1, e2) = (Epoch::from_u64(1), Epoch::from_u64(2), Epoch::from_u64(3));
+        let (before, last, after) =
+            (Origin::new(node, e0), Origin::new(node, e1), Origin::new(node, e2));
+        let later_node = Origin::new(kimmy_core::NodeId::from_bytes([6; 16]), e0);
+        let mut theirs = VersionVector::new();
+        for origin in [before, last, after, later_node] {
+            theirs.insert(origin, Hlc::new(5_000, 0));
+        }
+
+        let stop = Stamp::new(at, node, e1);
+        let through = coverage_up_to(&theirs, WindowEnd::Through(stop));
+        assert_eq!(through.get(before), at, "an earlier epoch's entry at the stamp was examined");
+        assert_eq!(through.get(last), at, "the entry itself was delivered");
+        assert_eq!(through.get(after), at.predecessor(), "a later epoch's tie was not examined");
+        assert_eq!(through.get(later_node), at.predecessor(), "nor a later node's");
+
+        let before_it = coverage_up_to(&theirs, WindowEnd::Before(stop));
+        assert_eq!(before_it.get(before), at);
+        assert_eq!(before_it.get(last), at.predecessor(), "the entry itself was not taken");
+        assert_eq!(before_it.get(after), at.predecessor());
+    }
+
+    /// A node-only comparison would read the three epochs alike; whole origins do not, and
+    /// the order of origins is the order of the oplog's keys.
+    mod coverage_order {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn any_stamp() -> impl Strategy<Value = Stamp> {
+            // few values on every axis, so ties at the same HLC and the same node are common
+            (1u64..6, 0u16..2, 0u8..3, 0u64..3).prop_map(|(wall, counter, node, epoch)| {
+                Stamp::new(
+                    Hlc::new(wall * 100, counter),
+                    kimmy_core::NodeId::from_bytes([node; 16]),
+                    Epoch::from_u64(epoch),
+                )
+            })
+        }
+
+        proptest! {
+            /// Against a brute-force served set: serve the first `limit` entries of a log in key
+            /// order; every entry served is covered by the answer and no entry left out is.
+            /// An entry the answer covered and the window left out would be skipped for good.
+            #[test]
+            fn a_window_covers_exactly_the_entries_it_served(
+                stamps in prop::collection::btree_set(any_stamp(), 1..24),
+                limit in 1usize..24,
+                before in any::<bool>(),
+            ) {
+                let log: Vec<Stamp> = stamps.into_iter().collect(); // key order
+                let mut theirs = VersionVector::new();
+                for stamp in &log {
+                    theirs.observe(*stamp);
+                }
+                let limit = limit.min(log.len());
+                let (served, rest) = log.split_at(limit);
+                // `Through` the last entry served, or `Before` the first one left out
+                let end = match (before, rest.first()) {
+                    (true, Some(next)) => WindowEnd::Before(*next),
+                    _ => WindowEnd::Through(*served.last().unwrap()),
+                };
+                let covered = coverage_up_to(&theirs, end);
+                for stamp in served {
+                    prop_assert!(
+                        stamp.hlc <= covered.get(stamp.origin()),
+                        "served {stamp:?} is not covered by {covered:?}"
+                    );
+                }
+                for stamp in rest {
+                    prop_assert!(
+                        stamp.hlc > covered.get(stamp.origin()),
+                        "{stamp:?} was not served but {covered:?} covers it: a skip"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn an_exhausted_window_proves_the_whole_advertised_vector() {
         let mut theirs = VersionVector::new();
-        let origin = kimmy_core::NodeId::generate();
+        let origin =
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
         theirs.insert(origin, Hlc::new(5_000, 0));
         assert_eq!(coverage_up_to(&theirs, WindowEnd::Exhausted), theirs);
     }
@@ -3487,14 +3598,24 @@ mod tests {
     fn a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached() {
         // Three advertised origins: one whose coverage ends before the window
         // does, one inside it, one beyond. Only the last is clipped.
-        let early = kimmy_core::NodeId::from_bytes([1; 16]);
-        let inside = kimmy_core::NodeId::from_bytes([2; 16]);
-        let beyond = kimmy_core::NodeId::from_bytes([3; 16]);
+        let early = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([1; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let inside = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([2; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let beyond = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([3; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         let mut theirs = VersionVector::new();
         theirs.insert(early, Hlc::new(1_000, 0));
         theirs.insert(inside, Hlc::new(2_500, 0));
         theirs.insert(beyond, Hlc::new(9_000, 0));
-        let stranger = kimmy_core::NodeId::generate();
+        let stranger =
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
 
         // A window the peer stopped scanning at 3_000 because its batch filled.
         let covered = coverage_up_to(&theirs, WindowEnd::Through(window_end(3_000)));
@@ -3516,7 +3637,10 @@ mod tests {
         // `apply_peer_batch` and pinned by
         // `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
         // `a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
-        let origin = kimmy_core::NodeId::from_bytes([1; 16]);
+        let origin = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([1; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         let mut theirs = VersionVector::new();
         theirs.insert(origin, Hlc::new(9_000, 0));
 
@@ -3525,9 +3649,9 @@ mod tests {
         assert_ne!(covered, theirs, "an empty batch must not absorb the peer's vector");
     }
 
-    fn entry_from(node: kimmy_core::NodeId, hlc: Hlc) -> OplogEntry {
+    fn entry_from(origin: kimmy_core::Origin, hlc: Hlc) -> OplogEntry {
         OplogEntry {
-            stamp: kimmy_core::Stamp::new(hlc, node),
+            stamp: kimmy_core::Stamp::new(hlc, origin.node, origin.epoch),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId::derive("db", "c"),
             doc_id: Some(DocId::String("x".into())),
@@ -3566,7 +3690,7 @@ mod tests {
         let ca = a.get_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
         assert!(round(&b, &a, LIMIT).total() > 0);
-        let floor = b.witnessed_vector().unwrap().get(a.node_id());
+        let floor = b.witnessed_vector().unwrap().get(a.origin());
         assert!(floor > Hlc::ZERO);
 
         // (2) C writes more than a batch; A and B both take all of it from C.
@@ -3585,7 +3709,11 @@ mod tests {
         // (3) A records a violation: its newest own stamp, never shipped, and
         // stamped after everything C wrote.
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(9_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(9_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -3596,7 +3724,7 @@ mod tests {
         a.apply_remote(&ca, &clash).unwrap();
         assert_eq!(a.unique_violations(), 1);
         let a_adv = a.version_vector().unwrap();
-        assert!(a_adv.get(a.node_id()) > c.version_vector().unwrap().get(c.node_id()));
+        assert!(a_adv.get(a.origin()) > c.version_vector().unwrap().get(c.origin()));
         let shippable =
             a.entries_for_peer(floor, usize::MAX, crate::WalkScope::Background).unwrap().entries;
         assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
@@ -3651,7 +3779,11 @@ mod tests {
         // mints its own `UniqueViolation` entry for it, which it will never
         // ship to a peer (ADR-029).
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(just_above(a), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                just_above(a),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -3810,7 +3942,11 @@ mod tests {
         // A's newest own stamp: minted now, so it sits after every entry above
         // and more than one window of shippable entries lies under it.
         let clash = OplogEntry {
-            stamp: kimmy_core::Stamp::new(just_above(&a), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                just_above(&a),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -3821,7 +3957,7 @@ mod tests {
         a.apply_remote(&ca, &clash).unwrap();
         assert_eq!(a.unique_violations(), 1);
 
-        let pinning = a.version_vector().unwrap().get(a.node_id());
+        let pinning = a.version_vector().unwrap().get(a.origin());
         let shippable = a
             .entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
             .unwrap()
@@ -3844,7 +3980,7 @@ mod tests {
         }
 
         assert_eq!(
-            b.witnessed_vector().unwrap().get(a.node_id()),
+            b.witnessed_vector().unwrap().get(a.origin()),
             pinning,
             "B must absorb the advertised stamp it can never be sent, or it asks for ever"
         );
@@ -3870,7 +4006,8 @@ mod tests {
         // floor for ever — the livelock ADR-082 exists to prevent.
         assert!(last.exhausted, "the round that caught B up must have reached A's tail");
         let mut advertised = a.version_vector().unwrap();
-        let granted = kimmy_core::NodeId::generate();
+        let granted =
+            kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
         let beyond = Hlc::new(last.scanned_to.wall_ms + 60_000, 0);
         advertised.insert(granted, beyond);
         assert!(beyond > last.scanned_to, "only above the window's end do the two rules differ");
@@ -4040,6 +4177,7 @@ mod tests {
     }
 
     mod props {
+        use kimmy_core::Epoch;
         use proptest::prelude::*;
 
         use super::*;
@@ -4079,7 +4217,7 @@ mod tests {
                     if *collides {
                         let id = format!("r{i}");
                         let entry = OplogEntry {
-                            stamp: kimmy_core::Stamp::new(just_above(&a), origin),
+                            stamp: kimmy_core::Stamp::new(just_above(&a), origin, Epoch::ZERO),
                             kind: OpKind::Insert,
                             collection: ca.id,
                             doc_id: Some(DocId::String(id.clone())),
@@ -4143,9 +4281,9 @@ mod tests {
 
         let origin = NodeId::generate();
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(10_000, 0), origin));
+        mine.observe(Stamp::new(Hlc::new(10_000, 0), origin, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin));
+        theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin, Epoch::ZERO));
 
         // The peer holds newer, and the newest we have is 12 s old.
         assert_eq!(lag_behind_ms(&mine, &theirs, 22_000), 12_000, "12 s behind the clock");
@@ -4168,9 +4306,9 @@ mod tests {
         let first = Hlc::new(1_000_000, 0);
         let last = Hlc::new(1_000_300, 0);
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(first, origin));
+        mine.observe(Stamp::new(first, origin, Epoch::ZERO));
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(last, origin));
+        theirs.observe(Stamp::new(last, origin, Epoch::ZERO));
         let now = first.wall_ms + 30_000;
 
         let span = last.wall_ms - first.wall_ms;
@@ -4184,11 +4322,11 @@ mod tests {
 
         let (a, b) = (NodeId::generate(), NodeId::generate());
         let mut mine = VersionVector::new();
-        mine.observe(Stamp::new(Hlc::new(1_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(8_000, 0), b));
+        mine.observe(Stamp::new(Hlc::new(1_000, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(8_000, 0), b, Epoch::ZERO));
         let mut theirs = mine.clone();
-        theirs.observe(Stamp::new(Hlc::new(2_000, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(9_000, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(2_000, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(9_000, 0), b, Epoch::ZERO));
 
         // An alert cares how far behind the worst origin is; summing origins
         // would report a cluster-wide write burst as one enormous lag. At
@@ -4198,7 +4336,7 @@ mod tests {
         // An origin the peer is level on does not count, whatever its age:
         // catch up on `a` and only `b` is left.
         let mut level = mine.clone();
-        level.observe(Stamp::new(Hlc::new(2_000, 0), a));
+        level.observe(Stamp::new(Hlc::new(2_000, 0), a, Epoch::ZERO));
         assert_eq!(lag_behind_ms(&level, &theirs, 10_000), 2_000);
     }
 
@@ -4223,7 +4361,7 @@ mod tests {
         assert_eq!(outcome.applied, 0, "A's write must lose");
         assert!(outcome.superseded > 0);
 
-        let a_origin = a.node_id();
+        let a_origin = a.origin();
         let servable = b.version_vector().unwrap();
         let witnessed = b.witnessed_vector().unwrap();
 
@@ -4288,7 +4426,7 @@ mod tests {
         use kimmy_core::{NodeId, Stamp};
 
         let mut theirs = VersionVector::new();
-        theirs.observe(Stamp::new(Hlc::new(1_786_000_000_000, 0), NodeId::generate()));
+        theirs.observe(Stamp::new(Hlc::new(1_786_000_000_000, 0), NodeId::generate(), Epoch::ZERO));
 
         // The peer's vector holds only the *newest* stamp per origin, so an
         // origin this node has never seen has no honest gap to report —
@@ -4322,7 +4460,7 @@ mod tests {
 
         let vector = engine.version_vector().unwrap();
         assert_eq!(vector.len(), 1);
-        assert!(vector.get(engine.node_id()) > Hlc::ZERO);
+        assert!(vector.get(engine.origin()) > Hlc::ZERO);
     }
 
     #[test]
@@ -4336,7 +4474,7 @@ mod tests {
             let engine = Engine::open(&path).unwrap();
             let coll = engine.create_collection("db", "c").unwrap();
             engine.insert(&coll, doc! { "_id": 1 }).unwrap();
-            (engine.node_id(), engine.version_vector().unwrap())
+            (engine.origin(), engine.version_vector().unwrap())
         };
 
         {
@@ -4462,7 +4600,7 @@ mod tests {
         // replacement.
         for hlc in [ca_old.created, dropped_at] {
             let entry = OplogEntry {
-                stamp: kimmy_core::Stamp::new(hlc, kimmy_core::NodeId::generate()),
+                stamp: kimmy_core::Stamp::new(hlc, kimmy_core::NodeId::generate(), Epoch::ZERO),
                 kind: OpKind::Insert,
                 collection: ca_new.id,
                 doc_id: Some(DocId::String("ghost".into())),
@@ -4483,6 +4621,7 @@ mod tests {
                 stamp: kimmy_core::Stamp::new(
                     Hlc::new(dropped_at.wall_ms + offset, 0),
                     kimmy_core::NodeId::generate(),
+                    Epoch::ZERO,
                 ),
                 kind: OpKind::Insert,
                 collection: ca_new.id,
@@ -4509,7 +4648,11 @@ mod tests {
         a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
 
         let entry = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(9_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(9_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: ca.id,
             doc_id: Some(DocId::String("remote".into())),
@@ -4701,8 +4844,8 @@ mod tests {
             Some(crate::codec::encode_oplog_entry(&index)),
             "the origin's entry, as sent"
         );
-        assert!(b.witnessed_vector().unwrap().get(index.stamp.node) >= index.stamp.hlc);
-        assert!(b.version_vector().unwrap().get(index.stamp.node) >= index.stamp.hlc);
+        assert!(b.witnessed_vector().unwrap().get(index.stamp.origin()) >= index.stamp.hlc);
+        assert!(b.version_vector().unwrap().get(index.stamp.origin()) >= index.stamp.hlc);
         assert_eq!(published.try_recv().unwrap().stamp, index.stamp, "and published");
         assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_some());
     }
@@ -4786,7 +4929,7 @@ mod tests {
         assert!(b.apply_ddl(&index).is_err());
         assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_none());
         assert_eq!(held_bytes(&b, &index.stamp), None);
-        assert!(b.witnessed_vector().unwrap().get(index.stamp.node) < index.stamp.hlc);
+        assert!(b.witnessed_vector().unwrap().get(index.stamp.origin()) < index.stamp.hlc);
     }
 
     #[test]
@@ -5026,7 +5169,7 @@ mod tests {
 
         let origin = kimmy_core::NodeId::generate();
         let remote = |ms: u64, id: &str, email: &str| OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin),
+            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin, Epoch::ZERO),
             kind: OpKind::Insert,
             collection: cb.id,
             doc_id: Some(DocId::String(id.into())),
@@ -5065,7 +5208,11 @@ mod tests {
         let (b, _db) = engine();
 
         let orphan = OplogEntry {
-            stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), kimmy_core::NodeId::generate()),
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(1_000, 0),
+                kimmy_core::NodeId::generate(),
+                Epoch::ZERO,
+            ),
             kind: OpKind::Insert,
             collection: kimmy_core::CollectionId::derive("shop", "never-heard-of"),
             doc_id: Some(DocId::Int64(1)),
@@ -6339,8 +6486,11 @@ mod tests {
         // And a drop stamped between the two creations — which is exactly
         // what anti-entropy delivers on heal — now resolves the same way on
         // each of them.
-        let between =
-            Stamp::new(Hlc::new(first.hlc.wall_ms + 1, 0), kimmy_core::NodeId::from_bytes([9; 16]));
+        let between = Stamp::new(
+            Hlc::new(first.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
+        );
         assert!(between > first && between < second, "the fixture's drop sits between them");
         let drop = crate::engine::ddl_entry(
             between,
@@ -6414,8 +6564,8 @@ mod tests {
         // to every member that pulls from it, for ever. ADR-123's rule for a
         // refusal, and ADR-132's for a loser.
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = create_index_entry(
             id,
@@ -6600,7 +6750,7 @@ mod tests {
         // filter -- `create_index_inner` parses for every origin. That is the
         // case: the entry comes from a build whose parser accepted it.
         let node = kimmy_core::NodeId::from_bytes([7; 16]);
-        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node, Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let mut index = definition("by_shape", vec![field("size")], false, Some(stamp));
         let filter = doc! {"size": {"$sameShapeAs": 5}};
@@ -6637,7 +6787,7 @@ mod tests {
         // as a request refusal: skipped and counted, not a failed round. No
         // released build stores one, so the entry is built by hand.
         let node = kimmy_core::NodeId::from_bytes([7; 16]);
-        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node, Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let mut index = definition("by_pattern", vec![field("size")], false, Some(stamp));
         let filter = doc! {"size": bson::Bson::RegularExpression(bson::Regex {
@@ -6676,8 +6826,8 @@ mod tests {
         // later stamp wins, on whichever member the entries reach in
         // whichever order (ADR-132).
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = definition("by_email", vec![field("email")], false, Some(earlier));
         let winner = definition("by_email", vec![field("email")], true, Some(later));
@@ -6712,8 +6862,8 @@ mod tests {
         // anti-entropy produces routinely — otherwise the two definitions
         // would trade places on every round for ever.
         let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
-        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
-        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1), Epoch::ZERO);
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2), Epoch::ZERO);
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let loser = create_index_entry(
             id,
@@ -6811,7 +6961,7 @@ mod tests {
             "shop",
             "orders",
             "probe",
-            Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]))),
+            Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO)),
         );
         let held = b.get_collection("shop", "orders").unwrap().index("probe").unwrap().id;
         let before = crate::index::scan_range(
@@ -6868,7 +7018,7 @@ mod tests {
             "the entries behind the refusal still arrive"
         );
         assert!(
-            b.witnessed_vector().unwrap().get(stamp.node) >= stamp.hlc,
+            b.witnessed_vector().unwrap().get(stamp.origin()) >= stamp.hlc,
             "witnessed, so it would not be re-requested"
         );
     }
@@ -7061,7 +7211,7 @@ mod tests {
 
         let vector = b.version_vector().unwrap();
         assert!(
-            vector.get(a.node_id()) > Hlc::ZERO,
+            vector.get(a.origin()) > Hlc::ZERO,
             "b must record coverage of a's writes under a's node id"
         );
         assert!(b.version_vector().unwrap().covers(&a.version_vector().unwrap()));
@@ -7404,14 +7554,14 @@ mod tests {
         let c = NodeId::from_bytes([3; 16]);
 
         let mut mine = VersionVector::default();
-        mine.observe(Stamp::new(Hlc::new(100_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(90_000, 0), b));
-        mine.observe(Stamp::new(Hlc::new(50_000, 0), c));
+        mine.observe(Stamp::new(Hlc::new(100_000, 0), a, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(90_000, 0), b, Epoch::ZERO));
+        mine.observe(Stamp::new(Hlc::new(50_000, 0), c, Epoch::ZERO));
 
         // The peer last saw `a` at 10s, `b` at 90s (level), never `c`.
         let mut theirs = VersionVector::default();
-        theirs.observe(Stamp::new(Hlc::new(10_000, 0), a));
-        theirs.observe(Stamp::new(Hlc::new(90_000, 0), b));
+        theirs.observe(Stamp::new(Hlc::new(10_000, 0), a, Epoch::ZERO));
+        theirs.observe(Stamp::new(Hlc::new(90_000, 0), b, Epoch::ZERO));
 
         let now = 100_000;
         assert_eq!(
@@ -7433,7 +7583,7 @@ mod tests {
         // idled 36 hours, wrote again; B holds the first write and has not yet
         // pulled the second. The span is 36 hours, but nothing in it was
         // collected: B can still be served the one entry it lacks.
-        let a = kimmy_core::NodeId::generate();
+        let a = kimmy_core::Origin::new(kimmy_core::NodeId::generate(), kimmy_core::Epoch::ZERO);
         let first = Hlc::new(1_000, 0);
         let second = Hlc::new(1_000 + 36 * HOUR_MS, 0);
         let mut theirs = VersionVector::new();
@@ -7489,7 +7639,7 @@ mod tests {
         b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
         sync(&a, &b);
 
-        let a_previous = b.witnessed_vector().unwrap().get(a.node_id());
+        let a_previous = b.witnessed_vector().unwrap().get(a.origin());
         a.collect_garbage_at(
             crate::physical_now_ms() + 365 * 24 * HOUR_MS,
             RetentionPolicy::new(DAY, DAY),
@@ -7500,7 +7650,7 @@ mod tests {
             "B's first write was collected after A's, so the coarse horizon is above A's previous write"
         );
         assert_eq!(
-            a.oplog_collected().unwrap().get(a.node_id()),
+            a.oplog_collected().unwrap().get(a.origin()),
             a_previous,
             "the per-origin record names A's previous write as the last of A's collected"
         );
@@ -7639,11 +7789,11 @@ mod tests {
             outcome.deferred > 0,
             "entries above what B advertised for A are left for the next window: {outcome:?}"
         );
-        let a_on_c = c.witnessed_vector().unwrap().get(a.node_id());
+        let a_on_c = c.witnessed_vector().unwrap().get(a.origin());
         let a_advertised = window.entries.iter().find(|e| e.stamp.node == b.node_id());
         assert!(a_advertised.is_some());
         assert!(
-            a_on_c < a.version_vector().unwrap().get(a.node_id()),
+            a_on_c < a.version_vector().unwrap().get(a.origin()),
             "C's witnessed position on A must not have jumped over the run it was not sent"
         );
 
@@ -7669,21 +7819,32 @@ mod tests {
     /// counters from zero in the same millisecond — was not examined.
     #[test]
     fn coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node() {
-        let early = kimmy_core::NodeId::from_bytes([1; 16]);
-        let last = kimmy_core::NodeId::from_bytes([5; 16]);
-        let later = kimmy_core::NodeId::from_bytes([9; 16]);
+        let early = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([1; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let last = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([5; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let later = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         let at = Hlc::new(1_000, 3);
         let mut theirs = VersionVector::new();
         theirs.insert(early, Hlc::new(5_000, 0));
         theirs.insert(last, Hlc::new(5_000, 0));
         theirs.insert(later, Hlc::new(5_000, 0));
 
-        let through = coverage_up_to(&theirs, WindowEnd::Through(Stamp::new(at, last)));
+        let through =
+            coverage_up_to(&theirs, WindowEnd::Through(Stamp::new(at, last.node, last.epoch)));
         assert_eq!(through.get(early), at, "an earlier node's entry at the stamp was examined");
         assert_eq!(through.get(last), at, "the entry itself was delivered");
         assert_eq!(through.get(later), at.predecessor(), "a later node's tie was not examined");
 
-        let before = coverage_up_to(&theirs, WindowEnd::Before(Stamp::new(at, last)));
+        let before =
+            coverage_up_to(&theirs, WindowEnd::Before(Stamp::new(at, last.node, last.epoch)));
         assert_eq!(before.get(early), at);
         assert_eq!(before.get(last), at.predecessor(), "the entry itself was not taken");
         assert_eq!(before.get(later), at.predecessor());
@@ -7699,8 +7860,14 @@ mod tests {
     fn an_entry_tied_at_a_truncated_windows_end_from_a_later_node_is_served_next_round() {
         let (b, _db) = engine();
         b.create_collection("db", "c").unwrap();
-        let first = kimmy_core::NodeId::from_bytes([1; 16]);
-        let second = kimmy_core::NodeId::from_bytes([2; 16]);
+        let first = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([1; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let second = kimmy_core::Origin::new(
+            kimmy_core::NodeId::from_bytes([2; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
         let at = Hlc::new(1_000, 0);
         let mut theirs = VersionVector::new();
         theirs.insert(first, at);
@@ -7745,7 +7912,7 @@ mod tests {
         // A hole, as an upgrade finds one: B's position on A already sits
         // above the creation of `docs` without B having applied it.
         let mut hole = VersionVector::new();
-        hole.insert(a.node_id(), first_doc.hlc);
+        hole.insert(a.origin(), first_doc.hlc);
         b.absorb_witnessed(&hole).unwrap();
 
         for round_no in 0..3 {
@@ -7760,7 +7927,7 @@ mod tests {
                 b.get_collection("app", "later").is_err(),
                 "the later creation was not reached"
             );
-            let position = b.witnessed_vector().unwrap().get(a.node_id());
+            let position = b.witnessed_vector().unwrap().get(a.origin());
             assert!(position < later_create.hlc, "and not witnessed either: {position:?}");
         }
 
@@ -7796,7 +7963,7 @@ mod tests {
         let unknown = outcome.unknown.expect("names the collection");
         assert_eq!(unknown.id, orders.id);
         assert_eq!(unknown.name.as_deref(), Some("shop.orders"));
-        assert_eq!(b.witnessed_vector().unwrap().get(a.node_id()), Hlc::ZERO, "not witnessed");
+        assert_eq!(b.witnessed_vector().unwrap().get(a.origin()), Hlc::ZERO, "not witnessed");
 
         // Dropped here, newer than the change: history.
         b.create_collection("shop", "orders").unwrap();
@@ -7804,7 +7971,7 @@ mod tests {
         let outcome = b.apply_batch(&[index]).unwrap();
         assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
         assert_eq!(outcome.superseded, 1, "{outcome:?}");
-        assert!(b.witnessed_vector().unwrap().get(a.node_id()) > Hlc::ZERO, "and witnessed");
+        assert!(b.witnessed_vector().unwrap().get(a.origin()) > Hlc::ZERO, "and witnessed");
     }
 
     /// A small deterministic pseudo-random source, so the load below is the
@@ -7848,23 +8015,23 @@ mod tests {
                     .filter(|s| s.node == origin.node_id())
                     .collect();
                 for stamp in own {
-                    if stamp.hlc <= servable.get(origin.node_id()) {
+                    if stamp.hlc <= servable.get(origin.origin()) {
                         assert!(
                             held.contains(&stamp),
                             "member {} advertises origin {} up to {:?} but lacks {:?}",
                             member.node_id(),
                             origin.node_id(),
-                            servable.get(origin.node_id()),
+                            servable.get(origin.origin()),
                             stamp
                         );
                     }
-                    if stamp.hlc <= witnessed.get(origin.node_id()) {
+                    if stamp.hlc <= witnessed.get(origin.origin()) {
                         assert!(
                             held.contains(&stamp),
                             "member {} has witnessed origin {} up to {:?} but never applied {:?}",
                             member.node_id(),
                             origin.node_id(),
-                            witnessed.get(origin.node_id()),
+                            witnessed.get(origin.origin()),
                             stamp
                         );
                     }
@@ -8303,7 +8470,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateCollection)
             .cloned()
             .expect("the creation's entry");
-        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        let below =
+            Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO);
         assert!(below < create.stamp, "premise: the drop sorts below the creation");
         let landing = Arc::clone(&b);
         let id = create.collection;
@@ -8331,7 +8499,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateCollection)
             .cloned()
             .expect("the creation's entry");
-        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        let below =
+            Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO);
         b.record_collection_drop(create.collection, below).unwrap();
         b.apply_batch(std::slice::from_ref(&create)).unwrap();
         assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
@@ -8353,7 +8522,7 @@ mod tests {
             .collection_dropped_at(CollectionId::derive("shop", &shadow))
             .unwrap()
             .expect("the shadow's drop");
-        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         let entry = crate::engine::ddl_entry(
             tied,
             OpKind::ConfigureVectors,
@@ -8391,6 +8560,7 @@ mod tests {
         let covering = Stamp::new(
             Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         let landing = Arc::clone(&b);
         let (applied, ()) = race_hooks::race(
@@ -8432,6 +8602,7 @@ mod tests {
         let at = Stamp::new(
             Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         b.record_collection_drop(index.collection, at).unwrap();
         let holds = |e: &Engine| {
@@ -8467,7 +8638,8 @@ mod tests {
             .find(|e| e.kind == OpKind::CreateIndex)
             .cloned()
             .expect("the index's entry");
-        index.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        index.stamp =
+            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
         assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
         let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
         assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
@@ -8745,7 +8917,7 @@ mod tests {
         engine
             .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
             .unwrap();
-        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (settled, created) = race_hooks::race(
             race_hooks::Race::IndexCreation,
@@ -8797,8 +8969,10 @@ mod tests {
         let coll = engine.get_collection("shop", "orders").unwrap();
         let held_at = coll.index("by_a").unwrap().created;
         let index_id = coll.index("by_a").unwrap().id;
-        let arriving = Stamp::new(Hlc::new(u64::MAX / 4, 0), NodeId::from_bytes([9; 16]));
-        let dropped_at = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let arriving =
+            Stamp::new(Hlc::new(u64::MAX / 4, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
+        let dropped_at =
+            Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (outcome, ()) = race_hooks::race(
             race_hooks::Race::IndexCreation,
@@ -8878,7 +9052,7 @@ mod tests {
         // under a tombstone newer than it, which the members that applied the
         // two the other way round do not hold.
         let (engine, _dir) = collection_with_documents();
-        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
         let competing = Arc::clone(&engine);
         let (dropped, created) = race_hooks::race(
             race_hooks::Race::IndexDrop,
@@ -10210,6 +10384,7 @@ mod budget_tests {
     use super::*;
     use crate::watch::ExamineBudget;
     use bson::doc;
+    use kimmy_core::Epoch;
     use kimmy_core::{CollectionId, DocId, NodeId};
 
     /// A budget with no time: every window ends at the first row past its
@@ -10222,14 +10397,14 @@ mod budget_tests {
         (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
     }
 
-    fn origin(byte: u8) -> NodeId {
-        NodeId::from_bytes([byte; 16])
+    fn origin(byte: u8) -> Origin {
+        Origin::new(NodeId::from_bytes([byte; 16]), Epoch::ZERO)
     }
 
-    fn insert(collection: CollectionId, node: NodeId, hlc: Hlc) -> OplogEntry {
-        let id = format!("{}-{}-{}", node, hlc.wall_ms, hlc.counter);
+    fn insert(collection: CollectionId, origin: Origin, hlc: Hlc) -> OplogEntry {
+        let id = format!("{}-{}-{}", origin, hlc.wall_ms, hlc.counter);
         OplogEntry {
-            stamp: Stamp::new(hlc, node),
+            stamp: Stamp::new(hlc, origin.node, origin.epoch),
             kind: OpKind::Insert,
             collection,
             doc_id: Some(DocId::String(id.clone())),
@@ -10363,7 +10538,7 @@ mod budget_tests {
         let asked = PeerWindow { asked_partial: true, ..window };
         requester.apply_peer_window_into(&theirs, Some(&mine), &[], asked, &mut outcome).unwrap();
         assert!(
-            requester.witnessed_vector().unwrap().get(p.node) >= p.hlc,
+            requester.witnessed_vector().unwrap().get(p.origin()) >= p.hlc,
             "asked for, the same window covers its origin through p"
         );
     }
@@ -10384,7 +10559,7 @@ mod budget_tests {
         let before = insert(held.id, a, Hlc::new(base, 0));
         let stop = insert(lacked, b, Hlc::new(base + 1, 0));
         let after = insert(held.id, a, Hlc::new(base + 2, 0));
-        let p = Stamp::new(Hlc::new(base + 3, 0), c);
+        let p = Stamp::new(Hlc::new(base + 3, 0), c.node, c.epoch);
         let theirs: VersionVector =
             [(a, after.stamp.hlc), (b, stop.stamp.hlc), (c, p.hlc)].into_iter().collect();
         let window = PeerWindow {
@@ -10403,7 +10578,7 @@ mod budget_tests {
         assert_eq!(outcome.applied, 1, "only the entry before the stop");
         let witnessed = requester.witnessed_vector().unwrap();
         for node in [a, b, c] {
-            let reached = Stamp::new(witnessed.get(node), node);
+            let reached = Stamp::new(witnessed.get(node), node.node, node.epoch);
             assert!(reached < stop.stamp, "{node} is covered to {reached:?}, past the stop");
         }
         assert!(witnessed.get(a) >= before.stamp.hlc, "the entry before the stop is covered");
@@ -10420,7 +10595,7 @@ mod budget_tests {
         let top = theirs.iter().map(|(_, hlc)| hlc).max().unwrap();
         // The requester holds everything: only the span is asked for.
         let held = theirs.clone();
-        let span = MarkedRange { origin: lowest.node, from: lowest.hlc, through: top };
+        let span = MarkedRange { origin: lowest.origin(), from: lowest.hlc, through: top };
         for from in [top, stamps[20].hlc] {
             let window = sender
                 .serve_entries_to_peer(from, usize::MAX, Some(&held), &[span], Some(NO_TIME))

@@ -53,7 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The cluster protocol this build speaks. Every member must run one
 /// release: a `Hello` or `Welcome` that does not name this protocol is refused
 /// ([`release_fault`]).
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// What a member says to a peer whose handshake named `theirs` instead of
 /// [`PROTOCOL`], naming both.
@@ -64,7 +64,7 @@ pub fn release_fault(theirs: Option<u32>) -> String {
     };
     format!(
         "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}); the peer speaks {peer}; every member must run one release",
-        kimmy_core::build::SCHEMA_6_RELEASE
+        kimmy_core::build::SCHEMA_8_RELEASE
     )
 }
 
@@ -104,20 +104,81 @@ fn lenient_generation<'de, D: serde::Deserializer<'de>>(
     crate::facts::lenient_millis(deserializer)
 }
 
-/// A position on a frame, read leniently: anything that is not one reads as
-/// absent, so a field of another shape costs the field and never the frame.
-fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Hlc>, D::Error> {
+/// A replay position on a frame, read leniently: anything that is not a whole stamp (an
+/// HLC, a node id and an 18-byte epoch) reads as absent, so a field of another shape costs the
+/// field and never the frame. Lenient because the dialler reads it in `Vectors`, the first answer
+/// of every round: failing the frame would fail every round with that peer, and the pull with it
+/// (ADR-139: an error inside replication must never wedge it). **Not silent**: a value present
+/// and not a position is flagged for the read's caller ([`take_malformed_replay_from`]), which
+/// says so once per peer. A stamp that decodes and names another member than the sender is
+/// refused where it is used.
+fn lenient_stamp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_core::Stamp>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
+    Ok(raw.and_then(|raw| match bson::deserialize_from_bson::<kimmy_core::Stamp>(raw) {
+        Ok(stamp) => Some(stamp),
+        Err(_) => {
+            MALFORMED_REPLAY_FROM.with(|flag| flag.set(true));
+            None
+        }
+    }))
+}
+
+thread_local! {
+    /// Set by [`lenient_stamp`] when the frame being decoded on this thread carried a
+    /// `replay_from` that is not a replay position. The decode and the caller's next line run
+    /// in one poll, as [`take_malformed_digest_cut`]'s do.
+    static MALFORMED_REPLAY_FROM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the frame just decoded on this thread carried a malformed `replay_from`; clears
+/// the flag.
+pub(crate) fn take_malformed_replay_from() -> bool {
+    MALFORMED_REPLAY_FROM.with(|flag| flag.replace(false))
 }
 
 /// A digest request, read leniently (B3): one that does not decode is none, so a
 /// field of another shape costs the field and never the frame.
+///
+/// **One case is not silent.** A request whose `cut` is present and is not a version
+/// vector (a key that is not an origin, such as a node alone) is also none, because
+/// failing the frame would end the connection and the count half of the divergence
+/// check with it, on every round the requester repeats it (ADR-139: an error inside
+/// replication must never wedge it). It is flagged for the read's caller
+/// ([`take_malformed_digest_cut`]), which says so once per peer and counts it.
 fn lenient_digest_ask<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<kimmy_storage::DigestAsk>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+    Ok(raw.and_then(|raw| {
+        let cut_malformed = matches!(&raw, bson::Bson::Document(ask)
+        if ask.get("cut").is_some_and(|cut| {
+            bson::deserialize_from_bson::<VersionVector>(cut.clone()).is_err()
+        }));
+        match bson::deserialize_from_bson(raw) {
+            Ok(ask) => Some(ask),
+            Err(_) => {
+                if cut_malformed {
+                    MALFORMED_DIGEST_CUT.with(|flag| flag.set(true));
+                }
+                None
+            }
+        }
+    }))
+}
+
+thread_local! {
+    /// Set by [`lenient_digest_ask`] when the frame being decoded on this thread
+    /// carried a digest request whose `cut` did not decode. The decode and the
+    /// caller's next line run in one poll, as `facts::take_undecodable`'s do.
+    static MALFORMED_DIGEST_CUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the frame just decoded on this thread carried a digest request with a
+/// malformed `cut`; clears the flag.
+pub(crate) fn take_malformed_digest_cut() -> bool {
+    MALFORMED_DIGEST_CUT.with(|flag| flag.replace(false))
 }
 
 /// A digest answer, read leniently, as the request is.
@@ -254,15 +315,16 @@ pub enum Message {
         )]
         echo: Option<Echo>,
         /// This member's replay of its own origin is armed and the requester has
-        /// not answered it: the position the replay asks from, so the requester
-        /// serves it on this connection (ADR-212's addendum). Absent when there
-        /// is nothing to ask.
+        /// not answered it: the position the replay asks after, a stamp of this
+        /// member's (its floor `H` as `(H, node, the largest epoch)`, or the last
+        /// entry it read), so the requester serves it on this connection
+        /// (ADR-212's addendum). Absent when there is nothing to ask.
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_hlc"
+            deserialize_with = "lenient_stamp"
         )]
-        replay_from: Option<Hlc>,
+        replay_from: Option<kimmy_core::Stamp>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -351,22 +413,25 @@ pub enum Message {
     /// served the entry (ADR-097).
     BeyondHorizon {},
     /// A page of the entries the requester holds of the **answerer's own origin**
-    /// above `from`, sent on a connection whose `Vectors` asked for them
-    /// (`replay_from`). `exhausted` says the sender holds nothing more above this
-    /// page; `horizon` says it has collected the oplog below `from` and cannot
-    /// say. Only ever sent to a peer that asked.
+    /// after `from`, sent on a connection whose `Vectors` asked for them
+    /// (`replay_from`). `from` and `scanned_to` are stamps of the answerer's, compared
+    /// in stamp order, since two epochs of one node can hold one HLC. `exhausted`
+    /// says the sender holds nothing more after this page; `horizon` says it has
+    /// collected the oplog below `from` and cannot say. Only ever sent to a peer
+    /// that asked.
     ReplayEntries {
-        from: Hlc,
+        from: kimmy_core::Stamp,
         entries: Vec<OplogEntry>,
         exhausted: bool,
         horizon: bool,
-        /// How far the sender's walk got. It is at least the last entry's stamp (a
-        /// page that says less is refused); a value below `from` is read as `from`.
-        /// On an empty page that is not the end, the requester moves its cursor
-        /// here, as `Entries::scanned_to` moves a pull's. A walk the sender's budget
-        /// cut short before it reached the requester's entries therefore still
-        /// makes progress at every contact.
-        scanned_to: Hlc,
+        /// How far the sender's walk got, as a stamp of the answerer's node (its walk's
+        /// HLC with the largest epoch, or the last entry). It is at least the last
+        /// entry's stamp (a page that says less, or names another node, is refused); a
+        /// value below `from` is read as `from`. On an empty page that is not the end,
+        /// the requester moves its cursor here, as `Entries::scanned_to` moves a pull's.
+        /// A walk the sender's budget cut short before it reached the requester's
+        /// entries therefore still makes progress at every contact.
+        scanned_to: kimmy_core::Stamp,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has
@@ -374,7 +439,8 @@ pub enum Message {
     /// must first receive by the ordinary pull, so the replay stops for this
     /// contact and goes on at the next, with nothing answered.
     ReplayAck {
-        next_from: Hlc,
+        /// A stamp of the acking member's own node; another node's ends the contact.
+        next_from: kimmy_core::Stamp,
         done: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stalled: Option<ReplayStall>,
@@ -636,6 +702,7 @@ pub(crate) async fn read_frame_noting_facts<R: AsyncRead + Unpin>(
 ) -> Result<(Message, bool, u64), ProtocolError> {
     let body = read_body(reader).await?;
     crate::facts::take_undecodable();
+    take_malformed_replay_from();
     let message = decode(&body)?;
     let seq = crate::facts::next_decoded_seq();
     Ok((message, crate::facts::take_undecodable(), seq))
@@ -679,6 +746,7 @@ pub(crate) async fn read_frame_noting_facts_within<R: AsyncRead + Unpin>(
 ) -> Result<(Message, bool, u64), ProtocolError> {
     let body = read_body_within(reader, Some(waits)).await?;
     crate::facts::take_undecodable();
+    take_malformed_digest_cut();
     let message = decode(&body)?;
     let seq = crate::facts::next_decoded_seq();
     Ok((message, crate::facts::take_undecodable(), seq))
@@ -866,6 +934,7 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kimmy_core::Epoch;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -965,7 +1034,7 @@ mod tests {
     /// did not.
     fn populated_vector() -> VersionVector {
         let mut v = VersionVector::new();
-        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate()));
+        v.observe(kimmy_core::Stamp::new(Hlc::new(42, 3), NodeId::generate(), Epoch::ZERO));
         v
     }
 
@@ -992,7 +1061,7 @@ mod tests {
                 limit: 10,
                 held: Some(populated_vector()),
                 marked: vec![kimmy_storage::MarkedRange {
-                    origin: NodeId::generate(),
+                    origin: kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
                     from: Hlc::new(3, 0),
                     through: Hlc::new(5, 2),
                 }],
@@ -1081,10 +1150,15 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
-                refused: vec![kimmy_core::Stamp::new(Hlc::new(3, 1), NodeId::from_bytes([7; 16]))],
+                refused: vec![kimmy_core::Stamp::new(
+                    Hlc::new(3, 1),
+                    NodeId::from_bytes([7; 16]),
+                    Epoch::ZERO,
+                )],
                 stopped_at: Some(kimmy_core::Stamp::new(
                     Hlc::new(4, 0),
                     NodeId::from_bytes([8; 16]),
+                    Epoch::ZERO,
                 )),
             },
             Message::Fault("nope".into()),
@@ -1520,8 +1594,8 @@ mod tests {
     /// with none and never as a zero horizon.
     #[tokio::test]
     async fn a_snapshot_page_needs_its_lists_and_reads_an_absent_horizon_as_none() {
-        let node = NodeId::from_bytes([3; 16]);
-        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node);
+        let node = kimmy_core::Origin::new(NodeId::from_bytes([3; 16]), kimmy_core::Epoch::ZERO);
+        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node.node, node.epoch);
         let mut versions = VersionVector::new();
         versions.insert(node, Hlc::new(900, 0));
         let page = SnapshotPage {
@@ -1581,7 +1655,12 @@ mod tests {
             buffer
         };
         let ask = kimmy_storage::DigestAsk {
-            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
             uncovered: vec![kimmy_storage::Uncovered {
                 collection: CollectionId(u64::MAX),
                 keys: vec![serde_bytes::ByteBuf::from(vec![1, 2])],
@@ -1682,6 +1761,72 @@ mod tests {
         }
         let old: OldAnswer = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
         assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
+    }
+
+    /// A digest request is read leniently, with one case that is loud: a `cut` that is
+    /// not a version vector (a key naming a node and no epoch) reads as no digest and
+    /// is flagged for the read's caller, where any other shape that does not decode
+    /// is no digest and no flag; and a good cut, after either, is read whole.
+    #[test]
+    fn a_digest_request_with_a_malformed_cut_reads_as_none_and_is_flagged() {
+        let ask = kimmy_storage::DigestAsk {
+            cut: [(
+                kimmy_core::Origin::new(NodeId::generate(), kimmy_core::Epoch::ZERO),
+                Hlc::new(5, 1),
+            )]
+            .into_iter()
+            .collect(),
+            uncovered: Vec::new(),
+            busy: None,
+        };
+        let good = bson::serialize_to_document(&Message::AskDivergence {
+            probe: None,
+            digest: Some(ask.clone()),
+            definitions: None,
+        })
+        .unwrap();
+        let decode_flagged = |body: &bson::Document| {
+            take_malformed_digest_cut();
+            let message = decode(&bson::serialize_to_vec(body).unwrap()).unwrap();
+            (message, take_malformed_digest_cut())
+        };
+
+        // A cut keyed by a node alone.
+        let mut node_only = good.clone();
+        let cut = node_only
+            .get_document_mut("AskDivergence")
+            .unwrap()
+            .get_document_mut("digest")
+            .unwrap()
+            .get_document_mut("cut")
+            .unwrap();
+        let (key, value) = cut.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        cut.remove(&key);
+        cut.insert(key.split('/').next().unwrap().to_string(), value);
+        let (message, flagged) = decode_flagged(&node_only);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: None, definitions: None },
+            "read as no digest, the frame still decodes"
+        );
+        assert!(flagged, "and the malformed cut is flagged");
+
+        // A digest of some other shape: no digest, no flag (the lenient reading).
+        let other_shape = bson::doc! { "AskDivergence": { "digest": "not a request" } };
+        let (message, flagged) = decode_flagged(&other_shape);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: None, definitions: None }
+        );
+        assert!(!flagged, "another shape is the old lenient reading");
+
+        // A good cut is read whole, and not flagged.
+        let (message, flagged) = decode_flagged(&good);
+        assert_eq!(
+            message,
+            Message::AskDivergence { probe: None, digest: Some(ask), definitions: None }
+        );
+        assert!(!flagged);
     }
 
     /// B3 half 2: the definition digest crosses the version line in both

@@ -284,8 +284,9 @@ struct Replay {
     floor: kimmy_core::Hlc,
     /// The peers that have answered this run.
     answered: BTreeSet<NodeId>,
-    /// How far each peer's replay has read and applied, across rounds.
-    cursors: BTreeMap<NodeId, kimmy_core::Hlc>,
+    /// How far each peer's replay has read and applied, across rounds: the full stamp of
+    /// this member's last entry it read, since two epochs of this member can hold one HLC.
+    cursors: BTreeMap<NodeId, kimmy_core::Stamp>,
     /// How long a peer keeps the oplog: what is older than this can no longer be
     /// read back, and asking for it is answered `BeyondHorizon`. `None` when
     /// retention collection is off.
@@ -366,21 +367,22 @@ impl Replay {
         now.saturating_duration_since(from) < wait
     }
 
-    /// Where the replay against `peer` asks from.
-    fn asks_from(&self, peer: NodeId) -> kimmy_core::Hlc {
-        self.cursors
-            .get(&peer)
-            .copied()
-            .unwrap_or_default()
-            .max(self.floor)
-            .max(oldest_readable(self.retention))
+    /// Where the replay against `peer` asks from, for this member, `me`: strictly after it.
+    fn asks_from(&self, peer: NodeId, me: NodeId) -> kimmy_core::Stamp {
+        let floor = replay_after(self.floor.max(oldest_readable(self.retention)), me);
+        self.cursors.get(&peer).map_or(floor, |cursor| (*cursor).max(floor))
     }
 
     /// `peer` has answered: it no longer owes.
     fn answered_by(&mut self, peer: NodeId) {
         self.answered.insert(peer);
         if self.owing.remove(&peer).is_some() {
-            info!(%peer, from = ?self.asks_from(peer), "a member owing the replay has answered");
+            info!(
+                %peer,
+                floor = %self.floor,
+                cursor = ?self.cursors.get(&peer),
+                "a member owing the replay has answered"
+            );
         }
     }
 
@@ -839,8 +841,13 @@ impl CatchUp {
     /// earlier round got further, and never older than the oplog the peers keep
     /// (which moves on as the run does: a peer that answered `BeyondHorizon` is
     /// asked from a later position next round).
-    pub fn replay_from(&self, peer: NodeId) -> kimmy_core::Hlc {
-        self.replay.lock().asks_from(peer)
+    ///
+    /// A full stamp of this member, `me`, and the replay asks for what is strictly after it:
+    /// the floor `H` is [`replay_after`]`(H, me)`, past every entry of `me` at `H` in every
+    /// epoch, and a cursor is the last entry read, so an entry of another epoch at the same HLC
+    /// is still after it.
+    pub fn replay_from(&self, peer: NodeId, me: NodeId) -> kimmy_core::Stamp {
+        self.replay.lock().asks_from(peer, me)
     }
 
     /// `peer` answered the replay `BeyondHorizon` at `now`: it cannot tell what it
@@ -861,12 +868,13 @@ impl CatchUp {
         if replay.horizon_reported.insert(peer) { Horizon::First } else { Horizon::Again }
     }
 
-    /// The replay against `peer` has read and applied everything through `hlc`.
-    pub fn replay_advanced(&self, peer: NodeId, hlc: kimmy_core::Hlc) {
+    /// The replay against `peer` has read and applied everything through `at`, a stamp of this
+    /// member's own; it never moves back.
+    pub fn replay_advanced(&self, peer: NodeId, at: kimmy_core::Stamp) {
         let mut replay = self.replay.lock();
         replay.horizon_since.remove(&peer);
-        let cursor = replay.cursors.entry(peer).or_default();
-        *cursor = (*cursor).max(hlc);
+        let cursor = replay.cursors.entry(peer).or_insert(at);
+        *cursor = (*cursor).max(at);
     }
 
     /// Whether this is the first time in this armed episode that `peer` has shown
@@ -947,8 +955,8 @@ impl CatchUp {
             replay.first_contact_at.get_or_insert(now);
         }
         for peer in tick.reached.iter().filter(|peer| peer.node != me) {
-            replay.origins.extend(peer.servable.iter().map(|(node, _)| node));
-            replay.origins.extend(peer.witnessed.iter().map(|(node, _)| node));
+            replay.origins.extend(peer.servable.iter().map(|(origin, _)| origin.node));
+            replay.origins.extend(peer.witnessed.iter().map(|(origin, _)| origin.node));
         }
         replay.origins.remove(&me);
         replay.present.extend(present.iter().copied());
@@ -1200,8 +1208,8 @@ impl CatchUp {
             seen_now.extend(live.iter().copied());
         }
         for peer in tick.reached {
-            seen_now.extend(peer.servable.iter().map(|(node, _)| node));
-            seen_now.extend(peer.witnessed.iter().map(|(node, _)| node));
+            seen_now.extend(peer.servable.iter().map(|(origin, _)| origin.node));
+            seen_now.extend(peer.witnessed.iter().map(|(origin, _)| origin.node));
         }
         seen_now.remove(&tick.me);
         for id in seen_now {
@@ -1238,11 +1246,23 @@ impl CatchUp {
         let marker = grown;
 
         // A counting peer: reached, not itself catching up (a peer that has sent
-        // no block counts), and not one that has lost data (it holds less of its
-        // own origin than this member holds of it).
+        // no block counts), and not one that has lost data (it holds less of one of
+        // its own origins than this member holds of it). Origin by origin: a peer
+        // that lost an old epoch's tail and has written further under a new one
+        // has still lost data, whatever its node's highest position. How far it
+        // holds an origin is what it has witnessed of it: a write that lost on
+        // arrival there (superseded) is witnessed and never appended, so its
+        // servable position can stay below for good. The witnessed vector is at or
+        // above the servable one by construction (ADR-054, the `Vectors` answer in
+        // transport.rs), so the larger of the two is the witnessed one from a
+        // current peer; taking it guards a peer that sent the servable one alone.
         let counts = |peer: &Reached| {
             !peer.facts.as_deref().is_some_and(|f| f.catching_up)
-                && tick.mine_witnessed.get(peer.node) <= peer.servable.get(peer.node)
+                && tick.mine_witnessed.iter().filter(|(origin, _)| origin.node == peer.node).all(
+                    |(origin, hlc)| {
+                        hlc <= peer.servable.get(origin).max(peer.witnessed.get(origin))
+                    },
+                )
         };
         // The latch drops when nothing is owed (ADR-212): the member is then
         // judged as any marked member is, and gated if no rule clears it.
@@ -1619,6 +1639,13 @@ fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>)>
 }
 
 /// The oldest position a peer keeping the oplog for `retention` can still serve.
+/// The replay position just after `hlc` for `node`: past every entry of `node` at or below
+/// `hlc`, in every epoch, and before every one above it. What a floor, which is one HLC, is as a
+/// replay cursor; "after the floor" is still "an HLC above it".
+pub fn replay_after(hlc: kimmy_core::Hlc, node: NodeId) -> kimmy_core::Stamp {
+    kimmy_core::Stamp::new(hlc, node, kimmy_core::Epoch::MAX)
+}
+
 fn oldest_readable(retention: Option<Duration>) -> kimmy_core::Hlc {
     match retention {
         Some(retention) => kimmy_core::Hlc::new(
@@ -1683,7 +1710,10 @@ mod tests {
     fn vector(entries: &[(u8, u64)]) -> VersionVector {
         let mut v = VersionVector::new();
         for (n, at) in entries {
-            v.insert(node(*n), kimmy_core::Hlc::new(*at, 0));
+            v.insert(
+                kimmy_core::Origin::new(node(*n), kimmy_core::Epoch::ZERO),
+                kimmy_core::Hlc::new(*at, 0),
+            );
         }
         v
     }
@@ -1835,6 +1865,72 @@ mod tests {
         // A peer that holds less of its own origin than this member holds of it.
         let lost = [reached(1, vector(&[(1, 10)]), None, block(None))];
         assert_eq!(f.catchup.evaluate(&tick(&lost, &mine, None, now)), Decision::Kept);
+    }
+
+    /// A peer that lost its old epoch's tail and has written under a new one since (a volume
+    /// rollback, a crash under coalesced durability after a minting open) holds less of that
+    /// old origin than this member holds of it: it has lost data, and does not count, however
+    /// far its new epoch has gone. Compared origin by origin, never by the node's highest.
+    #[test]
+    fn a_peer_that_lost_an_old_epochs_tail_does_not_count_whatever_its_new_epoch_holds() {
+        let f = marked(CatchUpReason::Restored);
+        let now = Instant::now();
+        let at = |epoch: u64, ms: u64| {
+            (
+                kimmy_core::Origin::new(node(1), kimmy_core::Epoch::from_u64(epoch)),
+                kimmy_core::Hlc::new(ms, 0),
+            )
+        };
+        let of = |entries: &[(kimmy_core::Origin, kimmy_core::Hlc)]| {
+            let mut v = VersionVector::new();
+            for (origin, hlc) in entries {
+                v.insert(*origin, *hlc);
+            }
+            v
+        };
+        // This member holds the old epoch to 100 and the new one to 200; the peer holds the
+        // old one only to 10. Its highest position, 200, is not less than this member's.
+        let mine = of(&[at(1, 100), at(2, 200)]);
+        let lost = [reached(1, of(&[at(1, 10), at(2, 200)]), None, block(None))];
+        assert_eq!(f.catchup.evaluate(&tick(&lost, &mine, None, now)), Decision::Kept);
+        // The same peer holding the old epoch's tail counts, and clears by dominance.
+        let whole = [reached(1, of(&[at(1, 100), at(2, 200)]), None, block(None))];
+        assert_eq!(
+            f.catchup.evaluate(&tick(&whole, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
+    }
+
+    /// A peer that has caught up on an old epoch of its own whose last write lost on arrival
+    /// there (superseded by a newer write, so nothing was appended): its servable position on
+    /// that origin stays below this member's, but it has witnessed the whole origin. It has not
+    /// lost data and counts; its witnessed vector is what says how far it holds an origin.
+    #[test]
+    fn a_caught_up_peer_whose_old_epochs_last_write_was_superseded_counts() {
+        let f = marked(CatchUpReason::Restored);
+        let now = Instant::now();
+        let at = |epoch: u64, ms: u64| {
+            (
+                kimmy_core::Origin::new(node(1), kimmy_core::Epoch::from_u64(epoch)),
+                kimmy_core::Hlc::new(ms, 0),
+            )
+        };
+        let of = |entries: &[(kimmy_core::Origin, kimmy_core::Hlc)]| {
+            let mut v = VersionVector::new();
+            for (origin, hlc) in entries {
+                v.insert(*origin, *hlc);
+            }
+            v
+        };
+        let mine = of(&[at(1, 100), at(2, 200)]);
+        // The old epoch's write at 100 was superseded on arrival: served through 90 only.
+        let servable = of(&[at(1, 90), at(2, 200)]);
+        let witnessed = of(&[at(1, 100), at(2, 200)]);
+        let caught_up = [reached(1, servable, Some(witnessed), block(None))];
+        assert_eq!(
+            f.catchup.evaluate(&tick(&caught_up, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
     }
 
     #[test]
@@ -1995,7 +2091,10 @@ mod tests {
         for i in 0..(MAX_SEEN as u64 + 5) {
             let mut bytes = [0u8; 16];
             bytes[..8].copy_from_slice(&(i + 1).to_be_bytes());
-            big.insert(NodeId::from_bytes(bytes), kimmy_core::Hlc::new(1, 0));
+            big.insert(
+                kimmy_core::Origin::new(NodeId::from_bytes(bytes), kimmy_core::Epoch::ZERO),
+                kimmy_core::Hlc::new(1, 0),
+            );
         }
         let live: BTreeSet<NodeId> = [node(1)].into();
         let peer = [reached(1, big.clone(), Some(big.clone()), seeded)];
@@ -2352,12 +2451,47 @@ mod tests {
         let f = marked(CatchUpReason::Restored);
         let floor = kimmy_core::Hlc::new(50, 0);
         f.catchup.arm_replay(floor, None).unwrap();
-        assert_eq!(f.catchup.replay_from(node(1)), floor);
-        f.catchup.replay_advanced(node(1), kimmy_core::Hlc::new(80, 0));
-        assert_eq!(f.catchup.replay_from(node(1)), kimmy_core::Hlc::new(80, 0));
-        f.catchup.replay_advanced(node(1), kimmy_core::Hlc::new(60, 0));
-        assert_eq!(f.catchup.replay_from(node(1)), kimmy_core::Hlc::new(80, 0), "never back");
-        assert_eq!(f.catchup.replay_from(node(2)), floor, "another peer starts at the floor");
+        let me = node(9);
+        let at = |ms: u64, epoch: u64| {
+            kimmy_core::Stamp::new(
+                kimmy_core::Hlc::new(ms, 0),
+                me,
+                kimmy_core::Epoch::from_u64(epoch),
+            )
+        };
+        assert_eq!(f.catchup.replay_from(node(1), me), replay_after(floor, me));
+        f.catchup.replay_advanced(node(1), at(80, 1));
+        assert_eq!(f.catchup.replay_from(node(1), me), at(80, 1));
+        f.catchup.replay_advanced(node(1), at(60, 2));
+        assert_eq!(f.catchup.replay_from(node(1), me), at(80, 1), "never back");
+        // Another epoch of this member at the same HLC is after the cursor, and moves it on.
+        assert!(at(80, 2) > f.catchup.replay_from(node(1), me));
+        f.catchup.replay_advanced(node(1), at(80, 2));
+        assert_eq!(f.catchup.replay_from(node(1), me), at(80, 2));
+        f.catchup.replay_advanced(node(1), at(80, 1));
+        assert_eq!(f.catchup.replay_from(node(1), me), at(80, 2), "never back within an HLC");
+        assert_eq!(
+            f.catchup.replay_from(node(2), me),
+            replay_after(floor, me),
+            "another peer starts at the floor"
+        );
+    }
+
+    /// The floor is one HLC, and as a cursor it is just after every entry of this member at
+    /// it, in every epoch, and just before every one above it: "after the floor" is still "an
+    /// HLC above it".
+    #[test]
+    fn the_floor_as_a_cursor_is_after_every_epoch_at_it_and_before_every_hlc_above_it() {
+        let me = node(9);
+        let floor = kimmy_core::Hlc::new(50, 7);
+        let after = replay_after(floor, me);
+        assert_eq!((after.hlc, after.node), (floor, me));
+        for epoch in [kimmy_core::Epoch::ZERO, kimmy_core::Epoch::from_u64(u64::MAX)] {
+            assert!(kimmy_core::Stamp::new(floor, me, epoch) <= after, "{epoch:?} at the floor");
+            assert!(kimmy_core::Stamp::new(floor.successor(), me, epoch) > after);
+            assert!(kimmy_core::Stamp::new(floor.successor(), me, kimmy_core::Epoch::ZERO) > after);
+        }
+        assert!(kimmy_core::Stamp::new(floor, me, kimmy_core::Epoch::MAX) <= after);
     }
 
     /// The floor is the lowest position any start since the last complete replay
@@ -2481,7 +2615,7 @@ mod tests {
         assert!(floor.wall_ms + 3_600_000 >= now, "clamped up to the retention: {floor:?}");
         assert!(floor.wall_ms + 3_600_000 <= now + 10_000, "and no further: {floor:?}");
         assert_eq!(read_replay_floor(&dir.path().join(REPLAY_FLOOR_FILE)), Some(floor));
-        assert!(catchup.replay_from(node(1)) >= floor);
+        assert!(catchup.replay_from(node(1), node(9)) >= replay_after(floor, node(9)));
 
         let bare = tempfile::tempdir().unwrap();
         write_replay_floor(bare.path(), kimmy_core::Hlc::new(1_000, 0)).unwrap();
@@ -2499,9 +2633,9 @@ mod tests {
         let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
         let retention = Duration::from_millis(200);
         catchup.arm_replay(kimmy_core::Hlc::ZERO, Some(retention)).unwrap();
-        let first = catchup.replay_from(node(1));
+        let first = catchup.replay_from(node(1), node(9)).hlc;
         std::thread::sleep(Duration::from_millis(300));
-        let later = catchup.replay_from(node(1));
+        let later = catchup.replay_from(node(1), node(9)).hlc;
         assert!(later.wall_ms >= first.wall_ms + 250, "{first:?} then {later:?}");
         assert!(catchup.replay_floor() <= first, "the persisted floor does not move");
     }
@@ -2570,7 +2704,10 @@ mod tests {
         assert!(!f.catchup.replay_answered(node(2)));
 
         // An answer between two horizons starts the count again.
-        f.catchup.replay_advanced(node(2), kimmy_core::Hlc::new(60, 0));
+        f.catchup.replay_advanced(
+            node(2),
+            kimmy_core::Stamp::new(kimmy_core::Hlc::new(60, 0), node(9), kimmy_core::Epoch::ZERO),
+        );
         assert_eq!(f.catchup.replay_beyond_horizon(node(2), t0 + wait), Horizon::Again);
         assert_eq!(
             f.catchup.replay_beyond_horizon(node(2), t0 + wait * 2 - Duration::from_secs(1)),
@@ -3747,7 +3884,8 @@ mod tests {
         assert_eq!(warned.len(), 1, "{warned:?}");
         assert_eq!(warned[0].0, tracing::Level::WARN);
         assert!(
-            catchup.replay_from(node(2)).wall_ms + 60_000 >= kimmy_storage::physical_now_ms(),
+            catchup.replay_from(node(2), node(9)).hlc.wall_ms + 60_000
+                >= kimmy_storage::physical_now_ms(),
             "the replay asks from the horizon"
         );
     }

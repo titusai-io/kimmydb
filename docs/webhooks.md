@@ -47,7 +47,7 @@ The body is a batch:
 
 ```json
 { "subscription": "wh_…",
-  "events": [ { "eventId": "1786…-ec4c…", "operationType": "insert",
+  "events": [ { "eventId": "1786…-ec4c…-0000…", "operationType": "insert",
                 "database": "shop", "collection": "orders",
                 "clusterTime": "1786…", "documentKey": {"_id": 1},
                 "fullDocument": {"_id": 1, "item": "widget"} } ] }
@@ -63,6 +63,21 @@ subscriptions routes on the body rather than on which URL was called.
 **Deduplicate on `eventId`.** Exactly-once is not achievable over a network by
 any design, so the id is stable across redeliveries and identical on every node
 — a set-membership test is all a receiver needs.
+
+The id is the change's stamp, `{hlc}-{node}-{epoch}`: the HLC as
+`<wall ms>.<counter>`, the node id as its hyphenated UUID, and the epoch as 36
+lowercase hex digits, so the epoch is always the last 36 characters. For
+example:
+
+```
+1794482424658.0-92182685-4a9c-4903-9123-223d2c353993-000001a1ca93180000005c1e9a07d2b4f836
+```
+
+The epoch is in it since 0.61.0 (the id was `{hlc}-{node}` before): a node's
+epoch changes when it is restored or rewound, and a change made after that can
+share an HLC with one made before, so the epoch is what keeps the two ids apart.
+**A receiver that deduplicates on the id needs no change other than accepting
+the longer id.** Treat it as an opaque string.
 
 Duplicates should be rare rather than routine: a crash mid-delivery, or a brief
 disagreement about cluster membership. Answer `2xx` and the batch is marked
@@ -86,6 +101,17 @@ computes independently, so there is no leader, no election, and no coordination.
 **When that node dies, another takes over** and resumes from replicated
 progress, so nothing is lost and nothing is sent five times.
 [ADR-045](decisions.md) has the reasoning.
+
+Progress is kept in the system collection `__webhook_progress`, one record per
+subscription and node (`_id` = `{subscription}:{node}`), whose `delivered` document is
+keyed by origin, `<node uuid>/<36 hex digits of the epoch>`, with the position as 10
+bytes of HLC. **An entry the reader cannot use counts as nothing delivered**: a key that
+is not an origin (for example the bare node id written before 0.61.0), a value that is
+not binary, or a value that is not 10 bytes. The events it covered are sent again
+(at-least-once, as before), not skipped. The node logs it once per process for each
+subscription and key, at `WARN`, naming the subscription, the record and the key and
+what is wrong with it (`a webhook progress entry cannot be read`); further hits are
+`DEBUG`. No metric counts it.
 
 **Moving a node does not move its subscriptions.** Ownership follows the node
 id, which lives in the database file — so a pod rescheduled onto a new IP, a

@@ -5,6 +5,7 @@
 //! use only what the engine offers, so a test here that is red names a
 //! behaviour, not a missing function.
 
+use kimmy_core::Epoch;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,7 +147,7 @@ fn a_definition_below_the_databases_tombstone_is_history_for_an_absent_collectio
         .find(|entry| entry.kind == OpKind::CreateIndex)
         .expect("the index's entry");
     let orders = CollectionId::derive("shop", "orders");
-    let at = |wall: u64| Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([7; 16]));
+    let at = |wall: u64| Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO);
     e.record_collection_drop(orders, at(created.stamp.hlc.wall_ms - 1)).unwrap();
     e.record_database_tombstone_for_test(
         kimmy_core::database_drop_id("shop"),
@@ -184,9 +185,10 @@ fn a_life_created_over_its_databases_tombstone_takes_its_own_and_its_shadows() {
 fn a_local_creation_whose_next_tick_is_its_floors_hlc_is_minted_above_it() {
     let (e, _d) = engine();
     let ahead = crate::physical_now_ms() + 3_600_000;
-    let floor = Stamp::new(Hlc::new(ahead, 1), NodeId::from_bytes([7; 16]));
+    let floor = Stamp::new(Hlc::new(ahead, 1), NodeId::from_bytes([7; 16]), Epoch::ZERO);
     e.record_collection_drop(CollectionId::derive("shop", "orders"), floor).unwrap();
-    e.witness_processed(&Stamp::new(Hlc::new(ahead, 0), NodeId::from_bytes([7; 16]))).unwrap();
+    e.witness_processed(&Stamp::new(Hlc::new(ahead, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO))
+        .unwrap();
     let created = e.create_collection("shop", "orders").unwrap();
     assert_eq!(created.incarnation_floor, Some(floor.hlc), "premise: floored at the tombstone");
     assert!(created.created > floor.hlc, "minted at or below its floor: {:?}", created.created);
@@ -200,7 +202,8 @@ fn a_database_sweep_counts_a_life_it_kept() {
     let orders = e.create_collection("shop", "orders").unwrap();
     e.insert(&orders, doc! { "_id": "before" }).unwrap();
     later();
-    let dropped = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+    let dropped =
+        Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]), Epoch::ZERO);
     later();
     e.insert(&orders, doc! { "_id": "after" }).unwrap();
     e.record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), dropped).unwrap();
@@ -225,7 +228,8 @@ fn an_expansion_of_a_database_drop_follows_a_later_drop_of_the_database() {
     assert_ne!(own, first, "premise: a stamp of its own");
     // A tombstone of another database's collection, below the first drop.
     let elsewhere = CollectionId::derive("other", "x");
-    let older = Stamp::new(Hlc::new(first.hlc.wall_ms - 1, 0), NodeId::from_bytes([9; 16]));
+    let older =
+        Stamp::new(Hlc::new(first.hlc.wall_ms - 1, 0), NodeId::from_bytes([9; 16]), Epoch::ZERO);
     a.record_collection_drop(elsewhere, older).unwrap();
     later();
     let second = stamp_of(crate::physical_now_ms() + 1_000, 7);
@@ -514,14 +518,17 @@ fn the_sentinel_is_an_ordinary_drop_collection_entry() {
     let hlc = Hlc::new(1_000, 0);
     let id = CollectionId::derive("shop", RESERVED);
     let entry = crate::engine::ddl_entry(
-        Stamp::new(hlc, origin),
+        Stamp::new(hlc, origin, Epoch::ZERO),
         OpKind::DropCollection,
         id,
         &CollectionRef::new("shop", RESERVED),
     )
     .unwrap();
     let encoded = crate::codec::encode_oplog_entry(&entry);
-    assert_eq!(crate::codec::decode_oplog_entry(&encoded).unwrap(), entry);
+    assert_eq!(
+        crate::codec::decode_oplog_entry(&crate::codec::oplog_key(&entry.stamp), &encoded).unwrap(),
+        entry
+    );
 
     b.apply_batch(std::slice::from_ref(&entry)).unwrap();
     assert_eq!(b.collection_dropped_at(id).unwrap(), Some(entry.stamp));
@@ -541,7 +548,7 @@ fn the_sentinel_is_an_ordinary_drop_collection_entry() {
 // ---------------------------------------------------------------------------
 
 fn stamp_of(hlc: u64, node: u8) -> Stamp {
-    Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([node; 16]))
+    Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([node; 16]), Epoch::ZERO)
 }
 
 fn create_entry(db: &str, name: &str, at: Stamp) -> kimmy_core::OplogEntry {
@@ -688,8 +695,11 @@ fn a_member_that_took_the_drop_as_a_plain_collection_drop_buries_under_it_on_rec
     let (e, _d) = engine();
     e.create_collection("shop", "orders").unwrap();
     later();
-    let after =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16]));
+    let after = Stamp::new(
+        Hlc::new(crate::physical_now_ms() + 1_000, 0),
+        NodeId::from_bytes([7; 16]),
+        Epoch::ZERO,
+    );
     e.record_collection_drop(kimmy_core::database_drop_id("shop"), after).unwrap();
     assert!(holds(&e, "shop", "orders"), "nothing has acted on the tombstone yet");
     let swept = e.reconcile_database_tombstones().unwrap();
@@ -1241,7 +1251,11 @@ fn tombstoned_store() -> (Arc<Engine>, tempfile::TempDir) {
     engine
         .record_collection_drop(
             kimmy_core::database_drop_id("shop"),
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+            Stamp::new(
+                Hlc::new(crate::physical_now_ms() + 1_000, 0),
+                NodeId::from_bytes([7; 16]),
+                Epoch::ZERO,
+            ),
         )
         .unwrap();
     (engine, dir)
@@ -1305,7 +1319,8 @@ fn the_stamp_based_start_of_a_stream_on_a_survivor_costs_one_pass_over_the_older
     }
     eprintln!("MEASURE wrote {rows} entries in {:?}", started.elapsed());
     later();
-    let dropped = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+    let dropped =
+        Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]), Epoch::ZERO);
     c.record_collection_drop(kimmy_core::database_drop_id("shop"), dropped).unwrap();
     c.record_collection_drop(CollectionId::derive("shop", "late"), dropped).unwrap();
     later();
@@ -1909,7 +1924,11 @@ fn a_stop_that_comes_with_the_last_burial_ends_the_sweep_before_its_second_walk(
     engine
         .record_collection_drop(
             kimmy_core::database_drop_id("shop"),
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+            Stamp::new(
+                Hlc::new(crate::physical_now_ms() + 1_000, 0),
+                NodeId::from_bytes([7; 16]),
+                Epoch::ZERO,
+            ),
         )
         .unwrap();
     let stopper = Arc::clone(&engine);
@@ -1992,7 +2011,11 @@ fn a_stop_ends_a_sweep_between_two_shadow_burials() {
     engine
         .record_collection_drop(
             kimmy_core::database_drop_id("shop"),
-            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+            Stamp::new(
+                Hlc::new(crate::physical_now_ms() + 1_000, 0),
+                NodeId::from_bytes([7; 16]),
+                Epoch::ZERO,
+            ),
         )
         .unwrap();
     let stopper = Arc::clone(&engine);

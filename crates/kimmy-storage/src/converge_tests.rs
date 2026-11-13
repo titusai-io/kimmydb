@@ -320,7 +320,7 @@ fn a_page_that_says_the_sender_dropped_the_collection_applies_nothing() {
     later();
     a.replace(&coll(&a), &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
     let mut page = a.snapshot_page(None, Some(orders())).unwrap();
-    page.dropped = Some(Stamp::new(Hlc::new(1, 0), a.node_id()));
+    page.dropped = Some(Stamp::new(Hlc::new(1, 0), a.node_id(), a.epoch()));
     let mut progress =
         SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
@@ -442,7 +442,7 @@ fn a_young_row_is_not_written_into_a_life_that_owes_a_sweep() {
     // A drop tombstone below the receiver's life with the floor not taken up to it: the
     // life owes ADR-231's sweep, so what it holds may include the life before.
     let created = coll(&b).created;
-    let stamp = kimmy_core::Stamp::new(Hlc::new(created.wall_ms - 1, 0), b.node_id());
+    let stamp = kimmy_core::Stamp::new(Hlc::new(created.wall_ms - 1, 0), b.node_id(), b.epoch());
     {
         let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
         txn.open_table(crate::tables::COLLECTIONS_DROPPED)
@@ -463,7 +463,7 @@ fn a_young_row_is_not_written_into_a_life_that_owes_a_sweep_for_a_database_drop(
     let (a, b, _d) = young_pair();
     a.insert(&coll(&a), doc! { "_id": 3, "v": 3 }).unwrap();
     let created = coll(&b).created;
-    let stamp = kimmy_core::Stamp::new(Hlc::new(created.wall_ms - 1, 0), b.node_id());
+    let stamp = kimmy_core::Stamp::new(Hlc::new(created.wall_ms - 1, 0), b.node_id(), b.epoch());
     {
         let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
         txn.open_table(crate::tables::COLLECTIONS_DROPPED)

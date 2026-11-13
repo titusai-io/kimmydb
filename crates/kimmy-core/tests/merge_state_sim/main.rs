@@ -436,14 +436,24 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   bound 1000 0x405c7af0cbda4a1a -> 0x4da7ddd027fdb0cd   sequential 0x66628b9442fa1213 -> 0x87dffcb22fdb3060
     //   horizon 0x35fe713c19988bed -> 0xd40a73c20627234b      bounded 0x0ddcbb0a2eb7ebf0 (unchanged)
     //   bounded nested 0x95744a329c2b2f5e -> 0x0ae6e20a9e5c4125
+    // RE-PINNED when `WriterId` became an alias of `Origin` (Q7 Step 1, P1): the fingerprints hash the `{:?}` text of the states, and the
+    // derived Debug now prints `Origin {..}` where it printed `WriterId {..}`. States and reads are unchanged: with a temporary Debug printing
+    // `WriterId`, every pin matched.
+    //   restore 0x3a6e9028d87f9721 -> 0xaf155a3830061b55
+    //   no restore 0xa95f8ce408365ff1 -> 0x8706e1e410ebdb07
+    //   bound 1000 0x4da7ddd027fdb0cd -> 0x837adb767df6d405
+    //   sequential 0x87dffcb22fdb3060 -> 0xbb67e71425fc62ec
+    //   horizon 0xd40a73c20627234b -> 0xa3c93e720200ee58
+    //   bounded 0x0ddcbb0a2eb7ebf0 -> 0x83e73911c4ed16af
+    //   bounded nested 0x0ae6e20a9e5c4125 -> 0xdba30f39f2adb4df
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x3a6e9028d87f9721),
-        ("no restore", 0xa95f8ce408365ff1),
-        ("bound 1000", 0x4da7ddd027fdb0cd),
-        ("sequential", 0x87dffcb22fdb3060),
-        ("horizon", 0xd40a73c20627234b),
-        ("bounded", 0x0ddcbb0a2eb7ebf0),
-        ("bounded nested", 0x0ae6e20a9e5c4125),
+        ("restore", 0xaf155a3830061b55),
+        ("no restore", 0x8706e1e410ebdb07),
+        ("bound 1000", 0x837adb767df6d405),
+        ("sequential", 0xbb67e71425fc62ec),
+        ("horizon", 0xa3c93e720200ee58),
+        ("bounded", 0x83e73911c4ed16af),
+        ("bounded nested", 0xdba30f39f2adb4df),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }

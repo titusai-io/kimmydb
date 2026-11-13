@@ -649,7 +649,12 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// RE-PINNED for the counter cell (the differential flips to ABSORBED = True; the compact bytes in the fold changed with
 /// the slot flag byte and the pair): 0x5f0f_3ecf_ab90_7bba to 0x3ddd_f823_ee88_e7c7. The replay's 300 scripts agree with the
 /// model; the scripts are the same draws (12,854 steps) and the model's states differ by the absorbed store.
-const PINNED_300: u64 = 0x3ddd_f823_ee88_e7c7;
+///
+/// RE-PINNED when `WriterId` became an alias of `Origin` (Q7 Step 1, P1): the fingerprint hashes the `{:?}` text of the states, and the
+/// derived Debug of the type now prints `Origin {..}` where it printed `WriterId {..}`. States and reads are unchanged: with a temporary Debug
+/// impl printing `WriterId`, every pin matched; the Python differential still reports 0 scripts disagreeing.
+/// 0x3ddd_f823_ee88_e7c7 to 0xccb0_e0db_c8f1_83b7.
+const PINNED_300: u64 = 0xccb0_e0db_c8f1_83b7;
 
 #[test]
 fn differential_against_the_python_model() {

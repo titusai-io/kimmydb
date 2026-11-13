@@ -95,6 +95,7 @@
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
 
+use kimmy_core::Epoch;
 use std::fmt;
 
 use kimmy_core::{
@@ -151,11 +152,17 @@ pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
 /// What a document on a page costs beyond its body and its `_id` as it
 /// crosses ([`id_wire_len`]): its collection and stamp, the `_id`'s variant, the
 /// field names and their framing, a bound and not a measure.
-pub(crate) const DOCUMENT_OVERHEAD: usize = 160;
+///
+/// Measured (`the_row_overheads_bound_the_encoding`'s shapes, BSON through
+/// `serialize_to_vec`, so the stamp's epoch is an 18-byte binary, 30 bytes in a
+/// frame): at most 186 across the `_id` kinds, 156 before the stamp had an epoch,
+/// against 160 then. The slack of 4 is kept.
+pub(crate) const DOCUMENT_OVERHEAD: usize = 190;
 
 /// What a tombstone on a page costs beyond its key (sent as bytes), likewise;
-/// 138 measured at the widest collection id and stamp.
-pub(crate) const TOMBSTONE_OVERHEAD: usize = 160;
+/// 168 measured at the widest collection id and stamp, 138 before the stamp had
+/// an epoch, against 160 then. The slack of 22 is kept.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 190;
 
 /// What the cursor a page cuts costs beyond its key as it crosses: its
 /// collection and its framing, a bound.
@@ -976,10 +983,13 @@ impl Engine {
     /// Whether the caps of a client write apply (always, outside a test).
     pub(crate) fn caps_apply(&self) -> bool {
         #[cfg(any(test, feature = "test-hooks"))]
-        if self.caps_lifted_for_test.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+        {
+            !self.caps_lifted_for_test.load(std::sync::atomic::Ordering::Relaxed)
         }
-        true
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            true
+        }
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
@@ -1390,8 +1400,8 @@ impl Engine {
         if progress.scope.is_none() && progress.pages == 0 {
             let mut granted = page.versions.clone();
             for stamp in withheld {
-                if stamp.hlc <= granted.get(stamp.node) {
-                    granted.insert(stamp.node, stamp.hlc.predecessor());
+                if stamp.hlc <= granted.get(stamp.origin()) {
+                    granted.insert(stamp.origin(), stamp.hlc.predecessor());
                 }
             }
             progress.granted = Some(granted);
@@ -1636,7 +1646,7 @@ impl Engine {
         let mut created_at_cut = 0usize;
         let mut failed = None;
         // At or below the cut of the finding that planned the pull.
-        let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
+        let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.origin());
         if !page.documents.is_empty() || !deletes.is_empty() {
             let mut memo = Memo::default();
             #[cfg(test)]
@@ -1917,11 +1927,11 @@ impl Engine {
         let mut converge = converge;
         let mut recorded = 0usize;
         for tombstone in deletes {
-            if tombstone.stamp.hlc > versions.get(tombstone.stamp.node) {
+            if tombstone.stamp.hlc > versions.get(tombstone.stamp.origin()) {
                 warn!(
                     collection = %tombstone.collection,
                     stamp = ?tombstone.stamp,
-                    covered_to = ?versions.get(tombstone.stamp.node),
+                    covered_to = ?versions.get(tombstone.stamp.origin()),
                     "a snapshot page deleted a document with a stamp its sender's own coverage \
                      does not name; ignored"
                 );
@@ -2129,7 +2139,7 @@ impl Engine {
                 let id = kimmy_core::database_drop_id(db);
                 page.dropped_collections.iter().find(|(carried, _)| *carried == id).copied()
             })
-            .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
+            .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.origin()))
             .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
             .collect();
         // Before they are recorded, so no write minted in between sits below a
@@ -2148,11 +2158,11 @@ impl Engine {
         let mut to_record = Vec::new();
         for (id, dropped) in &page.dropped_collections {
             // A peer may only deny what its own coverage names (ADR-163).
-            if dropped.hlc > page.versions.get(dropped.node) {
+            if dropped.hlc > page.versions.get(dropped.origin()) {
                 warn!(
                     collection = %id,
                     stamp = ?dropped,
-                    covered_to = ?page.versions.get(dropped.node),
+                    covered_to = ?page.versions.get(dropped.origin()),
                     "a whole-database page denied a collection with a stamp its sender's own \
                      coverage does not name; ignored"
                 );
@@ -2219,11 +2229,11 @@ impl Engine {
             if scope.is_some_and(|scope| scope != *collection) {
                 continue;
             }
-            if dropped.hlc > page.versions.get(dropped.node) {
+            if dropped.hlc > page.versions.get(dropped.origin()) {
                 warn!(
                     collection = %collection,
                     stamp = ?dropped,
-                    covered_to = ?page.versions.get(dropped.node),
+                    covered_to = ?page.versions.get(dropped.origin()),
                     "a snapshot page dropped an index with a stamp its sender's own coverage \
                      does not name; ignored"
                 );
@@ -2361,7 +2371,7 @@ impl Engine {
     /// minting a write below the floor it had just restored, which every peer then
     /// judged history and dropped, silently.
     fn witness_covered(&self, stamp: &Stamp, versions: &kimmy_core::VersionVector) {
-        if stamp.hlc <= versions.get(stamp.node) {
+        if stamp.hlc <= versions.get(stamp.origin()) {
             self.witness(stamp);
         }
     }
@@ -2477,7 +2487,7 @@ impl Engine {
         // that never buries a write the real drop keeps.
         let stamp = carried
             .filter(|dropped| dropped.hlc == floor)
-            .unwrap_or_else(|| Stamp::new(floor, NodeId::from_bytes([0; 16])));
+            .unwrap_or_else(|| Stamp::new(floor, NodeId::from_bytes([0; 16]), Epoch::ZERO));
         if crate::late_drop::owes_a_sweep(&standing, floor) {
             return self.sweep_after_an_ignored_drop(&standing, stamp);
         }
@@ -2797,12 +2807,12 @@ impl Engine {
         if Self::unless_gone(self.get_collection(&state.db, &state.name))?.is_none() {
             return Ok(());
         }
-        if stamp.hlc > versions.get(stamp.node) {
+        if stamp.hlc > versions.get(stamp.origin()) {
             warn!(
                 db = %state.db,
                 collection = %state.name,
                 stamp = ?stamp,
-                covered_to = ?versions.get(stamp.node),
+                covered_to = ?versions.get(stamp.origin()),
                 "a snapshot page changed a validator at a stamp its sender's own coverage \
                  does not name; ignored"
             );
@@ -2859,12 +2869,12 @@ impl Engine {
         let Some(stamp) = state.vector_changed else {
             return Ok(0);
         };
-        if stamp.hlc > versions.get(stamp.node) {
+        if stamp.hlc > versions.get(stamp.origin()) {
             warn!(
                 db = %state.db,
                 collection = %state.name,
                 stamp = ?stamp,
-                covered_to = ?versions.get(stamp.node),
+                covered_to = ?versions.get(stamp.origin()),
                 "a snapshot page changed a vector configuration at a stamp its sender's own \
                  coverage does not name; ignored"
             );
@@ -3127,6 +3137,7 @@ pub enum ServeVerdict {
 mod tests {
     use super::*;
     use bson::doc;
+    use kimmy_core::Epoch;
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -3531,6 +3542,7 @@ mod tests {
         let above = Stamp::new(
             Hlc::new(changed.hlc.wall_ms + 1, 0),
             kimmy_core::NodeId::from_bytes([7; 16]),
+            Epoch::ZERO,
         );
         let landing = std::sync::Arc::clone(&b);
         let (restored, ()) = crate::sync::race_hooks::race(
@@ -4001,7 +4013,13 @@ mod tests {
         b.create_collection("shop", "orders").unwrap();
         b.create_index("shop", "orders", vec![field("item")], false, Some("by_item".into()))
             .unwrap();
-        restamp_index(&b, "shop", "orders", "by_item", Stamp::new(Hlc::new(1, 0), node(1)));
+        restamp_index(
+            &b,
+            "shop",
+            "orders",
+            "by_item",
+            Stamp::new(Hlc::new(1, 0), node(1), Epoch::ZERO),
+        );
 
         let (c, _dc) = engine();
         c.create_collection("shop", "orders").unwrap();
@@ -4015,7 +4033,7 @@ mod tests {
             "shop",
             "orders",
             "by_item",
-            Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1)),
+            Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1), Epoch::ZERO),
         );
 
         let page = a.snapshot_page(None, None).unwrap();
@@ -4184,8 +4202,8 @@ mod tests {
         // B's own origin moved — creating the collection here minted an
         // entry — and A's did not: a scoped snapshot grants no coverage, and
         // its documents move no vector either. The position carries the rest.
-        assert_eq!(b.version_vector().unwrap().get(a.node_id()), b_before.get(a.node_id()));
-        assert_eq!(b.witnessed_vector().unwrap().get(a.node_id()), Hlc::ZERO);
+        assert_eq!(b.version_vector().unwrap().get(a.origin()), b_before.get(a.origin()));
+        assert_eq!(b.witnessed_vector().unwrap().get(a.origin()), Hlc::ZERO);
 
         // The whole-database snapshot is what it was: every collection,
         // every document, coverage at the end.
@@ -4272,7 +4290,7 @@ mod tests {
         );
         assert_eq!(
             granted.behind(&a.version_vector().unwrap()),
-            Some(first_vector.get(a.node_id())),
+            Some(first_vector.get(a.origin())),
             "the next round asks from where the snapshot's vector left it"
         );
     }
@@ -4649,7 +4667,7 @@ mod tests {
             ca.created,
             "B holds the incarnation A is about to drop"
         );
-        let b_own = b.version_vector().unwrap().get(b.node_id());
+        let b_own = b.version_vector().unwrap().get(b.origin());
 
         a_moment();
         a.drop_collection("shop", "orders").unwrap();
@@ -4668,7 +4686,7 @@ mod tests {
             "at the sender's stamp, so a recreation that followed it is still usable"
         );
         assert_eq!(
-            b.version_vector().unwrap().get(b.node_id()),
+            b.version_vector().unwrap().get(b.origin()),
             b_own,
             "a replicated drop mints no entry of this node's own"
         );
@@ -4773,7 +4791,7 @@ mod tests {
         // Read after the first page, which created the collection: what must
         // not move is B's own coverage, because a replicated drop mints no
         // entry of the receiver's own.
-        let b_own = b.version_vector().unwrap().get(b.node_id());
+        let b_own = b.version_vector().unwrap().get(b.origin());
 
         // Between the pages.
         a.drop_collection("shop", "orders").unwrap();
@@ -4796,7 +4814,7 @@ mod tests {
             Some(dropped),
             "at the sender's stamp, so a recreation that follows it is still usable"
         );
-        assert_eq!(b.version_vector().unwrap().get(b.node_id()), b_own, "no entry of its own");
+        assert_eq!(b.version_vector().unwrap().get(b.origin()), b_own, "no entry of its own");
 
         // The whole-database route names nothing in `dropped` on any page --
         // that field is the scoped route's -- and carries its denials in
@@ -4865,7 +4883,7 @@ mod tests {
     fn at_its_own_floor(b: &Engine, wall: u64) -> (CollectionMeta, Stamp, OplogEntry) {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(wall, 0);
-        let dropped = Stamp::new(tie, low);
+        let dropped = Stamp::new(tie, low, Epoch::ZERO);
 
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
@@ -4879,13 +4897,20 @@ mod tests {
         let drop = OplogEntry { stamp: dropped, ..of(OpKind::DropCollection) };
 
         b.record_collection_drop(ca.id, dropped).unwrap();
-        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create.clone() }]).unwrap();
+        b.apply_batch(&[OplogEntry {
+            stamp: Stamp::new(tie, high, Epoch::ZERO),
+            ..create.clone()
+        }])
+        .unwrap();
         assert!(
             b.get_collection("shop", "orders").is_err(),
             "a creation in the drop's own Hlc is history (ADR-236)"
         );
-        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie.successor(), high), ..create }])
-            .unwrap();
+        b.apply_batch(&[OplogEntry {
+            stamp: Stamp::new(tie.successor(), high, Epoch::ZERO),
+            ..create
+        }])
+        .unwrap();
         let mut legacy = b.get_collection("shop", "orders").unwrap();
         legacy.created = tie;
         let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
@@ -4964,15 +4989,18 @@ mod tests {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(1, 0);
         let id = CollectionId::derive("shop", "orders");
-        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        b.record_collection_drop(id, Stamp::new(tie, low, Epoch::ZERO)).unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         assert_eq!(cb.incarnation_floor, Some(tie));
-        assert!(Stamp::new(tie, high) > Stamp::new(tie, low), "the tombstone cannot turn it away");
+        assert!(
+            Stamp::new(tie, high, Epoch::ZERO) > Stamp::new(tie, low, Epoch::ZERO),
+            "the tombstone cannot turn it away"
+        );
 
         let document = |wall: u64, key: i64| SnapshotDoc {
             collection: id,
             id: DocId::Int64(key),
-            stamp: Stamp::new(Hlc::new(wall, 0), high),
+            stamp: Stamp::new(Hlc::new(wall, 0), high, Epoch::ZERO),
             body: Some(bson::serialize_to_vec(&doc! { "_id": key }).unwrap()),
         };
         let page = SnapshotPage {
@@ -5053,12 +5081,12 @@ mod tests {
         a.insert(&ca, doc! { "_id": 1 }).unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         b.insert(&cb, doc! { "_id": "local-only" }).unwrap();
-        let b_own = b.version_vector().unwrap().get(b.node_id());
+        let b_own = b.version_vector().unwrap().get(b.origin());
 
         transfer(&b, &a);
 
         assert_eq!(
-            b.version_vector().unwrap().get(b.node_id()),
+            b.version_vector().unwrap().get(b.origin()),
             b_own,
             "the receiver's own coverage must survive"
         );
@@ -5140,8 +5168,8 @@ mod tests {
             "a restart must not raise the position over documents held as state"
         );
         assert!(
-            reopened.version_vector().unwrap().get(a.node_id())
-                < a.version_vector().unwrap().get(a.node_id()),
+            reopened.version_vector().unwrap().get(a.origin())
+                < a.version_vector().unwrap().get(a.origin()),
             "the receiver must still be behind the sender it has not finished copying"
         );
     }
@@ -5236,8 +5264,8 @@ mod tests {
         // the document, and does not claim a position it cannot serve from.
         assert!(b.get(&ca, &DocId::Int64(99_999)).unwrap().is_some());
         assert!(
-            b.version_vector().unwrap().get(a.node_id())
-                < a.version_vector().unwrap().get(a.node_id()),
+            b.version_vector().unwrap().get(a.origin())
+                < a.version_vector().unwrap().get(a.origin()),
             "the grant does not reach the write that came after it"
         );
     }
@@ -5265,8 +5293,8 @@ mod tests {
         transfer_under(&b, &a, &mut progress);
         assert_eq!(b.held_len().unwrap(), 0, "completion must release what the restart kept");
         assert_eq!(
-            b.version_vector().unwrap().get(a.node_id()),
-            a.version_vector().unwrap().get(a.node_id()),
+            b.version_vector().unwrap().get(a.origin()),
+            a.version_vector().unwrap().get(a.origin()),
             "and the receiver is caught up once it is"
         );
     }
@@ -5309,8 +5337,8 @@ mod tests {
             "arrived in a window contiguous from this node's position: released (ADR-169)"
         );
         assert_eq!(
-            b.version_vector().unwrap().get(a.node_id()),
-            a.version_vector().unwrap().get(a.node_id()),
+            b.version_vector().unwrap().get(a.origin()),
+            a.version_vector().unwrap().get(a.origin()),
             "a contiguous window from the beginning does catch the node up"
         );
     }
@@ -5455,13 +5483,17 @@ mod tests {
         // allowed, and the mark on the discarded entry must go with it.
         let cb = b.get_collection("shop", "orders").unwrap();
         let own = b.insert(&cb, doc! { "_id": 424_242 }).unwrap();
-        let mid = b.version_vector().unwrap().get(b.node_id());
+        let mid = b.version_vector().unwrap().get(b.origin());
         let page = SnapshotPage {
             collections: Vec::new(),
             documents: vec![SnapshotDoc {
                 collection: cb.id,
                 id: DocId::Int64(424_242),
-                stamp: Stamp::new(a.version_vector().unwrap().get(a.node_id()), a.node_id()),
+                stamp: Stamp::new(
+                    a.version_vector().unwrap().get(a.origin()),
+                    a.node_id(),
+                    a.epoch(),
+                ),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 424_242, "v": 2 }).unwrap()),
             }],
             next: None,
@@ -5499,12 +5531,12 @@ mod tests {
         assert!(b.held_len().unwrap() > 0);
 
         // Far in the future: nothing is discarded, so every mark stands.
-        let far = a.version_vector().unwrap().get(a.node_id());
+        let far = a.version_vector().unwrap().get(a.origin());
         b.rewind_to(far).unwrap();
 
         assert!(b.held_len().unwrap() > 0, "nothing was discarded, so nothing was collected");
         assert_eq!(
-            b.version_vector().unwrap().get(a.node_id()),
+            b.version_vector().unwrap().get(a.origin()),
             Hlc::ZERO,
             "the rewind must not raise the vector over held entries, as the open-time rebuild \
              does not"
@@ -5943,7 +5975,7 @@ mod tests {
         // A denial of the very collection the receiver holds, at a stamp above
         // its incarnation -- which on the whole-database route would take it.
         page.dropped_collections =
-            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()))];
+            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()))];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
             .unwrap();
@@ -5983,8 +6015,8 @@ mod tests {
              shows the denial is not a stale echo of something the sender dropped"
         );
         page.dropped_collections = vec![
-            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
-            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
+            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
+            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
         ];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6025,10 +6057,10 @@ mod tests {
         let page = a.snapshot_page(None, None).unwrap();
         let (_, stamp) = page.dropped_collections[0];
         assert!(
-            stamp.hlc <= page.versions.get(stamp.node),
+            stamp.hlc <= page.versions.get(stamp.origin()),
             "a sender's own drop is absorbed in position, so its coverage names it: {stamp:?} vs \
              {:?}",
-            page.versions.get(stamp.node)
+            page.versions.get(stamp.origin())
         );
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6076,7 +6108,7 @@ mod tests {
         let relayed = b.snapshot_page(None, None).unwrap();
         let (_, stamp) = relayed.dropped_collections[0];
         assert!(
-            stamp.hlc > relayed.versions.get(stamp.node),
+            stamp.hlc > relayed.versions.get(stamp.origin()),
             "the fixture must produce the refused case, or it proves nothing"
         );
 
@@ -6292,7 +6324,7 @@ mod tests {
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
             key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
-            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
+            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -6453,6 +6485,7 @@ mod tests {
         let ahead = Stamp::new(
             Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
             NodeId::from_bytes([9; 16]),
+            Epoch::ZERO,
         );
         a.witness_processed(&ahead).unwrap();
         a.create_collection("shop", "orders").unwrap();
@@ -6465,8 +6498,8 @@ mod tests {
         let floor = cb.incarnation_floor.expect("the fixture must restore a floor");
 
         let below = crate::physical_now_ms();
-        let document = Stamp::new(Hlc::new(below, 0), c.node_id());
-        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id());
+        let document = Stamp::new(Hlc::new(below, 0), c.node_id(), c.epoch());
+        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id(), c.epoch());
         assert!(delete.hlc < floor, "premise: both sit below the floor");
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
@@ -6513,16 +6546,17 @@ mod tests {
         let (low, high) = tied_nodes();
         let tie = Hlc::new(1, 0);
         let id = CollectionId::derive("shop", "orders");
-        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        b.record_collection_drop(id, Stamp::new(tie, low, Epoch::ZERO)).unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         assert_eq!(cb.incarnation_floor, Some(tie));
-        let delete = Stamp::new(tie, high);
-        assert!(delete > Stamp::new(tie, low), "the tombstone cannot turn it away");
+        let delete = Stamp::new(tie, high, Epoch::ZERO);
+        assert!(delete > Stamp::new(tie, low, Epoch::ZERO), "the tombstone cannot turn it away");
         {
             let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
             let mut docs = txn.open_table(tables::DOCS).unwrap();
             let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
-            let record = kimmy_core::DocRecord::live(Stamp::new(Hlc::new(0, 5), low), body);
+            let record =
+                kimmy_core::DocRecord::live(Stamp::new(Hlc::new(0, 5), low, Epoch::ZERO), body);
             crate::live_count::put_record(
                 &txn,
                 &mut docs,
@@ -6535,7 +6569,7 @@ mod tests {
             txn.commit().unwrap();
         }
         let mut versions = VersionVector::new();
-        versions.insert(high, tie);
+        versions.insert(kimmy_core::Origin::new(high, kimmy_core::Epoch::ZERO), tie);
         let page = SnapshotPage {
             collections: Vec::new(),
             documents: Vec::new(),
@@ -6596,7 +6630,7 @@ mod tests {
             .find(|e| e.kind == OpKind::Delete && e.doc_id == Some(DocId::Int64(0)))
             .expect("B holds the Delete");
         assert!(
-            delete.stamp.hlc <= b.version_vector().unwrap().get(a.node_id()),
+            delete.stamp.hlc <= b.version_vector().unwrap().get(a.origin()),
             "arrived in position: B now advertises it"
         );
         assert_eq!(b.held_len().unwrap(), 0, "and holds nothing as state");
@@ -6639,8 +6673,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(b.held_len().unwrap(), 0, "every held document arrived in position");
-        let theirs = a.version_vector().unwrap().get(a.node_id());
-        assert_eq!(b.version_vector().unwrap().get(a.node_id()), theirs);
+        let theirs = a.version_vector().unwrap().get(a.origin());
+        assert_eq!(b.version_vector().unwrap().get(a.origin()), theirs);
         // Released, not re-appended: no document the page carried gains a second
         // arrival, so a resumed change stream replays nothing twice. What does
         // arrive is what the page did not carry -- the last document, and the
@@ -6656,7 +6690,7 @@ mod tests {
 
         drop(b);
         let b = Engine::open(&path).unwrap();
-        assert_eq!(b.version_vector().unwrap().get(a.node_id()), theirs, "a reopen agrees");
+        assert_eq!(b.version_vector().unwrap().get(a.origin()), theirs, "a reopen agrees");
     }
 
     #[test]
@@ -6700,8 +6734,8 @@ mod tests {
         assert_eq!(b.held_len().unwrap(), 0, "the held document was served and released");
         assert!(b.get(&ca, &DocId::Int64(99_999)).unwrap().is_some());
         assert_eq!(
-            b.version_vector().unwrap().get(a.node_id()),
-            a.version_vector().unwrap().get(a.node_id())
+            b.version_vector().unwrap().get(a.origin()),
+            a.version_vector().unwrap().get(a.origin())
         );
     }
 
@@ -6737,7 +6771,7 @@ mod tests {
         a.insert(&ca, doc! { "_id": "a0" }).unwrap();
         pause();
         a.insert(&ca, doc! { "_id": "s" }).unwrap();
-        let s = a.version_vector().unwrap().get(a.node_id());
+        let s = a.version_vector().unwrap().get(a.origin());
         let is_s = |e: &OplogEntry| e.stamp.node == a.node_id() && e.stamp.hlc == s;
 
         // R takes A's history with S missing from the window, and the window's
@@ -6749,7 +6783,7 @@ mod tests {
         r.apply_peer_batch(&a.version_vector().unwrap(), &holed, history.scanned_to, true).unwrap();
         let cr = r.get_collection("shop", "orders").unwrap();
         assert!(r.get(&cr, &DocId::String("s".into())).unwrap().is_none());
-        assert!(r.witnessed_vector().unwrap().get(a.node_id()) >= s, "the hole: S is covered");
+        assert!(r.witnessed_vector().unwrap().get(a.origin()) >= s, "the hole: S is covered");
 
         let mut progress = SnapshotProgress::of_collection(ca.id);
         while !progress.is_complete() {
@@ -6758,7 +6792,7 @@ mod tests {
         }
         assert!(r.get(&cr, &DocId::String("s".into())).unwrap().is_some(), "the repair brought S");
         assert_eq!(r.held_len().unwrap(), 1, "and holds it as state");
-        assert!(r.version_vector().unwrap().get(a.node_id()) < s, "R advertises A below S");
+        assert!(r.version_vector().unwrap().get(a.origin()) < s, "R advertises A below S");
 
         pause();
         b.insert(&cb, doc! { "_id": "b2" }).unwrap();
@@ -6780,7 +6814,7 @@ mod tests {
         r.apply_peer_batch(&theirs, &window.entries, window.scanned_to, true).unwrap();
         assert_eq!(r.held_len().unwrap(), 1, "without a span, the mark stays");
         assert!(
-            r.version_vector().unwrap().get(a.node_id()) < s,
+            r.version_vector().unwrap().get(a.origin()) < s,
             "and R still advertises A below S"
         );
 
@@ -6791,7 +6825,7 @@ mod tests {
         let spans = r.held_ranges_covered_by(&held).unwrap();
         assert_eq!(
             spans,
-            vec![crate::sync::MarkedRange { origin: a.node_id(), from: s, through: s }]
+            vec![crate::sync::MarkedRange { origin: a.origin(), from: s, through: s }]
         );
         let marked = a
             .entries_for_peer_marked(
@@ -6809,7 +6843,7 @@ mod tests {
         );
         r.apply_peer_batch(&theirs, &marked.entries, marked.scanned_to, marked.exhausted).unwrap();
         assert_eq!(r.held_len().unwrap(), 0, "arriving in a window releases it");
-        assert_eq!(r.version_vector().unwrap().get(a.node_id()), s);
+        assert_eq!(r.version_vector().unwrap().get(a.origin()), s);
         assert!(r.held_ranges_covered_by(&r.witnessed_vector().unwrap()).unwrap().is_empty());
     }
 
@@ -6946,7 +6980,7 @@ mod tests {
             txn.open_table(tables::OPLOG).unwrap().remove(key.as_slice()).unwrap();
             txn.commit().unwrap();
         }
-        let before = b.version_vector().unwrap().get(a.node_id());
+        let before = b.version_vector().unwrap().get(a.origin());
         assert!(before < held.hlc, "the fixture must not already cover the held entry");
 
         // Everything up to and including the held entry, in a window, not
@@ -6967,7 +7001,7 @@ mod tests {
             .map(|e| e.stamp.hlc)
             .max()
             .unwrap_or(Hlc::ZERO);
-        let after = b.version_vector().unwrap().get(a.node_id());
+        let after = b.version_vector().unwrap().get(a.origin());
         assert!(
             after < held.hlc,
             "no vector raised over an entry the oplog does not hold: {after:?} vs {held:?} \
@@ -7013,7 +7047,7 @@ mod tests {
             "the held Delete is the newest entry and is kept"
         );
         assert_eq!(b.held_len().unwrap(), 1, "only the Delete's mark is left");
-        assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc);
+        assert!(b.version_vector().unwrap().get(a.origin()) < delete.stamp.hlc);
 
         let window =
             a.entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
@@ -7021,7 +7055,7 @@ mod tests {
         b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
             .expect("the batch must not fail on the release");
         assert_eq!(b.held_len().unwrap(), 0, "released through append_oplog_at's existing key");
-        assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+        assert!(b.version_vector().unwrap().get(a.origin()) >= delete.stamp.hlc);
         assert_eq!(b.held_marks_released(), 1, "and counted, once, from that branch");
     }
 
@@ -7115,15 +7149,15 @@ mod tests {
         let mid = stamps[stamps.len() / 2];
         let above = stamps.iter().filter(|h| **h > mid).count();
         let mut theirs = kimmy_core::VersionVector::new();
-        theirs.insert(a.node_id(), mid);
+        theirs.insert(a.origin(), mid);
         let window =
             a.entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
         let outcome = b
             .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
             .unwrap();
         assert!(outcome.deferred > 0);
-        assert!(b.version_vector().unwrap().get(a.node_id()) <= mid, "raised past a deferral");
-        assert!(b.witnessed_vector().unwrap().get(a.node_id()) <= mid);
+        assert!(b.version_vector().unwrap().get(a.origin()) <= mid, "raised past a deferral");
+        assert!(b.witnessed_vector().unwrap().get(a.origin()) <= mid);
         assert_eq!(b.held_len().unwrap(), above, "held {held}, released at or below mid only");
 
         let mut reversed = window.entries.clone();
@@ -7132,7 +7166,7 @@ mod tests {
         c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
             .unwrap();
         c.apply_peer_batch(&theirs, &reversed, window.scanned_to, false).unwrap();
-        assert!(c.version_vector().unwrap().get(a.node_id()) <= mid, "and in reverse order too");
+        assert!(c.version_vector().unwrap().get(a.origin()) <= mid, "and in reverse order too");
     }
 
     #[test]
@@ -7162,13 +7196,13 @@ mod tests {
             .into_iter()
             .filter(|e| e.doc_id.is_some() && first.documents.iter().any(|d| d.stamp == e.stamp))
             .collect();
-        let before = b.version_vector().unwrap().get(a.node_id());
+        let before = b.version_vector().unwrap().get(a.origin());
         assert!(before < held_stamp.hlc, "the fixture must not already cover the held entries");
 
         b.apply_batch(&carried).unwrap();
         assert_eq!(b.held_len().unwrap(), held, "no window, no release");
         assert_eq!(
-            b.version_vector().unwrap().get(a.node_id()),
+            b.version_vector().unwrap().get(a.origin()),
             before,
             "and no vector raised over a held entry"
         );
@@ -7237,7 +7271,7 @@ mod tests {
         let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
         let row = b.digest_row(cb.id).unwrap().expect("a row");
         assert_eq!(
-            row.bare_max.get(&delete.stamp.node),
+            row.bare_max.get(&delete.stamp.origin()),
             Some(&delete.stamp.hlc),
             "the bare tombstone is not in bare_max: {row:?}"
         );
@@ -7358,7 +7392,7 @@ mod tests {
         transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
         let cb = b.get_collection("shop", "orders").unwrap();
         assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise: the bare tombstone");
-        assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc, "premise: below");
+        assert!(b.version_vector().unwrap().get(a.origin()) < delete.stamp.hlc, "premise: below");
         let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
         txn.open_table(tables::OPLOG_HELD)
             .unwrap()
@@ -7375,8 +7409,8 @@ mod tests {
 
         assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1, "in the oplog once");
         assert_eq!(b.held_len().unwrap(), 0, "no mark remains");
-        assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc, "vectors rose");
-        assert!(b.witnessed_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+        assert!(b.version_vector().unwrap().get(a.origin()) >= delete.stamp.hlc, "vectors rose");
+        assert!(b.witnessed_vector().unwrap().get(a.origin()) >= delete.stamp.hlc);
     }
 
     #[test]
@@ -7467,10 +7501,13 @@ mod tests {
         assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
         let (b, _db) = engine();
         let mut page = a.snapshot_page(None, None).unwrap();
-        let far =
-            Stamp::new(Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0), a.node_id());
+        let far = Stamp::new(
+            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            a.node_id(),
+            a.epoch(),
+        );
         page.deleted_documents[0].stamp = far;
-        page.versions.insert(far.node, far.hlc);
+        page.versions.insert(far.origin(), far.hlc);
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -7527,7 +7564,8 @@ mod tests {
         // another origin meets a newer tombstone and is history, as for any entry.
         let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
         let tombstone = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
-        let older = Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]));
+        let older =
+            Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]), Epoch::ZERO);
 
         b.apply_batch(&[forged_at(older, OpKind::Delete, &cb, None)]).unwrap();
 
@@ -7544,6 +7582,7 @@ mod tests {
         let far = Stamp::new(
             Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
             NodeId::from_bytes([6; 16]),
+            Epoch::ZERO,
         );
         let key = crate::docs::doc_key(&DocId::Int64(2)).unwrap();
         let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
@@ -7595,7 +7634,8 @@ mod tests {
     fn a_live_write_below_a_bare_or_appended_tombstone_still_loses() {
         let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
         let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
-        let older = Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node);
+        let older =
+            Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node, delete.stamp.epoch);
         let write = OplogEntry {
             stamp: older,
             kind: OpKind::Insert,
@@ -7635,7 +7675,7 @@ mod tests {
         let (b, _db) = engine();
         let mut page = a.snapshot_page(None, None).unwrap();
         let stamp = page.deleted_documents[0].stamp;
-        page.versions.insert(stamp.node, stamp.hlc.predecessor());
+        page.versions.insert(stamp.origin(), stamp.hlc.predecessor());
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -7667,6 +7707,7 @@ mod tests {
             let stamp = Stamp::new(
                 Hlc::new(crate::engine::physical_now_ms() + 10_000, 0),
                 NodeId::from_bytes([9; 16]),
+                Epoch::ZERO,
             );
             let record = kimmy_core::DocRecord::tombstone(stamp);
             let mut docs = txn.open_table(tables::DOCS).unwrap();
@@ -7796,7 +7837,7 @@ mod tests {
         transfer(&p, &a);
 
         let held = p.state_held().unwrap();
-        assert_eq!(held.get(a.node_id()), a.version_vector().unwrap().get(a.node_id()));
+        assert_eq!(held.get(a.origin()), a.version_vector().unwrap().get(a.origin()));
         // A requester that holds nothing of `a` is behind the hole: refused, and the
         // refusal is the hole's and not retention's, which collected nothing here.
         let nothing = kimmy_core::VersionVector::new();
@@ -7807,7 +7848,7 @@ mod tests {
         assert_eq!(p.serve_verdict(&all).unwrap(), ServeVerdict::Serve);
         // And so is a requester with a pull of nothing to ask for (`held: None`) from
         // the top, while one asking from below it is refused (the scalar rule).
-        let top = held.get(a.node_id());
+        let top = held.get(a.origin());
         assert_eq!(p.serve_verdict_from(top).unwrap(), ServeVerdict::Serve);
         assert_eq!(p.serve_verdict_from(Hlc::ZERO).unwrap(), ServeVerdict::StateHeld);
     }
@@ -7866,13 +7907,13 @@ mod tests {
         transfer(&b, &a);
 
         let top = a.version_vector().unwrap();
-        assert_eq!(b.state_held().unwrap().get(a.node_id()), top.get(a.node_id()));
+        assert_eq!(b.state_held().unwrap().get(a.origin()), top.get(a.origin()));
         assert_eq!(b.serve_verdict(&top).unwrap(), ServeVerdict::Serve);
         // Conservative, said plainly: one maximum per origin, so a requester that
         // holds `b`'s own prefix of the origin is refused as well.
         let at_prefix = b.version_vector().unwrap();
         let mut inside = kimmy_core::VersionVector::new();
-        inside.insert(a.node_id(), prefix.last().unwrap().stamp.hlc);
+        inside.insert(a.origin(), prefix.last().unwrap().stamp.hlc);
         assert_eq!(b.serve_verdict(&inside).unwrap(), ServeVerdict::StateHeld);
         let _ = at_prefix;
     }
@@ -8094,14 +8135,15 @@ mod tests {
         page.documents.clear();
         page.deleted_documents.clear();
         let held = b.get_collection("shop", "orders").unwrap();
-        let newer = Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id());
+        let newer =
+            Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id(), a.epoch());
         for state in &mut page.collections {
             if state.name == "orders" {
                 state.vector = Some(kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
                 state.vector_changed = Some(newer);
             }
         }
-        page.versions.insert(newer.node, newer.hlc);
+        page.versions.insert(newer.origin(), newer.hlc);
         let before = b.commits();
 
         let outcome = b
@@ -8514,7 +8556,7 @@ mod tests {
         let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
         assert!(state.vector.is_none() && state.vector_changed == off, "{state:?}");
         assert!(
-            page.versions.get(off.unwrap().node) >= off.unwrap().hlc,
+            page.versions.get(off.unwrap().origin()) >= off.unwrap().hlc,
             "and the sender's own coverage names it"
         );
     }
@@ -8587,7 +8629,7 @@ mod tests {
                 stamp.hlc = ahead;
             }
         }
-        page.versions.insert(a.node_id(), ahead);
+        page.versions.insert(a.origin(), ahead);
         let mut progress = SnapshotProgress::whole_database();
         b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert!(!vector_state(&b).0, "premise: applied");
@@ -8673,7 +8715,7 @@ mod tests {
         let hlc = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
         let x = NodeId::from_bytes([1; 16]);
         let y = NodeId::from_bytes([2; 16]);
-        (Stamp::new(hlc, x), Stamp::new(hlc, y))
+        (Stamp::new(hlc, x, Epoch::ZERO), Stamp::new(hlc, y, Epoch::ZERO))
     }
 
     #[test]
@@ -8721,8 +8763,8 @@ mod tests {
                 state.vector = on.then(vector_config);
                 state.vector_changed = Some(stamp);
             }
-            page.versions.insert(on_at.node, on_at.hlc);
-            page.versions.insert(off_at.node, off_at.hlc);
+            page.versions.insert(on_at.origin(), on_at.hlc);
+            page.versions.insert(off_at.origin(), off_at.hlc);
             page
         };
         for order in [[true, false], [false, true]] {
@@ -8754,7 +8796,7 @@ mod tests {
                 stamp.hlc = ahead;
             }
         }
-        page.versions.insert(a.node_id(), ahead);
+        page.versions.insert(a.origin(), ahead);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         drop(b);
@@ -8781,7 +8823,7 @@ mod tests {
         let (a, _da) = aged_origin(3);
         let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
         let mut page = a.snapshot_page(None, None).unwrap();
-        page.versions.insert(a.node_id(), ahead);
+        page.versions.insert(a.origin(), ahead);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -8815,7 +8857,7 @@ mod tests {
                 stamp.hlc = ahead;
             }
         }
-        page.versions.insert(a.node_id(), ahead);
+        page.versions.insert(a.origin(), ahead);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -8851,7 +8893,7 @@ mod tests {
         assert_eq!(entry.kind, OpKind::ConfigureVectors);
         let stamp = a.get_collection("shop", "orders").unwrap().vector_changed;
         assert_eq!(stamp, Some(entry.stamp));
-        assert!(a.version_vector().unwrap().get(entry.stamp.node) >= entry.stamp.hlc);
+        assert!(a.version_vector().unwrap().get(entry.stamp.origin()) >= entry.stamp.hlc);
     }
 
     #[test]
@@ -8961,7 +9003,7 @@ mod tests {
         let before = b.get_collection("shop", "orders").unwrap();
         let mut page = a.snapshot_page(None, None).unwrap();
         let stamp = page.collections.iter().find_map(|c| c.vector_changed).unwrap();
-        page.versions.insert(stamp.node, stamp.hlc.predecessor());
+        page.versions.insert(stamp.origin(), stamp.hlc.predecessor());
         let mut progress = SnapshotProgress::whole_database();
 
         let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
@@ -8980,6 +9022,7 @@ mod tests {
         let newer = Stamp::new(
             held.vector_changed.unwrap().hlc.successor(),
             held.vector_changed.unwrap().node,
+            held.vector_changed.unwrap().epoch,
         );
         for state in &mut page.collections {
             if state.name == "orders" {
@@ -8987,7 +9030,7 @@ mod tests {
                 state.vector_changed = Some(newer);
             }
         }
-        page.versions.insert(newer.node, newer.hlc);
+        page.versions.insert(newer.origin(), newer.hlc);
         let mut progress = SnapshotProgress::whole_database();
 
         let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
@@ -9004,8 +9047,8 @@ mod tests {
         let (a, _da, b, _db) = both_hold_a_configuration();
         let held = b.get_collection("shop", "orders").unwrap();
         let first = held.vector_changed.unwrap();
-        let second = Stamp::new(first.hlc.successor(), first.node);
-        let third = Stamp::new(second.hlc.successor(), first.node);
+        let second = Stamp::new(first.hlc.successor(), first.node, first.epoch);
+        let third = Stamp::new(second.hlc.successor(), first.node, first.epoch);
         let page_at = |stamp: Stamp, config: kimmy_core::VectorConfig| {
             let mut page = a.snapshot_page(None, None).unwrap();
             page.collections.retain(|state| state.name == "orders");
@@ -9013,7 +9056,7 @@ mod tests {
                 state.vector = Some(config.clone());
                 state.vector_changed = Some(stamp);
             }
-            page.versions.insert(stamp.node, stamp.hlc);
+            page.versions.insert(stamp.origin(), stamp.hlc);
             page
         };
 
@@ -9405,13 +9448,13 @@ mod relog {
             p.oplog_entry(&origin.stamp).unwrap().is_some(),
             "the entry is appended with the definition, on the first page"
         );
-        assert_eq!(p.version_vector().unwrap().get(a.node_id()), Hlc::ZERO, "and covers nothing");
+        assert_eq!(p.version_vector().unwrap().get(a.origin()), Hlc::ZERO, "and covers nothing");
 
         while !progress.is_complete() {
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             p.apply_snapshot_page(a.node_id(), &mut progress, &over_the_wire(page)).unwrap();
         }
-        assert!(p.version_vector().unwrap().get(a.node_id()) >= origin.stamp.hlc, "until granted");
+        assert!(p.version_vector().unwrap().get(a.origin()) >= origin.stamp.hlc, "until granted");
         assert_eq!(p.held_len().unwrap(), 0, "and the grant releases its mark");
     }
 

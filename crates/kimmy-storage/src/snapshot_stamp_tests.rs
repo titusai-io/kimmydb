@@ -13,6 +13,7 @@
 //! rebuilt it from a peer that had not heard of the drop.
 
 use bson::doc;
+use kimmy_core::Epoch;
 use kimmy_core::{CollectionId, DocId, Hlc, IndexField, NodeId, Stamp};
 
 use crate::{Engine, SnapshotProgress, WalkScope};
@@ -57,8 +58,11 @@ fn field(path: &str) -> Vec<IndexField> {
 /// An engine whose clock runs an hour ahead of this host's, as a peer's can.
 fn engine_an_hour_ahead() -> (Engine, tempfile::TempDir, Hlc) {
     let (a, dir) = engine();
-    let ahead =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 3_600_000, 0), NodeId::from_bytes([9; 16]));
+    let ahead = Stamp::new(
+        Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
+        NodeId::from_bytes([9; 16]),
+        Epoch::ZERO,
+    );
     a.witness_processed(&ahead).unwrap();
     (a, dir, ahead.hlc)
 }
@@ -229,7 +233,7 @@ fn a_scoped_drop_or_a_creation_the_senders_coverage_does_not_name_moves_nothing(
     transfer(&b, &a);
     let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
     let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
-    page.dropped = Some(Stamp::new(far, a.node_id()));
+    page.dropped = Some(Stamp::new(far, a.node_id(), a.epoch()));
     for state in &mut page.collections {
         state.created = far;
     }
@@ -246,7 +250,8 @@ fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
     let (b, _db) = engine();
     a.create_collection("shop", "orders").unwrap();
     transfer(&b, &a);
-    let far = Stamp::new(Hlc::new(crate::physical_now_ms() + 86_400_000, 0), a.node_id());
+    let far =
+        Stamp::new(Hlc::new(crate::physical_now_ms() + 86_400_000, 0), a.node_id(), a.epoch());
     let mut page = a.snapshot_page(None, None).unwrap();
     page.dropped_collections.push((CollectionId::derive("shop", "other"), far));
     page.dropped_indexes.push((CollectionId::derive("shop", "orders"), 7, far));
