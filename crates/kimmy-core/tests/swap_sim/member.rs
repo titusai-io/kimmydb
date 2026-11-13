@@ -355,7 +355,8 @@ impl Member {
         let pend = self.pending(w);
         let sup = self.first_superseding(w, &s).is_some();
         if self.info_superseding(w, &s).is_some() {
-            w.stats.bump("accepted_while_info_superseded"); // a sanity counter: D10 refuses before this point
+            w.stats.bump("accepted_while_info_superseded"); // D10 refuses before this point: now an invariant (N6)
+            self.inv.insert("write_accepted_while_info_superseded");
         }
         let h = self.next_hlc(w);
         let e = w.record(Entry::new(self.id, h, Kind::Doc).phys(&s).doc(key, body, opk), true);
@@ -407,6 +408,7 @@ impl Member {
         let sup = self.first_superseding(w, &s).is_some();
         if self.info_superseding(w, &s).is_some() {
             w.stats.bump("accepted_while_info_superseded");
+            self.inv.insert("write_accepted_while_info_superseded");
         }
         let h = self.next_hlc(w);
         let mark = format!("{}:{}", self.name, w.clock);

@@ -154,7 +154,7 @@ impl Member {
         // rule B / D10: "known" includes an event held as information ahead of its position
         let first = self.first_superseding(w, s);
         let is_info = first.is_none();
-        let x = first.or_else(|| self.info_superseding(w, s))?;
+        let x = if f.fm_d10_ignores_info { first? } else { first.or_else(|| self.info_superseding(w, s))? };
         match self.refusal_eps.get_mut(&x.idx) {
             None => {
                 self.refusal_eps.insert(
