@@ -318,6 +318,17 @@ impl Member {
             self.dochist.remove(&e.idx); // superseded on arrival: witnessed, not in the product's oplog, never served
             w.stats.bump("lww_losers_not_kept");
         }
+        // gap 1's NON-STAGING half (the manager's 6d-delta ruling, `coder-gap1-check.py`): a non-staging document entry that arrives in
+        // position on a live physical and is superseded ONLY by a record held as an unfinished snapshot's state is appended (servable
+        // onward). True by construction of the branch above; `m-no-append-in-position` breaks it, and this names it by a consequence
+        // independent of the staged-row scenario. (The `field` path is not checked.)
+        if !wins && held_state && !e.staging && !self.held_oop.contains(&e.idx) {
+            w.stats.bump("gap1_nonstaging_candidates");
+            if !self.appended.contains(&e.idx) {
+                w.stats.bump("gap1_nonstaging_not_appended");
+                self.inv.insert("gap1_nonstaging_not_appended");
+            }
+        }
     }
 
     /// DF-1's structural marker (B1 classification, an open design finding): the version that supersedes an arriving entry is
