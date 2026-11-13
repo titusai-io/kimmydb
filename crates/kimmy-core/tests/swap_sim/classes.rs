@@ -351,7 +351,8 @@ mod tests {
     /// (nothing unexplained) with the fix, and the mutant trips the step check on each seed.
     #[test]
     fn a_window_does_not_release_a_mark_past_an_earlier_held_entry_seeds_25_138_154() {
-        let seeds: [((usize, usize, usize), bool, bool, u64); 3] = [
+        type Pin = ((usize, usize, usize), bool, bool, u64);
+        let seeds: [Pin; 3] = [
             ((3, 1, 4), true, false, 25),
             ((3, 3, 3), true, false, 138),
             ((3, 2, 5), true, true, 154),
