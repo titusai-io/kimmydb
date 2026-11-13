@@ -201,7 +201,13 @@ impl Member {
                 assert_eq!(a, b, "the replayed page order is a permutation of the alive pages");
                 pages = order;
             }
-            None => shuffle(&mut w.rng, &mut pages),
+            None => {
+                // the Python replay takes the resulting order as one `P` line, not the draws inside the shuffle
+                crate::rng::MUTE.with(|m| m.set(true));
+                shuffle(&mut w.rng, &mut pages);
+                crate::rng::MUTE.with(|m| m.set(false));
+                crate::rng::record(format!("P {}", pages.join(",")));
+            }
         }
         let mut vec: BTreeMap<usize, i64> = BTreeMap::new();
         if f.grant_prefix {

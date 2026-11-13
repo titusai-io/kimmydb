@@ -205,7 +205,12 @@ impl Member {
             if ok || w.f.fm_release_unconditional {
                 self.held_oop.remove(&i);
                 self.appended.insert(i);
-                self.vc.raise(e.origin, e.hlc); // released in position: the vector rises
+                // released in position: the vector rises to the servable prefix (the model's coverage never passes a hold)
+                if w.f.fm_release_behind_held {
+                    self.vc.raise(e.origin, e.hlc);
+                } else {
+                    self.raise_servable(w, e.origin);
+                }
                 self.retire_repair(i);
                 released_event |= e.kind != Kind::Doc;
             }

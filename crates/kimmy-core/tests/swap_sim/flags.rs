@@ -69,8 +69,8 @@ pub struct Flags {
     /// served) takes effect only at a LATER settle, not in the releasing one; a snapshot taken in between carries the coverage
     /// without the event
     pub fm_release_without_effect: bool,
-    /// Rust-only mutant `m-release-behind-held`: a window releases a held mark although an earlier entry of the origin is still
-    /// held here (ADR-169: a mark is released by a window CONTIGUOUS from the receiver's position); the vector then rises over a hold
+    /// Rust-only mutant `m-release-behind-held`: a release raises the vector to the released entry although an earlier entry of the
+    /// origin is still held here; the vector then rises over a hold (the model's coverage never does)
     pub fm_release_behind_held: bool,
     /// Rust-only mutants of the `field` policy's apply and loss path (point 4; read only under `Policy::Field`, no-ops otherwise)
     pub fm_always_append: bool,

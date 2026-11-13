@@ -206,6 +206,21 @@ impl Member {
         self.vc.raise(e.origin, e.hlc);
     }
 
+    /// Raise the vector to the end of the member's contiguous SERVABLE prefix of `origin` (covered and not held out of position):
+    /// the vector never passes a hold, whatever was released above it (the model's `covers` has the same shape).
+    pub fn raise_servable(&mut self, w: &World, origin: usize) {
+        let mut top = -1;
+        for &x in &w.by_origin[origin] {
+            if !self.cv.has(x) || self.held_oop.contains(&x) {
+                break;
+            }
+            top = w.ent(x).hlc;
+        }
+        if top >= 0 {
+            self.vc.raise(origin, top);
+        }
+    }
+
     /// The step check of B2: the vector and the prefix agree, at every entry of every origin: the vector covers exactly the entries
     /// of the member's contiguous servable prefix (an entry held out of position is not in it). Returns the first origin where they
     /// disagree.
