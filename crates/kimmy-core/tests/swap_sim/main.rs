@@ -111,6 +111,41 @@ mod tests {
         assert_eq!(res["true_late_writes_allowed"], 1);
     }
 
+    /// M5, the abandon-and-restart mode (`Cfg::restart_joins`): a join whose sender has vanished lands no further page and is
+    /// restarted from a live eligible peer (the product cannot complete a join from a dead member). The base grid and the
+    /// product-route grid (document policy) stay clean (every problem classified), and the mode is not vacuous: joins are restarted.
+    /// `dead_sender_join_open_at_end` (a join left open because no peer could serve it) is printed.
+    #[test]
+    fn the_restart_joins_mode_restarts_a_dead_senders_join_and_stays_clean() {
+        let seeds = env_u64("Q6_RESTART_RUNS", 40);
+        for routes in [false, true] {
+            let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+            for c in cfgs.iter_mut() {
+                c.restart_joins = true;
+                if routes {
+                    c.routes = Some(crate::run::Routes {
+                        f: 0.3,
+                        hold: false,
+                        repair: false,
+                        doc_hold: true,
+                        doc_repair: true,
+                    });
+                }
+            }
+            let (s, classes, residual) =
+                crate::run::run_grid_classified("v6", &cfgs, 0, seeds, threads());
+            eprintln!(
+                "restart_joins routes {routes}: {} runs; restarted {} waiting {} open at end {}; classes {classes:?}; unclassified {residual:?}",
+                s.runs,
+                s.get("cnt_join_restarted_dead_sender"),
+                s.get("cnt_dead_sender_join_waiting"),
+                s.get("cnt_dead_sender_join_open_at_end")
+            );
+            assert!(s.get("cnt_join_restarted_dead_sender") > 0, "vacuous: no join was restarted");
+            assert!(residual.is_empty(), "unclassified: {residual:?}");
+        }
+    }
+
     /// `K = 4` on the field grid (design note 1.4, rule 2; `outReplaced` and Q7's records share one per-document `K`): 0 problems
     /// under the relaxed required set (up to `K` per document, the newest by loser stamp), no member holds a record that `K` newer
     /// ones push out, and the run is not vacuous (records are dropped, heads exempted). The default of the harness is `K` off.
