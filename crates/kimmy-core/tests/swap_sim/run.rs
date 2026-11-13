@@ -342,9 +342,10 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                 let joining: Vec<usize> = (0..ms.len())
                     .filter(|&i| {
                         !ms[i].vanished
-                            && ms[i].join.as_ref().is_some_and(|j| {
-                                !(cfg.restart_joins && ms[j.src].vanished)
-                            })
+                            && ms[i]
+                                .join
+                                .as_ref()
+                                .is_some_and(|j| !(cfg.restart_joins && ms[j.src].vanished))
                     })
                     .collect();
                 if !joining.is_empty() {

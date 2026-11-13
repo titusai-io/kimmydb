@@ -575,7 +575,10 @@ fn within_grant_join_twin(mode: &str) -> Twin {
     assert!(!loss_entries(&sc, "C", x.key, x.stamp).is_empty(), "C did not mint r_C");
     step(&mut sc);
     sc.advance(28);
-    assert!(sc.snapshot("R", "C", false), "R joins from C, whole, with the record within the grant");
+    assert!(
+        sc.snapshot("R", "C", false),
+        "R joins from C, whole, with the record within the grant"
+    );
     step(&mut sc);
     sc.advance(30);
     sc.vanish(&["B", "C"]);
@@ -768,6 +771,14 @@ mod tests {
             partial,
             "without rule B C covers the writer at the bind through a window that skipped the rows"
         );
+        // M6/N6: D10 on an event parked as information: with `m-d10-ignores-info` the write is accepted while the parked bind
+        // supersedes the served physical, and the invariant names it
+        let (parked, refused, _, _, problems) = rule_b_shape(&format!("{pre}m-d10-ignores-info"));
+        assert!(parked && !refused, "the mutant accepts a write while the bind is information");
+        assert!(
+            problems.iter().any(|(k, _)| k == "inv_write_accepted_while_info_superseded"),
+            "{problems:?}"
+        );
     }
 
     fn a_refusal_on_an_unfinished_join_is_released_by_a_fresh_pull_after_its_sender_dies_under(
@@ -910,7 +921,10 @@ mod tests {
             assert!(t.problems.is_empty(), "{:?}", t.problems);
             assert!(t.e_has_record && !t.step_check, "E gets the record from R by a window");
             let m = within_grant_join_twin(&format!("{pre}m-snap-record-not-served"));
-            eprintln!("m-snap-record-not-served: step check {} E record {} {:?}", m.step_check, m.e_has_record, m.problems);
+            eprintln!(
+                "m-snap-record-not-served: step check {} E record {} {:?}",
+                m.step_check, m.e_has_record, m.problems
+            );
             assert!(m.step_check, "the step check sees the carried record without a served entry");
             assert!(!m.e_has_record, "the mutant: E never gets the record");
         }
