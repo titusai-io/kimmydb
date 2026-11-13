@@ -231,6 +231,7 @@ mod tests {
                 .unwrap_or(0)
         };
         let mut differing_book = 0;
+        let (mut book_event_diffs, mut book_traces) = (0usize, 0usize);
         for f in &files {
             let off = run(f, false);
             let on = run(f, true);
@@ -238,6 +239,17 @@ mod tests {
                 v.iter().filter(|l| !l.starts_with("BOOK")).cloned().collect::<Vec<_>>()
             };
             let (a, b) = (doc(&off), doc(&on));
+            // bookkeeping that differs mid-run (not compared): events after which the marks held, the entries served, the marks
+            // dropped or the held-behind-held decisions differ between OFF and ON
+            let bev = |v: &Vec<String>| {
+                v.iter().filter(|l| l.starts_with("BOOKEV")).cloned().collect::<Vec<_>>()
+            };
+            let (ea, eb) = (bev(&off), bev(&on));
+            let n = ea.iter().zip(&eb).filter(|(x, y)| x != y).count();
+            book_event_diffs += n;
+            if n > 0 {
+                book_traces += 1;
+            }
             events += a.len();
             let first = a
                 .iter()
@@ -253,8 +265,8 @@ mod tests {
                 ));
             }
             let (bo, bn) = (
-                off.iter().find(|l| l.starts_with("BOOK")),
-                on.iter().find(|l| l.starts_with("BOOK")),
+                off.iter().find(|l| l.starts_with("BOOK ")),
+                on.iter().find(|l| l.starts_with("BOOK ")),
             );
             if let (Some(bo), Some(bn)) = (bo, bn) {
                 if bo != bn {
@@ -269,7 +281,7 @@ mod tests {
             }
         }
         eprintln!(
-            "ITEM Q {dir}: {} traces, {events} events; document-layer differences {}; traces whose bookkeeping differs {differing_book}; \
+            "ITEM Q {dir}: {} traces, {events} events; document-layer differences {}; traces whose end bookkeeping differs {differing_book}; bookkeeping differs mid-run after {book_event_diffs} events in {book_traces} traces; \
              totals OFF/ON: held marks left {}/{}, entries served {}/{}, marks dropped {}/{}, releases in window {}/{}",
             files.len(),
             diffs.len(),

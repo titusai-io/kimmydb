@@ -188,7 +188,7 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     if T.out is not None:
         T.write(dict(v=1, model=MODEL + ".py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
                      members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
-                     route_f=float(os.environ.get("Q6_F", "0") or 0), routes=os.environ.get("Q6_ROUTES", "")))
+                     route_f=float(os.environ.get("Q6_F", "0") or 0), routes=os.environ.get("Q6_ROUTES", ""), staged_row=(MODEL not in ("swapmodel6a", "swapmodel6b") and os.environ.get("Q6_STAGEDROW", "1") != "0")))
     T.started = True
 
 

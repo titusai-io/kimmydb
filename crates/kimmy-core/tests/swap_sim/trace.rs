@@ -813,6 +813,14 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         };
         if collect_mode().is_some() {
             collect_push(format!("{kind} {res} {}", doc_layer_view(&ms)));
+            // bookkeeping per event, NOT compared: marks held, entries served, marks dropped, held-behind-held decisions
+            collect_push(format!(
+                "BOOKEV {} {} {} {}",
+                ms.iter().map(|m| m.held_oop.len()).sum::<usize>(),
+                ms.iter().map(|m| m.appended.len()).sum::<usize>(),
+                w.stats.get("marks_dropped_superseded"),
+                w.stats.get("held_behind_held")
+            ));
             continue;
         }
         if kind != "final" && kind != "pre_finish" && kind != "lost" {
