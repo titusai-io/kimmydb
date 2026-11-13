@@ -429,6 +429,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     // 6d: the product routes (`doc_hold`, `doc_repair`) hold entries out of position and do not cover them
     let routes = head["routes"].as_str().unwrap_or("");
     w.held_uncovered = routes.contains("doc_hold") || routes.contains("doc_repair");
+    // rule S: the trace says whether the model that made it ran with the staged-row rule (the harness replays what the model did)
+    if let Some(on) = head["staged_row"].as_bool() {
+        w.f.staged_row = on;
+    }
     if let Some(on) = collect_mode() {
         w.product_marks = on;
         w.vector_cov = on;

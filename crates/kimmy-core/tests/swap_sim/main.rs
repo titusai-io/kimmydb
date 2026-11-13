@@ -300,6 +300,61 @@ mod tests {
         assert!(diffs.is_empty(), "item Q: {} traces differ on the document layer", diffs.len());
     }
 
+    /// A scan for pins (an `#[ignore]`d aid): the (configuration, route, seed) where mode `Q6SCAN_MODE` has a problem key in
+    /// `Q6SCAN_KEYS` (comma list) and mode `Q6SCAN_BASE` has none of them, on the product-route rows. Prints the first 12.
+    #[test]
+    #[ignore = "scan aid: Q6SCAN_MODE, Q6SCAN_BASE, Q6SCAN_KEYS, Q6SCAN_SEEDS"]
+    fn scan_for_a_killing_seed() {
+        let mode = std::env::var("Q6SCAN_MODE").expect("Q6SCAN_MODE");
+        let base = std::env::var("Q6SCAN_BASE").expect("Q6SCAN_BASE");
+        let keys: Vec<String> = std::env::var("Q6SCAN_KEYS")
+            .expect("Q6SCAN_KEYS")
+            .split(',')
+            .map(String::from)
+            .collect();
+        let seeds = env_u64("Q6SCAN_SEEDS", 250);
+        let mut found = Vec::new();
+        'outer: for (dh, dr) in [(true, true), (true, false), (false, true)] {
+            for m in [2usize, 3, 4, 5] {
+                for o in [1usize, 2, 3] {
+                    for k in [3usize, 4, 5] {
+                        for seed in 0..seeds {
+                            let hit = |md: &str| -> Vec<String> {
+                                let r = crate::run::run_product(
+                                    md,
+                                    crate::world::Policy::Document,
+                                    (m, o, k),
+                                    dh,
+                                    dr,
+                                    0.3,
+                                    seed,
+                                    false,
+                                );
+                                keys.iter()
+                                    .filter(|key| r.res.get(*key).copied().unwrap_or(0) != 0)
+                                    .cloned()
+                                    .collect()
+                            };
+                            let a = hit(&mode);
+                            if !a.is_empty() && hit(&base).is_empty() {
+                                found.push(format!(
+                                    "{m}/{o}/{k} dh {dh} dr {dr} f 0.3 seed {seed}: {a:?}"
+                                ));
+                                if found.len() >= 12 {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for f in &found {
+            eprintln!("KILLING SEED {f}");
+        }
+        assert!(!found.is_empty(), "no killing seed found");
+    }
+
     /// ITEM Q on the GRID (not on exported traces): the product-route rows at gate size, each run twice with the same seed, once with
     /// the model's bookkeeping (`product_marks` off) and once with the product's mark mechanism (on): in-window entries never held
     /// for a held predecessor, the vector raised at release, covered superseded marks dropped after each window. Every key of the

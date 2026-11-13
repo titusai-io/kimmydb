@@ -381,10 +381,8 @@ pub fn product_classes(res: &Res, field: bool) -> (Vec<&'static str>, Vec<String
     let on = |k: &str| res.get(k).copied().unwrap_or(0) != 0;
     let mut classes = Vec::new();
     let mut explained: BTreeSet<&str> = BTreeSet::new();
-    if on("inv_partial_flip") && on("cnt_df1_loser_superseded_by_uncovered") {
-        classes.push("DF-1");
-        explained.insert("inv_partial_flip");
-    }
+    // DF-1 (the partial flip of a loser superseded by an uncovered version) is FIXED by rule S and is no longer a named class: a
+    // partial flip on the product routes is unclassified and fails the grid (`classes.rs`, `df1_is_required_zero_...`)
     let df2_keys = [
         "diverged",
         "div_state",
@@ -1116,6 +1114,9 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "held_released_in_window",
         "held_kept_unservable",
         "df1_loser_superseded_by_uncovered",
+        "staged_row_appended",
+        "rule_s_negative_cases",
+        "rule_s_negative_appended",
         "late_d11_not_buried",
         "late_drop_phys_alive_at_sender",
         "late_drop_phys_alive_elsewhere",
