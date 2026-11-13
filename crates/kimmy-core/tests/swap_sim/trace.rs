@@ -434,9 +434,9 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
     let routes = head["routes"].as_str().unwrap_or("");
     w.held_uncovered = routes.contains("doc_hold") || routes.contains("doc_repair");
     // rule S: the trace says whether the model that made it ran with the staged-row rule (the harness replays what the model did)
-    if let Some(on) = head["staged_row"].as_bool() {
-        w.f.staged_row = on;
-    }
+    // A trace without the field was made by a model that has no rule S (6d's traces, before the staged-row rule): it replays with the rule OFF
+    // whatever the environment says (review: the p3 traces used to depend on `Q6_STAGEDROW=0` in the caller's environment)
+    w.f.staged_row = head["staged_row"].as_bool().unwrap_or(false);
     if let Some(on) = collect_mode() {
         w.product_marks = on;
         w.vector_cov = on;

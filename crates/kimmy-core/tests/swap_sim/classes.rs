@@ -250,6 +250,21 @@ mod tests {
                 0,
                 "a partial flip with rule S on the field policy (dh {dh} dr {dr})"
             );
+            // O-F1 is a class on the field policy that explains any loss-record or head failure (the model of record has no field
+            // policy): an upper bound on the runs it explains (measured 7 and 4 of 9,000 runs at gate size; the bound is 20), so that a loss-record
+            // regression raises a failure, not a printed number
+            let (_, classes, residual) = crate::run::run_grid_classified("v6", &cfgs, 0, seeds, 4);
+            let of1 = classes.get("O-F1").copied().unwrap_or(0);
+            eprintln!(
+                "FIELD GRID dh {dh} dr {dr}: classes {classes:?}; unclassified {residual:?}; O-F1 {of1} of {} runs",
+                seeds * 36
+            );
+            assert!(residual.is_empty(), "unclassified on the field policy: {residual:?}");
+            assert!(
+                of1 <= crate::env_u64("Q6_OF1_BOUND", 20) as i64,
+                "O-F1 explains {of1} runs of {}: above its bound",
+                seeds * 36
+            );
             assert!(
                 off.get("inv_partial_flip") > 0,
                 "the rule is not needed on the field policy (dh {dh} dr {dr})"
@@ -350,6 +365,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The structural lost set as an OPTION of the oracle (`Cfg::lost_struct`, the model's `Q6_LOSTSTRUCT=1`; the default stays 6d's, the one item P
+    /// compares against). Natively (the harness's own draws, so the model's four seeds are NOT the same runs): every run of the in-order grid is clean
+    /// with the option on, and it never ADDS a required head (the structural set holds fewer entries than 6d's, so it can only remove requirements). The
+    /// comparison against the MODEL's moved runs is owed to the trace replay (a header field `lost_struct` of the tracer; see the review's open items).
+    #[test]
+    fn the_structural_lost_set_option_is_clean_and_never_adds_a_required_head() {
+        let (mut runs, mut fewer) = (0, 0);
+        for m in [3usize, 4] {
+            for o in [2usize, 3] {
+                for k in [3usize, 4, 5] {
+                    for seed in 0..60u64 {
+                        let off =
+                            crate::run::run("v6", "v6", seed, crate::run::Cfg::new(m, o, k), false);
+                        let mut c = crate::run::Cfg::new(m, o, k);
+                        c.lost_struct = true;
+                        let on = crate::run::run("v6", "v6", seed, c, false);
+                        assert!(
+                            nonzero_problems(&on).is_empty(),
+                            "{m}/{o}/{k} seed {seed}: not clean with the structural set"
+                        );
+                        assert!(
+                            on.res["heads_required"] <= off.res["heads_required"],
+                            "{m}/{o}/{k} seed {seed}: the option ADDED a head"
+                        );
+                        runs += 1;
+                        fewer += (on.res["heads_required"] < off.res["heads_required"]) as i32;
+                    }
+                }
+            }
+        }
+        eprintln!("structural lost set: {runs} runs, {fewer} with fewer required heads");
     }
 
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
