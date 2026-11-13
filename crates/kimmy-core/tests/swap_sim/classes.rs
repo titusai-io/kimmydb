@@ -550,7 +550,14 @@ mod tests {
         );
         let lines = crate::rng::LOG.with(|l| l.borrow_mut().take().unwrap());
         std::fs::write(std::env::var("Q6_OUT").expect("Q6_OUT"), lines.join("\n") + "\n").unwrap();
-        eprintln!("EXPORTED {} draws; RES {:?}", lines.len(), nonzero_problems(&r));
+        eprintln!(
+            "EXPORTED {} draws; RES {:?}; page_carries_held_state {} page_above_coverage {} grant_above_coverage {}",
+            lines.len(),
+            nonzero_problems(&r),
+            r.res["cnt_page_carries_held_state"],
+            r.res["cnt_page_above_coverage"],
+            r.res["cnt_grant_above_coverage"]
+        );
     }
 
     /// Debug aid: one product-route run with its trace and every member's final state (`Q6_ONE=<doc|field>,m,o,k,dh,dr,f,seed`).
