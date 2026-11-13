@@ -51,6 +51,8 @@ pub struct Cfg {
     pub end_repair: bool,
     /// ITEM Q: the product's mark mechanism (`World::product_marks`) in a grid run (default off = the model's bookkeeping)
     pub product_marks: bool,
+    /// ITEM Q, the Q6 build item: with `product_marks`, covered held marks of LATE entries are dropped too
+    pub drop_late_marks: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -100,6 +102,7 @@ impl Cfg {
             state_survives: false,
             end_repair: false,
             product_marks: false,
+            drop_late_marks: false,
         }
     }
 }
@@ -249,6 +252,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.field_counters = cfg.field_counters;
     w.witness_pages = cfg.witness_pages;
     w.product_marks = cfg.product_marks;
+    w.drop_late_marks = cfg.drop_late_marks;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
     for k in 0..cfg.keys as u32 {
         ms[0].local_doc(&mut w, k, DocOp::Insert);
@@ -603,6 +607,16 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     }
     note_vector_flag(&ms, &mut w);
     count_open_refusals(&mut w, &ms, true); // ... and at the end of the run, after the end-of-run delivery
+    // ITEM Q: a mark dropped because its physical is buried here, whose physical is ALIVE at another live member at the end (physicals
+    // only ever die, so alive at the end means alive when the mark was dropped); the age fallback is off in this harness
+    for (who, phys, _) in w.late_drops.clone() {
+        if ms
+            .iter()
+            .any(|m| !m.vanished && m.name != who && m.phys.get(&phys).is_some_and(|p| p.alive))
+        {
+            w.stats.bump("late_drop_phys_alive_elsewhere");
+        }
+    }
     let res = finish(&mut w, &mut ms);
     RunOut { res, w, ms }
 }

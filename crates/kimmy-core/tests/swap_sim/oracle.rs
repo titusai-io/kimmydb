@@ -153,8 +153,9 @@ impl Member {
                         let p = self.phys.get(&e.phys);
                         let rec = self.loss.keys().any(|lk| lk.key == e.key && lk.stamp == Some(e.stamp));
                         format!(
-                            "COVERED-HELD #{h}@{} kind {:?} staging {} phys {:?} (alive here {:?}) key {} loss-record-here {rec} lost-with-writer {}",
-                            e.hlc, e.kind, e.staging, e.phys, p.map(|p| p.alive), e.key, w.lost.contains(&h)
+                            "COVERED-HELD #{h}@{} kind {:?} staging {} phys {:?} (alive here {:?}) key {} loss-record-here {rec} lost-with-writer {} | superseding event known here: {:?}, birth known: {}, entry stamp {:?}",
+                            e.hlc, e.kind, e.staging, e.phys, p.map(|p| p.alive), e.key, w.lost.contains(&h),
+                            self.late_stamp(w, &e.phys), self.bmap.contains_key(&e.phys), e.stamp
                         )
                     })
                     .collect();
@@ -1115,6 +1116,10 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "held_released_in_window",
         "held_kept_unservable",
         "df1_loser_superseded_by_uncovered",
+        "late_d11_not_buried",
+        "late_drop_phys_alive_at_sender",
+        "late_drop_phys_alive_elsewhere",
+        "late_buried_not_d11",
         "page_carries_held_state",
         "doc_repair",
         "route_carries_q6_kind",
