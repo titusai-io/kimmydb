@@ -358,7 +358,7 @@ mod tests {
     #[test]
     #[ignore = "debug aid: Q6_DF_FLAGS=strict,survive,repair selects the DF measurement switches"]
     fn show_df_missing_head_seeds() {
-        let rows: [(&str, Policy, (usize, usize, usize), bool, bool, f64, u64); 5] = [
+        let rows: [B1Seed; 5] = [
             ("O-F1", Policy::Field, (4, 2, 3), true, false, 0.3, 336),
             ("O-F1", Policy::Field, (4, 2, 5), true, false, 0.3, 1361),
             ("O-F1", Policy::Field, (3, 2, 3), false, true, 0.1, 1365),
