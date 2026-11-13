@@ -47,6 +47,8 @@ pub struct Member {
     pub vc: VectorCoverage,
     /// the apply in progress is under `Position::Hold` (it raises no vector): set by the hold routes around `take`
     pub pos_hold: bool,
+    /// the entry a `take_hold` is delivering now (the model's `_holding`): its own removal from `appended` is not counted
+    pub holding: Option<EntryId>,
     /// the end-of-run delivery's shortcut witnessed an entry here that no live member appended (`take_quiesce`)
     pub quiesce_witnessed: bool,
     /// H-Q6-L1's repair ledger (an emulation: the product's `repair_ledger.rs` is not modelled): the held marks a Definitions repair is
@@ -130,6 +132,7 @@ impl Member {
             cv: PrefixCoverage::new(),
             vc: VectorCoverage::new(),
             pos_hold: false,
+            holding: None,
             quiesce_witnessed: false,
             repairs_planned: Default::default(),
             repairs_retired: Default::default(),
