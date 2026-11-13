@@ -5624,17 +5624,42 @@ async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
     assert_phases_fit_in(&pull, took);
 }
 
+/// How many pulls [`a_pull_from_a_slow_peer_says_so_in_serve`] may make to see
+/// the slow answer counted in serve alone.
+const SERVE_PULLS: usize = 3;
+
+/// The slow answer is counted in serve, on every pull, and not also in wait or
+/// apply. Those two are the puller's own commit and its wait for the writer,
+/// timed in real time: a loaded disk's fsync or a stalled host can stretch
+/// either past half of serve on any one pull, with nothing misattributed. A
+/// delay counted in the wrong phase is counted there on every pull, so the
+/// test asks for one pull of [`SERVE_PULLS`], each into an empty member, in
+/// which neither reads half of serve; and every pull, whatever else, still
+/// reads serve at the floor and fits its phases in its wall time.
 #[tokio::test]
 async fn a_pull_from_a_slow_peer_says_so_in_serve() {
     let (a, b) = a_source_holding(50).await;
     let slow = slow_relay(a.addr, PHASE_SLOW).await;
 
-    let (_, pull, took) = pull_measured(&b.engine, slow).await;
-
-    assert!(pull.serve >= PHASE_FLOOR, "a slow answer is the serve phase: {pull:?}");
-    assert_not_counted_in(("serve", pull.serve), ("wait", pull.wait), &pull);
-    assert_not_counted_in(("serve", pull.serve), ("apply", pull.apply), &pull);
-    assert_phases_fit_in(&pull, took);
+    let mut pulls = Vec::new();
+    let mut into = b;
+    for attempt in 1..=SERVE_PULLS {
+        if attempt > 1 {
+            into = node().await;
+        }
+        let (_, pull, took) = pull_measured(&into.engine, slow).await;
+        assert!(pull.serve >= PHASE_FLOOR, "a slow answer is the serve phase: {pull:?}");
+        assert_phases_fit_in(&pull, took);
+        let apart = pull.wait < pull.serve / 2 && pull.apply < pull.serve / 2;
+        pulls.push(pull);
+        if apart {
+            return;
+        }
+    }
+    panic!(
+        "the serve delay is not also counted in wait or apply: on each of {SERVE_PULLS} pulls one \
+         of them read at least half of serve: {pulls:#?}"
+    );
 }
 
 #[tokio::test]
