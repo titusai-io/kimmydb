@@ -130,6 +130,14 @@ impl Member {
             // the in-window release raises the vector (`release_held_in_position`) to the servable PREFIX: the model (6d, `take_from`)
             // releases the entry even behind a still-held earlier one, and its coverage stays below that hold. `m-release-behind-held`
             // raises the vector to the released entry over the hold (the old harness behaviour)
+            if w.product_marks
+                && w.by_origin[e.origin]
+                    .iter()
+                    .take_while(|&&x| w.ent(x).hlc < e.hlc)
+                    .any(|&x| self.held_oop.contains(&x))
+            {
+                w.stats.bump("release_raised_over_hold"); // the mechanism fired: the vector rises over a hold still marked below the release
+            }
             if w.f.fm_release_behind_held || w.product_marks {
                 self.raise(w, e.idx);
             } else {

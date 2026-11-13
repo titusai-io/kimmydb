@@ -336,6 +336,23 @@ impl Member {
         true
     }
 
+    /// F2 (review: item Q was vacuous on doc_repair): the product applies a scoped repair's pages under `Position::Hold`, which writes an
+    /// OPLOG_HELD mark for each version's entry. Under `product_marks` a repaired version whose entry this member does not hold yet is
+    /// held out of position as a mark (held, not covering, not served), so the release raise and the #313 drop can act on the repair route.
+    pub fn repair_hold_mark(&mut self, w: &mut World, phys: &str, key: u32, stamp: &Stamp) {
+        if !w.product_marks {
+            return;
+        }
+        if let Some(&i) = w.rec_index.get(&(phys.to_string(), key, *stamp))
+            && !self.cv.has(i)
+        {
+            self.cv.add(i);
+            self.held_oop.insert(i);
+            self.appended.remove(&i);
+            w.stats.bump("repair_marks_written");
+        }
+    }
+
     /// The product's scoped repair (design note, phase G addition; `live_count.rs:599-608`): the source's document versions of the
     /// physicals this member holds alive are handed over as pages of a snapshot that grants NO coverage and carries no register
     /// events, so what they write stays held as state (`held_records`, the pages' retained versions) until the entries arrive in
@@ -585,6 +602,12 @@ impl Member {
                         }
                     }
                 }
+            }
+        }
+        if j.repair {
+            // F2: the repaired versions are marked held AFTER the page was applied (the page's own witnessing and entry bookkeeping see them as new)
+            for (k, v) in pd.docs.iter() {
+                self.repair_hold_mark(w, &name, *k, &v.stamp);
             }
         }
         let done = j.pages.is_empty() && !j.repair;

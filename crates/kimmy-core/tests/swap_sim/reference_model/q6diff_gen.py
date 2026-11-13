@@ -1,6 +1,6 @@
 """q6diff_gen.py: the tracer of the Q6 swap harness' differential. It wraps the vendored, unmodified `swapmodel6b.py` (the model of
 record, sha256 4343f520...; `Q6DIFF_MODEL=swapmodel6a` wraps the previous one) and dumps JSONL traces that the Rust harness (`tests/swap_sim/trace.rs`) replays event by event,
-comparing every member's state after every event, the entries each event mints, the counters before `finish`, and the verdict of
+comparing the acting member's state after every event (every member's at the structural events, the lost set, before `finish`, at the end and every 20 events), the entries each event mints, the counters before `finish`, and the verdict of
 `finish`. Python decides: a disagreement is a finding about the port (or the model), never an exclusion.
 
 Run (from any directory; no bytecode is written):
@@ -103,7 +103,7 @@ def member_j(m):
         held_records=sj([p, k, stamp_j(s)] for (p, k, s) in m.held_records),
         bare_state=sj([p, k, stamp_j(s)] for (p, k, s) in m.bare_state),
         state_held=sj([o, h] for o, h in m.state_held.items()), join=j, inv=sorted(m.inv), refused=m.refused, flips=m.flips,
-        last_served=m.last_served)
+        last_served=m.last_served, creates=sorted([n, e.idx] for n, e in m.creates.items()))
 
 
 class RecRng:

@@ -25,11 +25,14 @@ pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "s
 /// The counters of the Rust-only emulations (the route tests' live page read, `Repair::Replay`, the push, the product routes' held
 /// entries and DF-1's marker): the model has none of them, so they are left out of the counter comparison (they count, they decide
 /// nothing the model decides).
-pub const RUST_ONLY_STATS: [&str; 13] = [
+pub const RUST_ONLY_STATS: [&str; 16] = [
     // item Q / rule S: counters of the harness only (the model has no such names)
     "rule_s_negative_cases",
     "rule_s_negative_appended",
     "marks_dropped_superseded",
+    "marks_dropped_late",
+    "release_raised_over_hold",
+    "repair_marks_written",
     "page_drop_information_only",
     "replay_entries",
     "push_without_window",
@@ -223,6 +226,12 @@ pub fn member_view(w: &World, m: &Member) -> Value {
     });
     let mut abandoned: Vec<&String> = m.abandoned.iter().collect();
     abandoned.sort();
+    let creates: Vec<Value> = {
+        let mut c: Vec<(String, usize)> =
+            m.creates.iter().map(|(p, e)| (p.clone(), e.idx)).collect();
+        c.sort();
+        c.iter().map(|(p, i)| json!([p, i])).collect()
+    };
     json!({
         "name": m.name, "serving": m.serving(), "cur": m.cur.as_ref().map(|c| c.idx), "vanished": m.vanished, "hlc": m.hlc,
         "phys": phys, "evl": m.evl,
@@ -250,6 +259,7 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         "held_oop": sorted_ids(m.held_oop.iter().copied()),
         "eps": sj(m.refusal_eps.iter().map(|(i, e)| json!([i, e.start, e.last, e.n, e.end, e.end_q, e.info, e.cover, e.cover_q])).collect()),
         "join": join, "inv": m.inv.iter().collect::<Vec<_>>(), "refused": m.refused, "flips": m.flips, "last_served": m.last_served,
+        "creates": creates,
     })
 }
 

@@ -295,6 +295,9 @@ impl Member {
                 }
                 self.held_oop.remove(&i);
                 self.retire_repair(i);
+                if late && !superseded {
+                    w.stats.bump("marks_dropped_late");
+                }
                 n += 1;
             }
         }
