@@ -1386,8 +1386,30 @@ fn apply_one(
             if touches_id(target) {
                 return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
+            match rename_way(doc, &op.path) {
+                Way::Clear => {}
+                Way::Array { prefix, index: true } => {
+                    return Err(invalid(format!(
+                        "$rename: the source field cannot be an array element: {:?} goes through \
+                         the array {prefix:?}",
+                        op.path
+                    )));
+                }
+                Way::Array { prefix, index: false } => {
+                    return Err(invalid(traverse_refusal(doc, &prefix, &op.path)));
+                }
+                Way::Scalar { prefix } => {
+                    return Err(invalid(traverse_refusal(doc, &prefix, &op.path)));
+                }
+            }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
+                if let Way::Array { prefix, .. } = rename_way(doc, target) {
+                    return Err(invalid(format!(
+                        "$rename: the destination field cannot be an array element: {target:?} \
+                         goes through the array {prefix:?}"
+                    )));
+                }
                 path::unset_checked(doc, &op.path);
                 path::set_checked(doc, target, value, created).map_err(invalid)?;
             }
@@ -1398,6 +1420,47 @@ fn apply_one(
         }
     }
     Ok(())
+}
+
+/// What lies in the way of a `$rename` path in a document: the first value on
+/// the path, above its last segment, that is not a sub-document.
+enum Way {
+    /// A sub-document at every step, or nothing at some step.
+    Clear,
+    /// An array at `prefix`; `index` says the segment after it is a number.
+    Array { prefix: String, index: bool },
+    /// A scalar at `prefix`, with a segment still to go through it.
+    Scalar { prefix: String },
+}
+
+fn rename_way(doc: &Document, path: &str) -> Way {
+    let segments = path::segments(path);
+    let mut level = doc;
+    for (at, segment) in segments[..segments.len() - 1].iter().enumerate() {
+        let prefix = || segments[..=at].join(".");
+        match level.get(*segment) {
+            None => return Way::Clear,
+            Some(Bson::Document(child)) => level = child,
+            Some(Bson::Array(_)) => {
+                return Way::Array {
+                    prefix: prefix(),
+                    index: segments[at + 1].parse::<usize>().is_ok(),
+                };
+            }
+            Some(_) => return Way::Scalar { prefix: prefix() },
+        }
+    }
+    Way::Clear
+}
+
+/// The refusal for a `$rename` source that goes through a value it cannot
+/// enter: an array with no index, or a scalar.
+fn traverse_refusal(doc: &Document, prefix: &str, path: &str) -> String {
+    let part = prefix.rsplit('.').next().unwrap_or(prefix);
+    let held = path::resolve(doc, prefix).first().map(|v| v.to_string()).unwrap_or_default();
+    format!(
+        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
+    )
 }
 
 /// `$bit` over the stored value: each step in turn, the result an `Int32`
@@ -3229,16 +3292,15 @@ mod tests {
             ) && err.contains("at \"items.1.qty\""),
             "{err}"
         );
-        // Onto a field no positional path reaches, it applies.
-        let out = applied_with(
+        // Onto a field no positional path reaches there is no conflict, but a
+        // rename into an array element is refused all the same (q7s2.out
+        // line 111).
+        let err = apply_err_with(
             doc! { "$rename": { "x": "items.1.note" }, "$inc": { "items.$[].qty": 1 } },
             vec![],
             start,
         );
-        assert_eq!(
-            out.get_array("items").unwrap()[1].as_document().unwrap().get_i32("note").unwrap(),
-            7
-        );
+        assert!(err.contains("destination field cannot be an array element"), "{err}");
     }
 
     #[test]

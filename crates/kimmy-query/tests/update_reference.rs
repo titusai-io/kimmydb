@@ -366,3 +366,74 @@ fn b_two_spellings_of_one_element_are_a_path_conflict() {
         assert!(err.contains("conflict"), "{err}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// (C) $rename and array elements
+// ---------------------------------------------------------------------------
+
+fn renamed_doc() -> Document {
+    doc! {
+        "_id": 1, "items": [{ "sku": "a", "qty": 1 }, { "sku": "b" }], "s": "x",
+        "arr": [1, 2], "o": { "p": 1 },
+    }
+}
+
+#[test]
+fn c_a_rename_out_of_an_array_element_is_refused() {
+    // q7s2.out lines 101 and 121.
+    refused(
+        updated(doc! { "$rename": { "items.0.sku": "code" } }, renamed_doc()),
+        "source field cannot be an array element",
+    );
+    refused(
+        updated(doc! { "$rename": { "arr.0": "z" } }, renamed_doc()),
+        "source field cannot be an array element",
+    );
+}
+
+#[test]
+fn c_a_rename_into_an_array_element_is_refused() {
+    // q7s2.out lines 106 and 111.
+    refused(
+        updated(doc! { "$rename": { "s": "arr.1" } }, renamed_doc()),
+        "destination field cannot be an array element",
+    );
+    refused(
+        updated(doc! { "$rename": { "s": "items.0.s" } }, renamed_doc()),
+        "destination field cannot be an array element",
+    );
+}
+
+#[test]
+fn c_a_rename_through_an_array_without_an_index_is_refused() {
+    // q7s2.out line 116, and line 586 for a scalar in the way.
+    refused(
+        updated(doc! { "$rename": { "items.sku": "code" } }, renamed_doc()),
+        "cannot use the part (items of items.sku) to traverse the element",
+    );
+    refused(
+        updated(doc! { "$rename": { "a.y": "b" } }, doc! { "_id": 1, "a": 5 }),
+        "cannot use the part (a of a.y) to traverse the element",
+    );
+}
+
+#[test]
+fn c_a_rename_of_a_whole_array_or_a_subdocument_field_still_applies() {
+    // q7s2.out lines 126, 131, 136.
+    let mut want = renamed_doc();
+    let items = want.remove("items").unwrap();
+    want.insert("lines", items);
+    same(updated(doc! { "$rename": { "items": "lines" } }, renamed_doc()), want);
+
+    let mut want = renamed_doc();
+    want.insert("o", doc! { "q": 1 });
+    same(updated(doc! { "$rename": { "o.p": "o.q" } }, renamed_doc()), want);
+
+    same(
+        updated(doc! { "$rename": { "s": "s2" }, "$set": { "arr.0": 9 } }, renamed_doc()),
+        doc! {
+            "_id": 1, "items": [{ "sku": "a", "qty": 1 }, { "sku": "b" }], "arr": [9, 2],
+            "o": { "p": 1 }, "s2": "x",
+        },
+    );
+}

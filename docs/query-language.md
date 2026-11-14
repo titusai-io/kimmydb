@@ -644,6 +644,17 @@ an array element that is not a document** is a `400`, `cannot create field 'y'
 in element {a: 5}`, and the document is unchanged; before, the scalar was
 replaced by a document. `$unset` below a scalar changes nothing.
 
+**`$rename` does not move a field into or out of an array element.** A source
+or a destination that goes through an array in the document is a `400`: the
+source `items.0.sku` or `arr.0` is refused (`the source field cannot be an array
+element`), the destination `arr.1` or `items.0.s` is refused (`the destination
+field cannot be an array element`), and a source that goes through an array
+without an index (`items.sku`) or through a scalar (`a.y` over `a: 5`) is
+refused (`cannot use the part (items of items.sku) to traverse the element`). A
+whole array (`items` to `lines`), a field of a sub-document (`o.p` to `o.q`)
+and a rename beside a write to an array still apply. A source that is missing
+is still a no-op.
+
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator
