@@ -611,6 +611,13 @@ mod tests {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             eprintln!("ONE {name} nonzero checks: {bad:?}");
+            eprintln!(
+                "ONE {name} classes {:?}; cnt_df2 {} cnt_df2r {} cnt_hb2_stages {}",
+                crate::oracle::product_classes(&r.res, false),
+                r.res.get("cnt_df2_held_above_coverage_behind_lost").copied().unwrap_or(0),
+                r.res.get("cnt_df2r").copied().unwrap_or(0),
+                r.res.get("cnt_hb2_stages").copied().unwrap_or(0)
+            );
         }
         if let Some(i) = first {
             for j in i.saturating_sub(4)..(i + 6).min(a.len().max(b.len())) {
@@ -1402,6 +1409,10 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6d.py")).unwrap();
         let got6d: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got6d, m6d, "swapmodel6d.py");
+        let m6f = "a0f2afe98a030ca32c97c5627acd03d6e5c143439cc9fa90736e6b08b53f51ba";
+        let bytes = std::fs::read(dir.join("swapmodel6f.py")).unwrap();
+        let got6f: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got6f, m6f, "swapmodel6f.py");
         let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
         assert!(
             recorded.contains(want)
