@@ -63,6 +63,7 @@
 //! than 2^56 maximal increments to reach, `decode` and `receive_loss` refuse a total past it,
 //! and `write_inc` refuses an `$inc` that would carry a writer's slot past it.
 
+pub mod bridge;
 mod codec;
 mod compact;
 mod counter;

@@ -49,6 +49,18 @@ Status meanings:
 
 ---
 
+<a id="field-merge-unsupported-bson-types-q7"></a>
+
+## 🟡 Under the `field` merge policy six BSON types are refused with a 400 where the reference stores them (Q7 step 2)
+
+**Raised with the Q7 step 2 bridge between BSON and the merge state's value type.** The field-level merge state has a value variant for every BSON type except JavaScript code (with and without scope), symbol, DB pointer, min key, max key and undefined. A write that carries one of them, at any depth (a field, an element of an array, a field of a sub-document), is refused whole with a `400` (`BadValue`, naming the type) and changes nothing. The `document` policy stores them as before. The reference stores all six.
+
+**Workaround:** store the value as a string or a number, or keep the collection under the `document` policy.
+
+**To close:** give the merge state a variant for each of the six (a codec change, so a format decision).
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches

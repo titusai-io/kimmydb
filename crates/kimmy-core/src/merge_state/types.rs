@@ -183,6 +183,10 @@ pub enum InvalidValue {
     /// A written document names a field twice, or a field name has a NUL byte.
     #[error("merge state: a document field name is repeated or has a NUL byte")]
     BadFieldName,
+    /// A BSON type the merge state cannot hold (see `merge_state::bridge`): JavaScript code,
+    /// symbol, DB pointer, min key, max key and undefined. Refused on `field` collections.
+    #[error("merge state: the BSON type {0} cannot be stored under the field merge policy")]
+    UnsupportedType(&'static str),
 }
 
 impl Value {
