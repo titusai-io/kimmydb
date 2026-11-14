@@ -80,6 +80,8 @@ mod trig_tests;
 #[cfg(test)]
 mod update_effects_tests;
 #[cfg(test)]
+mod update_pipeline_effects_tests;
+#[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
 mod window_deadline_tests;
