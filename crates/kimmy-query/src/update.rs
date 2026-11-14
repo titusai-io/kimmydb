@@ -966,8 +966,27 @@ fn apply_to_at(
             // replacement that left it last would be a different document,
             // byte for byte, from the same fields stored by a `PUT`, and
             // would count as a change every time it was sent (ADR-208).
+            //
+            // An upsert's seed holds the filter's `_id`, when it has one, and
+            // no other field of the filter reaches the document. The body may
+            // name the `_id` the document is inserted under when the filter
+            // names none; naming a different one is a change of an immutable
+            // field (q7s2b.out lines 133, 138, 142).
+            let id = match (target, doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
+                (Target::Inserted, Some(seeded), Some(named)) => {
+                    if canonical_cmp(seeded, named) != Ordering::Equal {
+                        return Err(Error::InvalidUpdate(format!(
+                            "the (immutable) field '_id' cannot be changed from {seeded} to \
+                             {named} by the replacement of an upsert"
+                        )));
+                    }
+                    Some(seeded)
+                }
+                (Target::Inserted, None, named) => named,
+                (_, held, _) => held,
+            };
             let mut next = Document::new();
-            if let Some(id) = doc.get(ID_FIELD) {
+            if let Some(id) = id {
                 next.insert(ID_FIELD, id.clone());
             }
             for (key, value) in replacement {

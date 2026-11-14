@@ -1107,6 +1107,15 @@ keeps the body's own `_id` when it names the same id, as an insert does, and
 otherwise stores the narrowest integer type that holds the path id: a 32-bit
 integer when it fits, as a JSON insert of the same number does.
 
+A **replacement as the update of an upsert** that inserts creates the document
+from the body alone: the filter's fields are not carried into it (`{filter:
+{k: 1}, update: {v: 2}}` creates `{v: 2}`; the operator form `{$set: {v: 2}}`
+keeps `k`). Its `_id` is the filter's `_id` when the filter has one and the body
+has none, the body's `_id` when the filter has none, and a generated one
+otherwise. A filter `_id` and a body `_id` that differ are refused with a `400`
+naming the immutable field, and nothing is inserted. A replacement of a
+document that exists replaces every field but `_id`.
+
 `_id` is identity, not content. Neither operators nor replacements can move a
 document:
 

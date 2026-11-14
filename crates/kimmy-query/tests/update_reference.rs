@@ -437,3 +437,45 @@ fn c_a_rename_of_a_whole_array_or_a_subdocument_field_still_applies() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// (D) Replacement upserts and `_id`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_a_replacement_upsert_does_not_carry_the_filter_fields() {
+    // q7s2b.out lines 113, 118, 123, 128, 148: the filter's fields are not in
+    // the document, and `_id` is left for the store to generate.
+    same(upserted(doc! {}, doc! {}), doc! {});
+    same(upserted(doc! {}, doc! { "_id": 1 }), doc! { "_id": 1 });
+    same(upserted(doc! { "v": 2 }, doc! { "k": 1 }), doc! { "v": 2 });
+    same(upserted(doc! { "x": 1 }, doc! { "a": { "b": 1 } }), doc! { "x": 1 });
+    same(upserted(doc! { "x": 1 }, doc! { "a": { "b": 1 } }), doc! { "x": 1 });
+}
+
+#[test]
+fn d_a_replacement_upsert_takes_the_id_of_the_filter_or_the_body() {
+    // q7s2b.out lines 133, 138.
+    same(upserted(doc! { "v": 2 }, doc! { "_id": 7, "k": 1 }), doc! { "_id": 7, "v": 2 });
+    same(upserted(doc! { "_id": 9, "v": 2 }, doc! { "k": 1 }), doc! { "_id": 9, "v": 2 });
+    // The same `_id` in both is not a difference.
+    same(upserted(doc! { "_id": 7, "v": 2 }, doc! { "_id": 7 }), doc! { "_id": 7, "v": 2 });
+}
+
+#[test]
+fn d_a_replacement_upsert_whose_body_id_differs_from_the_filter_id_is_refused() {
+    // q7s2b.out line 142 (code 66, the immutable field).
+    refused(upserted(doc! { "_id": 8, "v": 2 }, doc! { "_id": 7 }), "immutable");
+}
+
+#[test]
+fn d_a_replacement_of_a_stored_document_keeps_only_its_id() {
+    // q7s2b.out line 153.
+    same(updated(doc! { "v": 2 }, doc! { "_id": 1, "k": 1, "z": 9 }), doc! { "_id": 1, "v": 2 });
+}
+
+#[test]
+fn d_an_operator_upsert_keeps_the_filter_field() {
+    // q7s2b.out line 158.
+    same(upserted(doc! { "$set": { "v": 2 } }, doc! { "k": 1 }), doc! { "k": 1, "v": 2 });
+}
