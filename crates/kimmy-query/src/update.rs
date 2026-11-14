@@ -1279,6 +1279,16 @@ fn apply_one(
     now_ms: i64,
     created: &mut path::Created,
 ) -> Result<()> {
+    if matches!(
+        op.kind,
+        OpKind::Pull(_)
+            | OpKind::PullWhere(_)
+            | OpKind::PullQuery(_)
+            | OpKind::PullAll(_)
+            | OpKind::Pop(_)
+    ) {
+        refuse_untraversable(doc, op)?;
+    }
     let current = path::resolve(doc, &op.path).first().cloned().cloned();
 
     let invalid = |msg: String| Error::InvalidUpdate(msg);
@@ -1319,6 +1329,8 @@ fn apply_one(
             };
             if replace {
                 set(doc, candidate.clone())?;
+            } else {
+                refuse_untraversable(doc, op)?;
             }
         }
 
@@ -1329,6 +1341,8 @@ fn apply_one(
             };
             if replace {
                 set(doc, candidate.clone())?;
+            } else {
+                refuse_untraversable(doc, op)?;
             }
         }
 
@@ -1423,7 +1437,9 @@ fn apply_one(
         }
 
         OpKind::Pop(direction) => {
-            let Some(Bson::Array(mut items)) = current else {
+            // A value that is not an array is refused (code 14), a missing one is
+            // no change (q7s2j.out j0793-j0817).
+            let Some(mut items) = pull_target(current, "$pop", &op.path)? else {
                 return Ok(());
             };
             if !items.is_empty() {
@@ -1456,7 +1472,7 @@ fn apply_one(
                 // A path that goes through a value it cannot enter is refused
                 // whether or not anything lies beyond it (q7s2f.out lines 5-63).
                 Source::Blocked { part, held } => {
-                    return Err(invalid(traverse_refusal(&part, &op.path, &held)));
+                    return Err(invalid(traverse_refusal("$rename", &part, &op.path, &held)));
                 }
                 Source::Found => {}
             }
@@ -1572,10 +1588,25 @@ fn rename_source(doc: &Document, path: &str) -> Source {
 
 /// The refusal for a `$rename` source that goes through a value it cannot
 /// enter, naming the part of the path that names it.
-fn traverse_refusal(part: &str, path: &str, held: &Bson) -> String {
+fn traverse_refusal(operator: &str, part: &str, path: &str, held: &Bson) -> String {
     format!(
-        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
+        "{operator} cannot use the part ({part} of {path}) to traverse the element \
+         ({{{part}: {held}}})"
     )
+}
+
+/// Refuse an operation whose path goes through a value it cannot enter (a scalar
+/// or `null` by any segment, an array by a field name), where a missing step is
+/// no change. The array operators and a `$min` or `$max` that leaves the field
+/// as it is write nothing there, and the reference refuses them all the same
+/// (q7s2j.out j0800-j0864, q7s2i.out i0418).
+fn refuse_untraversable(doc: &Document, op: &Operation) -> Result<()> {
+    match rename_source(doc, &op.path) {
+        Source::Blocked { part, held } => {
+            Err(Error::InvalidUpdate(traverse_refusal(op.kind.name(), &part, &op.path, &held)))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `$bit` over the stored value: each step in turn, the result an `Int32`
@@ -3963,6 +3994,127 @@ mod tests {
                 message.contains("$pull cannot mix operators with plain fields"),
                 "{operand}: {message}"
             );
+        }
+    }
+
+    fn one_op(operator: &str, path: &str, operand: impl Into<Bson>) -> Document {
+        let mut inner = Document::new();
+        inner.insert(path, operand);
+        let mut update = Document::new();
+        update.insert(operator, inner);
+        update
+    }
+
+    /// The three array operators over a path that goes through a value they
+    /// cannot enter: a scalar or `null` by any segment, an array by a field
+    /// name. The reference refuses each as a traverse (code 28) whether or
+    /// not anything lies beyond it. `$pop` rows of q7s2j.out; the `$pull`
+    /// rows (j0577-j0720, lines 3458-4316) and the `$pullAll` rows
+    /// (j0721-j0792, lines 4322-4748) hold the same shapes.
+    #[test]
+    fn array_operators_below_a_value_they_cannot_enter_are_refused() {
+        let docs = || bson::bson!([{ "a": 1 }, { "a": 2 }]);
+        let nested = || bson::bson!([[1, 2], [3]]);
+        let keyed = || bson::bson!({ "0": [1, 2], "1": 3 });
+        let shapes: Vec<(&str, &str, Bson)> = vec![
+            ("j0800 f.a over f=5, q7s2j.out 4796", "f.a", Bson::Int32(5)),
+            ("j0801 f.0 over f=5, 4802", "f.0", Bson::Int32(5)),
+            ("j0812 f.a over f=null", "f.a", Bson::Null),
+            (
+                "j0828 f.a.b over f={a:[1,2],b:2}, 4964",
+                "f.a.b",
+                bson::bson!({ "a": [1, 2], "b": 2 }),
+            ),
+            ("j0836 f.a over f=[1,2], 5012", "f.a", bson::bson!([1, 2])),
+            ("j0839 f.0.a over f=[1,2], 5030", "f.0.a", bson::bson!([1, 2])),
+            ("j0842 f.a over f=[{a:1},{a:2}], 5048", "f.a", docs()),
+            ("j0848 f.a over f=[[1,2],[3]], 5084", "f.a", nested()),
+            ("j0851 f.0.a over f=[[1,2],[3]], 5102", "f.0.a", nested()),
+            ("j0863 f.0.a over f={0:[1,2],1:3}, 5174", "f.0.a", keyed()),
+        ];
+        for (label, path, stored) in shapes {
+            for update in [
+                one_op("$pop", path, 1),
+                one_op("$pull", path, bson::bson!({ "$gt": 1 })),
+                one_op("$pullAll", path, bson::bson!([1, 9])),
+            ] {
+                let message = apply_err(update.clone(), doc! { "f": stored.clone() });
+                assert!(message.contains("cannot use the part"), "{label}: {update}: {message}");
+            }
+        }
+    }
+
+    /// A path with nothing at it is no change, and a path that reaches an
+    /// array through documents and indexes works: q7s2j.out j0793-j0798
+    /// (lines 4754-4795), j0818 (4904), j0824 (4940), j0831 (4982), j0857
+    /// (5138), j0860 (5156), j0861 (5162), j0864 (5180).
+    #[test]
+    fn array_operators_leave_a_missing_path_alone_and_reach_arrays_by_index() {
+        for path in ["f", "f.a", "f.0", "f.1", "f.0.a", "f.a.b"] {
+            for update in [
+                one_op("$pop", path, 1),
+                one_op("$pull", path, bson::bson!({ "$gt": 1 })),
+                one_op("$pullAll", path, bson::bson!([1, 9])),
+            ] {
+                assert_eq!(applied(update, doc! { "b": 1 }), doc! { "b": 1 }, "{path} over absent");
+            }
+        }
+        let empty = || doc! { "f": {} };
+        assert_eq!(applied(one_op("$pop", "f.a", 1), empty()), empty(), "j0818");
+        assert_eq!(applied(one_op("$pop", "f.0", 1), doc! { "f": [] }), doc! { "f": [] }, "j0831");
+        assert_eq!(
+            applied(one_op("$pop", "f.a", 1), doc! { "f": { "a": [1, 2], "b": 2 } }),
+            doc! { "f": { "a": [1], "b": 2 } },
+            "j0824"
+        );
+        assert_eq!(
+            applied(one_op("$pop", "f.0.a", 1), doc! { "f": [{ "a": [1, 2] }, { "a": [3] }] }),
+            doc! { "f": [{ "a": [1] }, { "a": [3] }] },
+            "j0857"
+        );
+        let keyed = || doc! { "f": { "0": [1, 2], "1": 3 } };
+        assert_eq!(applied(one_op("$pop", "f.a", 1), keyed()), keyed(), "j0860");
+        assert_eq!(
+            applied(one_op("$pop", "f.0", 1), keyed()),
+            doc! { "f": { "0": [1], "1": 3 } },
+            "j0861"
+        );
+        assert_eq!(applied(one_op("$pop", "f.a.b", 1), keyed()), keyed(), "j0864");
+    }
+
+    /// `$pop` of a path that holds something that is not an array is refused
+    /// (code 14), as `$pull` and `$pullAll` are: a string, `null`, a document,
+    /// an element of an array, a field of an element. q7s2j.out j0805 (line
+    /// 4826), j0811 (4862), j0817 (4898), j0837 (5018), j0845 (5066); the
+    /// `$pop` of q7s2m.out m0122 (line 728), whose other operator is fine.
+    #[test]
+    fn pop_of_a_value_that_is_not_an_array_is_refused() {
+        for (label, path, stored) in [
+            ("j0805", "f", Bson::String("s".into())),
+            ("j0811", "f", Bson::Null),
+            ("j0817", "f", Bson::Document(Document::new())),
+            ("j0837", "f.0", bson::bson!([1, 2])),
+            ("j0845", "f.0.a", bson::bson!([{ "a": 1 }, { "a": 2 }])),
+        ] {
+            let message = apply_err(one_op("$pop", path, 1), doc! { "f": stored });
+            assert!(message.contains("non-array"), "{label}: {message}");
+        }
+        let message = apply_err(
+            doc! { "$unset": { "a.b": 1 }, "$pop": { "a.c": 1 } },
+            doc! { "a": { "b": 5, "c": 6 } },
+        );
+        assert!(message.contains("non-array"), "m0122: {message}");
+    }
+
+    /// `$min` and `$max` that would leave the field as it is still refuse a
+    /// path through an array by a field name, as a write there is refused:
+    /// q7s2i.out i0418 (line 2504), `$min 3` at `f.a` over `[{a:1},{a:2}]`.
+    #[test]
+    fn min_through_an_array_by_a_field_name_is_refused_even_when_it_would_not_write() {
+        let stored = || doc! { "f": [{ "a": 1 }, { "a": 2 }] };
+        for update in [one_op("$min", "f.a", 3), one_op("$max", "f.a", 0)] {
+            let message = apply_err(update.clone(), stored());
+            assert!(message.contains("cannot"), "{update}: {message}");
         }
     }
 

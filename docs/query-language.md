@@ -694,6 +694,19 @@ operator document in its list as the plain document it is. `$pullAll` on a field
 is missing does nothing; on a field that is not an array it is a `400`,
 because the caller believes the field is an array and it is not. **So is `$pull`,
 of a value or a condition**: `cannot apply $pull to non-array field "v"`.
+**So is `$pop`**: a field that holds a string, a number, `null` or a document
+is a `400` (`cannot apply $pop to non-array field "v"`), and `$pop` of an empty
+array or of a missing field changes nothing.
+
+**`$pull`, `$pullAll` and `$pop` do not look through a value they cannot
+enter.** A path that goes through a scalar or `null` by any segment (`f.a` or
+`f.0` over `f: 5`), or through an array by a field name (`f.a` over
+`f: [{a: [1, 2]}]`), is a `400` as a `$rename` source is
+(`cannot use the part (a of f.a) to traverse the element`), whether or not
+anything lies beyond it. A path that reaches nothing (`f.a` over a missing `f`,
+`f.0` over `f: []`) is no change, and an index into an array works
+(`f.0` over `f: [[1, 2], [3]]`). A `$min` or `$max` that would leave the field
+as it is refuses the same paths, as one that writes does.
 
 ### `$pull`: a value, a condition or a query
 
