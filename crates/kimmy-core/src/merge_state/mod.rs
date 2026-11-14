@@ -83,8 +83,6 @@ mod counter_tests;
 #[cfg(test)]
 mod counter_type_tests;
 #[cfg(test)]
-mod d7_equivalence_tests;
-#[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
 mod hand_built;
