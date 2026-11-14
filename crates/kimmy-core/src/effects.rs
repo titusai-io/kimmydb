@@ -183,7 +183,9 @@
 //!   sorted (invariant 5, `q7s2.out` lines 189-204): the filter's equality fields, sorted, come
 //!   first, then every new field from `$set`, `$setOnInsert`, `$inc` and the register operators,
 //!   sorted together; an override keeps its place. The ORDER comes from the post-image
-//!   (`apply_to_at`, the `UpsertPlan`'s `post_image`); `creation_cells` composes the layers and its
+//!   (`apply_to_at`, the `UpsertPlan`'s `post_image`), WHOLE: S2b passes the path of every cell,
+//!   the filter's cells included, and [`UpsertEffects::creation_list`] follows it exactly (an
+//!   order that leaves a cell out is refused); `creation_cells` composes the layers and its
 //!   own order is only deterministic. The cells go to the writer as `fields` (the `Creation` cells)
 //!   and `sets` (the `Plain` cells) of `upsert_soi_create` in the tests; the S2a item below makes
 //!   the entry one ordered list.
@@ -510,14 +512,13 @@ pub struct UpsertWritten {
 impl UpsertEffects {
     /// The creation as ONE ordered list, the increments in it: [`UpsertEffects::creation_cells`]
     /// followed by an [`CellTag::Inc`] cell per `inc` entry, then put in the post-image order the
-    /// caller names. `order` is the post-image order the product computed (S2b's `UpsertPlan`
-    /// `post_image`, new fields sorted at each level, the filter's equality fields first): it lists
-    /// the paths of the NEW fields (every `set_on_insert`, `set` and
-    /// `inc` path, as written) in the order the product's post-image has them; empty means the
-    /// default sequence (filter cells, then `set_on_insert`, `set`, `inc`). With an order, the
-    /// cells the order does not name (the filter's, and a cell a merge placed at another path)
-    /// stay first in their sequence, then the named ones follow in the order's sequence; an order
-    /// that leaves out a `set_on_insert`, `set` or `inc` path is [`UpdateRefused::BadPath`].
+    /// caller names. `order` is the FULL post-image order the product computed (S2b's
+    /// `UpsertPlan` `post_image`, new fields sorted at each level, the filter's equality fields
+    /// first): it lists the path of EVERY cell, the filter's cells included (a filter field that
+    /// a `$set` overrides is one cell, at its place in the post-image, not behind the others).
+    /// Empty means the default sequence (filter cells, then `set_on_insert`, `set`, `inc`). With
+    /// an order, the cells follow it exactly; an order that leaves out the path of any cell is
+    /// [`UpdateRefused::BadPath`], so no cell is placed by a guess.
     pub fn creation_list(&self, order: &[Path]) -> Result<Vec<CreationCell>, UpdateRefused> {
         let mut list = self.creation_cells()?;
         list.extend(self.inc.iter().map(|(p, v)| CreationCell {
@@ -528,18 +529,14 @@ impl UpsertEffects {
         if order.is_empty() {
             return Ok(list);
         }
-        let new = self.set_on_insert.iter().chain(&self.set).chain(&self.inc);
-        if new.into_iter().any(|(p, _)| !order.contains(p)) {
+        let rank = |c: &CreationCell| order.iter().position(|p| *p == c.path);
+        if list.iter().any(|c| rank(c).is_none()) {
             return Err(UpdateRefused::BadPath(InvalidPath(
-                "the field order of the creation leaves out a new field",
+                "the field order of the creation leaves out a cell",
             )));
         }
-        let rank = |c: &CreationCell| order.iter().position(|p| *p == c.path);
-        let (mut named, mut rest): (Vec<_>, Vec<_>) =
-            list.into_iter().partition(|c| rank(c).is_some());
-        named.sort_by_key(|c| rank(c));
-        rest.extend(named);
-        Ok(rest)
+        list.sort_by_key(|c| rank(c));
+        Ok(list)
     }
 
     /// Create the document: [`UpsertEffects::creation_list`] (the checks included), then
