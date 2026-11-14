@@ -576,3 +576,16 @@ fn g_a_numeric_source_inside_an_array_is_refused() {
         "source field cannot be an array element",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `_id` of a replacement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn h_a_replacement_cannot_give_a_stored_document_an_id() {
+    // A stored document has its `_id`; one that does not (a fixture of the
+    // fuzz harness) is not given one by a replacement, which is a change of
+    // `_id`. Only the document an upsert inserts takes the body's.
+    refused(updated(doc! { "_id": 1, "v": 1 }, doc! { "k": 1 }), "_id is immutable");
+    same(upserted(doc! { "_id": 1, "v": 1 }, doc! { "k": 1 }), doc! { "_id": 1, "v": 1 });
+}

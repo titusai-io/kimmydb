@@ -983,7 +983,16 @@ fn apply_to_at(
                     }
                     Some(named)
                 }
-                (held, named) => named.or(held),
+                // Only the document an upsert inserts takes the body's `_id`; a
+                // stored one has its own, and is not given one.
+                (None, Some(named)) if target == Target::Inserted => Some(named),
+                (None, Some(named)) => {
+                    return Err(Error::InvalidUpdate(format!(
+                        "_id is immutable and cannot be updated: the replacement names _id \
+                         {named}, and the document has none"
+                    )));
+                }
+                (held, None) => held,
             };
             let mut next = Document::new();
             if let Some(id) = id {
