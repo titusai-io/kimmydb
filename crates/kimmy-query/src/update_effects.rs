@@ -27,7 +27,27 @@
 //!
 //! The effects are listed in the order of the post-image the engine builds: an effect whose field
 //! is new takes the place its field has there, so `field` and `document` collections show the
-//! same field order. Unsets come first, in operator order.
+//! same field order. A plain `$unset` comes first, in operator order; a `$rename` is its `Unset`
+//! and its `Set` together ([`Effects::rename`]), at the place of the DESTINATION in the post-image.
+//!
+//! # `field` collections only
+//!
+//! [`apply_with_effects`] and [`plan_upsert`] are for collections under the `field` merge policy.
+//! They run the engine first, so every refusal of the `document` path is theirs too, and they can
+//! refuse where the `document` path succeeds: a `$rename` through an array element or a scalar
+//! ([`refuse_rename_ways`]), a BSON type the merge state cannot hold (the bridge), and the
+//! writer's own refusals once the effects are applied. A `document` collection keeps using
+//! [`crate::update::apply`] and its siblings.
+//!
+//! # Pending
+//!
+//! * The seeding of an upsert from the filter (`implied_equalities` here) is a copy of the one in
+//!   `kimmy-api` (`exec.rs`). One function in `kimmy-query`, used by both, is to replace the two
+//!   after the engine fix of the seed order lands on main and main is merged into q7.
+//! * Costs to measure with L34-B B2-1 (no change now): the update runs on a clone of the
+//!   document, the effects convert before and after values to merge-state values twice, and the
+//!   order of the effects ([`build`]) ranks each effect against the post-image, O(effects x
+//!   fields).
 
 use bson::{Bson, Document};
 use kimmy_core::effects::{Effects, UpsertEffects};
@@ -61,7 +81,8 @@ enum Item {
     Rename(Path, Path, Value),
 }
 
-/// Plan the effects of `update` on `doc`. `filter` is what matched the document: it resolves a
+/// Plan the effects of `update` on `doc`, for a `field` collection ONLY (see the module docs):
+/// it can refuse where [`crate::update::apply`] succeeds. `filter` is what matched the document: it resolves a
 /// `$` positional segment (as [`crate::update::apply_matched`]); `None` for an update with none.
 /// `now_ms` is the one date of `$currentDate`.
 pub fn apply_with_effects(
@@ -394,7 +415,9 @@ fn dotted(p: &str) -> Result<Path> {
     to_path(&path::segments(p))
 }
 
-/// Plan the creation of an upsert whose `filter` matched nothing. The engine builds the inserted
+/// Plan the creation of an upsert whose `filter` matched nothing, for a `field` collection ONLY
+/// (see the module docs): it can refuse where [`crate::update::apply_on_insert`] succeeds. The
+/// engine builds the inserted
 /// document as it always did (the filter's equalities, then the update); the effects are the
 /// layers of the creation, each as written: `from_filter` (an `_id` path is left out, the upsert's
 /// `_id` logic owns it), `set_on_insert`, `set` (including the creation value of `$mul`, `$min`,
