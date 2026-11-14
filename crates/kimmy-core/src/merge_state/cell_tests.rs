@@ -320,10 +320,8 @@ fn counter_state(slot: Slot) -> (MergeState, Path) {
 #[test]
 fn b1_the_field_is_present_when_the_slot_moved_since_its_absorbed_stamp() {
     let o = opts();
-    let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| Slot {
-        stamp: st(stamp, 'A'),
-        total: total.into(),
-        absorbed: abs.map(|(sa, t)| (st(sa, 'A'), t.into())),
+    let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| {
+        Slot::new(st(stamp, 'A'), total.into(), abs.map(|(sa, t)| (st(sa, 'A'), t.into())))
     };
     let value = |sl: Slot| {
         let (s, x) = counter_state(sl);
@@ -355,10 +353,8 @@ fn one_slot(s: Slot) -> MergeState {
 fn a_slot_joins_by_the_higher_stamp_and_its_pair_by_the_higher_absorbed_stamp() {
     let o = opts();
     let key = (st(1, 'A'), p("x"), wid('A', 0), None::<MStamp>);
-    let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| Slot {
-        stamp: st(stamp, 'A'),
-        total: total.into(),
-        absorbed: abs.map(|(sa, t)| (st(sa, 'A'), t.into())),
+    let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| {
+        Slot::new(st(stamp, 'A'), total.into(), abs.map(|(sa, t)| (st(sa, 'A'), t.into())))
     };
     // s holds the newer slot with the older pair; t the older slot with the newer pair
     let s = one_slot(slot(6, 7, Some((3, 3))));
@@ -444,10 +440,8 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
         t
     };
     let dec_bytes = |t: &str| t.parse::<bson::Decimal128>().unwrap().bytes();
-    let slot = |total: Num, absorbed: Option<(u64, Num)>| Slot {
-        stamp: st(5, 'A'),
-        total,
-        absorbed: absorbed.map(|(w, n)| (st(w, 'A'), n)),
+    let slot = |total: Num, absorbed: Option<(u64, Num)>| {
+        Slot::new(st(5, 'A'), total, absorbed.map(|(w, n)| (st(w, 'A'), n)))
     };
     let cases: Vec<(&str, Slot, Vec<u8>)> = vec![
         // Int64, no pair: flags 0
@@ -559,10 +553,7 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
 fn state_with_total(total: Num) -> MergeState {
     let mut state = MergeState::default();
     state.lives.insert(st(1, 'A'), upsert_life());
-    state.slots.insert(
-        (st(1, 'A'), p("x"), writer_a(), None),
-        Slot { stamp: st(5, 'A'), total, absorbed: None },
-    );
+    state.slots.insert((st(1, 'A'), p("x"), writer_a(), None), Slot::new(st(5, 'A'), total, None));
     state.vv.insert(writer_a(), h(9));
     state
 }
@@ -705,7 +696,7 @@ fn paired() -> MergeState {
     state.lives.insert(life, upsert_life());
     state.slots.insert(
         (life, p("x"), writer_a(), None),
-        Slot { stamp: st(5, 'A'), total: 7.into(), absorbed: Some((st(3, 'A'), 4.into())) },
+        Slot::new(st(5, 'A'), 7.into(), Some((st(3, 'A'), 4.into()))),
     );
     state.vv.insert(writer_a(), h(9));
     state
@@ -774,10 +765,7 @@ fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
     s.vv.insert(wid('A', 0), h(9));
     s.vv.insert(wid('B', 0), h(9));
     let key = (st(1, 'A'), p("x"), wid('B', 0), None);
-    s.slots.insert(
-        key.clone(),
-        Slot { stamp: st(5, 'B'), total: 7.into(), absorbed: Some((st(3, 'B'), 4.into())) },
-    );
+    s.slots.insert(key.clone(), Slot::new(st(5, 'B'), 7.into(), Some((st(3, 'B'), 4.into()))));
     accepts(&s);
     s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'A'), 4.into()));
     refuses(&s, DecodeError::AbsorbedWriterMismatch);
@@ -794,7 +782,7 @@ fn decode_refuses_a_slot_stamped_by_another_writer_than_its_key() {
     s.vv.insert(wid('A', 0), h(9));
     s.vv.insert(wid('B', 0), h(9));
     // no pair
-    s.slots.insert(key.clone(), Slot { stamp: st(5, 'B'), total: 3.into(), absorbed: None });
+    s.slots.insert(key.clone(), Slot::new(st(5, 'B'), 3.into(), None));
     assert_eq!(s.check_decoded(), Err(DecodeError::SlotWriterMismatch));
     refuses(&s, DecodeError::SlotWriterMismatch);
     // a pair by the key's writer, below the slot
@@ -815,7 +803,7 @@ fn decode_refuses_a_slot_stamped_by_another_writer_than_its_key() {
     s.vv.insert(wid('A', 0), h(9));
     s.vv.insert(wid('B', 0), h(9));
     let key = (st(1, 'A'), p("x"), wid('B', 0), None);
-    s.slots.insert(key.clone(), Slot { stamp: st(5, 'B'), total: 7.into(), absorbed: None });
+    s.slots.insert(key.clone(), Slot::new(st(5, 'B'), 7.into(), None));
     accepts(&s);
     s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'B'), 4.into()));
     accepts(&s);
@@ -955,17 +943,17 @@ fn the_version_vector_covers_every_stamp_an_honest_state_covers() {
         ("an absorbed stamp", |state| {
             state.slots.insert(
                 (st(1, 'A'), p("x"), wid('A', 0), None),
-                Slot { stamp: st(5, 'A'), total: 1.into(), absorbed: Some((st(5, 'A'), 1.into())) },
+                Slot::new(st(5, 'A'), 1.into(), Some((st(5, 'A'), 1.into()))),
             );
             state.slots.insert(
                 (st(1, 'A'), p("y"), wid('B', 0), None),
-                Slot { stamp: st(9, 'B'), total: 1.into(), absorbed: Some((st(9, 'B'), 1.into())) },
+                Slot::new(st(9, 'B'), 1.into(), Some((st(9, 'B'), 1.into()))),
             );
         }),
         ("the generation of a slot key", |state| {
             state.slots.insert(
                 (st(1, 'A'), p("x"), wid('A', 0), Some(st(9, 'B'))),
-                Slot { stamp: st(5, 'A'), total: 1.into(), absorbed: None },
+                Slot::new(st(5, 'A'), 1.into(), None),
             );
         }),
         ("a register's generation", |state| {

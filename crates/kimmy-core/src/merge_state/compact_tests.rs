@@ -1094,10 +1094,7 @@ fn every_table_of_one_to_three_hundred_writers_round_trips() {
                 epoch: Epoch::from_u64(0),
             };
             let at = MStamp { hlc: Hlc::new(2 + k as u64, 0), writer: w };
-            s.slots.insert(
-                (life, p("x"), w, None),
-                Slot { stamp: at, total: Num::Int64(k as i128 + 1), absorbed: None },
-            );
+            s.slots.insert((life, p("x"), w, None), Slot::new(at, Num::Int64(k as i128 + 1), None));
             s.vv.insert(w, at.hlc);
         }
         s.vv.insert(life.writer, life.hlc);

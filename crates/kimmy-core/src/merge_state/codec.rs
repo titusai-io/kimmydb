@@ -101,6 +101,10 @@ pub enum DecodeError {
     SlotWriterMismatch,
     #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
     AbsorbedWiderThanSlot,
+    #[error(
+        "merge state: a slot's operand stamps are not its writer's, above its own, or do not match its total's type"
+    )]
+    SlotWidthsInconsistent,
     #[error("merge state: a Decimal128 total is not one a writer produces (not canonical)")]
     NotCanonicalDecimal,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
@@ -364,12 +368,12 @@ impl MergeState {
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
     /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
     /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
-    /// type; the compact form spells them), and not when a slot carries an absorbed pair (the
-    /// version 1 form has no place for it), and not when it carries an order state (the version
+    /// type; the compact form spells them), and not when a slot carries an absorbed pair or operand stamps that are not its own (the
+    /// version 1 form has no place for them), and not when it carries an order state (the version
     /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
         self.ords.is_empty()
-            && self.slots.values().all(|s| s.absorbed.is_none())
+            && self.slots.values().all(|s| s.absorbed.is_none() && s.v1_widths())
             && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
@@ -472,7 +476,7 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed: None })?;
+            put(&mut s.slots, (l, p, wr, g), Slot::new(stamp, total, None))?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
@@ -525,8 +529,8 @@ impl MergeState {
     /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
     pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
         let mut bare = self.without_ords();
-        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some());
-        bare.slots.values_mut().for_each(|s| s.absorbed = None);
+        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some() || !s.v1_widths());
+        bare.slots.values_mut().for_each(Slot::for_v1);
         had_pair && bare.v1_can_hold()
     }
 }
@@ -543,7 +547,7 @@ impl MergeState {
         }
         assert!(self.v1_refused_only_for_a_pair(), "version 1 refuses a state for another reason");
         let mut stripped = self.without_ords();
-        stripped.slots.values_mut().for_each(|s| s.absorbed = None);
+        stripped.slots.values_mut().for_each(Slot::for_v1);
         (stripped.canonical_bytes().len(), false)
     }
 }

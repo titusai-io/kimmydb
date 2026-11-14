@@ -849,10 +849,7 @@ fn deep_states(n: usize) -> Vec<(&'static str, MergeState, bool)> {
     s.regs.insert((life, p.clone()), Reg::new(at(2, b'A'), Value::Int64(1), None, false).unwrap());
     out.push(("register", s, true));
     let mut s = deep_base();
-    s.slots.insert(
-        (life, p.clone(), a, None),
-        Slot { stamp: at(2, b'A'), total: Num::Int64(3), absorbed: None },
-    );
+    s.slots.insert((life, p.clone(), a, None), Slot::new(at(2, b'A'), Num::Int64(3), None));
     out.push(("slot", s, true));
     let mut s = deep_base();
     s.losses.insert(
