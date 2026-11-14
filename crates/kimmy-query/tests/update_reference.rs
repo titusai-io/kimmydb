@@ -965,3 +965,122 @@ fn l_a_field_name_that_is_not_an_index_on_an_array_is_the_same_refusal() {
         "cannot create field 'y' in element {a: [ 1 ]}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// (M) New fields with all-digit names sort by value, ahead of the others
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m_new_digit_names_come_first_by_value_then_the_rest_by_bytes() {
+    // q7s2h.out h1 and h2 (lines 2-12): `10, 9, 1, a, B` and `1, 9, 10, a, B`
+    // over `{_id: 1}` both store `_id, 1, 9, 10, B, a`.
+    let want = doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "B": 1, "a": 1 };
+    same(
+        updated(doc! { "$set": { "10": 1, "9": 1, "1": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "1": 1, "9": 1, "10": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
+        want,
+    );
+    // h8 (line 44): `$inc` of `10, 9, a, 1`.
+    same(
+        updated(doc! { "$inc": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
+    );
+    // h15 (line 86): letters only, the control.
+    same(
+        updated(doc! { "$set": { "Z": 1, "a": 1, "B": 1, "b": 1 } }, doc! { "_id": 1, "m": 1 }),
+        doc! { "_id": 1, "m": 1, "B": 1, "Z": 1, "a": 1, "b": 1 },
+    );
+}
+
+#[test]
+fn m_a_level_an_update_creates_sorts_its_digit_names_by_value() {
+    // h3, h4, h5 (lines 14-30): `s.10, s.9, s.b` with `s` absent, `s` present and
+    // empty, and written in the other order; each stores `s: {9, 10, b}`.
+    let want = doc! { "_id": 1, "s": { "9": 1, "10": 1, "b": 1 } };
+    same(
+        updated(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1, "s": {} }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "s.b": 1, "s.9": 1, "s.10": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    // h13 and h14 (lines 74-84): the same over an upsert, `$set` and `$setOnInsert`.
+    same(
+        upserted(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        upserted(doc! { "$setOnInsert": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want,
+    );
+}
+
+#[test]
+fn m_an_upsert_sorts_what_every_operator_adds_together() {
+    // h9 (line 50): `$setOnInsert` of `10, 9, a, 1`.
+    same(
+        upserted(doc! { "$setOnInsert": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
+    );
+    // h11 (line 62): `$set` of `b, 3`, `$inc` of `20, 2, a` and `$setOnInsert` of `7, c`
+    // store `_id, 2, 3, 7, 20, a, b, c`.
+    same(
+        upserted(
+            doc! {
+                "$set": { "b": 1, "3": 1 },
+                "$inc": { "20": 1, "2": 1, "a": 1 },
+                "$setOnInsert": { "7": 1, "c": 1 },
+            },
+            doc! { "_id": 1 },
+        ),
+        doc! { "_id": 1, "2": 1, "3": 1, "7": 1, "20": 1, "a": 1, "b": 1, "c": 1 },
+    );
+}
+
+#[test]
+fn m_the_filter_seed_keeps_its_own_byte_order_and_the_update_adds_after_it() {
+    // h6, h7, h10 and h12 (lines 32-42, 56-60, 68-72): the seed of the filter
+    // `_id, 10, 9` is in byte order (`10` before `9`), and what the update
+    // creates follows it, digit names by value: `_id, 10, 9, 5, z`.
+    let seed = || doc! { "_id": 1, "10": 1, "9": 2 };
+    same(
+        upserted(doc! { "$set": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    same(
+        upserted(doc! { "$set": { "5": 1, "z": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    same(
+        upserted(doc! { "$setOnInsert": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    // h12: `$inc` of the seed's own `10, 9` and a new `a`, `$set` of `z, 5`.
+    same(
+        upserted(doc! { "$inc": { "10": 1, "9": 1, "a": 1 }, "$set": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 2, "9": 3, "5": 1, "a": 1, "z": 1 },
+    );
+}
+
+#[test]
+fn m_two_digit_names_of_one_value_are_told_apart_by_their_bytes() {
+    // UNRECORDED: `01` and `1` have one numeric value; the recording has no pair
+    // like it. The tie is broken by bytes, so `01` comes first.
+    same(
+        updated(doc! { "$set": { "1": 1, "01": 1, "2": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "01": 1, "1": 1, "2": 1 },
+    );
+    // A name that merely contains digits is not an all-digit name.
+    same(
+        updated(doc! { "$set": { "a1": 1, "10": 1, "-1": 1, "9": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "9": 1, "10": 1, "-1": 1, "a1": 1 },
+    );
+}

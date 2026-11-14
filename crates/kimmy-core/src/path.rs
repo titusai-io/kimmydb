@@ -330,7 +330,9 @@ fn write_in_array(
 }
 
 /// Put the keys an update created in order: at each level, the fields that
-/// were there stay where they were and the new ones follow, sorted by name.
+/// were there stay where they were and the new ones follow, sorted by
+/// [`new_key_order`]: the names made of digits by their numeric value, then the
+/// others in byte order.
 ///
 /// A document an update was given as a value is not touched, only the levels
 /// the update's own paths created or wrote into.
@@ -367,6 +369,23 @@ fn array_document_at<'a>(items: &'a mut [Bson], trail: &[String]) -> Option<&'a 
     }
 }
 
+/// The order the fields an update creates take at a level: a name made only of
+/// ASCII digits sorts before any other, by its numeric value (`9` before `10`),
+/// and the rest follow in byte order. UNRECORDED: two digit names of one value
+/// (`01` and `1`) are told apart by their bytes.
+pub fn new_key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match (digits(a), digits(b)) {
+        (true, true) => {
+            let (x, y) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+            x.len().cmp(&y.len()).then_with(|| x.cmp(y)).then_with(|| a.cmp(b))
+        }
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.cmp(b),
+    }
+}
+
 fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
     let keys: Vec<&String> = level.keys().collect();
     let first_new = keys.iter().position(|k| new.contains(k.as_str()));
@@ -374,7 +393,7 @@ fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
         None => true,
         Some(at) => {
             keys[at..].iter().all(|k| new.contains(k.as_str()))
-                && keys[at..].windows(2).all(|w| w[0] < w[1])
+                && keys[at..].windows(2).all(|w| new_key_order(w[0], w[1]).is_lt())
         }
     };
     if settled {
@@ -382,7 +401,7 @@ fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
     }
     let (mut fresh, kept): (Vec<_>, Vec<_>) =
         std::mem::take(level).into_iter().partition(|(k, _)| new.contains(k.as_str()));
-    fresh.sort_by(|a, b| a.0.cmp(&b.0));
+    fresh.sort_by(|a, b| new_key_order(&a.0, &b.0));
     level.extend(kept.into_iter().chain(fresh));
 }
 
