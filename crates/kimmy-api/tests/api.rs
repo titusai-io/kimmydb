@@ -21883,3 +21883,47 @@ async fn an_upsert_seeds_the_nested_fields_of_dotted_filter_keys_in_name_order()
         }
     }
 }
+
+#[tokio::test]
+async fn a_replacement_may_not_restate_the_id_as_something_that_is_no_id() {
+    // A double is equal to the stored `1` by value and is no document id: the
+    // replacement would have stored a document no filtered write could reach.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "k": 1 }), json!({ "_id": 7 })]).await;
+    for route in ["update", "find_and_modify"] {
+        for (id, body) in [
+            (1, json!({ "_id": 1.0, "v": 1 })),
+            (7, json!({ "_id": { "$numberDecimal": "7.5" }, "v": 1 })),
+        ] {
+            let res = server
+                .post(
+                    &format!("/v1/db/shop/coll/pu/{route}"),
+                    Some(&token),
+                    json!({ "filter": { "_id": id }, "update": body }),
+                )
+                .await;
+            assert_eq!(res.status, 400, "{route} {body}: {:?}", res.body);
+        }
+    }
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "k": 1 }));
+    // Still writable: nothing was stored under a key the store cannot read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "w": 1 } } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // A replacement upsert: the filter's `_id` against the body's.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "update": { "_id": 5.0, "v": 1 }, "upsert": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/5", Some(&token)).await.status, 404);
+}

@@ -1122,9 +1122,10 @@ otherwise. A filter `_id` and a body `_id` that differ are refused with a `400`
 naming the immutable field, and nothing is inserted. A replacement of a
 document that exists replaces every field but `_id`, and its own `_id` must be
 the stored one: a body `_id` that differs is refused with a `400` and the
-document is unchanged, an equal one is applied (of another numeric type it is
-stored as written, `NumberLong(1)` over the 32-bit `1` gives the 64-bit `1`),
-and a body with no `_id` keeps the stored one.
+document is unchanged, an equal one is applied (equal as a document id: of
+another numeric type it is stored as written, `NumberLong(1)` over the 32-bit
+`1` gives the 64-bit `1`), a body `_id` that is no document id, a double such
+as `1.0`, is refused, and a body with no `_id` keeps the stored one.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
 document:

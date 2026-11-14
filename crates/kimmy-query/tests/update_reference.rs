@@ -578,8 +578,39 @@ fn g_a_numeric_source_inside_an_array_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// The `_id` of a replacement
+// The `_id` of a replacement is a document id
 // ---------------------------------------------------------------------------
+
+fn decimal(text: &str) -> bson::Bson {
+    bson::Bson::Decimal128(text.parse().expect("a decimal"))
+}
+
+#[test]
+fn h_a_body_id_that_is_no_document_id_is_refused() {
+    // Not recorded: a double is equal to the stored 1 by value, but it is no
+    // `DocId`, and a document stored under it could not be read back by key.
+    refused(updated(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1, "k": 1 }), "_id is immutable");
+    refused(
+        updated(doc! { "_id": decimal("7.5"), "v": 1 }, doc! { "_id": 7, "k": 1 }),
+        "_id is immutable",
+    );
+    // A replacement upsert: the filter's `_id` against the body's, and a body
+    // `_id` with no filter `_id`.
+    refused(upserted(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1 }), "_id is immutable");
+    assert!(upserted(doc! { "_id": 1.0, "v": 1 }, doc! {}).is_err());
+    // A non-integral Decimal128 is a document id, so it is a valid body `_id`
+    // when the filter names none, and differs from a stored integer id.
+    assert!(upserted(doc! { "_id": decimal("7.5"), "v": 1 }, doc! {}).is_ok());
+}
+
+#[test]
+fn h_equal_document_ids_are_stored_as_written() {
+    // q7s2d.out line 134 for Int64; an integral Decimal128 is the same id.
+    let out = updated(doc! { "_id": decimal("1"), "v": 1 }, doc! { "_id": 1, "k": 1 }).unwrap();
+    assert!(matches!(out.get("_id"), Some(bson::Bson::Decimal128(_))), "{out}");
+    let out = upserted(doc! { "_id": 1_i64, "v": 1 }, doc! { "_id": 1 }).unwrap();
+    assert!(matches!(out.get("_id"), Some(bson::Bson::Int64(1))), "{out}");
+}
 
 #[test]
 fn h_a_replacement_cannot_give_a_stored_document_an_id() {

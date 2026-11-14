@@ -8,7 +8,7 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::decimal::arith;
 use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
-use kimmy_core::{Error, Result};
+use kimmy_core::{DocId, Error, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -973,9 +973,18 @@ fn apply_to_at(
             // A body that names none keeps the document's, and in an upsert
             // with no filter `_id` the body's is the one inserted (q7s2b.out
             // lines 133, 138, 142; q7s2d.out lines 122-168).
+            //
+            // "The same `_id`" is the same `DocId`, as a pipeline update reads
+            // it: `1`, `1i64` and `Decimal128("1")` are one id, and a value
+            // that is no id at all (a double) is refused, so the document can
+            // never be stored under a key the store cannot read.
             let id = match (doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
                 (Some(held), Some(named)) => {
-                    if canonical_cmp(held, named) != Ordering::Equal {
+                    let same = match (DocId::try_from_bson(held), DocId::try_from_bson(named)) {
+                        (Ok(was), Ok(is)) => was == is,
+                        _ => false,
+                    };
+                    if !same {
                         return Err(Error::InvalidUpdate(format!(
                             "_id is immutable and cannot be updated: the replacement names _id \
                              {named}, and the document's is {held}"
@@ -985,7 +994,10 @@ fn apply_to_at(
                 }
                 // Only the document an upsert inserts takes the body's `_id`; a
                 // stored one has its own, and is not given one.
-                (None, Some(named)) if target == Target::Inserted => Some(named),
+                (None, Some(named)) if target == Target::Inserted => {
+                    DocId::try_from_bson(named)?;
+                    Some(named)
+                }
                 (None, Some(named)) => {
                     return Err(Error::InvalidUpdate(format!(
                         "_id is immutable and cannot be updated: the replacement names _id \
