@@ -71,6 +71,13 @@
 //!    then its path), a stamp and the lost value. The whole document is its own tag, not the
 //!    path `_`, so that it cannot be mistaken for a field named `_` (the version 1 form cannot
 //!    tell them apart; see `codec.rs`).
+//!    The entries are in the key order of the map, which is by (kind, about, stamp): the kind
+//!    as its byte, then the "about" by this rule, then the stamp as (HLC, writer, the writer compared
+//!    by its node then its epoch bytes). The rule for "about" is `Ord for LossAt`: the whole document sorts
+//!    as the ONE segment `_`, so it comes just before a field literally named `_` (and after a field named
+//!    `Z` or `-`, before one named `a`), the segments of a path being compared one by one as strings
+//!    by their UTF-8 bytes, a shorter path before a longer one it is a prefix of. An independent writer needs
+//!    this rule to put a whole-document entry in its place, though the tag byte (0 or 1) says nothing of it.
 //!
 //! 10. the **order state** (`ords`, the `FieldOrd` of option A, `ord.rs`): a count, 0 when the
 //!     state has none (and only then: a state has one spelling), then each entry keyed `(life index, path)` like a
