@@ -429,13 +429,11 @@ fn a_width_read_from_the_value_of_each_part_is_killed() {
     assert!(err.contains("Int32"), "{err}");
 }
 
-/// OPEN, review item 1: a slot's type label survives a base write that absorbed it. `{n: Int32 1}`,
-/// `$inc n Decimal 1.5`, `$set n Int32 5`, `$inc n Int32 1` reads `Decimal128 6.0` here, and the
-/// reference gives `Int32 6` (likewise with an `Int64` operand): the label of the slot is the join
-/// of every operand it ever added, absorbed ones included. The fix needs the operands added SINCE
-/// the absorb, which the state does not keep (see the report); the test is ignored until it does.
+/// Review item 1: a slot's type label does not survive a base write that absorbed it. `{n: Int32 1}`,
+/// `$inc n Decimal 1.5`, `$set n Int32 5`, `$inc n Int32 1` reads `Int32 6`, as the reference does
+/// (likewise with an `Int64` operand): the slot keeps the stamps of its latest wide and decimal
+/// operands, and the type of what it gained since the absorb is the width of the operands newer than it.
 #[test]
-#[ignore = "R1 review item 1: the label of a slot outlives the base write that absorbed it"]
 fn a_base_write_that_absorbed_a_wider_operand_leaves_its_type_behind() {
     for wide in [dec("1.5"), i64v(1)] {
         let mut w = base(i32v(1));
@@ -444,4 +442,123 @@ fn a_base_write_that_absorbed_a_wider_operand_leaves_its_type_behind() {
         w.write_inc_value(&p("n"), &i32v(1), 0).unwrap();
         assert_eq!(n(&w), i32v(6), "after {wide:?}");
     }
+}
+
+/// The absorb case as a property, the review's counterexample over many shapes: A adds `first`, W
+/// receives A and `$set`s a numeric base (the fold absorbs A's slot), W adds `w_ops`, and A, unaware
+/// of W, adds `second`. Joined either way, the counter is the base W wrote plus the operands NOT
+/// absorbed, with the width of those operands and of the base.
+fn r1_absorb_case(
+    o: &JoinOptions,
+    first: &[Amt],
+    base_after: &Amt,
+    second: &[Amt],
+    w_ops: &[Amt],
+) -> Result<bool, String> {
+    let mut root = Writer::new(wid('R', 0), o.clone());
+    root.insert(&fl(&[("n", i32v(1))]), 0).unwrap();
+    let mut a = Writer::new(wid('A', 0), o.clone());
+    a.receive(&root.state);
+    for x in first {
+        let _ = a.write_inc_value(&p("n"), &x.value(), 0);
+    }
+    let mut w = Writer::new(wid('W', 0), o.clone());
+    w.receive(&a.state);
+    // a `$set` of the value the counter already reads is a no-op and absorbs nothing: the case is skipped
+    if w.visible().unwrap()[&p("n")] == base_after.value() {
+        return Ok(false);
+    }
+    w.write_set(&p("n"), base_after.value(), 0).unwrap();
+    let mut added: Vec<Amt> = Vec::new();
+    for x in w_ops {
+        if w.write_inc_value(&p("n"), &x.value(), 0).is_some() {
+            added.push(x.clone());
+        }
+    }
+    for x in second {
+        if a.write_inc_value(&p("n"), &x.value(), 1).is_some() {
+            added.push(x.clone());
+        }
+    }
+    let want = r1_expected(base_after, &added);
+    for (x, y) in [(&a.state, &w.state), (&w.state, &a.state)] {
+        let got = rendered(&join(x, y, o).0.visible(o).unwrap()[&p("n")]);
+        if got != want {
+            return Err(format!(
+                "first {first:?}, base {base_after:?}, W {w_ops:?}, A after {second:?}: {got}, want {want}"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// What `r1_absorb_check` ran: the cases that ran, the cases SKIPPED (a no-op `$set` absorbs nothing), and the
+/// cases where an absorbed operand was WIDER than everything that counts (the base and the operands after it),
+/// so the type must narrow back: the ones the property is about.
+struct AbsorbRun {
+    ran: usize,
+    skipped: usize,
+    narrowing: usize,
+}
+
+fn r1_absorb_check(o: &JoinOptions) -> Result<AbsorbRun, String> {
+    use Amt::{Dec, I32, I64};
+    let mut run = AbsorbRun { ran: 0, skipped: 0, narrowing: 0 };
+    let mut one =
+        |first: &[Amt], base: &Amt, second: &[Amt], w_ops: &[Amt]| -> Result<(), String> {
+            if r1_absorb_case(o, first, base, second, w_ops)? {
+                run.ran += 1;
+                let width = |xs: &[Amt]| xs.iter().map(Amt::width).max().unwrap_or(0);
+                let rest = width(second).max(width(w_ops)).max(base.width());
+                run.narrowing += usize::from(width(first) > rest);
+            } else {
+                run.skipped += 1;
+            }
+            Ok(())
+        };
+    // the review's counterexample and its Int64 form
+    one(&[Dec("1.50")], &I32(5), &[I32(1)], &[])?;
+    one(&[I64(1)], &I32(5), &[I32(1)], &[])?;
+    let bases = [I32(5), I32(i32::MAX), I64(7), Dec("2.00"), Dec("-0.50")];
+    let operands =
+        [I32(1), I32(-3), I32(i32::MAX), I64(2), I64(-(1 << 33)), Dec("1.50"), Dec("-0.25")];
+    let mut seed = 23u64;
+    let pick = |xs: &[Amt], seed: &mut u64| xs[(lcg(seed) % xs.len() as u64) as usize].clone();
+    for _ in 0..300 {
+        let first: Vec<Amt> =
+            (0..1 + lcg(&mut seed) % 2).map(|_| pick(&operands, &mut seed)).collect();
+        let second: Vec<Amt> =
+            (0..lcg(&mut seed) % 3).map(|_| pick(&operands, &mut seed)).collect();
+        let w_ops: Vec<Amt> = (0..lcg(&mut seed) % 2).map(|_| pick(&operands, &mut seed)).collect();
+        let base = pick(&bases, &mut seed);
+        one(&first, &base, &second, &w_ops)?;
+    }
+    Ok(run)
+}
+
+/// R1 with base writes: the counter is the current base plus the operands it has not absorbed, in
+/// the width of both, whichever way the two states are joined.
+#[test]
+fn a_base_write_leaves_only_the_operands_it_did_not_absorb_in_the_type() {
+    let run = r1_absorb_check(&opts()).unwrap();
+    eprintln!(
+        "absorb property: {} ran, {} skipped, {} narrowing",
+        run.ran, run.skipped, run.narrowing
+    );
+    // NON-VACUITY: of the 302 cases, the ones that ran are most of them, and in at least 40 an absorbed
+    // operand was wider than the base and every operand after it (the type must narrow back). N = 40 is
+    // set before the first run (the pool makes about a fifth of the cases such); the run prints the real
+    // figures and N is raised to what it shows.
+    assert!(run.ran >= 200, "{} ran, {} skipped", run.ran, run.skipped);
+    assert!(run.narrowing >= 40, "{} narrowing cases", run.narrowing);
+}
+
+/// The mutant that keeps the width of the absorbed operands (the label of a slot is the join of every
+/// operand it ever took) is killed by an observable value: the counterexample reads `Decimal128`.
+#[test]
+fn a_label_that_survives_the_absorb_is_killed() {
+    let mut o = opts();
+    o.set_counter_label_survives_absorb(true);
+    let err = r1_absorb_check(&o).unwrap_err();
+    assert!(err.contains("Int32(6)"), "{err}");
 }

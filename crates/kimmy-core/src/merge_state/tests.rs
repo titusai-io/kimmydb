@@ -1412,10 +1412,7 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     let life = *st.lives.keys().next().unwrap();
     for c in ['B', 'C'] {
         let stamp = MStamp { hlc: h(1), writer: wid(c, 0) };
-        st.slots.insert(
-            (life, p("x"), wid(c, 0), None),
-            Slot { stamp, total: total.into(), absorbed: None },
-        );
+        st.slots.insert((life, p("x"), wid(c, 0), None), Slot::new(stamp, total.into(), None));
     }
     st.vv.insert(wid('B', 0), h(1)); // B and C wrote the slots
     st.vv.insert(wid('C', 0), h(1));
@@ -1536,15 +1533,11 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     w.state.slots.insert(
         (life, p("x"), wid('A', 0), None),
-        Slot {
-            stamp: w.state.slots.values().next().unwrap().stamp,
-            total: (MAX_TOTAL - 2).into(),
-            absorbed: None,
-        },
+        Slot::new(w.state.slots.values().next().unwrap().stamp, (MAX_TOTAL - 2).into(), None),
     );
     w.state.slots.insert(
         (life, p("x"), wid('B', 0), None),
-        Slot { stamp, total: (-(MAX_TOTAL - 2)).into(), absorbed: None },
+        Slot::new(stamp, (-(MAX_TOTAL - 2)).into(), None),
     );
     assert_eq!(w.visible().unwrap()[&p("x")], i(0));
     let clock = w.clock;
@@ -1622,10 +1615,7 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
         // a slot is stamped by the writer of its key
         let stamp = MStamp { hlc: h(1), writer: wr };
         st.vv.insert(wr, h(1));
-        st.slots.insert(
-            (life, p("x"), wr, None),
-            Slot { stamp, total: MAX_TOTAL.into(), absorbed: None },
-        );
+        st.slots.insert((life, p("x"), wr, None), Slot::new(stamp, MAX_TOTAL.into(), None));
     }
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(
@@ -1693,10 +1683,8 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     let gen_stamp = MStamp { hlc: h(9), writer: wid('A', 0) };
     let slot_stamp = MStamp { hlc: h(2), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert(
-            (life, p("x"), wid(c, 0), None),
-            Slot { stamp: slot_stamp, total: i128::MAX.into(), absorbed: None },
-        );
+        st.slots
+            .insert((life, p("x"), wid(c, 0), None), Slot::new(slot_stamp, i128::MAX.into(), None));
     }
     let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
     // B's slot was seen at -1: i128::MAX - (-1) overflows a plain subtraction
@@ -2478,11 +2466,7 @@ fn decode_refuses_a_version_vector_that_does_not_cover_a_stamp() {
             st.regs.insert((life, Path::flat("x").unwrap()), r.unwrap());
         }),
         ("a slot", |st, life, _| {
-            let slot = Slot {
-                stamp: MStamp { hlc: h(9), writer: life.writer },
-                total: 1.into(),
-                absorbed: None,
-            };
+            let slot = Slot::new(MStamp { hlc: h(9), writer: life.writer }, 1.into(), None);
             st.slots.insert((life, Path::flat("x").unwrap(), life.writer, None), slot);
         }),
     ];

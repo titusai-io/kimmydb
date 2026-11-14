@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::DecodeError;
-use super::counter::Num;
+use super::counter::{Kind, Num};
 use super::join::JoinOptions;
 use super::ord::{FieldOrd, OrdAt};
 use super::types::{Epoch, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
@@ -193,6 +193,60 @@ pub struct Slot {
     pub stamp: MStamp,
     pub total: Num,
     pub absorbed: Option<(MStamp, Num)>,
+    /// The stamp of the latest operand of this writer's slot whose type is `Int64` or wider. Its
+    /// writer's own history: an honest value is at most `stamp`, and `None` while every operand was an
+    /// `Int32`. With `decimal_at` it tells the width of the operands added AFTER an absorb at stamp
+    /// `a` (see [`Slot::width_since`]): the type of a counter is the base's width joined with the width
+    /// of what its slots gained since the base last absorbed them (R1).
+    pub wide_at: Option<MStamp>,
+    /// The stamp of the latest `Decimal128` operand of the slot. When present, `wide_at` is present
+    /// and at least this.
+    pub decimal_at: Option<MStamp>,
+}
+
+impl Slot {
+    /// A slot whose operands were all of the width of its total, the latest at `stamp`: the
+    /// shape of a slot written once, and of every slot a test builds by its total. A slot a writer
+    /// grows keeps the stamps of its operands (`Writer::put_slot`).
+    pub fn new(stamp: MStamp, total: Num, absorbed: Option<(MStamp, Num)>) -> Slot {
+        let (wide_at, decimal_at) = match total.label() {
+            Kind::Int32 => (None, None),
+            Kind::Int64 => (Some(stamp), None),
+            Kind::Decimal128 => (Some(stamp), Some(stamp)),
+        };
+        Slot { stamp, total, absorbed, wide_at, decimal_at }
+    }
+
+    /// Does the version 1 form spell this slot's operand stamps? It spells none: its decoder
+    /// reads a slot whose operands were all of its total's width and the latest at its stamp
+    /// ([`Slot::new`]), so it holds a slot of exactly that shape.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(super) fn v1_widths(&self) -> bool {
+        let shape = Slot::new(self.stamp, self.total, None);
+        self.wide_at == shape.wide_at && self.decimal_at == shape.decimal_at
+    }
+
+    /// The slot as the version 1 form reads it back, for the size checks of the tests: no absorbed
+    /// pair and the operand stamps of [`Slot::new`].
+    #[cfg(test)]
+    pub(crate) fn for_v1(&mut self) {
+        *self = Slot::new(self.stamp, self.total, None);
+    }
+
+    /// The width of the operands this slot gained since its absorbed stamp (all of them when it has
+    /// none): `Decimal128` if its latest decimal operand is newer than the absorb, `Int64` if its
+    /// latest wide operand is, `Int32` otherwise.
+    pub(super) fn width_since(&self) -> Kind {
+        let a = self.absorbed.as_ref().map(|x| x.0);
+        let newer = |w: Option<MStamp>| w.is_some_and(|w| a.is_none_or(|a| w > a));
+        if newer(self.decimal_at) {
+            Kind::Decimal128
+        } else if newer(self.wide_at) {
+            Kind::Int64
+        } else {
+            Kind::Int32
+        }
+    }
 }
 
 /// The replicated merge state. Grow-only components are joined by union, cells
@@ -500,6 +554,21 @@ impl MergeState {
                     return Err(DecodeError::AbsorbedWiderThanSlot);
                 }
             }
+            // the stamps of the latest wide and decimal operands: this writer's, not above the slot's
+            // own, a decimal one also a wide one, and the type they spell is the total's
+            let own = |w: &Option<MStamp>| w.is_none_or(|w| w.writer == k.2 && w <= s.stamp);
+            let spelled = match (s.wide_at, s.decimal_at) {
+                (_, Some(_)) => Kind::Decimal128,
+                (Some(_), None) => Kind::Int64,
+                (None, None) => Kind::Int32,
+            };
+            if !own(&s.wide_at)
+                || !own(&s.decimal_at)
+                || s.decimal_at.is_some_and(|d| s.wide_at.is_none_or(|w| w < d))
+                || spelled != s.total.label()
+            {
+                return Err(DecodeError::SlotWidthsInconsistent);
+            }
         }
         let covered = |st: &MStamp| self.vv.get(&st.writer).is_some_and(|h| *h >= st.hlc);
         let gens = self.regs.values().filter_map(|r| r.generation.as_ref());
@@ -511,6 +580,7 @@ impl MergeState {
             .chain(self.regs.values().map(|r| &r.stamp))
             .chain(self.slots.values().map(|s| &s.stamp))
             .chain(self.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| &a.0)))
+            .chain(self.slots.values().flat_map(|s| s.wide_at.iter().chain(&s.decimal_at)))
             .chain(self.slots.keys().filter_map(|k| k.3.as_ref()))
             .chain(gens.clone().map(|g| &g.stamp))
             .chain(gens.flat_map(|g| g.seen.keys().flat_map(|k| [&k.0].into_iter().chain(&k.2))));
@@ -874,6 +944,10 @@ impl MergeState {
                     s.total.sub_sat(&x.1, &mut cut)
                 }
             });
+            // R1: the type of what the slot gained is the width of the operands added since the
+            // absorb, not the join of every operand the slot ever took
+            let d =
+                if o.counter_label_survives_absorb() { d } else { d.narrowed_to(s.width_since()) };
             if !d.is_zero() || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp))
             {
                 terms.push((s.stamp, k, d));
