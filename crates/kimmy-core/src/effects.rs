@@ -300,7 +300,7 @@ use crate::merge_state::{UpdateError, Writer};
 
 /// The effects of one update: an ordered list of per-leaf [`UpdateOp`]s that make ONE write with
 /// ONE stamp. See the module docs for the operator table and the invariants.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
     ops: Vec<UpdateOp>,
     /// The source paths of the renames recorded by [`Effects::rename`], in order.
@@ -354,6 +354,11 @@ impl Effects {
     }
 
     /// The sources of the recorded renames, in order.
+    /// The operators, in order (read-only: a rename enters only through [`Effects::rename`]).
+    pub fn ops(&self) -> impl Iterator<Item = &UpdateOp> {
+        self.ops.iter()
+    }
+
     pub fn renames(&self) -> &[Path] {
         &self.renames
     }
@@ -522,7 +527,8 @@ impl UpsertEffects {
         first_overlap(&mut written)?;
         let mut leaves = Vec::new();
         for (p, v) in &filter {
-            v.check_input().map_err(|e| UpdateRefused::BadValue((*p).clone(), e))?;
+            v.check_input_under(p.segments().len())
+                .map_err(|e| UpdateRefused::BadValue((*p).clone(), e))?;
             leaf_paths(p, v, &mut leaves)?;
         }
         let mut sorted: Vec<&Path> = leaves.iter().collect();
@@ -530,7 +536,8 @@ impl UpsertEffects {
 
         let mut cells: Vec<CreationCell> = Vec::new();
         for (p, v) in filter {
-            v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
+            v.check_input_under(p.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
             place(&mut cells, p, v, CellTag::Creation)?;
         }
         let higher = self
@@ -544,7 +551,8 @@ impl UpsertEffects {
                     "_id is the upsert's key: S2b owns it, not the effects",
                 )));
             }
-            v.check_input().map_err(|e| UpdateRefused::BadValue(q.clone(), e))?;
+            v.check_input_under(q.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(q.clone(), e))?;
             if *v == Value::Unset {
                 unset_at(&mut cells, q);
             } else {
@@ -553,7 +561,9 @@ impl UpsertEffects {
         }
         // a merge can nest deeper than either part: check the composed values too
         for c in &cells {
-            c.value.check_input().map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
+            c.value
+                .check_input_under(c.path.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
         }
         // the writer's rule: an `$inc` path must not be equal to, above or below a cell path
         for c in &cells {

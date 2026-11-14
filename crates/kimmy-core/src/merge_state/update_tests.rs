@@ -109,7 +109,8 @@ fn each_refusal_is_named_and_changes_nothing() {
 
 #[test]
 fn a_field_name_that_cannot_be_a_segment_is_a_bad_path() {
-    // a path of 60 segments and a document 60 deep pass the document's own depth check and not the path's
+    // a path of 60 segments with a document 60 deep: the path counts against the depth limit with
+    // its value (120 levels), so the value is refused as too deep before any leaf path is built
     let mut w = seeded();
     let mut v = i(1);
     for _ in 0..60 {
@@ -118,7 +119,7 @@ fn a_field_name_that_cannot_be_a_segment_is_a_bad_path() {
     let long = Path::new((0..60).map(|n| format!("p{n}"))).unwrap();
     let before = w.state.clone();
     let e = w.write_update(&[UpdateOp::Set(long, v)], 0).unwrap_err();
-    assert!(matches!(e, UpdateRefused::BadPath(_)), "{e:?}");
+    assert!(matches!(e, UpdateRefused::BadValue(_, InvalidValue::TooDeep)), "{e:?}");
     assert_eq!(w.state, before);
 }
 
