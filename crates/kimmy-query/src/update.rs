@@ -726,6 +726,9 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "pop" => match arg {
             Bson::Int32(1) | Bson::Int64(1) => OpKind::Pop(1),
             Bson::Int32(-1) | Bson::Int64(-1) => OpKind::Pop(-1),
+            // A double is a direction when it is exactly 1 or -1 (q7s2j.out j1388, j1394).
+            Bson::Double(d) if *d == 1.0 => OpKind::Pop(1),
+            Bson::Double(d) if *d == -1.0 => OpKind::Pop(-1),
             _ => return Err(Error::InvalidUpdate("$pop requires 1 or -1".into())),
         },
         "rename" => match arg {
@@ -2334,6 +2337,27 @@ mod tests {
     #[test]
     fn pop_rejects_directions_other_than_one() {
         assert!(parse(&doc! { "$pop": { "a": 2 } }).is_err());
+    }
+
+    /// A double that is `1` or `-1` is a direction, j1388 (q7s2j.out line 8366) and j1394
+    /// (line 8403); any other number is not: `0` (j1406, line 8477), `2` (j1412, 8514),
+    /// `1.5` (j1430, 8625). UNRECORDED: `2.0`, `-0.0`, `NaN`, the infinities.
+    #[test]
+    fn pop_takes_a_double_that_is_one_or_minus_one() {
+        assert_eq!(
+            applied(doc! { "$pop": { "a": 1.0 } }, doc! { "a": [1, 2, 3] }),
+            doc! { "a": [1, 2] }
+        );
+        assert_eq!(
+            applied(doc! { "$pop": { "a": -1.0 } }, doc! { "a": [1, 2, 3] }),
+            doc! { "a": [2, 3] }
+        );
+        for bad in [0.0, -0.0, 1.5, 2.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(parse(&doc! { "$pop": { "a": bad } }).is_err(), "{bad}");
+        }
+        for bad in [0, 2, -2] {
+            assert!(parse(&doc! { "$pop": { "a": bad } }).is_err(), "{bad}");
+        }
     }
 
     #[test]
