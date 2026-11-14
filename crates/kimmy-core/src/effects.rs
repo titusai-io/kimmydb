@@ -481,6 +481,10 @@ pub enum CellTag {
     Creation,
     /// Some part from `$set` (`sets` of `Writer::upsert_soi_create`): untagged.
     Plain,
+    /// An `$inc`: the cell's value is the typed operand, no register is written; the field takes
+    /// its place in the creation order, the slot is written by the increment write that follows.
+    /// Only [`UpsertEffects::creation_list`] produces it.
+    Inc,
 }
 
 /// One cell of the composed creation, AS WRITTEN: a dotted leaf is a leaf cell at its own path, a
@@ -501,12 +505,49 @@ pub struct UpsertWritten {
 }
 
 impl UpsertEffects {
-    /// Create the document: [`UpsertEffects::creation_cells`] (the checks included), then
+    /// The creation as ONE ordered list, the increments in it: [`UpsertEffects::creation_cells`]
+    /// followed by an [`CellTag::Inc`] cell per `inc` entry, then put in the post-image order the
+    /// caller names. `order` lists the paths of the NEW fields (every `set_on_insert`, `set` and
+    /// `inc` path, as written) in the order the product's post-image has them; empty means the
+    /// default sequence (filter cells, then `set_on_insert`, `set`, `inc`). With an order, the
+    /// cells the order does not name (the filter's, and a cell a merge placed at another path)
+    /// stay first in their sequence, then the named ones follow in the order's sequence; an order
+    /// that leaves out a `set_on_insert`, `set` or `inc` path is [`UpdateRefused::BadPath`].
+    pub fn creation_list(&self, order: &[Path]) -> Result<Vec<CreationCell>, UpdateRefused> {
+        let mut list = self.creation_cells()?;
+        list.extend(self.inc.iter().map(|(p, v)| CreationCell {
+            path: p.clone(),
+            value: v.clone(),
+            tag: CellTag::Inc,
+        }));
+        if order.is_empty() {
+            return Ok(list);
+        }
+        let new = self.set_on_insert.iter().chain(&self.set).chain(&self.inc);
+        if new.into_iter().any(|(p, _)| !order.contains(p)) {
+            return Err(UpdateRefused::BadPath(InvalidPath(
+                "the field order of the creation leaves out a new field",
+            )));
+        }
+        let rank = |c: &CreationCell| order.iter().position(|p| *p == c.path);
+        let (mut named, mut rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|c| rank(c).is_some());
+        named.sort_by_key(|c| rank(c));
+        rest.extend(named);
+        Ok(rest)
+    }
+
+    /// Create the document: [`UpsertEffects::creation_list`] (the checks included), then
     /// [`Writer::upsert_create`]. On a document that already exists the caller applies the
     /// `set` and `inc` lists as an ordinary update ([`Effects`]) and never calls this.
-    pub fn apply(&self, writer: &mut Writer, skew: u64) -> Result<UpsertWritten, UpdateRefused> {
-        let cells = self.creation_cells()?;
-        let (created, incremented) = writer.upsert_create(&cells, &self.inc, skew)?;
+    pub fn apply(
+        &self,
+        writer: &mut Writer,
+        order: &[Path],
+        skew: u64,
+    ) -> Result<UpsertWritten, UpdateRefused> {
+        let cells = self.creation_list(order)?;
+        let (created, incremented) = writer.upsert_create(&cells, skew)?;
         Ok(UpsertWritten { created, incremented })
     }
 
@@ -515,10 +556,11 @@ impl UpsertEffects {
     pub fn apply_stamped(
         &self,
         writer: &mut Writer,
+        order: &[Path],
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<UpsertWritten, UpdateError> {
-        let cells = self.creation_cells()?;
-        let (created, incremented) = writer.upsert_create_stamped(&cells, &self.inc, stamp)?;
+        let cells = self.creation_list(order)?;
+        let (created, incremented) = writer.upsert_create_stamped(&cells, stamp)?;
         Ok(UpsertWritten { created, incremented })
     }
 
