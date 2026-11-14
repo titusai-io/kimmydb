@@ -81,6 +81,9 @@ mod database_drop_tests;
 mod epoch_tests;
 
 #[cfg(test)]
+mod merge_policy_tests;
+
+#[cfg(test)]
 mod converge_tests;
 
 #[cfg(test)]

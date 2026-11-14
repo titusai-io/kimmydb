@@ -41,8 +41,8 @@ pub use cmp::{canonical_cmp, holds_decimal128};
 pub use conflict::{UniqueViolationDetail, UnkeyedDocumentDetail};
 pub use cursor::Cursor;
 pub use ddl::{
-    CollectionCreate, CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, ValidatorSet,
-    VectorSet, database_drop_id,
+    CollectionCreate, CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, MergePolicy,
+    ValidatorSet, VectorSet, database_drop_id,
 };
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};

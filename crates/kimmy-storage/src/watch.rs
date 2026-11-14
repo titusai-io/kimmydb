@@ -4281,7 +4281,12 @@ mod tests {
             neighbour(0),
             OpKind::CreateCollection,
             CollectionId::derive("app", "z"),
-            &kimmy_core::CollectionRef::new("app", "z"),
+            &kimmy_core::CollectionCreate {
+                db: "app".into(),
+                name: "z".into(),
+                merge_policy: kimmy_core::MergePolicy::Document,
+                validator: None,
+            },
         )
         .unwrap();
         let document = kimmy_core::OplogEntry {

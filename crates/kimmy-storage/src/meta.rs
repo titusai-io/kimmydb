@@ -5,7 +5,9 @@
 //! able to read it directly when diagnosing a broken data directory is worth
 //! more than the space.
 
-pub use kimmy_core::{Enforcement, IndexField, IndexMeta, ValidatorSpec, VectorConfig};
+pub use kimmy_core::{
+    Enforcement, IndexField, IndexMeta, MergePolicy, ValidatorSpec, VectorConfig,
+};
 use kimmy_core::{Hlc, ids::CollectionId};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,9 @@ pub struct CollectionMeta {
     pub db: String,
     pub name: String,
     pub created: Hlc,
+    /// How concurrent writes to one document merge. Fixed at creation. No serde default: a
+    /// stored definition without it does not decode.
+    pub merge_policy: MergePolicy,
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///
@@ -133,6 +138,7 @@ impl CollectionMeta {
             db: db.into(),
             name: name.into(),
             created,
+            merge_policy: MergePolicy::Document,
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,
@@ -170,6 +176,19 @@ mod tests {
             Hlc::new(10, 0),
             Some(Hlc::new(10, 0)),
         )
+    }
+
+    #[test]
+    fn the_merge_policy_is_always_stored_and_required() {
+        let mut m = meta();
+        m.merge_policy = MergePolicy::Field;
+        let json = serde_json::to_vec(&m).unwrap();
+        let back: CollectionMeta = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.merge_policy, MergePolicy::Field);
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["merge_policy"], "field");
+        value.as_object_mut().unwrap().remove("merge_policy");
+        assert!(serde_json::from_value::<CollectionMeta>(value).is_err());
     }
 
     /// A marker is read only for the `created` it was written with: a stale one
