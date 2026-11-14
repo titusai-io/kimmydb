@@ -26,7 +26,6 @@ pub use kimmy_core::json_schema;
 pub use kimmy_core::path;
 pub mod pipeline;
 pub mod plan;
-pub mod seed;
 pub mod shape;
 pub mod stages;
 pub mod update;

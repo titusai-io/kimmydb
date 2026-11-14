@@ -8707,6 +8707,7 @@ mod tests {
                 incarnation_floor: None,
                 validator: None,
                 validator_changed: None,
+                merge_policy: kimmy_core::MergePolicy::Document,
             }]
         } else {
             Vec::new()

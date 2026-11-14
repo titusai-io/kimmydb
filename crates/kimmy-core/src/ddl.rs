@@ -37,6 +37,57 @@ impl CollectionRef {
     }
 }
 
+/// How a collection merges concurrent writes to one document (Q7).
+///
+/// `Field` merges per field (the replicated state travels with the record); `Document` is whole-document
+/// last-writer-wins, as before. Chosen at creation and immutable: no DDL changes it. There is
+/// deliberately no `Default` impl and no serde default: a stored or replicated definition without
+/// the policy is a decode error (a release that introduces it always writes it, and members run one
+/// version at a time). [`MergePolicy::DEFAULT`] is what the HTTP create route uses when the request
+/// names none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergePolicy {
+    Field,
+    Document,
+}
+
+impl MergePolicy {
+    /// What a create request that names no policy gets.
+    pub const DEFAULT: MergePolicy = MergePolicy::Field;
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergePolicy::Field => "field",
+            MergePolicy::Document => "document",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<MergePolicy> {
+        match text {
+            "field" => Some(MergePolicy::Field),
+            "document" => Some(MergePolicy::Document),
+            _ => None,
+        }
+    }
+
+    /// The policy a collection of this name really gets: system collections (`__` prefix) and
+    /// vector shadows are always `Document`, whatever was asked.
+    pub fn fixed_for(self, name: &str) -> MergePolicy {
+        if name.starts_with("__") || crate::vector_meta::is_shadow(name) {
+            MergePolicy::Document
+        } else {
+            self
+        }
+    }
+}
+
+impl std::fmt::Display for MergePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A collection being created: the body of a `CreateCollection` entry.
 ///
 /// It is a [`CollectionRef`] and, when the collection is created with a validator,
@@ -48,6 +99,8 @@ impl CollectionRef {
 pub struct CollectionCreate {
     pub db: String,
     pub name: String,
+    /// Always written; absent in a received entry is a decode error.
+    pub merge_policy: MergePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator: Option<ValidatorSpec>,
 }
@@ -119,6 +172,42 @@ pub struct ValidatorSet {
 mod tests {
     use super::*;
     use crate::Epoch;
+
+    #[test]
+    fn a_creation_without_a_policy_does_not_decode() {
+        let with = CollectionCreate {
+            db: "shop".into(),
+            name: "orders".into(),
+            merge_policy: MergePolicy::Field,
+            validator: None,
+        };
+        let bytes = bson::serialize_to_vec(&with).unwrap();
+        assert_eq!(bson::deserialize_from_slice::<CollectionCreate>(&bytes).unwrap(), with);
+        let doc = bson::doc! { "db": "shop", "name": "orders" };
+        assert!(
+            bson::deserialize_from_slice::<CollectionCreate>(
+                &bson::serialize_to_vec(&doc).unwrap()
+            )
+            .is_err()
+        );
+        let bad = bson::doc! { "db": "shop", "name": "orders", "merge_policy": "both" };
+        assert!(
+            bson::deserialize_from_slice::<CollectionCreate>(
+                &bson::serialize_to_vec(&bad).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn system_and_shadow_names_are_always_document() {
+        assert_eq!(MergePolicy::Field.fixed_for("orders"), MergePolicy::Field);
+        assert_eq!(MergePolicy::Field.fixed_for("__webhooks"), MergePolicy::Document);
+        assert_eq!(MergePolicy::Field.fixed_for("orders.__vectors"), MergePolicy::Document);
+        assert_eq!(MergePolicy::parse("field"), Some(MergePolicy::Field));
+        assert_eq!(MergePolicy::parse("Field"), None);
+        assert_eq!(MergePolicy::DEFAULT, MergePolicy::Field);
+    }
 
     #[test]
     fn payloads_round_trip_through_bson() {

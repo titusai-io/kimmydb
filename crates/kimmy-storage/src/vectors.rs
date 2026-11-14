@@ -277,6 +277,7 @@ impl crate::Engine {
                     &|_| false,
                     || self.next_stamp(),
                     None,
+                    kimmy_core::MergePolicy::Document,
                 )),
                 Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
                     &txn,
@@ -287,6 +288,7 @@ impl crate::Engine {
                     &|dropped| crate::sync::creation_is_history(stamp.hlc, dropped.hlc),
                     || stamp,
                     None,
+                    kimmy_core::MergePolicy::Document,
                 )),
                 // A sweep only turns a configuration off, and never configures.
                 Configured::FromSnapshot(_) | Configured::Swept(_) => None,
