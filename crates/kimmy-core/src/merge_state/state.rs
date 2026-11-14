@@ -894,7 +894,16 @@ impl MergeState {
         // contributes (a label is the join of the operand types a writer has added, never the
         // value its running sum has had), and an integer total that does not fit an `i32` is an
         // `Int64` whatever the labels are (`Num::into_value`).
-        let kind = terms.iter().map(|t| t.2.label()).chain(base.map(|b| b.label())).max()?;
+        // (the mutants: no base in the width, or the width of the value of each part)
+        let by_value = o.counter_kind_by_value();
+        let part = |n: &Num| if by_value { n.kind() } else { n.label() };
+        let from_slots = terms.iter().map(|t| part(&t.2)).max();
+        let from_base = base.map(|b| part(&b));
+        let kind = if o.counter_ignores_base() {
+            from_slots.or(from_base)?
+        } else {
+            from_slots.into_iter().chain(from_base).max()?
+        };
         let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
         for (_, _, d) in &terms {
             acc = if o.no_decimal_saturation() {
