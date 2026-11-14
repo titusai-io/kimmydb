@@ -194,38 +194,42 @@ pub fn update_parse_apply(data: &[u8]) {
     use kimmy_query::update;
 
     let Some(doc) = json_document(data) else { return };
-    let Ok(update) = update::parse(&doc) else { return };
-    for fixture in FIXTURES.iter() {
-        let mut target = fixture.clone();
-        let id_before = target.get("_id").cloned();
-        if update::apply(&update, &mut target, NOW_MS).is_ok() {
-            // The same `_id` is the same `DocId`: a replacement may restate
-            // `1` as `1i64`, which is one id (ADR-111's guard is that the
-            // document is not relocated, not that its bytes are equal).
-            let same_id = match (target.get("_id"), id_before.as_ref()) {
-                (None, None) => true,
-                (Some(now), Some(was)) => {
-                    matches!(
-                        (kimmy_core::DocId::try_from_bson(now), kimmy_core::DocId::try_from_bson(was)),
-                        (Ok(now), Ok(was)) if now == was
-                    )
-                }
-                _ => false,
-            };
-            assert!(
-                same_id,
-                "an update changed _id from {:?} to {:?}: {doc:?}",
-                id_before,
-                target.get("_id")
-            );
-            // Arithmetic writes a canonical Decimal128 or leaves the field as
-            // it was: a result is never a coefficient above 10^34 - 1 or an
-            // exponent out of range, in a field the update changed.
-            for (key, value) in &target {
-                if let Bson::Decimal128(d) = value
-                    && fixture.get(key) != Some(value)
-                {
-                    assert_canonical(d, &doc);
+    // The update as any request parses it, and as an upsert's does, which may name
+    // `_id`: a document that matched is refused it, so its `_id` holds either way.
+    let parsed = [update::parse(&doc), update::parse_for_upsert(&doc, &[])];
+    for update in parsed.iter().filter_map(|p| p.as_ref().ok()) {
+        for fixture in FIXTURES.iter() {
+            let mut target = fixture.clone();
+            let id_before = target.get("_id").cloned();
+            if update::apply(update, &mut target, NOW_MS).is_ok() {
+                // The same `_id` is the same `DocId`: a replacement may restate
+                // `1` as `1i64`, which is one id (ADR-111's guard is that the
+                // document is not relocated, not that its bytes are equal).
+                let same_id = match (target.get("_id"), id_before.as_ref()) {
+                    (None, None) => true,
+                    (Some(now), Some(was)) => {
+                        matches!(
+                            (kimmy_core::DocId::try_from_bson(now), kimmy_core::DocId::try_from_bson(was)),
+                            (Ok(now), Ok(was)) if now == was
+                        )
+                    }
+                    _ => false,
+                };
+                assert!(
+                    same_id,
+                    "an update changed _id from {:?} to {:?}: {doc:?}",
+                    id_before,
+                    target.get("_id")
+                );
+                // Arithmetic writes a canonical Decimal128 or leaves the field as
+                // it was: a result is never a coefficient above 10^34 - 1 or an
+                // exponent out of range, in a field the update changed.
+                for (key, value) in &target {
+                    if let Bson::Decimal128(d) = value
+                        && fixture.get(key) != Some(value)
+                    {
+                        assert_canonical(d, &doc);
+                    }
                 }
             }
         }

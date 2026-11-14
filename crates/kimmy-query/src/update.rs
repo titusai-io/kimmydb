@@ -209,6 +209,10 @@ pub fn parse(doc: &Document) -> Result<Update> {
 /// always a misspelt identifier, and applying the update regardless would
 /// change elements the caller never selected.
 pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<Update> {
+    parse_operators(doc, array_filters, false)
+}
+
+fn parse_operators(doc: &Document, array_filters: &[Document], upsert: bool) -> Result<Update> {
     // One date for every `$$NOW` of the update and its `arrayFilters` (ADR-253).
     let _clock = crate::expr::RequestClock::open();
     let has_operators = doc.keys().any(|k| k.starts_with('$'));
@@ -238,7 +242,7 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
             return Err(Error::InvalidUpdate(format!("${op} requires a document")));
         };
         for (target_path, arg) in targets {
-            if touches_id(target_path) {
+            if touches_id(target_path) && !upsert {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
             let kind = parse_op(op, arg)?;
@@ -778,6 +782,16 @@ fn parse_pull(arg: &Bson) -> Result<OpKind> {
     Ok(OpKind::Pull(arg.clone()))
 }
 
+/// Parse an update that an upsert may insert with. [`apply_on_insert`] is the
+/// entry point for the document it creates.
+///
+/// It differs from [`parse_with_filters`] in one thing: an operator may name
+/// `_id`. The refusal moves to the application: the document an upsert inserts
+/// may take it (see [`apply_on_insert`]), a document that matched never does.
+pub fn parse_for_upsert(doc: &Document, array_filters: &[Document]) -> Result<Update> {
+    parse_operators(doc, array_filters, true)
+}
+
 /// `$bit`'s specification: a non-empty document of `and`, `or` and `xor`, each
 /// with an `Int32` or `Int64` operand. A double is refused even where it holds
 /// an integral value: a bitwise operand is a bit pattern, and which pattern a
@@ -1058,6 +1072,14 @@ fn apply_to_at(
                 .into(),
         ));
     }
+    // An operator names `_id` only in an upsert's update (see [`parse_for_upsert`]).
+    // A document that matched has its id and keeps it; the one an upsert inserts
+    // may take the operators' (see `settle_inserted_id`).
+    let names_id = operations.iter().any(|op| applies(op) && touches_id(&op.path));
+    if names_id && target == Target::Existing {
+        return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
+    }
+    let seeded_id = if names_id { doc.get(ID_FIELD).cloned() } else { None };
     let concrete = concrete_paths(operations, doc, at, applies)?;
     if operations.iter().any(|op| has_positional(&op.path)) {
         claim_concrete(operations, &concrete)?;
@@ -1075,6 +1097,36 @@ fn apply_to_at(
         }
     }
     path::settle_created(doc, &created);
+    if names_id {
+        settle_inserted_id(doc, seeded_id)?;
+    }
+    Ok(())
+}
+
+/// The id of the document an upsert inserts, once its operators have run. An id
+/// the filter gave is held to: the update may name it, to the same value of the
+/// same type, and nothing else (q7s2o.out o0692-o0725). Where the filter gave
+/// none the operators' id stands, and is stored first, where every document
+/// keeps it (o0736-o0757).
+fn settle_inserted_id(doc: &mut Document, seeded: Option<Bson>) -> Result<()> {
+    let now = doc.get(ID_FIELD).cloned();
+    if let Some(was) = seeded
+        && now.as_ref() != Some(&was)
+    {
+        let found = now.map_or_else(|| "none".to_string(), |id| id.to_string());
+        return Err(Error::InvalidUpdate(format!(
+            "_id is immutable and cannot be updated: the filter gives _id {was}, and the update \
+             would make it {found}"
+        )));
+    }
+    if doc.contains_key(ID_FIELD) && doc.keys().next().map(String::as_str) != Some(ID_FIELD) {
+        let mut next = Document::new();
+        if let Some(id) = doc.remove(ID_FIELD) {
+            next.insert(ID_FIELD, id);
+        }
+        next.extend(std::mem::take(doc));
+        *doc = next;
+    }
     Ok(())
 }
 
@@ -1457,9 +1509,6 @@ fn apply_one(
         }
 
         OpKind::Rename(target) => {
-            if touches_id(target) {
-                return Err(invalid("_id is immutable and cannot be renamed onto".into()));
-            }
             match rename_source(doc, &op.path) {
                 // A source that is not there is nothing to move, and nothing
                 // else is looked at, the destination included (q7s2e.out lines
@@ -1479,6 +1528,11 @@ fn apply_one(
                     return Err(invalid(traverse_refusal("$rename", &part, &op.path, &held)));
                 }
                 Source::Found => {}
+            }
+            // The destination is judged only for a source that is there: a rename of
+            // a missing field onto `_id` is no change (q7s2o.out o0700, o0755).
+            if touches_id(target) {
+                return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {

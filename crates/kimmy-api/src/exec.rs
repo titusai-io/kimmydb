@@ -1355,7 +1355,7 @@ pub fn update(
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
-    let update = parse_update(update_json, &params.array_filters)?;
+    let update = parse_update(update_json, &params.array_filters, false)?;
     let expected = params.expected()?;
     let stop_after = if multi { None } else { Some(1) };
 
@@ -1419,7 +1419,14 @@ pub fn update(
 /// An update body and the request's `arrayFilters`, parsed together: the
 /// identifiers the paths use and the filters that define them are checked
 /// against each other, so neither is meaningful alone.
-fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::Update, ApiError> {
+///
+/// `upsert` is whether the request may insert: an operator of an upsert's may name
+/// `_id`, which the insert settles against the filter's (`update::parse_for_upsert`).
+fn parse_update(
+    update_json: &Value,
+    array_filters: &[Value],
+    upsert: bool,
+) -> Result<update::Update, ApiError> {
     let filters = array_filters.iter().map(json_to_document).collect::<Result<Vec<_>, _>>()?;
     // An array is a pipeline update, a list of aggregation stages (ADR-265); a document
     // is operators or a replacement.
@@ -1427,7 +1434,12 @@ fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::
         let stages = stages.iter().map(json_to_bson).collect::<Result<Vec<_>, _>>()?;
         return Ok(update::parse_pipeline(&stages, &filters)?);
     }
-    Ok(update::parse_with_filters(&json_to_document(update_json)?, &filters)?)
+    let document = json_to_document(update_json)?;
+    Ok(if upsert {
+        update::parse_for_upsert(&document, &filters)?
+    } else {
+        update::parse_with_filters(&document, &filters)?
+    })
 }
 
 /// A positional projection names the element a filter matched, so a request
@@ -1721,7 +1733,7 @@ pub fn find_and_modify(
         ));
     }
     let update = match &spec.update {
-        Some(value) => Some(parse_update(value, &spec.array_filters)?),
+        Some(value) => Some(parse_update(value, &spec.array_filters, spec.upsert)?),
         None => None,
     };
     if let (Some(projection), Some(update), ReturnDocument::After) =

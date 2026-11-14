@@ -22045,3 +22045,61 @@ async fn an_upsert_seeds_the_filter_fields_in_name_order_for_every_kind_of_updat
     let (id, got) = upsert(filter(), json!({ "v": 1 })).await;
     assert_eq!(got, want(id, json!({ "v": 1 })));
 }
+
+/// An upsert whose operators name `_id` inserts as any insert does (q7s2o.out o0692-o0799):
+/// the id it ends with is judged as an insert's, a duplicate is a conflict that overwrites
+/// nothing, and a document that matched is never given another `_id`.
+#[tokio::test]
+async fn an_upsert_that_names_its_id_is_inserted_as_any_insert_is() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 7, "k": "a" })]).await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    // The operators' id is the one inserted.
+    let res = fam(json!({ "filter": { "k": "new" }, "update": { "$set": { "_id": 8 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 8, "k": "new" }));
+    // The same id as the filter's is no change to the id the filter gave.
+    let res = fam(json!({ "filter": { "_id": 9 }, "update": { "$set": { "_id": 9 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 9 }));
+    // Another id than the filter's is refused, and nothing is inserted.
+    let res = fam(json!({ "filter": { "_id": 10 }, "update": { "$set": { "_id": 11 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/10", Some(&token)).await.status, 404);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/11", Some(&token)).await.status, 404);
+    // An id that exists is a duplicate, as an insert of it is, and the document stays.
+    let res = fam(json!({ "filter": { "k": "other" }, "update": { "$set": { "_id": 7 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+    // An id that is no document id (a double, a document) is refused as an insert's is.
+    for update in [json!({ "$set": { "_id": 5.5 } }), json!({ "$set": { "_id.x": 1 } })] {
+        let res = fam(json!({ "filter": { "k": "bad" }, "update": update, "upsert": true })).await;
+        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
+    }
+    // A document that matched keeps its `_id`: `$set` of it is refused, the same id too.
+    for id in [7, 12] {
+        let res = fam(json!({ "filter": { "_id": 7 }, "update": { "$set": { "_id": id } },
+                              "upsert": true }))
+        .await;
+        assert_eq!(res.status, 400, "{id}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap_or_default().contains("_id is immutable"),
+            "{:?}",
+            res.body
+        );
+    }
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+}

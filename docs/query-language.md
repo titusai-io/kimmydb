@@ -1178,7 +1178,7 @@ as `1.0`, is refused, and a body with no `_id` keeps the stored one.
 document:
 
 ```javascript
-// Rejected at parse time
+// Rejected at parse time (an update that cannot insert)
 { "$set": { "_id": 2 } }
 // Rejected when the result is known (a pipeline update)
 [ { "$set": { "_id": 2 } } ]
@@ -1188,6 +1188,22 @@ document:
 // Accepted: the same _id, or none (the stored one is kept)
 { "_id": 7, "item": "widget" }
 ```
+
+**An upsert's operators may name `_id`, so long as the id the filter gives
+holds.** With `upsert`, an operator update of `_id` is applied to the document
+that would be inserted, and judged by the result. Where the filter pins an `_id`
+(`{_id: 5}`, `{_id: {$in: [5]}}`), `{"$set": {"_id": 5}}` and `{"$setOnInsert":
+{"_id": 5}}` leave the document as it is, and any operator that would make it
+another id, or another type of the same number (`5` over a 64-bit `5`), is a
+`400` naming the immutable field: `{"$set": {"_id": 6}}`, `$inc`, `$unset`,
+`$min` or `$max` that moves it, and `{"$set": {"_id.x": 1}}` below a number. Where the filter pins none
+(`{}`, `{a: 5}`, `{_id: {$regex: "x"}}`), the operators' result is the id:
+`{"$set": {"_id": 6}}` inserts `{_id: 6, a: 5}`, `$inc` and `$min` create one,
+and `$unset` leaves a generated one. The id the document ends with is judged as an insert's (a double or a document is
+a `400`), and one that already exists is `409 duplicate_key`. A document that matched is never given an
+id this way: it is the same `400`. A `$rename` of a field that is not there onto
+`_id` changes nothing, as for any destination; of one that is there it is a
+`400`.
 
 ### `modified` counts changes
 

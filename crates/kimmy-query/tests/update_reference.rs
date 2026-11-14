@@ -1084,3 +1084,102 @@ fn m_two_digit_names_of_one_value_are_told_apart_by_their_bytes() {
         doc! { "_id": 1, "9": 1, "10": 1, "-1": 1, "a1": 1 },
     );
 }
+
+// ---------------------------------------------------------------------------
+// (N) An upsert may name `_id` in its operators, if the filter's does not change
+// ---------------------------------------------------------------------------
+
+/// The update, parsed as an upsert's, applied to the seed an upsert inserts.
+fn upserted_id(update: Document, mut seed: Document) -> Result<Document, String> {
+    let parsed = update::parse_for_upsert(&update, &[]).map_err(|e| e.to_string())?;
+    update::apply_on_insert(&parsed, &mut seed, NOW).map_err(|e| e.to_string())?;
+    Ok(seed)
+}
+
+#[test]
+fn n_an_upsert_may_set_the_id_the_filter_gives() {
+    // q7s2o.out o0692 (line 4076), o0695 (4092), o0703 (4135; a `$in` of one value seeds
+    // the same id): the same id is no change, and the document keeps the filter's.
+    for update in [doc! { "$set": { "_id": 5 } }, doc! { "$setOnInsert": { "_id": 5 } }] {
+        same(upserted_id(update, doc! { "_id": 5 }), doc! { "_id": 5 });
+    }
+    // With a field beside it (o0747, line 4374).
+    same(
+        upserted_id(doc! { "$set": { "_id": 5, "z": 1 } }, doc! { "_id": 5, "a": 5 }),
+        doc! { "_id": 5, "a": 5, "z": 1 },
+    );
+}
+
+#[test]
+fn n_an_upsert_cannot_change_the_id_the_filter_gives() {
+    // o0693 (line 4082), o0694 (4087), o0696 (4098), o0697 (4103), o0698 (4108), o0699
+    // (4113): code 66, the immutable field.
+    for update in [
+        doc! { "$set": { "_id": 6 } },
+        doc! { "$setOnInsert": { "_id": 7 } },
+        doc! { "$inc": { "_id": 1 } },
+        doc! { "$unset": { "_id": 1 } },
+        doc! { "$min": { "_id": 1 } },
+        doc! { "$max": { "_id": 9 } },
+    ] {
+        refused(upserted_id(update, doc! { "_id": 5 }), "_id is immutable");
+    }
+    // o0702 (line 4130): a field below the id, which is a scalar.
+    assert!(upserted_id(doc! { "$set": { "_id.x": 1 } }, doc! { "_id": 5 }).is_err());
+    // o0725 (line 4251): the same number of another type is another id.
+    refused(upserted_id(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5_i64 }), "_id is immutable");
+    // o0764 (line 4470), o0762 (4460): a document id, which `$min` lowers and `$inc` cannot add to.
+    refused(
+        upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "_id": { "k": 1 } }),
+        "_id is immutable",
+    );
+    assert!(upserted_id(doc! { "$inc": { "_id": 1 } }, doc! { "_id": { "k": 1 } }).is_err());
+    // o0765 (line 4475): `$max` of a number leaves a document id as it is. o0786 (4586):
+    // so does `$min` of a number leave a null.
+    same(
+        upserted_id(doc! { "$max": { "_id": 9 } }, doc! { "_id": { "k": 1 } }),
+        doc! { "_id": { "k": 1 } },
+    );
+    same(
+        upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "_id": bson::Bson::Null }),
+        doc! { "_id": bson::Bson::Null },
+    );
+}
+
+#[test]
+fn n_an_upsert_whose_filter_gives_no_id_may_set_any() {
+    // o0736-o0743 (lines 4308-4350) and o0747-o0754 (4374-4416), a filter with no `_id`;
+    // o0791-o0792 (4614, 4620), a filter on `_id` that pins none. The id is stored first.
+    same(upserted_id(doc! { "$set": { "_id": 5 } }, doc! {}), doc! { "_id": 5 });
+    same(upserted_id(doc! { "$set": { "_id": 6 } }, doc! { "a": 5 }), doc! { "_id": 6, "a": 5 });
+    same(
+        upserted_id(doc! { "$setOnInsert": { "_id": 7 } }, doc! { "a": 5 }),
+        doc! { "_id": 7, "a": 5 },
+    );
+    same(upserted_id(doc! { "$inc": { "_id": 1 } }, doc! { "a": 5 }), doc! { "_id": 1, "a": 5 });
+    same(upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "a": 5 }), doc! { "_id": 1, "a": 5 });
+    same(upserted_id(doc! { "$max": { "_id": 9 } }, doc! { "a": 5 }), doc! { "_id": 9, "a": 5 });
+    // o0752 (line 4404): `$unset` of an id that is not there leaves none, and one is made.
+    same(upserted_id(doc! { "$unset": { "_id": 1 } }, doc! { "a": 5 }), doc! { "a": 5 });
+}
+
+#[test]
+fn n_a_stored_document_still_cannot_be_given_an_id_by_operators() {
+    // UNRECORDED for an operator update of a stored document: refused, as it was.
+    let parsed = update::parse_for_upsert(&doc! { "$set": { "_id": 5 } }, &[]).unwrap();
+    let mut stored = doc! { "_id": 5, "a": 1 };
+    let err = update::apply(&parsed, &mut stored, NOW).unwrap_err().to_string();
+    assert!(err.contains("_id is immutable"), "{err}");
+    // And an update that is not an upsert's still refuses it as it parses.
+    refused(updated(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5 }), "_id is immutable");
+}
+
+#[test]
+fn n_a_rename_to_the_id_of_a_field_that_is_missing_is_no_change() {
+    // o0700 (line 4118) and o0755 (4422): the source is not there, so nothing is moved
+    // and the destination is not judged.
+    same(upserted_id(doc! { "$rename": { "y": "_id" } }, doc! { "_id": 5 }), doc! { "_id": 5 });
+    same(upserted_id(doc! { "$rename": { "y": "_id" } }, doc! { "a": 5 }), doc! { "a": 5 });
+    // UNRECORDED: a source that is there is still refused.
+    refused(upserted_id(doc! { "$rename": { "a": "_id" } }, doc! { "a": 5 }), "_id is immutable");
+}
