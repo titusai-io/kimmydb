@@ -625,7 +625,8 @@ impl Writer {
     }
 
     /// The creation write of an upsert from the composed cells, in the order of `cells` (see
-    /// `kimmy_core::effects::UpsertEffects::creation_cells`), each with its tag. `inc_paths` are
+    /// `kimmy_core::effects::UpsertEffects::creation_list`), each with its tag; a cell tagged
+    /// [`CellTag::Inc`] writes no register but takes its field's place in the order. `inc_paths` are
     /// the paths of the increments that follow ([`Writer::upsert_create`]); the cells and those
     /// paths must be pairwise disjoint. `None` when refused or a life is alive.
     pub fn upsert_cells(
@@ -904,8 +905,17 @@ impl Writer {
         inc_paths: &[&Path],
         m: &mut Mint<'_>,
     ) -> Option<Written> {
-        if cells.iter().any(|c| c.value.check_input_under(c.path.segments().len()).is_err()) {
-            return None;
+        let bound = self.opts.int_bound();
+        for c in cells {
+            let legal = if c.tag == CellTag::Inc {
+                // an increment's operand, as an `$inc` of an absent field meets it
+                counter::inc_result(None, &c.value, bound).is_some()
+            } else {
+                c.value.check_input_under(c.path.segments().len()).is_ok()
+            };
+            if !legal {
+                return None;
+            }
         }
         // The paths of one update must not meet: no path twice, none below another (the
         // reference refuses a conflicting update).
@@ -921,12 +931,20 @@ impl Writer {
             return None;
         }
         // (path, value, tagged), in the order of the list; a document cell is its map marker and
-        // the cells of its fields
+        // the cells of its fields. `at` lists every path the creation names, in the same order,
+        // an `Inc` cell's path included: the increment's slot is written by the write that follows,
+        // but its field takes its place in the order here, among the cells.
         let mut expanded: Vec<(Path, Value, bool)> = Vec::new();
+        let mut at: Vec<Path> = Vec::new();
         for c in cells {
+            if c.tag == CellTag::Inc {
+                at.push(c.path.clone());
+                continue;
+            }
             let mut out = Vec::new();
             expand(&c.path, &c.value, &mut out).ok()?;
             let soi = c.tag == CellTag::Creation;
+            at.extend(out.iter().map(|(q, _)| q.clone()));
             expanded.extend(out.into_iter().map(|(q, v)| (q, v, soi)));
         }
         if !self.state.alive(&self.opts).is_empty() {
@@ -973,8 +991,11 @@ impl Writer {
         }
         s.vv.insert(st.writer, st.hlc);
         // a write below a map is a write to the map: each path names its ancestors first
-        let (mut items, mut seen) = (Items::new(), BTreeSet::new());
-        for q in &paths {
+        let (mut items, mut seen, mut named) = (Items::new(), BTreeSet::new(), BTreeSet::new());
+        for q in &at {
+            if !named.insert(q.clone()) {
+                continue;
+            }
             ancestor_items(q, &mut seen, &mut items, &self.opts);
             items.push((OrdAt::Field(q.clone()), OrdMode::Write));
         }
@@ -988,41 +1009,42 @@ impl Writer {
     }
 
     /// The upsert of the effects layer, one entry for every shape (module docs of
-    /// `kimmy_core::effects`, "Upserts" (d)): the creation from `cells`, in the order of the list
-    /// with each cell's tag, and the increments `incs` with their TYPED operands (`Int32`, `Int64`,
-    /// `Decimal128` or `Double`). Validated as a whole, before anything is written or the clock
-    /// moves: a refusal changes nothing.
+    /// `kimmy_core::effects`, "Upserts" (d)): ONE ordered list of cells
+    /// ([`UpsertEffects::creation_list`](crate::effects::UpsertEffects::creation_list)): the
+    /// creation cells, each with its tag, and the increments as cells tagged [`CellTag::Inc`]
+    /// (the value is the TYPED operand: `Int32`, `Int64`, `Decimal128` or `Double`), all in the
+    /// order of the update's post-image. Validated as a whole, before anything is written or the
+    /// clock moves: a refusal changes nothing.
     ///
-    /// * no `cells` and some `incs`: ONE write, the life, the counter slots and any `Double`
-    ///   register under one stamp (the one-write `upsert_inc`);
-    /// * some `cells`: the creation write, then, when `incs` is not empty, ONE more write holding
-    ///   every increment under its own stamp (the two-write `upsert_soi`); no `incs` is the creation
-    ///   alone, `cells` and `incs` both empty the empty document.
+    /// * only increments: ONE write, the life, the counter slots and any `Double` register under
+    ///   one stamp (the one-write `upsert_inc`);
+    /// * some other cell: the creation write, in which every field, an increment's included,
+    ///   takes its place in the list order, then, when there are increments, ONE more write holding
+    ///   all of them under its own stamp (the two-write `upsert_soi`); no increment is the creation
+    ///   alone, no cell at all the empty document.
     ///
     /// A `Double` operand on an absent path is a Double register (not a counter): `1.5` twice,
     /// concurrently, is `1.5`. The result is the creation and the increment write, if any.
     pub fn upsert_create(
         &mut self,
         cells: &[CreationCell],
-        incs: &[(Path, Value)],
         skew: u64,
     ) -> Result<(Written, Option<Written>), UpdateRefused> {
         let mut m = Mint { source: Source::Skew(skew), error: None };
-        self.upsert_create_m(cells, incs, &mut m)
+        self.upsert_create_m(cells, &mut m)
     }
 
     /// [`Writer::upsert_create`] with the stamps taken from `stamp`, called once for each stamp the
-    /// write needs (two for the two-write shape) and never for a refusal. Both stamps are checked
-    /// before the first write, so a rejected stamp is [`UpdateError::Stamp`] and nothing, the
-    /// clock included, has moved.
+    /// write needs (two for creation cells plus increments, one otherwise) and never for a
+    /// refusal. Both stamps are checked before the first write, so a rejected stamp is
+    /// [`UpdateError::Stamp`] and nothing, the clock included, has moved.
     pub fn upsert_create_stamped(
         &mut self,
         cells: &[CreationCell],
-        incs: &[(Path, Value)],
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<(Written, Option<Written>), UpdateError> {
         let mut m = Mint { source: Source::Given(stamp), error: None };
-        let r = self.upsert_create_m(cells, incs, &mut m);
+        let r = self.upsert_create_m(cells, &mut m);
         match m.error {
             Some(e) => Err(UpdateError::Stamp(e)),
             None => Ok(r?),
@@ -1032,25 +1054,26 @@ impl Writer {
     fn upsert_create_m(
         &mut self,
         cells: &[CreationCell],
-        incs: &[(Path, Value)],
         m: &mut Mint<'_>,
     ) -> Result<(Written, Option<Written>), UpdateRefused> {
+        let bound = self.opts.int_bound();
+        let mut incs: Vec<(Path, Value)> = Vec::new();
+        let mut others = 0usize;
         for c in cells {
-            c.value
-                .check_input_under(c.path.segments().len())
-                .map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
+            if c.tag == CellTag::Inc {
+                // the operand's own refusals, as an `$inc` of an absent field would meet them
+                counter::inc_result(None, &c.value, bound)
+                    .ok_or_else(|| inc_refusal(None, &c.value, &c.path))?;
+                incs.push((c.path.clone(), c.value.clone()));
+            } else {
+                c.value
+                    .check_input_under(c.path.segments().len())
+                    .map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
+                others += 1;
+            }
         }
-        for (p, by) in incs {
-            // the operand's own refusals, as an `$inc` of an absent field would meet them
-            counter::inc_result(None, by, self.opts.int_bound())
-                .ok_or_else(|| inc_refusal(None, by, p))?;
-        }
-        let mut paths: Vec<&Path> = cells
-            .iter()
-            .filter(|c| c.value != Value::Unset)
-            .map(|c| &c.path)
-            .chain(incs.iter().map(|(p, _)| p))
-            .collect();
+        let mut paths: Vec<&Path> =
+            cells.iter().filter(|c| c.value != Value::Unset).map(|c| &c.path).collect();
         paths.sort_unstable();
         if let Some(w) = paths.windows(2).find(|w| w[0] == w[1] || w[1].is_below(w[0])) {
             return Err(UpdateRefused::Overlap(w[0].clone(), w[1].clone()));
@@ -1058,12 +1081,10 @@ impl Writer {
         if !self.state.alive(&self.opts).is_empty() {
             return Err(UpdateRefused::LifeExists);
         }
-        let stamps_needed = if cells.is_empty() || incs.is_empty() { 1 } else { 2 };
+        let two_writes = others > 0 && !incs.is_empty();
         // The stamps of a caller are all taken and checked now, before the first write, so a bad
         // second stamp cannot leave the creation written.
-        if stamps_needed == 2
-            && let Source::Given(f) = &mut m.source
-        {
+        if two_writes && let Source::Given(f) = &mut m.source {
             let (first, second) = (f(), f());
             let mut top = self.top();
             for st in [first, second] {
@@ -1082,12 +1103,11 @@ impl Writer {
             }
             m.source = Source::Queued([first, second].into());
         }
-        let incs_paths: Vec<&Path> = incs.iter().map(|(p, _)| p).collect();
-        if cells.is_empty() && !incs.is_empty() {
-            let w = self.create_with_incs_m(incs, m).ok_or(UpdateRefused::WriterCap)?;
+        if others == 0 && !incs.is_empty() {
+            let w = self.create_with_incs_m(&incs, m).ok_or(UpdateRefused::WriterCap)?;
             return Ok((w, None));
         }
-        let created = self.upsert_cells_m(cells, &incs_paths, m).ok_or(UpdateRefused::WriterCap)?;
+        let created = self.upsert_cells_m(cells, &[], m).ok_or(UpdateRefused::WriterCap)?;
         if incs.is_empty() {
             return Ok((created, None));
         }
