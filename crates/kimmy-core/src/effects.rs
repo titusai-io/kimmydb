@@ -31,8 +31,10 @@
 //!    rewritten); `$unset` of an element writes `null` (as the reference does). So `$set {"a.0": 1,
 //!    "a.1": 2}` is `Set(a, [1, 2, ..])`; expressed as two leaf `Set`s of `a.0` and `a.1` it is
 //!    `BelowScalar`, and `Set(a)` beside `Set(a.0)` is `Overlap`.
-//! 5. Order is the order of the operators in the update, and positions within the list are
-//!    deterministic: the same update on the same document yields the same list.
+//! 5. Order is the POST-IMAGE order: S2b lists the effects (and the new fields of an upsert) in the
+//!    order of the existing engine's post-image (what `apply_to_at` in `kimmy-query/src/update.rs`
+//!    produces today), so `field` and `document` collections give the same field order; the same
+//!    update on the same document yields the same list. No sorting here, no guessing.
 //! 6. `Set(path, Value::Unset)` is an `Unset`; the writer normalises it.
 //! 7. A refusal changes nothing (no stamp, no clock move): the whole update is refused.
 //! 8. A [`Path`]'s `Display` is LOSSY (it joins the segments with `.`, so `a.b` as one segment and
@@ -117,6 +119,11 @@
 //!   equality), and the second is a deviation (`docs/deviations.md`,
 //!   "upsert-filter-field-incremented-q7"), as is `{a: 5}` with `$inc a 1`. A MATCHED upsert is an
 //!   ordinary update and is never refused for it (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})`).
+//!   In short: an `$inc` equal to, above or below ANY creation cell is `Overlap`, only "beside"
+//!   passes. Where that concerns a non-document it matches the reference (`{"a.b": 1}` with `$inc
+//!   a.b.k` cannot create a field in a non-document there either; `{"a.b": 1}` with `$inc a` is an
+//!   increment of a document), so it is NOT a deviation: the deviations entry keeps only
+//!   `{a: 5}` with `$inc a` and the filter-document case `{a: {b: 1}}` with `$inc a.c`.
 //!   A Document-valued `$setOnInsert` or `$set` with an `$inc` below it is refused by the reference
 //!   at parse time too, so it is no deviation.
 //! * (b2) Composition, before the writer ([`UpsertEffects::creation_cells`]), at AS-WRITTEN
@@ -136,12 +143,17 @@
 //!   (`Set(p, Value::Unset)`) in a higher layer removes the cell at or below `p`, or the nested field
 //!   of a Document cell, and is a NO-OP, with no refusal, when absent or below a scalar (`{a: 5}`
 //!   with `$unset a.y`). `_id`: any filter path whose FIRST segment is `_id` (`{"_id.x": 1}`
-//!   included) is left out, the existing upsert `_id` logic owns it. `$inc` is not a cell. Field
+//!   included) is left out, the existing upsert `_id` logic owns it. A `$set` or `$setOnInsert`
+//!   (an `Unset` too) whose path starts with `_id` is refused by the composition as `BadPath`. That
+//!   is a defensive check only: the update parse (`kimmy-query/src/update.rs`) refuses ANY write to
+//!   `_id`, for both merge policies, so it never fires from the product. Every value of every layer, and every composed cell, passes
+//!   `Value::check_input` (a repeated or NUL field name, a map marker, nesting past the depth
+//!   limit are `BadValue`), so the writer is never the first to see them. `$inc` is not a cell. Field
 //!   ORDER: filter fields in filter order; an override keeps its field in place; new fields are
-//!   appended in the order the caller lists them, `set_on_insert` first, then `set`. The caller (S2b)
-//!   lists the new fields of an operator update in lexicographic order (as ruled) and a pipeline
-//!   update in pipeline order. The cells go to the writer as `fields` (the `Creation` cells) and
-//!   `sets` (the `Plain` cells) of `upsert_soi_create`; the tests drive exactly that.
+//!   appended in the order the caller lists them, `set_on_insert` first, then `set`. The caller
+//!   (S2b) lists them in the order of the existing engine's post-image (what `apply_to_at` in
+//!   `kimmy-query/src/update.rs` produces today), as invariant 5 says. The cells go to the writer as `fields` (the `Creation` cells) and
+//!   `sets` (the `Plain` cells) of `upsert_soi_create` in the tests; the S2a item above makes the entry one ordered list.
 //! * (c) Creation values of `$mul`, `$min`, `$max`, `$currentDate`, `$push`, `$addToSet` and `$bit`
 //!   are computed by S2b and go in `set`.
 //! * (d) One write or two, from the existing code (`merge_state/writer.rs`): `upsert_inc` is ONE
@@ -165,6 +177,13 @@
 //! `write_update` already does, so no model rerun; extend the Rust oracle and property generator
 //! to multi-`$inc` upserts. It also accepts an empty `inc` list (a), and the `from_filter` layer
 //! (b).
+//!
+//! The same item fixes the creation FIELD ORDER: `upsert_soi_create_m` takes `fields` (the tagged
+//! cells) and `sets` as two lists and feeds all fields before all sets, so filter `{a: 1, b: 2}`
+//! with `$set {a: 5}` would come out `b`, `a`. The creation entry must take the cells as ONE ordered
+//! list with a per-cell tag ([`CellTag`]), in the order [`UpsertEffects::creation_cells`] returns
+//! them, and S2a adds a test of the order at the writer. The writer is not changed here (the tests
+//! below split the cells by tag, so they do not see the order).
 //!
 //! The same item widens `upsert_soi*` and `upsert_inc_on` from `i64` to typed operands (as
 //! [`UpdateOp::Inc`] already is: Int32, Int64, Double or Decimal128; the 2026-11-03 ruling already
@@ -220,7 +239,8 @@
 //! * RESOLVED (supersedes the one-cell-per-top-level-field ruling): creation cells are AS WRITTEN, and
 //!   `check_creation` mirrors the writer, see (b1), (b2).
 //! * TO BE RECORDED (S2a and S2b items, they do not block this interface): (1) the new-field ORDER
-//!   of operator updates and upserts, and (2) the reference's result of a double `$inc` on an
+//!   of operator updates and upserts (the mars recording confirms the post-image order or it
+//!   becomes a deviation for BOTH policies, a separate decision later), and (2) the reference's result of a double `$inc` on an
 //!   integer or `Decimal128` field and of an unrepresentable `Decimal128` total. Neither has a
 //!   recording: `reference-6.0.5` holds none. S2a and S2b record reference probes in the same way as
 //!   the existing recordings: `mongosh --quiet <probe>.js` scripts (see `q8-probes/acc.js` and
@@ -228,7 +248,7 @@
 //!   under `reference-6.0.5/`. The order and the deviation text of "field-merge-refusals-q7" are
 //!   then settled from the recordings before S2b and S2a finish.
 
-pub use crate::merge_state::{MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
+pub use crate::merge_state::{InvalidPath, MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
 
 /// The effects of one update: an ordered list of per-leaf [`UpdateOp`]s that make ONE write with
@@ -455,6 +475,7 @@ impl UpsertEffects {
         first_overlap(&mut written)?;
         let mut leaves = Vec::new();
         for (p, v) in &filter {
+            v.check_input().map_err(|e| UpdateRefused::BadValue((*p).clone(), e))?;
             leaf_paths(p, v, &mut leaves)?;
         }
         let mut sorted: Vec<&Path> = leaves.iter().collect();
@@ -462,6 +483,7 @@ impl UpsertEffects {
 
         let mut cells: Vec<CreationCell> = Vec::new();
         for (p, v) in filter {
+            v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
             place(&mut cells, p, v, CellTag::Creation)?;
         }
         let higher = self
@@ -470,11 +492,21 @@ impl UpsertEffects {
             .map(|(p, v)| (p, v, CellTag::Creation))
             .chain(self.set.iter().map(|(p, v)| (p, v, CellTag::Plain)));
         for (q, v, tag) in higher {
+            if is_id(q) {
+                return Err(UpdateRefused::BadPath(InvalidPath(
+                    "_id is the upsert's key: S2b owns it, not the effects",
+                )));
+            }
+            v.check_input().map_err(|e| UpdateRefused::BadValue(q.clone(), e))?;
             if *v == Value::Unset {
                 unset_at(&mut cells, q);
             } else {
                 place(&mut cells, q, v, tag)?;
             }
+        }
+        // a merge can nest deeper than either part: check the composed values too
+        for c in &cells {
+            c.value.check_input().map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
         }
         // the writer's rule: an `$inc` path must not be equal to, above or below a cell path
         for c in &cells {
@@ -1187,5 +1219,53 @@ mod tests {
         assert!(on.creation_cells().is_err());
         // a MATCHED upsert is an ordinary update: the parse-time check accepts it
         assert!(on.check().is_ok());
+    }
+
+    #[test]
+    fn a_value_the_writer_would_refuse_is_refused_before_it() {
+        let bad = |v: Value| UpsertEffects { set: vec![(p("a"), v)], ..Default::default() };
+        // a repeated field name
+        let repeated = bad(dc(vec![("x", i(1)), ("x", i(2))]));
+        assert!(matches!(repeated.creation_cells(), Err(UpdateRefused::BadValue(..))));
+        // a NUL in a field name
+        let nul = bad(dc(vec![("x\0y", i(1))]));
+        assert!(matches!(nul.creation_cells(), Err(UpdateRefused::BadValue(..))));
+        // a map marker inside a value
+        let marker = bad(dc(vec![("x", Value::Map)]));
+        assert!(matches!(marker.creation_cells(), Err(UpdateRefused::BadValue(..))));
+        // nesting past the depth limit (101 levels)
+        let mut deep = i(1);
+        for _ in 0..101 {
+            deep = dc(vec![("k", deep)]);
+        }
+        assert!(matches!(bad(deep.clone()).creation_cells(), Err(UpdateRefused::BadValue(..))));
+        // the same in the filter and in $setOnInsert
+        let f = filter(vec![(p("a"), deep.clone())]);
+        assert!(matches!(f.creation_cells(), Err(UpdateRefused::BadValue(..))));
+        let soi =
+            UpsertEffects { set_on_insert: vec![(p("a"), marker_doc())], ..Default::default() };
+        assert!(matches!(soi.creation_cells(), Err(UpdateRefused::BadValue(..))));
+        // a legal value passes, and the writer agrees
+        let ok = bad(dc(vec![("x", i(1))]));
+        let cells = ok.creation_cells().unwrap();
+        assert!(through_the_writer(&ok, &cells).is_some());
+    }
+    fn marker_doc() -> Value {
+        Value::Document(vec![("x".to_string(), Value::Map)])
+    }
+
+    #[test]
+    fn an_id_in_a_higher_layer_is_refused_as_a_bad_path() {
+        for path in [p("_id"), np(&["_id", "x"])] {
+            let set = UpsertEffects { set: vec![(path.clone(), i(1))], ..Default::default() };
+            assert!(matches!(set.creation_cells(), Err(UpdateRefused::BadPath(_))));
+            let soi =
+                UpsertEffects { set_on_insert: vec![(path.clone(), i(1))], ..Default::default() };
+            assert!(matches!(soi.creation_cells(), Err(UpdateRefused::BadPath(_))));
+            let unset = UpsertEffects { set: vec![(path, Value::Unset)], ..Default::default() };
+            assert!(matches!(unset.creation_cells(), Err(UpdateRefused::BadPath(_))));
+        }
+        // a filter on _id stays silently left out
+        assert!(filter(vec![(p("_id"), i(1))]).creation_cells().unwrap().is_empty());
     }
 }
