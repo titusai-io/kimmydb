@@ -72,6 +72,17 @@ pub(crate) fn plan(u: Document, d: &Document) -> Effects {
     plan_of(&parse(u), None, d).0
 }
 
+/// The document as bytes with its top-level fields sorted by name and `_id` left out: the
+/// comparison for a PIPELINE step, where the writer keeps the order of the fields that stay
+/// (`pipeline-reorder-only-q7`) and the stored `_id` (`pipeline-id-type-q7`). Every value, nested
+/// order and bit pattern still counts.
+pub(crate) fn canonical(d: &Document) -> Vec<u8> {
+    let mut fields: Vec<(&String, &Bson)> = d.iter().filter(|(k, _)| *k != "_id").collect();
+    fields.sort_by(|a, b| a.0.cmp(b.0));
+    let sorted: Document = fields.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    bytes(&sorted)
+}
+
 /// The expected effects, built with the same builder.
 pub(crate) fn fx(build: impl FnOnce(&mut Effects)) -> Effects {
     let mut e = Effects::new();

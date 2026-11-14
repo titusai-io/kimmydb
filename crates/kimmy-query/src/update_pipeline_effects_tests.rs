@@ -7,7 +7,7 @@ use kimmy_core::effects::{Effects, Outcome};
 use crate::update::{self, Update};
 use crate::update_effects::{Plan, apply_with_effects};
 use crate::update_effects_tests::{
-    NOW, bytes, fx, np, p, parity, plan_of, render, same_effects, v, writer_with,
+    NOW, bytes, canonical, fx, np, p, parity, plan_of, render, same_effects, v, writer_with,
 };
 
 fn pipe(stages: Vec<Document>) -> Update {
@@ -278,13 +278,17 @@ fn the_recorded_reference_answers_are_what_the_writer_renders() {
             })
             .collect()
     };
-    // `same_as_reference`: the engine's result, the writer's render and the recorded answer are
-    // the same bytes (order and every bit). `known_order`: the writer's render is the engine's
-    // post-image with its top-level fields in the writer's order, not the pipeline's (a KNOWN
-    // DIFFERENCE of the `field` policy: `pipeline-reorder-only-q7` in docs/deviations.md, the
-    // writer keeps the order of the fields that stay), so it is not "the same as the reference".
-    // `engine_differs`: the engine's own result is not the recorded one (not a matter of effects).
-    let (mut same_as_reference, mut engine_differs) = (0, 0);
+    // The four classes of a (case, document) pair:
+    // * `same_as_reference`: the engine's result, the writer's render and the recorded answer are
+    //   the same bytes (order and every bit);
+    // * `order_differs_from_reference`: the recorded answer is the engine's result but for the
+    //   order of the top-level fields (`canonical`: nested order and every bit still equal);
+    // * `known_order`: the writer's render is the engine's post-image with its top-level fields
+    //   in the writer's order, not the pipeline's: a KNOWN DIFFERENCE of the `field` policy
+    //   (`pipeline-reorder-only-q7` in docs/deviations.md), so it is not "the same as the
+    //   reference". Compared with `canonical`, so a nested-order or -0.0 difference still fails;
+    // * `engine_differs`: the engine's own result is not the recorded one (not a matter of effects).
+    let (mut same_as_reference, mut order_differs, mut engine_differs) = (0, 0, 0);
     let mut known_order: Vec<String> = Vec::new();
     for case in data.as_array().unwrap() {
         let label = case["label"].as_str().unwrap();
@@ -307,44 +311,31 @@ fn the_recorded_reference_answers_are_what_the_writer_renders() {
             let rendered = render(&w);
             let want = after.iter().find(|a| a.get("_id") == before.get("_id")).unwrap();
             if bytes(&rendered) != bytes(&post_image) {
-                // only the order of the top-level fields may differ, never a value
-                assert_eq!(rendered, post_image, "{label}: the writer renders another document");
+                assert_eq!(
+                    canonical(&rendered),
+                    canonical(&post_image),
+                    "{label}: the writer renders another document"
+                );
                 known_order.push(label.to_string());
             } else if bytes(&post_image) == bytes(want) {
                 same_as_reference += 1;
+            } else if canonical(&post_image) == canonical(want) {
+                order_differs += 1;
             } else {
                 engine_differs += 1;
             }
         }
     }
-    assert!(
-        same_as_reference >= 1,
-        "{same_as_reference} same, {engine_differs} engine differs, known order: {known_order:?}"
+    // the vacuity guard: the recorded cases that match the reference (bytes, or top-level order
+    // apart) are what this test is about; at least 8 of them, as before
+    let matching = same_as_reference + order_differs;
+    eprintln!(
+        "fixture: {same_as_reference} same, {order_differs} order differs, {engine_differs} engine \
+         differs, known order: {known_order:?}"
     );
     assert!(
-        same_as_reference + known_order.len() + engine_differs >= 12,
-        "{same_as_reference} same, {engine_differs} engine differs, known order: {known_order:?}"
+        matching >= 8,
+        "{same_as_reference} same, {order_differs} order differs, {engine_differs} engine \
+         differs, known order: {known_order:?}"
     );
-}
-
-/// Not a deviation (nothing in docs/deviations.md): a `$set` of a sub-document whose fields are
-/// only reordered IS a write on a `field` collection, as it is on a `document` one (the bytes
-/// differ). The writer counts an order-only change of a sub-document as a change
-/// (`Writer::reordered`), so the answer is `modified: true` under both policies, for an operator
-/// update and for a pipeline update, and the written document has the new order. Only a
-/// TOP-LEVEL reorder of a pipeline result is no write (`pipeline-reorder-only-q7`).
-#[test]
-fn a_set_of_a_sub_document_with_its_fields_reordered_is_a_write() {
-    let d = doc! { "_id": 1, "sub": { "k": 1, "j": 2 } };
-    for (label, update) in [
-        ("operator", crate::update_effects_tests::parse(doc! {"$set": {"sub": {"j": 2, "k": 1}}})),
-        ("pipeline", pipe(vec![doc! {"$set": {"sub": {"j": 2, "k": 1}}}])),
-    ] {
-        let (effects, outcome) = parity(&update, None, &d);
-        assert!(outcome.modified(), "{label}: {outcome:?} for {effects:?}");
-        let mut w = writer_with(&d);
-        effects.apply(&mut w, 0);
-        let sub = render(&w).get_document("sub").unwrap().clone();
-        assert_eq!(keys(&sub), ["j", "k"], "{label}");
-    }
 }

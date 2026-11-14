@@ -10,9 +10,12 @@ use bson::{Bson, Document, doc};
 use kimmy_core::effects::{Outcome, UpdateRefused};
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::update_effects::{Plan, apply_with_effects};
-use crate::update_effects_tests::{NOW, bytes, render, writer_with};
+use crate::path;
+use crate::update::{OpKind, Operation, Update};
+use crate::update_effects::{Plan, apply_with_effects, first_rename_refusal};
+use crate::update_effects_tests::{NOW, bytes, canonical, render, writer_with};
 
 fn small_int() -> impl Strategy<Value = i32> {
     prop_oneof![Just(0), Just(1), Just(-1), Just(7), -50..50, Just(i32::MAX), Just(i32::MIN)]
@@ -51,6 +54,15 @@ pub(crate) fn arb_doc() -> impl Strategy<Value = Document> {
                 items.into_iter().map(|(k, q)| Bson::Document(doc! { "k": k, "q": q })).collect();
             doc.insert("items", items);
             doc.insert("grid", grid);
+            // the fields the `$rename` slots work on: an array of documents, a scalar, a string,
+            // an integer (a counter)
+            doc.insert(
+                "ra",
+                vec![Bson::Document(doc! { "t": 1 }), Bson::Document(doc! { "t": 2 })],
+            );
+            doc.insert("rs", 5);
+            doc.insert("rt", "txt");
+            doc.insert("rn", 7);
             if let Some((k, j)) = sub {
                 let mut sub = doc! { "k": k };
                 if let Some(j) = j {
@@ -177,6 +189,37 @@ fn slot_grid() -> impl Strategy<Value = Slot> {
     ])
 }
 
+/// A `$rename`: the shapes the reference refuses (a source or a destination inside an array
+/// element by an index or not, below a scalar, a counter into an array), the missing sources it
+/// leaves alone, and the moves it allows.
+fn slot_rename() -> impl Strategy<Value = Slot> {
+    let pairs: Vec<(&'static str, &'static str)> = vec![
+        // refused
+        ("ra.0.t", "r1"),
+        ("ra.t", "r2"),
+        ("rt", "ra.0.u"),
+        ("rt", "ra.u"),
+        ("rs.y", "r3"),
+        ("rt", "rs.y"),
+        ("rn", "ra.1"),
+        ("ra.1.t", "ra.0.t"),
+        // a missing source: nothing is done, nothing is checked
+        ("ra.0.nope", "r4"),
+        ("ra.5.t", "r5"),
+        ("nomissing", "ra.0.u"),
+        ("nomissing", "rs.y"),
+        ("ra.0.nope", "ra.1.x"),
+        // allowed (the counter rename is the writer's own refusal)
+        ("rt", "r6"),
+        ("ra", "ra2"),
+        ("rn", "rn2"),
+    ];
+    prop::option::of(
+        proptest::sample::select(pairs)
+            .prop_map(|(from, to)| ("$rename", from, Bson::String(to.into()))),
+    )
+}
+
 /// One step of a run: an operator update (with the `arrayFilters` and the matching filter its
 /// positional paths need) or a pipeline update.
 #[derive(Clone, Debug)]
@@ -188,13 +231,13 @@ enum Step {
 fn arb_ops() -> impl Strategy<Value = Step> {
     (
         (slot_n(), slot_d(), slot_s(), slot_arr(), slot_k(), slot_j(), slot_x(), slot_date()),
-        (slot_items(), slot_grid()),
+        (slot_items(), slot_grid(), slot_rename()),
     )
-        .prop_map(|((a, b, c, d, e, f, g, h), (i, j))| {
+        .prop_map(|((a, b, c, d, e, f, g, h), (i, j, k))| {
             let mut update = Document::new();
             let mut each = false;
             let mut dollar = false;
-            for (op, path, arg) in [a, b, c, d, e, f, g, h, i, j].into_iter().flatten() {
+            for (op, path, arg) in [a, b, c, d, e, f, g, h, i, j, k].into_iter().flatten() {
                 each |= path.contains("$[e]");
                 dollar |= path.contains(".$.");
                 if !update.contains_key(op) {
@@ -248,16 +291,10 @@ fn documented(r: &UpdateRefused) -> bool {
     )
 }
 
-/// The document as bytes with its top-level fields sorted by name and `_id` left out: the
-/// comparison for a PIPELINE step, where the writer keeps the order of the fields that stay
-/// (`pipeline-reorder-only-q7`) and the stored `_id` (`pipeline-id-type-q7`). Every value, nested
-/// order and bit pattern still counts.
-fn canonical(d: &Document) -> Vec<u8> {
-    let mut fields: Vec<(&String, &Bson)> = d.iter().filter(|(k, _)| *k != "_id").collect();
-    fields.sort_by(|a, b| a.0.cmp(b.0));
-    let sorted: Document = fields.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    bytes(&sorted)
-}
+/// How many steps hit the extra refusal of a `$rename`, and how many a `$rename` whose source is
+/// not there (a no-op): both must happen, or the generators prove nothing.
+static REFUSED_RENAMES: AtomicUsize = AtomicUsize::new(0);
+static NOOP_RENAMES: AtomicUsize = AtomicUsize::new(0);
 
 /// One run: the steps applied in turn to an engine document and to a writer holding the same one.
 fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
@@ -302,8 +339,12 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
                 return Err(TestCaseError::fail("a replacement from a generated update"));
             }
             (Err(_), Err(_)) => continue,
-            // the one refusal the plan adds: a rename through an array element or a scalar
-            (Ok(()), Err(e)) if e.to_string().contains("$rename") => continue,
+            // the one refusal the plan adds: a `$rename` the recordings refuse (a source or a
+            // destination in an array element, below a scalar), named by its enum variant
+            (Ok(()), Err(_)) if first_rename_refusal(&update, &doc).is_some() => {
+                REFUSED_RENAMES.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             (engine, planned) => {
                 return Err(TestCaseError::fail(format!(
                     "the engine says {engine:?} and the plan says {:?} for {step:?} over {doc}",
@@ -311,6 +352,15 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
                 )));
             }
         };
+        // a `$rename` of a source that is not there did nothing and was not refused
+        if let Update::Operators(operations) = &update {
+            let missing = |op: &Operation| {
+                matches!(op.kind, OpKind::Rename(_)) && path::resolve(&doc, &op.path).is_empty()
+            };
+            if operations.iter().any(missing) {
+                NOOP_RENAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let outcome = effects.apply(&mut w, 0);
         match &outcome {
             Outcome::Refused(r) => {
@@ -364,6 +414,8 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
 /// a thread with a stack of its own, not the test thread's 2 MiB.
 #[test]
 fn effects_through_the_writer_render_the_engines_post_image() {
+    REFUSED_RENAMES.store(0, Ordering::Relaxed);
+    NOOP_RENAMES.store(0, Ordering::Relaxed);
     std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(|| {
@@ -376,4 +428,9 @@ fn effects_through_the_writer_render_the_engines_post_image() {
         .unwrap()
         .join()
         .unwrap();
+    let (refused, noop) =
+        (REFUSED_RENAMES.load(Ordering::Relaxed), NOOP_RENAMES.load(Ordering::Relaxed));
+    eprintln!("renames: {refused} refused by the plan, {noop} of a missing source");
+    assert!(refused > 0, "no generated step hit a refused rename");
+    assert!(noop > 0, "no generated step renamed a missing source");
 }
