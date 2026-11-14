@@ -47,18 +47,101 @@ fn the_minimised_input_is_an_int32() {
     assert_eq!(ba.visible(&opts()).unwrap()[&p("n")], i32v(6));
 }
 
-/// The recorded cases (`q7s2.out`: d8, d9, z2).
+fn inc(w: &mut Writer, by: Value) -> Result<Option<Written>, UpdateRefused> {
+    w.write_update(&[UpdateOp::Inc(p("n"), by)], 0)
+}
+
+fn dec(s: &str) -> Value {
+    Value::Decimal128(s.parse::<bson::Decimal128>().unwrap().bytes())
+}
+
+fn dec_text(v: &Value) -> String {
+    match v {
+        Value::Decimal128(b) => bson::Decimal128::from_bytes(*b).to_string(),
+        v => panic!("not a decimal: {v:?}"),
+    }
+}
+
+/// The recorded integer-type cases, `q7s2-probes/reference-6.0.5/q7s2.out` (line of the result,
+/// operands, result of the reference):
+///
+/// | lines (reply-after) | case | operands | reference result | here |
+/// |---|---|---|---|---|
+/// | 267-268 | d8 | Int32 5 `$inc` Int64 1 | `n` = NumberLong 6 | `Int64(6)`, modified |
+/// | 272-273 | d9 | Int32 2147483647 `$inc` Int32 1 | `n` = NumberLong 2147483648 | `Int64(2147483648)`, modified |
+/// | 277-278 | d10 | Int64 max `$inc` Int32 1 | error code 2, the document unchanged | `IncOutOfRange`, state and clock unchanged |
+/// | 381-382 | z2 | Int32 5 `$inc` Int64 0 | `modified` 1, `n` = NumberLong 5 | modified, `Int64(5)` |
+/// | 386-387 | z3 | Int32 5 `$inc` Double 0.0 | `modified` 1, `n` = 5.0 (Double) | THE DEVIATION `field-merge-refusals-q7` (2): refused, `IncDoubleOnCounter`, nothing changed |
+///
+/// z4 (lines 392-393: Int64 5 `$inc` Int32 0, `modified` 0, `n` stays NumberLong 5): the value and
+/// the type are the reference's, but the WRITER records every increment it is given, this one included
+/// (a slot move). That is the writer's contract; the no-op of an increment whose result is unchanged
+/// by representation (ADR-208) belongs to the effects layer, in one place, and its test (z4, with
+/// the typed `$inc` table) is the effects layer's.
 #[test]
 fn the_recorded_integer_types() {
-    let mut w = base(i32v(5)); // d8: Int32 + Int64 is Int64
-    w.write_inc_value(&p("n"), &i64v(1), 0).unwrap();
+    let mut w = base(i32v(5)); // d8
+    assert!(inc(&mut w, i64v(1)).unwrap().is_some());
     assert_eq!(n(&w), i64v(6));
-    let mut w = base(i32v(i32::MAX)); // d9: Int32 max + 1 is Int64
-    w.write_inc_value(&p("n"), &i32v(1), 0).unwrap();
+    let mut w = base(i32v(i32::MAX)); // d9
+    assert!(inc(&mut w, i32v(1)).unwrap().is_some());
     assert_eq!(n(&w), i64v(i64::from(i32::MAX) + 1));
-    let mut w = base(i32v(5)); // z2: Int32 5 + Int64 0 is 5L, a modification
-    assert!(w.write_inc_value(&p("n"), &i64v(0), 0).is_some());
+    let mut w = base(i64v(i64::MAX)); // d10
+    let before = (w.state.clone(), w.clock);
+    assert_eq!(inc(&mut w, i32v(1)), Err(UpdateRefused::IncOutOfRange(p("n"))));
+    assert_eq!((w.state.clone(), w.clock), before);
+    assert_eq!(n(&w), i64v(i64::MAX));
+    let mut w = base(i32v(5)); // z2: a modification
+    assert!(inc(&mut w, i64v(0)).unwrap().is_some());
     assert_eq!(n(&w), i64v(5));
+    let mut w = base(i32v(5)); // z3: the deviation, refused whole
+    let before = (w.state.clone(), w.clock);
+    assert_eq!(inc(&mut w, Value::Double(0.0)), Err(UpdateRefused::IncDoubleOnCounter(p("n"))));
+    assert_eq!((w.state.clone(), w.clock), before);
+    assert_eq!(n(&w), i32v(5));
+    // z4: the reference reports `modified` 0 and writes nothing; the writer records the increment
+    // it is given (a slot move) and the value and the type are the reference's: the effects layer
+    // drops such an increment before it reaches the writer
+    let mut w = base(i64v(5));
+    assert!(inc(&mut w, i32v(0)).unwrap().is_some());
+    assert_eq!(n(&w), i64v(5));
+}
+
+/// The other recorded `$inc` cases of the same recording (line of the result):
+///
+/// | lines (reply-after) | case | operands | reference result | here |
+/// |---|---|---|---|---|
+/// | 229-230 | d1 | Int32 5 `$inc` Double 1.5 | Double 6.5 | DEVIATION (`field-merge-refusals-q7`, 2): refused |
+/// | 235-236 | d2 | Int64 7 `$inc` Double 0.5 | Double 7.5 | DEVIATION: refused |
+/// | 240-241 | d3 | Int32 5 `$inc` Double 1.0 | Double 6.0 | DEVIATION: refused |
+/// | 246-247 | d4 | Int64 5 `$inc` Double 1.0 | Double 6.0 | DEVIATION: refused |
+/// | 251-252 | d5 | Decimal128 2.5 `$inc` Double 1.5 | Decimal128 4.00000000000000 | DEVIATION: refused |
+/// | 256-257 | d6 | Decimal128 2.5 `$inc` Int32 1 | Decimal128 3.5 | Decimal128 3.5 |
+/// | 261-262 | d7 | Int32 5 `$inc` Decimal128 1.5 | Decimal128 6.5 | Decimal128 6.5 |
+/// | 282-283 | d11 | Double 1.5 `$inc` Int32 1 | Double 2.5 | Double 2.5 (a double is a register) |
+#[test]
+fn the_recorded_double_and_decimal_cases() {
+    let refused = |base_v: Value, by: Value| {
+        let mut w = base(base_v.clone());
+        let before = (w.state.clone(), w.clock);
+        assert_eq!(inc(&mut w, by), Err(UpdateRefused::IncDoubleOnCounter(p("n"))));
+        assert_eq!((w.state.clone(), w.clock), before);
+        assert_eq!(n(&w), base_v);
+    };
+    refused(i32v(5), Value::Double(1.5)); // d1
+    refused(i64v(7), Value::Double(0.5)); // d2
+    refused(i32v(5), Value::Double(1.0)); // d3
+    refused(i64v(5), Value::Double(1.0)); // d4
+    refused(dec("2.5"), Value::Double(1.5)); // d5
+    let mut w = base(dec("2.5")); // d6
+    assert!(inc(&mut w, i32v(1)).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), "3.5");
+    let mut w = base(i32v(5)); // d7
+    assert!(inc(&mut w, dec("1.5")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), "6.5");
+    let mut w = base(Value::Double(1.5)); // d11
+    assert!(inc(&mut w, i32v(1)).unwrap().is_some());
+    assert_eq!(n(&w), Value::Double(2.5));
 }
 
 /// An `Int64` operand keeps the counter an `Int64` for good, wherever the total goes.
