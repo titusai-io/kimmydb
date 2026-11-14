@@ -437,6 +437,38 @@ mod tests {
         eprintln!("structural lost set: {runs} runs, {fewer} with fewer required heads");
     }
 
+    /// HB-2's "has served" is an EVER-served set (review re-check, item 2): a stage some live member served earlier and no longer serves is not
+    /// "unseen" and is not in HB-2. The shape needs a binding the oracle calls invalid but a member applied (`m-orphan-no-deadline`): the writer
+    /// vanishes, X serves the stage, then stops serving it. Without the insert in `enter` the stage would be in HB-2 (the control at the end).
+    #[test]
+    fn hb2_uses_an_ever_served_set_not_the_last_served_physical() {
+        use crate::member::DocOp;
+        let mut sc = crate::scenario::Sc::new("m-orphan-no-deadline", &[("W", 0), ("X", 0)], 20);
+        sc.advance(1);
+        sc.ms[0].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        sc.advance(2);
+        let mut job = sc.ms[0].start_out(&mut sc.w, vec![0], crate::entry::JobKind::Late, 0);
+        let stage = job.stage.clone();
+        sc.advance(60); // past the deadline: the bind is not valid for the oracle
+        sc.ms[0].do_bind(&mut sc.w, &mut job, 2);
+        sc.pull("X", "W");
+        let bind = sc.w.all.iter().find(|e| e.kind == crate::entry::Kind::Bind && e.phys == stage).cloned().expect("the late bind was minted");
+        assert!(!sc.w.valid(&bind), "the bind must be invalid for the oracle (never validly bound)");
+        // X serves the stage by the bind (the model's lenient member: `m-orphan-no-deadline`); entered directly so the shape does not depend on the relay
+        sc.ms[1].enter(&mut sc.w, &bind);
+        assert!(sc.ms[1].ever_served.contains(&stage), "enter() did not record the physical as ever served");
+        sc.ms[0].vanished = true;
+        sc.w.held_uncovered = true;
+        sc.ms[1].cur = None; // X no longer serves it (nor does anyone)
+        assert_ne!(sc.ms[1].serving().as_deref(), Some(stage.as_str()));
+        let hb2 = crate::oracle::hb2_stages(&sc.w, &sc.ms);
+        assert!(!hb2.contains(&stage), "a stage a live member served earlier is in HB-2");
+        // control: with the history forgotten the stage IS in HB-2 (the test is sensitive to the set)
+        sc.ms[1].ever_served.remove(&stage);
+        sc.ms[1].last_served = "L".to_string();
+        assert!(crate::oracle::hb2_stages(&sc.w, &sc.ms).contains(&stage), "control: the stage should be in HB-2");
+    }
+
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost
     /// entry on a served collection). As DF-1's pin: the class must occur on each listed seed and the pin fails loudly once it
     /// disappears.
