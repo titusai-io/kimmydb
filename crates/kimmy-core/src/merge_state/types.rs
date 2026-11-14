@@ -169,7 +169,7 @@ pub enum Value {
 }
 
 /// A value that is not legal where it was put.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvalidValue {
     /// A document as a register: only inside an array is a document a value.
     #[error("merge state: a document is a value only inside an array")]
@@ -187,6 +187,10 @@ pub enum InvalidValue {
     /// symbol, DB pointer, min key, max key and undefined. Refused on `field` collections.
     #[error("merge state: the BSON type {0} cannot be stored under the field merge policy")]
     UnsupportedType(&'static str),
+    /// A merge-state value with no BSON form (an unset where a value is wanted, a regex with a
+    /// NUL byte, a value that is not a document where one is wanted).
+    #[error("merge state: no BSON value for {0}")]
+    NoBsonForm(&'static str),
 }
 
 impl Value {
