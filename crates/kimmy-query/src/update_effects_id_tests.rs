@@ -53,10 +53,9 @@ fn overlapping_operators_are_refused_at_parse_matched_or_not() {
         assert!(update::parse(&u).is_err(), "{u}");
     }
     // several $inc on distinct paths, and a leaf beside a leaf, are fine
-    for u in [
-        doc! {"$inc": {"a": 1, "b": 1, "c.d": 1}},
-        doc! {"$set": {"a.x": 1}, "$inc": {"a.n": 1}},
-    ] {
+    for u in
+        [doc! {"$inc": {"a": 1, "b": 1, "c.d": 1}}, doc! {"$set": {"a.x": 1}, "$inc": {"a.n": 1}}]
+    {
         assert!(update::parse(&u).is_ok(), "{u}");
     }
 }
@@ -78,7 +77,8 @@ fn lines() -> bson::Document {
 fn nested_array_index_follows_the_engines_post_image_as_it_is() {
     let d = lines();
     let (effects, _) = parity_doc(doc! {"$set": {"grid.0.1": 9}}, &d);
-    let want = Bson::Array(vec![Bson::Document(doc! {"1": 9}), Bson::Array(vec![3.into(), 4.into()])]);
+    let want =
+        Bson::Array(vec![Bson::Document(doc! {"1": 9}), Bson::Array(vec![3.into(), 4.into()])]);
     crate::update_effects_tests::same_effects(
         &effects,
         &fx(|e| {
