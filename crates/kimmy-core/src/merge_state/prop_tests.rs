@@ -1125,9 +1125,36 @@ fn state_equality_is_the_equality_of_the_compact_bytes() {
             }
         }
     }
-    eprintln!("state_equality: {same} equal pairs, {differ} different, {with_ords} with an order state");
+    eprintln!(
+        "state_equality: {same} equal pairs, {differ} different, {with_ords} with an order state"
+    );
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
     assert!(with_ords > 500, "only {with_ords} states carry an order state");
+    // The random pairs seldom differ in their order state ALONE (it follows from the cells), so make such
+    // pairs: the same state with one order entry removed, or one part of the first entry changed. Equal bytes
+    // for these would mean section 10 does not tell the order states apart.
+    let mut tweaked = 0;
+    for x in pools_.iter().flatten().filter(|x| !x.ords.is_empty()) {
+        let key = x.ords.keys().next().unwrap().clone();
+        let mut removed = x.clone();
+        removed.ords.remove(&key);
+        let mut changed = x.clone();
+        let e = changed.ords.get_mut(&key).unwrap();
+        if let Some(c) = &mut e.last {
+            c.1 += 1;
+        } else if let Some(l) = e.lvl {
+            e.lvl = Some(MStamp { hlc: Hlc::new(l.hlc.wall_ms + 1, 0), ..l });
+        } else {
+            e.last = Some((key.0, 0));
+        }
+        for y in [removed, changed] {
+            assert_ne!(*x, y);
+            assert_ne!(x.compact_bytes(), y.compact_bytes(), "section 10 misses a change");
+            assert_ne!(x.compact_hash(), y.compact_hash());
+            tweaked += 1;
+        }
+    }
+    assert!(tweaked > 500, "{tweaked}");
 }
 
 // ---- typed counters --------------------------------------------------------------------------
