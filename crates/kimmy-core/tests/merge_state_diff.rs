@@ -740,6 +740,9 @@ fn golden_vectors_match_the_model() {
         "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
         "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
+        // a NEW key: typed slots (the model's operands are Int64s: its encoder is told the labels and stamps)
+        "typed": J::Null,
+        "typed-compact": ["8291f85d0c22817da0032635387e1351", 286],
     });
     assert_eq!(got, want);
 }

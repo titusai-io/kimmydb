@@ -1030,6 +1030,24 @@ pub(super) fn golden_obs() -> MergeState {
     st
 }
 
+/// Three counters of one writer whose slots are not all `Int64`: `a` has an `Int32` slot (no operand
+/// stamp); `b` a `Decimal128` slot (`wide_at` and `decimal_at`, both its one write); `c` the shape the
+/// stamps exist for: a `Decimal128` operand, an `Int64` operand, a base write of an `Int32` that absorbs
+/// them, then an `Int32` operand. Its slot has `decimal_at < wide_at < stamp`, its absorbed pair is at
+/// `wide_at`, and what it gained since that pair is an `Int32`: the counter reads 7 + 5 = 12, an `Int32`.
+pub(super) fn golden_typed() -> MergeState {
+    let dv = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("a", i(1)), ("b", i(1)), ("c", i(1))]), 0).unwrap();
+    w.write_inc_value(&p("a"), &Value::Int32(5), 0).unwrap();
+    w.write_inc_value(&p("b"), &dv("3"), 0).unwrap();
+    w.write_inc_value(&p("c"), &dv("1"), 0).unwrap();
+    w.write_inc_value(&p("c"), &Value::Int64(2), 0).unwrap();
+    w.write_set(&p("c"), Value::Int32(7), 0).unwrap();
+    w.write_inc_value(&p("c"), &Value::Int32(5), 0).unwrap();
+    w.state.clone()
+}
+
 pub(super) fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
     w.insert(&fl(&[("x", i(1)), ("s", s("t"))]), 0).unwrap();
