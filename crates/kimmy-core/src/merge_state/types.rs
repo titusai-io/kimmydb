@@ -200,10 +200,16 @@ impl Value {
     /// May this value be a register of the state? Not a top-level `Document`; an array's
     /// elements may be anything but the map marker (documents among them, at any depth).
     pub fn check_register(&self) -> Result<(), InvalidValue> {
+        self.check_register_at(0)
+    }
+
+    /// [`Value::check_register`] for a value whose own level is `depth` (a cell at a path of
+    /// `depth` segments holds it).
+    fn check_register_at(&self, depth: usize) -> Result<(), InvalidValue> {
         match self {
             Value::Document(_) => Err(InvalidValue::DocumentAsRegister),
             Value::Map | Value::ImplicitMap => Ok(()),
-            v => v.check_element(0),
+            v => v.check_element(depth),
         }
     }
 
@@ -234,6 +240,14 @@ impl Value {
         self.check_input_at(0)
     }
 
+    /// [`Value::check_input`] for a value held by a cell at a path of `path_len` segments: the
+    /// path and the value nest in one document, so the path's segments count against the depth
+    /// limit with the value's own levels (a path of N segments holds a value at most 100 - N levels
+    /// deep; one level more is `TooDeep`). Every entry that takes a path and a value uses this one.
+    pub fn check_input_under(&self, path_len: usize) -> Result<(), InvalidValue> {
+        self.check_input_at(path_len)
+    }
+
     /// [`Value::check_input`] for a value `depth` documents down: a document nested as deep as the
     /// depth limit allows is refused (`TooDeep`) before the recursion goes past it.
     fn check_input_at(&self, depth: usize) -> Result<(), InvalidValue> {
@@ -251,7 +265,7 @@ impl Value {
                 f.iter().try_for_each(|(_, x)| x.check_input_at(depth + 1))
             }
             Value::Map | Value::ImplicitMap => Err(InvalidValue::MapMarker),
-            v => v.check_register(),
+            v => v.check_register_at(depth),
         }
     }
 

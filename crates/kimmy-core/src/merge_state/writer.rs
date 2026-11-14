@@ -139,7 +139,7 @@ fn expand_document(fields: &[(Path, Value)]) -> Option<Vec<(Path, Value)>> {
         if p.segments().len() != 1 || !named.insert(p) {
             return None;
         }
-        v.check_input().ok()?;
+        v.check_input_under(p.segments().len()).ok()?;
         expand(p, v, &mut out).ok()?;
     }
     Some(out)
@@ -844,7 +844,8 @@ impl Writer {
         sets: &[(Path, Value)],
         m: &mut Mint<'_>,
     ) -> Option<Written> {
-        if fields.iter().chain(sets).any(|(_, v)| v.check_input().is_err()) {
+        if fields.iter().chain(sets).any(|(q, v)| v.check_input_under(q.segments().len()).is_err())
+        {
             return None;
         }
         // The paths of one update must not meet: no path twice, none below another (the
@@ -1099,7 +1100,7 @@ impl Writer {
             // the writer's spelling of an unset: it is one, and names no ancestor (the unset body)
             return self.write_unset_m(path, m);
         }
-        v.check_input().ok()?;
+        v.check_input_under(path.segments().len()).ok()?;
         let vis = self.visible()?;
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
             return None;
@@ -1328,7 +1329,7 @@ impl Writer {
 /// `Decimal128` base, a register write for a `Double` base). Every other operator is computed by the
 /// caller from what the writer sees and sent as a `Set` of the new value (an array is one atomic
 /// value); `$setOnInsert` is the creation of an upsert, not an update operator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UpdateOp {
     /// `$set path = value`. A `Value::Document` is a sub-document (only the leaves that changed are
     /// written); `Value::Unset` is an `$unset`.
@@ -1559,7 +1560,8 @@ impl Writer {
                     }
                 }
                 UpdateOp::Set(p, v) => {
-                    v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
+                    v.check_input_under(p.segments().len())
+                        .map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
                     ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
                     let n0 = eff.len();
                     self.diff(&vis, p, v, &mut eff, &mut items, OrdMode::Write)

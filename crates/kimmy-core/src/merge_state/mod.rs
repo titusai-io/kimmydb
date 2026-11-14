@@ -85,6 +85,8 @@ mod d7_equivalence_tests;
 #[cfg(test)]
 mod hand_built;
 #[cfg(test)]
+mod depth_tests;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod ord_codec_tests;
