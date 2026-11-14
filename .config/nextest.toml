@@ -20,3 +20,12 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = 'package(kimmy-storage) & test(/^hold_meter::tests::/)'
 threads-required = "num-cpus"
+
+# `merge_state_sim`'s `runner` is CPU-bound and takes about 125 s alone (three runs of the
+# target on its own, 2026-11-13), but 512 s to over 600 s inside the whole-crate run, where
+# nextest runs it beside the rest of kimmy-core's tests: the nightly 600 s limit above was
+# missed once by load alone. It takes every slot, so it runs alone and measures only itself,
+# as the hold-meter tests do. No limit is raised.
+[[profile.default.overrides]]
+filter = 'package(kimmy-core) & binary(merge_state_sim) & test(=runner)'
+threads-required = "num-cpus"
