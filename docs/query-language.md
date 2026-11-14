@@ -1241,7 +1241,10 @@ queue never hands out the same job twice.
 - **`upsert` seeds the filter's equalities.** `{filter: {_id: "hits", scope:
   "global"}, update: {$inc: {n: 1}}, upsert: true}` creates
   `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
-  seeded, because a match does not imply it. `$setOnInsert` fields are added
+  seeded, because a match does not imply it. Two
+  equalities that overlap, the same path twice or one path inside another
+  (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
+  and are a `400` when the upsert would insert; `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that

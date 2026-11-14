@@ -21927,3 +21927,45 @@ async fn a_replacement_may_not_restate_the_id_as_something_that_is_no_id() {
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert_eq!(server.get("/v1/db/shop/coll/pu/docs/5", Some(&token)).await.status, 404);
 }
+
+#[tokio::test]
+async fn an_upsert_whose_filter_matches_one_path_twice_or_inside_itself_is_refused() {
+    // q7s2.out lines 517-545 and q7s2e.out lines 99-123: the filters whose
+    // equalities overlap name no one document to seed (code 54); two dotted
+    // keys beside each other are fine.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![]).await;
+    let fam = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/find_and_modify",
+                    Some(token),
+                    json!({ "filter": filter, "update": { "$set": { "z": 1 } }, "upsert": true,
+                            "returnDocument": "after" }),
+                )
+                .await
+        }
+    };
+    for filter in [
+        json!({ "_id": 1, "a": 1, "a.b": 2 }),
+        json!({ "_id": 1, "a": { "b": 1 }, "a.b": 2 }),
+        json!({ "_id": 1, "$and": [{ "a": 1 }, { "a": 2 }] }),
+        json!({ "_id": 1, "a": { "b": 1 }, "a.c": 2 }),
+        json!({ "_id": 1, "a.b": 1, "a": { "c": 2 } }),
+        json!({ "_id": 1, "a": { "c": 1, "b": 2 }, "a.d": 3 }),
+    ] {
+        let res = fam(filter.clone()).await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("cannot infer the fields an upsert seeds"), "{msg}");
+    }
+    let found =
+        server.post("/v1/db/shop/coll/pu/find", Some(&token), json!({ "filter": {} })).await;
+    assert_eq!(found.body["count"], 0, "{:?}", found.body);
+    let res = fam(json!({ "_id": 1, "a.b": 1, "a.c": 2 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 1, "a": { "b": 1, "c": 2 }, "z": 1 }));
+}
