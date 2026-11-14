@@ -172,6 +172,7 @@ fn the_same_update_on_the_same_document_gives_the_same_list() {
     }
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine adds new fields in the order the update names them; the reference sorts them. Flip this test with that PR.
 #[test]
 fn new_fields_take_the_order_of_the_engines_post_image() {
     let d = doc! { "_id": 1, "x": 1 };
@@ -621,6 +622,7 @@ fn table() -> Vec<Row> {
     ]
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the row "several operators" lists new fields in the engine's post-image order (the reference sorts them). Flip this test with that PR.
 #[test]
 fn the_operator_by_effect_table() {
     for (label, u, want) in table() {
@@ -819,6 +821,7 @@ fn a_positional_that_selects_nothing_has_no_effects() {
     assert!(effects.is_empty());
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: `grid.0.1`-style paths below a nested array are not in this list, the engine does not set them like the reference. Flip this test with that PR.
 #[test]
 fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
     let d = lines();

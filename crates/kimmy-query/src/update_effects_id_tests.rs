@@ -73,6 +73,7 @@ fn lines() -> bson::Document {
 /// below an element that is itself an array does not address the inner element: the engine
 /// replaces the inner array by a document (`{"1": 2}`). The reference sets `grid[0][1]`. The
 /// effects follow the engine's post-image; a fix of the engine is a separate change on main.
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine replaces the inner array by a document, the reference sets the nested element. Flip this test with that PR.
 #[test]
 fn nested_array_index_follows_the_engines_post_image_as_it_is() {
     let d = lines();
@@ -92,6 +93,7 @@ fn nested_array_index_follows_the_engines_post_image_as_it_is() {
 /// inside an array element. The effects follow the engine: the source's array is rewritten whole
 /// (`Set(items)`), the target is a `Set`, and a counter check does not apply (an array holds no
 /// counters).
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine accepts a `$rename` from inside an array element, the reference refuses it (code 2). Flip this test with that PR.
 #[test]
 fn a_rename_from_inside_an_array_element_is_a_set_of_the_array_and_a_set() {
     let d = lines();
@@ -110,6 +112,7 @@ fn a_rename_from_inside_an_array_element_is_a_set_of_the_array_and_a_set() {
     );
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine accepts a `$rename` into an array element, the reference refuses it (code 2). Flip this test with that PR.
 #[test]
 fn a_rename_into_an_array_element_is_an_unset_and_a_set_of_the_array() {
     let d = lines();
