@@ -426,7 +426,7 @@ fn a_register_set_over_a_counter_of_two_writers_folds_what_it_saw() {
 }
 
 #[test]
-fn sees_counter_at_or_under_looks_through_sub_documents_but_not_arrays() {
+fn is_incremented_number_at_or_under_looks_through_sub_documents_but_not_arrays() {
     let mut w = writer(1);
     w.insert(
         &fl(&[
@@ -439,14 +439,19 @@ fn sees_counter_at_or_under_looks_through_sub_documents_but_not_arrays() {
         0,
     )
     .unwrap();
-    for p in ["withint", "deep", "deep.l1", "n", "deep.l1.l2.c"] {
-        assert!(w.sees_counter_at_or_under(&np(p)), "{p}");
+    // a base with no slot is no counter, wherever it sits
+    for p in ["withint", "deep", "deep.l1", "n", "deep.l1.l2.c", "plain", "arr", "missing"] {
+        assert!(!w.is_incremented_number_at_or_under(&np(p)), "{p}");
     }
-    for p in ["plain", "arr", "missing", "plain.d"] {
-        assert!(!w.sees_counter_at_or_under(&np(p)), "{p}");
+    w.write_inc(&np("withint.c"), 1, 0).unwrap();
+    w.write_inc(&np("deep.l1.l2.c"), 1, 0).unwrap();
+    w.write_inc(&np("n"), 1, 0).unwrap();
+    for p in ["withint", "withint.c", "deep", "deep.l1", "n", "deep.l1.l2.c"] {
+        assert!(w.is_incremented_number_at_or_under(&np(p)), "{p}");
     }
-    // a sibling sharing a name prefix is not under the path
-    assert!(!w.sees_counter_at_or_under(&np("with")));
+    for p in ["plain", "arr", "missing", "plain.d", "withint.x"] {
+        assert!(!w.is_incremented_number_at_or_under(&np(p)), "{p}");
+    }
 }
 
 #[test]
@@ -472,4 +477,225 @@ fn the_renaming_entry_refuses_a_counter_source_before_the_clock_moves() {
     // a non-counter source is an ordinary update
     let ok = [UpdateOp::Unset(np("b")), UpdateOp::Set(np("b2"), s("str"))];
     assert!(w.write_update_renaming(&ok, &[np("b")], 0).unwrap().is_some());
+}
+
+// ---- `$rename` is refused only for a numeric field that has been incremented (Q7 amendment 8) ----
+
+/// The ops of `$rename from to` over the value `v` that the product read at `from`.
+fn rename_ops(from: &str, to: &str, v: Value) -> Vec<UpdateOp> {
+    vec![UpdateOp::Unset(np(from)), UpdateOp::Set(np(to), v)]
+}
+
+/// Rename `from` to `to` through the writer; `Ok` carries whether anything was written.
+fn rename(w: &mut Writer, from: &str, to: &str, v: Value) -> Result<bool, UpdateRefused> {
+    w.write_update_renaming(&rename_ops(from, to, v), &[np(from)], 0).map(|r| r.is_some())
+}
+
+fn refusal(p: &str) -> Result<bool, UpdateRefused> {
+    Err(UpdateRefused::RenameOfCounter(np(p)))
+}
+
+const DEC: Value = Value::Decimal128([0x30; 16]);
+
+#[test]
+fn rn_a_never_incremented_number_is_renamed_like_a_register() {
+    for v in [Value::Int32(4), i(4), DEC] {
+        let mut w = writer(1);
+        w.insert(&fl(&[("a", v.clone()), ("k", s("keep"))]), 0).unwrap();
+        assert_eq!(rename(&mut w, "a", "b", v.clone()), Ok(true), "{v:?}");
+        let got = w.visible().unwrap();
+        assert_eq!(got.get(&np("b")), Some(&v), "{v:?}");
+        assert_eq!(got.get(&np("a")), None, "{v:?}");
+        assert_eq!(got.get(&np("k")), Some(&s("keep")), "{v:?}");
+        // a plain `$set` of a number is no counter either
+        let mut w = writer(1);
+        w.insert(&fl(&[("k", s("keep"))]), 0).unwrap();
+        w.write_set(&np("a"), v.clone(), 0).unwrap();
+        assert_eq!(rename(&mut w, "a", "b", v.clone()), Ok(true), "set {v:?}");
+        assert_eq!(w.visible().unwrap().get(&np("b")), Some(&v), "set {v:?}");
+    }
+}
+
+#[test]
+fn rn_a_sub_document_of_plain_numbers_is_renamed_and_the_source_is_gone() {
+    let m = doc(&[("x", i(1)), ("y", Value::Int32(2)), ("z", DEC)]);
+    let mut w = writer(1);
+    w.insert(&fl(&[("m", m.clone())]), 0).unwrap();
+    // what `Effects::rename` sends: `Unset(m)` and `Set(n, Document)`
+    let ops = rename_ops("m", "n", m);
+    assert!(w.write_update_renaming(&ops, &[np("m")], 0).unwrap().is_some());
+    let got = w.visible().unwrap();
+    assert!(
+        got.keys().all(|k| *k != np("m") && !k.is_below(&np("m"))),
+        "the source stays: {got:?}"
+    );
+    assert_eq!(got.get(&np("n.x")), Some(&i(1)));
+    assert_eq!(got.get(&np("n.y")), Some(&Value::Int32(2)));
+    assert_eq!(got.get(&np("n.z")), Some(&DEC));
+}
+
+#[test]
+fn rn_a_field_with_one_slot_is_refused() {
+    let mut w = writer(1);
+    w.insert(&fl(&[("a", i(1))]), 0).unwrap();
+    w.write_inc(&np("a"), 1, 0).unwrap();
+    assert_eq!(rename(&mut w, "a", "b", i(2)), refusal("a"));
+}
+
+#[test]
+fn rn_a_numeric_set_over_an_incremented_field_does_not_free_it() {
+    let mut w = writer(1);
+    w.insert(&fl(&[("a", i(1))]), 0).unwrap();
+    w.write_inc(&np("a"), 1, 0).unwrap();
+    w.write_set(&np("a"), i(100), 0).unwrap();
+    assert!(w.state.slots.values().all(|s| s.absorbed.is_some()), "the set absorbed the slot");
+    assert_eq!(rename(&mut w, "a", "b", i(100)), refusal("a"));
+}
+
+#[test]
+fn rn_a_field_incremented_and_then_set_to_a_non_number_is_renamed() {
+    let mut base = writer(1);
+    base.insert(&fl(&[("a", i(1))]), 0).unwrap();
+    base.write_inc(&np("a"), 1, 0).unwrap();
+    assert_eq!(rename(&mut base.clone(), "a", "b", i(2)), refusal("a"));
+    for v in [s("s"), Value::Array(vec![i(1)]), doc(&[("x", i(1))])] {
+        let mut w = base.clone();
+        w.write_set(&np("a"), v.clone(), 0).unwrap();
+        assert!(!w.state.slots.is_empty(), "the slot is still there");
+        assert!(!w.is_incremented_number_at_or_under(&np("a")), "{v:?}");
+        assert_eq!(rename(&mut w, "a", "b", v.clone()), Ok(true), "{v:?}");
+        let got = w.visible().unwrap();
+        assert!(got.keys().all(|k| *k != np("a") && !k.is_below(&np("a"))), "{v:?}: {got:?}");
+        assert!(got.contains_key(&np("b")), "{v:?}");
+    }
+}
+
+#[test]
+fn rn_a_parent_whose_incremented_child_is_gone_is_renamed() {
+    for how in ["unset", "replace"] {
+        let mut w = writer(1);
+        w.insert(&fl(&[("m", doc(&[("x", i(1)), ("c", i(1))]))]), 0).unwrap();
+        w.write_inc(&np("m.c"), 1, 0).unwrap();
+        let rest = doc(&[("x", i(1))]);
+        assert_eq!(rename(&mut w.clone(), "m", "n", rest.clone()), refusal("m"), "{how}");
+        match how {
+            "unset" => w.write_unset(&np("m.c"), 0).unwrap(),
+            _ => w.write_replace(&fl(&[("m", rest.clone())]), 0).unwrap(),
+        };
+        assert!(!w.is_incremented_number_at_or_under(&np("m")), "{how}");
+        assert_eq!(rename(&mut w, "m", "n", rest), Ok(true), "{how}");
+        let got = w.visible().unwrap();
+        assert!(got.keys().all(|k| *k != np("m") && !k.is_below(&np("m"))), "{how}: {got:?}");
+        assert_eq!(got.get(&np("n.x")), Some(&i(1)), "{how}");
+    }
+}
+
+#[test]
+fn rn_a_slot_in_the_older_of_two_alive_lives_is_found() {
+    // two alive lives from an explicit insert and a creating upsert (concurrent first inserts
+    // supersede each other, so they cannot be used); the slot of `a` is in the OLDER life, in
+    // both ways round
+    for upsert_is_older in [false, true] {
+        let (skew_insert, skew_upsert) = if upsert_is_older { (1000, 0) } else { (0, 1000) };
+        let mut ins = writer(1);
+        let mut ups = writer(2);
+        ins.insert(&fl(&[("a", i(1))]), skew_insert).unwrap();
+        if upsert_is_older {
+            ups.upsert_inc(&np("a"), 1, skew_upsert).unwrap();
+        } else {
+            ins.write_inc(&np("a"), 1, 0).unwrap();
+            ups.upsert_inc(&np("y"), 1, skew_upsert).unwrap();
+        }
+        let mut c = writer(3);
+        c.receive(&ins.state);
+        c.receive(&ups.state);
+        let alive = c.alive();
+        assert_eq!(alive.len(), 2, "two alive lives (upsert older: {upsert_is_older})");
+        let slot_life = c.state.slots.keys().find(|k| k.1 == np("a")).unwrap().0;
+        assert!(slot_life < alive[1], "the slot is in the older life: {slot_life:?} {alive:?}");
+        assert!(c.is_incremented_number_at_or_under(&np("a")), "upsert older: {upsert_is_older}");
+        assert_eq!(rename(&mut c, "a", "z", i(0)), refusal("a"), "upsert older: {upsert_is_older}");
+    }
+}
+
+#[test]
+fn rn_the_second_of_two_renames_is_checked_too() {
+    let mut w = writer(1);
+    w.insert(&fl(&[("p", i(1)), ("c", i(1))]), 0).unwrap();
+    w.write_inc(&np("c"), 1, 0).unwrap();
+    let (state, clock) = (w.state.clone(), w.clock);
+    let mut ops = rename_ops("p", "p2", i(1));
+    ops.extend(rename_ops("c", "c2", i(2)));
+    let r = w.write_update_renaming(&ops, &[np("p"), np("c")], 0);
+    assert_eq!(r, Err(UpdateRefused::RenameOfCounter(np("c"))));
+    assert_eq!((w.state.clone(), w.clock), (state, clock));
+}
+
+#[test]
+fn rn_a_sub_document_holding_one_incremented_field_is_refused() {
+    let mut w = writer(1);
+    w.insert(&fl(&[("m", doc(&[("x", i(1)), ("y", i(2))]))]), 0).unwrap();
+    w.write_inc(&np("m.y"), 1, 0).unwrap();
+    assert_eq!(rename(&mut w, "m", "n", i(0)), refusal("m"));
+    // the plain sibling alone is renamable
+    assert_eq!(rename(&mut w, "m.x", "m2", i(1)), Ok(true));
+}
+
+#[test]
+fn rn_a_field_created_by_inc_on_an_absent_path_is_refused() {
+    let mut w = writer(1);
+    w.insert(&fl(&[("k", i(1))]), 0).unwrap();
+    w.write_inc(&np("c"), 3, 0).unwrap();
+    assert_eq!(rename(&mut w, "c", "d", i(3)), refusal("c"));
+}
+
+#[test]
+fn rn_a_creating_upserts_filter_and_set_fields_are_renamed_but_its_inc_field_is_not() {
+    let mut w = writer(1);
+    w.upsert_soi(&fl(&[("f", i(3))]), &np("c"), 1, &fl(&[("t", Value::Int32(4))]), 0).unwrap();
+    assert_eq!(rename(&mut w, "f", "f2", i(3)), Ok(true));
+    assert_eq!(rename(&mut w, "t", "t2", Value::Int32(4)), Ok(true));
+    assert_eq!(rename(&mut w, "c", "c2", i(1)), refusal("c"));
+}
+
+#[test]
+fn rn_the_race_rename_of_a_plain_field_against_a_first_inc_reads_rename_then_inc_in_every_order() {
+    // both stamp orders: the rename is stamped before or after the increment
+    for (skew_a, skew_b) in [(1000u64, 0u64), (0, 1000)] {
+        let mut a = writer(1);
+        a.insert(&fl(&[("a", i(7))]), 0).unwrap();
+        let mut b = writer(2);
+        b.receive(&a.state);
+        let mut c = writer(3);
+        c.receive(&a.state);
+        // A renames `a` to `b`; B, which has not seen it, makes the first increment of `a`
+        let ops = rename_ops("a", "b", i(7));
+        assert!(a.write_update_renaming(&ops, &[np("a")], skew_a).unwrap().is_some());
+        b.write_inc(&np("a"), 5, skew_b).unwrap();
+        let want: BTreeMap<Path, Value> = [(np("a"), i(5)), (np("b"), i(7))].into_iter().collect();
+        let o = opts();
+        let tag = format!("skews ({skew_a}, {skew_b})");
+        let (ab, l1) = a.state.join(&b.state, &o);
+        let (ba, l2) = b.state.join(&a.state, &o);
+        assert_eq!(ab, ba, "{tag}");
+        assert!(l1.is_empty() && l2.is_empty(), "{tag}: no loss record: {l1:?} {l2:?}");
+        assert_eq!(ab.visible(&o).unwrap(), want, "{tag}");
+        let order = ab.ordered_document(&o);
+        assert_eq!(order, ba.ordered_document(&o), "{tag}");
+        let names: Vec<String> = order.iter().flatten().map(|(n, _)| n.clone()).collect();
+        eprintln!("rn race {tag}: field order {names:?}");
+        // the serial order "rename, then increment": `b` is written first, `a` is created after
+        // it (the reading of `ord.rs`; the hold shows both skews agree)
+        assert_eq!(names, ["b", "a"], "{tag}");
+        // a third member that has seen neither, receiving the two states in each order
+        for (first, second) in [(&a.state, &b.state), (&b.state, &a.state)] {
+            let mut m = c.clone();
+            let mut l = m.receive(first);
+            l.extend(m.receive(second));
+            assert!(l.is_empty(), "{tag}: no loss record: {l:?}");
+            assert_eq!(m.state, ab, "{tag}");
+            assert_eq!(m.visible().unwrap(), want, "{tag}");
+            assert_eq!(m.state.ordered_document(&o), order, "{tag}");
+        }
+    }
 }
