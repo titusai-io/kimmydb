@@ -654,7 +654,14 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// derived Debug of the type now prints `Origin {..}` where it printed `WriterId {..}`. States and reads are unchanged: with a temporary Debug
 /// impl printing `WriterId`, every pin matched; the Python differential still reports 0 scripts disagreeing.
 /// 0x3ddd_f823_ee88_e7c7 to 0xccb0_e0db_c8f1_83b7.
-const PINNED_300: u64 = 0xccb0_e0db_c8f1_83b7;
+///
+/// RE-PINNED when a counter slot began to spell the stamps of its latest wide and decimal operands (`wide_at`, `decimal_at`; Amendment 6
+/// of the Q7 design): the fingerprint hashes the `{:?}` text of the states, and a slot now prints those two fields. Every operand of this
+/// differential is an Int64, so every slot holds `wide_at`. Compared step by step against the series before the change (the same 300 scripts,
+/// the same draws): 38,435 steps in common, 20,321 steps whose state holds no slot are identical, 0 slotless steps differ, 18,114 steps
+/// whose state holds a slot differ, 0 steps with a slot are identical. The replay still agrees with the model (0 scripts disagree).
+/// 0xccb0_e0db_c8f1_83b7 to 0x6369_2db0_1289_772a.
+const PINNED_300: u64 = 0x6369_2db0_1289_772a;
 
 #[test]
 fn differential_against_the_python_model() {
