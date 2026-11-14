@@ -18817,6 +18817,31 @@ async fn a_merge_into_another_database_needs_the_grant_there() {
     assert!(sink_dump(&server, &root, "reports", "daily").await.is_empty());
 }
 
+/// An implicitly created `$out` or `$merge` target is a collection like one created over HTTP
+/// without a `mergePolicy`: it has the collection default (`field`), not `document`.
+#[tokio::test]
+async fn an_implicitly_created_sink_target_has_the_default_merge_policy() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(&server, &token, "src", sink_source()).await;
+    let res = sink_run(&server, &token, "src", json!([{"$out": "snap"}])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([{"$merge": {"into": {"db": "shop", "coll": "joined"}}}]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let made = server.post("/v1/db/shop/collections", Some(&token), json!({"name": "made"})).await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    for name in ["snap", "joined", "made"] {
+        let meta = server.state.engine.get_collection("shop", name).unwrap();
+        assert_eq!(meta.merge_policy, kimmy_core::MergePolicy::DEFAULT, "shop.{name}");
+    }
+}
+
 #[tokio::test]
 async fn out_writes_a_missing_or_empty_target_and_refuses_one_with_documents() {
     let server = Server::start().await;

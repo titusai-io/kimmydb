@@ -3311,7 +3311,16 @@ fn write_sink(
     let _suspended = deadline::Deadline::suspend();
     let meta = match existing {
         Some(meta) => meta,
-        None => match kimmy_storage::blocking(|| state.engine.create_collection(&db, &coll)) {
+        // An implicit target is a collection like any created without a `mergePolicy`: the
+        // collection default, as over HTTP.
+        None => match kimmy_storage::blocking(|| {
+            state.engine.create_collection_with_policy(
+                &db,
+                &coll,
+                kimmy_core::MergePolicy::DEFAULT,
+                None,
+            )
+        }) {
             Ok(meta) => meta,
             // Created by someone else since the plan: it is theirs, and for `$out`
             // it is no longer new.
