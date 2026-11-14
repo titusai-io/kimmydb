@@ -76,6 +76,9 @@ pub enum OpKind {
     /// Remove every element that satisfies this condition, parsed once with the
     /// update (`$pull` with an all-operator document; see [`pull_is_condition`]).
     PullWhere(Filter),
+    /// Remove every element that is a document the query matches (`$pull` with a
+    /// document naming fields; see [`parse_pull`]).
+    PullQuery(Filter),
     /// Remove every element equal to any of these values.
     PullAll(Vec<Bson>),
     /// Remove the first (`-1`) or last (`1`) element.
@@ -98,7 +101,7 @@ impl OpKind {
             OpKind::Max(_) => "$max",
             OpKind::Push(_) | OpKind::PushEach(_) => "$push",
             OpKind::AddToSet(_) => "$addToSet",
-            OpKind::Pull(_) | OpKind::PullWhere(_) => "$pull",
+            OpKind::Pull(_) | OpKind::PullWhere(_) | OpKind::PullQuery(_) => "$pull",
             OpKind::PullAll(_) => "$pullAll",
             OpKind::Pop(_) => "$pop",
             OpKind::Rename(_) => "$rename",
@@ -729,20 +732,34 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
     })
 }
 
-/// Whether a `$pull` operand is a condition rather than a value to match.
+/// Whether a `$pull` operand is an operator condition rather than a value to match.
 ///
-/// The one place this is decided. A document every key of which starts with
-/// `$` is a condition, evaluated for each element with the filter matcher; any
-/// other operand (a scalar, an array, a document with no `$` key, the empty
-/// document) is a value, removed by canonical equality as `$pull` always has.
-/// A document with some `$` keys and some not is neither, and is refused by
-/// [`parse_pull`] rather than guessed at.
+/// A document every key of which starts with `$` is a condition, evaluated for
+/// each element with the filter matcher. A document with no `$` key, the empty
+/// document too, is a query on each element (see [`parse_pull`]); any other
+/// operand (a scalar, an array) is a value, removed by canonical equality. A
+/// document with some `$` keys and some not is refused by [`parse_pull`]
+/// (q7s2q.out q0194 line 1317).
 fn pull_is_condition(operand: &Bson) -> bool {
     matches!(operand, Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')))
 }
 
-/// `$pull`: a condition for an all-operator document, a value otherwise.
+/// `$pull`: a condition for an all-operator document or a regular expression,
+/// a query on each element for a document naming fields (q7s2j.out j1254),
+/// a value otherwise.
 fn parse_pull(arg: &Bson) -> Result<OpKind> {
+    if let Bson::RegularExpression(_) = arg {
+        let mut pattern = Document::new();
+        pattern.insert("$regex", arg.clone());
+        return Ok(OpKind::PullWhere(filter::parse_condition_document(&pattern)?));
+    }
+    // The empty document too: a query every document element satisfies
+    // (q7s2q.out q0240 line 1593).
+    if let Bson::Document(doc) = arg
+        && doc.keys().all(|k| !k.starts_with('$'))
+    {
+        return Ok(OpKind::PullQuery(filter::parse_pull_query(doc)?));
+    }
     if let Bson::Document(doc) = arg
         && pull_is_condition(arg)
     {
@@ -754,9 +771,8 @@ fn parse_pull(arg: &Bson) -> Result<OpKind> {
     {
         return Err(Error::InvalidUpdate(format!(
             "$pull cannot mix operators with plain fields in one document (found {operator:?} \
-             and {plain:?}); to remove the elements whose fields satisfy conditions, spell it \
-             {{\"$elemMatch\": {{...}}}}, as in {{\"$pull\": {{\"results\": {{\"$elemMatch\": \
-             {{\"score\": 8}}}}}}}}"
+             and {plain:?}); write the operators alone, as a condition on each element, or the \
+             fields alone, as a query on each document element"
         )));
     }
     Ok(OpKind::Pull(arg.clone()))
@@ -1374,6 +1390,17 @@ fn apply_one(
             let mut kept = Vec::with_capacity(items.len());
             for item in items {
                 if !filter::matches_pull_element(condition, &item)? {
+                    kept.push(item);
+                }
+            }
+            set(doc, Bson::Array(kept))?;
+        }
+
+        OpKind::PullQuery(query) => {
+            let Some(items) = pull_target(current, "$pull", &op.path)? else { return Ok(()) };
+            let mut kept = Vec::with_capacity(items.len());
+            for item in items {
+                if !filter::matches_pull_query(query, &item)? {
                     kept.push(item);
                 }
             }
@@ -3630,10 +3657,6 @@ mod tests {
             doc! { "v": [3] }
         );
         assert_eq!(
-            applied(doc! { "$pull": { "v": { "$not": { "$gt": 2 } } } }, doc! { "v": [1, 2, 3] }),
-            doc! { "v": [3] }
-        );
-        assert_eq!(
             applied(doc! { "$pull": { "v": { "$regex": "^a" } } }, doc! { "v": ["ab", "ba", 5] }),
             doc! { "v": ["ba", 5] }
         );
@@ -3643,53 +3666,301 @@ mod tests {
         );
     }
 
+    /// A top-level `$elemMatch` removes no document element: q7s2q.out q0221 (line 1479)
+    /// over the documents, q0311 (2019) over the mix, q0356 (2289) over documents holding
+    /// arrays, q0401 (2559) over sub-documents, and j1296 of q7s2j.out.
     #[test]
-    fn pull_elem_match_removes_the_documents_whose_fields_match() {
+    fn pull_elem_match_leaves_the_documents() {
+        let a_is_1 = || bson::bson!({ "$elemMatch": { "a": 1 } });
+        let with_arrays = bson::bson!([{ "a": [1, 2] }, { "a": [3] }, { "a": [] }, { "a": 1 }]);
+        let sub_documents =
+            bson::bson!([{ "a": { "b": 1 } }, { "a": { "b": 2 } }, { "a": { "b": 1, "c": 1 } }]);
+        for stored in [q_documents(), q_mixed(), with_arrays, sub_documents] {
+            assert_eq!(pulled(a_is_1(), stored.clone()), stored);
+        }
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$gt": 1 } }), pull_documents()),
+            pull_documents()
+        );
+        // The same on a collection of results, whose arrays the recording does not hold.
         let out =
             applied(doc! { "$pull": { "results": { "$elemMatch": { "score": 8 } } } }, results());
-        assert_eq!(out, doc! { "results": [{ "score": 7, "item": "C" }] });
+        assert_eq!(out, results());
         let out = applied(
             doc! { "$pull": { "results": { "$elemMatch": { "score": { "$gte": 8 }, "item": "B" } } } },
             results(),
         );
-        assert_eq!(out.get_array("results").unwrap().len(), 3);
+        assert_eq!(out, results());
     }
 
+    /// The array a `$pull` of `operand` leaves of `before` at the field `f`.
+    fn pulled(operand: Bson, before: Bson) -> Bson {
+        let out = applied(doc! { "$pull": { "f": operand } }, doc! { "f": before });
+        out.get("f").cloned().expect("the field stays")
+    }
+
+    fn ints(values: &[i32]) -> Bson {
+        Bson::Array(values.iter().map(|v| Bson::Int32(*v)).collect())
+    }
+
+    /// The array every recorded `$pull` case starts from where the elements
+    /// are documents.
+    fn pull_documents() -> Bson {
+        bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }, { "a": 1, "b": 7 }])
+    }
+
+    /// A mix of an integer, an array, a document, a null and a string.
+    fn pull_mixed() -> Bson {
+        bson::bson!([1, [2], { "a": 3 }, null, "s"])
+    }
+
+    /// Removing an element equal to a whole document is `$pullAll`, which compares the
+    /// whole value: `{a: 1}` removes no `{a: 1, b: 5}` (q7s2j.out j1344, line 8094, and
+    /// j1341, line 8076) and `{a: 1, b: 5}` removes that element alone (j1350, line 8131;
+    /// j1347, line 8113). A `$pull` of the same document is a query and removes by fields.
+    /// UNRECORDED: an `$eq` of a document as a `$pull` condition.
     #[test]
-    fn pull_with_a_plain_document_matches_the_whole_element() {
-        // `{score: 8}` is not a condition: it removes only the elements equal
-        // to it, not the superset `{score: 8, item: "B"}`.
-        let out = applied(doc! { "$pull": { "results": { "score": 8 } } }, results());
+    fn pull_all_is_the_whole_element_form_that_pull_by_document_replaced() {
+        let pull_all = |listed: Bson, before: Bson| -> Bson {
+            let out = applied(doc! { "$pullAll": { "f": [listed] } }, doc! { "f": before });
+            out.get("f").cloned().expect("the field stays")
+        };
+        assert_eq!(pull_all(bson::bson!({ "a": 1 }), pull_documents()), pull_documents());
         assert_eq!(
-            out,
-            doc! { "results": [
-                { "score": 8, "item": "A" },
-                { "score": 8, "item": "B" },
-                { "score": 7, "item": "C" },
-            ] }
+            pull_all(bson::bson!({ "a": 1, "b": 5 }), pull_documents()),
+            bson::bson!([{ "a": 2, "b": 6 }, { "a": 1, "b": 7 }]),
         );
-        // Field order counts, as it always has.
-        let out = applied(
-            doc! { "$pull": { "r": { "a": 1, "b": 2 } } },
-            doc! { "r": [{ "b": 2, "a": 1 }, { "a": 1, "b": 2 }] },
+        assert_eq!(
+            pull_all(
+                bson::bson!({ "a": 1, "b": 5 }),
+                bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }])
+            ),
+            bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }]),
         );
-        assert_eq!(out, doc! { "r": [{ "b": 2, "a": 1 }] });
-        // The empty document is a value too: it removes the empty documents.
-        let out = applied(doc! { "$pull": { "r": {} } }, doc! { "r": [{}, { "a": 1 }, 5] });
-        assert_eq!(out, doc! { "r": [{ "a": 1 }, 5] });
+    }
+
+    /// A document operand with no `$` key is a query on each element: a
+    /// document element it matches by those fields is removed, whatever else
+    /// it holds and in whatever order. q7s2j.out, reference 6.0.5.
+    #[test]
+    fn pull_by_document_is_a_query_on_each_element() {
+        // j1254, q7s2j.out lines 7539-7544.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), pull_documents()),
+            bson::bson!([{ "a": 2, "b": 6 }]),
+        );
+        // j1251, lines 7521-7526: both elements hold a: 1, in two field orders.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }])),
+            bson::bson!([]),
+        );
+        // j1260, lines 7576-7581: every field named must match.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1, "b": 7 }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }]),
+        );
+        // j1266, lines 7613-7618: the order the fields are named in does not matter.
+        assert_eq!(
+            pulled(bson::bson!({ "b": 7, "a": 1 }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }]),
+        );
+        // j0709, lines 4250-4255: a field holding an array matches by an element of it.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), bson::bson!([{ "a": [1, 2] }, { "a": [3] }])),
+            bson::bson!([{ "a": [3] }]),
+        );
+    }
+
+    /// A field of the query may carry operators: j1270 (lines 7638-7643) and
+    /// j1272 (lines 7650-7655).
+    #[test]
+    fn pull_by_document_takes_operators_on_its_fields() {
+        assert_eq!(
+            pulled(bson::bson!({ "a": { "$gte": 2 } }), pull_mixed()),
+            bson::bson!([1, [2], null, "s"]),
+        );
+        assert_eq!(
+            pulled(bson::bson!({ "a": { "$gte": 2 } }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 1, "b": 7 }]),
+        );
+    }
+
+    /// Only a document element is tested: scalars, arrays and nulls stay,
+    /// j1252 (lines 7527-7532), j1253 (7533-7538) and j1255 (7545-7550).
+    /// UNRECORDED: an array element that holds documents.
+    #[test]
+    fn pull_by_document_leaves_the_elements_that_are_not_documents() {
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), pull_mixed()), pull_mixed());
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+        let arrays = bson::bson!([[1, 2], [2, 1], [1, 2]]);
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), arrays.clone()), arrays);
+    }
+
+    /// A regular expression operand is a pattern the elements are matched
+    /// against: a string it matches is removed and nothing else is,
+    /// j1312 (lines 7897-7902) and j1310 (lines 7885-7890).
+    #[test]
+    fn pull_by_document_reads_a_regular_expression_as_a_pattern() {
+        let re = || {
+            Bson::RegularExpression(bson::Regex {
+                pattern: "^s".to_string().try_into().expect("valid pattern"),
+                options: String::new().try_into().expect("valid options"),
+            })
+        };
+        assert_eq!(pulled(re(), pull_mixed()), bson::bson!([1, [2], { "a": 3 }, null]));
+        assert_eq!(pulled(re(), pull_documents()), pull_documents());
+        assert_eq!(pulled(re(), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+    }
+
+    /// `{$elemMatch: {...}}` as the whole operand reads an element that is an
+    /// array: the scalars in an array of scalars stay, j1292 (lines 7774-7779)
+    /// and j1295 (lines 7792-7797), and the arrays one of whose members
+    /// satisfies the body go, j1294 (7786-7791) and j1297 (7804-7809).
+    #[test]
+    fn pull_by_document_reads_an_elem_match_as_a_search_of_an_array_element() {
+        let operand = || bson::bson!({ "$elemMatch": { "$gt": 1 } });
+        let longs =
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(2), Bson::Double(2.0), Bson::Int64(3)]);
+        assert_eq!(pulled(operand(), longs.clone()), longs);
+        assert_eq!(pulled(operand(), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+        assert_eq!(pulled(operand(), pull_mixed()), bson::bson!([1, { "a": 3 }, null, "s"]));
+        assert_eq!(pulled(operand(), pull_documents()), pull_documents());
+        assert_eq!(pulled(operand(), bson::bson!([[1, 2], [2, 1], [1, 2]])), bson::bson!([]));
+    }
+
+    /// The arrays of q7s2q.out, the recorded fixtures of cases q0151-q0426.
+    fn q_scalars() -> Bson {
+        bson::bson!([1, 2, 3, 2, "a", null, 2.0])
+    }
+    fn q_documents() -> Bson {
+        bson::bson!([{ "a": 1, "b": 2 }, { "a": 2 }, { "a": 1, "b": 3 }, { "b": 2, "a": 1 }])
+    }
+    fn q_arrays() -> Bson {
+        bson::bson!([[1, 2], [2, 3], [1], []])
+    }
+    fn q_mixed() -> Bson {
+        bson::bson!([1, { "a": 1 }, [1], "s", null, { "a": [1, 2] }])
+    }
+
+    /// The empty document is a query every document element satisfies, and no other
+    /// element does: q7s2q.out q0240 (line 1593) over the documents, q0330 (2133) over the
+    /// mix, q0195 (1323) over the scalars, q0285 (1863) over the arrays.
+    #[test]
+    fn pull_by_document_reads_the_empty_document_as_every_document() {
+        let operand = || bson::bson!({});
+        assert_eq!(pulled(operand(), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(operand(), q_mixed()), bson::bson!([1, [1], "s", null]));
+        assert_eq!(pulled(operand(), q_scalars()), q_scalars());
+        assert_eq!(pulled(operand(), q_arrays()), q_arrays());
+    }
+
+    /// A top-level `$elemMatch` pulls an element that is an array when a member satisfies
+    /// its body, and never a document or a scalar element: q7s3i.jsonl cases 127, 128, 130
+    /// (over `[[1,2],[3]]`), 140 and 143 (over `[{b:1},5,[6],null]`, where `[6]` goes), 132
+    /// and 145 (an empty body pulls none), 96-108 and 148-159 (documents), 109-121 (scalars)
+    /// and, as a query on the fields, 160.
+    #[test]
+    fn pull_elem_match_pulls_only_the_array_elements_a_member_satisfies() {
+        let gt = || bson::bson!({ "$elemMatch": { "$gt": 1 } });
+        let arrays = || bson::bson!([[1, 2], [3]]);
+        assert_eq!(pulled(gt(), arrays()), bson::bson!([]));
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$gt": 1, "$lt": 3 } }), arrays()),
+            bson::bson!([[3]])
+        );
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$exists": true } }), arrays()),
+            bson::bson!([])
+        );
+        let mixed = || bson::bson!([{ "b": 1 }, 5, [6], null]);
+        let without = bson::bson!([{ "b": 1 }, 5, null]);
+        assert_eq!(pulled(gt(), mixed()), without);
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": { "$exists": true } }), mixed()), without);
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": {} }), arrays()), arrays());
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": {} }), mixed()), mixed());
+        let docs = || bson::bson!([{ "b": 1, "c": [1, 2] }, { "b": 2 }, { "b": 3, "c": [] }]);
+        for body in [
+            bson::bson!({ "$elemMatch": { "b": 1 } }),
+            bson::bson!({ "$elemMatch": { "$gt": 1 } }),
+            bson::bson!({ "$elemMatch": {} }),
+            bson::bson!({ "$elemMatch": { "$or": [{ "b": 1 }, { "b": 3 }] } }),
+        ] {
+            assert_eq!(pulled(body.clone(), docs()), docs(), "{body}");
+        }
+        let scalars = bson::bson!([1, 2, 3]);
+        assert_eq!(pulled(gt(), scalars.clone()), scalars);
+        let nested = bson::bson!([{ "b": [{ "c": 1 }, { "c": 2 }] }, { "b": [{ "c": 3 }] }]);
+        assert_eq!(
+            pulled(bson::bson!({ "b": { "$elemMatch": { "c": 1 } } }), nested),
+            bson::bson!([{ "b": [{ "c": 3 }] }])
+        );
+    }
+
+    /// `$and`, `$or` and `$nor` are queries on the document elements, and no other element
+    /// satisfies them, a `$nor` included: q7s2q.out q0234-q0236 (lines 1557-1569) over the
+    /// documents, q0189-q0191 (1281-1299) over the scalars, q0279-q0281 (1821-1839) over the
+    /// arrays, q0324-q0326 (2097-2109) over the mix.
+    #[test]
+    fn pull_by_document_reads_the_logical_operators_as_queries_on_documents() {
+        let or = || bson::bson!({ "$or": [{ "a": 1 }, { "a": 2 }] });
+        let and = || bson::bson!({ "$and": [{ "a": 1 }, { "b": 2 }] });
+        let nor = || bson::bson!({ "$nor": [{ "a": 1 }] });
+        // q0234, q0235, q0236.
+        assert_eq!(pulled(or(), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(and(), q_documents()), bson::bson!([{ "a": 2 }, { "a": 1, "b": 3 }]));
+        assert_eq!(
+            pulled(nor(), q_documents()),
+            bson::bson!([{ "a": 1, "b": 2 }, { "a": 1, "b": 3 }, { "b": 2, "a": 1 }])
+        );
+        // q0189-q0191 and q0279-q0281: nothing else is removed, a `$nor` included.
+        for operand in [or(), and(), nor()] {
+            assert_eq!(pulled(operand.clone(), q_scalars()), q_scalars(), "{operand}");
+            assert_eq!(pulled(operand.clone(), q_arrays()), q_arrays(), "{operand}");
+        }
+        // q0324: both documents with `a: 1`, one of them with `a: [1, 2]`, go; q0325 and
+        // q0326: no document matches the `$and`, and both match `a: 1`, so the `$nor`
+        // pulls nothing.
+        assert_eq!(pulled(or(), q_mixed()), bson::bson!([1, [1], "s", null]));
+        assert_eq!(pulled(and(), q_mixed()), q_mixed());
+        assert_eq!(pulled(nor(), q_mixed()), q_mixed());
+        // An operator inside a logical clause is not a query, and is refused: q0192 (line 1305),
+        // q0193, q0237.
+        for operand in [
+            doc! { "$or": [{ "$gt": 2 }, { "$lt": 2 }] },
+            doc! { "$and": [{ "$gt": 1 }, { "$lt": 3 }] },
+        ] {
+            let message = apply_err(doc! { "$pull": { "f": operand.clone() } }, doc! { "f": [1] });
+            assert!(message.contains("$gt"), "{operand}: {message}");
+        }
+    }
+
+    /// `$ne` and `$nin` hold for a document element, which has no such value, and so remove
+    /// every one: q7s2q.out q0212 (line 1425), q0213 (1431); over the scalars q0167 (1155),
+    /// q0168 (1161) they remove what is not listed.
+    #[test]
+    fn pull_by_condition_treats_a_document_element_as_a_value_that_is_not_listed() {
+        assert_eq!(pulled(bson::bson!({ "$ne": 2 }), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(bson::bson!({ "$nin": [1, 2] }), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(bson::bson!({ "$ne": 2 }), q_scalars()), bson::bson!([2, 2, 2.0]));
+        assert_eq!(
+            pulled(bson::bson!({ "$nin": [1, 2] }), q_scalars()),
+            bson::bson!([1, 2, 2, 2.0])
+        );
     }
 
     #[test]
-    fn pull_with_a_mixed_document_is_refused_saying_how_to_spell_it() {
+    fn pull_with_a_mixed_document_is_refused() {
+        // q7s2q.out q0194 (line 1317): code 2, `unknown operator: a`. The two orders of a
+        // mix and a mix with a logical operator are UNRECORDED.
         for operand in [
+            doc! { "$gt": 1, "a": 1 },
             doc! { "$gte": 6, "score": 8 },
             doc! { "score": 8, "$lt": 3 },
             doc! { "a": 1, "$elemMatch": { "b": 1 } },
         ] {
             let message = apply_err(doc! { "$pull": { "r": operand.clone() } }, results());
             assert!(
-                message.contains("$pull cannot mix operators with plain fields")
-                    && message.contains("$elemMatch"),
+                message.contains("$pull cannot mix operators with plain fields"),
                 "{operand}: {message}"
             );
         }
@@ -3728,23 +3999,19 @@ mod tests {
         }
     }
 
+    /// A `$not` at the top of the operand is refused, whatever it holds: q7s2q.out q0177
+    /// (line 1215), q0222 (1485), q0267, q0312, q0357, q0402, code 2, `unknown top level
+    /// operator: $not`.
     #[test]
-    fn pull_with_a_not_of_no_operator_is_refused_at_parse() {
-        let message = parse(&doc! { "$pull": { "r": { "$not": { "score": 8 } } } })
-            .expect_err("a $not of a plain document")
-            .to_string();
-        assert!(
-            message.contains("$not takes operators") && message.contains("$elemMatch"),
-            "{message}"
-        );
-        // The operator form is the condition.
-        assert_eq!(
-            applied(
-                doc! { "$pull": { "r": { "$not": { "$gte": 5 } } } },
-                doc! { "r": [1, 6, 4, 9] }
-            ),
-            doc! { "r": [6, 9] }
-        );
+    fn pull_refuses_a_not_at_the_top_of_the_operand() {
+        for operand in
+            [doc! { "$not": { "$gt": 1 } }, doc! { "$not": { "score": 8 } }, doc! { "$not": 5 }]
+        {
+            let message = parse(&doc! { "$pull": { "r": operand.clone() } })
+                .expect_err(&format!("{operand} must not parse"))
+                .to_string();
+            assert!(message.contains("unknown top level operator: $not"), "{operand}: {message}");
+        }
     }
 
     #[test]

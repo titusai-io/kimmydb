@@ -4627,24 +4627,22 @@ async fn pull_with_a_condition_removes_the_matching_elements() {
     assert_eq!(res.body["modified"], 1);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
     assert_eq!(doc["scores"], json!([1]), "{doc}");
+    // A top-level `$elemMatch` removes no document element (q7s2q.out q0221).
     let res = update(1, json!({"$pull": {"results": {"$elemMatch": {"score": 8}}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
-    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
+    assert_eq!(doc["results"], results, "{doc}");
 
-    // A plain document matches the whole element, so the supersets stay.
+    // A plain document is a query on each element (q7s2j.out j1254), so the
+    // supersets go too.
     let res = update(2, json!({"$pull": {"results": {"score": 8}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
-    assert_eq!(
-        doc["results"],
-        json!([{"score": 8, "item": "A"}, {"score": 8, "item": "B"}, {"score": 7, "item": "C"}]),
-        "{doc}"
-    );
+    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
 
     // A mixed document and a bad condition are 400s, and write nothing.
     for (spec, needle) in [
-        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "$elemMatch"),
+        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "cannot mix operators"),
         (json!({"$pull": {"scores": {"$nope": 1}}}), "unsupported operator"),
         (json!({"$pull": {"scores": {"$in": 3}}}), "$in requires an array"),
     ] {

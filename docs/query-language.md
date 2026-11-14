@@ -610,7 +610,7 @@ see [Pipeline updates](#pipeline-updates).
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
 | `$bit` | Bitwise `and`, `or`, `xor` of an integer field: `{"$bit": {"flags": {"or": 4}}}`. See [`$bit`](#bit) |
-| `$pull` `$pop` | Remove matching elements / one end. A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition: `$pull: {scores: {$gte: 6}}`. See [`$pull`](#pull-a-value-or-a-condition) |
+| `$pull` `$pop` | Remove matching elements / one end. A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition, `$pull: {scores: {$gte: 6}}`, and a document of fields is a query on each element, `$pull: {results: {score: 8}}`. See [`$pull`](#pull-a-value-a-condition-or-a-query) |
 | `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
@@ -689,44 +689,52 @@ looking at the destination.
 
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
-also takes a condition (below); `$pullAll` does not, and compares an operator
-document in its list as the plain document it is. `$pullAll` on a field that
+also takes a condition or a query (below); `$pullAll` does not, and compares an
+operator document in its list as the plain document it is. `$pullAll` on a field that
 is missing does nothing; on a field that is not an array it is a `400`,
 because the caller believes the field is an array and it is not. **So is `$pull`,
 of a value or a condition**: `cannot apply $pull to non-array field "v"`.
 
-### `$pull`: a value or a condition
+### `$pull`: a value, a condition or a query
 
-What `$pull` does with a **document** operand depends on its keys, and
-nothing else about it changes. A scalar or an array operand always removes the
-elements equal to it, as `$pull: {tags: "a"}` does.
+What `$pull` does with an operand depends on its shape. A scalar or an array
+operand always removes the elements equal to it, as `$pull: {tags: "a"}` does.
 
 | Operand | Reading | Example |
 |---|---|---|
-| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
-| A document with **no** key starting with `$` (the empty document too) | A **value**: removes the elements equal to the whole document, field order included | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}]` leaves `[{score: 8, item: "B"}]` |
-| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gte": 6, "score": 8 } } }` is a `400` |
+| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language: a comparison, `$in`, `$nin`, `$ne`, `$exists`, `$type`, `$size`, `$all`, `$mod`, `$regex` and the rest of the field operators, each as it reads a stored value (an element that is an array matches by its members: `{$gt: 1}` removes `[1, 2]`) | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
+| `$and`, `$or` or `$nor` of queries | A query, tested on the elements that are documents only: no scalar, array or `null` element is removed, a `$nor` included | `{ "$pull": { "r": { "$or": [{ "a": 1 }, { "a": 2 }] } } }` |
+| A document with **no** key starting with `$`, the empty document too | A **query** on each element: every element that is a document the query matches is removed, whatever else it holds and in whatever field order. A scalar, an array or a `null` element is never removed. The empty document is a query every document satisfies | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}, {score: 7}]` leaves `[{score: 7}]` |
+| A regular expression value (`{"$regularExpression": {...}}` in Extended JSON) | A pattern: the string elements it matches are removed | `{ "$pull": { "words": {"$regularExpression": {"pattern": "^tmp", "options": ""}} } }` |
+| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gt": 1, "score": 8 } } }` is a `400` |
 
 ```javascript
 { "$pull": { "scores": { "$gt": 1, "$lt": 5 } } }            // [1, 2, 4, 5] -> [1, 5]
 { "$pull": { "tags": { "$in": ["draft", "stale"] } } }
 { "$pull": { "words": { "$regex": "^tmp" } } }
 { "$pull": { "flags": { "$bitsAllSet": 4 } } }                // see the bit operators
-{ "$pull": { "scores": { "$not": { "$gt": 2 } } } }
-{ "$pull": { "results": { "$elemMatch": { "score": 8 } } } }  // removes {score: 8, item: "B"} too
+{ "$pull": { "results": { "score": { "$gte": 8 } } } }        // a query on each document element
+{ "$pull": { "grid": { "$elemMatch": { "$gt": 1 } } } }       // removes each array holding a member over 1
 ```
 
-A condition holds the operators of an `$elemMatch` over scalars, and an
-element is a scalar or a sub-document. To remove sub-documents by **some** of
-their fields, spell it `$elemMatch`: it matches the fields of a document
-element, where the plain `{ "score": 8 }` is a value and removes only a
-document equal to it. The condition is parsed once, with the update: an
-unknown operator or a bad argument (`{ "$in": 3 }`) is a `400` before any
-element is looked at. `$pull` from a field that is missing does nothing, and from
-one that is not an array is a `400`. A `$not` in a condition takes operators, as
-everywhere (`{ "$not": { "$gt": 2 } }`): `{ "$not": { "score": 8 } }` is a `400`
-naming `$ne` and `$elemMatch`, because a document with no operator in it would be
-read as the negation of an equality on a whole document.
+To remove the elements **equal to a whole document**, field order included, use
+`$pullAll` with that document in the list: `{ "$pullAll": { "results": [{ "score":
+8, "item": "A" }] } }` removes `{score: 8, item: "A"}` and neither `{score: 8}` nor an
+element with more fields. `$pull` of the same document is the query above, and
+removes by its fields.
+
+A top-level `$elemMatch` searches an element that is an **array** for a member
+that satisfies its body; a scalar element and a document element are not
+searched, so `{ "$pull": { "v": { "$elemMatch": { "$gt": 1 } } } }` over
+`[1, 2, 3]` removes nothing, and neither does `{ "$elemMatch": { "score": 8 } }`
+over an array of documents: write the fields as a query, `{ "score": 8 }`. A
+`$not` at the top of the operand is a `400` (`unknown top level operator:
+$not`), whatever it holds; an operator inside `$and`, `$or` or `$nor`
+(`{ "$or": [{ "$gt": 2 }] }`) is a `400` too, for the clauses are queries. The
+condition is parsed once, with the update: an unknown operator or a bad
+argument (`{ "$in": 3 }`) is a `400` before any element is looked at. `$pull`
+from a field that is missing does nothing, and from one that is not an array is
+a `400`.
 
 ### `$bit`
 

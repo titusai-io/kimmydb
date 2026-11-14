@@ -528,20 +528,6 @@ systems use.
 
 ---
 
-## 🟡 A plain-document `$pull` matches the whole element, where MongoDB reads it as a query on the element's fields
-
-**Raised 2026-10-26, with ADR-253.** `{"$pull": {"results": {"score": 8}}}` removes the elements **equal** to `{score: 8}` and leaves `{score: 8, item: "B"}`, as `$pull` of a document always has here. MongoDB reads a document operand as a query against each element, and removes `{score: 8, item: "B"}` too. A document whose keys all start with `$` is a condition here (`{"$pull": {"scores": {"$gte": 6}}}`), as there, and a document mixing `$` keys and plain keys is a `400`.
-
-**The spelling that does what MongoDB's plain document does** is `$elemMatch`: `{"$pull": {"results": {"$elemMatch": {"score": 8}}}}` removes `{score: 8}` and `{score: 8, item: "B"}` alike, and takes the conditions a filter does (`{"$elemMatch": {"score": {"$gte": 8}, "item": "B"}}`).
-
-**Why.** Every `$pull` that worked before still does what it did, byte for byte: a plain document was always a value. Reading it as a query would have made an update that removed one element remove several, with a `200`, for a caller who changed nothing. Only a document that could not have matched anything before (an operator document compared as a value) changed meaning.
-
-**What it costs.** A port written against MongoDB's reading of a plain document removes less here, silently, and must spell it `$elemMatch`.
-
-**Closing it** means reading a plain document as a query, which changes the result of every existing partial-document `$pull`. Not planned.
-
----
-
 ## 🟡 `$zip` refuses an empty `inputs` and a result over a million values
 
 **Raised 2026-10-28, with ADR-255.** `{$zip: {inputs: []}}` is a `400` here; the reference answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built. (This entry also held `$sortArray`'s and `$sort`'s reading of a descending key through an array by its smallest element; that now takes the largest, as the reference does, since ADR-264.)

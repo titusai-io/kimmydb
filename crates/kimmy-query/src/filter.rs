@@ -1485,18 +1485,46 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
 /// `{$in: [1, 2]}`, `{$elemMatch: {score: 8}}`). Parsed once per update, so an
 /// unknown operator or a bad argument is refused before any element is tested.
 pub fn parse_condition_document(doc: &Document) -> Result<Filter> {
+    // The reference refuses a `$not` at the top of the operand, whatever it holds
+    // (q7s2q.out q0177 line 1215, code 2).
+    if doc.contains_key("$not") {
+        return Err(Error::InvalidQuery(
+            "unknown top level operator: $not. If you are trying to negate an entire \
+             expression, use $nor"
+                .into(),
+        ));
+    }
     let _budget = RegexBudget::open();
     parse_elem_match(doc, Scope::NONE)
+}
+
+/// Parse the document operand of an update's `$pull` that names fields (no key
+/// starts with `$`): a query, as a filter is, tested against each element that
+/// is a document.
+pub fn parse_pull_query(doc: &Document) -> Result<Filter> {
+    parse(doc)
+}
+
+/// Whether one array element satisfies a query parsed by [`parse_pull_query`]:
+/// a document element is matched as a stored document is, any other element
+/// (a scalar, an array, `null`) does not match. UNRECORDED: an array element
+/// that holds documents (q7s2j.out j1255 records arrays of scalars only).
+pub fn matches_pull_query(filter: &Filter, element: &Bson) -> Result<bool> {
+    match element {
+        Bson::Document(d) => {
+            matches(filter, d).map_err(|e| unevaluable(e, None, "an array element of "))
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Whether one array element satisfies a condition parsed by
 /// [`parse_condition_document`], as `$pull` asks of each element.
 ///
 /// The conditions are tested against the element itself, as an `$elemMatch`
-/// over scalars tests them. A top-level `$elemMatch` (or one under `$not`)
-/// reads the element as the thing to match, not as an array to search: a
-/// document element is matched against its body by field, a scalar element
-/// as `$elemMatch: {$gt: 5}` matches one. A document-level clause (`$and`,
+/// over scalars tests them. A top-level `$elemMatch` searches an array element
+/// for a member that satisfies its body; a document or a scalar element holds
+/// nothing to search and does not match. A document-level clause (`$and`,
 /// `$or`, `$nor`, `$expr`) is matched against a document element and holds for
 /// no scalar. `Err` only when a `$expr` cannot be evaluated against the element.
 pub fn matches_pull_element(filter: &Filter, element: &Bson) -> Result<bool> {
@@ -1506,9 +1534,26 @@ pub fn matches_pull_element(filter: &Filter, element: &Bson) -> Result<bool> {
 fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
     fn condition(c: &Condition, element: &Bson) -> Result<bool> {
         match c {
+            // An array element is searched for a member that satisfies the body. A
+            // document or a scalar is not searched: it holds nothing to find
+            // (q7s2j.out lines 7774-7779, 7792-7797, q7s2q.out q0221 line 1479).
             Condition::ElemMatch(inner) => match element {
-                Bson::Document(d) => evaluate(inner, d, &[]),
-                scalar => matches_scalar_against(inner, scalar, &[]),
+                Bson::Array(members) => {
+                    for member in members {
+                        let hit = match member {
+                            Bson::Document(d) => evaluate(inner, d, &[])?,
+                            // An empty body asks for a document member: a scalar is not one
+                            // (q7s3i.jsonl 132, 145).
+                            _ if matches!(**inner, Filter::AlwaysTrue) => false,
+                            scalar => matches_scalar_against(inner, scalar, &[])?,
+                        };
+                        if hit {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                _ => Ok(false),
             },
             Condition::Not(inner) => Ok(!condition(inner, element)?),
             Condition::Both(a, b) => all_of(&[a.as_ref(), b.as_ref()], |c| condition(c, element)),
@@ -1519,9 +1564,12 @@ fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
         Filter::Field { path, conditions } if path.is_empty() => {
             all_of(conditions, |c| condition(c, element))
         }
+        // A clause on a document (`$and`, `$or`, `$nor`, `$expr`, `$jsonSchema`) is tested
+        // on a document element, and no other element satisfies it, a `$nor` included
+        // (q7s2q.out q0191 line 1299, q0326 line 2109).
         other => match element {
             Bson::Document(d) => evaluate(other, d, &[]),
-            scalar => matches_scalar_against(other, scalar, &[]),
+            _ => Ok(false),
         },
     }
 }
@@ -3334,8 +3382,6 @@ mod tests {
         assert!(pulls(doc! { "$gt": 1, "$lt": 5 }, 3));
         assert!(!pulls(doc! { "$gt": 1, "$lt": 5 }, 5));
         assert!(pulls(doc! { "$in": [1, 2] }, 2));
-        assert!(pulls(doc! { "$not": { "$gt": 5 } }, 5));
-        assert!(!pulls(doc! { "$not": { "$gt": 5 } }, 6));
         assert!(pulls(doc! { "$regex": "^a" }, "abc"));
         assert!(!pulls(doc! { "$regex": "^a" }, 5));
         assert!(pulls(doc! { "$bitsAllSet": 4 }, 6));
@@ -3345,23 +3391,40 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_elem_match_reads_the_element_as_the_thing_to_match() {
+    fn a_pull_elem_match_searches_an_array_element_and_no_other() {
+        // q7s2q.out q0221 (line 1479), q0175 (1233), q0266 (1749), q0265 (1743), q7s2j.out
+        // j1292-j1297: a document or a scalar element is not searched, an array element is.
         let c = || doc! { "$elemMatch": { "score": 8 } };
-        assert!(pulls(c(), doc! { "score": 8, "item": "B" }));
-        assert!(!pulls(c(), doc! { "score": 7, "item": "B" }));
+        assert!(!pulls(c(), doc! { "score": 8, "item": "B" }));
         assert!(!pulls(c(), 8));
-        // Over scalars it is the scalar form of an `$elemMatch`.
-        assert!(pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 7));
-        assert!(!pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 8));
-        // Under `$not`.
-        assert!(pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, 8));
-        assert!(!pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, doc! { "score": 8 }));
+        let body = || doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } };
+        assert!(!pulls(body(), 7));
+        assert!(pulls(body(), bson::bson!([1, 7])));
+        assert!(!pulls(body(), bson::bson!([1, 8])));
+        assert!(!pulls(doc! { "$elemMatch": { "a": 1 } }, bson::bson!([1, 2])));
+        // q7s3i.jsonl cases 127, 130 and 143: an array element is pulled when a member
+        // satisfies the body, and 141, 133, 131: not when none does or the body names fields.
+        assert!(pulls(doc! { "$elemMatch": { "$gt": 1 } }, bson::bson!([1, 2])));
+        assert!(pulls(doc! { "$elemMatch": { "$exists": true } }, bson::bson!([6])));
+        assert!(!pulls(doc! { "$elemMatch": { "$gt": 1, "$lt": 3 } }, bson::bson!([6])));
+        assert!(!pulls(
+            doc! { "$elemMatch": { "$or": [{ "b": 1 }, { "b": 3 }] } },
+            bson::bson!([1, 2])
+        ));
+        assert!(!pulls(doc! { "$elemMatch": { "b": Bson::Null } }, bson::bson!([1, 2])));
+        // Cases 132 and 145: an empty body asks for a document member, and a scalar is none.
+        assert!(!pulls(doc! { "$elemMatch": {} }, bson::bson!([1, 2])));
+        assert!(!pulls(doc! { "$elemMatch": {} }, bson::bson!([6])));
     }
 
     #[test]
     fn a_pull_condition_is_refused_at_parse_time() {
         let err = |d: Document| parse_condition_document(&d).unwrap_err();
         assert!(matches!(err(doc! { "$nope": 1 }), Error::UnsupportedOperator { .. }));
+        // q7s2q.out q0177 (line 1215): code 2, `unknown top level operator: $not`.
+        assert!(
+            matches!(err(doc! { "$not": { "$gt": 1 } }), Error::InvalidQuery(m) if m.contains("unknown top level operator: $not"))
+        );
         assert!(matches!(err(doc! { "$in": 1 }), Error::InvalidQuery(_)));
         assert!(matches!(err(doc! { "$bitsAllSet": -1 }), Error::InvalidQuery(_)));
         assert!(matches!(err(doc! { "$regex": "(" }), Error::InvalidQuery(_)));
