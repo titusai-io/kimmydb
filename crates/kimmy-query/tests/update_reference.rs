@@ -338,7 +338,7 @@ fn b_a_write_below_a_scalar_is_refused() {
     // Line 571: a field name into an array.
     refused(
         updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": [1] }),
-        "non-numeric segment",
+        "cannot create field 'y' in element {a: [ 1 ]}",
     );
 }
 
@@ -779,5 +779,308 @@ fn j_a_rename_source_below_a_null_is_a_traverse_refusal_and_a_number_on_a_docume
     same(
         updated(doc! { "$rename": { "o.0.x": "y" } }, doc! { "o": { "0": { "x": 1 } } }),
         doc! { "o": { "0": {} }, "y": 1 },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (K) A write through an index far past the end of an array
+// ---------------------------------------------------------------------------
+
+const BACKFILL: &str = "can't backfill more than 1500000 elements";
+
+fn arr_of_one() -> Document {
+    doc! { "_id": 1, "arr": [7] }
+}
+
+#[test]
+fn k_a_write_more_than_the_limit_past_the_end_is_refused_and_changes_nothing() {
+    // q7s2g.out lines 59-76 (1500002 and 2000000 over `arr: [7]`; the length is
+    // still 1 after). The index here, 5000000, is a modest one for the test:
+    // the refusal is the same, and a build that does not refuse allocates it.
+    for update in [
+        doc! { "$set": { "arr.5000000": 1 } },
+        doc! { "$inc": { "arr.5000000": 1 } },
+        doc! { "$set": { "arr.5000000.x": 1 } },
+    ] {
+        let mut stored = arr_of_one();
+        let compiled = parsed(update.clone()).unwrap();
+        let err = update::apply(&compiled, &mut stored, NOW).unwrap_err().to_string();
+        assert!(err.contains(BACKFILL), "{update}: {err}");
+        assert_eq!(stored.get_array("arr").unwrap().len(), 1, "{update}: nothing was pushed");
+    }
+}
+
+#[test]
+fn k_the_limit_is_a_gap_of_exactly_one_and_a_half_million() {
+    // q7s2g.out lines 52-58: over `arr: [7]` (length 1) the index 1500001 is
+    // written (length 1500002) and 1500002 is refused (lines 59-61).
+    let at = |index: usize| {
+        let key = format!("arr.{index}");
+        updated(doc! { "$set": { key: 1 } }, arr_of_one())
+    };
+    let written = at(1_500_001).expect("a gap of exactly 1500000 is allowed");
+    assert_eq!(written.get_array("arr").unwrap().len(), 1_500_002);
+    refused(at(1_500_002), BACKFILL);
+}
+
+#[test]
+fn k_a_missing_parent_makes_a_key_never_a_backfill() {
+    // q7s2g.out lines 326-385: over a document with no `arr` the digits are a
+    // field name, however large.
+    same(
+        updated(doc! { "$set": { "arr.1500001": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "1500001": 1 } },
+    );
+    same(
+        updated(doc! { "$set": { "arr.1500001.x": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "1500001": { "x": 1 } } },
+    );
+}
+
+#[test]
+fn k_a_segment_too_large_to_be_an_index_is_a_field_that_cannot_be_created() {
+    // q7s2g.out lines 76-116: `arr.99999999999` over `arr: [7]` is
+    // `Cannot create field '99999999999' in element {arr: [ 7 ]}` for `$set`,
+    // `$inc` and a subfield, and the array is unchanged.
+    let want = "cannot create field '99999999999' in element {arr: [ 7 ]}";
+    refused(updated(doc! { "$set": { "arr.99999999999": 1 } }, arr_of_one()), want);
+    refused(updated(doc! { "$inc": { "arr.99999999999": 1 } }, arr_of_one()), want);
+    refused(updated(doc! { "$set": { "arr.99999999999.x": 1 } }, arr_of_one()), want);
+    // UNRECORDED: where the reference draws the line between this refusal and
+    // the backfill one. Any value that does not fit an i32 is treated as the
+    // first; 2147483647 fits, so it is a backfill refusal (the gap is huge).
+    refused(updated(doc! { "$set": { "arr.2147483647": 1 } }, arr_of_one()), BACKFILL);
+    refused(
+        updated(doc! { "$set": { "arr.2147483648": 1 } }, arr_of_one()),
+        "cannot create field '2147483648' in element {arr: [ 7 ]}",
+    );
+}
+
+#[test]
+fn k_a_missing_parent_with_a_huge_segment_is_still_a_key() {
+    // q7s2g.out lines 326-385: `arr.99999999999` over a document with no `arr`.
+    same(
+        updated(doc! { "$set": { "arr.99999999999": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "99999999999": 1 } },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (L) What spells an array index: a run of digits, and nothing with a sign
+// ---------------------------------------------------------------------------
+
+fn arr_of_two() -> Document {
+    doc! { "_id": 1, "arr": [7, 8] }
+}
+
+#[test]
+fn l_a_signed_segment_is_a_field_name_that_cannot_be_created_in_an_array() {
+    // q7s2g.out lines 118-122 (`+5`) and 133-137 (`+0`).
+    for field in ["+5", "+0"] {
+        let key = format!("arr.{field}");
+        refused(
+            updated(doc! { "$set": { key.clone(): 1 } }, arr_of_two()),
+            &format!("cannot create field '{field}' in element {{arr: [ 7, 8 ]}}"),
+        );
+        refused(
+            updated(doc! { "$inc": { key: 1 } }, arr_of_two()),
+            &format!("cannot create field '{field}' in element {{arr: [ 7, 8 ]}}"),
+        );
+    }
+}
+
+#[test]
+fn l_an_unset_of_a_signed_segment_on_an_array_changes_nothing() {
+    // q7s2g.out lines 123-127 (`+5`) and 138-142 (`+0`): matched 1, modified 0.
+    for key in ["arr.+5", "arr.+0"] {
+        same(updated(doc! { "$unset": { key: "" } }, arr_of_two()), arr_of_two());
+    }
+}
+
+#[test]
+fn l_a_rename_source_with_a_signed_segment_on_an_array_is_the_traverse_refusal() {
+    // q7s2g.out lines 128-132 and 143-147.
+    for (key, part) in [("arr.+5", "arr of arr.+5"), ("arr.+0", "arr of arr.+0")] {
+        refused(
+            updated(doc! { "$rename": { key: "y" } }, arr_of_two()),
+            &format!("cannot use the part ({part}) to traverse the element"),
+        );
+    }
+}
+
+#[test]
+fn l_leading_zeros_spell_an_index() {
+    // q7s2g.out lines 148-175: `00` is index 0 and `01` is index 1, for `$set`
+    // and `$unset`; a `$rename` of one is the array-element refusal.
+    same(updated(doc! { "$set": { "arr.00": 1 } }, arr_of_two()), doc! { "_id": 1, "arr": [1, 8] });
+    same(updated(doc! { "$set": { "arr.01": 1 } }, arr_of_two()), doc! { "_id": 1, "arr": [7, 1] });
+    same(
+        updated(doc! { "$unset": { "arr.00": "" } }, arr_of_two()),
+        doc! { "_id": 1, "arr": [bson::Bson::Null, 8] },
+    );
+    same(
+        updated(doc! { "$unset": { "arr.01": "" } }, arr_of_two()),
+        doc! { "_id": 1, "arr": [7, bson::Bson::Null] },
+    );
+    for key in ["arr.00", "arr.01"] {
+        refused(
+            updated(doc! { "$rename": { key: "y" } }, arr_of_two()),
+            "source field cannot be an array element",
+        );
+    }
+}
+
+#[test]
+fn l_over_a_document_every_spelling_is_a_key() {
+    // q7s2g.out lines 176-255 and the top-level `+0` after them.
+    let keyed = || doc! { "_id": 1, "o": { "+0": 5, "+5": 5, "00": 5, "01": 5 } };
+    same(
+        updated(doc! { "$set": { "o.+5": 1 } }, keyed()),
+        doc! { "_id": 1, "o": { "+0": 5, "+5": 1, "00": 5, "01": 5 } },
+    );
+    same(
+        updated(doc! { "$unset": { "o.+0": "" } }, keyed()),
+        doc! { "_id": 1, "o": { "+5": 5, "00": 5, "01": 5 } },
+    );
+    same(
+        updated(doc! { "$rename": { "o.+0": "y" } }, keyed()),
+        doc! { "_id": 1, "o": { "+5": 5, "00": 5, "01": 5 }, "y": 5 },
+    );
+    same(
+        updated(doc! { "$rename": { "o.01": "y" } }, keyed()),
+        doc! { "_id": 1, "o": { "+0": 5, "+5": 5, "00": 5 }, "y": 5 },
+    );
+    // An array beside a key of the same spelling is still an array.
+    refused(
+        updated(doc! { "$set": { "arr.+0": 1 } }, doc! { "_id": 1, "arr": [7, 8], "+0": 5 }),
+        "cannot create field '+0' in element {arr: [ 7, 8 ]}",
+    );
+}
+
+#[test]
+fn l_a_field_name_that_is_not_an_index_on_an_array_is_the_same_refusal() {
+    // q7s2.out line 571: `a.y` over `a: [1]`.
+    refused(
+        updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": [1] }),
+        "cannot create field 'y' in element {a: [ 1 ]}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (M) New fields with all-digit names sort by value, ahead of the others
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m_new_digit_names_come_first_by_value_then_the_rest_by_bytes() {
+    // q7s2h.out h1 and h2 (lines 2-12): `10, 9, 1, a, B` and `1, 9, 10, a, B`
+    // over `{_id: 1}` both store `_id, 1, 9, 10, B, a`.
+    let want = doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "B": 1, "a": 1 };
+    same(
+        updated(doc! { "$set": { "10": 1, "9": 1, "1": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "1": 1, "9": 1, "10": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
+        want,
+    );
+    // h8 (line 44): `$inc` of `10, 9, a, 1`.
+    same(
+        updated(doc! { "$inc": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
+    );
+    // h15 (line 86): letters only, the control.
+    same(
+        updated(doc! { "$set": { "Z": 1, "a": 1, "B": 1, "b": 1 } }, doc! { "_id": 1, "m": 1 }),
+        doc! { "_id": 1, "m": 1, "B": 1, "Z": 1, "a": 1, "b": 1 },
+    );
+}
+
+#[test]
+fn m_a_level_an_update_creates_sorts_its_digit_names_by_value() {
+    // h3, h4, h5 (lines 14-30): `s.10, s.9, s.b` with `s` absent, `s` present and
+    // empty, and written in the other order; each stores `s: {9, 10, b}`.
+    let want = doc! { "_id": 1, "s": { "9": 1, "10": 1, "b": 1 } };
+    same(
+        updated(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1, "s": {} }),
+        want.clone(),
+    );
+    same(
+        updated(doc! { "$set": { "s.b": 1, "s.9": 1, "s.10": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    // h13 and h14 (lines 74-84): the same over an upsert, `$set` and `$setOnInsert`.
+    same(
+        upserted(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want.clone(),
+    );
+    same(
+        upserted(doc! { "$setOnInsert": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
+        want,
+    );
+}
+
+#[test]
+fn m_an_upsert_sorts_what_every_operator_adds_together() {
+    // h9 (line 50): `$setOnInsert` of `10, 9, a, 1`.
+    same(
+        upserted(doc! { "$setOnInsert": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
+    );
+    // h11 (line 62): `$set` of `b, 3`, `$inc` of `20, 2, a` and `$setOnInsert` of `7, c`
+    // store `_id, 2, 3, 7, 20, a, b, c`.
+    same(
+        upserted(
+            doc! {
+                "$set": { "b": 1, "3": 1 },
+                "$inc": { "20": 1, "2": 1, "a": 1 },
+                "$setOnInsert": { "7": 1, "c": 1 },
+            },
+            doc! { "_id": 1 },
+        ),
+        doc! { "_id": 1, "2": 1, "3": 1, "7": 1, "20": 1, "a": 1, "b": 1, "c": 1 },
+    );
+}
+
+#[test]
+fn m_the_filter_seed_keeps_its_own_byte_order_and_the_update_adds_after_it() {
+    // h6, h7, h10 and h12 (lines 32-42, 56-60, 68-72): the seed of the filter
+    // `_id, 10, 9` is in byte order (`10` before `9`), and what the update
+    // creates follows it, digit names by value: `_id, 10, 9, 5, z`.
+    let seed = || doc! { "_id": 1, "10": 1, "9": 2 };
+    same(
+        upserted(doc! { "$set": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    same(
+        upserted(doc! { "$set": { "5": 1, "z": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    same(
+        upserted(doc! { "$setOnInsert": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 1, "9": 2, "5": 1, "z": 1 },
+    );
+    // h12: `$inc` of the seed's own `10, 9` and a new `a`, `$set` of `z, 5`.
+    same(
+        upserted(doc! { "$inc": { "10": 1, "9": 1, "a": 1 }, "$set": { "z": 1, "5": 1 } }, seed()),
+        doc! { "_id": 1, "10": 2, "9": 3, "5": 1, "a": 1, "z": 1 },
+    );
+}
+
+#[test]
+fn m_two_digit_names_of_one_value_are_told_apart_by_their_bytes() {
+    // UNRECORDED: `01` and `1` have one numeric value; the recording has no pair
+    // like it. The tie is broken by bytes, so `01` comes first.
+    same(
+        updated(doc! { "$set": { "1": 1, "01": 1, "2": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "01": 1, "1": 1, "2": 1 },
+    );
+    // A name that merely contains digits is not an all-digit name.
+    same(
+        updated(doc! { "$set": { "a1": 1, "10": 1, "-1": 1, "9": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "9": 1, "10": 1, "-1": 1, "a1": 1 },
     );
 }

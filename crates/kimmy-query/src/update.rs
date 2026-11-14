@@ -622,9 +622,10 @@ impl<'a> Claims<'a> {
 }
 
 /// A path with every segment that addresses an array element by number in
-/// its decimal form: `a.01` and `a.+1` are `a.1`, because the path language
-/// reads all three as the element at index 1 (`usize::from_str`), and two
-/// writes to it are one path written twice. A positional segment is left as
+/// its decimal form: `a.01` is `a.1`, because the path language reads both as
+/// the element at index 1 (a run of ASCII digits, [`path::array_index`]), and
+/// two writes to it are one path written twice. `a.+1` is not: a sign makes
+/// the segment a field name, so it stays as written. A positional segment is left as
 /// it is. Over a document whose `a` holds an object, `01` and `1` would be
 /// two keys; they are still read as one path here, so such a pair is refused
 /// rather than told apart. The first segment is left as written: it names a
@@ -634,8 +635,8 @@ fn canonical(path: &str) -> String {
     path::segments(path)
         .iter()
         .enumerate()
-        .map(|(at, segment)| match segment.parse::<usize>() {
-            Ok(index) if at > 0 => index.to_string(),
+        .map(|(at, segment)| match path::array_index(segment) {
+            Some(index) if at > 0 => index.to_string(),
             _ => (*segment).to_string(),
         })
         .collect::<Vec<_>>()
@@ -1247,7 +1248,7 @@ fn expand_into(
     // an absent path means (`$set` creates it, `$pull` ignores it).
     let next = match value {
         Some(Bson::Document(child)) => child.get(*head),
-        Some(Bson::Array(items)) => head.parse::<usize>().ok().and_then(|i| items.get(i)),
+        Some(Bson::Array(items)) => path::array_index(head).and_then(|i| items.get(i)),
         _ => None,
     };
     prefix.push((*head).to_string());
@@ -1522,12 +1523,12 @@ fn rename_source(doc: &Document, path: &str) -> Source {
         let named = segments[at - 1];
         let next = match value {
             Bson::Document(child) => child.get(*segment),
-            Bson::Array(items) => match segment.parse::<usize>() {
-                Ok(index) => {
+            Bson::Array(items) => match path::array_index(segment) {
+                Some(index) => {
                     array.get_or_insert_with(|| segments[..at].join("."));
                     items.get(index)
                 }
-                Err(_) => {
+                None => {
                     return Source::Blocked { part: named.to_string(), held: value.clone() };
                 }
             },
@@ -3329,9 +3330,10 @@ mod tests {
 
     #[test]
     fn an_index_segment_is_one_path_however_it_is_spelled() {
-        // The path language reads `01` and `+1` as index 1, so each was a
-        // second write to `a.1`, and the result followed the key order.
-        for spelling in ["a.01", "a.+1", "a.001"] {
+        // The path language reads `01` as index 1, so each was a second write
+        // to `a.1`, and the result followed the key order. A sign makes `+1` a
+        // field name, so it is no spelling of that index.
+        for spelling in ["a.01", "a.001"] {
             for update in [
                 doc! { "$set": { "a.1": 5 }, "$inc": { spelling: 1 } },
                 doc! { "$inc": { spelling: 1 }, "$set": { "a.1": 5 } },

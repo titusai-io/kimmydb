@@ -622,17 +622,21 @@ see [Pipeline updates](#pipeline-updates).
 ```
 
 **New fields are sorted.** A field an update adds goes after the fields the
-document already had, and the new fields of a level are sorted by name,
-whichever operator adds them and in whatever order the request writes them:
+document already had, and the new fields of a level are sorted, whichever
+operator adds them and in whatever order the request writes them:
 `{"$set": {"b": 1, "a": 2}, "$inc": {"c": 1}}` over `{_id: 1}` gives `{_id, a,
 b, c}`, and `{"$set": {"b.y": 1, "b.x": 2}}` gives `b: {x, y}`. Fields already
 there keep their place, and a document given as a value keeps its own order.
+Sorted means the names made only of digits first, by numeric value, then the
+others in byte order: `{"$set": {"10": 1, "9": 1, "1": 1, "a": 1, "B": 1}}`
+gives `{_id, 1, 9, 10, B, a}`, and `s.10`, `s.9`, `s.b` give `s: {9, 10, b}`.
 An upsert stores `_id` first, then the fields its filter implies, sorted, then
 every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
 operators), sorted together. The nested fields a dotted filter key seeds are
 sorted at every level too (`{"a.c": 1, "a.b": 2}` seeds `a: {b, c}`), while a
 whole document given as the value of a key (`{"a": {"c": 1, "b": 2}}`) keeps
-its own order. A [pipeline update](#pipeline-updates) adds the
+its own order. The filter's own fields at the top level are in plain byte order
+(`10` before `9`), and the fields the update creates follow them. A [pipeline update](#pipeline-updates) adds the
 fields its stages write in the order they are written, but an upsert's seed is
 sorted for it as for operators (`_id`, then the filter's fields by name); a
 replacement upsert keeps none of the filter's fields but `_id`.
@@ -648,6 +652,20 @@ numeric segment is a field name, as in `{"$set": {"x.0": 1}}` giving `x: {"0":
 an array element that is not a document** is a `400`, `cannot create field 'y'
 in element {a: 5}`, and the document is unchanged; before, the scalar was
 replaced by a document. `$unset` below a scalar changes nothing.
+
+**What an index is, and how far past the end a write may go.** A segment is an
+index when it is a non-empty run of ASCII digits, leading zeros allowed (`00`
+and `01` are indexes 0 and 1); a segment with a sign (`+0`, `+5`) is a field
+name. On an array a field name cannot be created: `$set` and `$inc` are a `400`
+(`cannot create field '+0' in element {arr: [ 7, 8 ]}`), `$unset` changes
+nothing, and a `$rename` source through it is the traverse refusal. A write
+through an index into an array is refused, with the document unchanged, when the
+index is more than 1500000 past the end of the array (`can't backfill more than
+1500000 elements`); a gap of exactly 1500000 is written. A run of digits too
+large to be an index (one that does not fit a 32-bit integer) is refused as a
+field that cannot be created in the array. Over a field that is absent the
+digits are a key whatever their size (`{"$set": {"arr.1500001": 1}}` gives
+`arr: {"1500001": 1}`), never a backfill.
 
 **`$rename` does not move a field into or out of an array element.** A source
 or a destination that goes through an array in the document is a `400`: the
@@ -1248,11 +1266,14 @@ queue never hands out the same job twice.
   order, which is [unspecified](deviations.md). A FIFO queue wants a sort.
 - **`upsert` seeds the filter's equalities.** `{filter: {_id: "hits", scope:
   "global"}, update: {$inc: {n: 1}}, upsert: true}` creates
-  `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
-  seeded, because a match does not imply it. Two
+  `{_id: "hits", scope: "global", n: 1}`. An equality is taken from `$eq`, from
+  a `$in` or an `$all` of exactly one value, from a `$or` of exactly one branch,
+  and from an `$and` of any of those; not from a `$in` of two values, a `$or` of
+  two branches or a `$gte` with a `$lte`, because a match does not imply them. Two
   equalities that overlap, the same path twice or one path inside another
   (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
-  and are a `400` when the upsert would insert; `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
+  and are a `400` when the upsert would insert, through every one of those forms
+  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that
