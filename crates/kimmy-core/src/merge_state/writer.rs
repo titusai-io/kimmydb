@@ -745,7 +745,10 @@ impl Writer {
     /// `Decimal128` (refused when it overflows from finite inputs). Concurrent increments from
     /// other writers sum with this one. DOUBLES ARE NOT COUNTERS: a `Double` operand against an
     /// `Int32`, `Int64` or `Decimal128` counter is refused, and `$inc` of a double base (or of
-    /// an absent field by a double) is a register write.
+    /// an absent field by a double) is a register write. The writer records every increment it is
+    /// given, a counter's included (an `$inc` of 0 that keeps the type is a slot move): the effects
+    /// layer drops an increment whose result is unchanged by representation (ADR-208), before the
+    /// writer sees it.
     pub fn write_inc_value(&mut self, p: &Path, by: &Value, skew: u64) -> Option<Written> {
         self.ticking(skew, |w, m| w.write_inc_m(p, by, m))
     }
