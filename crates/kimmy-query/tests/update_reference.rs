@@ -338,7 +338,7 @@ fn b_a_write_below_a_scalar_is_refused() {
     // Line 571: a field name into an array.
     refused(
         updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": [1] }),
-        "non-numeric segment",
+        "cannot create field 'y' in element {a: [ 1 ]}",
     );
 }
 
@@ -862,5 +862,106 @@ fn k_a_missing_parent_with_a_huge_segment_is_still_a_key() {
     same(
         updated(doc! { "$set": { "arr.99999999999": 1 } }, doc! { "_id": 1 }),
         doc! { "_id": 1, "arr": { "99999999999": 1 } },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (L) What spells an array index: a run of digits, and nothing with a sign
+// ---------------------------------------------------------------------------
+
+fn arr_of_two() -> Document {
+    doc! { "_id": 1, "arr": [7, 8] }
+}
+
+#[test]
+fn l_a_signed_segment_is_a_field_name_that_cannot_be_created_in_an_array() {
+    // q7s2g.out lines 118-122 (`+5`) and 133-137 (`+0`).
+    for field in ["+5", "+0"] {
+        let key = format!("arr.{field}");
+        refused(
+            updated(doc! { "$set": { key.clone(): 1 } }, arr_of_two()),
+            &format!("cannot create field '{field}' in element {{arr: [ 7, 8 ]}}"),
+        );
+        refused(
+            updated(doc! { "$inc": { key: 1 } }, arr_of_two()),
+            &format!("cannot create field '{field}' in element {{arr: [ 7, 8 ]}}"),
+        );
+    }
+}
+
+#[test]
+fn l_an_unset_of_a_signed_segment_on_an_array_changes_nothing() {
+    // q7s2g.out lines 123-127 (`+5`) and 138-142 (`+0`): matched 1, modified 0.
+    for key in ["arr.+5", "arr.+0"] {
+        same(updated(doc! { "$unset": { key: "" } }, arr_of_two()), arr_of_two());
+    }
+}
+
+#[test]
+fn l_a_rename_source_with_a_signed_segment_on_an_array_is_the_traverse_refusal() {
+    // q7s2g.out lines 128-132 and 143-147.
+    for (key, part) in [("arr.+5", "arr of arr.+5"), ("arr.+0", "arr of arr.+0")] {
+        refused(
+            updated(doc! { "$rename": { key: "y" } }, arr_of_two()),
+            &format!("cannot use the part ({part}) to traverse the element"),
+        );
+    }
+}
+
+#[test]
+fn l_leading_zeros_spell_an_index() {
+    // q7s2g.out lines 148-175: `00` is index 0 and `01` is index 1, for `$set`
+    // and `$unset`; a `$rename` of one is the array-element refusal.
+    same(updated(doc! { "$set": { "arr.00": 1 } }, arr_of_two()), doc! { "_id": 1, "arr": [1, 8] });
+    same(updated(doc! { "$set": { "arr.01": 1 } }, arr_of_two()), doc! { "_id": 1, "arr": [7, 1] });
+    same(
+        updated(doc! { "$unset": { "arr.00": "" } }, arr_of_two()),
+        doc! { "_id": 1, "arr": [bson::Bson::Null, 8] },
+    );
+    same(
+        updated(doc! { "$unset": { "arr.01": "" } }, arr_of_two()),
+        doc! { "_id": 1, "arr": [7, bson::Bson::Null] },
+    );
+    for key in ["arr.00", "arr.01"] {
+        refused(
+            updated(doc! { "$rename": { key: "y" } }, arr_of_two()),
+            "source field cannot be an array element",
+        );
+    }
+}
+
+#[test]
+fn l_over_a_document_every_spelling_is_a_key() {
+    // q7s2g.out lines 176-255 and the top-level `+0` after them.
+    let keyed = || doc! { "_id": 1, "o": { "+0": 5, "+5": 5, "00": 5, "01": 5 } };
+    same(
+        updated(doc! { "$set": { "o.+5": 1 } }, keyed()),
+        doc! { "_id": 1, "o": { "+0": 5, "+5": 1, "00": 5, "01": 5 } },
+    );
+    same(
+        updated(doc! { "$unset": { "o.+0": "" } }, keyed()),
+        doc! { "_id": 1, "o": { "+5": 5, "00": 5, "01": 5 } },
+    );
+    same(
+        updated(doc! { "$rename": { "o.+0": "y" } }, keyed()),
+        doc! { "_id": 1, "o": { "+5": 5, "00": 5, "01": 5 }, "y": 5 },
+    );
+    same(
+        updated(doc! { "$rename": { "o.01": "y" } }, keyed()),
+        doc! { "_id": 1, "o": { "+0": 5, "+5": 5, "00": 5 }, "y": 5 },
+    );
+    // An array beside a key of the same spelling is still an array.
+    refused(
+        updated(doc! { "$set": { "arr.+0": 1 } }, doc! { "_id": 1, "arr": [7, 8], "+0": 5 }),
+        "cannot create field '+0' in element {arr: [ 7, 8 ]}",
+    );
+}
+
+#[test]
+fn l_a_field_name_that_is_not_an_index_on_an_array_is_the_same_refusal() {
+    // q7s2.out line 571: `a.y` over `a: [1]`.
+    refused(
+        updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": [1] }),
+        "cannot create field 'y' in element {a: [ 1 ]}",
     );
 }

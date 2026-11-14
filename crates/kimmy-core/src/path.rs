@@ -13,6 +13,18 @@ use bson::{Bson, Document};
 /// The most elements a write through an index may add to an array past its end.
 pub const MAX_BACKFILL: usize = 1_500_000;
 
+/// The array position a path segment names, if it names one.
+///
+/// A position is a non-empty run of ASCII digits, leading zeros allowed (`00`
+/// and `01` are positions), and nothing else: a sign (`+0`) makes it a field
+/// name. A run of digits too long for a `usize` names no position either.
+pub fn array_index(segment: &str) -> Option<usize> {
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    segment.parse::<usize>().ok()
+}
+
 /// Why a write cannot address a position of an array.
 enum IndexRefusal {
     /// The segment is no position at all.
@@ -28,7 +40,7 @@ enum IndexRefusal {
 /// The position `segment` names for a write into an array of `len` elements.
 /// Checked before any element is added, by both [`set`] and [`set_checked`].
 fn index_to_write(segment: &str, len: usize) -> Result<usize, IndexRefusal> {
-    let index = segment.parse::<usize>().map_err(|_| IndexRefusal::NotAnIndex)?;
+    let index = array_index(segment).ok_or(IndexRefusal::NotAnIndex)?;
     if i32::try_from(index).is_err() {
         return Err(IndexRefusal::TooLarge);
     }
@@ -83,7 +95,7 @@ fn descend<'a>(value: &'a Bson, segs: &[&str], out: &mut Vec<&'a Bson>) {
         }
         Bson::Array(items) => {
             // A numeric segment may address a position...
-            if let Ok(index) = head.parse::<usize>()
+            if let Some(index) = array_index(head)
                 && let Some(item) = items.get(index)
             {
                 descend(item, rest, out);
@@ -140,7 +152,7 @@ fn visit_arrays(
         }
         Bson::Array(items) => {
             // The same two readings of a segment as `descend`.
-            if let Ok(index) = head.parse::<usize>()
+            if let Some(index) = array_index(head)
                 && let Some(item) = items.get(index)
             {
                 visit_arrays(item, segs, depth + 1, out);
@@ -291,10 +303,9 @@ fn write_in_array(
 ) -> Result<(), String> {
     let (index_seg, tail) = segs.split_first().expect("non-empty path");
     let index = index_to_write(index_seg, items.len()).map_err(|why| match why {
-        IndexRefusal::NotAnIndex => {
-            format!("cannot traverse array with non-numeric segment {index_seg:?}")
+        IndexRefusal::NotAnIndex | IndexRefusal::TooLarge => {
+            cannot_create_in_array(index_seg, under, items)
         }
-        IndexRefusal::TooLarge => cannot_create_in_array(index_seg, under, items),
         IndexRefusal::Backfill => backfill_refusal(),
     })?;
     let existed = index < items.len();
@@ -349,7 +360,7 @@ fn document_at<'a>(doc: &'a mut Document, trail: &[String]) -> Option<&'a mut Do
 
 fn array_document_at<'a>(items: &'a mut [Bson], trail: &[String]) -> Option<&'a mut Document> {
     let (head, rest) = trail.split_first()?;
-    match items.get_mut(head.parse::<usize>().ok()?)? {
+    match items.get_mut(array_index(head)?)? {
         Bson::Document(child) => document_at(child, rest),
         Bson::Array(inner) => array_document_at(inner, rest),
         _ => None,
@@ -405,7 +416,7 @@ fn unset_in_document(doc: &mut Document, segs: &[&str]) -> bool {
         Some(Bson::Document(child)) => unset_in_document(child, rest),
         Some(Bson::Array(items)) => {
             let (index_seg, tail) = rest.split_first().expect("rest is non-empty");
-            let Ok(index) = index_seg.parse::<usize>() else {
+            let Some(index) = array_index(index_seg) else {
                 return false;
             };
             match items.get_mut(index) {
@@ -445,7 +456,7 @@ fn unset_deep_in_document(doc: &mut Document, segs: &[&str]) -> bool {
 
 fn unset_deep_in_array(items: &mut [Bson], segs: &[&str]) -> bool {
     let (index_seg, tail) = segs.split_first().expect("non-empty path");
-    let Ok(index) = index_seg.parse::<usize>() else {
+    let Some(index) = array_index(index_seg) else {
         return false;
     };
     match items.get_mut(index) {
