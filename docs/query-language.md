@@ -605,7 +605,7 @@ see [Pipeline updates](#pipeline-updates).
 |---|---|
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
-| `$inc` `$mul` | Arithmetic; a missing field starts at `0`. A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
+| `$inc` `$mul` | Arithmetic; a missing field starts at `0` (`$inc` creates it as its operand, `-0.0` included). A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
@@ -1254,6 +1254,7 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
 | `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
+| `$mul: {n: -1}` or `{n: -0.0}` | `n: -0.0` or `n: 0.0` (a double) | no: the result is a double equal to the one stored, so a stored zero keeps its sign. A `NaN` is never equal, so it is written |
 | `$bit: {n: {or: 0}}`, `{and: -1}`, `{xor: 0}`, or any operation that leaves the bits as they are | `n` a 32-bit integer, 32-bit operands | no |
 | `$bit: {n: {or: NumberLong(0)}}` | `n` a 32-bit integer | **yes**: a 64-bit operand makes the result a 64-bit integer |
 | `$pull` with a condition no element satisfies | | no |

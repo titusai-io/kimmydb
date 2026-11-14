@@ -1410,14 +1410,24 @@ fn apply_one(
         }
 
         OpKind::Inc(delta) => {
-            // An absent field starts at zero, so `$inc` on a new counter works.
-            let base = current.unwrap_or(Bson::Int32(0));
-            set(doc, arithmetic(&base, delta, Arith::Add, &op.path)?)?;
+            // An absent field takes the operand as it is, so `$inc` on a new counter
+            // works, and `-0.0` is created as `-0.0`, not as `0 + -0.0` (q7s2k.out
+            // k0010).
+            let Some(base) = current else {
+                return set(doc, delta.clone());
+            };
+            let result = arithmetic(&base, delta, Arith::Add, &op.path)?;
+            if !same_double(&base, &result) {
+                set(doc, result)?;
+            }
         }
 
         OpKind::Mul(factor) => {
             let base = current.unwrap_or(Bson::Int32(0));
-            set(doc, arithmetic(&base, factor, Arith::Mul, &op.path)?)?;
+            let result = arithmetic(&base, factor, Arith::Mul, &op.path)?;
+            if !same_double(&base, &result) {
+                set(doc, result)?;
+            }
         }
 
         OpKind::Bit(steps) => {
@@ -1617,6 +1627,14 @@ fn apply_one(
         }
     }
     Ok(())
+}
+
+/// Whether an arithmetic result is a double equal to the double stored, which the
+/// reference does not write: a stored zero keeps its sign (`-0.0 * -1` leaves
+/// `-0.0`), and a NaN is never equal, so it is written (q7s2k.out k0235, k0260,
+/// k0677-k0710, k0686).
+fn same_double(stored: &Bson, result: &Bson) -> bool {
+    matches!((stored, result), (Bson::Double(old), Bson::Double(new)) if old == new)
 }
 
 /// What lies in the way of a `$rename` destination in a document: the first
@@ -1993,6 +2011,53 @@ mod tests {
         assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! {}), doc! { "n": 5 });
         assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! { "n": 1 }), doc! { "n": 6 });
         assert_eq!(applied(doc! { "$inc": { "n": -2 } }, doc! { "n": 1 }), doc! { "n": -1 });
+    }
+
+    /// The double a field holds in `doc`, from its bits, so that `-0.0` is not `0.0`.
+    fn bits_of(doc: &Document, field: &str) -> u64 {
+        match doc.get(field) {
+            Some(Bson::Double(d)) => d.to_bits(),
+            other => panic!("a double wanted, found {other:?}"),
+        }
+    }
+
+    /// k0010 (q7s2k.out line 59): `$inc` of `-0.0` over a missing field creates it as
+    /// `-0.0`, not as the `0.0` that `0 + -0.0` is.
+    #[test]
+    fn inc_of_a_missing_field_stores_the_operand_as_it_is() {
+        let out = applied(doc! { "$inc": { "n": -0.0 } }, doc! {});
+        assert_eq!(bits_of(&out, "n"), (-0.0_f64).to_bits());
+        let out = applied(doc! { "$inc": { "n": 0.0 } }, doc! {});
+        assert_eq!(bits_of(&out, "n"), 0.0_f64.to_bits());
+        assert_eq!(applied(doc! { "$inc": { "n": 7_i64 } }, doc! {}), doc! { "n": 7_i64 });
+        assert_eq!(applied(doc! { "$inc": { "n": 2.5 } }, doc! {}), doc! { "n": 2.5 });
+    }
+
+    /// A double the arithmetic leaves equal to the stored one is not written, so a stored
+    /// zero keeps its sign: k0677 (q7s2k.out line 4061), k0680 (4079), k0685 (4109), k0702
+    /// (4211), k0710 (4259), and `$inc` of `-0.0` over a stored `0.0`, k0260 (1559), and
+    /// over `-0.0`, k0235 (1409). A result that differs, or a NaN, is written (k0686, 4115).
+    #[test]
+    fn a_result_equal_to_the_stored_double_leaves_it_as_it_was() {
+        let neg = (-0.0_f64).to_bits();
+        let pos = 0.0_f64.to_bits();
+        for (update, stored, kept) in [
+            (doc! { "$mul": { "n": -1 } }, -0.0, neg),
+            (doc! { "$mul": { "n": i32::MIN } }, -0.0, neg),
+            (doc! { "$mul": { "n": -0.0 } }, -0.0, neg),
+            (doc! { "$mul": { "n": -1 } }, 0.0, pos),
+            (doc! { "$mul": { "n": i32::MIN } }, 0.0, pos),
+            (doc! { "$mul": { "n": -0.0 } }, 0.0, pos),
+            (doc! { "$inc": { "n": -0.0 } }, 0.0, pos),
+            (doc! { "$inc": { "n": -0.0 } }, -0.0, neg),
+        ] {
+            let out = applied(update.clone(), doc! { "n": stored });
+            assert_eq!(bits_of(&out, "n"), kept, "{update} over {stored:?}");
+        }
+        let out = applied(doc! { "$mul": { "n": f64::NAN } }, doc! { "n": -0.0 });
+        assert!(matches!(out.get("n"), Some(Bson::Double(d)) if d.is_nan()));
+        let out = applied(doc! { "$inc": { "n": 1 } }, doc! { "n": -0.0 });
+        assert_eq!(out, doc! { "n": 1.0 });
     }
 
     #[test]

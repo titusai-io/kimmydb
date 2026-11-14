@@ -12,6 +12,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Fixed:** `$inc` created a missing field from `0 + operand`, so `{"$inc": {"n": -0.0}}` over a document with no `n` stored `0.0`; it now stores the operand as it is, `-0.0`, as the reference does. An `$inc` or `$mul` whose result is a double equal to the stored double is no longer written, so a stored zero keeps its sign: `{"$mul": {"n": -1}}` over `n: -0.0` leaves `-0.0` (it flipped to `0.0`, and `0.0` to `-0.0`) and counts as no change. A `NaN` result is still written.
+
 **Fixed:** `$pop` refused a direction written as a double: `{"$pop": {"f": 1.0}}` and `-1.0` were a `400` (`$pop requires 1 or -1`), where the reference pops the last and the first element. A double that is exactly `1` or `-1` is now a direction; every other number (`0`, `2`, `1.5`, `NaN`) is still a `400`.
 
 **Fixed:** an upsert whose filter held an `$all` of two or more values (`{a: {$all: [5, 6]}}`) or an `$expr` (`{$expr: {$eq: ["$a", 5]}}`, alone or beside other conditions, under `$or`, `$and` or `$nor`) inserted a document seeded without them, where the reference refuses. They are now a `400` when the upsert would insert, nothing is inserted, and a filter that matches a document is unaffected: an `$all` of two values is the path matched twice (`cannot infer the fields an upsert seeds from the filter: path 'a' is matched twice`), and an `$expr` is `$expr is not allowed in the query predicate for an upsert`. An `$all` of one value still seeds.
