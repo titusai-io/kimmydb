@@ -12,6 +12,7 @@ pub mod cursor;
 pub mod ddl;
 pub mod deadline;
 pub mod decimal;
+pub mod effects;
 pub mod error;
 pub mod hlc;
 pub mod ids;
