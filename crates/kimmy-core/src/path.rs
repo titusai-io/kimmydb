@@ -10,6 +10,38 @@
 
 use bson::{Bson, Document};
 
+/// The most elements a write through an index may add to an array past its end.
+pub const MAX_BACKFILL: usize = 1_500_000;
+
+/// Why a write cannot address a position of an array.
+enum IndexRefusal {
+    /// The segment is no position at all.
+    NotAnIndex,
+    /// A position, but too large to be an index of a document's array: a value
+    /// that does not fit an `i32`. UNRECORDED where the reference draws this
+    /// line, the recording has 99999999999 only.
+    TooLarge,
+    /// A position more than [`MAX_BACKFILL`] past the end of the array.
+    Backfill,
+}
+
+/// The position `segment` names for a write into an array of `len` elements.
+/// Checked before any element is added, by both [`set`] and [`set_checked`].
+fn index_to_write(segment: &str, len: usize) -> Result<usize, IndexRefusal> {
+    let index = segment.parse::<usize>().map_err(|_| IndexRefusal::NotAnIndex)?;
+    if i32::try_from(index).is_err() {
+        return Err(IndexRefusal::TooLarge);
+    }
+    if index > len && index - len > MAX_BACKFILL {
+        return Err(IndexRefusal::Backfill);
+    }
+    Ok(index)
+}
+
+fn backfill_refusal() -> String {
+    format!("can't backfill more than {MAX_BACKFILL} elements")
+}
+
 /// Split a dot path into its segments.
 pub fn segments(path: &str) -> Vec<&str> {
     path.split('.').collect()
@@ -152,8 +184,12 @@ fn set_in_document(doc: &mut Document, segs: &[&str], value: Bson) -> Result<(),
         Bson::Document(child) => set_in_document(child, rest, value),
         Bson::Array(items) => {
             let (index_seg, tail) = rest.split_first().expect("rest is non-empty");
-            let index: usize = index_seg.parse().map_err(|_| {
-                format!("cannot traverse array with non-numeric segment {index_seg:?}")
+            let index = index_to_write(index_seg, items.len()).map_err(|why| match why {
+                IndexRefusal::NotAnIndex => {
+                    format!("cannot traverse array with non-numeric segment {index_seg:?}")
+                }
+                IndexRefusal::TooLarge => cannot_create_in_array(index_seg, head, items),
+                IndexRefusal::Backfill => backfill_refusal(),
             })?;
             while items.len() <= index {
                 items.push(Bson::Null);
@@ -198,7 +234,20 @@ pub fn set_checked(
 }
 
 fn cannot_create(field: &str, under: &str, element: &Bson) -> String {
-    format!("cannot create field '{field}' in element {{{under}: {element}}}")
+    match element {
+        Bson::Array(items) => cannot_create_in_array(field, under, items),
+        _ => format!("cannot create field '{field}' in element {{{under}: {element}}}"),
+    }
+}
+
+/// [`cannot_create`] for an array, which the reference shows with a space inside
+/// its brackets: `{arr: [ 7, 8 ]}`.
+fn cannot_create_in_array(field: &str, under: &str, items: &[Bson]) -> String {
+    if items.is_empty() {
+        return format!("cannot create field '{field}' in element {{{under}: []}}");
+    }
+    let shown: Vec<String> = items.iter().map(ToString::to_string).collect();
+    format!("cannot create field '{field}' in element {{{under}: [ {} ]}}", shown.join(", "))
 }
 
 fn write_in_document(
@@ -225,7 +274,7 @@ fn write_in_document(
     trail.push((*head).to_string());
     let outcome = match doc.get_mut(*head).expect("just ensured present") {
         Bson::Document(child) => write_in_document(child, rest, value, trail, created),
-        Bson::Array(items) => write_in_array(items, rest, value, trail, created),
+        Bson::Array(items) => write_in_array(items, head, rest, value, trail, created),
         other => Err(cannot_create(rest[0], head, other)),
     };
     trail.pop();
@@ -234,15 +283,20 @@ fn write_in_document(
 
 fn write_in_array(
     items: &mut Vec<Bson>,
+    under: &str,
     segs: &[&str],
     value: Bson,
     trail: &mut Vec<String>,
     created: &mut Created,
 ) -> Result<(), String> {
     let (index_seg, tail) = segs.split_first().expect("non-empty path");
-    let index: usize = index_seg
-        .parse()
-        .map_err(|_| format!("cannot traverse array with non-numeric segment {index_seg:?}"))?;
+    let index = index_to_write(index_seg, items.len()).map_err(|why| match why {
+        IndexRefusal::NotAnIndex => {
+            format!("cannot traverse array with non-numeric segment {index_seg:?}")
+        }
+        IndexRefusal::TooLarge => cannot_create_in_array(index_seg, under, items),
+        IndexRefusal::Backfill => backfill_refusal(),
+    })?;
     let existed = index < items.len();
     while items.len() <= index {
         items.push(Bson::Null);
@@ -257,7 +311,7 @@ fn write_in_array(
     trail.push(index.to_string());
     let outcome = match &mut items[index] {
         Bson::Document(child) => write_in_document(child, tail, value, trail, created),
-        Bson::Array(inner) => write_in_array(inner, tail, value, trail, created),
+        Bson::Array(inner) => write_in_array(inner, index_seg, tail, value, trail, created),
         other => Err(cannot_create(tail[0], index_seg, other)),
     };
     trail.pop();
@@ -543,5 +597,54 @@ mod tests {
         let mut d = doc! { "a": [1, 2, 3] };
         assert!(unset(&mut d, "a.1"));
         assert_eq!(d, doc! { "a": [1, Bson::Null, 3] });
+    }
+
+    #[test]
+    fn both_writes_refuse_an_index_far_past_the_end_before_pushing() {
+        // q7s2g.out lines 59-76. A modest index (5000000): a build that does not
+        // refuse allocates it, which a larger one would not survive.
+        let mut d = doc! { "arr": [7] };
+        let err = set(&mut d, "arr.5000000", Bson::Int32(1)).unwrap_err();
+        assert_eq!(err, "can't backfill more than 1500000 elements");
+        assert_eq!(d, doc! { "arr": [7] });
+        let err = set_checked(&mut d, "arr.5000000.x", Bson::Int32(1), &mut Vec::new());
+        assert_eq!(err.unwrap_err(), "can't backfill more than 1500000 elements");
+        assert_eq!(d, doc! { "arr": [7] });
+    }
+
+    #[test]
+    fn the_gap_that_is_allowed_is_exactly_one_and_a_half_million() {
+        // q7s2g.out lines 52-61: length 1, so index 1500001 is written and
+        // 1500002 is not.
+        let mut d = doc! { "arr": [7] };
+        set(&mut d, "arr.1500001", Bson::Int32(1)).unwrap();
+        assert_eq!(d.get_array("arr").unwrap().len(), 1_500_002);
+        let mut d = doc! { "arr": [7] };
+        set_checked(&mut d, "arr.1500001", Bson::Int32(1), &mut Vec::new()).unwrap();
+        assert_eq!(d.get_array("arr").unwrap().len(), 1_500_002);
+        let mut d = doc! { "arr": [7] };
+        assert!(set(&mut d, "arr.1500002", Bson::Int32(1)).is_err());
+        assert!(set_checked(&mut d, "arr.1500002", Bson::Int32(1), &mut Vec::new()).is_err());
+        assert_eq!(d.get_array("arr").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_segment_too_large_for_an_index_is_refused_by_both_writes() {
+        // q7s2g.out lines 76-116 (99999999999). UNRECORDED: the line between this
+        // and the backfill refusal; a value that does not fit an i32 is this one.
+        for index in ["99999999999", "2147483648"] {
+            let want = format!("cannot create field '{index}' in element {{arr: [ 7 ]}}");
+            let mut d = doc! { "arr": [7] };
+            assert_eq!(
+                set_checked(&mut d, &format!("arr.{index}.x"), Bson::Null, &mut vec![]),
+                Err(want)
+            );
+            assert_eq!(d, doc! { "arr": [7] });
+            assert!(set(&mut d, &format!("arr.{index}"), Bson::Null).is_err());
+            assert_eq!(d, doc! { "arr": [7] });
+        }
+        let mut d = doc! { "arr": [7] };
+        let err = set_checked(&mut d, "arr.2147483647", Bson::Null, &mut vec![]).unwrap_err();
+        assert_eq!(err, "can't backfill more than 1500000 elements");
     }
 }

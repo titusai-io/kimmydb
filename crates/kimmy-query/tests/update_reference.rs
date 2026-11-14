@@ -781,3 +781,86 @@ fn j_a_rename_source_below_a_null_is_a_traverse_refusal_and_a_number_on_a_docume
         doc! { "o": { "0": {} }, "y": 1 },
     );
 }
+
+// ---------------------------------------------------------------------------
+// (K) A write through an index far past the end of an array
+// ---------------------------------------------------------------------------
+
+const BACKFILL: &str = "can't backfill more than 1500000 elements";
+
+fn arr_of_one() -> Document {
+    doc! { "_id": 1, "arr": [7] }
+}
+
+#[test]
+fn k_a_write_more_than_the_limit_past_the_end_is_refused_and_changes_nothing() {
+    // q7s2g.out lines 59-76 (1500002 and 2000000 over `arr: [7]`; the length is
+    // still 1 after). The index here, 5000000, is a modest one for the test:
+    // the refusal is the same, and a build that does not refuse allocates it.
+    for update in [
+        doc! { "$set": { "arr.5000000": 1 } },
+        doc! { "$inc": { "arr.5000000": 1 } },
+        doc! { "$set": { "arr.5000000.x": 1 } },
+    ] {
+        let mut stored = arr_of_one();
+        let compiled = parsed(update.clone()).unwrap();
+        let err = update::apply(&compiled, &mut stored, NOW).unwrap_err().to_string();
+        assert!(err.contains(BACKFILL), "{update}: {err}");
+        assert_eq!(stored.get_array("arr").unwrap().len(), 1, "{update}: nothing was pushed");
+    }
+}
+
+#[test]
+fn k_the_limit_is_a_gap_of_exactly_one_and_a_half_million() {
+    // q7s2g.out lines 52-58: over `arr: [7]` (length 1) the index 1500001 is
+    // written (length 1500002) and 1500002 is refused (lines 59-61).
+    let at = |index: usize| {
+        let key = format!("arr.{index}");
+        updated(doc! { "$set": { key: 1 } }, arr_of_one())
+    };
+    let written = at(1_500_001).expect("a gap of exactly 1500000 is allowed");
+    assert_eq!(written.get_array("arr").unwrap().len(), 1_500_002);
+    refused(at(1_500_002), BACKFILL);
+}
+
+#[test]
+fn k_a_missing_parent_makes_a_key_never_a_backfill() {
+    // q7s2g.out lines 326-385: over a document with no `arr` the digits are a
+    // field name, however large.
+    same(
+        updated(doc! { "$set": { "arr.1500001": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "1500001": 1 } },
+    );
+    same(
+        updated(doc! { "$set": { "arr.1500001.x": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "1500001": { "x": 1 } } },
+    );
+}
+
+#[test]
+fn k_a_segment_too_large_to_be_an_index_is_a_field_that_cannot_be_created() {
+    // q7s2g.out lines 76-116: `arr.99999999999` over `arr: [7]` is
+    // `Cannot create field '99999999999' in element {arr: [ 7 ]}` for `$set`,
+    // `$inc` and a subfield, and the array is unchanged.
+    let want = "cannot create field '99999999999' in element {arr: [ 7 ]}";
+    refused(updated(doc! { "$set": { "arr.99999999999": 1 } }, arr_of_one()), want);
+    refused(updated(doc! { "$inc": { "arr.99999999999": 1 } }, arr_of_one()), want);
+    refused(updated(doc! { "$set": { "arr.99999999999.x": 1 } }, arr_of_one()), want);
+    // UNRECORDED: where the reference draws the line between this refusal and
+    // the backfill one. Any value that does not fit an i32 is treated as the
+    // first; 2147483647 fits, so it is a backfill refusal (the gap is huge).
+    refused(updated(doc! { "$set": { "arr.2147483647": 1 } }, arr_of_one()), BACKFILL);
+    refused(
+        updated(doc! { "$set": { "arr.2147483648": 1 } }, arr_of_one()),
+        "cannot create field '2147483648' in element {arr: [ 7 ]}",
+    );
+}
+
+#[test]
+fn k_a_missing_parent_with_a_huge_segment_is_still_a_key() {
+    // q7s2g.out lines 326-385: `arr.99999999999` over a document with no `arr`.
+    same(
+        updated(doc! { "$set": { "arr.99999999999": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "arr": { "99999999999": 1 } },
+    );
+}
