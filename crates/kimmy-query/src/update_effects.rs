@@ -35,7 +35,7 @@
 //! [`apply_with_effects`] and [`plan_upsert`] are for collections under the `field` merge policy.
 //! They run the engine first, so every refusal of the `document` path is theirs too, and they can
 //! refuse where the `document` path succeeds: a `$rename` through an array element or a scalar
-//! ([`refuse_rename_ways`]), a BSON type the merge state cannot hold (the bridge), and the
+//! ([`rename_refusal`]), a BSON type the merge state cannot hold (the bridge), and the
 //! writer's own refusals once the effects are applied. A `document` collection keeps using
 //! [`crate::update::apply`] and its siblings.
 //!
@@ -176,12 +176,47 @@ fn way(doc: &Document, path: &str) -> Way {
     Way::Clear
 }
 
-fn traverse_refusal(doc: &Document, prefix: &str, path: &str) -> Error {
-    let part = prefix.rsplit('.').next().unwrap_or(prefix);
-    let held = path::resolve(doc, prefix).first().map(|v| v.to_string()).unwrap_or_default();
-    Error::InvalidUpdate(format!(
-        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
-    ))
+/// Why a `$rename` is refused ([`rename_refusal`]), each naming the array or scalar in the way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RenameRefusal {
+    /// An existing source inside an array element, by an index.
+    SourceInArrayElement { prefix: String },
+    /// A source through an array by a non-numeric segment, or below a scalar.
+    SourceTraverse { prefix: String },
+    /// A destination inside an array element (by an index or not).
+    DestInArrayElement { prefix: String },
+    /// A destination below a scalar.
+    DestBelowScalar { prefix: String },
+}
+
+impl RenameRefusal {
+    fn error(&self, doc: &Document, source: &str, target: &str) -> Error {
+        let held = |prefix: &str| {
+            path::resolve(doc, prefix).first().map(|v| v.to_string()).unwrap_or_default()
+        };
+        let part = |prefix: &str| prefix.rsplit('.').next().unwrap_or(prefix).to_string();
+        Error::InvalidUpdate(match self {
+            RenameRefusal::SourceInArrayElement { prefix } => format!(
+                "$rename: the source field cannot be an array element: {source:?} goes through \
+                 the array {prefix:?}"
+            ),
+            RenameRefusal::SourceTraverse { prefix } => format!(
+                "$rename cannot use the part ({0} of {source}) to traverse the element ({{{0}: {1}}})",
+                part(prefix),
+                held(prefix)
+            ),
+            RenameRefusal::DestInArrayElement { prefix } => format!(
+                "$rename: the destination field cannot be an array element: {target:?} goes \
+                 through the array {prefix:?}"
+            ),
+            RenameRefusal::DestBelowScalar { prefix } => format!(
+                "$rename: cannot create a field below the scalar in the element ({{{0}: {1}}}): \
+                 {target:?}",
+                part(prefix),
+                held(prefix)
+            ),
+        })
+    }
 }
 
 /// The value at `segs`, following a document by its field and an array by a numeric segment.
@@ -199,11 +234,9 @@ fn value_at<'a>(doc: &'a Document, segs: &[&str]) -> Option<&'a Bson> {
 }
 
 /// The recorded refusals of a `$rename` (the reference's, `q7s2.out` lines 101 to 121 and 586,
-/// `q7s2d.out` lines 76 to 116), made here BEFORE the update runs, because an array element or a
-/// scalar has no counter check at the writer and the engine of this release still applies these
-/// forms: a source or a destination inside an array element (by an index or not), a source below
-/// a scalar, a destination below a scalar. Allowed, as in the reference: a whole array, a field
-/// of a sub-document, a document key spelled `0`.
+/// `q7s2d.out` lines 76 to 116): a source or a destination inside an array element (by an index
+/// or not), a source below a scalar, a destination below a scalar. Allowed, as in the reference:
+/// a whole array, a field of a sub-document, a document key spelled `0`.
 ///
 /// A source that is not there is a no-op, whatever the destination looks like and even when the
 /// source path goes through an array by an index that is out of range or names a field the
@@ -211,55 +244,47 @@ fn value_at<'a>(doc: &'a Document, segs: &[&str]) -> Option<&'a Bson> {
 /// source that EXISTS is refused for sitting inside an array element, and then the destination is
 /// checked. A source that goes through an array by a non-numeric segment, or through a scalar, is
 /// refused whether or not it exists (`q7s2.out` line 116 and 586).
-fn refuse_rename_ways(doc: &Document, source: &str, target: &str) -> Result<()> {
+pub(crate) fn rename_refusal(doc: &Document, source: &str, target: &str) -> Option<RenameRefusal> {
     let segs = path::segments(source);
     match way(doc, source) {
         Way::Array { prefix, index: false } | Way::Scalar { prefix } => {
-            return Err(traverse_refusal(doc, &prefix, source));
+            return Some(RenameRefusal::SourceTraverse { prefix });
         }
         Way::Array { prefix, index: true } => {
-            if value_at(doc, &segs).is_none() {
-                return Ok(());
-            }
-            return Err(Error::InvalidUpdate(format!(
-                "$rename: the source field cannot be an array element: {source:?} goes through \
-                 the array {prefix:?}"
-            )));
+            return value_at(doc, &segs).map(|_| RenameRefusal::SourceInArrayElement { prefix });
         }
         Way::Clear => {
-            if get_in(doc, &segs).is_none() {
-                return Ok(());
-            }
+            get_in(doc, &segs)?;
         }
     }
     match way(doc, target) {
-        Way::Clear => Ok(()),
-        Way::Array { prefix, .. } => Err(Error::InvalidUpdate(format!(
-            "$rename: the destination field cannot be an array element: {target:?} goes \
-             through the array {prefix:?}"
-        ))),
-        Way::Scalar { prefix } => {
-            let part = prefix.rsplit('.').next().unwrap_or(&prefix);
-            let held =
-                path::resolve(doc, &prefix).first().map(|v| v.to_string()).unwrap_or_default();
-            Err(Error::InvalidUpdate(format!(
-                "$rename: cannot create a field below the scalar in the element ({{{part}: {held}}}): \
-                 {target:?}"
-            )))
-        }
+        Way::Clear => None,
+        Way::Array { prefix, .. } => Some(RenameRefusal::DestInArrayElement { prefix }),
+        Way::Scalar { prefix } => Some(RenameRefusal::DestBelowScalar { prefix }),
     }
 }
 
-/// Run [`refuse_rename_ways`] for every `$rename` of `update` against `doc`.
-fn refuse_renames(update: &Update, doc: &Document) -> Result<()> {
-    if let Update::Operators(operations) = update {
-        for op in operations {
-            if let OpKind::Rename(target) = &op.kind {
-                refuse_rename_ways(doc, &op.path, target)?;
-            }
+/// The first refusal among the `$rename`s of `update` against `doc`, if any, with the source and
+/// destination it concerns.
+pub(crate) fn first_rename_refusal(
+    update: &Update,
+    doc: &Document,
+) -> Option<(RenameRefusal, String, String)> {
+    let Update::Operators(operations) = update else { return None };
+    operations.iter().find_map(|op| match &op.kind {
+        OpKind::Rename(target) => {
+            rename_refusal(doc, &op.path, target).map(|r| (r, op.path.clone(), target.clone()))
         }
+        _ => None,
+    })
+}
+
+/// Refuse the first `$rename` of `update` that [`rename_refusal`] names, against `doc`.
+fn refuse_renames(update: &Update, doc: &Document) -> Result<()> {
+    match first_rename_refusal(update, doc) {
+        None => Ok(()),
+        Some((refusal, source, target)) => Err(refusal.error(doc, &source, &target)),
     }
-    Ok(())
 }
 
 fn bad(e: impl std::fmt::Display) -> Error {
@@ -354,7 +379,7 @@ fn classify(
             }
         }
         // a rename that goes through an array or a scalar was refused before the update ran
-        // ([`refuse_rename_ways`]): what is left is a plain move of a document field
+        // ([`rename_refusal`]): what is left is a plain move of a document field
         OpKind::Rename(target) => {
             if let Some(source) = get_in(doc, &segs) {
                 let to_segs = path::segments(target);
