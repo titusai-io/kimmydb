@@ -1103,11 +1103,15 @@ fn state_equality_is_the_equality_of_the_compact_bytes() {
     let o = opts(1_000_000_000);
     let mut pools_ = pools(40, 24, &o);
     pools_.extend(nested_pools(40, 24, &o));
-    let (mut same, mut differ) = (0, 0);
-    for (a, b, _) in triples(&pools_, 600) {
+    // `pools` and `nested_pools` clear the order state: these two keep it
+    pools_.extend(ord_pools(40, 24, &o));
+    pools_.extend(nested_ord_pools(40, 24, &o));
+    let (mut same, mut differ, mut with_ords) = (0, 0, 0);
+    for (a, b, _) in triples(&pools_, 1200) {
         let merged = join(a, b, &o).0;
         for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
             let by_state = x == y;
+            with_ords += usize::from(!x.ords.is_empty());
             assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
             assert_eq!(
                 x.compact_hash() == y.compact_hash(),
@@ -1121,8 +1125,9 @@ fn state_equality_is_the_equality_of_the_compact_bytes() {
             }
         }
     }
-    eprintln!("state_equality: {same} equal pairs, {differ} different");
+    eprintln!("state_equality: {same} equal pairs, {differ} different, {with_ords} with an order state");
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
+    assert!(with_ords > 500, "only {with_ords} states carry an order state");
 }
 
 // ---- typed counters --------------------------------------------------------------------------
