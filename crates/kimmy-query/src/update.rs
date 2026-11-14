@@ -1046,13 +1046,6 @@ fn apply_to_at(
         claim_concrete(operations, &concrete)?;
     }
 
-    // The filter's equalities that seed an inserted document come first and
-    // sorted, `_id` ahead of them; the fields the update adds follow, sorted
-    // together whichever operator added them.
-    if target == Target::Inserted {
-        sort_seed(doc);
-    }
-
     // Then `$setOnInsert`, only for an inserted document, and everything else.
     let mut created = path::Created::new();
     let on_insert = |op: &Operation| matches!(op.kind, OpKind::SetOnInsert(_));
@@ -1066,15 +1059,6 @@ fn apply_to_at(
     }
     path::settle_created(doc, &created);
     Ok(())
-}
-
-/// The fields an upsert's filter seeds, in name order after `_id`.
-fn sort_seed(doc: &mut Document) {
-    let mut fields: Vec<(String, Bson)> = std::mem::take(doc).into_iter().collect();
-    // `_id` sorts first of all: it is stored first, where every write path
-    // puts it, and `sort_by_key` is stable.
-    fields.sort_by(|a, b| (a.0 != ID_FIELD, &a.0).cmp(&(b.0 != ID_FIELD, &b.0)));
-    doc.extend(fields);
 }
 
 /// Each operation's concrete paths in `doc`, in operation order: its own path

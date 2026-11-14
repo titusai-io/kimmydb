@@ -1805,7 +1805,15 @@ pub fn find_and_modify(
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
         // Refused like any refusal of the seed: said only if nothing matches.
-        let seeded = implied_equalities(&filter, &mut seed, &mut Vec::new());
+        let seeded = implied_equalities(&filter, &mut seed, &mut Vec::new()).map(|()| {
+            // The seed's top-level fields are in name order, `_id` first,
+            // whichever order the filter wrote them in and whatever kind of
+            // update runs over it: the fields the update adds follow them.
+            let mut fields: Vec<(String, bson::Bson)> =
+                std::mem::take(&mut seed).into_iter().collect();
+            fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
+            seed.extend(fields);
+        });
         match &update {
             _ if seeded.is_err() => seeded.err().map(Err),
             // The seed is run through the update only to be inserted, so a refusal

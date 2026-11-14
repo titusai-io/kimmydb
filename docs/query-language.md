@@ -632,8 +632,10 @@ every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
 operators), sorted together. The nested fields a dotted filter key seeds are
 sorted at every level too (`{"a.c": 1, "a.b": 2}` seeds `a: {b, c}`), while a
 whole document given as the value of a key (`{"a": {"c": 1, "b": 2}}`) keeps
-its own order. A [pipeline update](#pipeline-updates) is not
-covered by this: its stages add fields in the order they are written.
+its own order. A [pipeline update](#pipeline-updates) adds the
+fields its stages write in the order they are written, but an upsert's seed is
+sorted for it as for operators (`_id`, then the filter's fields by name); a
+replacement upsert keeps none of the filter's fields but `_id`.
 
 **A numeric segment addresses an array element, at any depth, and nothing is
 written below a scalar.** `{"$set": {"grid.0.1": 9}}` over `grid: [[1, 2], [3,
