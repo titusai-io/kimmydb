@@ -448,3 +448,28 @@ fn sees_counter_at_or_under_looks_through_sub_documents_but_not_arrays() {
     // a sibling sharing a name prefix is not under the path
     assert!(!w.sees_counter_at_or_under(&np("with")));
 }
+
+#[test]
+fn the_renaming_entry_refuses_a_counter_source_before_the_clock_moves() {
+    let mut w = seeded();
+    w.write_inc(&np("n"), 1, 0).unwrap();
+    let (state, clock) = (w.state.clone(), w.clock);
+    let ops = [UpdateOp::Unset(np("n")), UpdateOp::Set(np("m"), i(1))];
+    let r = w.write_update_renaming(&ops, &[np("n")], 0);
+    assert_eq!(r, Err(UpdateRefused::RenameOfCounter(np("n"))));
+    let mut called = false;
+    let mut stamp = || {
+        called = true;
+        MStamp {
+            hlc: Hlc::new(1, 0),
+            writer: WriterId { node: NodeId::from_bytes([1; 16]), epoch: Epoch::from_u64(0) },
+        }
+    };
+    let r = w.write_update_renaming_stamped(&ops, &[np("n")], &mut stamp);
+    assert_eq!(r, Err(UpdateError::Refused(UpdateRefused::RenameOfCounter(np("n")))));
+    assert!(!called);
+    assert_eq!((w.state.clone(), w.clock), (state, clock));
+    // a non-counter source is an ordinary update
+    let ok = [UpdateOp::Unset(np("b")), UpdateOp::Set(np("b2"), s("str"))];
+    assert!(w.write_update_renaming(&ok, &[np("b")], 0).unwrap().is_some());
+}
