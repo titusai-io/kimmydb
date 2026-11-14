@@ -452,11 +452,22 @@ mod tests {
         sc.advance(60); // past the deadline: the bind is not valid for the oracle
         sc.ms[0].do_bind(&mut sc.w, &mut job, 2);
         sc.pull("X", "W");
-        let bind = sc.w.all.iter().find(|e| e.kind == crate::entry::Kind::Bind && e.phys == stage).cloned().expect("the late bind was minted");
-        assert!(!sc.w.valid(&bind), "the bind must be invalid for the oracle (never validly bound)");
+        let bind =
+            sc.w.all
+                .iter()
+                .find(|e| e.kind == crate::entry::Kind::Bind && e.phys == stage)
+                .cloned()
+                .expect("the late bind was minted");
+        assert!(
+            !sc.w.valid(&bind),
+            "the bind must be invalid for the oracle (never validly bound)"
+        );
         // X serves the stage by the bind (the model's lenient member: `m-orphan-no-deadline`); entered directly so the shape does not depend on the relay
         sc.ms[1].enter(&mut sc.w, &bind);
-        assert!(sc.ms[1].ever_served.contains(&stage), "enter() did not record the physical as ever served");
+        assert!(
+            sc.ms[1].ever_served.contains(&stage),
+            "enter() did not record the physical as ever served"
+        );
         sc.ms[0].vanished = true;
         sc.w.held_uncovered = true;
         sc.ms[1].cur = None; // X no longer serves it (nor does anyone)
@@ -466,7 +477,10 @@ mod tests {
         // control: with the history forgotten the stage IS in HB-2 (the test is sensitive to the set)
         sc.ms[1].ever_served.remove(&stage);
         sc.ms[1].last_served = "L".to_string();
-        assert!(crate::oracle::hb2_stages(&sc.w, &sc.ms).contains(&stage), "control: the stage should be in HB-2");
+        assert!(
+            crate::oracle::hb2_stages(&sc.w, &sc.ms).contains(&stage),
+            "control: the stage should be in HB-2"
+        );
     }
 
     /// PIN of DF-2 (open design finding, UNDER REVIEW: convergence, state held above coverage stranded behind a permanently lost

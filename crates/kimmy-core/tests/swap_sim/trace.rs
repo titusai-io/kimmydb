@@ -420,7 +420,10 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
         serde_json::from_str(lines.next().ok_or("empty trace")?).map_err(|e| e.to_string())?;
     let name = path.file_name().unwrap().to_string_lossy().to_string();
     assert!(
-        matches!(head["sha256_16"].as_str(), Some("4343f5208763266f" | "409eb9d10f35682c")),
+        matches!(
+            head["sha256_16"].as_str(),
+            Some("4343f5208763266f" | "409eb9d10f35682c" | "a0f2afe98a030ca3")
+        ),
         "{name}: the trace is of a vendored model"
     );
     let members: Vec<(String, i64)> = head["members"]
@@ -690,6 +693,22 @@ pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, Strin
                     .iter()
                     .map(|x| x.as_u64().unwrap() as usize)
                     .collect();
+                if head["lost_struct"].as_bool() == Some(true) {
+                    // the trace was made with the model's `Q6_LOSTSTRUCT=1` (the structural lost set: applied, held out of position or received as an entry)
+                    w.lost_struct = Some(
+                        w.all
+                            .iter()
+                            .filter(|e| {
+                                !ms.iter().filter(|m| !m.vanished).any(|m| {
+                                    m.appended.contains(&e.idx)
+                                        || m.held_oop.contains(&e.idx)
+                                        || m.recv_entry.contains(&e.idx)
+                                })
+                            })
+                            .map(|e| e.idx)
+                            .collect(),
+                    );
+                }
                 Value::Null
             }
             "pre_finish" => {
