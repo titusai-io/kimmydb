@@ -507,7 +507,9 @@ pub struct UpsertWritten {
 impl UpsertEffects {
     /// The creation as ONE ordered list, the increments in it: [`UpsertEffects::creation_cells`]
     /// followed by an [`CellTag::Inc`] cell per `inc` entry, then put in the post-image order the
-    /// caller names. `order` lists the paths of the NEW fields (every `set_on_insert`, `set` and
+    /// caller names. `order` is the post-image order the product computed (S2b's `UpsertPlan`
+    /// `post_image`, new fields sorted at each level, the filter's equality fields first): it lists
+    /// the paths of the NEW fields (every `set_on_insert`, `set` and
     /// `inc` path, as written) in the order the product's post-image has them; empty means the
     /// default sequence (filter cells, then `set_on_insert`, `set`, `inc`). With an order, the
     /// cells the order does not name (the filter's, and a cell a merge placed at another path)
