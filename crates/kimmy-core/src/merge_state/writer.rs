@@ -1627,7 +1627,8 @@ pub enum UpdateRefused {
     /// depth limit).
     #[error("merge state: the value for {0} is not legal: {1}")]
     BadValue(Path, InvalidValue),
-    /// A field name of a `$set` document cannot be a path segment.
+    /// A field name of a `$set` document cannot be a path segment. Not reachable through `$set` since
+    /// the value check (`BadFieldName`, `TooDeep`) runs first: an over-long leaf path is `TooDeep`.
     #[error("merge state: {0}")]
     BadPath(InvalidPath),
     /// The `$inc` operand at this path is not an `Int32`, `Int64`, `Decimal128` or `Double`.
