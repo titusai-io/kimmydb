@@ -457,6 +457,8 @@ fn implied_equalities(f: &Filter, seed: &mut Document, out: &mut Vec<(String, Bs
                 if let filter::Condition::Eq(value) = c {
                     // as the seed of the stored-document policy: a dotted path seeds a nested field
                     let _ = path::set(seed, field, value.clone());
+                    // the levels a dotted key creates are in name order (q7s2d.out 3 f1-f7)
+                    kimmy_core::path::sort_levels_through(seed, field);
                     out.push((field.clone(), value.clone()));
                 }
             }
@@ -482,6 +484,12 @@ pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<Upse
     let mut seed = Document::new();
     let mut equalities = Vec::new();
     implied_equalities(filter, &mut seed, &mut equalities);
+    // the seed's top-level fields are in name order, `_id` first, whichever order the filter
+    // wrote them in (q7s2.out u1, u2); the fields the update adds follow them. This is the
+    // seed `kimmy-api` builds, until the one shared function replaces both.
+    let mut fields: Vec<(String, Bson)> = std::mem::take(&mut seed).into_iter().collect();
+    fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
+    seed.extend(fields);
     refuse_renames(update, &seed)?;
     let mut post = seed.clone();
     apply_to_at(update, &mut post, now_ms, Target::Inserted, None)?;

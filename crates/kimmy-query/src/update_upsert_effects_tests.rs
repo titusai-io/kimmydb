@@ -7,7 +7,7 @@ use kimmy_core::merge_state::{JoinOptions, Path, Value, Writer};
 
 use crate::update::{self, Update};
 use crate::update_effects::{UpsertPlan, plan_upsert};
-use crate::update_effects_tests::{NOW, filt, np, p, parse, render, v, wid};
+use crate::update_effects_tests::{NOW, bytes, filt, np, p, parse, render, v, wid};
 
 fn plan(filter: Document, u: Document) -> (UpsertEffects, Document) {
     match plan_upsert(&parse(u.clone()), &filt(filter.clone()), NOW)
@@ -95,7 +95,8 @@ fn a_set_overrides_the_filter_and_dotted_leaves_merge() {
     assert_eq!(post, doc! {"a": {"x": 1, "y": 2}});
 }
 
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the order of the listed new fields is the engine's, the reference sorts them. Flip this test with that PR.
+/// The creation values of the register operators, listed in name order like the document the
+/// reference inserts (q7s2.out u8: arr, b, d, hi, lo, m, st).
 #[test]
 fn the_creation_values_of_the_register_operators_go_in_set() {
     let (fx, post) = creates(
@@ -124,6 +125,7 @@ fn the_creation_values_of_the_register_operators_go_in_set() {
     let order: Vec<&str> = post.keys().map(String::as_str).collect();
     let listed: Vec<String> = fx.set.iter().map(|(q, _)| q.name().to_string()).collect();
     assert_eq!(listed, order);
+    assert_eq!(listed, ["arr", "b", "d", "hi", "lo", "m", "set"]);
 }
 
 #[test]
@@ -147,18 +149,141 @@ fn an_unset_removes_the_filter_field_and_a_rename_moves_it() {
     assert_eq!(post, doc! {"b": 1});
 }
 
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine inserts new fields in the order of the update, the reference sorts them (the filter fields too). Flip this test with that PR.
+/// The new fields of an upsert are in name order, whatever order the update names them in and
+/// whichever operator makes them, after the filter's fields (q7s2.out u1-u4, u7). The layers
+/// keep the order of the inserted document inside each list.
 #[test]
-fn new_fields_are_in_the_order_of_the_inserted_document() {
-    // $setOnInsert first in the document, then $set: the engine inserts the $setOnInsert fields
-    // first whatever the order written
-    let (fx, post) = creates(
-        doc! {"k": 1},
-        doc! {"$set": {"zz": 1, "aa": 2}, "$setOnInsert": {"s2": 3, "s1": 4}},
+fn new_fields_are_sorted_like_the_reference() {
+    // u4: `$set` zz,aa and `$setOnInsert` s2,s1 give aa, s1, s2, zz
+    let (fx, post) =
+        plan(doc! {}, doc! {"$set": {"zz": 1, "aa": 2}, "$setOnInsert": {"s2": 3, "s1": 4}});
+    let keys: Vec<&str> = post.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["aa", "s1", "s2", "zz"]);
+    assert_eq!(fx.set, vec![(p("aa"), v(2)), (p("zz"), v(1))]);
+    assert_eq!(fx.set_on_insert, vec![(p("s1"), v(4)), (p("s2"), v(3))]);
+    // u1: the filter fields k, j (stored j, k), then every new field sorted across the operators
+    let (fx, post) = plan(
+        doc! {"k": 1, "j": 2},
+        doc! {"$set": {"b": 1, "a": 2}, "$setOnInsert": {"c": 1, "z": 2}, "$inc": {"n": 1, "m": 1}},
     );
     let keys: Vec<&str> = post.keys().map(String::as_str).collect();
-    assert_eq!(keys, ["k", "s2", "s1", "zz", "aa"]);
-    assert_eq!(fx.set_on_insert.len() + fx.set.len(), 4);
+    assert_eq!(keys, ["j", "k", "a", "b", "c", "m", "n", "z"]);
+    assert_eq!(fx.from_filter, vec![(p("k"), v(1)), (p("j"), v(2))]);
+    assert_eq!(fx.set, vec![(p("a"), v(2)), (p("b"), v(1))]);
+    assert_eq!(fx.set_on_insert, vec![(p("c"), v(1)), (p("z"), v(2))]);
+    // u3: an `$inc` written first changes nothing about the order
+    let (_, post) =
+        plan(doc! {"k": 1}, doc! {"$inc": {"n": 1}, "$set": {"b": 1}, "$setOnInsert": {"c": 1}});
+    let keys: Vec<&str> = post.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["k", "b", "c", "n"]);
+    // u7: a filter field that is also `$set` keeps its place
+    let (_, post) = plan(doc! {"a": 1, "b": 2}, doc! {"$set": {"a": 9, "c": 3}});
+    assert_eq!(bytes(&post), bytes(&doc! {"a": 9, "b": 2, "c": 3}));
+}
+
+/// The seed of an upsert by filter shape, and the fields the update adds after it
+/// (q7s2d.out 3 f1-f7: the levels a dotted key makes are sorted, a document given whole keeps its
+/// own order, the new fields follow in name order).
+#[test]
+fn the_seed_by_filter_shape_and_the_new_fields_after_it() {
+    let shapes: Vec<(&str, Document, Document, Document)> = vec![
+        (
+            "f1 {a.c, a.b}",
+            doc! {"a.c": 1, "a.b": 2},
+            doc! {"z": 1},
+            doc! {"a": {"b": 2, "c": 1}, "z": 1},
+        ),
+        (
+            "f2 {a.b, a.c}",
+            doc! {"a.b": 2, "a.c": 1},
+            doc! {"z": 1},
+            doc! {"a": {"b": 2, "c": 1}, "z": 1},
+        ),
+        (
+            "f3 {a: {c, b}} keeps the order of the value",
+            doc! {"a": {"c": 1, "b": 2}},
+            doc! {"z": 1},
+            doc! {"a": {"c": 1, "b": 2}, "z": 1},
+        ),
+        (
+            "f4 {a.c, a.b, b}",
+            doc! {"a.c": 1, "a.b": 2, "b": 3},
+            doc! {"z": 1},
+            doc! {"a": {"b": 2, "c": 1}, "b": 3, "z": 1},
+        ),
+        (
+            "f5 {x.y.z2, x.y.z1}",
+            doc! {"x.y.z2": 1, "x.y.z1": 2},
+            doc! {"z": 1},
+            doc! {"x": {"y": {"z1": 2, "z2": 1}}, "z": 1},
+        ),
+        (
+            "f6 {a.c, b, a.b}",
+            doc! {"a.c": 1, "b": 3, "a.b": 2},
+            doc! {"z": 1},
+            doc! {"a": {"b": 2, "c": 1}, "b": 3, "z": 1},
+        ),
+    ];
+    for (label, filter, set, want) in shapes {
+        let (_, post) = plan(filter.clone(), doc! {"$set": set});
+        assert_eq!(bytes(&post), bytes(&want), "{label}");
+    }
+    // the same filters with `$set {zz, aa}`: the new fields are sorted after the seed
+    let (_, post) = plan(doc! {"a.c": 1, "a.b": 2, "b": 3}, doc! {"$set": {"zz": 1, "aa": 2}});
+    assert_eq!(
+        bytes(&post),
+        bytes(&doc! {"a": {"b": 2, "c": 1}, "b": 3, "aa": 2, "zz": 1}),
+        "f4 with zz, aa"
+    );
+    let (_, post) = plan(doc! {"a": {"c": 1, "b": 2}}, doc! {"$set": {"zz": 1, "aa": 2}});
+    assert_eq!(bytes(&post), bytes(&doc! {"a": {"c": 1, "b": 2}, "aa": 2, "zz": 1}), "f3 zz, aa");
+}
+
+/// A multi-field filter with an operator body and a pipeline body (q7s2e.out 2a-2d, 2g, 2h, 2j):
+/// the seed is in name order, a restated filter field keeps its place, the fields the update adds
+/// follow, appended after the seed.
+#[test]
+fn an_upsert_with_a_multi_field_filter_by_body() {
+    let seeded = |extra: Document| {
+        let mut d = doc! {"aa": 2, "k": 5, "m": {"p": 4, "q": 3}, "zz": 1};
+        d.extend(extra);
+        d
+    };
+    // filter written in another order than it is stored in (q7s2e.out 2g)
+    let filter = || doc! {"k": 5, "m.p": 4, "aa": 2, "m.q": 3, "zz": 1};
+    // 2c: operator `$set z`
+    let (_, post) = plan(filter(), doc! {"$set": {"z": 1}});
+    assert_eq!(bytes(&post), bytes(&seeded(doc! {"z": 1})), "2c");
+    // 2d: operator `$set zz, aa` restates two filter fields with the same values
+    let (_, post) = plan(filter(), doc! {"$set": {"zz": 1, "aa": 2}});
+    assert_eq!(bytes(&post), bytes(&seeded(doc! {})), "2d");
+    let pipeline = |stage: Document| {
+        let stages = vec![Bson::Document(stage)];
+        let update = update::parse_pipeline(&stages, &[]).unwrap();
+        match plan_upsert(&update, &filt(filter()), NOW).unwrap() {
+            UpsertPlan::Effects { post_image, .. } => post_image,
+            UpsertPlan::Replace { .. } => panic!("a replacement"),
+        }
+    };
+    // 2a, 2g: pipeline `$set z`
+    assert_eq!(bytes(&pipeline(doc! {"$set": {"z": 1}})), bytes(&seeded(doc! {"z": 1})), "2a");
+    // 2b: pipeline `$set zz, aa`
+    assert_eq!(bytes(&pipeline(doc! {"$set": {"zz": 1, "aa": 2}})), bytes(&seeded(doc! {})), "2b");
+    // 2h: a pipeline that restates a filter field with another value and adds one
+    assert_eq!(
+        bytes(&pipeline(doc! {"$set": {"aa": 9, "nn": 1}})),
+        bytes(&doc! {"aa": 9, "k": 5, "m": {"p": 4, "q": 3}, "zz": 1, "nn": 1}),
+        "2h"
+    );
+    // 2j: a nested seed split by a top-level field
+    let stages = vec![Bson::Document(doc! {"$set": {"z": 1}})];
+    let update = update::parse_pipeline(&stages, &[]).unwrap();
+    let UpsertPlan::Effects { post_image, .. } =
+        plan_upsert(&update, &filt(doc! {"a.c": 1, "b": 3, "a.b": 2}), NOW).unwrap()
+    else {
+        panic!("effects")
+    };
+    assert_eq!(bytes(&post_image), bytes(&doc! {"a": {"b": 2, "c": 1}, "b": 3, "z": 1}), "2j");
 }
 
 #[test]

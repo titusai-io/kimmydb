@@ -184,20 +184,52 @@ fn the_same_update_on_the_same_document_gives_the_same_list() {
     }
 }
 
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine adds new fields in the order the update names them; the reference sorts them. Flip this test with that PR.
+/// New fields are listed in the order the reference stores them: sorted by name, nested fields
+/// too (q7s2.out o3 `$set z,a,m`, o4 `$set b.y,b.x,a`), whatever the order of the update.
 #[test]
-fn new_fields_take_the_order_of_the_engines_post_image() {
+fn new_fields_are_sorted_like_the_reference() {
     let d = doc! { "_id": 1, "x": 1 };
     let (effects, _) = parity_doc(doc! { "$set": { "z": 1, "a": 2, "m.q": 3, "m.b": 4 } }, &d);
     same_effects(
         &effects,
         &fx(|e| {
-            e.set(p("z"), v(1));
             e.set(p("a"), v(2));
-            e.set(np(&["m", "q"]), v(3));
             e.set(np(&["m", "b"]), v(4));
+            e.set(np(&["m", "q"]), v(3));
+            e.set(p("z"), v(1));
         }),
-        "post-image order",
+        "sorted",
+    );
+}
+
+/// q7s2.out o7: a `$set` over existing fields keeps their place, the new field goes after them.
+#[test]
+fn existing_fields_keep_their_place_and_new_ones_follow() {
+    let d = doc! { "_id": 1, "a": 1, "b": 2 };
+    let (effects, _) = parity_doc(doc! { "$set": { "c": 3, "b": 9, "a": 8 } }, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(p("a"), v(8));
+            e.set(p("b"), v(9));
+            e.set(p("c"), v(3));
+        }),
+        "o7",
+    );
+}
+
+/// q7s2.out o8: an `$unset` is listed first, then the new field.
+#[test]
+fn an_unset_comes_before_a_new_field() {
+    let d = doc! { "_id": 1, "a": 1, "b": 2 };
+    let (effects, _) = parity_doc(doc! { "$unset": { "a": "" }, "$set": { "z": 1 } }, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.unset(p("a"));
+            e.set(p("z"), v(1));
+        }),
+        "o8",
     );
 }
 
@@ -620,21 +652,42 @@ fn table() -> Vec<Row> {
         d("rename missing source", doc! {"$rename": {"nope": "t"}}, fx(|_| {})),
         // $setOnInsert is nothing on an existing document
         d("setOnInsert", doc! {"$setOnInsert": {"z": 1}}, fx(|_| {})),
-        // several operators, one list in post-image order
+        // several operators, one list in post-image order: the new fields sorted by name
+        // (q7s2.out o1, o9)
         d(
             "several operators",
-            doc! {"$set": {"z": 1}, "$inc": {"n": 1}, "$unset": {"s": ""}, "$push": {"arr": 4}},
+            doc! {"$set": {"z": 1, "c": 2}, "$inc": {"n": 1}, "$unset": {"s": ""}, "$push": {"arr": 4}},
             fx(|e| {
                 e.unset(p("s"));
                 e.inc(p("n"), v(1));
                 e.set(p("arr"), v(vec![1, 2, 3, 4]));
+                e.set(p("c"), v(2));
                 e.set(p("z"), v(1));
+            }),
+        ),
+        // `$set` b,a then `$inc` c, and the operators the other way round: the same list, sorted
+        // (q7s2.out o1 and o2)
+        d(
+            "new fields sorted, $set before $inc",
+            doc! {"$set": {"nb": 1, "na": 2}, "$inc": {"nc": 1}},
+            fx(|e| {
+                e.set(p("na"), v(2));
+                e.set(p("nb"), v(1));
+                e.inc(p("nc"), v(1));
+            }),
+        ),
+        d(
+            "new fields sorted, $inc before $set",
+            doc! {"$inc": {"nc": 1}, "$set": {"nb": 1, "na": 2}},
+            fx(|e| {
+                e.set(p("na"), v(2));
+                e.set(p("nb"), v(1));
+                e.inc(p("nc"), v(1));
             }),
         ),
     ]
 }
 
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the row "several operators" lists new fields in the engine's post-image order (the reference sorts them). Flip this test with that PR.
 #[test]
 fn the_operator_by_effect_table() {
     for (label, u, want) in table() {
@@ -833,13 +886,14 @@ fn a_positional_that_selects_nothing_has_no_effects() {
     assert!(effects.is_empty());
 }
 
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: `grid.0.1`-style paths below a nested array are not in this list, the engine does not set them like the reference. Flip this test with that PR.
 #[test]
 fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
     let d = lines();
     for (u, array) in [
         (doc! {"$set": {"a.1": 99}}, "a"),
         (doc! {"$set": {"grid.1.0": 99}}, "grid"),
+        // below a nested array (q7s2.out a1)
+        (doc! {"$set": {"grid.0.1": 99}}, "grid"),
         (doc! {"$set": {"items.0.sku": "z"}}, "items"),
         (doc! {"$set": {"items.0.deep.x": 1}}, "items"),
         (doc! {"$set": {"sub.arr.0": 5}}, "sub.arr"),
@@ -860,6 +914,54 @@ fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
         });
         same_effects(&effects, &want, &u.to_string());
     }
+}
+
+/// A numeric segment below an array that is itself an element sets the element of the INNER
+/// array, as the reference does (q7s2.out a1-a4 for two levels, a8-a10 for three, a17 for a
+/// document element); the effect is still one `Set` of the outermost array.
+#[test]
+fn a_write_below_a_nested_array_sets_the_inner_element() {
+    use bson::bson;
+    let nested = |u: Document, d: &Document, array: &str, want: Bson, label: &str| {
+        let (effects, _) = parity_doc(u, d);
+        same_effects(
+            &effects,
+            &fx(|e| {
+                e.set(p(array), v(want));
+            }),
+            label,
+        );
+    };
+    let grid = lines();
+    nested(doc! {"$set": {"grid.0.1": 9}}, &grid, "grid", bson!([[1, 9], [3, 4]]), "a1 grid.0.1");
+    nested(doc! {"$set": {"grid.1.0": 9}}, &grid, "grid", bson!([[1, 2], [9, 4]]), "a2 grid.1.0");
+    nested(
+        doc! {"$set": {"grid.0.5": 9}},
+        &grid,
+        "grid",
+        bson!([[1, 2, null, null, null, 9], [3, 4]]),
+        "a3 grid.0.5 pads the inner array",
+    );
+    nested(
+        doc! {"$set": {"grid.2.0": 9}},
+        &grid,
+        "grid",
+        bson!([[1, 2], [3, 4], { "0": 9 }]),
+        "a4 grid.2.0 pads the outer array with a document",
+    );
+    let deep = doc! { "_id": 1, "d": [[[1, 2], [3]], [[4]]] };
+    nested(doc! {"$set": {"d.0.0.1": 9}}, &deep, "d", bson!([[[1, 9], [3]], [[4]]]), "a8 d.0.0.1");
+    nested(doc! {"$set": {"d.1.0.0": 9}}, &deep, "d", bson!([[[1, 2], [3]], [[9]]]), "a9 d.1.0.0");
+    nested(doc! {"$set": {"d.0.1.0": 9}}, &deep, "d", bson!([[[1, 2], [9]], [[4]]]), "a10 d.0.1.0");
+    // a17: a number below a document element is a field named by it, sorted in
+    let a17 = doc! { "_id": 1, "a": [{ "k": 1 }] };
+    nested(
+        doc! {"$set": {"a.0.1": 9}},
+        &a17,
+        "a",
+        bson!([{ "1": 9, "k": 1 }]),
+        "a17 a.0.1 over a document element",
+    );
 }
 
 #[test]

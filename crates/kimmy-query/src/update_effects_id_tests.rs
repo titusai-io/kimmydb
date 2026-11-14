@@ -68,17 +68,17 @@ fn lines() -> bson::Document {
     }
 }
 
-/// UNCHANGED ENGINE BEHAVIOUR, both policies, pinned as it is today: a numeric path component
-/// below an element that is itself an array does not address the inner element: the engine
-/// replaces the inner array by a document (`{"1": 2}`). The reference sets `grid[0][1]`. The
-/// effects follow the engine's post-image; a fix of the engine is a separate change on main.
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine replaces the inner array by a document, the reference sets the nested element. Flip this test with that PR.
+/// A numeric path component below an element that is itself an array addresses the inner
+/// element, as the reference does (q7s2.out a1-a4, a8-a10): `grid.0.1` sets `grid[0][1]`, and
+/// the effect is one `Set` of the outermost array.
 #[test]
-fn nested_array_index_follows_the_engines_post_image_as_it_is() {
+fn nested_array_index_sets_the_inner_element() {
     let d = lines();
     let (effects, _) = parity_doc(doc! {"$set": {"grid.0.1": 9}}, &d);
-    let want =
-        Bson::Array(vec![Bson::Document(doc! {"1": 9}), Bson::Array(vec![3.into(), 4.into()])]);
+    let want = Bson::Array(vec![
+        Bson::Array(vec![1.into(), 9.into()]),
+        Bson::Array(vec![3.into(), 4.into()]),
+    ]);
     crate::update_effects_tests::same_effects(
         &effects,
         &fx(|e| {
