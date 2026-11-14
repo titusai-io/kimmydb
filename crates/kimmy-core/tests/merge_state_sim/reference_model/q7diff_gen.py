@@ -488,13 +488,16 @@ class EncCompact:
             self.wid(k[2])
             self.opt_stamp(k[3])
             self.stamp(sl[0])
-            # the flag byte: bit 0 an absorbed pair follows; the types (bits 1-4) are Int64 = 0 here
+            # the flag byte: bit 0 an absorbed pair follows; the types (bits 1-4) are Int64 = 0 here;
+            # bit 5: the stamp of the slot's latest Int64-or-wider operand follows (`wide_at`). Every operand of the
+            # model is an Int64, so it is the slot's own stamp; bit 6 (`decimal_at`) is never set here
             pair = st.absorbed.get(k)
-            self.u8(1 if pair is not None else 0)
+            self.u8((1 if pair is not None else 0) | 0x20)
             self.payload(sl[1])
             if pair is not None:
                 self.stamp(pair[0])
                 self.payload(pair[1])
+            self.stamp(sl[0])
         self.vv(st.vv)
         self.vi(len(st.losses))
         for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):

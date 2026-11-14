@@ -296,6 +296,10 @@ def section10_start(buf):
         if flags & 1:
             w.stamp()
             w.payload((flags >> 3) & 3)
+        if flags & 0x20:                # wide_at: the latest Int64-or-wider operand
+            w.stamp()
+        if flags & 0x40:                # decimal_at: the latest Decimal128 operand
+            w.stamp()
     w.vv()                              # 8 version vector
     for _ in range(w.var()):            # 9 losses
         w.u8()
