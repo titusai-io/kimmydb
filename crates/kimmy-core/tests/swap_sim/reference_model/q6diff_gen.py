@@ -186,9 +186,14 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     _orig_world_init(self, members, flags, rec, D, trace)
     T.w = self
     if T.out is not None:
-        T.write(dict(v=1, model=MODEL + ".py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
-                     members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
-                     route_f=float(os.environ.get("Q6_F", "0") or 0), routes=os.environ.get("Q6_ROUTES", ""), staged_row=(MODEL not in ("swapmodel6a", "swapmodel6b") and os.environ.get("Q6_STAGEDROW", "1") != "0")))
+        head = dict(v=1, model=MODEL + ".py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
+                    members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe,
+                    route_f=float(os.environ.get("Q6_F", "0") or 0), routes=os.environ.get("Q6_ROUTES", ""), staged_row=(MODEL not in ("swapmodel6a", "swapmodel6b") and os.environ.get("Q6_STAGEDROW", "1") != "0"))
+        # the structural lost set (the model's Q6_LOSTSTRUCT=1, its default when it reads the variable at all): the Rust replay rebuilds it from the header.
+        # Only a model that reads Q6_LOSTSTRUCT is marked; =0 (6d's oracle) leaves the field absent, as the models that do not read it.
+        if os.environ.get("Q6_LOSTSTRUCT", "1") == "1" and b"Q6_LOSTSTRUCT" in open(sm.__file__, "rb").read():
+            head["lost_struct"] = True
+        T.write(head)
     T.started = True
 
 
