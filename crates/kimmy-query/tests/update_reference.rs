@@ -628,3 +628,33 @@ fn h_a_replacement_cannot_give_a_stored_document_an_id() {
     refused(updated(doc! { "_id": 1, "v": 1 }, doc! { "k": 1 }), "_id is immutable");
     same(upserted(doc! { "_id": 1, "v": 1 }, doc! { "k": 1 }), doc! { "_id": 1, "v": 1 });
 }
+
+// ---------------------------------------------------------------------------
+// A $rename whose source is missing moves nothing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i_a_rename_of_a_missing_source_is_no_change_and_checks_nothing_else() {
+    // q7s2e.out lines 5, 10, 15, 20, 25, 30, 35, 40, 45: every one is matched
+    // and not modified, the document as it was, whatever the destination.
+    let stored = || doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }], "arr": [1, 2] };
+    for (from, to) in [
+        ("items.0.nope", "code"),
+        ("items.5.sku", "code"),
+        ("items.0.nope", "items.1.x"),
+        ("arr.5", "y"),
+        ("nope", "items.0.t"),
+        ("nope", "items.s"),
+        ("nope", "missing.deep"),
+    ] {
+        same(updated(doc! { "$rename": { from: to } }, stored()), stored());
+    }
+    same(
+        updated(doc! { "$rename": { "nope": "a.b" } }, doc! { "_id": 1, "a": 5 }),
+        doc! { "_id": 1, "a": 5 },
+    );
+    same(
+        updated(doc! { "$rename": { "items.0.nope": "code" } }, doc! { "_id": 1 }),
+        doc! { "_id": 1 },
+    );
+}

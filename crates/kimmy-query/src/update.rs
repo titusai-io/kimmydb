@@ -1430,6 +1430,10 @@ fn apply_one(
             }
             match rename_way(doc, &op.path) {
                 Way::Clear => {}
+                // A source that is not there is nothing to move, whatever lies
+                // above it (q7s2e.out lines 5-46); one that is there, inside
+                // an element, cannot be moved.
+                Way::Array { index: true, .. } if current.is_none() => return Ok(()),
                 Way::Array { prefix, index: true } => {
                     return Err(invalid(format!(
                         "$rename: the source field cannot be an array element: {:?} goes through \

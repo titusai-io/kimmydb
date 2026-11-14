@@ -659,7 +659,8 @@ element, and one below a scalar (`a.y` over `a: 5`) is refused before anything
 moves. A
 whole array (`items` to `lines`), a field of a sub-document (`o.p` to `o.q`)
 and a rename beside a write to an array still apply. A source that is missing
-is still a no-op.
+is still a no-op, through an array index too (`items.0.nope`, `items.5.sku`,
+`arr.5`), and its destination is not checked.
 
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`

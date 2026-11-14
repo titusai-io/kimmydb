@@ -12,6 +12,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Fixed:** `$rename` of a source that is not there went through the array check first: `{"$rename": {"items.0.nope": "code"}}`, `items.5.sku` and `arr.5` over arrays answered `400` (`the source field cannot be an array element`) where the field being absent means there is nothing to move. A missing source is now a no-op whatever lies above it, and its destination is not looked at; a source that is there inside an element is still refused. See [Update operators](docs/query-language.md#update-operators).
+
 **Fixed:** an upsert whose filter named one path twice or one path inside another (`{a: 1, "a.b": 2}`, `{a: {b: 1}, "a.c": 2}`, `{$and: [{a: 1}, {a: 2}]}`) seeded whichever value the key order let win. It is now a `400` (`cannot infer the fields an upsert seeds from the filter`) when nothing matches and an insert would be needed; two dotted keys beside each other (`{"a.b": 1, "a.c": 2}`) are still seeded. See [Update operators](docs/query-language.md#update-operators).
 
 **Fixed:** an upsert seeded the nested documents of dotted filter keys in the order the filter wrote them, so `{"a.c": 1, "a.b": 2}` and `{"a.b": 2, "a.c": 1}` created different documents (`a: {c, b}` and `a: {b, c}`). The fields a dotted key creates are now sorted by name at every level, `_id` first and the fields the update adds after the filter's; a whole document given as the value of a filter key keeps its own order. See [Update operators](docs/query-language.md#update-operators).
