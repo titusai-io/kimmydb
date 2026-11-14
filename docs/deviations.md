@@ -61,6 +61,30 @@ Status meanings:
 
 ---
 
+<a id="pipeline-reorder-only-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that only reorders the fields of a document is not written, and a new field goes after the fields the document had
+
+**Raised with the Q7 step 2 pipeline-update effects.** A pipeline update (ADR-265) is diffed against the stored document, field by field: a changed or new top-level field is one write, a removed one an unset, and the order of the fields that stay is the writer's (the order they were first written in), not the order the pipeline's result lists them in. So over `{_id: 1, a: 1, b: 2}`, `[{$replaceWith: {_id: "$_id", b: "$b", a: "$a"}}]` changes nothing (`modified: false`), where the reference answers `modified: true` and stores `{_id, b, a}`; and `[{$replaceWith: {n: 9, b: "$b", _id: "$_id"}}]` stores `{_id, b, n}` (the kept field `b` first, then the new `n`), where the reference stores `{_id, n, b}`. A `document` collection stores the pipeline's result as it is. A reorder INSIDE a sub-document is a write (the writer counts an order-only change of a sub-document as a change), under both policies.
+
+**Workaround:** `replaceOne` with the document in the wanted order sets the order.
+
+**To close:** none planned; a pipeline update is a diff, not a replace (the 2026-11-04 ruling).
+
+---
+
+<a id="pipeline-id-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that restates `_id` as another numeric type of the same id keeps the stored `_id`
+
+**Raised with the Q7 step 2 pipeline-update effects.** ADR-265 stores a pipeline result whose `_id` is the same id of another type (`Int32 1` and `Int64 1` are one id) as the result gives it. On a `field` collection `_id` is never an effect: the document's identity is the one it was created with, so `[{$set: {_id: NumberLong(1)}}]` over `{_id: 1}` leaves `_id: 1` (an `Int32`) and answers `modified: false`, where a `document` collection stores the `Int64` and answers `modified: true`. A result with another document's id is refused under both policies.
+
+**Workaround:** none needed; the id is the same id.
+
+**To close:** none planned.
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches
