@@ -660,3 +660,108 @@ fn i_a_rename_of_a_missing_source_is_no_change_and_checks_nothing_else() {
         doc! { "_id": 1 },
     );
 }
+
+// ---------------------------------------------------------------------------
+// The source of a $rename: what it goes through
+// ---------------------------------------------------------------------------
+
+const TRAVERSE: &str = "cannot use the part (";
+
+#[test]
+fn j_a_rename_source_through_a_scalar_element_is_refused_whatever_follows() {
+    // q7s2f.out lines 5, 21: `arr.0.x` over [1, 2], with a plain destination
+    // and with `arr.1`, which would be refused for itself; the destination is
+    // never looked at.
+    for to in ["y", "arr.1"] {
+        refused(
+            updated(doc! { "$rename": { "arr.0.x": to } }, doc! { "_id": 1, "arr": [1, 2] }),
+            "cannot use the part (0 of arr.0.x) to traverse the element ({0: 1})",
+        );
+    }
+    // Lines 48, 53: `items.0.x` over a scalar element.
+    refused(
+        updated(doc! { "$rename": { "items.0.x": "y" } }, doc! { "_id": 1, "items": [7] }),
+        "cannot use the part (0 of items.0.x) to traverse the element ({0: 7})",
+    );
+    refused(
+        updated(
+            doc! { "$rename": { "items.0.x": "items.1.t" } },
+            doc! { "_id": 1, "items": [7, 8] },
+        ),
+        "cannot use the part (0 of items.0.x) to traverse the element ({0: 7})",
+    );
+}
+
+#[test]
+fn j_a_rename_source_through_a_scalar_field_of_an_element_is_refused() {
+    // q7s2f.out lines 10, 26: `items.0.sku.x` over a document element whose
+    // `sku` is a string; the part named is `sku`, not the array.
+    let items = || doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }] };
+    for to in ["y", "items.1.z"] {
+        refused(
+            updated(doc! { "$rename": { "items.0.sku.x": to } }, items()),
+            "cannot use the part (sku of items.0.sku.x) to traverse the element",
+        );
+    }
+    // Lines 58, 63: `items.0.y.z` over [{y: 5}].
+    let ys = || doc! { "_id": 1, "items": [{ "y": 5 }, { "y": 6 }] };
+    for to in ["w", "items.1.t"] {
+        refused(
+            updated(doc! { "$rename": { "items.0.y.z": to } }, ys()),
+            "cannot use the part (y of items.0.y.z) to traverse the element ({y: 5})",
+        );
+    }
+}
+
+#[test]
+fn j_a_rename_source_through_an_inner_array_by_a_name_is_refused() {
+    // q7s2f.out lines 15, 31: `grid.0.s` over an array of arrays.
+    let grid = || doc! { "_id": 1, "grid": [[1, 2], [3, 4]] };
+    for to in ["y", "grid.1.0"] {
+        refused(
+            updated(doc! { "$rename": { "grid.0.s": to } }, grid()),
+            "cannot use the part (0 of grid.0.s) to traverse the element",
+        );
+    }
+}
+
+#[test]
+fn j_a_rename_of_a_source_that_is_not_there_checks_nothing() {
+    // q7s2f.out lines 37, 42: a missing key, whatever the destination.
+    let items = || doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }] };
+    for to in ["y", "items.1.t"] {
+        same(updated(doc! { "$rename": { "nope.x": to } }, items()), items());
+    }
+    // Line 69: an index past the end, then a path a scalar could not follow.
+    same(
+        updated(doc! { "$rename": { "items.5.x.y": "y" } }, doc! { "_id": 1, "items": [7] }),
+        doc! { "_id": 1, "items": [7] },
+    );
+}
+
+#[test]
+fn j_a_rename_source_that_is_there_inside_an_array_cannot_be_moved() {
+    // q7s2f.out lines 74, 79 (code 2).
+    refused(
+        updated(doc! { "$rename": { "arr.0": "y" } }, doc! { "_id": 1, "arr": [1, 2] }),
+        "source field cannot be an array element",
+    );
+    refused(
+        updated(
+            doc! { "$rename": { "items.0.sku": "y" } },
+            doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }] },
+        ),
+        "source field cannot be an array element",
+    );
+}
+
+#[test]
+fn j_the_traverse_refusal_uses_the_engines_wording() {
+    // The recorded message begins `cannot use the part (X of path)`; ours
+    // names the operator in front of it, as the other `$rename` refusals do.
+    let Err(err) = updated(doc! { "$rename": { "arr.0.x": "y" } }, doc! { "_id": 1, "arr": [1] })
+    else {
+        panic!("applied")
+    };
+    assert!(err.starts_with("invalid update: $rename ") && err.contains(TRAVERSE), "{err}");
+}
