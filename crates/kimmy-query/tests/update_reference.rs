@@ -765,3 +765,19 @@ fn j_the_traverse_refusal_uses_the_engines_wording() {
     };
     assert!(err.starts_with("invalid update: $rename ") && err.contains(TRAVERSE), "{err}");
 }
+
+#[test]
+fn j_a_rename_source_below_a_null_is_a_traverse_refusal_and_a_number_on_a_document_is_a_key() {
+    // Not recorded; derived from the walk rule: a null is a value a path
+    // cannot enter, and names the part that holds it.
+    refused(
+        updated(doc! { "$rename": { "a.b": "c" } }, doc! { "a": bson::Bson::Null }),
+        "cannot use the part (a of a.b) to traverse the element ({a: null})",
+    );
+    // Not recorded; derived from the walk rule: a numeric segment on a
+    // document is a key, so the source is found and moves.
+    same(
+        updated(doc! { "$rename": { "o.0.x": "y" } }, doc! { "o": { "0": { "x": 1 } } }),
+        doc! { "o": { "0": {} }, "y": 1 },
+    );
+}
