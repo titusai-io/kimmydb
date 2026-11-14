@@ -101,43 +101,47 @@
 //!   as creation cells like `$setOnInsert`. They are the LOWEST layer: a `$set` or `$setOnInsert`
 //!   on the same path overrides them, and that is NOT an overlap.
 //! * (b1) Two checks, in two places. [`UpsertEffects::check`] runs at PARSE time on every update
-//!   (matched or not): the overlap among `set_on_insert`, `set` and `inc`. [`UpsertEffects::check_creation`]
-//!   (also run first by `creation_cells`) runs ONLY on the creation path: `from_filter` paths that
-//!   overlap EACH OTHER (the same path twice, or an ancestor and a descendant) are
-//!   [`UpdateRefused::Overlap`] (this matches the reference, so it is NOT a deviation); and an
-//!   `$inc` on a path that a filter leaf also writes, or below or above one, is
-//!   [`UpdateRefused::Overlap`] (the design's overlap refusal: the creation wrote the path, and
-//!   giving a creation register a slot of its own write is a merge-model change, out of scope).
-//!   Both are compared on the COMPOSED LEAVES, not on the paths as written, so `{"a.b": 1}` and
-//!   `{a: {b: 1}}` behave alike. The reference accepts an upsert that increments a filter field
-//!   (`{a: 5}` with `$inc a 1` gives 6) when no document matches, so that case is a deviation
-//!   (`docs/deviations.md`, "upsert-filter-field-incremented-q7"); a MATCHED upsert is an ordinary
-//!   update and is never refused for it (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})`).
-//! * (b2) Composition, before the writer ([`UpsertEffects::creation_cells`]): the layers compose
-//!   in order, filter first, then `$setOnInsert` and `$set` on top, into one cell per TOP-LEVEL
-//!   FIELD whose value is the whole composed subtree (a `Document` or a scalar), so the writer's
-//!   `expand` writes the map markers exactly as for an insert (`$setOnInsert {a: {x: 1}}` is one
-//!   cell `a` = `{x: 1}`). A higher-layer path EQUAL to or an ANCESTOR of a filter path overrides
-//!   it, IN PLACE, and the filter leaves below it are dropped (filter `{"a.b": 1}` with `$set
-//!   {a: {c: 2}}` gives `a: {c: 2}`); a higher-layer path BELOW a filter document merges into it
-//!   (filter `{a: {x: 1}}` with `$set {"a.y": 2}` gives `a: {x: 1, y: 2}`). A cell is tagged
-//!   `Creation` when its subtree came ONLY from the filter and/or `$setOnInsert`, `Plain` when any
-//!   part came from `$set` (so `$set` data is never dropped by a later insert; a mixed
-//!   filter-and-`$set` subtree is `Plain`, the filter part surviving being the safe side; `$setOnInsert`
-//!   with `$set` in one subtree is already an `Overlap`). A higher-layer path below a non-document
-//!   filter value (filter `{a: 5}`, `$set {"a.y": 2}`) is [`UpdateRefused::BelowScalar`], as the
-//!   reference cannot create a field in a non-document; an empty-document filter value gives way.
-//!   An `$unset` (`Set(p, Value::Unset)`) in a higher layer removes what is there and is a NO-OP,
-//!   with no refusal, when the path is absent or below a scalar (`{a: 5}` with `$unset a.y`).
-//!   `$inc` is not a cell. Field ORDER: filter fields in filter order; an override keeps its
-//!   field in place; new fields are appended in the order the caller lists them, `set_on_insert`
-//!   first, then `set`. The caller (S2b) lists the new fields of an operator update in
-//!   lexicographic order (the reference's order since 5.0, as ruled) and a pipeline update in
-//!   pipeline order. NOT checked against a recording: `reference-6.0.5` holds no operator-update or
-//!   upsert recording (its only upsert text is an expectation comment in `pipeline-updates.js`:
-//!   filter fields, then `n`, `label` in written order), so the field order of an upsert, and the
-//!   order of ordinary-update effects (the operator order given), are by ruling and S2b must
-//!   confirm them against the reference.
+//!   (matched or not): the overlap among `set_on_insert`, `set` and `inc` (the reference refuses
+//!   it at parse, so none of those cases is a deviation). [`UpsertEffects::check_creation`] (also
+//!   run by `creation_cells`) runs ONLY on the creation path: `from_filter` entries that overlap
+//!   EACH OTHER, as written or by their leaves (the same path twice, an ancestor and a
+//!   descendant), are [`UpdateRefused::Overlap`] (as the reference); and an `$inc` is
+//!   [`UpdateRefused::Overlap`] when its path is EQUAL to, ABOVE or BELOW the path of a composed
+//!   creation cell, a Document cell included. This MIRRORS the writer exactly: `upsert_soi_create_m`
+//!   (`merge_state/writer.rs`) sorts the cell paths and the `inc` path together and refuses when
+//!   two are equal or one is below the other; `upsert_inc_on_m` refuses an increment on a path the
+//!   creation wrote as a register. So `$set {"a.x": 1}` with `$inc {"a.n": 1}` is accepted (the
+//!   cell `a.x` is a leaf beside `a.n`), and so is filter `{"a.b": 1}` with `$inc a.c`; filter
+//!   `{a: {b: 1}}` with `$inc a.c` is refused (`a` is one Document cell and `a.c` is below it). The
+//!   two filters are different queries in the reference (whole-document equality against field
+//!   equality), and the second is a deviation (`docs/deviations.md`,
+//!   "upsert-filter-field-incremented-q7"), as is `{a: 5}` with `$inc a 1`. A MATCHED upsert is an
+//!   ordinary update and is never refused for it (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})`).
+//!   A Document-valued `$setOnInsert` or `$set` with an `$inc` below it is refused by the reference
+//!   at parse time too, so it is no deviation.
+//! * (b2) Composition, before the writer ([`UpsertEffects::creation_cells`]), at AS-WRITTEN
+//!   granularity: each cell sits at the path its layer wrote it at. A dotted leaf (`$set
+//!   {"a.x": 1}`, filter `{"a.b": 1}`) stays a LEAF cell (D4); a Document-valued entry
+//!   (`$setOnInsert {a: {x: 1}}`, filter `{a: {x: 1}}`) stays ONE Document cell, so the writer's
+//!   `expand` writes its map markers as for an insert. The layers compose in order, filter first,
+//!   then `$setOnInsert` and `$set`, and only merge where they meet: a higher-layer path EQUAL to
+//!   or ABOVE a cell overrides it (the cells below it are dropped; filter `{"a.b": 1}` with `$set
+//!   {a: {c: 2}}` gives the cell `a` = `{c: 2}`); a higher-layer path BELOW a Document cell merges
+//!   into it (filter `{a: {x: 1}}` with `$set {"a.y": 2}` gives the cell `a` = `{x: 1, y: 2}`); an
+//!   empty Document gives way; below any other cell it is [`UpdateRefused::BelowScalar`] (the
+//!   reference cannot create a field in a non-document). A cell is tagged `Creation` only when it
+//!   came entirely from the filter and/or `$setOnInsert`, `Plain` when any part came from `$set`
+//!   (`$set` data is never dropped by a later insert; the filter part surviving is the safe side;
+//!   `$setOnInsert` with `$set` in one subtree is already an `Overlap`). An `$unset`
+//!   (`Set(p, Value::Unset)`) in a higher layer removes the cell at or below `p`, or the nested field
+//!   of a Document cell, and is a NO-OP, with no refusal, when absent or below a scalar (`{a: 5}`
+//!   with `$unset a.y`). `_id`: any filter path whose FIRST segment is `_id` (`{"_id.x": 1}`
+//!   included) is left out, the existing upsert `_id` logic owns it. `$inc` is not a cell. Field
+//!   ORDER: filter fields in filter order; an override keeps its field in place; new fields are
+//!   appended in the order the caller lists them, `set_on_insert` first, then `set`. The caller (S2b)
+//!   lists the new fields of an operator update in lexicographic order (as ruled) and a pipeline
+//!   update in pipeline order. The cells go to the writer as `fields` (the `Creation` cells) and
+//!   `sets` (the `Plain` cells) of `upsert_soi_create`; the tests drive exactly that.
 //! * (c) Creation values of `$mul`, `$min`, `$max`, `$currentDate`, `$push`, `$addToSet` and `$bit`
 //!   are computed by S2b and go in `set`.
 //! * (d) One write or two, from the existing code (`merge_state/writer.rs`): `upsert_inc` is ONE
@@ -213,7 +217,16 @@
 //!   reference); an empty-document filter value gives way to what is set below it.
 //! * RESOLVED (withdrawn ruling): `$inc` on a filter field is not `{a: 5}` gives 6 but an
 //!   `Overlap` refusal, recorded as a deviation.
-//! * OPEN: the field order of upserts and of ordinary-update effects has no recording, see (b2).
+//! * RESOLVED (supersedes the one-cell-per-top-level-field ruling): creation cells are AS WRITTEN, and
+//!   `check_creation` mirrors the writer, see (b1), (b2).
+//! * TO BE RECORDED (S2a and S2b items, they do not block this interface): (1) the new-field ORDER
+//!   of operator updates and upserts, and (2) the reference's result of a double `$inc` on an
+//!   integer or `Decimal128` field and of an unrepresentable `Decimal128` total. Neither has a
+//!   recording: `reference-6.0.5` holds none. S2a and S2b record reference probes in the same way as
+//!   the existing recordings: `mongosh --quiet <probe>.js` scripts (see `q8-probes/acc.js` and
+//!   `q8-probes/pipeline-updates.js`) run against a MongoDB 6.0 reference server, the output saved
+//!   under `reference-6.0.5/`. The order and the deviation text of "field-merge-refusals-q7" are
+//!   then settled from the recordings before S2b and S2a finish.
 
 pub use crate::merge_state::{MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
@@ -384,19 +397,19 @@ pub struct UpsertEffects {
     pub inc: Vec<(Path, Value)>,
 }
 
-/// Who wrote a creation cell: a cell whose subtree came only from the filter and/or
-/// `$setOnInsert` is a creation cell (it can be dropped by a later merge); any `$set` part makes
-/// it `Plain`.
+/// Who wrote a creation cell: a cell that came entirely from the filter and/or `$setOnInsert` is a
+/// creation cell (it can be dropped by a later merge); any `$set` part makes it `Plain`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellTag {
-    /// Only from the filter and/or `$setOnInsert`: tagged as a creation cell.
+    /// Only from the filter and/or `$setOnInsert`: tagged as a creation cell (`fields` of
+    /// `Writer::upsert_soi_create`).
     Creation,
-    /// Some part from `$set`: untagged.
+    /// Some part from `$set` (`sets` of `Writer::upsert_soi_create`): untagged.
     Plain,
 }
 
-/// One TOP-LEVEL field of the composed creation: `path` has one segment, `value` is the whole
-/// composed subtree (a `Document` or a scalar), which the writer expands as for an insert.
+/// One cell of the composed creation, AS WRITTEN: a dotted leaf is a leaf cell at its own path, a
+/// Document-valued entry is one Document cell (the writer expands it, map markers included).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreationCell {
     pub path: Path,
@@ -415,36 +428,41 @@ impl UpsertEffects {
         first_overlap(&mut all)
     }
 
-    /// The checks of the CREATION path only (no document matched): `from_filter` leaves that
-    /// overlap each other, and an `$inc` equal to, below or above a filter leaf, are
-    /// [`UpdateRefused::Overlap`], compared on the composed leaves (so `{"a.b": 1}` and
-    /// `{a: {b: 1}}` behave alike). Filter paths starting with `_id` are left out.
+    /// The checks of the CREATION path only (no document matched), the writer's own
+    /// (`upsert_soi_create_m`): `from_filter` entries that overlap each other, as written or by
+    /// their leaves, and an `$inc` equal to, above or below a composed creation cell, are
+    /// [`UpdateRefused::Overlap`]; the composition's own refusals (`BelowScalar`) too. Filter
+    /// paths starting with `_id` are left out.
     pub fn check_creation(&self) -> Result<(), UpdateRefused> {
-        let mut filter = Vec::new();
-        for (p, v) in self.from_filter.iter().filter(|(p, _)| !is_id(p)) {
-            leaf_paths(p, v, &mut filter)?;
-        }
-        let mut sorted: Vec<&Path> = filter.iter().collect();
-        first_overlap(&mut sorted)?;
-        for f in &filter {
-            if let Some((q, _)) =
-                self.inc.iter().find(|(q, _)| q == f || q.is_below(f) || f.is_below(q))
-            {
-                return Err(UpdateRefused::Overlap(f.clone(), q.clone()));
-            }
-        }
-        Ok(())
+        self.compose().map(|_| ())
     }
 
-    /// The creation as one cell per top-level field, in a deterministic order: the composition of
-    /// "Upserts" (b2). Runs [`UpsertEffects::check`] and [`UpsertEffects::check_creation`] first.
-    /// `inc` is not part of the cells.
+    /// The creation as cells, AS WRITTEN, in a deterministic order: the composition of "Upserts"
+    /// (b2). Runs [`UpsertEffects::check`] and [`UpsertEffects::check_creation`] first. `inc` is not
+    /// part of the cells. The `Creation` cells are the `fields`, the `Plain` ones the `sets`, of
+    /// `Writer::upsert_soi_create`.
     pub fn creation_cells(&self) -> Result<Vec<CreationCell>, UpdateRefused> {
         self.check()?;
-        self.check_creation()?;
-        let mut root: Vec<(String, Node)> = Vec::new();
-        for (p, v) in self.from_filter.iter().filter(|(p, _)| !is_id(p)) {
-            put(&mut root, p, p.segments(), expand(v, CellTag::Creation))?;
+        self.compose()
+    }
+
+    /// The composition and the creation-only checks.
+    fn compose(&self) -> Result<Vec<CreationCell>, UpdateRefused> {
+        let filter: Vec<&(Path, Value)> =
+            self.from_filter.iter().filter(|(p, _)| !is_id(p)).collect();
+        // filter entries that overlap each other, as written or by their leaves
+        let mut written: Vec<&Path> = filter.iter().map(|(p, _)| p).collect();
+        first_overlap(&mut written)?;
+        let mut leaves = Vec::new();
+        for (p, v) in &filter {
+            leaf_paths(p, v, &mut leaves)?;
+        }
+        let mut sorted: Vec<&Path> = leaves.iter().collect();
+        first_overlap(&mut sorted)?;
+
+        let mut cells: Vec<CreationCell> = Vec::new();
+        for (p, v) in filter {
+            place(&mut cells, p, v, CellTag::Creation)?;
         }
         let higher = self
             .set_on_insert
@@ -453,98 +471,96 @@ impl UpsertEffects {
             .chain(self.set.iter().map(|(p, v)| (p, v, CellTag::Plain)));
         for (q, v, tag) in higher {
             if *v == Value::Unset {
-                unset(&mut root, q.segments());
+                unset_at(&mut cells, q);
             } else {
-                put(&mut root, q, q.segments(), expand(v, tag))?;
+                place(&mut cells, q, v, tag)?;
             }
         }
-        root.into_iter()
-            .map(|(name, node)| {
-                let path = Path::flat(&name).map_err(UpdateRefused::BadPath)?;
-                let tag = if node.all_creation() { CellTag::Creation } else { CellTag::Plain };
-                Ok(CreationCell { path, value: node.into_value(), tag })
-            })
-            .collect()
-    }
-}
-
-/// A composed subtree: a leaf value with the tag of the layer that wrote it, or a map.
-enum Node {
-    Leaf(Value, CellTag),
-    Map(Vec<(String, Node)>),
-}
-
-impl Node {
-    fn all_creation(&self) -> bool {
-        match self {
-            Node::Leaf(_, t) => *t == CellTag::Creation,
-            Node::Map(f) => f.iter().all(|(_, n)| n.all_creation()),
-        }
-    }
-
-    fn into_value(self) -> Value {
-        match self {
-            Node::Leaf(v, _) => v,
-            Node::Map(f) => {
-                Value::Document(f.into_iter().map(|(k, n)| (k, n.into_value())).collect())
+        // the writer's rule: an `$inc` path must not be equal to, above or below a cell path
+        for c in &cells {
+            if let Some((q, _)) = self
+                .inc
+                .iter()
+                .find(|(q, _)| *q == c.path || q.is_below(&c.path) || c.path.is_below(q))
+            {
+                return Err(UpdateRefused::Overlap(c.path.clone(), q.clone()));
             }
         }
+        Ok(cells)
     }
 }
 
-/// A value as a subtree: a non-empty document is a map, everything else (scalars, arrays, an empty
-/// document) is a leaf.
-fn expand(v: &Value, tag: CellTag) -> Node {
-    match v {
-        Value::Document(f) if !f.is_empty() => {
-            Node::Map(f.iter().map(|(k, fv)| (k.clone(), expand(fv, tag))).collect())
+/// Put `v` at `q`: below a Document cell it merges into it (the cell becomes `Plain` for `$set`);
+/// equal to or above cells it replaces them, in place of the first.
+fn place(
+    cells: &mut Vec<CreationCell>,
+    q: &Path,
+    v: &Value,
+    tag: CellTag,
+) -> Result<(), UpdateRefused> {
+    if let Some(c) = cells.iter_mut().find(|c| q.is_below(&c.path)) {
+        let Value::Document(fields) = &mut c.value else {
+            return Err(UpdateRefused::BelowScalar(q.clone()));
+        };
+        put_in(fields, q, &q.segments()[c.path.segments().len()..], v.clone())?;
+        if tag == CellTag::Plain {
+            c.tag = CellTag::Plain;
         }
-        _ => Node::Leaf(v.clone(), tag),
+        return Ok(());
     }
+    let at = cells.iter().position(|c| c.path == *q || c.path.is_below(q));
+    cells.retain(|c| !(c.path == *q || c.path.is_below(q)));
+    let cell = CreationCell { path: q.clone(), value: v.clone(), tag };
+    cells.insert(at.unwrap_or(cells.len()), cell);
+    Ok(())
 }
 
-/// Put `node` at `segs` below `fields`: an existing field is replaced IN PLACE, a new one is
-/// appended; a missing map is created, an empty-document leaf gives way, any other leaf on the way
-/// is `BelowScalar(full)`.
-fn put(
-    fields: &mut Vec<(String, Node)>,
+/// Put `v` at `segs` inside a Document: an existing field is replaced in place, a new one is
+/// appended, a missing map is created; a scalar on the way is `BelowScalar(full)`.
+fn put_in(
+    fields: &mut Vec<(String, Value)>,
     full: &Path,
     segs: &[String],
-    node: Node,
+    v: Value,
 ) -> Result<(), UpdateRefused> {
     let (first, rest) = segs.split_first().expect("a path has a segment");
     let at = fields.iter().position(|(k, _)| k == first);
     if rest.is_empty() {
         match at {
-            Some(i) => fields[i].1 = node,
-            None => fields.push((first.clone(), node)),
+            Some(i) => fields[i].1 = v,
+            None => fields.push((first.clone(), v)),
         }
         return Ok(());
     }
-    let i = match at {
-        Some(i) => i,
-        None => {
-            fields.push((first.clone(), Node::Map(Vec::new())));
-            fields.len() - 1
-        }
-    };
-    if matches!(&fields[i].1, Node::Leaf(Value::Document(d), _) if d.is_empty()) {
-        fields[i].1 = Node::Map(Vec::new());
-    }
+    let i = at.unwrap_or_else(|| {
+        fields.push((first.clone(), Value::Document(Vec::new())));
+        fields.len() - 1
+    });
     match &mut fields[i].1 {
-        Node::Map(inner) => put(inner, full, rest, node),
-        Node::Leaf(..) => Err(UpdateRefused::BelowScalar(full.clone())),
+        Value::Document(inner) => put_in(inner, full, rest, v),
+        _ => Err(UpdateRefused::BelowScalar(full.clone())),
     }
 }
 
-/// Remove the field at `segs`; a no-op (no refusal) when it is absent or below a leaf.
-fn unset(fields: &mut Vec<(String, Node)>, segs: &[String]) {
+/// An `$unset` of `q`: the cells at or below it go; inside a Document cell the nested field goes;
+/// absent, or below a scalar, it is a no-op.
+fn unset_at(cells: &mut Vec<CreationCell>, q: &Path) {
+    if let Some(c) = cells.iter_mut().find(|c| q.is_below(&c.path)) {
+        if let Value::Document(fields) = &mut c.value {
+            unset_in(fields, &q.segments()[c.path.segments().len()..]);
+        }
+        return;
+    }
+    cells.retain(|c| !(c.path == *q || c.path.is_below(q)));
+}
+
+fn unset_in(fields: &mut Vec<(String, Value)>, segs: &[String]) {
     let Some((first, rest)) = segs.split_first() else { return };
     let Some(i) = fields.iter().position(|(k, _)| k == first) else { return };
     if rest.is_empty() {
         fields.remove(i);
-    } else if let Node::Map(inner) = &mut fields[i].1 {
-        unset(inner, rest);
+    } else if let Value::Document(inner) = &mut fields[i].1 {
+        unset_in(inner, rest);
     }
 }
 
@@ -801,7 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_in_a_dead_or_superseded_life_does_not_block_a_rename() {
+    fn a_counter_in_a_dead_life_does_not_block_a_rename() {
+        // (a superseded life cannot be built: concurrent first inserts leave both lives alive.)
         // Every join drops the cells of a dead life, so such cells exist only in a state that is
         // not normalised: mark the life dead by hand, keeping its cells, so that a check that
         // ignores life state would see the counter.
@@ -810,14 +827,15 @@ mod tests {
         w.state.dead.insert(life);
         assert!(w.state.regs.keys().any(|(_, k)| *k == p("n")), "the dead life still holds n");
         assert!(!w.sees_counter_at_or_under(&p("n")));
-        // deleted and re-inserted without `n`: the rename is not blocked
+        // deleted and re-inserted without `n`: nothing to refuse, the rename of the absent source
+        // has no effects
         let mut w = writer();
         w.write_delete(0).unwrap();
         w.insert(&[(p("x"), i(2))], 0).unwrap();
         assert!(!w.sees_counter_at_or_under(&p("n")));
         let mut e = Effects::new();
-        e.rename(p("n"), p("m"), i(10));
-        assert!(e.apply(&mut w, 0).modified());
+        e.rename(p("n"), p("m"), Value::Unset);
+        assert_eq!(e.apply(&mut w, 0), Outcome::Unchanged);
     }
 
     #[test]
@@ -902,8 +920,8 @@ mod tests {
         assert!(same(None, &Value::Unset));
     }
 
-    fn cell(name: &str, value: Value, tag: CellTag) -> CreationCell {
-        CreationCell { path: p(name), value, tag }
+    fn cell(path: Path, value: Value, tag: CellTag) -> CreationCell {
+        CreationCell { path, value, tag }
     }
     fn filter(f: Vec<(Path, Value)>) -> UpsertEffects {
         UpsertEffects { from_filter: f, ..Default::default() }
@@ -912,65 +930,91 @@ mod tests {
         Value::Document(f.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 
-    #[test]
-    fn composition_is_one_cell_per_top_level_field_with_its_tag() {
-        let u = UpsertEffects {
-            from_filter: vec![(np(&["a", "b"]), i(1)), (p("d"), dc(vec![("x", i(1))]))],
-            set_on_insert: vec![(p("s"), i(2)), (p("m"), dc(vec![("x", i(1))]))],
-            set: vec![(p("t"), i(3))],
-            inc: vec![],
+    /// Create the document through the writer's creation entries, as S2a will: the `Creation`
+    /// cells are `fields`, the `Plain` ones `sets`, the first `$inc` follows. With no `$inc` the
+    /// writer still wants an `inc_path` to validate (S2a item (a)): a path that meets nothing.
+    /// `None` when the writer refuses any step.
+    fn through_the_writer(u: &UpsertEffects, cells: &[CreationCell]) -> Option<Writer> {
+        let mut w = writer_of(5);
+        let part = |t: CellTag| -> Vec<(Path, Value)> {
+            cells.iter().filter(|c| c.tag == t).map(|c| (c.path.clone(), c.value.clone())).collect()
         };
-        assert_eq!(
-            u.creation_cells().unwrap(),
-            vec![
-                cell("a", dc(vec![("b", i(1))]), CellTag::Creation),
-                cell("d", dc(vec![("x", i(1))]), CellTag::Creation),
-                cell("s", i(2), CellTag::Creation),
-                cell("m", dc(vec![("x", i(1))]), CellTag::Creation),
-                cell("t", i(3), CellTag::Plain),
-            ]
-        );
-        assert!(UpsertEffects::default().creation_cells().unwrap().is_empty());
-        // $setOnInsert {a: {x: 1}}: one cell a = Document, Creation
-        let soi = UpsertEffects {
-            set_on_insert: vec![(p("a"), dc(vec![("x", i(1))]))],
-            ..Default::default()
-        };
-        assert_eq!(
-            soi.creation_cells().unwrap(),
-            vec![cell("a", dc(vec![("x", i(1))]), CellTag::Creation)]
-        );
+        let none = p("__no_inc__");
+        let inc_path = u.inc.first().map(|(q, _)| q).unwrap_or(&none);
+        let made =
+            w.upsert_soi_create(&part(CellTag::Creation), inc_path, &part(CellTag::Plain), 0)?;
+        for (q, by) in &u.inc {
+            let Value::Int64(n) = by else { panic!("tests use Int64 operands") };
+            w.upsert_inc_on(made.stamp, q, *n, 0)?;
+        }
+        Some(w)
     }
 
     #[test]
-    fn a_higher_layer_equal_to_or_above_a_filter_path_overrides_it_in_place() {
+    fn composition_is_as_written_one_cell_per_entry_with_its_tag() {
+        let u = UpsertEffects {
+            from_filter: vec![(np(&["a", "b"]), i(1)), (p("d"), dc(vec![("x", i(1))]))],
+            set_on_insert: vec![(p("s"), i(2)), (p("m"), dc(vec![("x", i(1))]))],
+            set: vec![(p("t"), i(3)), (np(&["u", "v"]), i(4))],
+            inc: vec![],
+        };
+        let cells = u.creation_cells().unwrap();
+        assert_eq!(
+            cells,
+            vec![
+                cell(np(&["a", "b"]), i(1), CellTag::Creation),
+                cell(p("d"), dc(vec![("x", i(1))]), CellTag::Creation),
+                cell(p("s"), i(2), CellTag::Creation),
+                cell(p("m"), dc(vec![("x", i(1))]), CellTag::Creation),
+                cell(p("t"), i(3), CellTag::Plain),
+                cell(np(&["u", "v"]), i(4), CellTag::Plain),
+            ]
+        );
+        let w = through_the_writer(&u, &cells).expect("the writer accepts the creation");
+        let v = w.visible().unwrap();
+        assert_eq!((v[&np(&["a", "b"])].clone(), v[&np(&["d", "x"])].clone()), (i(1), i(1)));
+        assert_eq!((v[&np(&["m", "x"])].clone(), v[&np(&["u", "v"])].clone()), (i(1), i(4)));
+        assert!(UpsertEffects::default().creation_cells().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_higher_layer_equal_to_or_above_a_cell_overrides_it_in_place() {
         let eq = UpsertEffects { set: vec![(p("f"), i(9))], ..filter(vec![(p("f"), i(5))]) };
-        assert_eq!(eq.creation_cells().unwrap(), vec![cell("f", i(9), CellTag::Plain)]);
+        let cells = eq.creation_cells().unwrap();
+        assert_eq!(cells, vec![cell(p("f"), i(9), CellTag::Plain)]);
+        assert_eq!(through_the_writer(&eq, &cells).unwrap().visible().unwrap()[&p("f")], i(9));
         let soi =
             UpsertEffects { set_on_insert: vec![(p("f"), i(8))], ..filter(vec![(p("f"), i(5))]) };
-        assert_eq!(soi.creation_cells().unwrap(), vec![cell("f", i(8), CellTag::Creation)]);
-        // filter {"a.b": 1} with $set {a: {c: 2}} gives a: {c: 2}
+        assert_eq!(soi.creation_cells().unwrap(), vec![cell(p("f"), i(8), CellTag::Creation)]);
+        // filter {"a.b": 1} with $set {a: {c: 2}} gives the cell a = {c: 2}
         let anc = UpsertEffects {
             set: vec![(p("a"), dc(vec![("c", i(2))]))],
             ..filter(vec![(np(&["a", "b"]), i(1))])
         };
-        assert_eq!(
-            anc.creation_cells().unwrap(),
-            vec![cell("a", dc(vec![("c", i(2))]), CellTag::Plain)]
-        );
+        let cells = anc.creation_cells().unwrap();
+        assert_eq!(cells, vec![cell(p("a"), dc(vec![("c", i(2))]), CellTag::Plain)]);
+        let v = through_the_writer(&anc, &cells).unwrap().visible().unwrap();
+        assert_eq!(v[&np(&["a", "c"])], i(2));
+        assert!(!v.contains_key(&np(&["a", "b"])));
     }
 
     #[test]
-    fn a_higher_layer_below_a_filter_document_merges_into_it() {
-        // filter {a: {x: 1}} with $set {"a.y": 2}: one cell a = {x: 1, y: 2}, Plain
+    fn a_higher_layer_below_a_document_cell_merges_into_it() {
+        // filter {a: {x: 1}} with $set {"a.y": 2}: the cell a = {x: 1, y: 2}, Plain
         let u = UpsertEffects {
             set: vec![(np(&["a", "y"]), i(2))],
             ..filter(vec![(p("a"), dc(vec![("x", i(1))]))])
         };
-        assert_eq!(
-            u.creation_cells().unwrap(),
-            vec![cell("a", dc(vec![("x", i(1)), ("y", i(2))]), CellTag::Plain)]
-        );
+        let cells = u.creation_cells().unwrap();
+        assert_eq!(cells, vec![cell(p("a"), dc(vec![("x", i(1)), ("y", i(2))]), CellTag::Plain)]);
+        let v = through_the_writer(&u, &cells).unwrap().visible().unwrap();
+        assert_eq!((v[&np(&["a", "x"])].clone(), v[&np(&["a", "y"])].clone()), (i(1), i(2)));
+        // $setOnInsert below a filter Document stays a creation cell
+        let soi = UpsertEffects {
+            set_on_insert: vec![(np(&["a", "y"]), i(2))],
+            ..filter(vec![(p("a"), dc(vec![("x", i(1))]))])
+        };
+        assert_eq!(soi.creation_cells().unwrap()[0].tag, CellTag::Creation);
         // an empty filter document gives way
         let e = UpsertEffects {
             set: vec![(np(&["a", "y"]), i(2))],
@@ -978,95 +1022,170 @@ mod tests {
         };
         assert_eq!(
             e.creation_cells().unwrap(),
-            vec![cell("a", dc(vec![("y", i(2))]), CellTag::Plain)]
+            vec![cell(p("a"), dc(vec![("y", i(2))]), CellTag::Plain)]
         );
-        // below a non-document filter value is refused
+        // below a scalar is refused
         let bad =
             UpsertEffects { set: vec![(np(&["a", "y"]), i(2))], ..filter(vec![(p("a"), i(5))]) };
         assert_eq!(bad.creation_cells(), Err(UpdateRefused::BelowScalar(np(&["a", "y"]))));
     }
 
     #[test]
-    fn an_unset_through_a_scalar_is_a_no_op_and_an_unset_of_a_filter_field_removes_it() {
+    fn an_unset_through_a_scalar_is_a_no_op_and_an_unset_of_a_cell_removes_it() {
         let through = UpsertEffects {
             set: vec![(np(&["a", "y"]), Value::Unset)],
             ..filter(vec![(p("a"), i(5))])
         };
-        assert_eq!(through.creation_cells().unwrap(), vec![cell("a", i(5), CellTag::Creation)]);
+        assert_eq!(through.creation_cells().unwrap(), vec![cell(p("a"), i(5), CellTag::Creation)]);
         let missing = UpsertEffects {
             set: vec![(np(&["q", "y"]), Value::Unset)],
             ..filter(vec![(p("a"), i(5))])
         };
-        assert_eq!(missing.creation_cells().unwrap(), vec![cell("a", i(5), CellTag::Creation)]);
+        assert_eq!(missing.creation_cells().unwrap(), vec![cell(p("a"), i(5), CellTag::Creation)]);
         let removes = UpsertEffects {
             set: vec![(p("a"), Value::Unset)],
             ..filter(vec![(p("a"), i(5)), (p("b"), i(6))])
         };
-        assert_eq!(removes.creation_cells().unwrap(), vec![cell("b", i(6), CellTag::Creation)]);
+        assert_eq!(removes.creation_cells().unwrap(), vec![cell(p("b"), i(6), CellTag::Creation)]);
+        // inside a Document cell
+        let inner = UpsertEffects {
+            set: vec![(np(&["a", "x"]), Value::Unset)],
+            ..filter(vec![(p("a"), dc(vec![("x", i(1)), ("y", i(2))]))])
+        };
+        assert_eq!(
+            inner.creation_cells().unwrap(),
+            vec![cell(p("a"), dc(vec![("y", i(2))]), CellTag::Creation)]
+        );
     }
 
     #[test]
-    fn the_order_is_filter_order_overrides_in_place_and_new_fields_as_listed() {
+    fn the_order_is_filter_order_overrides_in_place_and_new_cells_as_listed() {
         let u = UpsertEffects {
             from_filter: vec![(p("z"), i(1)), (p("a"), i(2)), (p("m"), i(3))],
             set_on_insert: vec![(p("c"), i(4))],
             set: vec![(p("a"), i(9)), (p("b"), i(5))],
             inc: vec![],
         };
-        let names: Vec<String> =
-            u.creation_cells().unwrap().iter().map(|c| c.path.segments()[0].clone()).collect();
+        let cells = u.creation_cells().unwrap();
+        let names: Vec<String> = cells.iter().map(|c| c.path.segments()[0].clone()).collect();
         assert_eq!(names, ["z", "a", "m", "c", "b"]);
-        assert_eq!(u.creation_cells().unwrap()[1].value, i(9));
+        assert_eq!(cells[1].value, i(9));
     }
 
     #[test]
     fn any_filter_path_starting_with_id_is_left_out() {
         let u = filter(vec![(p("_id"), i(1)), (np(&["_id", "x"]), i(1)), (p("a"), i(2))]);
-        assert!(u.check_creation().is_ok(), "_id and _id.x do not even overlap here");
-        assert_eq!(u.creation_cells().unwrap(), vec![cell("a", i(2), CellTag::Creation)]);
+        assert!(u.check_creation().is_ok());
+        assert_eq!(u.creation_cells().unwrap(), vec![cell(p("a"), i(2), CellTag::Creation)]);
     }
 
     #[test]
-    fn filter_paths_that_overlap_each_other_are_refused_on_creation_only() {
+    fn filter_entries_that_overlap_each_other_are_refused_on_creation_only() {
         let twice = filter(vec![(p("a"), i(1)), (p("a"), i(2))]);
         assert!(matches!(twice.check_creation(), Err(UpdateRefused::Overlap(..))));
         assert!(twice.check().is_ok(), "the parse-time check never looks at the filter");
         let nested = filter(vec![(p("a"), i(1)), (np(&["a", "b"]), i(2))]);
         assert!(matches!(nested.creation_cells(), Err(UpdateRefused::Overlap(..))));
-        // compared on the composed leaves: a: {b: 1} with "a.b" is the same path twice
+        // by their leaves: a: {b: 1} with "a.b"
         let spelled = filter(vec![(p("a"), dc(vec![("b", i(1))])), (np(&["a", "b"]), i(2))]);
         assert!(matches!(spelled.check_creation(), Err(UpdateRefused::Overlap(..))));
         let disjoint = filter(vec![(np(&["a", "b"]), i(1)), (np(&["a", "c"]), i(2))]);
         assert!(disjoint.check_creation().is_ok());
     }
 
+    /// Every case the contract accepts the writer accepts, and every case it refuses for an `$inc`
+    /// the writer would refuse on the same cells, or the case is refused up front.
+    #[test]
+    fn the_checks_and_the_writer_agree_on_every_inc_case() {
+        let ab = np(&["a", "b"]);
+        let (ax, an, ac) = (np(&["a", "x"]), np(&["a", "n"]), np(&["a", "c"]));
+        // (name, upsert, accepted)
+        let cases: Vec<(&str, UpsertEffects, bool)> = vec![
+            (
+                "$set a.x + $inc a.n",
+                UpsertEffects {
+                    set: vec![(ax.clone(), i(1))],
+                    inc: vec![(an.clone(), i(1))],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "filter a.b + $inc a.c",
+                UpsertEffects { inc: vec![(ac.clone(), i(1))], ..filter(vec![(ab.clone(), i(1))]) },
+                true,
+            ),
+            (
+                "filter {a:{b:1}} + $inc a.c",
+                UpsertEffects {
+                    inc: vec![(ac.clone(), i(1))],
+                    ..filter(vec![(p("a"), dc(vec![("b", i(1))]))])
+                },
+                false,
+            ),
+            (
+                "filter a:5 + $inc a",
+                UpsertEffects { inc: vec![(p("a"), i(1))], ..filter(vec![(p("a"), i(5))]) },
+                false,
+            ),
+            (
+                "filter a.b + $inc a (above)",
+                UpsertEffects { inc: vec![(p("a"), i(1))], ..filter(vec![(ab.clone(), i(1))]) },
+                false,
+            ),
+            (
+                "filter a.b + $inc a.b (equal)",
+                UpsertEffects { inc: vec![(ab.clone(), i(1))], ..filter(vec![(ab.clone(), i(1))]) },
+                false,
+            ),
+            (
+                "filter a.b + $inc a.b.k (below a leaf)",
+                UpsertEffects {
+                    inc: vec![(np(&["a", "b", "k"]), i(1))],
+                    ..filter(vec![(ab.clone(), i(1))])
+                },
+                false,
+            ),
+            (
+                "unrelated $inc",
+                UpsertEffects { inc: vec![(p("n"), i(1))], ..filter(vec![(p("f"), i(2))]) },
+                true,
+            ),
+        ];
+        for (name, u, accepted) in cases {
+            if accepted {
+                let cells = u.creation_cells().unwrap_or_else(|e| panic!("{name}: {e}"));
+                let w = through_the_writer(&u, &cells)
+                    .unwrap_or_else(|| panic!("{name}: the writer refuses what the check accepts"));
+                if name.starts_with("$set a.x") {
+                    // created and read back
+                    let v = w.visible().unwrap();
+                    assert_eq!((v[&ax].clone(), v[&an.clone()].clone()), (i(1), i(1)));
+                }
+            } else {
+                assert!(u.creation_cells().is_err(), "{name}: refused up front");
+                // the writer refuses the same cells (composed without the inc check)
+                let mut bare = u.clone();
+                let inc = std::mem::take(&mut bare.inc);
+                let cells = bare.creation_cells().unwrap();
+                let mut w = writer_of(5);
+                let fields: Vec<_> = cells
+                    .iter()
+                    .filter(|c| c.tag == CellTag::Creation)
+                    .map(|c| (c.path.clone(), c.value.clone()))
+                    .collect();
+                let refused = w.upsert_soi_create(&fields, &inc[0].0, &[], 0).is_none();
+                assert!(refused, "{name}: the writer accepts what the check refuses");
+            }
+        }
+    }
+
     #[test]
     fn an_inc_on_a_path_the_filter_writes_is_refused_on_creation_but_not_when_matched() {
-        // {a: 5} with $inc a 1: refused on the creation path (the reference gives 6; a deviation)
         let on = UpsertEffects { inc: vec![(p("a"), i(1))], ..filter(vec![(p("a"), i(5))]) };
         assert_eq!(on.check_creation(), Err(UpdateRefused::Overlap(p("a"), p("a"))));
         assert!(on.creation_cells().is_err());
         // a MATCHED upsert is an ordinary update: the parse-time check accepts it
         assert!(on.check().is_ok());
-        // both spellings of the same filter behave alike: refused on the leaf, allowed beside it
-        for f in [vec![(np(&["a", "b"]), i(1))], vec![(p("a"), dc(vec![("b", i(1))]))]] {
-            let hit = UpsertEffects { inc: vec![(np(&["a", "b"]), i(1))], ..filter(f.clone()) };
-            assert!(matches!(hit.check_creation(), Err(UpdateRefused::Overlap(..))));
-            let beside = UpsertEffects { inc: vec![(np(&["a", "c"]), i(1))], ..filter(f.clone()) };
-            assert!(beside.check_creation().is_ok());
-            // above a filter leaf
-            let above = UpsertEffects { inc: vec![(p("a"), i(1))], ..filter(f) };
-            assert!(matches!(above.check_creation(), Err(UpdateRefused::Overlap(..))));
-        }
-        // below a scalar leaf, and an unrelated path
-        let below =
-            UpsertEffects { inc: vec![(np(&["a", "n"]), i(1))], ..filter(vec![(p("a"), i(5))]) };
-        assert!(matches!(below.check_creation(), Err(UpdateRefused::Overlap(..))));
-        let free = UpsertEffects {
-            inc: vec![(p("n"), i(1)), (np(&["a", "c"]), i(1))],
-            ..filter(vec![(np(&["a", "b"]), i(1)), (p("f"), i(2))])
-        };
-        assert!(free.check_creation().is_ok());
-        assert_eq!(free.creation_cells().unwrap().len(), 2);
     }
 }
