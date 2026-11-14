@@ -1537,6 +1537,7 @@ mod tests {
             validator: None,
             validator_changed: None,
             merge_policy: kimmy_core::MergePolicy::Document,
+            merge_policy_at: None,
         };
         let mut written = Vec::new();
         write_frame(

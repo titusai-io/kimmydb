@@ -4508,6 +4508,41 @@ impl Engine {
             .expect("a creation that judges nothing history always creates"))
     }
 
+    /// Converge the merge policy of a collection held already on the creation that wins: a
+    /// creation of the name at `at` under `policy`, met by an entry or a snapshot page, takes the
+    /// policy when it is later than the creation the held policy came from
+    /// ([`CollectionMeta::policy_yields_to`]); otherwise nothing changes. The policy is fixed
+    /// for the life of each creation, not chosen by arrival order. Converting the records written
+    /// under the policy that lost is not done here (D3).
+    pub(crate) fn adopt_creation_policy(
+        &self,
+        db: &str,
+        name: &str,
+        policy: kimmy_core::MergePolicy,
+        at: Hlc,
+    ) -> Result<CollectionMeta> {
+        let policy = policy.fixed_for(name);
+        for _ in 0..Self::MAX_DEFINITION_RETRIES {
+            let mut meta = self.get_collection(db, name)?;
+            if !meta.policy_yields_to(at, policy) {
+                return Ok(meta);
+            }
+            let read = meta.clone();
+            meta.merge_policy = policy;
+            meta.merge_policy_at = Some(at);
+            let txn = self.begin_write(WriterHolder::Ddl)?;
+            if !Self::definition_is(&txn, &read)? {
+                txn.abort()?;
+                continue;
+            }
+            Self::put_collection_meta(&txn, &meta)?;
+            txn.commit()?;
+            info!(db, collection = name, policy = %policy, "took the merge policy of the later creation");
+            return Ok(meta);
+        }
+        Err(Self::retries_exhausted_error(db, name))
+    }
+
     /// `log = false` when applying a replicated creation. See
     /// `create_index_inner` for why a replicated change must not mint an entry.
     ///
@@ -4814,6 +4849,7 @@ impl Engine {
             let mut meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             meta.merge_policy = policy;
+            meta.merge_policy_at = Some(origin.unwrap_or(stamp.hlc));
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.

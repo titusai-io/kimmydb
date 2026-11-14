@@ -31,6 +31,13 @@ pub struct CollectionMeta {
     /// How concurrent writes to one document merge. Fixed at creation. No serde default: a
     /// stored definition without it does not decode.
     pub merge_policy: MergePolicy,
+    /// The `created` of the creation whose `merge_policy` this is. Two members can create one name
+    /// at once under different policies; the policy follows the creation with the later stamp, the
+    /// policy text breaking a tie, on every route a creation arrives by (an entry, a snapshot page),
+    /// so all members hold the same one. `None` on a definition stored before it was kept: `created`
+    /// stands in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_policy_at: Option<Hlc>,
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///
@@ -126,6 +133,19 @@ impl CollectionMeta {
         self.redated.filter(|r| r.created == created && self.created == created)?.first_arrival
     }
 
+    /// What decides between two creations of this name: the stamp of the creation whose policy
+    /// this collection holds, then the policy's text (a tie between members that created at the
+    /// same instant under different policies is settled the same way everywhere).
+    pub fn policy_key(&self) -> (Hlc, &'static str) {
+        (self.merge_policy_at.unwrap_or(self.created), self.merge_policy.as_str())
+    }
+
+    /// Does a creation at `at` under `policy` take the policy of this collection from the one it
+    /// holds? The later creation wins; a creation never takes it from itself.
+    pub fn policy_yields_to(&self, at: Hlc, policy: MergePolicy) -> bool {
+        (at, policy.as_str()) > self.policy_key()
+    }
+
     pub fn new(
         id: CollectionId,
         db: impl Into<String>,
@@ -139,6 +159,7 @@ impl CollectionMeta {
             name: name.into(),
             created,
             merge_policy: MergePolicy::Document,
+            merge_policy_at: None,
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,

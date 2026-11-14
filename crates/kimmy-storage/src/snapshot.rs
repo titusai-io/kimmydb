@@ -370,6 +370,10 @@ pub struct CollectionState {
     /// The collection's merge policy (`CollectionMeta::merge_policy`), fixed at creation. No
     /// serde default: a page without it does not decode.
     pub merge_policy: kimmy_core::MergePolicy,
+    /// The creation the policy came from (`CollectionMeta::merge_policy_at`), so a receiver
+    /// holding another creation of the name settles on the later one. `None` reads as `created`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_policy_at: Option<Hlc>,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -387,6 +391,7 @@ impl From<CollectionMeta> for CollectionState {
             validator: meta.validator,
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,
+            merge_policy_at: meta.merge_policy_at,
         }
     }
 }
@@ -2634,6 +2639,14 @@ impl Engine {
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        // The collection is held now, by this page's creation or by another of the name: the
+        // merge policy follows the later creation, as it does on the entries route, when the
+        // page's coverage names that creation (ADR-163). A held policy never changes otherwise.
+        let policy_at = state.merge_policy_at.unwrap_or(state.created);
+        if hlc_is_named(policy_at, versions) {
+            self.adopt_creation_policy(&state.db, &state.name, state.merge_policy, policy_at)?;
         }
 
         // A page can name a life of the collection this node has seen dropped
