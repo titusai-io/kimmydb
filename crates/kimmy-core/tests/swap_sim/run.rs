@@ -505,7 +505,11 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
                             }
                         }
                         _ => {
-                            // the product's scoped repair: document versions as state, no grant, no register events
+                            // the product's scoped repair: document versions as state, no grant, no register events. Under `product_marks`
+                            // the repair ends in `write_repair_marks` (snapshot.rs), which applies each repaired version this member does
+                            // not hold under Hold through `take_hold` -> `take` (apply.rs): the entry is held out of position, not covering,
+                            // and `take` witnesses it, so the member's clock DOES merge the version's stamp on this route (unlike the
+                            // register-event repair route above, which adds events only and witnesses nothing)
                             w.note(format!("DOC-REPAIR {} <- {}", d.name, s.name));
                             if d.scoped_repair(&mut w, s) {
                                 w.stats.bump("doc_repair");
