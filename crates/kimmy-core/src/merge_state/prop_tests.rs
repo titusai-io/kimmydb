@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use crate::effects::{CellTag, CreationCell};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -1312,4 +1313,121 @@ fn the_states_writers_build_satisfy_the_invariants_decode_checks() {
             assert_eq!(MergeState::decode_compact(&st.encode_compact()).as_ref(), Ok(st));
         }
     }
+}
+
+/// An operand of an `$inc` from the typed pool: `Int32` (also at the `i32` range), `Int64`,
+/// `Decimal128`, and a `Double` (a register on an absent field).
+fn pool_typed_inc(rng: &mut Rng) -> Value {
+    let dec = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
+    match rng.below(10) {
+        0 => Value::Int32(1),
+        1 => Value::Int32(-3),
+        2 => Value::Int32(i32::MAX),
+        3 => Value::Int32(i32::MIN),
+        4 => Value::Int64(5),
+        5 => Value::Int64(-(1 << 33)),
+        6 => dec("1.5"),
+        7 => dec("-0.25"),
+        8 => Value::Double(0.5),
+        _ => Value::Int32(0),
+    }
+}
+
+/// One random run of the one-entry upsert of the effects layer (`Writer::upsert_create`: plain,
+/// creation and `Inc` cells, several `$inc` cells at one stamp, typed operands) with typed
+/// increments, base writes and the exchange of states between the writers; returns every state any
+/// writer held. Its own random stream: the pools of [`run`] are not touched by it.
+pub(super) fn run_typed_upserts(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+    let n = 3 + rng.below(2);
+    let mut ws: Vec<Writer> = (0..n)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let names = ["x", "y", "n", "z", "", "_", "a.b"];
+    let mut pool = Vec::new();
+    for _ in 0..steps {
+        let m = rng.below(n);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 45 {
+            let mut other = rng.below(n);
+            if other == m {
+                other = (m + 1) % n;
+            }
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let w = &mut ws[m];
+            match rng.below(8) {
+                0..=2 => {
+                    let mut cells: Vec<CreationCell> = Vec::new();
+                    for name in names {
+                        match rng.below(4) {
+                            0 => cells.push(CreationCell {
+                                path: p(name),
+                                value: pool_value(&mut rng),
+                                tag: *rng.pick(&[CellTag::Plain, CellTag::Creation]),
+                            }),
+                            1 | 2 => cells.push(CreationCell {
+                                path: p(name),
+                                value: pool_typed_inc(&mut rng),
+                                tag: CellTag::Inc,
+                            }),
+                            _ => {}
+                        }
+                    }
+                    let _ = w.upsert_create(&cells, skew);
+                }
+                3 | 4 => {
+                    let path = p(rng.pick(&names));
+                    let _ = w.write_inc_value(&path, &pool_typed_inc(&mut rng), skew);
+                }
+                5 => {
+                    let path = p(rng.pick(&names));
+                    let v = if rng.below(2) == 0 { Value::Int32(5) } else { Value::Int64(7) };
+                    let _ = w.write_set(&path, v, skew);
+                }
+                6 => {
+                    let path = p(rng.pick(&names));
+                    let _ = w.write_unset(&path, skew);
+                }
+                _ => {
+                    let _ = w.write_delete(skew);
+                }
+            }
+        }
+        pool.push(ws[m].state.clone());
+    }
+    pool
+}
+
+/// The join laws over the typed upsert pools: several `$inc` cells at one stamp, typed slots, base
+/// writes that absorb them.
+#[test]
+fn join_laws_on_typed_upsert_pools() {
+    let o = opts(1_000_000_000);
+    let ps: Vec<Vec<MergeState>> = (1..=40).map(|s| run_typed_upserts(s, 24, &o)).collect();
+    check_laws_on(&o, true, &ps, 300);
+}
+
+/// Every state of the typed upsert pools round-trips through the compact form, and the hash does not
+/// depend on how the state was reached.
+#[test]
+fn typed_upsert_pools_round_trip_the_compact_form() {
+    let o = opts(1_000_000_000);
+    let mut slots = 0;
+    for s in 1..=40 {
+        for st in run_typed_upserts(s, 24, &o) {
+            slots += st.slots.len();
+            let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
+            assert_eq!(back, st, "seed {s}");
+            assert_eq!(back.compact_hash(), st.compact_hash(), "seed {s}");
+        }
+    }
+    assert!(slots > 200, "the pools hold counters: {slots}");
 }
