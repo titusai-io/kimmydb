@@ -142,6 +142,60 @@ fn the_allowed_renames_are_plain_moves() {
     assert_eq!(effects.renames().len(), 1);
 }
 
+/// The nine recorded cases of a missing source (`q7s2e.out` lines 5 to 45): the reference does
+/// nothing (matched 1, modified 0, the document unchanged) and does not look at the destination,
+/// however it goes through an array or a scalar.
+#[test]
+fn a_missing_source_is_a_no_op_whatever_the_destination() {
+    let two = || doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }], "arr": [1, 2] };
+    let cases: Vec<(&str, Document, Document)> = vec![
+        ("1a items.0.nope -> code (line 5)", two(), doc! {"$rename": {"items.0.nope": "code"}}),
+        ("1b items.5.sku -> code (line 10)", two(), doc! {"$rename": {"items.5.sku": "code"}}),
+        (
+            "1c items.0.nope -> items.1.x (line 15)",
+            two(),
+            doc! {"$rename": {"items.0.nope": "items.1.x"}},
+        ),
+        ("1d arr.5 -> y (line 20)", two(), doc! {"$rename": {"arr.5": "y"}}),
+        ("1e nope -> items.0.t (line 25)", two(), doc! {"$rename": {"nope": "items.0.t"}}),
+        (
+            "1f nope -> a.b over {a:5} (line 30)",
+            doc! { "_id": 1, "a": 5 },
+            doc! {"$rename": {"nope": "a.b"}},
+        ),
+        ("1g nope -> items.s (line 35)", two(), doc! {"$rename": {"nope": "items.s"}}),
+        (
+            "1h items.0.nope -> code, items absent (line 40)",
+            doc! { "_id": 1 },
+            doc! {"$rename": {"items.0.nope": "code"}},
+        ),
+        ("1i nope -> missing.deep (line 45)", two(), doc! {"$rename": {"nope": "missing.deep"}}),
+    ];
+    for (label, d, u) in cases {
+        let (effects, outcome) = parity_doc(u, &d);
+        assert!(effects.is_empty(), "{label}: {effects:?}");
+        assert_eq!(outcome, Outcome::Unchanged, "{label}");
+    }
+}
+
+/// A missing source that goes through an array by a non-numeric segment, or below a scalar, is
+/// still refused, as the reference refuses it (`q7s2.out` lines 116 and 586, `q7s2d.out` 86 to 101).
+#[test]
+fn a_source_through_an_array_by_name_or_below_a_scalar_is_refused_even_when_missing() {
+    let err =
+        refusal(&doc! { "_id": 1, "items": [{ "s": 1 }] }, doc! {"$rename": {"items.nope": "y"}});
+    assert!(err.contains(TRAVERSE), "{err}");
+    let err = refusal(&doc! { "_id": 1, "a": 5 }, doc! {"$rename": {"a.y": "b"}});
+    assert!(err.contains(TRAVERSE), "{err}");
+}
+
+/// An existing source with a destination into an array stays refused (the counter of the review).
+#[test]
+fn an_existing_source_into_an_array_stays_refused() {
+    let err = refusal(&counter(), doc! {"$rename": {"n": "arr.1"}});
+    assert!(err.contains(DEST), "{err}");
+}
+
 #[test]
 fn a_rename_of_a_missing_source_is_nothing() {
     let (effects, outcome) = parity_doc(doc! {"$rename": {"nope": "t"}}, &items());

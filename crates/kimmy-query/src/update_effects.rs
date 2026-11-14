@@ -184,23 +184,52 @@ fn traverse_refusal(doc: &Document, prefix: &str, path: &str) -> Error {
     ))
 }
 
+/// The value at `segs`, following a document by its field and an array by a numeric segment.
+fn value_at<'a>(doc: &'a Document, segs: &[&str]) -> Option<&'a Bson> {
+    let (first, rest) = segs.split_first()?;
+    let mut cur = doc.get(*first)?;
+    for seg in rest {
+        cur = match cur {
+            Bson::Document(d) => d.get(*seg)?,
+            Bson::Array(a) => a.get(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 /// The recorded refusals of a `$rename` (the reference's, `q7s2.out` lines 101 to 121 and 586,
 /// `q7s2d.out` lines 76 to 116), made here BEFORE the update runs, because an array element or a
 /// scalar has no counter check at the writer and the engine of this release still applies these
 /// forms: a source or a destination inside an array element (by an index or not), a source below
 /// a scalar, a destination below a scalar. Allowed, as in the reference: a whole array, a field
 /// of a sub-document, a document key spelled `0`.
+///
+/// A source that is not there is a no-op, whatever the destination looks like and even when the
+/// source path goes through an array by an index that is out of range or names a field the
+/// element lacks (`q7s2e.out` lines 5 to 45: matched 1, modified 0, nothing checked): only a
+/// source that EXISTS is refused for sitting inside an array element, and then the destination is
+/// checked. A source that goes through an array by a non-numeric segment, or through a scalar, is
+/// refused whether or not it exists (`q7s2.out` line 116 and 586).
 fn refuse_rename_ways(doc: &Document, source: &str, target: &str) -> Result<()> {
+    let segs = path::segments(source);
     match way(doc, source) {
-        Way::Clear => {}
+        Way::Array { prefix, index: false } | Way::Scalar { prefix } => {
+            return Err(traverse_refusal(doc, &prefix, source));
+        }
         Way::Array { prefix, index: true } => {
+            if value_at(doc, &segs).is_none() {
+                return Ok(());
+            }
             return Err(Error::InvalidUpdate(format!(
                 "$rename: the source field cannot be an array element: {source:?} goes through \
                  the array {prefix:?}"
             )));
         }
-        Way::Array { prefix, index: false } | Way::Scalar { prefix } => {
-            return Err(traverse_refusal(doc, &prefix, source));
+        Way::Clear => {
+            if get_in(doc, &segs).is_none() {
+                return Ok(());
+            }
         }
     }
     match way(doc, target) {
