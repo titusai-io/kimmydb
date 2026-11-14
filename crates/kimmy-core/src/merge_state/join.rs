@@ -128,8 +128,8 @@ pub struct JoinOptions {
     /// A local write by a 257th writer is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_writer_cap: bool,
-    /// R1 mutant: the type of a counter is the widest label of its slots alone, the base's label
-    /// does not count.
+    /// R1 mutant: an `Int64` base that fits an `i32` counts as an `Int32` in the type of a counter:
+    /// the base's own label does not count.
     #[cfg(any(test, feature = "merge-mutants"))]
     counter_ignores_base: bool,
     /// R1 mutant: the type of a counter is read from the VALUE of each part (an `Int32` amount past
