@@ -662,7 +662,12 @@ moves. A
 whole array (`items` to `lines`), a field of a sub-document (`o.p` to `o.q`)
 and a rename beside a write to an array still apply. A source that is missing
 is still a no-op, through an array index too (`items.0.nope`, `items.5.sku`,
-`arr.5`), and its destination is not checked.
+`arr.5`), and its destination is not checked. The source is walked
+through documents by key and arrays by index, and a path that goes through a
+scalar or `null` (`arr.0.x` over `[1, 2]`, `items.0.sku.x` over a string), or
+through an array by a field name, is refused as a traverse whether or not
+anything lies beyond it, naming the part that holds the value, and without
+looking at the destination.
 
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`

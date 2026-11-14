@@ -1412,25 +1412,25 @@ fn apply_one(
             if touches_id(target) {
                 return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
-            match rename_way(doc, &op.path) {
-                Way::Clear => {}
-                // A source that is not there is nothing to move, whatever lies
-                // above it (q7s2e.out lines 5-46); one that is there, inside
-                // an element, cannot be moved.
-                Way::Array { index: true, .. } if current.is_none() => return Ok(()),
-                Way::Array { prefix, index: true } => {
+            match rename_source(doc, &op.path) {
+                // A source that is not there is nothing to move, and nothing
+                // else is looked at, the destination included (q7s2e.out lines
+                // 5-46, q7s2f.out lines 37, 42, 69).
+                Source::Missing => return Ok(()),
+                // A value that is there inside an array element cannot be moved.
+                Source::InArray { prefix } => {
                     return Err(invalid(format!(
                         "$rename: the source field cannot be an array element: {:?} goes through \
                          the array {prefix:?}",
                         op.path
                     )));
                 }
-                Way::Array { prefix, index: false } => {
-                    return Err(invalid(traverse_refusal(doc, &prefix, &op.path)));
+                // A path that goes through a value it cannot enter is refused
+                // whether or not anything lies beyond it (q7s2f.out lines 5-63).
+                Source::Blocked { part, held } => {
+                    return Err(invalid(traverse_refusal(&part, &op.path, &held)));
                 }
-                Way::Scalar { prefix } => {
-                    return Err(invalid(traverse_refusal(doc, &prefix, &op.path)));
-                }
+                Source::Found => {}
             }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
@@ -1468,13 +1468,13 @@ fn apply_one(
     Ok(())
 }
 
-/// What lies in the way of a `$rename` path in a document: the first value on
-/// the path, above its last segment, that is not a sub-document.
+/// What lies in the way of a `$rename` destination in a document: the first
+/// value on the path, above its last segment, that is not a sub-document.
 enum Way {
     /// A sub-document at every step, or nothing at some step.
     Clear,
-    /// An array at `prefix`; `index` says the segment after it is a number.
-    Array { prefix: String, index: bool },
+    /// An array at `prefix`.
+    Array { prefix: String },
     /// A scalar at `prefix`, with a segment still to go through it.
     Scalar { prefix: String },
 }
@@ -1488,10 +1488,7 @@ fn rename_way(doc: &Document, path: &str) -> Way {
             None => return Way::Clear,
             Some(Bson::Document(child)) => level = child,
             Some(Bson::Array(_)) => {
-                return Way::Array {
-                    prefix: prefix(),
-                    index: segments[at + 1].parse::<usize>().is_ok(),
-                };
+                return Way::Array { prefix: prefix() };
             }
             Some(_) => return Way::Scalar { prefix: prefix() },
         }
@@ -1499,11 +1496,55 @@ fn rename_way(doc: &Document, path: &str) -> Way {
     Way::Clear
 }
 
+/// Where a `$rename` source leads in a document.
+enum Source {
+    /// Nothing is there: a missing key, an index past the end, a missing leaf.
+    Missing,
+    /// A value is there, reached through an array by an index.
+    InArray { prefix: String },
+    /// The path goes through a value it cannot enter, an array by a name or a
+    /// scalar or `null` by any segment: `part` is the segment that names it
+    /// and `held` the value.
+    Blocked { part: String, held: Bson },
+    /// A value is there, reached through documents alone.
+    Found,
+}
+
+/// Walk a `$rename` source: documents by key, arrays by numeric index. A step
+/// that finds nothing ends the walk as [`Source::Missing`] before anything
+/// further is judged, so an index past the end is a no-op however the path
+/// goes on.
+fn rename_source(doc: &Document, path: &str) -> Source {
+    let segments = path::segments(path);
+    let Some(mut value) = doc.get(segments[0]) else { return Source::Missing };
+    let mut array: Option<String> = None;
+    for (at, segment) in segments.iter().enumerate().skip(1) {
+        let named = segments[at - 1];
+        let next = match value {
+            Bson::Document(child) => child.get(*segment),
+            Bson::Array(items) => match segment.parse::<usize>() {
+                Ok(index) => {
+                    array.get_or_insert_with(|| segments[..at].join("."));
+                    items.get(index)
+                }
+                Err(_) => {
+                    return Source::Blocked { part: named.to_string(), held: value.clone() };
+                }
+            },
+            other => return Source::Blocked { part: named.to_string(), held: other.clone() },
+        };
+        let Some(next) = next else { return Source::Missing };
+        value = next;
+    }
+    match array {
+        Some(prefix) => Source::InArray { prefix },
+        None => Source::Found,
+    }
+}
+
 /// The refusal for a `$rename` source that goes through a value it cannot
-/// enter: an array with no index, or a scalar.
-fn traverse_refusal(doc: &Document, prefix: &str, path: &str) -> String {
-    let part = prefix.rsplit('.').next().unwrap_or(prefix);
-    let held = path::resolve(doc, prefix).first().map(|v| v.to_string()).unwrap_or_default();
+/// enter, naming the part of the path that names it.
+fn traverse_refusal(part: &str, path: &str, held: &Bson) -> String {
     format!(
         "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
     )
