@@ -1095,37 +1095,29 @@ fn a_nested_writers_hash_equals_every_receivers() {
 }
 
 #[test]
-fn state_equality_is_the_equality_of_the_version_1_bytes() {
-    // `Writer::receive_report` decides "changed" by comparing states, where it once compared the
-    // version 1 canonical bytes: the two verdicts agree on every state version 1 can spell.
+fn state_equality_is_the_equality_of_the_compact_bytes() {
+    // `Writer::receive_report` decides "changed" by comparing states. The compact form is the canonical
+    // form and the state hash, so state equality must be exactly the equality of its bytes (and an
+    // equal pair must hash alike): on EVERY state, including the ones the legacy version 1 form cannot
+    // spell (a document in an array, an absorbed pair, an order state).
     let o = opts(1_000_000_000);
     let mut pools_ = pools(40, 24, &o);
-    pools_.extend(
-        nested_pools(40, 24, &o)
-            .into_iter()
-            .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
-    );
-    let (mut same, mut differ) = (0, 0);
-    let (mut v1_pairs, mut v1_held_pairs) = (0, 0);
-    for (a, b, _) in triples(&pools_, 600) {
+    pools_.extend(nested_pools(40, 24, &o));
+    // `pools` and `nested_pools` clear the order state: these two keep it
+    pools_.extend(ord_pools(40, 24, &o));
+    pools_.extend(nested_ord_pools(40, 24, &o));
+    let (mut same, mut differ, mut with_ords) = (0, 0, 0);
+    for (a, b, _) in triples(&pools_, 1200) {
         let merged = join(a, b, &o).0;
         for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
             let by_state = x == y;
-            // the compact bytes, for every state (the version 1 form cannot spell a state with an
-            // absorbed pair)
+            with_ords += usize::from(!x.ords.is_empty());
             assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
-            // version 1, where it holds both states of the pair
-            let (hx, hy) = (x.without_ords().v1_can_hold(), y.without_ords().v1_can_hold());
-            if hx && hy {
-                assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
-                v1_held_pairs += 1;
-            } else {
-                assert!(
-                    (hx || x.v1_refused_only_for_a_pair())
-                        && (hy || y.v1_refused_only_for_a_pair())
-                );
-            }
-            v1_pairs += 1;
+            assert_eq!(
+                x.compact_hash() == y.compact_hash(),
+                by_state,
+                "the hash tells states apart"
+            );
             if by_state {
                 same += 1;
             } else {
@@ -1133,9 +1125,36 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             }
         }
     }
-    eprintln!("state_equality: {v1_held_pairs} of {v1_pairs} pairs also on version 1");
+    eprintln!(
+        "state_equality: {same} equal pairs, {differ} different, {with_ords} with an order state"
+    );
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
-    assert!(v1_held_pairs > 50, "version 1 still compares {v1_held_pairs} pairs");
+    assert!(with_ords > 500, "only {with_ords} states carry an order state");
+    // The random pairs seldom differ in their order state ALONE (it follows from the cells), so make such
+    // pairs: the same state with one order entry removed, or one part of the first entry changed. Equal bytes
+    // for these would mean section 10 does not tell the order states apart.
+    let mut tweaked = 0;
+    for x in pools_.iter().flatten().filter(|x| !x.ords.is_empty()) {
+        let key = x.ords.keys().next().unwrap().clone();
+        let mut removed = x.clone();
+        removed.ords.remove(&key);
+        let mut changed = x.clone();
+        let e = changed.ords.get_mut(&key).unwrap();
+        if let Some(c) = &mut e.last {
+            c.1 += 1;
+        } else if let Some(l) = e.lvl {
+            e.lvl = Some(MStamp { hlc: Hlc::new(l.hlc.wall_ms + 1, 0), ..l });
+        } else {
+            e.last = Some((key.0, 0));
+        }
+        for y in [removed, changed] {
+            assert_ne!(*x, y);
+            assert_ne!(x.compact_bytes(), y.compact_bytes(), "section 10 misses a change");
+            assert_ne!(x.compact_hash(), y.compact_hash());
+            tweaked += 1;
+        }
+    }
+    assert!(tweaked > 500, "{tweaked}");
 }
 
 // ---- typed counters --------------------------------------------------------------------------

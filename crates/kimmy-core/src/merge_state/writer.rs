@@ -386,6 +386,27 @@ impl Writer {
     pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.state.visible(&self.opts)
     }
+    /// Read-only: does the writer see `p` as a counter? True when, in the alive lives the writer
+    /// sees, the visible cell at `p` is an `Int32`, `Int64` or `Decimal128` (a counter's base and/or
+    /// slots, design D5/NB1). A `Double`, a string, any other value, a map and a missing path (or no
+    /// alive life) are not counters. Only the writer's own state decides, never a `Document`.
+    pub fn sees_counter(&self, p: &Path) -> bool {
+        self.visible().is_some_and(|v| {
+            matches!(v.get(p), Some(Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_)))
+        })
+    }
+    /// Read-only: is `p` itself, or any path below it, a counter cell the writer sees (see
+    /// [`Writer::sees_counter`])? A `$rename` is leaf effects, so renaming a sub-document renames
+    /// every counter cell under it and the slots cannot move. An array is an atomic register: its
+    /// elements are never counters.
+    pub fn sees_counter_at_or_under(&self, p: &Path) -> bool {
+        self.visible().is_some_and(|v| {
+            v.iter().any(|(k, val)| {
+                matches!(val, Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_))
+                    && (k == p || k.ancestors().any(|a| a == *p))
+            })
+        })
+    }
     pub fn hidden_all(&self) -> BTreeMap<Path, i128> {
         self.state.hidden_all(&self.opts)
     }
@@ -1369,6 +1390,12 @@ pub enum UpdateRefused {
     /// The document already has [`MAX_WRITERS`] writers and this writer is not one.
     #[error("merge state: the document has {MAX_WRITERS} writers already")]
     WriterCap,
+    /// A `$rename` whose source, or any path below it, this writer sees as a counter (an `Int32`,
+    /// `Int64` or `Decimal128` cell, base and/or slots, see [`Writer::sees_counter_at_or_under`]): a
+    /// counter cannot be renamed. Raised by
+    /// the effects layer (`kimmy_core::effects::Effects::apply`) before anything is written.
+    #[error("merge state: {0} is a counter and cannot be renamed")]
+    RenameOfCounter(Path),
 }
 
 /// Why [`Writer::write_update_stamped`] did not write: the update was refused, or the stamp was.
@@ -1430,6 +1457,40 @@ impl Writer {
         match m.error {
             Some(e) => Err(UpdateError::Stamp(e)),
             None => Ok(r?),
+        }
+    }
+
+    /// [`Writer::write_update`] for an update that also holds `$rename`s, whose sources are
+    /// `renames` (the `Unset(from)` and `Set(to, value)` of each are in `ops`). It refuses with
+    /// [`UpdateRefused::RenameOfCounter`] before anything else when a source, or any path below
+    /// it, is a counter the writer sees ([`Writer::sees_counter_at_or_under`]): no stamp, no clock
+    /// move. `kimmy_core::effects::Effects::apply` is its caller.
+    pub fn write_update_renaming(
+        &mut self,
+        ops: &[UpdateOp],
+        renames: &[Path],
+        skew: u64,
+    ) -> Result<Option<Written>, UpdateRefused> {
+        self.refuse_counter_rename(renames)?;
+        self.write_update(ops, skew)
+    }
+
+    /// [`Writer::write_update_renaming`] with the stamp taken from `stamp`, as
+    /// [`Writer::write_update_stamped`]; the stamp closure is not called for a refusal.
+    pub fn write_update_renaming_stamped(
+        &mut self,
+        ops: &[UpdateOp],
+        renames: &[Path],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, UpdateError> {
+        self.refuse_counter_rename(renames)?;
+        self.write_update_stamped(ops, stamp)
+    }
+
+    fn refuse_counter_rename(&self, renames: &[Path]) -> Result<(), UpdateRefused> {
+        match renames.iter().find(|p| self.sees_counter_at_or_under(p)) {
+            Some(p) => Err(UpdateRefused::RenameOfCounter(p.clone())),
+            None => Ok(()),
         }
     }
 
