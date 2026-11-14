@@ -203,7 +203,7 @@
 //!   with `$inc a.b`, `$setOnInsert a` with `$inc a`, `$set a` with `$unset a.b`, `$set a.b` with
 //!   `$set a`, `$inc a` with `$inc a.b`); the control with distinct paths works (106-107).
 //!
-//! # S2a work item (not implemented here)
+//! # S2a work item (implemented in `Writer::upsert_create`, `Writer::upsert_cells`)
 //!
 //! `Writer::upsert_soi*` takes exactly one `(inc_path, n)`. S2a generalises the two-write upsert to
 //! a list of `(path, n)` at ONE stamp for the increments, validated as a whole together with the
@@ -224,7 +224,10 @@
 //! [`UpdateOp::Inc`] already is: Int32, Int64, Double or Decimal128; the 2026-11-03 ruling already
 //! says to extend `upsert_inc` to Decimal128 operands). On a counter, an Int or Decimal operand is
 //! a counter increment and a Double is a 400 (`IncDoubleOnCounter`); on a Double base it is a
-//! register write; on creation the operand's type sets the cell's type. Not implemented here.
+//! register write; on creation the operand's type sets the cell's type. Implemented: [`Writer::upsert_create`]
+//! takes typed operands, a LIST of increments (one stamp for all of them, validated with the
+//! creation before anything is written), an empty list, the cells in list order and the filter layer
+//! (as `Creation` cells); the `i64` entries (`upsert_soi*`, `upsert_inc*`) stay for the model harness.
 //!
 //! Typed-`$inc` tests of that item, against the recording (`q7s2.out`): `Int32` + `Int64` gives
 //! `Int64`; `Int32` max + 1 gives `Int64` (lines 264-273); `Int64` max + 1 is refused (code 2, line
@@ -489,7 +492,36 @@ pub struct CreationCell {
     pub tag: CellTag,
 }
 
+/// What [`UpsertEffects::apply`] wrote: the creation and, when there were increments beside
+/// creation cells, the increment write (its own stamp: the later one is the document's).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpsertWritten {
+    pub created: Written,
+    pub incremented: Option<Written>,
+}
+
 impl UpsertEffects {
+    /// Create the document: [`UpsertEffects::creation_cells`] (the checks included), then
+    /// [`Writer::upsert_create`]. On a document that already exists the caller applies the
+    /// `set` and `inc` lists as an ordinary update ([`Effects`]) and never calls this.
+    pub fn apply(&self, writer: &mut Writer, skew: u64) -> Result<UpsertWritten, UpdateRefused> {
+        let cells = self.creation_cells()?;
+        let (created, incremented) = writer.upsert_create(&cells, &self.inc, skew)?;
+        Ok(UpsertWritten { created, incremented })
+    }
+
+    /// [`UpsertEffects::apply`] with the stamps taken from `stamp` (two for creation cells plus
+    /// increments, one otherwise); a rejected stamp is the `Err` and nothing has moved.
+    pub fn apply_stamped(
+        &self,
+        writer: &mut Writer,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<UpsertWritten, UpdateError> {
+        let cells = self.creation_cells()?;
+        let (created, incremented) = writer.upsert_create_stamped(&cells, &self.inc, stamp)?;
+        Ok(UpsertWritten { created, incremented })
+    }
+
     /// The PARSE-time check, run on every update and upsert, matched or not: refuse any two paths
     /// of `set_on_insert`, `set` and `inc`, in or across the lists, where one is equal to or below
     /// the other ([`UpdateRefused::Overlap`], the first pair found, in sorted order). It never
