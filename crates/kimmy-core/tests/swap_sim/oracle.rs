@@ -331,7 +331,7 @@ pub fn oracle(w: &mut World) -> Oracle {
     for e in &log {
         for (path, stamp, _) in writes_of(w, e, false) {
             allowed.insert((e.key, path, stamp));
-            if lost.contains(&e.idx) {
+            if slost.contains(&e.idx) {
                 lost_late.insert((e.key, stamp)); // the converse: late writes lost with a vanished member
             }
         }

@@ -110,6 +110,43 @@ mod tests {
         assert_eq!(res["true_late_writes_allowed"], 1);
     }
 
+    /// With the structural lost set (`Q6_LOSTSTRUCT=1`) a late document write that every live member holds but none applied
+    /// (witnessed only) is coverage-held and structurally lost: the converse count (`vr_unreplicated_late_writes`, `w.lost_late`)
+    /// is taken over the structural set, as in the model's oracle. Without a structural set it is taken over the coverage set.
+    #[test]
+    fn the_unreplicated_late_writes_are_counted_over_the_structural_lost_set() {
+        let mut sc = Sc::new("v6", &[("W", 0), ("X", 0), ("Y", 0), ("O", 50)], 60);
+        let (w_, o) = (sc.idx("W"), sc.idx("O"));
+        sc.advance(1);
+        sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        for m in ["X", "Y", "O"] {
+            sc.pull(m, "W");
+        }
+        sc.advance(10);
+        let mut job = sc.ms[w_].start_out(&mut sc.w, vec![1], JobKind::Good, 0);
+        sc.advance(12);
+        let b = sc.ms[w_].do_bind(&mut sc.w, &mut job, 4).expect("the binding is written");
+        sc.advance(14);
+        let late = sc.ms[o]
+            .local_doc(&mut sc.w, 0, DocOp::Update)
+            .expect("O has not heard of the binding");
+        assert!(late.stamp > b.stamp, "the write is stamped after the binding");
+        sc.quiesce();
+        assert!(sc.w.lost.is_empty(), "every member holds every entry: the coverage set is empty");
+        crate::oracle::oracle(&mut sc.w);
+        assert!(sc.w.lost_late.is_empty(), "no structural set: counted over the coverage set");
+        // the structural set differs: the late write is held (witnessed) but applied by no live member
+        sc.w.lost_struct = Some([late.idx].into_iter().collect());
+        crate::oracle::oracle(&mut sc.w);
+        assert_eq!(
+            sc.w.lost_late.len(),
+            1,
+            "the structurally lost late write is counted: {:?}",
+            sc.w.lost_late
+        );
+        assert!(sc.w.lost_late.contains(&(late.key, late.stamp)));
+    }
+
     /// `m-visible-newest` is EQUIVALENT to the base under rule B (N2, the review's reasoning, here RUN): an event enters the register
     /// list only once covered and coverage is monotone, so the newest-applicable scan never sees an uncovered event. Asserted: on
     /// the whole base grid (and the product routes) the mutant's results equal the base's, run for run, for every counter and check.
