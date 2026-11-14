@@ -1,17 +1,14 @@
 //! The compact canonical form, `QMS` version 2.
 //!
-//! [`MergeState::canonical_bytes`] and [`MergeState::encode`] (version 1, `codec.rs`) write a full
-//! 44-byte stamp for every life and every cell, `u64` lengths, and a generation in each cell:
-//! 5 to 9 times the size the design assumes. This is the compact form that
-//! replaces them. NOTHING STORES OR HASHES IT YET: the version 1 form, its golden vectors and
-//! [`MergeState::state_hash`] are unchanged, and the switch (one format for the hash and for
-//! storage, the goldens re-pinned) waits on the goldens being pinned once, with the counter cell and
-//! the order state.
-//!
-//! The state hash, the stored form and the wire form will all be [`MergeState::compact_bytes`]
-//! (the body) and, with a header, [`MergeState::encode_compact`]: the 3 bytes `QMS`, ONE format
-//! version byte (2) and the body. Every map is written in key order. Mutant memory (`Gen::vv`,
-//! `MergeState::gens`) is in none of them.
+//! This is THE canonical form. The state hash is [`MergeState::compact_hash`] (a digest of
+//! [`MergeState::compact_bytes`], the body), the stored form and the wire form are the body behind a
+//! header ([`MergeState::encode_compact`]: the 3 bytes `QMS`, ONE format version byte (2) and the body),
+//! and nothing outside the tests calls the version 1 encoder of `codec.rs` (a 44-byte stamp for every life
+//! and every cell, `u64` lengths, a generation in each cell: 5 to 9 times the size the design assumes;
+//! it cannot spell a `Document` inside an array, an absorbed pair or an order state). Version 1 remains as
+//! a decode-only legacy path ([`MergeState::decode`]) and, under `cfg(test)` and the `merge-mutants`
+//! feature, as an encoder for the tests that pin it. Every map is written in key order. Mutant memory
+//! (`Gen::vv`, `MergeState::gens`) is in none of them.
 //!
 //! # Primitives
 //!
@@ -121,8 +118,9 @@
 //! # Extension points
 //!
 //! * **Order state** (the `FieldOrd` of option A: floors, per-writer firsts, last, level floor):
-//!   section 10, above. Its stamps use the same stamp and writer index primitives. The hash of a
-//!   state that carries one is NOT pinned by any golden: they wait for the counter cell.
+//!   section 10, above. Its stamps use the same stamp and writer index primitives. Its hash is pinned by the six goldens
+//!   (`the_compact_golden_hashes_with_the_order_state_are_pinned`), and the section's bytes by an
+//!   independent Python writer (`tests/data/check_ord_section.py`).
 //! * **Counter cell** (frozen): a slot is its stamp and total and, optionally, the highest
 //!   `(stamp, total)` of that very slot that any base write on the path had held (the ABSORBED pair;
 //!   section 7). A base write folds into the pairs every slot of the path its writer holds in an
@@ -584,9 +582,7 @@ impl MergeState {
         scan.seen_writers
     }
 
-    /// A 128-bit digest of [`MergeState::compact_bytes`], with the same mix as
-    /// [`MergeState::state_hash`]. Nothing uses it yet: the differential test pins it against
-    /// the reference model's own encoder until the hash is switched to the compact form.
+    /// A 128-bit digest of [`MergeState::compact_bytes`], with the mix of `hash128`. This is the state hash.
     pub fn compact_hash(&self) -> [u8; 16] {
         hash128(&self.compact_bytes())
     }

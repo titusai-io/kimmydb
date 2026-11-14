@@ -255,6 +255,7 @@ impl Value {
         }
     }
 
+    #[cfg(any(test, feature = "merge-mutants"))]
     /// Does this value hold a `Document` anywhere? The version 1 form cannot spell one.
     pub(super) fn contains_document(&self) -> bool {
         match self {
@@ -366,6 +367,7 @@ impl LossAt {
 
     /// The path the version 1 form writes for this record. A field literally named `_` has the
     /// same one, which is a known collision of that form (see `codec.rs`).
+    #[cfg(any(test, feature = "merge-mutants"))]
     pub(super) fn v1_path(&self) -> Path {
         match self {
             LossAt::Document => Path(vec!["_".to_string()]),
