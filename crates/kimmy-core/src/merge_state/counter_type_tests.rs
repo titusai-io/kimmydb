@@ -217,3 +217,231 @@ fn the_type_does_not_depend_on_the_order_the_contributions_are_joined() {
     }
     assert!(types.len() >= 2, "the cases reach both Int32 and Int64 totals");
 }
+
+// ---------------------------------------------------------------------------------------------
+// R1 as a property: the type and the value of a counter are the base plus every operand ever
+// added, whatever the order of the joins, the writers that saw each other, and the number of
+// writers. The expected answer is computed here, from the operands alone.
+// ---------------------------------------------------------------------------------------------
+
+/// One amount of the property: an operand or a base.
+#[derive(Clone, Debug)]
+enum Amt {
+    I32(i32),
+    I64(i64),
+    /// A decimal with two decimals, as text.
+    Dec(&'static str),
+}
+
+impl Amt {
+    fn value(&self) -> Value {
+        match self {
+            Amt::I32(v) => i32v(*v),
+            Amt::I64(v) => i64v(*v),
+            Amt::Dec(t) => dec(t),
+        }
+    }
+
+    /// The width of the type: `Int32` 0, `Int64` 1, `Decimal128` 2.
+    fn width(&self) -> u8 {
+        match self {
+            Amt::I32(_) => 0,
+            Amt::I64(_) => 1,
+            Amt::Dec(_) => 2,
+        }
+    }
+
+    /// The amount in hundredths.
+    fn cents(&self) -> i128 {
+        match self {
+            Amt::I32(v) => i128::from(*v) * 100,
+            Amt::I64(v) => i128::from(*v) * 100,
+            Amt::Dec(t) => cents_of(t),
+        }
+    }
+}
+
+fn cents_of(text: &str) -> i128 {
+    let negative = text.starts_with('-');
+    let text = text.trim_start_matches('-');
+    let (whole, frac) = text.split_once('.').unwrap_or((text, "00"));
+    assert_eq!(frac.len(), 2, "two decimals: {text}");
+    let v = whole.parse::<i128>().unwrap() * 100 + frac.parse::<i128>().unwrap();
+    if negative { -v } else { v }
+}
+
+fn cents_text(cents: i128) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    format!("{sign}{}.{:02}", cents.abs() / 100, cents.abs() % 100)
+}
+
+/// What R1 says the counter reads: the widest type among the base and the operands, an integer
+/// total outside the `i32` range an `Int64`, a decimal total exact to the hundredth.
+fn r1_expected(base: &Amt, ops: &[Amt]) -> String {
+    let width = ops.iter().map(Amt::width).chain([base.width()]).max().unwrap();
+    let total: i128 = ops.iter().map(Amt::cents).chain([base.cents()]).sum();
+    match width {
+        2 => format!("Decimal128({})", cents_text(total)),
+        _ => {
+            let whole = total / 100;
+            if width == 0 && i32::try_from(whole).is_ok() {
+                format!("Int32({whole})")
+            } else {
+                format!("Int64({whole})")
+            }
+        }
+    }
+}
+
+fn rendered(v: &Value) -> String {
+    match v {
+        Value::Decimal128(_) => format!("Decimal128({})", dec_text(v)),
+        v => format!("{v:?}"),
+    }
+}
+
+/// One case: the base inserted by a first writer, then `ops.len()` writers that each receive the
+/// base, some of the writers before them, and add their operands. Joined in several orders.
+fn r1_case(
+    o: &JoinOptions,
+    base: &Amt,
+    ops: &[Vec<Amt>],
+    sees: &[Vec<usize>],
+) -> Result<(), String> {
+    let mut root = Writer::new(wid('R', 0), o.clone());
+    root.insert(&fl(&[("n", base.value())]), 0).unwrap();
+    let mut states: Vec<MergeState> = Vec::new();
+    let mut added: Vec<Amt> = Vec::new();
+    for (k, mine) in ops.iter().enumerate() {
+        let mut w = Writer::new(wid(char::from(b'A' + k as u8), 0), o.clone());
+        w.receive(&root.state);
+        for &j in &sees[k] {
+            w.receive(&states[j]);
+        }
+        for a in mine {
+            if w.write_inc_value(&p("n"), &a.value(), k as u64).is_some() {
+                added.push(a.clone());
+            }
+        }
+        states.push(w.state);
+    }
+    // what the writers saw of each other's operands is part of their states: the expected answer
+    // is over every operand any of them added, each once
+    let want = r1_expected(base, &added);
+    let n = states.len();
+    let mut orders: Vec<Vec<usize>> = vec![(0..n).collect(), (0..n).rev().collect()];
+    orders.push((0..n).map(|x| (x + n / 2) % n).collect());
+    for order in orders {
+        let mut acc = root.state.clone();
+        for &k in &order {
+            acc = join(&acc, &states[k], o).0;
+        }
+        let got = rendered(&acc.visible(o).unwrap()[&p("n")]);
+        if got != want {
+            return Err(format!(
+                "base {base:?}, ops {ops:?}, sees {sees:?}, order {order:?}: {got}, want {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The cases, fixed ones first (the minimised input, a decimal base, a wider operand, five
+/// writers), then random ones with up to five writers, partial receives and decimal operands.
+fn r1_check(o: &JoinOptions) -> Result<usize, String> {
+    use Amt::{Dec, I32, I64};
+    let fixed: Vec<(Amt, Vec<Vec<Amt>>)> = vec![
+        (I32(i32::MIN), vec![vec![I32(7), I32(i32::MAX)]]),
+        (I32(i32::MIN), vec![vec![I32(7)], vec![I32(i32::MAX)]]),
+        (Dec("1.50"), vec![vec![I32(2)], vec![I32(3)]]),
+        (I32(5), vec![vec![I64(1)], vec![I32(1)]]),
+        (
+            I64(5),
+            vec![vec![I32(1), I32(-1)], vec![I32(2)], vec![I32(3)], vec![I32(4)], vec![I32(5)]],
+        ),
+        (I32(0), vec![vec![Dec("0.25")], vec![I32(i32::MAX)], vec![I32(i32::MAX)]]),
+    ];
+    let mut cases = 0;
+    for (base, ops) in &fixed {
+        let sees = vec![Vec::new(); ops.len()];
+        r1_case(o, base, ops, &sees)?;
+        cases += 1;
+    }
+    let bases = [I32(i32::MIN), I32(5), I64(5), I32(i32::MAX), I32(0), Dec("1.50"), Dec("-2.00")];
+    let operands = [
+        I32(7),
+        I32(i32::MAX),
+        I32(i32::MIN),
+        I32(-5),
+        I32(0),
+        I32(1_000_000_000),
+        I32(2_000_000_000),
+        I64(3),
+        I64(-4_000_000_000),
+        I64(1 << 40),
+        Dec("0.25"),
+        Dec("-2.00"),
+        Dec("10.75"),
+    ];
+    let mut seed = 11u64;
+    for _ in 0..300 {
+        let base = bases[(lcg(&mut seed) % bases.len() as u64) as usize].clone();
+        let writers = 2 + (lcg(&mut seed) % 4) as usize; // 2 to 5
+        let mut ops = Vec::new();
+        let mut sees = Vec::new();
+        for k in 0..writers {
+            let mine: Vec<Amt> = (0..(1 + lcg(&mut seed) % 3))
+                .map(|_| operands[(lcg(&mut seed) % operands.len() as u64) as usize].clone())
+                .collect();
+            ops.push(mine);
+            sees.push((0..k).filter(|_| lcg(&mut seed).is_multiple_of(3)).collect());
+        }
+        r1_case(o, &base, &ops, &sees)?;
+        cases += 1;
+    }
+    Ok(cases)
+}
+
+/// R1 holds for every order of the joins, with partial receives, decimal operands and up to five
+/// writers: the answer is the expected one, not only the same one.
+#[test]
+fn the_counter_is_the_base_and_every_operand_whatever_the_joins_and_the_receives() {
+    let cases = r1_check(&opts()).unwrap();
+    assert!(cases >= 300, "{cases}");
+}
+
+/// The mutant that does not count the base's own label is killed by an observable value: an
+/// `Int64` base with `Int32` operands reads as an `Int32`.
+#[test]
+fn a_width_that_ignores_the_base_is_killed() {
+    let mut o = opts();
+    o.set_counter_ignores_base(true);
+    assert!(r1_check(&o).is_err());
+}
+
+/// The mutant that reads the width from the value of each part (the sticky rule R1 replaced) is
+/// killed by the minimised input: `Int32` minimum, then `7` and `2147483647` is an `Int32` 6.
+#[test]
+fn a_width_read_from_the_value_of_each_part_is_killed() {
+    let mut o = opts();
+    o.set_counter_kind_by_value(true);
+    let err = r1_check(&o).unwrap_err();
+    assert!(err.contains("Int32"), "{err}");
+}
+
+/// OPEN, review item 1: a slot's type label survives a base write that absorbed it. `{n: Int32 1}`,
+/// `$inc n Decimal 1.5`, `$set n Int32 5`, `$inc n Int32 1` reads `Decimal128 6.0` here, and the
+/// reference gives `Int32 6` (likewise with an `Int64` operand): the label of the slot is the join
+/// of every operand it ever added, absorbed ones included. The fix needs the operands added SINCE
+/// the absorb, which the state does not keep (see the report); the test is ignored until it does.
+#[test]
+#[ignore = "R1 review item 1: the label of a slot outlives the base write that absorbed it"]
+fn a_base_write_that_absorbed_a_wider_operand_leaves_its_type_behind() {
+    for wide in [dec("1.5"), i64v(1)] {
+        let mut w = base(i32v(1));
+        w.write_inc_value(&p("n"), &wide, 0).unwrap();
+        w.write_set(&p("n"), i32v(5), 0).unwrap();
+        w.write_inc_value(&p("n"), &i32v(1), 0).unwrap();
+        assert_eq!(n(&w), i32v(6), "after {wide:?}");
+    }
+}
