@@ -386,6 +386,15 @@ impl Writer {
     pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.state.visible(&self.opts)
     }
+    /// Read-only: does the writer see `p` as a counter? True when, in the alive lives the writer
+    /// sees, the visible cell at `p` is an `Int32`, `Int64` or `Decimal128` (a counter's base and/or
+    /// slots, design D5/NB1). A `Double`, a string, any other value, a map and a missing path (or no
+    /// alive life) are not counters. Only the writer's own state decides, never a `Document`.
+    pub fn sees_counter(&self, p: &Path) -> bool {
+        self.visible().is_some_and(|v| {
+            matches!(v.get(p), Some(Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_)))
+        })
+    }
     pub fn hidden_all(&self) -> BTreeMap<Path, i128> {
         self.state.hidden_all(&self.opts)
     }
@@ -1369,6 +1378,11 @@ pub enum UpdateRefused {
     /// The document already has [`MAX_WRITERS`] writers and this writer is not one.
     #[error("merge state: the document has {MAX_WRITERS} writers already")]
     WriterCap,
+    /// A `$rename` whose source this writer sees as a counter (an `Int32`, `Int64` or `Decimal128`
+    /// cell, base and/or slots, see [`Writer::sees_counter`]): a counter cannot be renamed. Raised by
+    /// the effects layer (`kimmy_core::effects::Effects::apply`) before anything is written.
+    #[error("merge state: {0} is a counter and cannot be renamed")]
+    RenameOfCounter(Path),
 }
 
 /// Why [`Writer::write_update_stamped`] did not write: the update was refused, or the stamp was.
