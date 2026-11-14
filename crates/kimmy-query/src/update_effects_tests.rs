@@ -10,7 +10,7 @@ use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::bridge::{document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{Epoch, JoinOptions, Path, Value, Writer, WriterId};
 
-use crate::filter::Filter;
+use crate::filter::{self, Filter};
 use crate::update::{self, Update};
 use crate::update_effects::{Plan, apply_with_effects};
 
@@ -53,6 +53,10 @@ pub(crate) fn bytes(d: &Document) -> Vec<u8> {
 
 pub(crate) fn parse(u: Document) -> Update {
     update::parse(&u).unwrap_or_else(|e| panic!("{u}: {e}"))
+}
+
+pub(crate) fn filt(f: Document) -> Filter {
+    filter::parse(&f).unwrap_or_else(|e| panic!("{f}: {e}"))
 }
 
 /// The effects and the post-image of an operator update.
@@ -715,3 +719,194 @@ fn decimal_operands_over_decimal_and_absent_fields() {
     parity_doc(doc! {"$inc": {"fresh": dec("3.25")}}, &d);
 }
 
+// ---------------------------------------------------------------------------------------------
+// P3: arrays, positional forms and arrayFilters
+// ---------------------------------------------------------------------------------------------
+
+fn lines() -> Document {
+    doc! {
+        "_id": 1, "x": 1,
+        "items": [ {"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}, {"sku": "c", "qty": 3} ],
+        "grid": [[1, 2], [3, 4]],
+        "a": [10, 20, 30],
+        "sub": { "arr": [1, 2], "k": 1 },
+        "dz": { "0": 5 },
+    }
+}
+
+fn plan_filtered(
+    u: Document,
+    filters: Vec<Document>,
+    f: Document,
+    d: &Document,
+) -> (Effects, Document) {
+    let parsed = update::parse_with_filters(&u, &filters).unwrap_or_else(|e| panic!("{u}: {e}"));
+    let filter = filt(f);
+    let r = plan_of(&parsed, Some(&filter), d);
+    // the writer renders what the engine produced
+    let mut w = writer_with(d);
+    let outcome = r.0.apply(&mut w, 0);
+    assert!(outcome.refusal().is_none(), "{u}: {outcome:?}");
+    assert_eq!(bytes(&render(&w)), bytes(&r.1), "{u}");
+    r
+}
+
+#[test]
+fn the_matched_position_is_one_set_of_the_array() {
+    let d = lines();
+    let (effects, post) =
+        plan_filtered(doc! {"$set": {"items.$.qty": 9}}, vec![], doc! {"items.sku": "b"}, &d);
+    let want = Bson::Array(vec![
+        Bson::Document(doc! {"sku": "a", "qty": 1}),
+        Bson::Document(doc! {"sku": "b", "qty": 9}),
+        Bson::Document(doc! {"sku": "c", "qty": 3}),
+    ]);
+    assert_eq!(post.get("items"), Some(&want));
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(p("items"), v(want.clone()));
+        }),
+        "$",
+    );
+}
+
+#[test]
+fn all_positional_and_inc_on_an_element_is_a_register_write() {
+    let d = lines();
+    let (effects, post) = plan_filtered(doc! {"$inc": {"items.$[].qty": 10}}, vec![], doc! {}, &d);
+    let items = post.get_array("items").unwrap().clone();
+    assert_eq!(items[0].as_document().unwrap().get("qty"), Some(&Bson::Int32(11)));
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(p("items"), v(Bson::Array(items)));
+        }),
+        "$[] inc",
+    );
+}
+
+#[test]
+fn a_filtered_positional_changes_only_the_selected_elements_in_one_set() {
+    let d = lines();
+    let (effects, post) = plan_filtered(
+        doc! {"$set": {"items.$[big].flag": true}},
+        vec![doc! {"big.qty": {"$gte": 2}}],
+        doc! {},
+        &d,
+    );
+    let items = post.get_array("items").unwrap();
+    assert!(items[0].as_document().unwrap().get("flag").is_none());
+    assert_eq!(items[2].as_document().unwrap().get("flag"), Some(&Bson::Boolean(true)));
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(p("items"), v(Bson::Array(items.clone())));
+        }),
+        "$[id]",
+    );
+}
+
+#[test]
+fn a_positional_that_selects_nothing_has_no_effects() {
+    let d = lines();
+    let (effects, _) = plan_filtered(
+        doc! {"$set": {"items.$[big].flag": true}},
+        vec![doc! {"big.qty": {"$gte": 99}}],
+        doc! {},
+        &d,
+    );
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
+    let d = lines();
+    for (u, array) in [
+        (doc! {"$set": {"a.1": 99}}, "a"),
+        (doc! {"$set": {"grid.1.0": 99}}, "grid"),
+        (doc! {"$set": {"items.0.sku": "z"}}, "items"),
+        (doc! {"$set": {"items.0.deep.x": 1}}, "items"),
+        (doc! {"$set": {"sub.arr.0": 5}}, "sub.arr"),
+        (doc! {"$inc": {"a.0": 5}}, "a"),
+        (doc! {"$mul": {"a.2": 2}}, "a"),
+        (doc! {"$set": {"a.5": 1}}, "a"),
+        (doc! {"$push": {"grid.0": 9}}, "grid"),
+    ] {
+        let (effects, _) = parity_doc(u.clone(), &d);
+        let post = plan_of(&parse(u.clone()), None, &d).1;
+        let segs: Vec<&str> = array.split('.').collect();
+        let whole = post
+            .get_array(segs[0])
+            .map(|a| Bson::Array(a.clone()))
+            .or_else(|_| post.get_document(segs[0]).unwrap().get(segs[1]).cloned().ok_or(()));
+        let want = fx(|e| {
+            e.set(np(&segs), v(whole.unwrap()));
+        });
+        same_effects(&effects, &want, &u.to_string());
+    }
+}
+
+#[test]
+fn unset_of_an_element_writes_null_into_the_array() {
+    let d = lines();
+    let (effects, _) = parity_doc(doc! {"$unset": {"a.1": ""}}, &d);
+    let post = plan_of(&parse(doc! {"$unset": {"a.1": ""}}), None, &d).1;
+    assert_eq!(post.get_array("a").unwrap()[1], Bson::Null);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(p("a"), v(vec![Bson::Int32(10), Bson::Null, Bson::Int32(30)]));
+        }),
+        "unset element",
+    );
+}
+
+#[test]
+fn operators_on_one_array_combine_and_two_arrays_are_two_sets() {
+    let d = lines();
+    let (effects, _) = parity_doc(doc! {"$set": {"a.0": 1, "a.2": 3, "grid.0.0": 0}}, &d);
+    assert_eq!(effects.len(), 2);
+    let (effects, _) = parity_doc(doc! {"$set": {"a.0": 1}, "$inc": {"x": 1}}, &d);
+    assert_eq!(effects.len(), 2);
+}
+
+#[test]
+fn a_numeric_segment_is_an_index_only_when_the_stored_value_is_an_array() {
+    let d = lines();
+    // an absent parent: a field named 0, a leaf effect
+    let (effects, _) = parity_doc(doc! {"$set": {"fresh.0": 1}}, &d);
+    let post = plan_of(&parse(doc! {"$set": {"fresh.0": 1}}), None, &d).1;
+    assert_eq!(post.get_document("fresh").unwrap().get("0"), Some(&Bson::Int32(1)));
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(np(&["fresh", "0"]), v(1));
+        }),
+        "absent parent",
+    );
+    // a document with a field named 0
+    let (effects, _) = parity_doc(doc! {"$set": {"dz.0": 6}}, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.set(np(&["dz", "0"]), v(6));
+        }),
+        "document key 0",
+    );
+}
+
+#[test]
+fn a_noop_through_an_array_has_no_effects() {
+    let d = lines();
+    for u in [
+        doc! {"$set": {"a.0": 10}},
+        doc! {"$max": {"a.0": 1}},
+        doc! {"$unset": {"a.9": ""}},
+        doc! {"$set": {"grid.1": [3, 4]}},
+    ] {
+        let (effects, outcome) = parity_doc(u.clone(), &d);
+        assert!(effects.is_empty(), "{u}: {effects:?}");
+        assert_eq!(outcome, Outcome::Unchanged);
+    }
+}
