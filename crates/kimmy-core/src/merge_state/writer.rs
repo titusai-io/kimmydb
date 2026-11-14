@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::{self, Inc, Num};
 use super::join::{JoinOptions, join, join_into};
-use super::ord::{OrdAt, OrdMode, OrderedValue, ord_events};
+use super::ord::{OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
 };
@@ -160,6 +160,13 @@ fn below<'a>(
 
 /// The order items of one write, in write order: the model's `items`, `(path, mode)`.
 type Items = Vec<(OrdAt, OrdMode)>;
+
+/// The order events a creation leaves to the increment write that follows it, and the `known` of
+/// the creation they were made under.
+struct DeferredOrd {
+    known: Hlc,
+    events: Vec<OrdEvent>,
+}
 
 /// The model's `_unset_subtree`: unset what the writer sees at `p` and below it, and name each
 /// of them to the order state as an unset.
@@ -635,7 +642,8 @@ impl Writer {
 
     /// The creation write of an upsert from the composed cells, in the order of `cells` (see
     /// `kimmy_core::effects::UpsertEffects::creation_list`), each with its tag; a cell tagged
-    /// [`CellTag::Inc`] writes no register but takes its field's place in the order. `inc_paths` are
+    /// [`CellTag::Inc`] writes no register and feeds no order entry: its field takes its place in the order
+    /// with the increment write that creates it ([`Writer::upsert_create`] does both). `inc_paths` are
     /// the paths of the increments that follow ([`Writer::upsert_create`]); the cells and those
     /// paths must be pairwise disjoint. `None` when refused or a life is alive.
     pub fn upsert_cells(
@@ -917,6 +925,20 @@ impl Writer {
         inc_paths: &[&Path],
         m: &mut Mint<'_>,
     ) -> Option<Written> {
+        self.upsert_cells_core(cells, inc_paths, m).map(|(w, _)| w)
+    }
+
+    /// [`Writer::upsert_cells_m`] with what the creation leaves for the increment write: the order
+    /// events of the fields the `Inc` cells name, which the increment write (the one that creates
+    /// those fields) feeds, so that a state that holds the creation alone has no order entry for a
+    /// field that does not exist in it. The events are positioned among ALL the cells, so the
+    /// fields still take their place in the creation order.
+    fn upsert_cells_core(
+        &mut self,
+        cells: &[CreationCell],
+        inc_paths: &[&Path],
+        m: &mut Mint<'_>,
+    ) -> Option<(Written, DeferredOrd)> {
         let bound = self.opts.int_bound();
         for c in cells {
             let legal = if c.tag == CellTag::Inc {
@@ -1011,13 +1033,22 @@ impl Writer {
             ancestor_items(q, &mut seen, &mut items, &self.opts);
             items.push((OrdAt::Field(q.clone()), OrdMode::Write));
         }
-        self.feed(st, st, known, &items);
+        // the creation feeds the fields it writes (and their ancestors); the fields of the `Inc`
+        // cells wait for the write that creates them
+        let written_at: BTreeSet<Path> =
+            expanded.iter().flat_map(|(q, _, _)| q.ancestors().chain([q.clone()])).collect();
+        let (now, later): (Vec<OrdEvent>, Vec<OrdEvent>) =
+            ord_events(&items, &self.opts).into_iter().partition(|e| match &e.at {
+                OrdAt::Field(x) => written_at.contains(x),
+                OrdAt::Root => true,
+            });
+        self.state.ord_apply(st, st, known, &now, &self.opts);
         let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
         rec.vals = vals;
         rec.upsert = true;
         rec.insert = true;
         rec.soi = expanded.iter().filter(|(_, _, soi)| *soi).map(|(p, _, _)| p.clone()).collect();
-        Some(self.finish(st, rec))
+        Some((self.finish(st, rec), DeferredOrd { known, events: later }))
     }
 
     /// The upsert of the effects layer, one entry for every shape (module docs of
@@ -1122,9 +1153,16 @@ impl Writer {
             let w = self.create_with_incs_m(&incs, m).ok_or(UpdateRefused::WriterCap)?;
             return Ok((w, None));
         }
-        let created = self.upsert_cells_m(cells, &[], m).ok_or(UpdateRefused::WriterCap)?;
+        let (created, deferred) =
+            self.upsert_cells_core(cells, &[], m).ok_or(UpdateRefused::WriterCap)?;
         if incs.is_empty() {
             return Ok((created, None));
+        }
+        // the increment write creates the fields of the `Inc` cells: their order entries are fed
+        // with it (as of the creation's life and stamp, the position they have among the cells)
+        if !deferred.events.is_empty() {
+            let (life, known) = (created.stamp, deferred.known);
+            self.state.ord_apply(life, life, known, &deferred.events, &self.opts);
         }
         let ops: Vec<UpdateOp> =
             incs.iter().map(|(p, by)| UpdateOp::Inc(p.clone(), by.clone())).collect();
