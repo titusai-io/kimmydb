@@ -122,10 +122,6 @@ pub struct JoinOptions {
     /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
     #[cfg(any(test, feature = "merge-mutants"))]
     int32_saturates: bool,
-    /// A writer whose increment made the visible value an `Int64` still leaves its slot an
-    /// `Int32`, so a total that dips back under the `i32` range narrows again.
-    #[cfg(any(test, feature = "merge-mutants"))]
-    slot_never_widens: bool,
     /// A local `$inc` by a 65th contributor is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_contributor_cap: bool,
@@ -242,8 +238,6 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             int32_saturates: false,
             #[cfg(any(test, feature = "merge-mutants"))]
-            slot_never_widens: false,
-            #[cfg(any(test, feature = "merge-mutants"))]
             no_contributor_cap: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_writer_cap: false,
@@ -348,7 +342,6 @@ impl JoinOptions {
     switch!(no_saturation, set_no_saturation, false);
     switch!(no_decimal_saturation, set_no_decimal_saturation, false);
     switch!(int32_saturates, set_int32_saturates, false);
-    switch!(slot_never_widens, set_slot_never_widens, false);
     switch!(no_contributor_cap, set_no_contributor_cap, false);
     switch!(no_writer_cap, set_no_writer_cap, false);
     switch!(ord_keep_all, set_ord_keep_all, false);

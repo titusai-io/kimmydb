@@ -27,6 +27,16 @@ Status meanings:
 
 ---
 
+<a id="counter-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a counter's type is read from the merged state, so a sequential history that leaves the 32-bit range and comes back ends as an `Int32` where the reference stays an `Int64`
+
+**Raised with the Q7 step 2 counter rule R1.** Concurrent increments have no order, so the type of a counter cannot depend on the order or the partial sums they were added in. The type of a counter here is the narrowest of `Int32` and `Int64` that holds its TOTAL, never narrower than the widest type among the base and every increment operand the counter has seen (an `Int64` operand keeps it an `Int64`; a `Decimal128` makes it a `Decimal128`). This gives the reference's answer in every recorded case: an `Int32` plus an `Int64` is an `Int64`, an `Int32` maximum plus 1 is an `Int64`, an `Int32` 5 plus an `Int64` 0 is the long 5 and counts as modified (`q7s2.out`, d8, d9, z2).
+
+**What differs.** The reference remembers the type a running value has had. A single writer who adds `2000000000` to the `Int32` `2000000000` (the cell is now the long `4000000000`) and then adds `-2000000000` and `-1000000000` leaves the long `1000000000` in the reference, and the `Int32` `1000000000` here, because every operand was an `Int32` and the total fits. Two writers who add `7` and `2147483647` to the `Int32` minimum, concurrently or one after the other, get the `Int32` `6`, the same as the engine's update.
+
+**Workaround:** none needed for a counter that is read as a number; `$set` the value as a long (`NumberLong`) or add a long operand when the type matters.
+
 <a id="upsert-filter-field-incremented-q7"></a>
 
 ## 🟡 Under the `field` merge policy an upsert that creates a document and increments a field its own filter names is refused with a 400

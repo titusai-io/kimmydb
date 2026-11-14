@@ -81,15 +81,13 @@ mod compact_tests;
 #[cfg(test)]
 mod counter_tests;
 #[cfg(test)]
-mod d7_equivalence_tests;
+mod counter_type_tests;
 #[cfg(test)]
-mod hand_built;
+mod d7_equivalence_tests;
 #[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
-mod typed_inc_tests;
-#[cfg(test)]
-mod upsert_tests;
+mod hand_built;
 #[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
@@ -101,7 +99,11 @@ mod prop_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod typed_inc_tests;
+#[cfg(test)]
 mod update_tests;
+#[cfg(test)]
+mod upsert_tests;
 #[cfg(test)]
 mod work_tests;
 

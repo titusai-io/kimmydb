@@ -648,7 +648,7 @@ fn typed_slots_read_and_round_trip_through_a_writer() {
     assert_eq!(MergeState::decode_compact(&enc).unwrap(), w.state);
     assert_eq!(w.state.try_encode(), Err(V1CannotHold));
 
-    // Int32 widening: the slot becomes Int64 while its pair stays the Int32 it absorbed
+    // Int32 operands: the slot keeps its Int32 label past the i32 range, its pair stays the Int32 it absorbed
     let mut w = Writer::new(wid('A', 0), o.clone());
     w.insert(&fl(&[("x", Value::Int32(1))]), 0).unwrap();
     w.write_inc_value(&x, &Value::Int32(5), 0).unwrap();
@@ -656,7 +656,9 @@ fn typed_slots_read_and_round_trip_through_a_writer() {
     assert_eq!(w.state.slots.values().next().unwrap().absorbed.as_ref().unwrap().1, Num::Int32(5));
     w.write_inc_value(&x, &Value::Int32(i32::MAX), 0).unwrap();
     let sl = w.state.slots.values().next().unwrap().clone();
-    assert_eq!(sl.total, Num::Int64(5 + i128::from(i32::MAX)));
+    // R1: the slot keeps the join of the operand types it has added (Int32); the counter's
+    // visible type is read from the total, below
+    assert_eq!(sl.total, Num::Int32(5 + i128::from(i32::MAX)));
     assert_eq!(sl.absorbed.as_ref().unwrap().1, Num::Int32(5));
     assert_eq!(w.state.value(&x, &o), Some(Value::Int64(100 + i64::from(i32::MAX))));
     let enc = w.state.encode_compact();
