@@ -677,4 +677,17 @@ mod tests {
         let err = set_checked(&mut d, "arr.2147483647", Bson::Null, &mut vec![]).unwrap_err();
         assert_eq!(err, "can't backfill more than 1500000 elements");
     }
+
+    #[test]
+    fn a_read_takes_a_run_of_digits_as_an_index_and_a_signed_segment_as_a_name() {
+        // UNRECORDED: the reference's answer for a find, projection or sort path
+        // with a signed or zero-led segment; the build reads them as the writes
+        // do (see NEXT-PROBE.md).
+        let d = doc! { "arr": [7, 8], "o": { "+0": 1, "00": 2, "01": 3 } };
+        assert_eq!(resolve(&d, "arr.00"), vec![&Bson::Int32(7)]);
+        assert_eq!(resolve(&d, "arr.01"), vec![&Bson::Int32(8)]);
+        assert!(resolve(&d, "arr.+0").is_empty());
+        assert_eq!(resolve(&d, "o.+0"), vec![&Bson::Int32(1)]);
+        assert_eq!(resolve(&d, "o.00"), vec![&Bson::Int32(2)]);
+    }
 }
