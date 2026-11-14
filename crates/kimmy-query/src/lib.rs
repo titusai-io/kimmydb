@@ -77,6 +77,8 @@ mod stage_tests;
 mod trig_tests;
 
 #[cfg(test)]
+mod update_effects_id_tests;
+#[cfg(test)]
 mod update_effects_tests;
 #[cfg(test)]
 mod update_pipeline_effects_tests;
