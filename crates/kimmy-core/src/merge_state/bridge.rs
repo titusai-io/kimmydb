@@ -117,7 +117,10 @@ pub fn value_to_bson(v: &Value) -> Result<Bson, InvalidValue> {
                 bson::raw::CString::try_from(s)
                     .map_err(|_| InvalidValue::NoBsonForm("a regex with a NUL byte"))
             };
-            Bson::RegularExpression(bson::Regex { pattern: cstring(pattern)?, options: cstring(options)? })
+            Bson::RegularExpression(bson::Regex {
+                pattern: cstring(pattern)?,
+                options: cstring(options)?,
+            })
         }
         Value::Array(items) => {
             Bson::Array(items.iter().map(value_to_bson).collect::<Result<Vec<_>, _>>()?)
@@ -293,10 +296,8 @@ mod tests {
 
     #[test]
     fn a_repeated_field_name_is_an_error_not_a_collapse() {
-        let twice = Value::Document(vec![
-            ("a".into(), Value::Int32(1)),
-            ("a".into(), Value::Int32(2)),
-        ]);
+        let twice =
+            Value::Document(vec![("a".into(), Value::Int32(1)), ("a".into(), Value::Int32(2))]);
         assert_eq!(value_to_bson(&twice), Err(InvalidValue::BadFieldName));
         assert_eq!(value_to_bson(&Value::Array(vec![twice])), Err(InvalidValue::BadFieldName));
         let level = vec![

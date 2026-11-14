@@ -81,6 +81,8 @@ mod update_effects_id_tests;
 #[cfg(test)]
 mod update_effects_prop_tests;
 #[cfg(test)]
+mod update_effects_rename_tests;
+#[cfg(test)]
 mod update_effects_tests;
 #[cfg(test)]
 mod update_pipeline_effects_tests;
