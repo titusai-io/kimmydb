@@ -807,6 +807,13 @@ mod tests {
             appended,
             "the scenario does not distinguish S-bind from S-bind-origin: it is vacuous"
         );
+        // the same on the FIELD policy (rule S there is an unmodelled extension; the negative case is still asserted)
+        let (appended, held) = other_origin_write_above_the_binding("field:v6");
+        assert!(held, "field: the setup: X holds the newer version");
+        assert!(!appended, "field: S-bind-origin appended another origin's write to a stage physical");
+        let (appended, held) = other_origin_write_above_the_binding("field:m-s-bind-any-origin");
+        assert!(held, "field: the setup: X holds the newer version");
+        assert!(appended, "field: the scenario does not distinguish S-bind from S-bind-origin: it is vacuous");
     }
 
     fn the_mid_join_append_in_position_rule_under(pre: &str) {
