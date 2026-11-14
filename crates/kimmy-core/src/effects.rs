@@ -20,6 +20,9 @@
 //! 1. A no-op yields no effects and no write: an update whose operators change nothing produces an
 //!    empty [`Effects`] (or effects the writer finds unchanged, [`Outcome::Unchanged`]); neither
 //!    mints a stamp, writes a record or an entry (`modified: false`, ADR-208).
+//!    This is the effects layer's, in one place: it emits nothing for an `$inc` whose result is
+//!    unchanged by representation (`$inc` 0 that keeps the type), and the writer records every
+//!    increment it is given.
 //! 2. Effects are per LEAF path. A path is a [`Path`] of segments, never a dotted string split on
 //!    `.`: a pipeline `$setField` can name a field `a.b` or `$x`, which is a one-segment path.
 //! 3. One stamp per update. The list is one write; the paths are pairwise disjoint (none equal to
