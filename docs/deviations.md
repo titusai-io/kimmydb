@@ -17,6 +17,50 @@ Status meanings:
 
 ---
 
+## 🟡 An `$inc` or `$mul` that leaves a NaN, and a `$push` whose `$slice` leaves the array as it was, count as modified in the reference and not here
+
+**Raised 2026-11-14, from the update probes q7s2j and q7s2k on the reference (6.0.5).** A write that leaves the stored bytes as they were is not written and is not counted in `modified` ([ADR-208](decisions.md)). The reference counts two kinds of such write as modified (`nModified` 1), and answers the same document. **A stored NaN**: `$inc` and `$mul` of a number over a stored double or decimal `NaN` give `NaN` again, which the reference compares as unequal to itself, so it counts and writes it (`q7s2k.out` k0277 line 1661, k0376 line 2255, k0726 line 4355, k0826 line 4955: 64 cases over the integer, long, double and decimal operands). **A `$push` whose `$slice` leaves the array unchanged**: `{$each: [8, 9], $slice: 0}` over `[]` (`q7s2j.out` j1017 line 6098), `$slice: 2.0` over `[1, 2]`, `[{a: 1}, {a: 2}]` and `[[1, 2], [3]]` (j1039 line 6230 to j1041), and `$slice: 0` with `$sort: 1` over `[]` (j1115 line 6686): the reference does not compare the array it built with the one it held. Here nothing is written and `modified` is 0 for all five forms and all 64 NaN cases; the document, the stamp and the oplog are as they were.
+
+**Why.** The count and the write are one decision here, made on the stored bytes. Counting a write that changes no byte would mean writing it, minting a stamp and replicating it, which is the cost [ADR-208](decisions.md) removed, for a number that says "something happened" about nothing.
+
+**To close:** none planned.
+
+---
+
+## 🟡 An invalid sort direction is refused on every `find_and_modify`, where the reference refuses it only when it has to sort
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `sort: {a: 2}` is a `400` here whatever the filter is. The reference refuses it (code 15975, `$sort key ordering must be 1 (for ascending) or -1 (for descending)`) for a filter that matches nothing, one document, several or all of them (`q7s2p.out` p0019 line 182 and the seven cases beside it), and **applies** the update, ignoring the sort, when the filter is a point lookup on `_id`: `query: {_id: 3}, sort: {a: 2}` updates the document and answers it (p0107 line 1054, p0108). The cause is not recorded; a point lookup on `_id` needs no sort. Here the sort is parsed with the request, before any plan, so a bad direction is refused the same way for every filter.
+
+**Why.** Here the sort is parsed with the request, before any plan, so its validity does not depend on the plan. The refusal stays (kept, as the reference's answer for a point lookup is not worth a plan-dependent refusal).
+
+**To close:** none planned.
+
+---
+
+## 🟡 `arrayFilters` with a replacement document is a `400`, where the reference ignores it
+
+**Raised 2026-11-14, from the positional probe q7s2l.** `{update: {arr: []}, arrayFilters: [{x: 2}]}` replaces the document in the reference, which reads `arrayFilters` as meaningful to operators only and does not look at it (`q7s2l.out` l0297 line 1778: `nModified` 1, `arr: []`). Here it is `400` (`arrayFilters apply to update operators, not to a replacement document`), as it is for a pipeline update (the reference refuses that one too, and an empty list is accepted by both). The filters name identifiers a replacement cannot use, so a request that sends them has misunderstood its update, and applying it silently would hide that.
+
+**To close:** none planned.
+
+---
+
+## 🟡 A `null` `query` of `find_and_modify` is a `422`, where the reference reads it as no filter
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `{query: null, update: {$set: {z: 1}}}` updates the first document in the reference (`q7s2p.out` p0291 line 2903). A `null` `filter` is refused here at the body (`422`, `filter: invalid type: null, expected a non-null value`): a filter is a document, and `{}` says "every document" in the one way the API reads.
+
+**To close:** none planned.
+
+---
+
+## 🟡 A `find` or `find_and_modify` projection that names a path and a path below it lets the shorter path decide, where the reference refuses it
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `fields: {c: 1, "c.d": 1}` is refused by the reference (code 31249, `Path collision at c.d remaining portion d`) and the update is not applied (`q7s2p.out` p0179 line 1770, p0180 line 1779). Here the projection is applied: where one path is a prefix of another the shorter one decides, so `c` is included whole ([ADR-214](decisions.md)). The other order, an exclusion pair and a `find` are not recorded; the same reading holds for them here.
+
+**To close:** a refusal of an ancestor and its descendant in the projection parse, which is small. Not planned until the reference's answer is wanted.
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches
@@ -319,6 +363,8 @@ Also recorded here, so they are not read as bugs:
 ## 🟡 A document `_id` is refused at insert
 
 **Recorded 2026-11-01.** Only an ObjectId, string, integer, `Decimal128` and binary value can be a document `_id`; an embedded document, an array, a double, a boolean, a date or `null` is refused at insert (`400 invalid document id`), where the reference stores any type but an array. A pipeline update that sets `_id` to a double is refused for the same reason (see the pipeline-update entry). An existing design decision on the key type; not changed by the query-language work.
+
+**Recorded 2026-11-14 (`q7s2o`), the routes the reference accepts and this refuses.** An upsert whose replacement names `_id: 5.0` (`q7s2o.out` o0592 line 3473, 6 cases; with a filter `_id` that equals it, o0599 line 3514, 4 cases) is stored under `5` there and is `400 invalid _id type` here; an upsert whose filter pins `_id` to `5.0` or to a document (`{_id: {k: 1}}`, `{"_id.k": 1}`) inserts there (o0723 line 4240, o0767 line 4487, 4 cases) and is `400` here. A pipeline update that makes `_id` a double (`$toDouble`, a double literal, a `$replaceWith` naming one) stores it there (`q7s2s.jsonl` cases 3-4, 13-14, 47-48) and is refused here; the same number in a long or a decimal is accepted on both.
 
 **To close:** none planned.
 
@@ -963,6 +1009,24 @@ on 2026-10-16, except the n-ary `$add`, which is by reading):
   `{"$numberDecimal": "0.01"}`, because widening the double exactly would store
   `20.00000000000000000020816681711722` in a field that kept cents. The
   exact doubles (`0.5`, `0.25`, `2.0`, integers) and every decimal are applied.
+  Recorded 2026-11-14 (`q7s2k.out`): `$inc: {f: 1e308}` over `Decimal128("5.5")`
+  (k0364 line 2183) and `$mul` (k0814 line 4883) apply there, 4 cases each, and
+  are the `400` here.
+
+Recorded 2026-11-14 (`q7s2k.out`): an overflow applies in the reference and
+stores `Infinity`, `$inc` of the largest decimal over itself (k0443 line 2657)
+and 18 `$mul` cases such as k0493 (line 2957); here each is the `400`.
+
+**The exponent a result over a stored zero or a seeded decimal is stored with can differ from the
+reference's.** The same number is stored as another member of its cohort: `$mul` of
+`Decimal128("1E+3")`, `100E-2`, `1.50E+1`, `0E+3`, `-0E-2` or `1.000` over a stored
+`Decimal128("0")` is `0E+3`, `0.00`, `0.0`, `0E+3`, `-0.00` or `0.000` here and `0` there
+(`q7s4h.jsonl` 121-126); `$inc` of `-0E-2` over a stored `Decimal128("0")` is `0.00` here and `0`
+there (29); and an upsert that seeds a `Decimal128("2")` and applies `$inc` of `-0E-2` or `$mul`
+of `100E-2` stores `2.00` here and `2` there (206, 221). A representation difference, not a value
+difference: the values are equal and compare equal. The rows are pinned both ways in
+`decimal_arith_tests.rs` (ours and the recorded text), so a change on either side fails the test.
+`$inc` over an absent field stores the operand as given, as the reference does (1-6, 193-208).
 
 Also decided with it: a zero divisor of any spelling is a `400` for a decimal as
 for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` and
@@ -1432,6 +1496,15 @@ the conflicting-paths entry has closed.
   MongoDB appends the document literally with its `$each` key. A document with
   no `$`-prefixed key is a value, as before. `$addToSet` reads its argument the
   same way. A document with a `$`-prefixed key cannot be pushed as a value.
+- **A modifier document with no `$each` is refused, where the reference pushes it
+  as a value.** `{"$push": {"f": {"$slice": 1}}}` is `400` (`$push: a modifier
+  document requires $each (an array of values)`); the reference appends the
+  document `{$slice: 1}` to `f` literally, over an absent field, an empty array or
+  a longer one (`q7s2j.out` j1133 line 6794, j1136 line 6812 and the rest of the ten
+  cases). Raised 2026-11-14. The same reading of "any `$` key is a modifier" as
+  above, and kept for the same reason: a document that starts with `$` is not a
+  value anyone meant to store, and a `$slice` with no `$each` is almost always
+  a misspelt modifier.
 
 ---
 
