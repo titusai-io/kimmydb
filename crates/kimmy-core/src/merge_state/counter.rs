@@ -25,7 +25,13 @@
 //!   base and every slot that contributes. Its value is promoted to `Int64` when the total does
 //!   not fit an `i32`. R1: the type is a function of the merged state (increments have no order): the
 //!   narrowest of `Int32` and `Int64` that holds the TOTAL, never narrower than the widest label
-//!   among the base and every slot, a slot's label being the join of the operand types it has added.
+//!   among the base and every slot, a slot's label being the join of the operand types it has added
+//!   SINCE a base write absorbed the slot (the operands the current base has not seen; the ones it
+//!   absorbed leave no trace in the type). The slot carries, per width above `Int32`, the stamp of its
+//!   latest operand of that width ([`Slot::wide_at`](super::Slot), [`Slot::decimal_at`](super::Slot)):
+//!   the width of what it gained since an absorb at stamp `a` is the widest of the two whose stamp is
+//!   above `a` (`Int32` when neither is), and a writer's slot with the higher stamp holds all of its
+//!   writer's history, so the read is a function of the merged state.
 //!   THE ONE DEVIATION: a sequential history whose running value leaves the `i32` range and comes
 //!   back is `Int32` again here, where the reference stays `Int64` (`docs/deviations.md`,
 //!   `counter-type-q7`).
@@ -139,6 +145,40 @@ impl Num {
             Num::Int32(_) => Kind::Int32,
             Num::Int64(_) => Kind::Int64,
             Num::Decimal128(_) => Kind::Decimal128,
+        }
+    }
+
+    /// `self` brought down to the width `k` when its value allows it: an `Int64` is relabelled
+    /// `Int32` (the amount keeps its value, as an `Int32` label may hold one past the `i32` range),
+    /// a `Decimal128` of an integral value becomes an integer of that label. A wider width than the
+    /// amount's, and a decimal that is not integral, are returned as they are.
+    pub(super) fn narrowed_to(self, k: Kind) -> Num {
+        if self.label() <= k {
+            return self;
+        }
+        let whole = match self {
+            Num::Int32(v) | Num::Int64(v) => Some(v),
+            Num::Decimal128(_) => match self.as_raw() {
+                Raw::Finite { negative, coefficient, exponent } => {
+                    let mut c = i128::try_from(coefficient).ok();
+                    let mut e = exponent;
+                    while e < 0 && c.is_some() {
+                        c = c.filter(|c| c % 10 == 0).map(|c| c / 10);
+                        e += 1;
+                    }
+                    while e > 0 && c.is_some() {
+                        c = c.and_then(|c| c.checked_mul(10));
+                        e -= 1;
+                    }
+                    c.map(|c| if negative { -c } else { c })
+                }
+                _ => None,
+            },
+        };
+        match (whole, k) {
+            (Some(v), Kind::Int32) => Num::Int32(v),
+            (Some(v), Kind::Int64) => Num::Int64(v),
+            _ => self,
         }
     }
 

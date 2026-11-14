@@ -62,10 +62,18 @@
 //!    bit 2 is `soi`, bit 3 says the register stamp is the life's, and the other bits are 0;
 //! 7. `slots`: a count; each a life index, a path, a writer index, a generation byte (0 none,
 //!    1 and then its stamp), the stamp, a FLAG BYTE, the total's payload and, when bit 0 of the flag
-//!    byte is set, the ABSORBED pair: a stamp and the absorbed total's payload. The flag byte: bit 0
+//!    byte is set, the ABSORBED pair: a stamp and the absorbed total's payload, then the OPERAND
+//!    STAMPS: when bit 5 is set the stamp of the slot's latest operand of type `Int64` or wider
+//!    (`wide_at`), when bit 6 is set the stamp of its latest `Decimal128` operand (`decimal_at`),
+//!    in that order. The flag byte: bit 0
 //!    an absorbed pair is present; bits 1 and 2 the type of the total (0 `Int64`, 1 `Int32`,
-//!    2 `Decimal128`); bits 3 and 4 the type of the absorbed total (0 when there is no pair).
-//!    Type 3, a type bit with no pair, and any other bit set are refused (`BadTag`);
+//!    2 `Decimal128`); bits 3 and 4 the type of the absorbed total (0 when there is no pair);
+//!    bit 5 `wide_at` is present; bit 6 `decimal_at` is present. The operand stamps are the slot's
+//!    writer's, not above the slot's stamp, `decimal_at` implies `wide_at` at or above it, and the type
+//!    they spell (`Decimal128` if `decimal_at`, else `Int64` if `wide_at`, else `Int32`) is the total's
+//!    (R1: the type of what a slot gained since a base write absorbed it is the width of the operands
+//!    newer than the absorb, `Slot::width_since`). Type 3, a type bit with no pair, bit 7 and a
+//!    mismatch of the stamps with the total's type are refused (`BadTag`, `SlotWidthsInconsistent`);
 //! 8. the **version vector**: a count; each a writer index and an HLC;
 //! 9. `losses`: a count; each a kind byte, an "about" byte (0 the whole document, 1 a field and
 //!    then its path), a stamp and the lost value. The whole document is its own tag, not the
@@ -180,8 +188,11 @@ fn num_type(n: &Num) -> u8 {
 
 /// The flag byte of a counter slot (section 7): bit 0 an absorbed pair follows the total, bits 1
 /// and 2 the type of the total, bits 3 and 4 the type of the absorbed total (0 when there is no
-/// pair). The other bits are 0.
+/// pair), bit 5 the stamp of the latest `Int64`-or-wider operand follows, bit 6 the stamp of the
+/// latest `Decimal128` operand follows. Bit 7 is 0.
 const SLOT_ABSORBED: u8 = 1;
+const SLOT_WIDE: u8 = 0x20;
+const SLOT_DECIMAL: u8 = 0x40;
 const SLOT_TOTAL_TYPE_SHIFT: u8 = 1;
 const SLOT_ABSORBED_TYPE_SHIFT: u8 = 3;
 
@@ -527,11 +538,23 @@ impl MergeState {
             if let Some((_, a)) = &s.absorbed {
                 flags |= SLOT_ABSORBED | num_type(a) << SLOT_ABSORBED_TYPE_SHIFT;
             }
+            if s.wide_at.is_some() {
+                flags |= SLOT_WIDE;
+            }
+            if s.decimal_at.is_some() {
+                flags |= SLOT_DECIMAL;
+            }
             w.u8(flags);
             w.num_payload(&s.total);
             if let Some((st, a)) = &s.absorbed {
                 w.stamp(st);
                 w.num_payload(a);
+            }
+            if let Some(st) = &s.wide_at {
+                w.stamp(st);
+            }
+            if let Some(st) = &s.decimal_at {
+                w.stamp(st);
             }
         }
         w.vv(&self.vv);
@@ -684,7 +707,7 @@ impl MergeState {
             let (ty, aty) =
                 ((flags >> SLOT_TOTAL_TYPE_SHIFT) & 3, (flags >> SLOT_ABSORBED_TYPE_SHIFT) & 3);
             // no stray bit, no type 3, and no absorbed type without an absorbed pair
-            if flags & 0xe0 != 0 || ty == 3 || aty == 3 || (flags & SLOT_ABSORBED == 0 && aty != 0)
+            if flags & 0x80 != 0 || ty == 3 || aty == 3 || (flags & SLOT_ABSORBED == 0 && aty != 0)
             {
                 return Err(DecodeError::BadTag(flags));
             }
@@ -695,7 +718,9 @@ impl MergeState {
             } else {
                 None
             };
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed })?;
+            let wide_at = if flags & SLOT_WIDE != 0 { Some(r.stamp()?) } else { None };
+            let decimal_at = if flags & SLOT_DECIMAL != 0 { Some(r.stamp()?) } else { None };
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed, wide_at, decimal_at })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {

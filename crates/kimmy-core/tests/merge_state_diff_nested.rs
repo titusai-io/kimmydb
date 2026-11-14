@@ -743,7 +743,12 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// derived Debug of the type now prints `Origin {..}` where it printed `WriterId {..}`. States and reads are unchanged: with a temporary Debug
 /// impl printing `WriterId`, every pin matched; the Python differential still reports 0 scripts disagreeing.
 /// 0x717f_d665_e31b_848c to 0xe9b9_25e7_5146_822c.
-const PINNED_300: u64 = 0xe9b9_25e7_5146_822c;
+///
+/// RE-PINNED when a counter slot began to spell the stamps of its latest wide and decimal operands (`wide_at`, `decimal_at`; Amendment 6
+/// of the Q7 design): the fingerprint hashes the `{:?}` text of the states, and a slot now prints those two fields. Compared step by step
+/// against the series before the change (the same scripts, the same draws): old 36160 new 36160 steps common 36160 | slotless identical 12795; slot-bearing identical 0; slot-bearing differing 23365; slotless differing 0. The replay still agrees with the model (0 scripts disagree).
+/// 0xe9b9_25e7_5146_822c to 0xdc0d_b553_2c31_01ac.
+const PINNED_300: u64 = 0xdc0d_b553_2c31_01ac;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
