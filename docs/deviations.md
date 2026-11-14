@@ -17,6 +17,38 @@ Status meanings:
 
 ---
 
+<a id="field-merge-refusals-q7"></a>
+
+## 🟡 Under the `field` merge policy four kinds of update are refused with a 400 where the reference applies them (Q7 step 2)
+
+**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: (1) a 65th contributing writer to a counter; (2) a double increment of an integer or decimal counter, which the reference accepts (an `Int32` or `Int64` field becomes a `Double`, `5` + `1.5` gives `6.5`, recorded in `q7s2-probes/reference-6.0.5/q7s2.out` lines 230-247; a `Decimal128` field stays a `Decimal128`, at 15 digits, line 252); (3) an increment whose `Decimal128` total cannot be represented exactly: the reference ROUNDS the total to 34 digits (34 nines + 1 gives `1.000...E+34`, lines 326-340) or STORES `Infinity` on overflow (lines 341-345), where ours is refused with `IncOutOfRange`, because a counter must stay exact to merge (Chris's ruling, item 9: a deviation); and (4) a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has neither the 65-contributor nor the 256-writer limit. Not listed: an `$inc` past the Int64 range is refused by the reference too (line 277), so it is not a deviation. The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
+
+**To close:** none planned; the limits are the design's (D5, Q11).
+
+---
+
+<a id="upsert-filter-field-incremented-q7"></a>
+
+## 🟡 Under the `field` merge policy an upsert that creates a document and increments a field its own filter names is refused with a 400
+
+**Raised with the Q7 step 2 effects interface; recorded in `q7s2-probes/reference-6.0.5/q7s2.out` and `q7s2b.out`.** `update` with `upsert: true` that matches nothing. The deviations are EXACTLY: the `$inc` on the EQUAL path of a filter field, filter `{a: 5}` with `{$inc: {a: 1}}` (the reference creates `{a: 6}`, `q7s2.out` line 435) and filter `{"a.b": 1}` with `{$inc: {"a.b": 1}}` (the reference creates `{a: {b: 2}}`, `q7s2b.out` line 204); and an `$inc` BELOW a Document filter value, filter `{a: {b: 1}}` with `{$inc: {"a.c": 1}}` (the reference creates `{a: {b: 1, c: 1}}`, `q7s2.out` line 440). The reference accepts all three; here the creation path refuses them (`Overlap`): the filter's field is written by the creation, as a register or as one Document cell, and a counter slot at or below a creation register belongs to no generation of it (the design's overlap refusal). The spelling matters: filter `{"a.b": 1}` with `$inc a.c` is accepted here (a leaf cell beside the increment) and gives the same document as the reference (`q7s2.out` line 445). An `$inc` ABOVE a filter cell is NOT a deviation, the reference refuses it too (code 14, "non-numeric type object": filter `{"a.b": 1}` with `$inc a`, `q7s2b.out` line 163; filter `{"a.b.c": 1}` with `$inc a.b`, line 208; filter `{a: {b: 1}}` with `$inc a`, `q7s2.out` line 454), and neither is an `$inc` below a scalar filter value (`q7s2.out` line 449). A `$setOnInsert` or `$set` Document with an `$inc` below it is refused by the reference at parse time (code 40, `q7s2b.out` lines 5 to 45), so it is not part of this entry. An upsert that MATCHES a document is an ordinary update and is not refused (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})` increments). Giving a creation register a slot of its own write is a merge-model change, not in scope.
+
+**Workaround:** increment a field the filter does not name, or `$set` the computed value.
+
+**To close:** let the creation write a counter base and a slot together for a filter field (merge model, Q7 design).
+
+---
+
+<a id="rename-of-a-counter-q7"></a>
+
+## 🟡 Under the `field` merge policy `$rename` of any integer or decimal field, or of a sub-document holding one, is refused with a 400
+
+**Raised with the Q7 step 2 effects interface.** A counter's slots cannot move, and the writer cannot tell a field that was ever incremented from a plain integer: every visible `Int32`, `Int64` or `Decimal128` cell at the source path or below it counts (a double, a string and an array do not). The reference renames them. A concurrent first `$inc` elsewhere can still race a rename that was accepted, and its increments reappear on the source path (design U2). Chris has been told and may narrow it.
+
+**To close:** a rename that carries the slots, or a rule that narrows the refusal to fields that were incremented. S2a and S2b record the choice.
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches

@@ -53,6 +53,11 @@ cargo nextest run -p kimmy-core --features merge-mutants \
   --test merge_state_diff --test merge_state_diff_nested --test merge_state_ord_diff
 ```
 
+A plain `cargo test -p kimmy-core` also needs `python3`: one test runs the
+independent byte writer of the order section of the compact form
+(`tests/data/check_ord_section.py`) against the Rust bytes, and fails if
+`python3` is missing.
+
 `Q7DIFF_RUNS` and `Q7DIFF_NESTED_RUNS` set how many scripts the flat and the
 nested differential replay (default 300). `merge_state_min_a2b1` needs no
 feature: it replays every stamp order of an exhaustive class through the writers

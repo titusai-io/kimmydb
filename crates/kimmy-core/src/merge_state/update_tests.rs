@@ -373,3 +373,103 @@ fn a_large_update_is_checked_for_overlap_in_n_log_n() {
         UpdateRefused::Overlap(Path::flat("p123").unwrap(), Path::new(["p123", "child"]).unwrap())
     );
 }
+
+#[test]
+fn sees_counter_is_true_only_for_int_and_decimal_cells() {
+    let mut w = writer(1);
+    assert!(!w.sees_counter(&np("n")), "no life");
+    w.insert(
+        &fl(&[
+            ("i32", Value::Int32(1)),
+            ("i64", i(1)),
+            ("dec", Value::Decimal128([0x30; 16])),
+            ("dbl", Value::Double(1.5)),
+            ("str", s("x")),
+            ("m", doc(&[("x", i(1))])),
+        ]),
+        0,
+    )
+    .unwrap();
+    for p in ["i32", "i64", "dec", "m.x"] {
+        assert!(w.sees_counter(&np(p)), "{p}");
+    }
+    for p in ["dbl", "str", "m", "missing", "m.missing"] {
+        assert!(!w.sees_counter(&np(p)), "{p}");
+    }
+    // a counter made by an increment of an absent field
+    w.write_inc(&np("fresh"), 1, 0).unwrap();
+    assert!(w.sees_counter(&np("fresh")));
+    // read-only: the state did not move
+    let before = w.state.clone();
+    let _ = w.sees_counter(&np("i64"));
+    assert_eq!(w.state, before);
+}
+
+#[test]
+fn a_register_set_over_a_counter_of_two_writers_folds_what_it_saw() {
+    // slots of two writers at `n` (counter_of: base 0, one increment each)
+    let both = counter_of(2);
+    let mut a = writer(1);
+    a.receive(&both);
+    let mut b = writer(2);
+    b.receive(&both);
+    assert_eq!(a.visible().unwrap()[&np("n")], i(2));
+    // writer a sets n = 100 (a register write over both slots: the fold)
+    a.write_update(&[UpdateOp::Set(np("n"), i(100))], 0).unwrap().unwrap();
+    assert_eq!(a.visible().unwrap()[&np("n")], i(100));
+    // writer b, which has not seen the set, adds 5: an unseen increment adds on top
+    b.write_update(&[UpdateOp::Inc(np("n"), i(5))], 0).unwrap().unwrap();
+    a.receive(&b.state);
+    b.receive(&a.state);
+    assert_eq!(a.state, b.state);
+    assert_eq!(a.visible().unwrap()[&np("n")], i(105));
+}
+
+#[test]
+fn sees_counter_at_or_under_looks_through_sub_documents_but_not_arrays() {
+    let mut w = writer(1);
+    w.insert(
+        &fl(&[
+            ("withint", doc(&[("x", s("a")), ("c", i(1))])),
+            ("deep", doc(&[("l1", doc(&[("l2", doc(&[("c", Value::Int32(1))]))]))])),
+            ("plain", doc(&[("d", Value::Double(1.5)), ("s", s("t"))])),
+            ("arr", Value::Array(vec![i(1), i(2)])),
+            ("n", i(1)),
+        ]),
+        0,
+    )
+    .unwrap();
+    for p in ["withint", "deep", "deep.l1", "n", "deep.l1.l2.c"] {
+        assert!(w.sees_counter_at_or_under(&np(p)), "{p}");
+    }
+    for p in ["plain", "arr", "missing", "plain.d"] {
+        assert!(!w.sees_counter_at_or_under(&np(p)), "{p}");
+    }
+    // a sibling sharing a name prefix is not under the path
+    assert!(!w.sees_counter_at_or_under(&np("with")));
+}
+
+#[test]
+fn the_renaming_entry_refuses_a_counter_source_before_the_clock_moves() {
+    let mut w = seeded();
+    w.write_inc(&np("n"), 1, 0).unwrap();
+    let (state, clock) = (w.state.clone(), w.clock);
+    let ops = [UpdateOp::Unset(np("n")), UpdateOp::Set(np("m"), i(1))];
+    let r = w.write_update_renaming(&ops, &[np("n")], 0);
+    assert_eq!(r, Err(UpdateRefused::RenameOfCounter(np("n"))));
+    let mut called = false;
+    let mut stamp = || {
+        called = true;
+        MStamp {
+            hlc: Hlc::new(1, 0),
+            writer: WriterId { node: NodeId::from_bytes([1; 16]), epoch: Epoch::from_u64(0) },
+        }
+    };
+    let r = w.write_update_renaming_stamped(&ops, &[np("n")], &mut stamp);
+    assert_eq!(r, Err(UpdateError::Refused(UpdateRefused::RenameOfCounter(np("n")))));
+    assert!(!called);
+    assert_eq!((w.state.clone(), w.clock), (state, clock));
+    // a non-counter source is an ordinary update
+    let ok = [UpdateOp::Unset(np("b")), UpdateOp::Set(np("b2"), s("str"))];
+    assert!(w.write_update_renaming(&ok, &[np("b")], 0).unwrap().is_some());
+}
