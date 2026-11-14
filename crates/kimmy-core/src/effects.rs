@@ -101,6 +101,22 @@
 //!   the same path overrides them, and that is NOT an overlap ([`UpsertEffects::check`] does not
 //!   refuse it); an `$inc` on a filter field increments the filter value (`{a: 5}` with `$inc a 1`
 //!   gives 6, by the two-write shape). (Recorded on the Q7 design page as an amendment.)
+//! * (b2) Composition, before the writer, into NON-overlapping leaf cells
+//!   ([`UpsertEffects::creation_cells`]): the layers compose in order, filter first, then
+//!   `$setOnInsert` and `$set` on top. A higher-layer path EQUAL to or an ANCESTOR of a filter path
+//!   overrides it and the filter leaves below it are dropped (filter `{"a.b": 1}` with `$set
+//!   {a: {c: 2}}` gives `a: {c: 2}`); a higher-layer path BELOW a filter document merges into it
+//!   (filter `{a: {x: 1}}` with `$set {"a.y": 2}` gives `a: {x: 1, y: 2}`). Tagging is per leaf:
+//!   leaves from the filter or from `$setOnInsert` are creation cells, leaves from `$set` are not.
+//!   `_id` is the key, not a cell, and is dropped. `from_filter` paths that overlap EACH OTHER (the
+//!   same path twice, or an ancestor and a descendant such as a filter on `a` and `a.b`) are
+//!   refused as [`UpdateRefused::Overlap`] at parse time: this matches the reference, so it is NOT a
+//!   deviation. A higher-layer path below a non-document filter value (filter `{a: 5}`, `$set
+//!   {"a.y": 2}`) is [`UpdateRefused::BelowScalar`], as the reference cannot create a field in a
+//!   non-document. The `$inc` of a filter field is not a cell: the creation holds the filter value
+//!   and the increment follows (`{a: 5}` with `$inc a 1` gives 6). NOTE for S2a: today
+//!   `Writer::upsert_inc_on` refuses an increment on a path the creation wrote as a register, so
+//!   the slot must be allowed to land on a creation register's base (the S2a work item).
 //! * (c) Creation values of `$mul`, `$min`, `$max`, `$currentDate`, `$push`, `$addToSet` and `$bit`
 //!   are computed by S2b and go in `set`.
 //! * (d) One write or two, from the existing code (`merge_state/writer.rs`): `upsert_inc` is ONE
@@ -170,7 +186,10 @@
 //!   to the writer is S2a's (next section).
 //! * RESOLVED: bypass of the rename check (it is in the writer), `$rename` of a missing source (no
 //!   effects), arrays (one outermost `Set`), the upsert contract (a) to (e), the outcome mapping.
-//! * OPEN: from_filter paths that overlap each other, or sit below a `$set` path, are not ruled.
+//! * RESOLVED: `from_filter` overlap among itself is a parse-time `Overlap` (as the reference);
+//!   the layers compose filter, then `$setOnInsert`, then `$set`, see (b2).
+//! * OPEN: a higher-layer path below a NON-document filter value is `BelowScalar` here (as the
+//!   reference's error); not separately ruled.
 
 pub use crate::merge_state::{MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
@@ -341,23 +360,116 @@ pub struct UpsertEffects {
     pub inc: Vec<(Path, Value)>,
 }
 
+/// Who wrote a creation cell: a filter or `$setOnInsert` leaf is a creation cell (it can be
+/// dropped by a later merge), a `$set` leaf is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellTag {
+    /// From the filter or `$setOnInsert`: tagged as a creation cell.
+    Creation,
+    /// From `$set`: untagged.
+    Plain,
+}
+
+/// One leaf of the composed creation: a path, its value and its tag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreationCell {
+    pub path: Path,
+    pub value: Value,
+    pub tag: CellTag,
+}
+
 impl UpsertEffects {
     /// The parse-time check, run on every upsert, matched or not: refuse any two paths, in or
     /// across `set_on_insert`, `set` and `inc`, where one is equal to or below the other
-    /// ([`UpdateRefused::Overlap`], the first pair found, in sorted order). `from_filter` is the
-    /// lowest layer and is NOT checked against the others: a `$set` or `$setOnInsert` on a filter
-    /// path overrides it, and an `$inc` on one increments it.
+    /// ([`UpdateRefused::Overlap`], the first pair found, in sorted order); and any two
+    /// `from_filter` paths (without `_id`) where one is equal to or below the other. `from_filter`
+    /// is otherwise the lowest layer and is NOT checked against the others: a `$set` or
+    /// `$setOnInsert` on a filter path overrides it, and an `$inc` on one increments it.
     pub fn check(&self) -> Result<(), UpdateRefused> {
         let mut all: Vec<&Path> =
             self.set_on_insert.iter().chain(&self.set).chain(&self.inc).map(|(p, _)| p).collect();
-        // sorted, a path is followed by its extensions, so an overlap is between neighbours
-        all.sort();
-        for w in all.windows(2) {
-            if w[0] == w[1] || w[1].is_below(w[0]) {
-                return Err(UpdateRefused::Overlap(w[0].clone(), w[1].clone()));
-            }
+        first_overlap(&mut all)?;
+        let mut filter: Vec<&Path> =
+            self.from_filter.iter().map(|(p, _)| p).filter(|p| !is_id(p)).collect();
+        first_overlap(&mut filter)
+    }
+
+    /// The creation as non-overlapping leaf cells, in a deterministic order (the surviving filter
+    /// leaves, then `$setOnInsert`, then `$set`, each in the order given): the composition of
+    /// "Upserts" (b2). Runs [`UpsertEffects::check`] first. A document value is expanded into its
+    /// leaves (an empty document, an array and every scalar are leaves); a `Value::Unset` makes no
+    /// cell but still overrides the filter below it. `inc` is not part of the cells.
+    pub fn creation_cells(&self) -> Result<Vec<CreationCell>, UpdateRefused> {
+        self.check()?;
+        let mut cells = Vec::new();
+        for (p, v) in self.from_filter.iter().filter(|(p, _)| !is_id(p)) {
+            leaves(p, v, CellTag::Creation, &mut cells)?;
         }
-        Ok(())
+        let higher = self
+            .set_on_insert
+            .iter()
+            .map(|(p, v)| (p, v, CellTag::Creation))
+            .chain(self.set.iter().map(|(p, v)| (p, v, CellTag::Plain)));
+        for (q, v, tag) in higher {
+            let mut keep = Vec::with_capacity(cells.len());
+            for c in cells {
+                let below_or_equal = c.path == *q || c.path.is_below(q);
+                let ancestor = q.is_below(&c.path);
+                if c.tag == CellTag::Creation && below_or_equal {
+                    continue; // overridden (only filter and soi cells exist before this layer)
+                }
+                if ancestor && !matches!(&c.value, Value::Document(f) if f.is_empty()) {
+                    return Err(UpdateRefused::BelowScalar(q.clone()));
+                }
+                if ancestor {
+                    continue; // an empty filter document gives way to what is set below it
+                }
+                keep.push(c);
+            }
+            cells = keep;
+            leaves(q, v, tag, &mut cells)?;
+        }
+        Ok(cells)
+    }
+}
+
+fn is_id(p: &Path) -> bool {
+    p.segments().first().is_some_and(|s| s == "_id") && p.segments().len() == 1
+}
+
+/// The first pair, in sorted order, where one path is equal to or below the other.
+fn first_overlap(paths: &mut [&Path]) -> Result<(), UpdateRefused> {
+    // sorted, a path is followed by its extensions, so an overlap is between neighbours
+    paths.sort();
+    for w in paths.windows(2) {
+        if w[0] == w[1] || w[1].is_below(w[0]) {
+            return Err(UpdateRefused::Overlap(w[0].clone(), w[1].clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Expand `v` at `p` into leaf cells.
+fn leaves(
+    p: &Path,
+    v: &Value,
+    tag: CellTag,
+    out: &mut Vec<CreationCell>,
+) -> Result<(), UpdateRefused> {
+    match v {
+        Value::Unset => Ok(()),
+        Value::Document(fields) if !fields.is_empty() => {
+            for (name, fv) in fields {
+                let child = Path::new(p.segments().iter().cloned().chain([name.clone()]))
+                    .map_err(UpdateRefused::BadPath)?;
+                leaves(&child, fv, tag, out)?;
+            }
+            Ok(())
+        }
+        _ => {
+            out.push(CreationCell { path: p.clone(), value: v.clone(), tag });
+            Ok(())
+        }
     }
 }
 
@@ -670,5 +782,104 @@ mod tests {
         assert!(!same(Some(&Value::Int32(2)), &i(2)));
         assert!(!same(None, &Value::Null));
         assert!(same(None, &Value::Unset));
+    }
+
+    fn cell(path: Path, value: Value, tag: CellTag) -> CreationCell {
+        CreationCell { path, value, tag }
+    }
+    fn filter(f: Vec<(Path, Value)>) -> UpsertEffects {
+        UpsertEffects { from_filter: f, ..Default::default() }
+    }
+    fn dc(f: Vec<(&str, Value)>) -> Value {
+        Value::Document(f.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    #[test]
+    fn composition_filter_alone_and_soi_and_set_tags() {
+        let u = UpsertEffects {
+            from_filter: vec![(np(&["a", "b"]), i(1)), (p("d"), dc(vec![("x", i(1))]))],
+            set_on_insert: vec![(p("s"), i(2))],
+            set: vec![(p("t"), i(3))],
+            inc: vec![],
+        };
+        assert_eq!(
+            u.creation_cells().unwrap(),
+            vec![
+                cell(np(&["a", "b"]), i(1), CellTag::Creation),
+                cell(np(&["d", "x"]), i(1), CellTag::Creation),
+                cell(p("s"), i(2), CellTag::Creation),
+                cell(p("t"), i(3), CellTag::Plain),
+            ]
+        );
+        assert!(UpsertEffects::default().creation_cells().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_higher_layer_equal_to_or_above_a_filter_path_overrides_it() {
+        let eq = UpsertEffects { set: vec![(p("f"), i(9))], ..filter(vec![(p("f"), i(5))]) };
+        assert_eq!(eq.creation_cells().unwrap(), vec![cell(p("f"), i(9), CellTag::Plain)]);
+        let soi =
+            UpsertEffects { set_on_insert: vec![(p("f"), i(8))], ..filter(vec![(p("f"), i(5))]) };
+        assert_eq!(soi.creation_cells().unwrap(), vec![cell(p("f"), i(8), CellTag::Creation)]);
+        // filter {"a.b": 1} with $set {a: {c: 2}} gives a: {c: 2}
+        let anc = UpsertEffects {
+            set: vec![(p("a"), dc(vec![("c", i(2))]))],
+            ..filter(vec![(np(&["a", "b"]), i(1))])
+        };
+        assert_eq!(
+            anc.creation_cells().unwrap(),
+            vec![cell(np(&["a", "c"]), i(2), CellTag::Plain)]
+        );
+    }
+
+    #[test]
+    fn a_higher_layer_below_a_filter_document_merges_into_it() {
+        // filter {a: {x: 1}} with $set {"a.y": 2} gives a: {x: 1, y: 2}
+        let u = UpsertEffects {
+            set: vec![(np(&["a", "y"]), i(2))],
+            ..filter(vec![(p("a"), dc(vec![("x", i(1))]))])
+        };
+        assert_eq!(
+            u.creation_cells().unwrap(),
+            vec![
+                cell(np(&["a", "x"]), i(1), CellTag::Creation),
+                cell(np(&["a", "y"]), i(2), CellTag::Plain),
+            ]
+        );
+        // an empty filter document gives way
+        let e = UpsertEffects {
+            set: vec![(np(&["a", "y"]), i(2))],
+            ..filter(vec![(p("a"), dc(vec![]))])
+        };
+        assert_eq!(e.creation_cells().unwrap(), vec![cell(np(&["a", "y"]), i(2), CellTag::Plain)]);
+        // below a non-document filter value is refused
+        let bad =
+            UpsertEffects { set: vec![(np(&["a", "y"]), i(2))], ..filter(vec![(p("a"), i(5))]) };
+        assert_eq!(bad.creation_cells(), Err(UpdateRefused::BelowScalar(np(&["a", "y"]))));
+    }
+
+    #[test]
+    fn the_id_is_the_key_and_not_a_cell() {
+        let u = filter(vec![(p("_id"), i(1)), (p("a"), i(2))]);
+        assert_eq!(u.creation_cells().unwrap(), vec![cell(p("a"), i(2), CellTag::Creation)]);
+    }
+
+    #[test]
+    fn filter_paths_that_overlap_each_other_are_refused() {
+        let twice = filter(vec![(p("a"), i(1)), (p("a"), i(2))]);
+        assert!(matches!(twice.check(), Err(UpdateRefused::Overlap(..))));
+        let nested = filter(vec![(p("a"), i(1)), (np(&["a", "b"]), i(2))]);
+        assert!(matches!(nested.creation_cells(), Err(UpdateRefused::Overlap(..))));
+        let disjoint = filter(vec![(np(&["a", "b"]), i(1)), (np(&["a", "c"]), i(2))]);
+        assert!(disjoint.check().is_ok());
+    }
+
+    #[test]
+    fn an_inc_on_a_filter_field_leaves_the_filter_value_for_the_increment_to_follow() {
+        // {a: 5} with $inc a 1: the creation holds a = 5, the increment (inc list) follows -> 6
+        let u = UpsertEffects { inc: vec![(p("a"), i(1))], ..filter(vec![(p("a"), i(5))]) };
+        assert!(u.check().is_ok());
+        assert_eq!(u.creation_cells().unwrap(), vec![cell(p("a"), i(5), CellTag::Creation)]);
+        assert_eq!(u.inc, vec![(p("a"), i(1))]);
     }
 }
