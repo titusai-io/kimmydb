@@ -747,10 +747,10 @@ fn golden_vectors_match_the_model() {
         "obs": J::Null,
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
         "empty-compact": ["6a9f06d361f4fb8c789c079f6563280a", 10],
-        "170-compact": ["abedfb140b687b3671abd3023efa93a8", 215],
-        "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
+        "170-compact": ["06b5f3340937c85eca242ec49b53fa83", 237],
+        "mixed-compact": ["cb5e6838859904b50d3a0a03c290410d", 349],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
-        "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
+        "obs-compact": ["01ed28ab7e196e406d1c7f38d0af7b2b", 285],
     });
     assert_eq!(got, want);
 }

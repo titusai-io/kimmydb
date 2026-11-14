@@ -24,10 +24,10 @@ import sys
 # The pins of `the_compact_golden_hashes_with_the_order_state_are_pinned`: name -> (hash, length, order entries).
 PINS = {
     "empty": ("6a9f06d361f4fb8c789c079f6563280a", 10, 0),
-    "170": ("79f811df1f679ba13896538b36c9e324", 273, 1),
-    "mixed": ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5),
+    "170": ("c0a384f4112088636753e3948b1e1e13", 295, 1),
+    "mixed": ("d42951acd96e914ff082bf04c19a3a9d", 520, 5),
     "delete": ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0),
-    "obs": ("1714242f8331d6b9ca194c73191730ed", 329, 2),
+    "obs": ("09c078603374ae19df49d4aa38faed7c", 362, 2),
     "small": ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2),
     # NEW pins (`the_order_section_corpus_is_pinned`): states a Rust Writer builds, with every floor kind, a level mark,
     # the root key, several writers' firsts and positions of 128 and up (see `ord_section_states`).
