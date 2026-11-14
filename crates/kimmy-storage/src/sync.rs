@@ -2431,15 +2431,22 @@ impl Engine {
                     // of the name. The validator it carries is then a change like a
                     // `ConfigureValidator`'s, last writer winning on the stamp.
                     Ok(held) => {
-                        // The policy is fixed at creation and never changes here: a creation of
-                        // the name under the other policy is a conflict the held life wins.
+                        // The policy is fixed at creation, and two members can create the
+                        // name at once under different ones: it follows the creation with the
+                        // later stamp, on every member, whichever arrives first.
                         if held.merge_policy != target.merge_policy.fixed_for(&target.name) {
+                            let kept = self.adopt_creation_policy(
+                                &target.db,
+                                &target.name,
+                                target.merge_policy,
+                                entry.stamp.hlc,
+                            )?;
                             warn!(
                                 db = %target.db,
                                 collection = %target.name,
-                                held = %held.merge_policy,
                                 entry = %target.merge_policy,
-                                "a creation names a merge policy other than the one held; the held one stands"
+                                standing = %kept.merge_policy,
+                                "a creation names a merge policy other than the one held; the later creation's stands"
                             );
                         }
                         if let Some(outcome) = self.validator_of_a_creation(&target, entry)? {
