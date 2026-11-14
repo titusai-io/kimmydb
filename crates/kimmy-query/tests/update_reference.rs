@@ -197,3 +197,172 @@ fn a_upsert_sorts_the_fields_the_register_operators_create() {
         doc! { "_id": 1, "arr": [1], "b": 6, "hi": 7, "lo": 2, "m": 0, "st": ["x"] },
     );
 }
+
+// ---------------------------------------------------------------------------
+// (B) Numeric segments address array elements at any depth; no write below
+// a scalar
+// ---------------------------------------------------------------------------
+
+#[track_caller]
+fn refused(got: Result<Document, String>, needle: &str) {
+    match got {
+        Ok(d) => panic!("applied, giving {d}; wanted a refusal naming {needle:?}"),
+        Err(e) => assert!(e.contains(needle), "refused as {e:?}, which lacks {needle:?}"),
+    }
+}
+
+fn grid() -> Document {
+    doc! { "_id": 1, "grid": [[1, 2], [3, 4]] }
+}
+
+#[test]
+fn b_a_numeric_segment_writes_an_element_of_a_nested_array() {
+    // q7s2.out lines 6, 11, 16, 21, 26, 31, 36.
+    same(
+        updated(doc! { "$set": { "grid.0.1": 9 } }, grid()),
+        doc! { "_id": 1, "grid": [[1, 9], [3, 4]] },
+    );
+    same(
+        updated(doc! { "$set": { "grid.1.0": 9 } }, grid()),
+        doc! { "_id": 1, "grid": [[1, 2], [9, 4]] },
+    );
+    same(
+        updated(doc! { "$set": { "grid.0.5": 9 } }, grid()),
+        doc! { "_id": 1, "grid": [[1, 2, null, null, null, 9], [3, 4]] },
+    );
+    same(
+        updated(doc! { "$set": { "grid.2.0": 9 } }, grid()),
+        doc! { "_id": 1, "grid": [[1, 2], [3, 4], { "0": 9 }] },
+    );
+    same(
+        updated(doc! { "$inc": { "grid.0.0": 10 } }, grid()),
+        doc! { "_id": 1, "grid": [[11, 2], [3, 4]] },
+    );
+    same(
+        updated(doc! { "$unset": { "grid.0.0": "" } }, grid()),
+        doc! { "_id": 1, "grid": [[null, 2], [3, 4]] },
+    );
+    same(
+        updated(doc! { "$push": { "grid.0": 9 } }, grid()),
+        doc! { "_id": 1, "grid": [[1, 2, 9], [3, 4]] },
+    );
+}
+
+#[test]
+fn b_a_numeric_segment_reaches_three_levels_down() {
+    // q7s2.out lines 41, 46, 51.
+    let d = doc! { "_id": 1, "d": [[[1, 2], [3]], [[4]]] };
+    same(
+        updated(doc! { "$set": { "d.0.0.1": 9 } }, d.clone()),
+        doc! { "_id": 1, "d": [[[1, 9], [3]], [[4]]] },
+    );
+    same(
+        updated(doc! { "$set": { "d.1.0.0": 9 } }, d.clone()),
+        doc! { "_id": 1, "d": [[[1, 2], [3]], [[9]]] },
+    );
+    same(
+        updated(doc! { "$set": { "d.0.1.0": 9 } }, d),
+        doc! { "_id": 1, "d": [[[1, 2], [9]], [[4]]] },
+    );
+}
+
+#[test]
+fn b_a_numeric_segment_mixed_with_field_names_in_documents_and_arrays() {
+    // q7s2.out lines 56, 61, 71, 76, 81, 86.
+    let items = doc! { "_id": 1, "items": [{ "tags": ["a", "b"], "n": 1 }, { "tags": ["c"] }] };
+    same(
+        updated(doc! { "$set": { "items.0.tags.1": "z" } }, items.clone()),
+        doc! { "_id": 1, "items": [{ "tags": ["a", "z"], "n": 1 }, { "tags": ["c"] }] },
+    );
+    same(
+        updated(doc! { "$push": { "items.1.tags": "d" } }, items),
+        doc! { "_id": 1, "items": [{ "tags": ["a", "b"], "n": 1 }, { "tags": ["c", "d"] }] },
+    );
+    same(
+        updated(doc! { "$set": { "o.0": 6 } }, doc! { "_id": 1, "o": { "0": 5 } }),
+        doc! { "_id": 1, "o": { "0": 6 } },
+    );
+    same(
+        updated(doc! { "$set": { "x.0": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "x": { "0": 1 } },
+    );
+    same(
+        updated(doc! { "$set": { "x.0.y": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "x": { "0": { "y": 1 } } },
+    );
+    same(
+        updated(doc! { "$set": { "a.0.1": 9 } }, doc! { "_id": 1, "a": [{ "k": 1 }] }),
+        doc! { "_id": 1, "a": [{ "k": 1, "1": 9 }] },
+    );
+}
+
+#[test]
+fn b_a_write_below_a_scalar_is_refused() {
+    // q7s2.out lines 90, 95: an array element, and a field, that is a scalar.
+    refused(
+        updated(doc! { "$set": { "a.0.1": 9 } }, doc! { "_id": 1, "a": [7] }),
+        "cannot create field '1' in element {0: 7}",
+    );
+    refused(
+        updated(doc! { "$set": { "a.1": 9 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field '1' in element {a: 5}",
+    );
+    // Lines 561, 566, 576, 591: `$set`, `$inc` and `$push` below a scalar and
+    // below a null.
+    refused(
+        updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field 'y' in element {a: 5}",
+    );
+    refused(
+        updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": bson::Bson::Null }),
+        "cannot create field 'y' in element {a: null}",
+    );
+    refused(
+        updated(doc! { "$inc": { "a.y": 1 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field 'y' in element {a: 5}",
+    );
+    refused(
+        updated(doc! { "$push": { "a.y": 1 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field 'y' in element {a: 5}",
+    );
+    // Line 571: a field name into an array.
+    refused(
+        updated(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": [1] }),
+        "non-numeric segment",
+    );
+}
+
+#[test]
+fn b_an_unset_below_a_scalar_changes_nothing() {
+    // q7s2.out line 556.
+    same(
+        updated(doc! { "$unset": { "a.y": "" } }, doc! { "_id": 1, "a": 5 }),
+        doc! { "_id": 1, "a": 5 },
+    );
+}
+
+#[test]
+fn b_an_upsert_writing_below_a_filter_scalar_is_refused() {
+    // q7s2.out lines 449 and 464.
+    refused(
+        upserted(doc! { "$inc": { "a.x": 1 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field 'x' in element {a: 5}",
+    );
+    refused(
+        upserted(doc! { "$set": { "a.y": 1 } }, doc! { "_id": 1, "a": 5 }),
+        "cannot create field 'y' in element {a: 5}",
+    );
+}
+
+#[test]
+fn b_two_spellings_of_one_element_are_a_path_conflict() {
+    // No recorded answer. The product refuses the pair: `a.1` and `a.01` are
+    // one element, written twice.
+    for update in [
+        doc! { "$set": { "a.1": 5 }, "$inc": { "a.01": 1 } },
+        doc! { "$inc": { "a.01": 1 }, "$set": { "a.1": 5 } },
+    ] {
+        let Err(err) = parsed(update) else { panic!("applied") };
+        assert!(err.contains("conflict"), "{err}");
+    }
+}

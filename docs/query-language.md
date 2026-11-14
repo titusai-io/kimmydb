@@ -632,6 +632,18 @@ every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
 operators), sorted together. A [pipeline update](#pipeline-updates) is not
 covered by this: its stages add fields in the order they are written.
 
+**A numeric segment addresses an array element, at any depth, and nothing is
+written below a scalar.** `{"$set": {"grid.0.1": 9}}` over `grid: [[1, 2], [3,
+4]]` sets the inner element, and `$inc`, `$unset` and `$push` reach it the same
+way; writing past the end of an array pads it with `null`, and a position past
+the end of an outer array appends a document keyed by the next segment
+(`grid.2.0` adds `{"0": 9}`). Where the field is absent or a document, a
+numeric segment is a field name, as in `{"$set": {"x.0": 1}}` giving `x: {"0":
+1}`. A `$set`, `$inc` or `$push` whose path goes **below a scalar, a `null` or
+an array element that is not a document** is a `400`, `cannot create field 'y'
+in element {a: 5}`, and the document is unchanged; before, the scalar was
+replaced by a document. `$unset` below a scalar changes nothing.
+
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator
@@ -777,9 +789,10 @@ invalid update: $set on "a" conflicts with $inc on "a.b": updating the path "a.b
 
 A `$rename` counts as writing both its source and its destination. A
 `$setOnInsert` counts as a write whether or not the request inserts. **An
-index is compared by its value**: the path language reads `a.01` and `a.+1` as
+index is compared by its value**: an update here reads `a.01` and `a.+1` as
 `a.1`, so `{"$set": {"a.1": 5}, "$inc": {"a.01": 1}}` writes one path twice
-and is refused, with the conflict named at `"a.1"`. A path spelled that way
+and is refused as a path conflict (a `400`), with the conflict named at
+`"a.1"`. A path spelled that way
 alone is not refused. Over a field holding an object rather than an array,
 `01` and `1` are two keys, but such a pair is still refused rather than told
 apart.

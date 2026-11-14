@@ -1248,7 +1248,7 @@ fn apply_one(
         OpKind::Set(value) | OpKind::SetOnInsert(value) => set(doc, value.clone())?,
 
         OpKind::Unset => {
-            path::unset(doc, &op.path);
+            path::unset_checked(doc, &op.path);
         }
 
         OpKind::Inc(delta) => {
@@ -1388,7 +1388,7 @@ fn apply_one(
             }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
-                path::unset(doc, &op.path);
+                path::unset_checked(doc, &op.path);
                 path::set_checked(doc, target, value, created).map_err(invalid)?;
             }
         }

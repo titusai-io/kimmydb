@@ -178,12 +178,15 @@ fn set_in_document(doc: &mut Document, segs: &[&str], value: Bson) -> Result<(),
 /// positions from the document root down to the new key.
 pub type Created = Vec<Vec<String>>;
 
-/// Set a value at a dot path as [`set`] does, and record the keys it adds.
+/// Set a value at a dot path the way an update writes it: a numeric segment
+/// addresses an array element at any depth, and a write below a scalar, a
+/// `null` or an array element that is not a document is refused rather than
+/// replacing the value.
 ///
 /// Every key this call adds to a document is appended to `created`, for
 /// [`settle_created`] to put in order once the whole update has been applied.
-/// This is the update language's write; [`set`] stays for the stages that
-/// share it.
+/// Unlike [`set`], which the aggregation stages share and which makes room by
+/// replacing a scalar with a document, this is the update language's write.
 pub fn set_checked(
     doc: &mut Document,
     path: &str,
@@ -192,6 +195,10 @@ pub fn set_checked(
 ) -> Result<(), String> {
     let segs = segments(path);
     write_in_document(doc, &segs, value, &mut Vec::new(), created)
+}
+
+fn cannot_create(field: &str, under: &str, element: &Bson) -> String {
+    format!("cannot create field '{field}' in element {{{under}: {element}}}")
 }
 
 fn write_in_document(
@@ -212,15 +219,14 @@ fn write_in_document(
         doc.insert(*head, value);
         return Ok(());
     }
-    // Vivify a missing or non-traversable intermediate as a document.
-    if !matches!(doc.get(*head), Some(Bson::Document(_) | Bson::Array(_))) {
+    if !present {
         doc.insert(*head, Bson::Document(Document::new()));
     }
     trail.push((*head).to_string());
     let outcome = match doc.get_mut(*head).expect("just ensured present") {
         Bson::Document(child) => write_in_document(child, rest, value, trail, created),
         Bson::Array(items) => write_in_array(items, rest, value, trail, created),
-        _ => unreachable!("just ensured a container"),
+        other => Err(cannot_create(rest[0], head, other)),
     };
     trail.pop();
     outcome
@@ -237,6 +243,7 @@ fn write_in_array(
     let index: usize = index_seg
         .parse()
         .map_err(|_| format!("cannot traverse array with non-numeric segment {index_seg:?}"))?;
+    let existed = index < items.len();
     while items.len() <= index {
         items.push(Bson::Null);
     }
@@ -244,13 +251,14 @@ fn write_in_array(
         items[index] = value;
         return Ok(());
     }
-    if !matches!(items[index], Bson::Document(_)) {
+    if !existed {
         items[index] = Bson::Document(Document::new());
     }
     trail.push(index.to_string());
     let outcome = match &mut items[index] {
         Bson::Document(child) => write_in_document(child, tail, value, trail, created),
-        _ => unreachable!("just ensured a document"),
+        Bson::Array(inner) => write_in_array(inner, tail, value, trail, created),
+        other => Err(cannot_create(tail[0], index_seg, other)),
     };
     trail.pop();
     outcome
@@ -342,6 +350,42 @@ fn unset_in_document(doc: &mut Document, segs: &[&str]) -> bool {
                 _ => false,
             }
         }
+        _ => false,
+    }
+}
+
+/// Remove the value at a dot path as an update does: through a numeric
+/// segment at any depth of nested arrays, leaving a `null` hole where an
+/// element was. Returns whether anything was removed.
+pub fn unset_checked(doc: &mut Document, path: &str) -> bool {
+    let segs = segments(path);
+    unset_deep_in_document(doc, &segs)
+}
+
+fn unset_deep_in_document(doc: &mut Document, segs: &[&str]) -> bool {
+    let (head, rest) = segs.split_first().expect("non-empty path");
+    if rest.is_empty() {
+        return doc.remove(*head).is_some();
+    }
+    match doc.get_mut(*head) {
+        Some(Bson::Document(child)) => unset_deep_in_document(child, rest),
+        Some(Bson::Array(items)) => unset_deep_in_array(items, rest),
+        _ => false,
+    }
+}
+
+fn unset_deep_in_array(items: &mut [Bson], segs: &[&str]) -> bool {
+    let (index_seg, tail) = segs.split_first().expect("non-empty path");
+    let Ok(index) = index_seg.parse::<usize>() else {
+        return false;
+    };
+    match items.get_mut(index) {
+        Some(slot) if tail.is_empty() => {
+            *slot = Bson::Null;
+            true
+        }
+        Some(Bson::Document(child)) => unset_deep_in_document(child, tail),
+        Some(Bson::Array(inner)) => unset_deep_in_array(inner, tail),
         _ => false,
     }
 }
