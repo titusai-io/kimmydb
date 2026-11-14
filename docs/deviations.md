@@ -27,6 +27,18 @@ Status meanings:
 
 ---
 
+<a id="upsert-filter-field-incremented-q7"></a>
+
+## 🟡 Under the `field` merge policy an upsert that increments a field its own filter names is refused with a 400
+
+**Raised with the Q7 step 2 effects interface.** `update` with `upsert: true`, a filter `{a: 5}` and `{$inc: {a: 1}}`, matching nothing, creates `{a: 6}` in the reference. Here it is refused (`Overlap`) at parse time: the filter's field is written by the creation, and a counter slot beside a creation register belongs to no generation of it (the design's overlap refusal). The same holds when the `$inc` path is an ancestor or a descendant of a filter path. Giving a creation register a slot of its own write is a merge-model change, not in scope.
+
+**Workaround:** increment a field the filter does not name, or `$set` the computed value.
+
+**To close:** let the creation write a counter base and a slot together for a filter field (merge model, Q7 design).
+
+---
+
 <a id="rename-of-a-counter-q7"></a>
 
 ## 🟡 Under the `field` merge policy `$rename` of any integer or decimal field, or of a sub-document holding one, is refused with a 400
