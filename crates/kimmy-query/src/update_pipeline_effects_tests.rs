@@ -339,3 +339,25 @@ fn the_recorded_reference_answers_are_what_the_writer_renders() {
          differs, known order: {known_order:?}"
     );
 }
+
+/// Not a deviation (nothing in docs/deviations.md): a `$set` of a sub-document whose fields are
+/// only reordered IS a write on a `field` collection, as it is on a `document` one (the bytes
+/// differ). The writer counts an order-only change of a sub-document as a change
+/// (`Writer::reordered`), so the answer is `modified: true` under both policies, for an operator
+/// update and for a pipeline update, and the written document has the new order. Only a
+/// TOP-LEVEL reorder of a pipeline result is no write (`pipeline-reorder-only-q7`).
+#[test]
+fn a_set_of_a_sub_document_with_its_fields_reordered_is_a_write() {
+    let d = doc! { "_id": 1, "sub": { "k": 1, "j": 2 } };
+    for (label, update) in [
+        ("operator", crate::update_effects_tests::parse(doc! {"$set": {"sub": {"j": 2, "k": 1}}})),
+        ("pipeline", pipe(vec![doc! {"$set": {"sub": {"j": 2, "k": 1}}}])),
+    ] {
+        let (effects, outcome) = parity(&update, None, &d);
+        assert!(outcome.modified(), "{label}: {outcome:?} for {effects:?}");
+        let mut w = writer_with(&d);
+        effects.apply(&mut w, 0);
+        let sub = render(&w).get_document("sub").unwrap().clone();
+        assert_eq!(keys(&sub), ["j", "k"], "{label}");
+    }
+}
