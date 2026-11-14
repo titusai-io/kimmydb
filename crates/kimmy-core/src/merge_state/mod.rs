@@ -87,6 +87,8 @@ mod hand_built;
 #[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
+mod typed_inc_tests;
+#[cfg(test)]
 mod upsert_tests;
 #[cfg(test)]
 mod nested_tests;
