@@ -81,8 +81,6 @@ fn the_compact_golden_hashes_agree_with_the_reference_model() {
         ("mixed", golden_mixed(), ("d368f0edd26e1ed5e300dd97df80065e", 338)),
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235)),
         ("obs", golden_obs(), ("3894def7793a573b2dad9a4de56bf7cc", 252)),
-        // a NEW key: typed slots (an Int32 slot, a Decimal128 slot, and the shape of Amendment 6)
-        ("typed", golden_typed(), ("8291f85d0c22817da0032635387e1351", 286)),
     ] {
         // NAMED RESTRICTION: the goldens are the stage-A reference model's, which has no order state
         let st = st.without_ords();
@@ -124,7 +122,24 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
 fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
     let o = opts();
     let st = golden_typed();
+    let bare = st.without_ords();
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!(
+        "CAPTURE typed: bare=({}, {}) with_ords=({}, {}, {} ords) bytes={}",
+        hex(&bare.compact_hash()),
+        bare.compact_bytes().len(),
+        hex(&st.compact_hash()),
+        st.compact_bytes().len(),
+        st.ords.len(),
+        hex(&st.encode_compact())
+    );
     round_trip(&st);
+    // a NEW pin: the hash and length the reference model's independent encoder gives for the bare state
+    let hex16 = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(
+        (hex16(bare.compact_hash()).as_str(), bare.compact_bytes().len()),
+        ("8291f85d0c22817da0032635387e1351", 286)
+    );
     let slot = |name: &str| st.slots.iter().find(|(k, _)| k.1 == p(name)).unwrap().1.clone();
     let (a, b, c) = (slot("a"), slot("b"), slot("c"));
     assert_eq!((a.total.label(), a.wide_at, a.decimal_at), (Kind::Int32, None, None));
@@ -136,22 +151,11 @@ fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
     let (wide, dec, at) = (c.wide_at.unwrap(), c.decimal_at.unwrap(), c.absorbed.unwrap().0);
     assert!(dec < wide && wide < c.stamp, "decimal_at < wide_at < stamp");
     assert_eq!(at, wide, "the absorbed pair is at the last wide operand");
-    assert_eq!(c.width_since(), Kind::Int32);
     assert_eq!(st.value(&p("c"), &o), Some(Value::Int32(12)));
+    assert_eq!(c.width_since(), Kind::Int32);
     // and as the compact bytes say it
     let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
     assert_eq!(back.value(&p("c"), &o), Some(Value::Int32(12)));
-    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let bare = st.without_ords();
-    eprintln!(
-        "CAPTURE typed: bare=({}, {}) with_ords=({}, {}, {} ords) bytes={}",
-        hex(&bare.compact_hash()),
-        bare.compact_bytes().len(),
-        hex(&st.compact_hash()),
-        st.compact_bytes().len(),
-        st.ords.len(),
-        hex(&st.encode_compact())
-    );
 }
 
 /// The states of the Python writer's fixture: the six goldens, then states a `Writer` builds that exercise what

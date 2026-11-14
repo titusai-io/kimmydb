@@ -721,6 +721,17 @@ fn planted_type_blind_diff_is_detected() {
     planted("same-ignores-type", 300);
 }
 
+/// The `typed` golden (a NEW key, so a test of its own): the model's operands are Int64s, so its encoder is
+/// told the labels and the operand stamps of the typed slots it spells. `compact_tests` pins the same numbers
+/// against the Rust writer's bytes.
+#[test]
+fn the_typed_golden_vector_matches_the_model() {
+    let out = run_python(&["--golden".to_string()]);
+    let got: J = serde_json::from_str(out.trim()).expect("json");
+    assert_eq!(got["typed"], J::Null, "an absorbed pair: no version 1 spelling");
+    assert_eq!(got["typed-compact"], json!(["8291f85d0c22817da0032635387e1351", 286]));
+}
+
 /// The golden vectors of `merge_state/tests.rs`, hashed by the model's independent
 /// implementation of the canonical encoding and the hash.
 #[test]
@@ -740,9 +751,6 @@ fn golden_vectors_match_the_model() {
         "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
         "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
-        // a NEW key: typed slots (the model's operands are Int64s: its encoder is told the labels and stamps)
-        "typed": J::Null,
-        "typed-compact": ["8291f85d0c22817da0032635387e1351", 286],
     });
     assert_eq!(got, want);
 }
