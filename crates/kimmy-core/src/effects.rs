@@ -46,7 +46,7 @@
 //! | `$currentDate` | `Set(p, now)` | ONE `now` per update, from the product clock as today's `apply(update, doc, now_ms)`; NOT derived from the stamp (the `document` policy stays byte-identical to 0.59) |
 //! | `$push`, `$addToSet`, `$pull`, `$pullAll`, `$pop` | `Set(p, whole_array)` | arrays atomic; no effect if the array is unchanged |
 //! | positional `$`, `$[]`, `$[id]` (with `arrayFilters`) | `Set(array_path, whole_array)` | the product resolves the position; the array is the leaf |
-//! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded) | disjoint paths required (else `Overlap`); a path the WRITER sees as a counter at `a` is `RenameOfCounter(a)` (400), see below |
+//! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded) | disjoint paths required (else `Overlap`); `a` or any path below it that the WRITER sees as a counter is `RenameOfCounter(a)` (400), see below; a target that is a counter is just a `Set` (folds), allowed |
 //! | `$setOnInsert` | none on update; `UpsertEffects::set_on_insert` on an insert | no-op on an existing document |
 //! | pipeline update (ADR-265) | per-leaf `Set`/`Unset` of what differs, one list | not `write_replace` (a replace reorders fields); each written path is a [`Path`] of one segment per name |
 //! | replace-style update | not an effect list | stays the replace path of the storage layer |
@@ -60,6 +60,11 @@
 //! `Int32`, `Int64` or `Decimal128` (its base and/or slots, design D5/NB1); a `Double` is not.
 //! Only the writer's state knows this, so it is decided at the writer
 //! ([`Writer::sees_counter`], read-only), never inferred from the `Document` by the product.
+//! `$rename` is leaf effects (D4): renaming a sub-document renames every counter cell under it and
+//! the slots cannot move, so the refusal applies when the source path OR ANY DESCENDANT is a
+//! counter cell in an alive life ([`Writer::sees_counter_at_or_under`]). An array holding ints is
+//! an atomic register, not a counter. The TARGET side is unchanged: a rename onto a counter path is
+//! a `Set`, which folds, and is allowed.
 //! [`Effects::apply`] and [`Effects::apply_stamped`] refuse the whole update with
 //! [`UpdateRefused::RenameOfCounter`] (400) BEFORE writing or moving the clock when a recorded
 //! rename source is a counter. Race (U2, as the Q7 design words it): a counter field THIS member
@@ -85,6 +90,12 @@
 //! `write_update` already does, so no model rerun; extend the Rust oracle and property generator
 //! to multi-`$inc` upserts.
 //!
+//! The same item widens `upsert_soi*` and `upsert_inc_on` from `i64` to typed operands (as
+//! [`UpdateOp::Inc`] already is: Int32, Int64, Double or Decimal128; the 2026-11-03 ruling already
+//! says to extend `upsert_inc` to Decimal128 operands). On a counter, an Int or Decimal operand is
+//! a counter increment and a Double is a 400 (`IncDoubleOnCounter`); on a Double base it is a
+//! register write; on creation the operand's type sets the cell's type. Not implemented here.
+//!
 //! # No-op test
 //!
 //! By representation, as for every write ([`Value::same`]): doubles compare by bit pattern
@@ -98,8 +109,10 @@
 //! * RESOLVED: upserts refuse overlap, several `$inc` on distinct paths; generalisation is S2a's.
 //! * RESOLVED: pipeline no-op is by representation (`Value::same`).
 //! * RESOLVED: `$currentDate` is one product-clock `now` per update.
-//! * OPEN: `$rename` of a sub-document that holds counters: only the source path's own cell is
-//!   checked by [`Writer::sees_counter`].
+//! * RESOLVED: `$rename` of a sub-document holding counters is refused (source or any descendant).
+//! * RESOLVED: upsert `$inc` operands stay `Value` (Int32, Int64, Double, Decimal128); the bridge
+//!   to the writer is S2a's (next section).
+//! * OPEN: none.
 
 pub use crate::merge_state::{MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
@@ -162,7 +175,7 @@ impl Effects {
     fn rename_refusal(&self, writer: &Writer) -> Option<UpdateRefused> {
         self.renames
             .iter()
-            .find(|p| writer.sees_counter(p))
+            .find(|p| writer.sees_counter_at_or_under(p))
             .map(|p| UpdateRefused::RenameOfCounter(p.clone()))
     }
 
@@ -431,5 +444,25 @@ mod tests {
         assert!(!same(Some(&Value::Int32(2)), &i(2)));
         assert!(!same(None, &Value::Null));
         assert!(same(None, &Value::Unset));
+    }
+
+    #[test]
+    fn rename_of_a_sub_document_with_a_counter_is_refused_and_onto_a_counter_is_a_set() {
+        let mut w = writer();
+        let doc =
+            Value::Document(vec![("c".into(), i(1)), ("t".into(), Value::String("v".into()))]);
+        w.write_set(&p("sub"), doc.clone(), 0).unwrap();
+        let before = w.state.clone();
+        let mut e = Effects::new();
+        e.rename(p("sub"), p("moved"), doc);
+        let o = e.apply(&mut w, 0);
+        assert_eq!(o.refusal(), Some(&UpdateRefused::RenameOfCounter(p("sub"))));
+        assert_eq!(w.state, before);
+        // onto a counter path: allowed (a Set folds), the source is a string
+        w.write_set(&p("s"), Value::String("v".into()), 0).unwrap();
+        let mut r = Effects::new();
+        r.rename(p("s"), p("n"), Value::String("v".into()));
+        assert!(r.apply(&mut w, 0).modified());
+        assert_eq!(w.visible().unwrap()[&p("n")], Value::String("v".into()));
     }
 }

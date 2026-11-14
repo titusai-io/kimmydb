@@ -424,3 +424,27 @@ fn a_register_set_over_a_counter_of_two_writers_folds_what_it_saw() {
     assert_eq!(a.state, b.state);
     assert_eq!(a.visible().unwrap()[&np("n")], i(105));
 }
+
+#[test]
+fn sees_counter_at_or_under_looks_through_sub_documents_but_not_arrays() {
+    let mut w = writer(1);
+    w.insert(
+        &fl(&[
+            ("withint", doc(&[("x", s("a")), ("c", i(1))])),
+            ("deep", doc(&[("l1", doc(&[("l2", doc(&[("c", Value::Int32(1))]))]))])),
+            ("plain", doc(&[("d", Value::Double(1.5)), ("s", s("t"))])),
+            ("arr", Value::Array(vec![i(1), i(2)])),
+            ("n", i(1)),
+        ]),
+        0,
+    )
+    .unwrap();
+    for p in ["withint", "deep", "deep.l1", "n", "deep.l1.l2.c"] {
+        assert!(w.sees_counter_at_or_under(&np(p)), "{p}");
+    }
+    for p in ["plain", "arr", "missing", "plain.d"] {
+        assert!(!w.sees_counter_at_or_under(&np(p)), "{p}");
+    }
+    // a sibling sharing a name prefix is not under the path
+    assert!(!w.sees_counter_at_or_under(&np("with")));
+}
