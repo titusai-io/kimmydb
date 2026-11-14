@@ -592,6 +592,13 @@ mod tests {
         // diverge): per-seed identity no longer applies there. ACCEPTANCE (the manager's ruling): per row ON has 0 unclassified failures and no
         // failure CLASS above OFF's by count (an excess is traced and ruled), and the mechanism fired (the firing counters, printed above).
         assert!(on_unclassified.is_empty(), "item Q grid: ON has unclassified failures");
+        // the mechanism fired in this row: the two counters that are structural to every row (the others rest on pooled evidence and may be 0)
+        for fk in ["repair_marks_written", "held_released_in_window"] {
+            assert!(
+                fired.get(fk).map_or(0, |e| e.0) > 0,
+                "item Q grid: {fk} fired in no ON run at dh={dh} dr={dr} f={f} seeds from {from}"
+            );
+        }
         for (c, n) in &class_on {
             assert!(
                 *n <= class_off.get(c).copied().unwrap_or(0),
