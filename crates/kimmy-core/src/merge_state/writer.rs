@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::counter::{self, Inc, Kind, Num};
+use super::counter::{self, Inc, Num};
 use super::join::{JoinOptions, join, join_into};
 use super::ord::{OrdAt, OrdMode, OrderedValue, ord_events};
 use super::state::{
@@ -1124,7 +1124,6 @@ impl Writer {
         let known = self.known();
         let st = self.mint(m)?;
         let bound = self.opts.int_bound();
-        let widen = !self.opts.slot_never_widens();
         let starts_gen = !self.opts.creation_without_generation();
         let s = &mut self.state;
         s.lives.insert(
@@ -1153,12 +1152,9 @@ impl Writer {
                     }
                     vals.insert(p.clone(), v);
                 }
-                Inc::Slot(res) => {
+                Inc::Slot(_) => {
                     let op = Num::from_value(by).expect("the operand was checked");
-                    let mut total = op.first_amount();
-                    if res.kind() == Kind::Int64 && widen {
-                        total = total.widened();
-                    }
+                    let total = op.first_amount();
                     s.slots.insert(
                         (st, p.clone(), self.id, None),
                         Slot { stamp: st, total, absorbed: None },
@@ -1413,7 +1409,7 @@ impl Writer {
         // The production rule decides: a string or a map is refused, so is an integer past the
         // bound, a decimal that overflows and a double operand against a counter. A double base
         // is no counter: its `$inc` is a register write of the computed value.
-        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())
+        match counter::inc_result(vis.get(p), by, self.opts.int_bound())
             .ok_or_else(|| inc_refusal(vis.get(p), by, p))?
         {
             Inc::Register(v) => {
@@ -1424,8 +1420,8 @@ impl Writer {
                 }
                 return Ok(IncPlan::Register(v));
             }
-            Inc::Slot(res) => res,
-        };
+            Inc::Slot(_) => {}
+        }
         let op =
             Num::from_value(by).ok_or_else(|| UpdateRefused::IncOperandNotANumber(p.clone()))?;
         let al = self.state.alive_set(self.opts.retention);
@@ -1436,7 +1432,7 @@ impl Writer {
         // The writer's slot is its running sum in the join of the types it has added. The
         // `Int64` check above is on the saturated visible value, which does not bound the sum
         // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
-        let mut total = match self.state.slots.get(&key) {
+        let total = match self.state.slots.get(&key) {
             // the writer's first amount at the path is the product's stored form of the operand
             // (a canonical encoding of the operand, its cohort member kept), never the operand's own bytes
             None => op.first_amount(),
@@ -1453,11 +1449,9 @@ impl Writer {
                 return Err(UpdateRefused::TooManyContributors(p.clone()));
             }
         }
-        // The visible value became an Int64: the slot is an Int64 from now on, so a total that
-        // later dips back under the i32 range does not narrow again.
-        if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
-            total = total.widened();
-        }
+        // R1: the slot keeps the join of the operand types it has added (its label), whatever its
+        // running sum has been: the type of the counter is read from the merged state, not from the
+        // history of one writer's partial sums.
         Ok(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
     }
 
