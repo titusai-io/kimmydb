@@ -79,3 +79,76 @@ fn a_replicated_creation_creates_under_the_policy_it_carries() {
     assert_eq!(b.get_collection("app", "wide").unwrap().merge_policy, MergePolicy::Field);
     assert_eq!(b.get_collection("app", "plain").unwrap().merge_policy, MergePolicy::Document);
 }
+
+fn later() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+fn creation_entries(e: &Engine) -> Vec<kimmy_core::OplogEntry> {
+    e.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).unwrap()
+}
+
+fn policy_of(e: &Engine) -> MergePolicy {
+    e.get_collection("app", "c").unwrap().merge_policy
+}
+
+/// Two members create one name at the same time under different policies. The policy follows the
+/// creation with the later stamp, on every member, whichever order the entries arrive in.
+fn converges_on_the_later_creation(first: MergePolicy, second: MergePolicy) {
+    let (x, _dx) = open();
+    let (y, _dy) = open();
+    x.create_collection_with_policy("app", "c", first, None).unwrap();
+    later();
+    y.create_collection_with_policy("app", "c", second, None).unwrap();
+    let (ex, ey) = (creation_entries(&x), creation_entries(&y));
+    // each applies the other's entries
+    y.apply_batch(&ex).unwrap();
+    x.apply_batch(&ey).unwrap();
+    assert_eq!(policy_of(&x), second, "the earlier creator takes the later creation's policy");
+    assert_eq!(policy_of(&y), second, "the later creator keeps its own");
+    // a member that has neither: both orders
+    for (one, two) in [(&ex, &ey), (&ey, &ex)] {
+        let (z, _dz) = open();
+        z.apply_batch(one).unwrap();
+        z.apply_batch(two).unwrap();
+        assert_eq!(policy_of(&z), second);
+    }
+}
+
+#[test]
+fn concurrent_creations_under_different_policies_converge_on_the_later_one() {
+    converges_on_the_later_creation(MergePolicy::Field, MergePolicy::Document);
+    converges_on_the_later_creation(MergePolicy::Document, MergePolicy::Field);
+}
+
+/// The same through a snapshot page: a member that holds its own creation takes the policy of
+/// the later creation the page carries, and a member holding the later one keeps it.
+#[test]
+fn a_snapshot_page_carries_the_policy_of_the_winning_creation() {
+    use crate::SnapshotProgress;
+    let pull = |from: &Engine, into: &Engine| {
+        let mut progress =
+            SnapshotProgress::of_collection(kimmy_core::CollectionId::derive("app", "c"));
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        }
+    };
+    for (first, second) in
+        [(MergePolicy::Field, MergePolicy::Document), (MergePolicy::Document, MergePolicy::Field)]
+    {
+        let (x, _dx) = open();
+        let (y, _dy) = open();
+        x.create_collection_with_policy("app", "c", first, None).unwrap();
+        later();
+        y.create_collection_with_policy("app", "c", second, None).unwrap();
+        pull(&y, &x);
+        assert_eq!(policy_of(&x), second, "adopted from the page");
+        pull(&x, &y);
+        assert_eq!(policy_of(&y), second, "kept against the page of the earlier creation");
+        // and a member that took the policy by a page serves it onward
+        let (w, _dw) = open();
+        pull(&x, &w);
+        assert_eq!(policy_of(&w), second);
+    }
+}
