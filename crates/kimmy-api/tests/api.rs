@@ -21783,3 +21783,273 @@ async fn an_aggregate_explain_reports_the_limit_and_the_pool() {
         json!({ "limitBytes": 4 << 20, "poolBytes": 6 << 20, "poolUsedBytes": 0 })
     );
 }
+
+#[tokio::test]
+async fn a_replacement_of_a_stored_document_may_not_name_another_id() {
+    // q7s2d.out lines 122-168: refused, as an operator update that names
+    // `_id` is, and the stored document unchanged.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "k": 1 })]).await;
+    for route in ["update", "find_and_modify"] {
+        for filter in [json!({ "_id": 1 }), json!({ "k": 1 })] {
+            let res = server
+                .post(
+                    &format!("/v1/db/shop/coll/pu/{route}"),
+                    Some(&token),
+                    json!({ "filter": filter, "update": { "_id": 2, "v": 1 } }),
+                )
+                .await;
+            assert_eq!(res.status, 400, "{route} {filter}: {:?}", res.body);
+            let msg = res.body["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("_id is immutable and cannot be updated"), "{msg}");
+            assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "k": 1 }));
+        }
+    }
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/2", Some(&token)).await.status, 404);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "update": { "_id": 1, "v": 1 } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "v": 1 }));
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "v": 2 }, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 1, "v": 2 }));
+}
+
+#[tokio::test]
+async fn an_upsert_seeds_the_nested_fields_of_dotted_filter_keys_in_name_order() {
+    // q7s2d.out lines 6-71: the levels a dotted filter key creates are sorted
+    // at every depth, a whole document given as a filter value keeps its
+    // order, and the fields the update adds follow all the filter's.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![]).await;
+    let cases = [
+        (json!({ "a.c": 1, "a.b": 2 }), json!({ "a": { "b": 2, "c": 1 } })),
+        (json!({ "a.b": 2, "a.c": 1 }), json!({ "a": { "b": 2, "c": 1 } })),
+        (json!({ "a": { "c": 1, "b": 2 } }), json!({ "a": { "c": 1, "b": 2 } })),
+        (json!({ "a.c": 1, "a.b": 2, "b": 3 }), json!({ "a": { "b": 2, "c": 1 }, "b": 3 })),
+        (json!({ "a.c": 1, "b": 3, "a.b": 2 }), json!({ "a": { "b": 2, "c": 1 }, "b": 3 })),
+        (json!({ "x.y.z2": 1, "x.y.z1": 2 }), json!({ "x": { "y": { "z1": 2, "z2": 1 } } })),
+        (
+            json!({ "zz": 1, "aa": 2, "m.q": 3, "m.p": 4 }),
+            json!({ "aa": 2, "m": { "p": 4, "q": 3 }, "zz": 1 }),
+        ),
+    ];
+    for (n, (filter, seeded)) in cases.into_iter().enumerate() {
+        let id = i64::try_from(n).unwrap() + 1;
+        let mut filter = filter;
+        let mut with_id = serde_json::Map::new();
+        with_id.insert("_id".into(), json!(id));
+        with_id.extend(filter.as_object().unwrap().clone());
+        filter = Value::Object(with_id);
+        let mut want = serde_json::Map::new();
+        want.insert("_id".into(), json!(id));
+        want.extend(seeded.as_object().unwrap().clone());
+        // The seed's top-level fields are in name order, `_id` first, then the update's.
+        let mut top: Vec<(String, Value)> = want.into_iter().skip(1).collect();
+        top.sort_by(|a, b| a.0.cmp(&b.0));
+        for (set, adds) in
+            [(json!({ "z": 1 }), vec!["z"]), (json!({ "zz2": 1, "aa2": 2 }), vec!["aa2", "zz2"])]
+        {
+            let id = if adds.len() == 1 { id } else { id + 100 };
+            let mut filter = filter.clone();
+            filter["_id"] = json!(id);
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/pu/find_and_modify",
+                    Some(&token),
+                    json!({ "filter": filter, "update": { "$set": set }, "upsert": true,
+                            "returnDocument": "after" }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+            let mut expected = serde_json::Map::new();
+            expected.insert("_id".into(), json!(id));
+            expected.extend(top.clone());
+            for name in &adds {
+                expected.insert((*name).to_string(), set[*name].clone());
+            }
+            assert_eq!(
+                res.body["document"].to_string(),
+                Value::Object(expected).to_string(),
+                "{filter}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_may_not_restate_the_id_as_something_that_is_no_id() {
+    // A double is equal to the stored `1` by value and is no document id: the
+    // replacement would have stored a document no filtered write could reach.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "k": 1 }), json!({ "_id": 7 })]).await;
+    for route in ["update", "find_and_modify"] {
+        for (id, body) in [
+            (1, json!({ "_id": 1.0, "v": 1 })),
+            (7, json!({ "_id": { "$numberDecimal": "7.5" }, "v": 1 })),
+        ] {
+            let res = server
+                .post(
+                    &format!("/v1/db/shop/coll/pu/{route}"),
+                    Some(&token),
+                    json!({ "filter": { "_id": id }, "update": body }),
+                )
+                .await;
+            assert_eq!(res.status, 400, "{route} {body}: {:?}", res.body);
+        }
+    }
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "k": 1 }));
+    // Still writable: nothing was stored under a key the store cannot read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "w": 1 } } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // A replacement upsert: the filter's `_id` against the body's.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "update": { "_id": 5.0, "v": 1 }, "upsert": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/5", Some(&token)).await.status, 404);
+}
+
+#[tokio::test]
+async fn an_upsert_whose_filter_matches_one_path_twice_or_inside_itself_is_refused() {
+    // q7s2.out lines 517-545 and q7s2e.out lines 99-123: the filters whose
+    // equalities overlap name no one document to seed (code 54); two dotted
+    // keys beside each other are fine.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![]).await;
+    let fam = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/find_and_modify",
+                    Some(token),
+                    json!({ "filter": filter, "update": { "$set": { "z": 1 } }, "upsert": true,
+                            "returnDocument": "after" }),
+                )
+                .await
+        }
+    };
+    for filter in [
+        json!({ "_id": 1, "a": 1, "a.b": 2 }),
+        json!({ "_id": 1, "a": { "b": 1 }, "a.b": 2 }),
+        json!({ "_id": 1, "$and": [{ "a": 1 }, { "a": 2 }] }),
+        json!({ "_id": 1, "a": { "b": 1 }, "a.c": 2 }),
+        json!({ "_id": 1, "a.b": 1, "a": { "c": 2 } }),
+        json!({ "_id": 1, "a": { "c": 1, "b": 2 }, "a.d": 3 }),
+    ] {
+        let res = fam(filter.clone()).await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("cannot infer the fields an upsert seeds"), "{msg}");
+    }
+    let found =
+        server.post("/v1/db/shop/coll/pu/find", Some(&token), json!({ "filter": {} })).await;
+    assert_eq!(found.body["count"], 0, "{:?}", found.body);
+    let res = fam(json!({ "_id": 1, "a.b": 1, "a.c": 2 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 1, "a": { "b": 1, "c": 2 }, "z": 1 }));
+}
+
+#[tokio::test]
+async fn an_upsert_seeds_the_filter_fields_in_name_order_for_every_kind_of_update() {
+    // q7s2e.out lines 52-97: the top-level fields of the seed are sorted, `_id`
+    // first, for an operator update and a pipeline update alike, whatever order
+    // the filter wrote its keys in; a replacement keeps none of them.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![]).await;
+    let mut next_id = 0;
+    let mut upsert = |filter: Value, update: Value| {
+        next_id += 1;
+        let id = next_id;
+        let (server, token) = (&server, &token);
+        async move {
+            let mut body = serde_json::Map::new();
+            body.insert("_id".into(), json!(id));
+            body.extend(filter.as_object().unwrap().clone());
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/pu/find_and_modify",
+                    Some(token),
+                    json!({ "filter": body, "update": update, "upsert": true,
+                            "returnDocument": "after" }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            (id, res.body["document"].to_string())
+        }
+    };
+    let want = |id: i64, rest: Value| {
+        let mut doc = serde_json::Map::new();
+        doc.insert("_id".into(), json!(id));
+        doc.extend(rest.as_object().unwrap().clone());
+        Value::Object(doc).to_string()
+    };
+    let filter = || json!({ "zz": 1, "aa": 2, "m.q": 3, "m.p": 4, "k": 5 });
+    let seeded = |rest: Value| {
+        let mut base = json!({ "aa": 2, "k": 5, "m": { "p": 4, "q": 3 }, "zz": 1 });
+        base.as_object_mut().unwrap().extend(rest.as_object().unwrap().clone());
+        base
+    };
+    // 2a, 2b, 2c, 2d.
+    for update in [json!([{ "$set": { "z": 1 } }]), json!({ "$set": { "z": 1 } })] {
+        let (id, got) = upsert(filter(), update).await;
+        assert_eq!(got, want(id, seeded(json!({ "z": 1 }))));
+    }
+    for update in
+        [json!([{ "$set": { "zz": 1, "aa": 2 } }]), json!({ "$set": { "zz": 1, "aa": 2 } })]
+    {
+        let (id, got) = upsert(filter(), update).await;
+        assert_eq!(got, want(id, seeded(json!({}))));
+    }
+    // 2g: the filter's keys in another order.
+    let (id, got) = upsert(
+        json!({ "k": 5, "m.p": 4, "aa": 2, "m.q": 3, "zz": 1 }),
+        json!([{ "$set": { "z": 1 } }]),
+    )
+    .await;
+    assert_eq!(got, want(id, seeded(json!({ "z": 1 }))));
+    // 2h: a stage that restates a filter field keeps it in place and adds one after.
+    let (id, got) = upsert(filter(), json!([{ "$set": { "aa": 9, "nn": 1 } }])).await;
+    assert_eq!(
+        got,
+        want(id, json!({ "aa": 9, "k": 5, "m": { "p": 4, "q": 3 }, "zz": 1, "nn": 1 }))
+    );
+    // 2i: `$replaceWith` over the seed gives the body.
+    let (id, got) =
+        upsert(filter(), json!([{ "$replaceWith": { "_id": "$_id", "q": 1, "p": 2 } }])).await;
+    assert_eq!(got, want(id, json!({ "q": 1, "p": 2 })));
+    // 2j: a nested seed split by a top-level field.
+    let (id, got) =
+        upsert(json!({ "a.c": 1, "b": 3, "a.b": 2 }), json!([{ "$set": { "z": 1 } }])).await;
+    assert_eq!(got, want(id, json!({ "a": { "b": 2, "c": 1 }, "b": 3, "z": 1 })));
+    // 2e and 2f: a replacement keeps none of the filter's fields.
+    let (id, got) = upsert(filter(), json!({ "v": 1 })).await;
+    assert_eq!(got, want(id, json!({ "v": 1 })));
+}

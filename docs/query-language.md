@@ -621,6 +621,54 @@ see [Pipeline updates](#pipeline-updates).
 { "$pullAll": { "tags": ["draft", "stale"] } }
 ```
 
+**New fields are sorted.** A field an update adds goes after the fields the
+document already had, and the new fields of a level are sorted by name,
+whichever operator adds them and in whatever order the request writes them:
+`{"$set": {"b": 1, "a": 2}, "$inc": {"c": 1}}` over `{_id: 1}` gives `{_id, a,
+b, c}`, and `{"$set": {"b.y": 1, "b.x": 2}}` gives `b: {x, y}`. Fields already
+there keep their place, and a document given as a value keeps its own order.
+An upsert stores `_id` first, then the fields its filter implies, sorted, then
+every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
+operators), sorted together. The nested fields a dotted filter key seeds are
+sorted at every level too (`{"a.c": 1, "a.b": 2}` seeds `a: {b, c}`), while a
+whole document given as the value of a key (`{"a": {"c": 1, "b": 2}}`) keeps
+its own order. A [pipeline update](#pipeline-updates) adds the
+fields its stages write in the order they are written, but an upsert's seed is
+sorted for it as for operators (`_id`, then the filter's fields by name); a
+replacement upsert keeps none of the filter's fields but `_id`.
+
+**A numeric segment addresses an array element, at any depth, and nothing is
+written below a scalar.** `{"$set": {"grid.0.1": 9}}` over `grid: [[1, 2], [3,
+4]]` sets the inner element, and `$inc`, `$unset` and `$push` reach it the same
+way; writing past the end of an array pads it with `null`, and a position past
+the end of an outer array appends a document keyed by the next segment
+(`grid.2.0` adds `{"0": 9}`). Where the field is absent or a document, a
+numeric segment is a field name, as in `{"$set": {"x.0": 1}}` giving `x: {"0":
+1}`. A `$set`, `$inc` or `$push` whose path goes **below a scalar, a `null` or
+an array element that is not a document** is a `400`, `cannot create field 'y'
+in element {a: 5}`, and the document is unchanged; before, the scalar was
+replaced by a document. `$unset` below a scalar changes nothing.
+
+**`$rename` does not move a field into or out of an array element.** A source
+or a destination that goes through an array in the document is a `400`: the
+source `items.0.sku` or `arr.0` is refused (`the source field cannot be an array
+element`), the destination `arr.1` or `items.0.s` is refused (`the destination
+field cannot be an array element`), and a source that goes through an array
+without an index (`items.sku`) or through a scalar (`a.y` over `a: 5`) is
+refused (`cannot use the part (items of items.sku) to traverse the element`); a
+destination through an array by a field name (`items.s`) is refused as an array
+element, and one below a scalar (`a.y` over `a: 5`) is refused before anything
+moves. A
+whole array (`items` to `lines`), a field of a sub-document (`o.p` to `o.q`)
+and a rename beside a write to an array still apply. A source that is missing
+is still a no-op, through an array index too (`items.0.nope`, `items.5.sku`,
+`arr.5`), and its destination is not checked. The source is walked
+through documents by key and arrays by index, and a path that goes through a
+scalar or `null` (`arr.0.x` over `[1, 2]`, `items.0.sku.x` over a string), or
+through an array by a field name, is refused as a traverse whether or not
+anything lies beyond it, naming the part that holds the value, and without
+looking at the destination.
+
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator
@@ -766,9 +814,10 @@ invalid update: $set on "a" conflicts with $inc on "a.b": updating the path "a.b
 
 A `$rename` counts as writing both its source and its destination. A
 `$setOnInsert` counts as a write whether or not the request inserts. **An
-index is compared by its value**: the path language reads `a.01` and `a.+1` as
+index is compared by its value**: an update here reads `a.01` and `a.+1` as
 `a.1`, so `{"$set": {"a.1": 5}, "$inc": {"a.01": 1}}` writes one path twice
-and is refused, with the conflict named at `"a.1"`. A path spelled that way
+and is refused as a path conflict (a `400`), with the conflict named at
+`"a.1"`. A path spelled that way
 alone is not refused. Over a field holding an object rather than an array,
 `01` and `1` are two keys, but such a pair is still refused rather than told
 apart.
@@ -1072,6 +1121,20 @@ keeps the body's own `_id` when it names the same id, as an insert does, and
 otherwise stores the narrowest integer type that holds the path id: a 32-bit
 integer when it fits, as a JSON insert of the same number does.
 
+A **replacement as the update of an upsert** that inserts creates the document
+from the body alone: the filter's fields are not carried into it (`{filter:
+{k: 1}, update: {v: 2}}` creates `{v: 2}`; the operator form `{$set: {v: 2}}`
+keeps `k`). Its `_id` is the filter's `_id` when the filter has one and the body
+has none, the body's `_id` when the filter has none, and a generated one
+otherwise. A filter `_id` and a body `_id` that differ are refused with a `400`
+naming the immutable field, and nothing is inserted. A replacement of a
+document that exists replaces every field but `_id`, and its own `_id` must be
+the stored one: a body `_id` that differs is refused with a `400` and the
+document is unchanged, an equal one is applied (equal as a document id: of
+another numeric type it is stored as written, `NumberLong(1)` over the 32-bit
+`1` gives the 64-bit `1`), a body `_id` that is no document id, a double such
+as `1.0`, is refused, and a body with no `_id` keeps the stored one.
+
 `_id` is identity, not content. Neither operators nor replacements can move a
 document:
 
@@ -1081,8 +1144,10 @@ document:
 // Rejected when the result is known (a pipeline update)
 [ { "$set": { "_id": 2 } } ]
 
-// Accepted, but the existing _id is preserved — the document is not relocated
+// A replacement naming another _id is a 400 — the document is not relocated
 { "_id": 999, "item": "widget" }
+// Accepted: the same _id, or none (the stored one is kept)
+{ "_id": 7, "item": "widget" }
 ```
 
 ### `modified` counts changes
@@ -1184,7 +1249,10 @@ queue never hands out the same job twice.
 - **`upsert` seeds the filter's equalities.** `{filter: {_id: "hits", scope:
   "global"}, update: {$inc: {n: 1}}, upsert: true}` creates
   `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
-  seeded, because a match does not imply it. `$setOnInsert` fields are added
+  seeded, because a match does not imply it. Two
+  equalities that overlap, the same path twice or one path inside another
+  (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
+  and are a `400` when the upsert would insert; `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that
