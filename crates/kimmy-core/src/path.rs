@@ -174,6 +174,145 @@ fn set_in_document(doc: &mut Document, segs: &[&str], value: Bson) -> Result<(),
     }
 }
 
+/// The keys an update created, each as the full path of keys and array
+/// positions from the document root down to the new key.
+pub type Created = Vec<Vec<String>>;
+
+/// Set a value at a dot path as [`set`] does, and record the keys it adds.
+///
+/// Every key this call adds to a document is appended to `created`, for
+/// [`settle_created`] to put in order once the whole update has been applied.
+/// This is the update language's write; [`set`] stays for the stages that
+/// share it.
+pub fn set_checked(
+    doc: &mut Document,
+    path: &str,
+    value: Bson,
+    created: &mut Created,
+) -> Result<(), String> {
+    let segs = segments(path);
+    write_in_document(doc, &segs, value, &mut Vec::new(), created)
+}
+
+fn write_in_document(
+    doc: &mut Document,
+    segs: &[&str],
+    value: Bson,
+    trail: &mut Vec<String>,
+    created: &mut Created,
+) -> Result<(), String> {
+    let (head, rest) = segs.split_first().expect("non-empty path");
+    let present = doc.contains_key(*head);
+    if !present {
+        let mut key = trail.clone();
+        key.push((*head).to_string());
+        created.push(key);
+    }
+    if rest.is_empty() {
+        doc.insert(*head, value);
+        return Ok(());
+    }
+    // Vivify a missing or non-traversable intermediate as a document.
+    if !matches!(doc.get(*head), Some(Bson::Document(_) | Bson::Array(_))) {
+        doc.insert(*head, Bson::Document(Document::new()));
+    }
+    trail.push((*head).to_string());
+    let outcome = match doc.get_mut(*head).expect("just ensured present") {
+        Bson::Document(child) => write_in_document(child, rest, value, trail, created),
+        Bson::Array(items) => write_in_array(items, rest, value, trail, created),
+        _ => unreachable!("just ensured a container"),
+    };
+    trail.pop();
+    outcome
+}
+
+fn write_in_array(
+    items: &mut Vec<Bson>,
+    segs: &[&str],
+    value: Bson,
+    trail: &mut Vec<String>,
+    created: &mut Created,
+) -> Result<(), String> {
+    let (index_seg, tail) = segs.split_first().expect("non-empty path");
+    let index: usize = index_seg
+        .parse()
+        .map_err(|_| format!("cannot traverse array with non-numeric segment {index_seg:?}"))?;
+    while items.len() <= index {
+        items.push(Bson::Null);
+    }
+    if tail.is_empty() {
+        items[index] = value;
+        return Ok(());
+    }
+    if !matches!(items[index], Bson::Document(_)) {
+        items[index] = Bson::Document(Document::new());
+    }
+    trail.push(index.to_string());
+    let outcome = match &mut items[index] {
+        Bson::Document(child) => write_in_document(child, tail, value, trail, created),
+        _ => unreachable!("just ensured a document"),
+    };
+    trail.pop();
+    outcome
+}
+
+/// Put the keys an update created in order: at each level, the fields that
+/// were there stay where they were and the new ones follow, sorted by name.
+///
+/// A document an update was given as a value is not touched, only the levels
+/// the update's own paths created or wrote into.
+pub fn settle_created(doc: &mut Document, created: &[Vec<String>]) {
+    let mut levels: std::collections::BTreeMap<&[String], std::collections::HashSet<&str>> =
+        std::collections::BTreeMap::new();
+    for key in created {
+        if let Some((name, parent)) = key.split_last() {
+            levels.entry(parent).or_default().insert(name.as_str());
+        }
+    }
+    for (parent, names) in levels {
+        if let Some(level) = document_at(doc, parent) {
+            sort_new_keys(level, &names);
+        }
+    }
+}
+
+fn document_at<'a>(doc: &'a mut Document, trail: &[String]) -> Option<&'a mut Document> {
+    let Some((head, rest)) = trail.split_first() else { return Some(doc) };
+    match doc.get_mut(head)? {
+        Bson::Document(child) => document_at(child, rest),
+        Bson::Array(items) => array_document_at(items, rest),
+        _ => None,
+    }
+}
+
+fn array_document_at<'a>(items: &'a mut [Bson], trail: &[String]) -> Option<&'a mut Document> {
+    let (head, rest) = trail.split_first()?;
+    match items.get_mut(head.parse::<usize>().ok()?)? {
+        Bson::Document(child) => document_at(child, rest),
+        Bson::Array(inner) => array_document_at(inner, rest),
+        _ => None,
+    }
+}
+
+fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
+    let keys: Vec<&String> = level.keys().collect();
+    let first_new = keys.iter().position(|k| new.contains(k.as_str()));
+    let settled = match first_new {
+        None => true,
+        Some(at) => {
+            keys[at..].iter().all(|k| new.contains(k.as_str()))
+                && keys[at..].windows(2).all(|w| w[0] < w[1])
+        }
+    };
+    if settled {
+        return;
+    }
+    let (mut fresh, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(level).into_iter().partition(|(k, _)| new.contains(k.as_str()));
+    fresh.sort_by(|a, b| a.0.cmp(&b.0));
+    level.extend(kept.into_iter().chain(fresh));
+}
+
 /// Remove the value at a dot path. Returns whether anything was removed.
 pub fn unset(doc: &mut Document, path: &str) -> bool {
     let segs = segments(path);

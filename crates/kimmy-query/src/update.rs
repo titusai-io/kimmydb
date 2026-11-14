@@ -1004,17 +1004,35 @@ fn apply_to_at(
         claim_concrete(operations, &concrete)?;
     }
 
+    // The filter's equalities that seed an inserted document come first and
+    // sorted, `_id` ahead of them; the fields the update adds follow, sorted
+    // together whichever operator added them.
+    if target == Target::Inserted {
+        sort_seed(doc);
+    }
+
     // Then `$setOnInsert`, only for an inserted document, and everything else.
+    let mut created = path::Created::new();
     let on_insert = |op: &Operation| matches!(op.kind, OpKind::SetOnInsert(_));
     let passes: [&dyn Fn(&Operation) -> bool; 2] = [&on_insert, &|op| !on_insert(op)];
     for pass in passes {
         for (op, paths) in operations.iter().zip(&concrete) {
             if applies(op) && pass(op) {
-                apply_at(op, paths, doc, now_ms)?;
+                apply_at(op, paths, doc, now_ms, &mut created)?;
             }
         }
     }
+    path::settle_created(doc, &created);
     Ok(())
+}
+
+/// The fields an upsert's filter seeds, in name order after `_id`.
+fn sort_seed(doc: &mut Document) {
+    let mut fields: Vec<(String, Bson)> = std::mem::take(doc).into_iter().collect();
+    // `_id` sorts first of all: it is stored first, where every write path
+    // puts it, and `sort_by_key` is stable.
+    fields.sort_by(|a, b| (a.0 != ID_FIELD, &a.0).cmp(&(b.0 != ID_FIELD, &b.0)));
+    doc.extend(fields);
 }
 
 /// Each operation's concrete paths in `doc`, in operation order: its own path
@@ -1067,13 +1085,19 @@ fn claim_concrete(operations: &[Operation], concrete: &[Vec<String>]) -> Result<
 ///
 /// Positions stay valid across those applications because `$unset` leaves a
 /// null hole rather than shifting the elements after it.
-fn apply_at(op: &Operation, paths: &[String], doc: &mut Document, now_ms: i64) -> Result<()> {
+fn apply_at(
+    op: &Operation,
+    paths: &[String],
+    doc: &mut Document,
+    now_ms: i64,
+    created: &mut path::Created,
+) -> Result<()> {
     if !has_positional(&op.path) {
-        return apply_one(op, doc, now_ms);
+        return apply_one(op, doc, now_ms, created);
     }
     for path in paths {
         let at = Operation { path: path.clone(), kind: op.kind.clone(), array_filters: Vec::new() };
-        apply_one(&at, doc, now_ms)?;
+        apply_one(&at, doc, now_ms, created)?;
     }
     Ok(())
 }
@@ -1206,12 +1230,17 @@ fn expand_into(
     Ok(())
 }
 
-fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
+fn apply_one(
+    op: &Operation,
+    doc: &mut Document,
+    now_ms: i64,
+    created: &mut path::Created,
+) -> Result<()> {
     let current = path::resolve(doc, &op.path).first().cloned().cloned();
 
     let invalid = |msg: String| Error::InvalidUpdate(msg);
-    let set = |doc: &mut Document, value: Bson| -> Result<()> {
-        path::set(doc, &op.path, value).map_err(invalid)
+    let mut set = |doc: &mut Document, value: Bson| -> Result<()> {
+        path::set_checked(doc, &op.path, value, created).map_err(invalid)
     };
 
     match &op.kind {
@@ -1360,7 +1389,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
                 path::unset(doc, &op.path);
-                path::set(doc, target, value).map_err(invalid)?;
+                path::set_checked(doc, target, value, created).map_err(invalid)?;
             }
         }
 

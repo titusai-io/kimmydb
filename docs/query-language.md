@@ -621,6 +621,17 @@ see [Pipeline updates](#pipeline-updates).
 { "$pullAll": { "tags": ["draft", "stale"] } }
 ```
 
+**New fields are sorted.** A field an update adds goes after the fields the
+document already had, and the new fields of a level are sorted by name,
+whichever operator adds them and in whatever order the request writes them:
+`{"$set": {"b": 1, "a": 2}, "$inc": {"c": 1}}` over `{_id: 1}` gives `{_id, a,
+b, c}`, and `{"$set": {"b.y": 1, "b.x": 2}}` gives `b: {x, y}`. Fields already
+there keep their place, and a document given as a value keeps its own order.
+An upsert stores `_id` first, then the fields its filter implies, sorted, then
+every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
+operators), sorted together. A [pipeline update](#pipeline-updates) is not
+covered by this: its stages add fields in the order they are written.
+
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator
