@@ -769,18 +769,6 @@ pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
     corpus
 }
 
-/// The compact encodings the compact decode fuzz damages: the same states, every fifth of the pools
-/// of 24 runs, all of them (the compact form spells every state).
-pub(super) fn fuzz_corpus_compact(o: &JoinOptions) -> Vec<Vec<u8>> {
-    let mut corpus: Vec<Vec<u8>> = Vec::new();
-    for pool in pools(24, 24, o) {
-        for st in pool.iter().step_by(5) {
-            corpus.push(st.encode_compact());
-        }
-    }
-    corpus
-}
-
 /// One damaged input: an encoding of the corpus with one to four bit flips, byte sets,
 /// truncations, insertions, deletions or rewritten length fields.
 pub(super) fn fuzz_mutate(rng: &mut Rng, corpus: &[Vec<u8>]) -> Vec<u8> {
@@ -822,7 +810,7 @@ fn decode_mutation_fuzz() {
     let o = opts(1_000_000_000);
     let corpus = fuzz_corpus(&o);
     // the corpus is the states version 1 can spell; the others (an absorbed pair) are fuzzed through the
-    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`, and the d7 sweep)
+    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`)
     let mut split = codec::V1Split::default();
     for pool in pools(24, 24, &o) {
         pool.iter().step_by(5).for_each(|st| {
