@@ -177,7 +177,7 @@ impl Member {
             step_inv: BTreeSet::new(),
             flips: 0,
             last_served: L.to_string(),
-            ever_served: BTreeSet::new(),
+            ever_served: BTreeSet::from([L.to_string()]),
             repair_marks_pending: Vec::new(),
         }
     }

@@ -416,6 +416,7 @@ impl Member {
         self.cur = Some(v.clone());
         if matches!(v.kind, Kind::Bind | Kind::Lcreate) {
             self.last_served = v.phys.clone();
+            self.ever_served.insert(v.phys.clone());
             if v.kind == Kind::Lcreate && f.recreate_reuse {
                 // revive the head physical, floor = the latest drop known below the recreate
                 let floor = self
