@@ -1,9 +1,9 @@
-//! `$rename` on a `field` collection: the shapes the reference refuses are refused here before
-//! the update runs (`refuse_rename_ways`), the ones it allows are written as a plain move.
-//! The refusals follow `q7s2.out` lines 101 to 121 and 586 and `q7s2d.out` lines 76 to 116. A
-//! rename through an array element or a scalar must not reach the writer: it holds no counter
-//! check there (`RenameOfCounter` is decided on the leaf the writer sees), so an integer renamed
-//! into an array would otherwise pass it.
+//! `$rename` on a `field` collection: the shapes the reference refuses are refused by the engine
+//! (its source walk `rename_source` and the destination check, main #315 and #316), the ones it
+//! allows are written as a plain move. The refusals follow `q7s2.out` lines 101 to 121 and 586,
+//! `q7s2d.out` lines 76 to 116 and `q7s2f.out`. A rename through an array element or a scalar
+//! must not reach the writer: it holds no counter check there (`RenameOfCounter` is decided on
+//! the leaf the writer sees), so an integer renamed into an array would otherwise pass it.
 
 use bson::{Document, doc};
 use kimmy_core::effects::Outcome;
@@ -33,7 +33,7 @@ fn counter() -> Document {
 const SOURCE: &str = "the source field cannot be an array element";
 const DEST: &str = "the destination field cannot be an array element";
 const TRAVERSE: &str = "cannot use the part";
-const BELOW: &str = "cannot create a field below the scalar";
+const BELOW: &str = "cannot create field";
 
 fn refusal(d: &Document, u: Document) -> String {
     let update = parse(u.clone());
@@ -95,7 +95,10 @@ fn the_recorded_refusals_of_a_rename() {
     for (label, d, u, want) in cases {
         let err = refusal(&d, u.clone());
         assert!(err.contains(want), "{label}: {u}: {err}");
-        assert!(err.starts_with("invalid update: $rename"), "{label}: {err}");
+        // the reference words a destination below a scalar without the operator's name
+        if want != BELOW {
+            assert!(err.starts_with("invalid update: $rename"), "{label}: {err}");
+        }
     }
 }
 
@@ -214,4 +217,113 @@ fn an_upsert_refuses_the_same_ways() {
         Ok(UpsertPlan::Replace { .. }) => panic!("replace"),
     };
     assert!(err.contains(DEST), "{err}");
+}
+
+/// The `$rename` source rule, case by case (`q7s2f.out`): a source that goes through a scalar, or
+/// through an array by a name, is refused with the part that names the value, whatever the
+/// destination and whether or not anything lies beyond it; a missing source is nothing; an
+/// existing source inside an array element is refused as such.
+#[test]
+fn the_source_rule_of_q7s2f_case_by_case() {
+    let arr = || doc! { "_id": 1, "arr": [1, 2] };
+    let skus = || doc! { "_id": 1, "items": [{ "sku": "a" }, { "sku": "b" }] };
+    let grid = || doc! { "_id": 1, "grid": [[1, 2], [3, 4]] };
+    let seven = || doc! { "_id": 1, "items": [7] };
+    let seven_eight = || doc! { "_id": 1, "items": [7, 8] };
+    let ys = || doc! { "_id": 1, "items": [{ "y": 5 }] };
+    let ys2 = || doc! { "_id": 1, "items": [{ "y": 5 }, { "y": 6 }] };
+    // (label, document, update, the traversal message the reference gives)
+    let traverse: Vec<(&str, Document, Document, &str)> = vec![
+        (
+            "q7s2f f1 arr.0.x -> y over arr:[1,2]",
+            arr(),
+            doc! {"$rename": {"arr.0.x": "y"}},
+            "(0 of arr.0.x) to traverse the element ({0: 1})",
+        ),
+        (
+            "q7s2f f2 items.0.sku.x -> y",
+            skus(),
+            doc! {"$rename": {"items.0.sku.x": "y"}},
+            "(sku of items.0.sku.x) to traverse the element ({sku: \"a\"})",
+        ),
+        (
+            "q7s2f f3 grid.0.s -> y over an array of arrays",
+            grid(),
+            doc! {"$rename": {"grid.0.s": "y"}},
+            "(0 of grid.0.s) to traverse the element",
+        ),
+        (
+            "q7s2f f4 arr.0.x -> arr.1: the destination is not looked at",
+            arr(),
+            doc! {"$rename": {"arr.0.x": "arr.1"}},
+            "(0 of arr.0.x) to traverse the element ({0: 1})",
+        ),
+        (
+            "q7s2f f5 items.0.sku.x -> items.1.z",
+            skus(),
+            doc! {"$rename": {"items.0.sku.x": "items.1.z"}},
+            "(sku of items.0.sku.x) to traverse the element ({sku: \"a\"})",
+        ),
+        (
+            "q7s2f f6 grid.0.s -> grid.1.0",
+            grid(),
+            doc! {"$rename": {"grid.0.s": "grid.1.0"}},
+            "(0 of grid.0.s) to traverse the element",
+        ),
+        (
+            "q7s2f f9 items.0.x -> y over items:[7]",
+            seven(),
+            doc! {"$rename": {"items.0.x": "y"}},
+            "(0 of items.0.x) to traverse the element ({0: 7})",
+        ),
+        (
+            "q7s2f f10 items.0.x -> items.1.t over items:[7,8]",
+            seven_eight(),
+            doc! {"$rename": {"items.0.x": "items.1.t"}},
+            "(0 of items.0.x) to traverse the element ({0: 7})",
+        ),
+        (
+            "q7s2f f11 items.0.y.z -> w over items:[{y:5}]",
+            ys(),
+            doc! {"$rename": {"items.0.y.z": "w"}},
+            "(y of items.0.y.z) to traverse the element ({y: 5})",
+        ),
+        (
+            "q7s2f f12 items.0.y.z -> items.1.t",
+            ys2(),
+            doc! {"$rename": {"items.0.y.z": "items.1.t"}},
+            "(y of items.0.y.z) to traverse the element ({y: 5})",
+        ),
+    ];
+    for (label, d, u, want) in traverse {
+        let err = refusal(&d, u.clone());
+        assert!(err.contains(want), "{label}: {err}");
+        assert!(err.starts_with("invalid update: $rename cannot use the part"), "{label}: {err}");
+    }
+    // an existing source inside an array element (the reference: code 2)
+    for (label, d, u) in [
+        (
+            "q7s2f f14 arr.0 -> y (an existing scalar element)",
+            arr(),
+            doc! {"$rename": {"arr.0": "y"}},
+        ),
+        ("q7s2f f15 items.0.sku -> y", skus(), doc! {"$rename": {"items.0.sku": "y"}}),
+    ] {
+        let err = refusal(&d, u.clone());
+        assert!(err.contains(SOURCE), "{label}: {err}");
+    }
+    // a source that is not there: nothing, and the destination is not looked at
+    for (label, d, u) in [
+        ("q7s2f f7 nope.x -> y (control)", skus(), doc! {"$rename": {"nope.x": "y"}}),
+        ("q7s2f f8 nope.x -> items.1.t", skus(), doc! {"$rename": {"nope.x": "items.1.t"}}),
+        (
+            "q7s2f f13 items.5.x.y -> y: an index past the end ends the walk",
+            seven(),
+            doc! {"$rename": {"items.5.x.y": "y"}},
+        ),
+    ] {
+        let (effects, outcome) = parity_doc(u, &d);
+        assert!(effects.is_empty(), "{label}: {effects:?}");
+        assert_eq!(outcome, Outcome::Unchanged, "{label}");
+    }
 }

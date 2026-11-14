@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::path;
 use crate::update::{OpKind, Operation, Update};
-use crate::update_effects::{Plan, apply_with_effects, first_rename_refusal};
+use crate::update_effects::{Plan, apply_with_effects};
 use crate::update_effects_tests::{NOW, bytes, canonical, render, writer_with};
 
 fn small_int() -> impl Strategy<Value = i32> {
@@ -338,11 +338,14 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
             (Ok(()), Ok(Plan::Replace { .. })) => {
                 return Err(TestCaseError::fail("a replacement from a generated update"));
             }
-            (Err(_), Err(_)) => continue,
-            // the one refusal the plan adds: a `$rename` the recordings refuse (a source or a
-            // destination in an array element, below a scalar), named by its enum variant
-            (Ok(()), Err(_)) if first_rename_refusal(&update, &doc).is_some() => {
-                REFUSED_RENAMES.fetch_add(1, Ordering::Relaxed);
+            // both refuse: the engine's `$rename` rules (a source or a destination in an array
+            // element, below a scalar) are counted so that the run proves it reaches them
+            (Err(_), Err(_)) => {
+                if let Update::Operators(operations) = &update
+                    && operations.iter().any(|op| matches!(op.kind, OpKind::Rename(_)))
+                {
+                    REFUSED_RENAMES.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             (engine, planned) => {
@@ -430,7 +433,7 @@ fn effects_through_the_writer_render_the_engines_post_image() {
         .unwrap();
     let (refused, noop) =
         (REFUSED_RENAMES.load(Ordering::Relaxed), NOOP_RENAMES.load(Ordering::Relaxed));
-    eprintln!("renames: {refused} refused by the plan, {noop} of a missing source");
+    eprintln!("renames: {refused} steps with a rename refused, {noop} of a missing source");
     assert!(refused > 0, "no generated step hit a refused rename");
     assert!(noop > 0, "no generated step renamed a missing source");
 }
