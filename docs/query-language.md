@@ -653,7 +653,10 @@ source `items.0.sku` or `arr.0` is refused (`the source field cannot be an array
 element`), the destination `arr.1` or `items.0.s` is refused (`the destination
 field cannot be an array element`), and a source that goes through an array
 without an index (`items.sku`) or through a scalar (`a.y` over `a: 5`) is
-refused (`cannot use the part (items of items.sku) to traverse the element`). A
+refused (`cannot use the part (items of items.sku) to traverse the element`); a
+destination through an array by a field name (`items.s`) is refused as an array
+element, and one below a scalar (`a.y` over `a: 5`) is refused before anything
+moves. A
 whole array (`items` to `lines`), a field of a sub-document (`o.p` to `o.q`)
 and a rename beside a write to an array still apply. A source that is missing
 is still a no-op.

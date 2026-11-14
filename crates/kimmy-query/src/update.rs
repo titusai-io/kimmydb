@@ -1423,11 +1423,25 @@ fn apply_one(
             }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
-                if let Way::Array { prefix, .. } = rename_way(doc, target) {
-                    return Err(invalid(format!(
-                        "$rename: the destination field cannot be an array element: {target:?} \
-                         goes through the array {prefix:?}"
-                    )));
+                match rename_way(doc, target) {
+                    Way::Clear => {}
+                    Way::Array { prefix, .. } => {
+                        return Err(invalid(format!(
+                            "$rename: the destination field cannot be an array element: \
+                             {target:?} goes through the array {prefix:?}"
+                        )));
+                    }
+                    // Refused here, before the source is cleared, so that a
+                    // document updated in place is as it was.
+                    Way::Scalar { prefix } => {
+                        let part = prefix.rsplit('.').next().unwrap_or(&prefix);
+                        let below = target[prefix.len() + 1..].split('.').next().unwrap_or("");
+                        let held = path::resolve(doc, &prefix).first().map(|v| v.to_string());
+                        return Err(invalid(format!(
+                            "cannot create field '{below}' in element {{{part}: {}}}",
+                            held.unwrap_or_default()
+                        )));
+                    }
                 }
                 path::unset_checked(doc, &op.path);
                 path::set_checked(doc, target, value, created).map_err(invalid)?;

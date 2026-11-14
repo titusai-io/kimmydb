@@ -509,3 +509,70 @@ fn e_a_replacement_without_an_id_keeps_the_stored_one() {
     // q7s2d.out lines 139, 168.
     same(updated(doc! { "v": 1 }, doc! { "_id": 1, "k": 1 }), doc! { "_id": 1, "v": 1 });
 }
+
+// ---------------------------------------------------------------------------
+// (G) $rename through an array by a non-numeric segment, and below a scalar
+// ---------------------------------------------------------------------------
+
+fn pair_items() -> Document {
+    doc! { "_id": 1, "items": [{ "s": 1 }, { "s": 2 }], "x": 1 }
+}
+
+fn nested_items() -> Document {
+    doc! { "_id": 1, "items": [[{ "s": 1 }], [{ "s": 2 }]], "x": 1 }
+}
+
+#[test]
+fn g_a_rename_destination_through_an_array_by_a_field_name_is_refused() {
+    // q7s2d.out lines 76, 81, 106.
+    let dest = "destination field cannot be an array element";
+    refused(updated(doc! { "$rename": { "x": "items.s" } }, pair_items()), dest);
+    refused(updated(doc! { "$rename": { "x": "items.s" } }, nested_items()), dest);
+    refused(updated(doc! { "$rename": { "x": "items.s.t" } }, pair_items()), dest);
+}
+
+#[test]
+fn g_a_rename_source_through_an_array_by_a_field_name_is_refused() {
+    // q7s2d.out lines 86, 91.
+    let part = "cannot use the part (items of items.s) to traverse the element";
+    refused(updated(doc! { "$rename": { "items.s": "y" } }, pair_items()), part);
+    refused(updated(doc! { "$rename": { "items.s": "y" } }, nested_items()), part);
+}
+
+#[test]
+fn g_a_rename_below_a_scalar_is_refused_and_changes_nothing() {
+    // q7s2d.out lines 96 and 101.
+    let stored = doc! { "_id": 1, "a": 5, "x": 1 };
+    refused(
+        updated(doc! { "$rename": { "x": "a.y" } }, stored.clone()),
+        "cannot create field 'y' in element {a: 5}",
+    );
+    refused(
+        updated(doc! { "$rename": { "a.y": "b" } }, doc! { "_id": 1, "a": 5 }),
+        "cannot use the part (a of a.y) to traverse the element ({a: 5})",
+    );
+    // The refusal comes before anything moves, so a caller that applied the
+    // update in place keeps the field it was renaming.
+    let mut held = stored.clone();
+    let update = parsed(doc! { "$rename": { "x": "a.y" } }).unwrap();
+    assert!(update::apply(&update, &mut held, NOW).is_err());
+    assert_eq!(shown(&held), shown(&stored));
+}
+
+#[test]
+fn g_a_rename_onto_a_document_key_spelled_as_a_number_applies() {
+    // q7s2d.out lines 111-112.
+    same(
+        updated(doc! { "$rename": { "x": "o.0" } }, doc! { "_id": 1, "o": { "0": 1 }, "x": 1 }),
+        doc! { "_id": 1, "o": { "0": 1 } },
+    );
+}
+
+#[test]
+fn g_a_numeric_source_inside_an_array_is_refused() {
+    // q7s2d.out line 116.
+    refused(
+        updated(doc! { "$rename": { "items.0.s": "items.0.t" } }, pair_items()),
+        "source field cannot be an array element",
+    );
+}
