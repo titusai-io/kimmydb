@@ -20,3 +20,19 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = 'package(kimmy-storage) & test(/^hold_meter::tests::/)'
 threads-required = "num-cpus"
+
+# `the_driver_set_stays_bounded` makes 200 confirmations one after another
+# (`ROUNDS`) and awaits each answer and each driver's end with no deadline of
+# its own, to check that the confirmer's driver set is pruned to at most two.
+# What it waits on is the push's `request_timeout` (10 s): when the machine's
+# other threads starve the test's four runtime workers, one confirmation
+# outruns it and the round fails with "no answer within 10s". Run beside the
+# rest of the workspace's tests it did so in full-workspace runs, red at main
+# 665a0c9b on 2026-11-12 and again in the rename gate (`nextest-all` exit 100,
+# `FAIL [29.647s]`, round 38, q7-gate-main-rename-final.log line 3108), and it
+# passed in the #315 gate. The set's size is the property, not the speed, so
+# the wait stays as it is and the test takes every slot: it runs alone, on a
+# machine that is not busy with anything else.
+[[profile.default.overrides]]
+filter = 'package(kimmy-cluster) & test(=confirm::tests::the_driver_set_stays_bounded)'
+threads-required = "num-cpus"
