@@ -2665,19 +2665,19 @@ fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
                 current = child;
                 i += 1;
             }
-            Some(Bson::Array(items)) => match segs[i + 1].parse::<usize>() {
+            Some(Bson::Array(items)) => match path::array_index(segs[i + 1]) {
                 // A numeric next segment addresses a position, not a
                 // crossing; recurse into that element only if it is already
                 // a document — anything else is what `path::set` vivifies or
                 // overwrites, so nothing further along this path can fail.
-                Ok(index) => match items.get(index) {
+                Some(index) => match items.get(index) {
                     Some(Bson::Document(child)) => {
                         current = child;
                         i += 2;
                     }
                     _ => return None,
                 },
-                Err(_) => return Some((segs[..=i].join("."), segs[i + 1..].join("."))),
+                None => return Some((segs[..=i].join("."), segs[i + 1..].join("."))),
             },
             _ => return None,
         }
@@ -4324,6 +4324,29 @@ mod tests {
             out,
             docs(vec![doc! { "a": [{"b": 1}, {"b": [3]}] }, doc! { "a": [{"b": 2}, {"b": [3]}] },])
         );
+    }
+
+    #[test]
+    fn a_signed_segment_after_an_array_is_a_crossing_as_any_field_name_is() {
+        // A segment with a sign is a field name, not an index (the update
+        // language's rule, `path::array_index`), so `$unwind: "$arr.+0"` crosses
+        // the array as `$unwind: "$arr.x"` does, and the prediction
+        // (`crossing_array`) must agree with what `path::set` does for it.
+        // UNRECORDED: the reference's answer for a stage write through `+0`.
+        for field in ["$arr.x", "$arr.+0"] {
+            let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
+            let err = run(vec![doc! {"$unwind": field}], input).unwrap_err().to_string();
+            assert!(err.contains("$unwind") && err.contains("is an array"), "{field}: {err}");
+        }
+        // And a removal through it is refused as the write of a value would be.
+        for field in ["arr.x", "arr.+0"] {
+            let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
+            let err = run(vec![doc! {"$addFields": { field: "$$REMOVE" }}], input);
+            assert!(err.is_err(), "{field}: removal through a field name on an array");
+        }
+        // An index spelled with digits is still no crossing.
+        let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
+        run(vec![doc! {"$addFields": { "arr.01": "$$REMOVE" }}], input).unwrap();
     }
 
     #[test]
