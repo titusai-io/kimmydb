@@ -99,8 +99,10 @@ fn a_renamed_field_is_a_new_field_and_sorts_with_the_rest() {
 
 #[test]
 fn a_existing_fields_keep_their_place_and_new_ones_follow() {
-    // q7s2.out lines 173 and 178: the stored fields stay where they are (here
-    // in an order that is not sorted), the new one comes after them.
+    // q7s2.out lines 170-178 record a stored `a, b` and a stored `a, b` again;
+    // these start from `b, a` and `a, b` (not recorded) to show that the
+    // stored fields stay where they are, in an order that is not sorted, and
+    // that the new one comes after them.
     same(
         updated(doc! { "$set": { "c": 3, "b": 9, "a": 8 } }, doc! { "_id": 1, "b": 2, "a": 1 }),
         doc! { "_id": 1, "b": 9, "a": 8, "c": 3 },
@@ -116,7 +118,9 @@ fn a_existing_fields_keep_their_place_and_new_ones_follow() {
 
 #[test]
 fn a_new_fields_of_an_array_element_follow_its_own() {
-    // q7s2.out line 66: items.1.k is new in the second element.
+    // q7s2.out lines 62-66 record items.0.n and items.1.k; this adds a second
+    // new field (z, written before k) to the second element, which is not
+    // recorded, and asks for the same order the recording shows.
     same(
         updated(
             doc! { "$set": { "items.1.z": 1, "items.1.k": 6 } },
@@ -268,7 +272,11 @@ fn b_a_numeric_segment_reaches_three_levels_down() {
 
 #[test]
 fn b_a_numeric_segment_mixed_with_field_names_in_documents_and_arrays() {
-    // q7s2.out lines 56, 61, 71, 76, 81, 86.
+    // q7s2.out lines 56, 61, 71, 76, 81, 86. The last case differs from line
+    // 86 in the order of two fields: the recording lists the numeric-looking
+    // key "1" before "k", which says nothing a client can rely on (the
+    // reference orders integer-like keys by their own rules), so this pins the
+    // order the engine gives (the new field after the stored one).
     let items = doc! { "_id": 1, "items": [{ "tags": ["a", "b"], "n": 1 }, { "tags": ["c"] }] };
     same(
         updated(doc! { "$set": { "items.0.tags.1": "z" } }, items.clone()),

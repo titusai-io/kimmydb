@@ -666,8 +666,10 @@ fn conflict(
 /// Whether a target path is `_id` or anything beneath it.
 ///
 /// The exact match alone was not enough. `_id` holds a scalar in almost every
-/// document, and `path::set` on `"_id.x"` replaces a scalar with a document to
-/// make room — so `{$set: {"_id.x": 1}}` turned `_id: 7` into `_id: {x: 1}`,
+/// document, and a write at `"_id.x"` once replaced a scalar with a document
+/// to make room (`path::set` still does, for the stages that share it; the
+/// update's own `path::set_checked` refuses it) — so `{$set: {"_id.x": 1}}`
+/// turned `_id: 7` into `_id: {x: 1}`,
 /// past a check that only knew the literal name. That relocates the document
 /// out from under every index entry and oplog record that named it, silently.
 /// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
@@ -1452,8 +1454,10 @@ fn apply_one(
                              {target:?} goes through the array {prefix:?}"
                         )));
                     }
-                    // Refused here, before the source is cleared, so that a
-                    // document updated in place is as it was.
+                    // Refused here, before the source is cleared. That keeps a
+                    // document updated in place as it was for this refusal
+                    // alone: an update with several operators writes as it
+                    // goes, and callers apply it to a copy.
                     Way::Scalar { prefix } => {
                         let part = prefix.rsplit('.').next().unwrap_or(&prefix);
                         let below = target[prefix.len() + 1..].split('.').next().unwrap_or("");
@@ -2207,9 +2211,10 @@ mod tests {
 
     #[test]
     fn operators_may_not_reach_under_id_either() {
-        // `_id.x` is not `_id`, so the exact check let it through — and
-        // `path::set` replaces a scalar `_id` with a document to make room for
-        // `x`, which changes the document's identity. Every operator goes
+        // `_id.x` is not `_id`, so the exact check let it through — and a write
+        // there once replaced a scalar `_id` with a document to make room for
+        // `x` (`path::set` still does, for the stages that share it), which
+        // changes the document's identity. Every operator goes
         // through the same check, so `$unset` and `$rename` are pinned too.
         assert!(parse(&doc! { "$set": { "_id.x": 1 } }).is_err());
         assert!(parse(&doc! { "$unset": { "_id.x": "" } }).is_err());
