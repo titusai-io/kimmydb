@@ -407,7 +407,7 @@ mod tests {
     /// The structural lost set as an OPTION of the oracle (`Cfg::lost_struct`, the model's `Q6_LOSTSTRUCT=1`; the default stays 6d's, the one item P
     /// compares against). Natively (the harness's own draws, so the model's four seeds are NOT the same runs): every run of the in-order grid is clean
     /// with the option on, and it never ADDS a required head (the structural set holds fewer entries than 6d's, so it can only remove requirements). The
-    /// comparison against the MODEL's moved runs is owed to the trace replay (a header field `lost_struct` of the tracer; see the review's open items).
+    /// comparison against the MODEL's moved runs is done by the trace replay (the tracer writes the header field `lost_struct`): the LOSTSTRUCT replays at b872f81d, 10/10 (logs coder-s21-*.log).
     #[test]
     fn the_structural_lost_set_option_is_clean_and_never_adds_a_required_head() {
         let (mut runs, mut fewer) = (0, 0);
