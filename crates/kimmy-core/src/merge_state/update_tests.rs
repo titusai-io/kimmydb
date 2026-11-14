@@ -107,20 +107,35 @@ fn each_refusal_is_named_and_changes_nothing() {
     refused(&mut empty, &[UpdateOp::Set(np("a"), i(1))], UpdateRefused::NoLife);
 }
 
+/// A NUL in a field name is refused whole as a bad value before any leaf path is built: the value
+/// check is the first to see it, so `BadPath` cannot come out of a `$set` any more (the over-long
+/// leaf path it used to guard is `TooDeep` now, see the next test).
 #[test]
-fn a_field_name_that_cannot_be_a_segment_is_a_bad_path() {
-    // a path of 60 segments with a document 60 deep: the path counts against the depth limit with
-    // its value (120 levels), so the value is refused as too deep before any leaf path is built
+fn a_field_name_that_cannot_be_a_segment_is_refused_whole() {
     let mut w = seeded();
-    let mut v = i(1);
-    for _ in 0..60 {
-        v = doc(&[("k", v)]);
-    }
-    let long = Path::new((0..60).map(|n| format!("p{n}"))).unwrap();
     let before = w.state.clone();
-    let e = w.write_update(&[UpdateOp::Set(long, v)], 0).unwrap_err();
+    let v = doc(&[("a", doc(&[("b\0c", i(1))]))]);
+    let e = w.write_update(&[UpdateOp::Set(np("p"), v)], 0).unwrap_err();
+    assert!(matches!(e, UpdateRefused::BadValue(_, InvalidValue::BadFieldName)), "{e:?}");
+    assert_eq!(w.state, before);
+}
+
+#[test]
+fn a_path_and_its_value_count_together_against_the_depth_limit() {
+    let nest = |levels: usize| (0..levels).fold(i(1), |v, _| doc(&[("k", v)]));
+    let long = |n: usize| Path::new((0..n).map(|k| format!("p{k}"))).unwrap();
+    // 60 segments and a document 60 deep: 120 levels, refused whole
+    let mut w = seeded();
+    let before = w.state.clone();
+    let e = w.write_update(&[UpdateOp::Set(long(60), nest(60))], 0).unwrap_err();
     assert!(matches!(e, UpdateRefused::BadValue(_, InvalidValue::TooDeep)), "{e:?}");
     assert_eq!(w.state, before);
+    // exactly at the limit (60 + 40) is accepted, one level over (60 + 41) is refused
+    let mut w = seeded();
+    w.write_update(&[UpdateOp::Set(long(60), nest(40))], 0).unwrap();
+    let mut w = seeded();
+    let e = w.write_update(&[UpdateOp::Set(long(60), nest(41))], 0).unwrap_err();
+    assert!(matches!(e, UpdateRefused::BadValue(_, InvalidValue::TooDeep)), "{e:?}");
 }
 
 fn counter_of(n: usize) -> MergeState {
