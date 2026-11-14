@@ -242,7 +242,7 @@ impl Cx<'_> {
             // (the pair at the slot's own stamp is the slot, so it has the slot's type: it is not
             // the case that gets here)
         }
-        Slot { stamp, total, absorbed }
+        Slot::new(stamp, total, absorbed)
     }
 }
 
@@ -370,8 +370,8 @@ fn equal_stamps_under_one_key(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState
     } else {
         (Num::Int64(5), Num::Int64(6))
     };
-    put_slot(&mut s, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: ta, absorbed: None });
-    put_slot(&mut t, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: tb, absorbed: None });
+    put_slot(&mut s, la(), &p3, 0, None, Slot::new(slot_stamp(x), ta, None));
+    put_slot(&mut t, la(), &p3, 0, None, Slot::new(slot_stamp(x), tb, None));
     let sl = cx.slot(x, &p1, wid(1));
     put_slot(&mut s, la(), &p1, 1, None, sl);
     let sl = cx.slot(y, &p1, wid(1));
@@ -615,14 +615,7 @@ fn near_max_total(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
             let generation = if k % 5 == 4 { Some(g) } else { None };
             // the pair an earlier base write absorbed: the write `at`, below the slot's stamp
             let absorbed = Some((at, Num::Int64(-n)));
-            put_slot(
-                st,
-                la(),
-                &p,
-                k,
-                generation,
-                Slot { stamp: slot_stamp(slot_at), total, absorbed },
-            );
+            put_slot(st, la(), &p, k, generation, Slot::new(slot_stamp(slot_at), total, absorbed));
             seen.insert((la(), wid(k), generation), Num::Int64(n));
         }
         let base = cx.draw(("base", at), |r| {

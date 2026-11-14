@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::counter::{self, Inc, Num};
+use super::counter::{self, Inc, Kind, Num};
 use super::join::{JoinOptions, join, join_into};
 use super::ord::{OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events};
 use super::state::{
@@ -496,17 +496,29 @@ impl Writer {
         }
     }
 
-    /// Store the slot at `key` with the write `stamp` and the new `total`. The absorbed pair of a
-    /// slot the writer already holds is kept: an increment moves the slot, not what a base write
-    /// absorbed of it.
+    /// Store the slot at `key` with the write `stamp`, the new `total` and the type `op` of the
+    /// operand the write added. The absorbed pair of a slot the writer already holds is kept: an
+    /// increment moves the slot, not what a base write absorbed of it. The slot keeps the stamp of
+    /// its latest operand of each width above `Int32` (`Slot::wide_at`, `Slot::decimal_at`), which
+    /// tell the type of what it gained since an absorb.
     fn put_slot(
         &mut self,
         key: (MStamp, Path, WriterId, Option<MStamp>),
         stamp: MStamp,
         total: Num,
+        op: Kind,
     ) {
-        let absorbed = self.state.slots.get(&key).and_then(|s| s.absorbed);
-        self.state.slots.insert(key, Slot { stamp, total, absorbed });
+        let held = self.state.slots.get(&key);
+        let absorbed = held.and_then(|s| s.absorbed);
+        let (mut wide_at, mut decimal_at) =
+            held.map_or((None, None), |s| (s.wide_at, s.decimal_at));
+        if op >= Kind::Int64 {
+            wide_at = Some(stamp);
+        }
+        if op == Kind::Decimal128 {
+            decimal_at = Some(stamp);
+        }
+        self.state.slots.insert(key, Slot { stamp, total, absorbed, wide_at, decimal_at });
     }
 
     /// Set the register of `p` in the life `l` (the newest of the alive lives `al`), stamp `st`.
@@ -1208,10 +1220,7 @@ impl Writer {
                 Inc::Slot(_) => {
                     let op = Num::from_value(by).expect("the operand was checked");
                     let total = op.first_amount();
-                    s.slots.insert(
-                        (st, p.clone(), self.id, None),
-                        Slot { stamp: st, total, absorbed: None },
-                    );
+                    s.slots.insert((st, p.clone(), self.id, None), Slot::new(st, total, None));
                     slot_amounts.push(op);
                 }
             }
@@ -1255,7 +1264,12 @@ impl Writer {
         let known = self.known();
         let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.put_slot((life, path.clone(), self.id, None), st2, Num::from(i128::from(n)));
+        self.put_slot(
+            (life, path.clone(), self.id, None),
+            st2,
+            Num::from(i128::from(n)),
+            Kind::Int64,
+        );
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
         items.push((OrdAt::Field(path.clone()), OrdMode::Write));
@@ -1284,7 +1298,7 @@ impl Writer {
         );
         s.slots.insert(
             (st, path.clone(), self.id, None),
-            Slot { stamp: st, total: Num::from(i128::from(n)), absorbed: None },
+            Slot::new(st, Num::from(i128::from(n)), None),
         );
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
@@ -1536,7 +1550,7 @@ impl Writer {
                 for q in &eff.order {
                     self.setreg(q, eff.vals[q].clone(), st, &al);
                 }
-                self.put_slot(key, st, total);
+                self.put_slot(key, st, total, op.label());
                 self.feed(life, st, known, &items);
                 let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![p.clone()]);
                 rec.n = op.int().and_then(|v| i64::try_from(v).ok());
@@ -1894,8 +1908,8 @@ impl Writer {
                             changed = true;
                         }
                         IncPlan::Slot(plan) => {
-                            let SlotPlan { life, key, total, .. } = *plan;
-                            slots.push((life, key, total));
+                            let SlotPlan { life, key, total, op, .. } = *plan;
+                            slots.push((life, key, total, op.label()));
                             changed = true;
                         }
                     }
@@ -1920,9 +1934,9 @@ impl Writer {
             self.setreg(q, eff.vals[q].clone(), st, &al);
         }
         let mut paths = eff.order.clone();
-        for (_, key, total) in slots {
+        for (_, key, total, op) in slots {
             paths.push(key.1.clone());
-            self.put_slot(key, st, total);
+            self.put_slot(key, st, total, op);
         }
         if let Some(life) = l {
             self.feed(life, st, known, &items);
