@@ -108,6 +108,62 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
     }
 }
 
+/// The six goldens as the independent Python writer of section 10 reads them
+/// (`tests/data/check_ord_section.py`): each one's full compact bytes and its order state spelled out
+/// structurally (no indexes: stamps and writers by value). The checker parses the two tables from the bytes,
+/// writes section 10 itself and compares it with the tail of the Rust bytes, then checks the pinned length and
+/// the 128-bit hash with a hash of its own. Regenerate with `Q7_REGEN_ORD_SECTION=1`.
+fn ord_section_fixture() -> serde_json::Value {
+    use serde_json::{Value as J, json};
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let wj = |w: &WriterId| json!({"node": hex(&w.node.to_bytes()), "epoch": hex(&w.epoch.0)});
+    let sj = |s: &MStamp| json!({"hlc": hex(&s.hlc.to_bytes()), "writer": wj(&s.writer)});
+    let cj = |(s, pos): &(MStamp, u64)| json!({"stamp": sj(s), "pos": pos});
+    let mut out = Vec::new();
+    for (name, st) in [
+        ("empty", golden_empty()),
+        ("170", golden_170()),
+        ("mixed", golden_mixed()),
+        ("delete", golden_delete()),
+        ("obs", golden_obs()),
+        ("small", golden_small()),
+    ] {
+        let ords: Vec<J> = st
+            .ords
+            .iter()
+            .map(|((life, at), x)| {
+                let floor = match &x.floor {
+                    None => J::Null,
+                    Some(Floor::U { stamp, prev, others }) => {
+                        json!({"kind": "u", "stamp": sj(stamp), "prev": hex(&prev.to_bytes()), "others": others})
+                    }
+                    Some(Floor::R { stamp }) => json!({"kind": "r", "stamp": sj(stamp)}),
+                };
+                json!({
+                    "life": sj(life),
+                    "at": match at { OrdAt::Root => J::Null, OrdAt::Field(p) => json!(p.segments()) },
+                    "floor": floor,
+                    "firsts": x.firsts.iter().map(|(w, c)| json!({"writer": wj(w), "cand": cj(c)})).collect::<Vec<_>>(),
+                    "last": x.last.as_ref().map_or(J::Null, cj),
+                    "lvl": x.lvl.as_ref().map_or(J::Null, sj),
+                })
+            })
+            .collect();
+        out.push(json!({"name": name, "bytes": hex(&st.compact_bytes()), "ords": ords}));
+    }
+    J::Array(out)
+}
+
+#[test]
+fn the_order_section_fixture_of_the_python_writer_is_current() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ord_section_goldens.json");
+    let now = serde_json::to_string_pretty(&ord_section_fixture()).unwrap() + "\n";
+    if std::env::var_os("Q7_REGEN_ORD_SECTION").is_some() {
+        std::fs::write(path, &now).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), now, "the fixture is stale");
+}
+
 #[test]
 fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
     let mut w = Writer::new(wid(b'A', 7), opts());
