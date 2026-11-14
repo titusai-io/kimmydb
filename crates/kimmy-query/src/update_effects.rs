@@ -79,7 +79,8 @@ pub fn apply_with_effects(
     let operations = match update {
         Update::Replace(_) => return Ok(Plan::Replace { post_image: next }),
         Update::Pipeline(_) => {
-            return Err(Error::Internal("pipeline-update effects are not built yet".into()));
+            let items = pipeline_items(doc, &next)?;
+            return Ok(Plan::Effects { effects: build(items, &next), post_image: next });
         }
         Update::Operators(ops) => ops,
     };
@@ -94,6 +95,29 @@ pub fn apply_with_effects(
         }
     }
     Ok(Plan::Effects { effects: build(items, &next), post_image: next })
+}
+
+/// The effects of a pipeline update (ADR-265): one `Set` per top-level field the stages changed
+/// or added, one `Unset` per field they removed, each a [`Path`] of ONE segment (a field named
+/// `a.b` or `$x` is one field: the name is never split). The writer's diff writes only the
+/// changed leaves and unsets only what it saw, so this is not a replace: the stored order of the
+/// fields that stay is the writer's, and a result that only reorders fields is no effect. `_id`
+/// is never an effect (it is the document's identity: a result that restates it, even as another
+/// type of the same id, leaves the stored one).
+fn pipeline_items(doc: &Document, next: &Document) -> Result<Vec<Item>> {
+    let mut items = Vec::new();
+    for (name, after) in next {
+        if name == "_id" || same(doc.get(name), Some(after))? {
+            continue;
+        }
+        items.push(Item::Set(Path::flat(name).map_err(bad)?, value_of(after)?));
+    }
+    for name in doc.keys() {
+        if name != "_id" && !next.contains_key(name) {
+            items.push(Item::Unset(Path::flat(name).map_err(bad)?));
+        }
+    }
+    Ok(items)
 }
 
 fn bad(e: impl std::fmt::Display) -> Error {

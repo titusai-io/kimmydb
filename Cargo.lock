@@ -2621,6 +2621,7 @@ dependencies = [
  "proptest",
  "rand 0.10.3",
  "serde",
+ "serde_json",
  "stacker",
  "thiserror 2.0.21",
  "tracing",
