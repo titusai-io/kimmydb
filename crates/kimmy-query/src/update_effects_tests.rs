@@ -452,6 +452,46 @@ fn table() -> Vec<Row> {
                 e.inc(p("c"), v(0i64));
             }),
         ),
+        // `$inc 0` of another width on a number that is there: nothing, the stored type is not
+        // widened (q7s2.out z4 Int64 + Int32 0, z5 Double + Int32 0, z6 Decimal + Int32 0)
+        d("inc int32 zero on an int64 is nothing (q7s2 z4)", doc! {"$inc": {"l": 0}}, fx(|_| {})),
+        d("inc int32 zero on a double is nothing (q7s2 z5)", doc! {"$inc": {"f": 0}}, fx(|_| {})),
+        d(
+            "inc int32 zero on a decimal is nothing (q7s2 z6)",
+            doc! {"$inc": {"dec": 0}},
+            fx(|_| {}),
+        ),
+        // a wider operand does change the type, so it is an effect (q7s2.out z2 Int32 + Int64 0)
+        d(
+            "inc int64 zero on an int32 widens (q7s2 z2)",
+            doc! {"$inc": {"n": 0i64}},
+            fx(|e| {
+                e.inc(p("n"), v(0i64));
+            }),
+        ),
+        // the typed zero of the operand on an absent path (q7s2.out z9, z10)
+        d(
+            "inc double zero absent creates a double zero (q7s2 z9)",
+            doc! {"$inc": {"c": 0.0}},
+            fx(|e| {
+                e.inc(p("c"), v(0.0));
+            }),
+        ),
+        d(
+            "inc decimal zero absent creates a decimal zero (q7s2 z10)",
+            doc! {"$inc": {"c": dec("0")}},
+            fx(|e| {
+                e.inc(p("c"), v(dec("0")));
+            }),
+        ),
+        // a zero `$inc` beside a `$set` that changes: only the `$set` is an effect (q7s2.out z11)
+        d(
+            "inc zero beside a set (q7s2 z11)",
+            doc! {"$inc": {"n": 0}, "$set": {"m": 1}},
+            fx(|e| {
+                e.set(p("m"), v(1));
+            }),
+        ),
         // $mul, $bit: register writes of the computed value
         d(
             "mul",
@@ -766,6 +806,31 @@ fn inc_zero_on_an_absent_path_is_a_counter_cell_of_the_operand_type() {
         assert_eq!(render(&w).get("c"), Some(&want));
         assert!(w.sees_counter(&p("c")));
         // and a second `$inc 0` on the counter it made is no effect
+        let d2 = render(&w);
+        let (again, outcome) = parity_doc(doc! {"$inc": {"c": 0}}, &d2);
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(outcome, Outcome::Unchanged);
+    }
+}
+
+/// q7s2.out z9, z10: `$inc` of a double or a decimal zero on an absent path creates a zero of the
+/// operand's type, and a zero `$inc` of an `Int32` on that value is nothing (z5, z6).
+#[test]
+fn inc_zero_on_an_absent_path_is_a_typed_zero_of_a_double_and_a_decimal() {
+    let d = doc! { "_id": 1 };
+    for (operand, want) in [(Bson::Double(0.0), Bson::Double(0.0)), (dec("0"), dec("0"))] {
+        let (effects, outcome) = parity_doc(doc! {"$inc": {"c": operand.clone()}}, &d);
+        assert!(outcome.modified());
+        same_effects(
+            &effects,
+            &fx(|e| {
+                e.inc(p("c"), v(operand.clone()));
+            }),
+            "z9 and z10",
+        );
+        let mut w = writer_with(&d);
+        effects.apply(&mut w, 0);
+        assert_eq!(render(&w).get("c"), Some(&want));
         let d2 = render(&w);
         let (again, outcome) = parity_doc(doc! {"$inc": {"c": 0}}, &d2);
         assert!(again.is_empty(), "{again:?}");
