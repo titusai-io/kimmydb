@@ -128,7 +128,8 @@ fn the_creation_values_of_the_register_operators_go_in_set() {
 
 #[test]
 fn inc_is_the_operand_and_several_incs_are_allowed() {
-    let (fx, post) = creates(doc! {"k": 1}, doc! {"$inc": {"n": 2i64, "q.m": 3i64}, "$set": {"a": 1}});
+    let (fx, post) =
+        creates(doc! {"k": 1}, doc! {"$inc": {"n": 2i64, "q.m": 3i64}, "$set": {"a": 1}});
     assert_eq!(fx.inc, vec![(p("n"), v(2i64)), (np(&["q", "m"]), v(3i64))]);
     assert_eq!(post.get("n"), Some(&Bson::Int64(2)));
     // typed operands as written

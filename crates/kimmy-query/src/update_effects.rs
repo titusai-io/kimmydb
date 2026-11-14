@@ -345,7 +345,8 @@ pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<Upse
             }
         }
     }
-    let rank_of = |p: &Path, v: &Value| if *v == Value::Unset { Vec::new() } else { rank(&post, p) };
+    let rank_of =
+        |p: &Path, v: &Value| if *v == Value::Unset { Vec::new() } else { rank(&post, p) };
     fx.set.sort_by_cached_key(|(p, v)| rank_of(p, v));
     fx.set_on_insert.sort_by_cached_key(|(p, v)| rank_of(p, v));
     fx.check().map_err(bad)?;

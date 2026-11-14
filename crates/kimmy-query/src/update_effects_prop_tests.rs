@@ -59,12 +59,11 @@ fn slot_n() -> impl Strategy<Value = Slot> {
         small_int().prop_map(|b| ("$mul", "n", Bson::Int32(b))),
         small_int().prop_map(|b| ("$min", "n", Bson::Int32(b))),
         small_int().prop_map(|b| ("$max", "n", Bson::Int32(b))),
-        (prop_oneof![Just("and"), Just("or"), Just("xor")], small_int())
-            .prop_map(|(op, x)| {
-                let mut step = Document::new();
-                step.insert(op, Bson::Int32(x));
-                ("$bit", "n", Bson::Document(step))
-            }),
+        (prop_oneof![Just("and"), Just("or"), Just("xor")], small_int()).prop_map(|(op, x)| {
+            let mut step = Document::new();
+            step.insert(op, Bson::Int32(x));
+            ("$bit", "n", Bson::Document(step))
+        }),
     ])
 }
 
@@ -93,8 +92,11 @@ fn slot_arr() -> impl Strategy<Value = Slot> {
         small_int().prop_map(|b| ("$addToSet", "arr", Bson::Int32(b))),
         small_int().prop_map(|b| ("$pull", "arr", Bson::Int32(b))),
         prop_oneof![Just(1), Just(-1)].prop_map(|b| ("$pop", "arr", Bson::Int32(b))),
-        prop::collection::vec(small_int(), 0..3)
-            .prop_map(|v| ("$set", "arr", Bson::Array(v.into_iter().map(Bson::Int32).collect()))),
+        prop::collection::vec(small_int(), 0..3).prop_map(|v| (
+            "$set",
+            "arr",
+            Bson::Array(v.into_iter().map(Bson::Int32).collect())
+        )),
         Just(("$unset", "arr", Bson::String(String::new()))),
         small_int().prop_map(|b| ("$set", "arr.0", Bson::Int32(b))),
         small_int().prop_map(|b| ("$inc", "arr.1", Bson::Int32(b))),
@@ -167,7 +169,8 @@ fn run(start: Document, steps: Vec<Document>) -> Result<(), TestCaseError> {
             continue;
         }
         let Ok(update) = crate::update::parse(&step) else { continue };
-        let Ok(Plan::Effects { effects, post_image }) = apply_with_effects(&update, None, &doc, NOW)
+        let Ok(Plan::Effects { effects, post_image }) =
+            apply_with_effects(&update, None, &doc, NOW)
         else {
             continue;
         };
