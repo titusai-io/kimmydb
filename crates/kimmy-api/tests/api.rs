@@ -21777,3 +21777,46 @@ async fn an_aggregate_explain_reports_the_limit_and_the_pool() {
         json!({ "limitBytes": 4 << 20, "poolBytes": 6 << 20, "poolUsedBytes": 0 })
     );
 }
+
+#[tokio::test]
+async fn a_replacement_of_a_stored_document_may_not_name_another_id() {
+    // q7s2d.out lines 122-168: refused, as an operator update that names
+    // `_id` is, and the stored document unchanged.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "k": 1 })]).await;
+    for route in ["update", "find_and_modify"] {
+        for filter in [json!({ "_id": 1 }), json!({ "k": 1 })] {
+            let res = server
+                .post(
+                    &format!("/v1/db/shop/coll/pu/{route}"),
+                    Some(&token),
+                    json!({ "filter": filter, "update": { "_id": 2, "v": 1 } }),
+                )
+                .await;
+            assert_eq!(res.status, 400, "{route} {filter}: {:?}", res.body);
+            let msg = res.body["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("_id is immutable and cannot be updated"), "{msg}");
+            assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "k": 1 }));
+        }
+    }
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/2", Some(&token)).await.status, 404);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "update": { "_id": 1, "v": 1 } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "v": 1 }));
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "v": 2 }, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 1, "v": 2 }));
+}

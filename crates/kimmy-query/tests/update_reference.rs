@@ -479,3 +479,33 @@ fn d_an_operator_upsert_keeps_the_filter_field() {
     // q7s2b.out line 158.
     same(upserted(doc! { "$set": { "v": 2 } }, doc! { "k": 1 }), doc! { "k": 1, "v": 2 });
 }
+
+// ---------------------------------------------------------------------------
+// (E) The replacement of a stored document and its `_id`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e_a_replacement_naming_a_different_id_is_refused() {
+    // q7s2d.out lines 122, 143, 153, 158: code 66, the document unchanged.
+    refused(updated(doc! { "_id": 2, "v": 1 }, doc! { "_id": 1, "k": 1 }), "_id is immutable");
+}
+
+#[test]
+fn e_a_replacement_naming_the_same_id_replaces_everything_else() {
+    // q7s2d.out lines 128, 149, 163.
+    same(updated(doc! { "_id": 1, "v": 1 }, doc! { "_id": 1, "k": 1 }), doc! { "_id": 1, "v": 1 });
+}
+
+#[test]
+fn e_an_equal_id_of_another_numeric_type_is_stored_as_written() {
+    // q7s2d.out line 134: NumberLong(1) over the Int32 _id 1.
+    let out = updated(doc! { "_id": 1_i64, "v": 1 }, doc! { "_id": 1, "k": 1 }).unwrap();
+    assert!(matches!(out.get("_id"), Some(bson::Bson::Int64(1))), "{out}");
+    assert_eq!(shown(&out), shown(&doc! { "_id": 1_i64, "v": 1 }));
+}
+
+#[test]
+fn e_a_replacement_without_an_id_keeps_the_stored_one() {
+    // q7s2d.out lines 139, 168.
+    same(updated(doc! { "v": 1 }, doc! { "_id": 1, "k": 1 }), doc! { "_id": 1, "v": 1 });
+}

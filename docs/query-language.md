@@ -1114,7 +1114,11 @@ keeps `k`). Its `_id` is the filter's `_id` when the filter has one and the body
 has none, the body's `_id` when the filter has none, and a generated one
 otherwise. A filter `_id` and a body `_id` that differ are refused with a `400`
 naming the immutable field, and nothing is inserted. A replacement of a
-document that exists replaces every field but `_id`.
+document that exists replaces every field but `_id`, and its own `_id` must be
+the stored one: a body `_id` that differs is refused with a `400` and the
+document is unchanged, an equal one is applied (of another numeric type it is
+stored as written, `NumberLong(1)` over the 32-bit `1` gives the 64-bit `1`),
+and a body with no `_id` keeps the stored one.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
 document:
@@ -1125,8 +1129,10 @@ document:
 // Rejected when the result is known (a pipeline update)
 [ { "$set": { "_id": 2 } } ]
 
-// Accepted, but the existing _id is preserved — the document is not relocated
+// A replacement naming another _id is a 400 — the document is not relocated
 { "_id": 999, "item": "widget" }
+// Accepted: the same _id, or none (the stored one is kept)
+{ "_id": 7, "item": "widget" }
 ```
 
 ### `modified` counts changes

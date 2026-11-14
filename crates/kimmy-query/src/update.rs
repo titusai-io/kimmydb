@@ -967,23 +967,23 @@ fn apply_to_at(
             // byte for byte, from the same fields stored by a `PUT`, and
             // would count as a change every time it was sent (ADR-208).
             //
-            // An upsert's seed holds the filter's `_id`, when it has one, and
-            // no other field of the filter reaches the document. The body may
-            // name the `_id` the document is inserted under when the filter
-            // names none; naming a different one is a change of an immutable
-            // field (q7s2b.out lines 133, 138, 142).
-            let id = match (target, doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
-                (Target::Inserted, Some(seeded), Some(named)) => {
-                    if canonical_cmp(seeded, named) != Ordering::Equal {
+            // The body may name an `_id`, and then it must be the one the
+            // document has: the stored one, or the filter's in an upsert's
+            // seed. An equal one of another numeric type is stored as written.
+            // A body that names none keeps the document's, and in an upsert
+            // with no filter `_id` the body's is the one inserted (q7s2b.out
+            // lines 133, 138, 142; q7s2d.out lines 122-168).
+            let id = match (doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
+                (Some(held), Some(named)) => {
+                    if canonical_cmp(held, named) != Ordering::Equal {
                         return Err(Error::InvalidUpdate(format!(
-                            "the (immutable) field '_id' cannot be changed from {seeded} to \
-                             {named} by the replacement of an upsert"
+                            "_id is immutable and cannot be updated: the replacement names _id \
+                             {named}, and the document's is {held}"
                         )));
                     }
-                    Some(seeded)
+                    Some(named)
                 }
-                (Target::Inserted, None, named) => named,
-                (_, held, _) => held,
+                (held, named) => named.or(held),
             };
             let mut next = Document::new();
             if let Some(id) = id {
@@ -2141,17 +2141,17 @@ mod tests {
         // replacement names it, and wherever it names it (ADR-208).
         let keys = |d: &Document| d.keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys(&out), ["_id", "x"]);
-        let out = applied(doc! { "x": 1, "_id": 999, "y": 2 }, doc! { "_id": 7, "a": 1 });
+        let out = applied(doc! { "x": 1, "_id": 7, "y": 2 }, doc! { "_id": 7, "a": 1 });
         assert_eq!(keys(&out), ["_id", "x", "y"]);
         assert_eq!(out.get_i32("_id").unwrap(), 7);
     }
 
     #[test]
-    fn a_replacement_preserves_the_existing_id() {
-        // Even when the replacement names a different one: _id is identity,
-        // not content, and a replace must not relocate the document.
-        let out = applied(doc! { "_id": 999, "x": 1 }, doc! { "_id": 7, "a": 1 });
-        assert_eq!(out.get_i32("_id").unwrap(), 7);
+    fn a_replacement_naming_a_different_id_is_refused() {
+        // _id is identity, not content: a replace must not relocate the
+        // document (q7s2d.out lines 122, 143, 153, 158).
+        let err = apply_err(doc! { "_id": 999, "x": 1 }, doc! { "_id": 7, "a": 1 });
+        assert!(err.contains("_id is immutable"), "{err}");
     }
 
     #[test]
