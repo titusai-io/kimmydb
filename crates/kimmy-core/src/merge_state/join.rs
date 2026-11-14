@@ -128,6 +128,14 @@ pub struct JoinOptions {
     /// A local write by a 257th writer is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_writer_cap: bool,
+    /// R1 mutant: the type of a counter is the widest label of its slots alone, the base's label
+    /// does not count.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_ignores_base: bool,
+    /// R1 mutant: the type of a counter is read from the VALUE of each part (an `Int32` amount past
+    /// the `i32` range counts as an `Int64`), not from its label: the sticky widening R1 replaced.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_kind_by_value: bool,
     /// Order mutant: the candidates of an order entry are not voided by its floor.
     #[cfg(any(test, feature = "merge-mutants"))]
     ord_keep_all: bool,
@@ -242,6 +250,10 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             no_writer_cap: false,
             #[cfg(any(test, feature = "merge-mutants"))]
+            counter_ignores_base: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            counter_kind_by_value: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
             ord_keep_all: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             ord_latest: false,
@@ -344,6 +356,8 @@ impl JoinOptions {
     switch!(int32_saturates, set_int32_saturates, false);
     switch!(no_contributor_cap, set_no_contributor_cap, false);
     switch!(no_writer_cap, set_no_writer_cap, false);
+    switch!(counter_ignores_base, set_counter_ignores_base, false);
+    switch!(counter_kind_by_value, set_counter_kind_by_value, false);
     switch!(ord_keep_all, set_ord_keep_all, false);
     switch!(ord_latest, set_ord_latest, false);
     switch!(ord_no_last, set_ord_no_last, false);
