@@ -1657,71 +1657,6 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
     }
 }
 
-/// Equality constraints a match necessarily satisfies, for seeding an upsert.
-///
-/// Only `$and`-reachable `$eq` on a plain path counts. An equality inside `$or`
-/// is **not** implied by a match, so seeding from it would invent a field the
-/// caller never asked for — the kind of quiet wrongness that is hard to notice
-/// in a document that otherwise looks right.
-///
-/// A dotted key seeds nested documents, and their fields are in name order at
-/// each level whatever order the filter wrote its keys in; a whole document
-/// given as the value of a key keeps its own order.
-///
-/// Two of those equalities may not overlap: the same path twice, or one path
-/// inside another (`a` with `a.b`), has no one document to seed, and is
-/// refused. `claimed` holds the paths taken so far.
-fn implied_equalities(
-    filter: &filter::Filter,
-    out: &mut Document,
-    claimed: &mut Vec<String>,
-) -> Result<(), String> {
-    match filter {
-        filter::Filter::And(branches) => {
-            for branch in branches {
-                implied_equalities(branch, out, claimed)?;
-            }
-        }
-        filter::Filter::Field { path, conditions } => {
-            for condition in conditions {
-                if let filter::Condition::Eq(value) = condition {
-                    for taken in claimed.iter() {
-                        let inside = |outer: &str, inner: &str| {
-                            inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('.'))
-                        };
-                        if taken == path {
-                            return Err(format!(
-                                "cannot infer the fields an upsert seeds from the filter: path \
-                                 '{path}' is matched twice"
-                            ));
-                        }
-                        if inside(taken, path) || inside(path, taken) {
-                            let (long, short) = if taken.len() > path.len() {
-                                (taken, path)
-                            } else {
-                                (path, taken)
-                            };
-                            return Err(format!(
-                                "cannot infer the fields an upsert seeds from the filter: both \
-                                 paths '{long}' and '{short}' are matched"
-                            ));
-                        }
-                    }
-                    claimed.push(path.clone());
-                    // Dotted paths go through `path::set` so `{"a.b": 1}`
-                    // seeds a nested document rather than a literal key.
-                    let _ = kimmy_core::path::set(out, path, value.clone());
-                    // The levels a dotted key creates are sorted, at every
-                    // depth; a document given as the value of a key is not.
-                    kimmy_core::path::sort_levels_through(out, path);
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 thread_local! {
     /// A step a test runs between the engine's commit and the answer of `find_and_modify`,
@@ -1805,15 +1740,16 @@ pub fn find_and_modify(
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
         // Refused like any refusal of the seed: said only if nothing matches.
-        let seeded = implied_equalities(&filter, &mut seed, &mut Vec::new()).map(|()| {
-            // The seed's top-level fields are in name order, `_id` first,
-            // whichever order the filter wrote them in and whatever kind of
-            // update runs over it: the fields the update adds follow them.
-            let mut fields: Vec<(String, bson::Bson)> =
-                std::mem::take(&mut seed).into_iter().collect();
-            fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
-            seed.extend(fields);
-        });
+        let seeded = kimmy_query::seed::implied_equalities(&filter, &mut seed, &mut Vec::new())
+            .map(|()| {
+                // The seed's top-level fields are in name order, `_id` first,
+                // whichever order the filter wrote them in and whatever kind of
+                // update runs over it: the fields the update adds follow them.
+                let mut fields: Vec<(String, bson::Bson)> =
+                    std::mem::take(&mut seed).into_iter().collect();
+                fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
+                seed.extend(fields);
+            });
         match &update {
             _ if seeded.is_err() => seeded.err().map(Err),
             // The seed is run through the update only to be inserted, so a refusal
