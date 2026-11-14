@@ -364,3 +364,24 @@ fn a_decimal_operand_creates_a_decimal_counter_through_upsert_create() {
     w.write_update(&[UpdateOp::Inc(p("d"), Value::Int32(1))], 0).unwrap();
     assert_eq!(text(&w.visible().unwrap()[&p("d")]), "0.75");
 }
+
+/// The order entry of an `$inc` field comes with the write that creates the field: the creation
+/// alone (a member that holds only it) has no entry for a field it does not hold, and the two
+/// writes together give the field its entry and its place among the cells.
+#[test]
+fn an_increment_field_has_no_order_entry_in_the_creation_alone() {
+    use super::ord::OrdAt;
+    let list =
+        [cell("a", i(1), CellTag::Creation), inc("n", i(1)), cell("b", i(2), CellTag::Plain)];
+    let has =
+        |w: &Writer, name: &str| w.state.ords.keys().any(|(_, at)| *at == OrdAt::Field(p(name)));
+    let mut first = writer();
+    first.upsert_cells(&list, &[], 0).unwrap();
+    assert!(has(&first, "a") && has(&first, "b"));
+    assert!(!has(&first, "n"), "an order entry for a field the creation does not hold");
+    assert_eq!(names(&first), ["a", "b"]);
+    let mut both = writer();
+    both.upsert_create(&list, 0).unwrap();
+    assert!(has(&both, "n"));
+    assert_eq!(names(&both), ["a", "n", "b"]);
+}
