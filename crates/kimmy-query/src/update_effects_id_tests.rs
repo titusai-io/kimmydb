@@ -93,41 +93,6 @@ fn nested_array_index_follows_the_engines_post_image_as_it_is() {
 /// inside an array element. The effects follow the engine: the source's array is rewritten whole
 /// (`Set(items)`), the target is a `Set`, and a counter check does not apply (an array holds no
 /// counters).
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine accepts a `$rename` from inside an array element, the reference refuses it (code 2). Flip this test with that PR.
-#[test]
-fn a_rename_from_inside_an_array_element_is_a_set_of_the_array_and_a_set() {
-    let d = lines();
-    let (effects, _) = parity_doc(doc! {"$rename": {"items.0.sku": "code"}}, &d);
-    let items = Bson::Array(vec![
-        Bson::Document(doc! {"qty": 1}),
-        Bson::Document(doc! {"sku": "b", "qty": 2}),
-    ]);
-    crate::update_effects_tests::same_effects(
-        &effects,
-        &fx(|e| {
-            e.set(p("items"), v(items.clone()));
-            e.set(p("code"), v("a"));
-        }),
-        "rename out of an element",
-    );
-}
-
-/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine accepts a `$rename` into an array element, the reference refuses it (code 2). Flip this test with that PR.
-#[test]
-fn a_rename_into_an_array_element_is_an_unset_and_a_set_of_the_array() {
-    let d = lines();
-    let (effects, outcome) = parity_doc(doc! {"$rename": {"s": "arr.1"}}, &d);
-    assert!(outcome.modified());
-    crate::update_effects_tests::same_effects(
-        &effects,
-        &fx(|e| {
-            e.unset(p("s"));
-            e.set(p("arr"), v(vec![Bson::Int32(1), Bson::String("x".into())]));
-        }),
-        "rename into an element",
-    );
-}
-
 #[test]
 fn two_writes_inside_one_array_are_one_set_of_it() {
     let d = lines();

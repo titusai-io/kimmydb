@@ -74,6 +74,7 @@ pub fn apply_with_effects(
         Some(f) if update.uses_matched_position() => filter::position(f, doc)?,
         _ => None,
     };
+    refuse_renames(update, doc)?;
     let mut next = doc.clone();
     apply_to_at(update, &mut next, now_ms, Target::Existing, at.as_ref())?;
     let operations = match update {
@@ -118,6 +119,97 @@ fn pipeline_items(doc: &Document, next: &Document) -> Result<Vec<Item>> {
         }
     }
     Ok(items)
+}
+
+/// What lies in the way of a path in a document: the first value on the way down that is not a
+/// sub-document.
+enum Way {
+    Clear,
+    /// An array, named by its prefix; `index` when the next segment is a number.
+    Array {
+        prefix: String,
+        index: bool,
+    },
+    Scalar {
+        prefix: String,
+    },
+}
+
+fn way(doc: &Document, path: &str) -> Way {
+    let segments = path::segments(path);
+    let mut level = doc;
+    for (at, segment) in segments[..segments.len() - 1].iter().enumerate() {
+        let prefix = || segments[..=at].join(".");
+        match level.get(*segment) {
+            None => return Way::Clear,
+            Some(Bson::Document(child)) => level = child,
+            Some(Bson::Array(_)) => {
+                return Way::Array {
+                    prefix: prefix(),
+                    index: segments[at + 1].parse::<usize>().is_ok(),
+                };
+            }
+            Some(_) => return Way::Scalar { prefix: prefix() },
+        }
+    }
+    Way::Clear
+}
+
+fn traverse_refusal(doc: &Document, prefix: &str, path: &str) -> Error {
+    let part = prefix.rsplit('.').next().unwrap_or(prefix);
+    let held = path::resolve(doc, prefix).first().map(|v| v.to_string()).unwrap_or_default();
+    Error::InvalidUpdate(format!(
+        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
+    ))
+}
+
+/// The recorded refusals of a `$rename` (the reference's, `q7s2.out` lines 101 to 121 and 586,
+/// `q7s2d.out` lines 76 to 116), made here BEFORE the update runs, because an array element or a
+/// scalar has no counter check at the writer and the engine of this release still applies these
+/// forms: a source or a destination inside an array element (by an index or not), a source below
+/// a scalar, a destination below a scalar. Allowed, as in the reference: a whole array, a field
+/// of a sub-document, a document key spelled `0`.
+fn refuse_rename_ways(doc: &Document, source: &str, target: &str) -> Result<()> {
+    match way(doc, source) {
+        Way::Clear => {}
+        Way::Array { prefix, index: true } => {
+            return Err(Error::InvalidUpdate(format!(
+                "$rename: the source field cannot be an array element: {source:?} goes through \
+                 the array {prefix:?}"
+            )));
+        }
+        Way::Array { prefix, index: false } | Way::Scalar { prefix } => {
+            return Err(traverse_refusal(doc, &prefix, source));
+        }
+    }
+    match way(doc, target) {
+        Way::Clear => Ok(()),
+        Way::Array { prefix, .. } => Err(Error::InvalidUpdate(format!(
+            "$rename: the destination field cannot be an array element: {target:?} goes \
+             through the array {prefix:?}"
+        ))),
+        Way::Scalar { prefix } => {
+            let part = prefix.rsplit('.').next().unwrap_or(&prefix);
+            let held =
+                path::resolve(doc, &prefix).first().map(|v| v.to_string()).unwrap_or_default();
+            Err(Error::InvalidUpdate(format!(
+                "$rename: cannot create a field below the scalar in the element ({{{part}: {held}}}): \
+                 {target:?}"
+            )))
+        }
+    }
+}
+
+/// Run [`refuse_rename_ways`] for every `$rename` of `update` against `doc`.
+fn refuse_renames(update: &Update, doc: &Document) -> Result<()> {
+    if let Update::Operators(operations) = update {
+        for op in operations {
+            if let OpKind::Rename(target) = &op.kind {
+                refuse_rename_ways(doc, &op.path, target)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bad(e: impl std::fmt::Display) -> Error {
@@ -211,14 +303,11 @@ fn classify(
                 items.push(Item::Inc(to_path(&segs)?, value_of(by)?));
             }
         }
+        // a rename that goes through an array or a scalar was refused before the update ran
+        // ([`refuse_rename_ways`]): what is left is a plain move of a document field
         OpKind::Rename(target) => {
-            let to_segs = path::segments(target);
-            if crosses(&segs) || crosses(&to_segs) {
-                // inside an array element: the arrays are rewritten whole, and a missing
-                // source changes nothing, so each side is its own write (none when unchanged)
-                write_of(&segs, doc, next, hoisted, items)?;
-                write_of(&to_segs, doc, next, hoisted, items)?;
-            } else if let Some(source) = get_in(doc, &segs) {
+            if let Some(source) = get_in(doc, &segs) {
+                let to_segs = path::segments(target);
                 items.push(Item::Rename(to_path(&segs)?, to_path(&to_segs)?, value_of(source)?));
             }
         }
@@ -316,6 +405,7 @@ pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<Upse
     let mut seed = Document::new();
     let mut equalities = Vec::new();
     implied_equalities(filter, &mut seed, &mut equalities);
+    refuse_renames(update, &seed)?;
     let mut post = seed.clone();
     apply_to_at(update, &mut post, now_ms, Target::Inserted, None)?;
     let mut fx = UpsertEffects::default();
@@ -385,11 +475,8 @@ fn creation_of(
         OpKind::Unset if !crosses(&segs) => fx.set.push((to_path(&segs)?, Value::Unset)),
         OpKind::Inc(by) if !crosses(&segs) => fx.inc.push((to_path(&segs)?, value_of(by)?)),
         OpKind::Rename(target) => {
-            let to_segs = path::segments(target);
-            if crosses(&segs) || crosses(&to_segs) {
-                generic(&segs, hoisted, fx)?;
-                generic(&to_segs, hoisted, fx)?;
-            } else if let Some(source) = get_in(seed, &segs) {
+            if let Some(source) = get_in(seed, &segs) {
+                let to_segs = path::segments(target);
                 fx.set.push((to_path(&segs)?, Value::Unset));
                 fx.set.push((to_path(&to_segs)?, value_of(source)?));
             }
