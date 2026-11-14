@@ -10,7 +10,9 @@ This script shares no code with the Rust side and imports nothing from the model
 module documentation of `compact.rs` (primitives and section 10), the bytes of section 10, and checks:
   1. it parses the writer table (section 1) and the life table (section 2) out of the Rust bytes, so that the life
      index of an entry's key and the writer index in a stamp are the ones the table says, not ones it was told;
-  2. the section 10 it writes equals, byte for byte, the TAIL of the Rust bytes (section 10 is the last section);
+  2. it walks sections 3 to 9 (skipping values; no semantics), finds the offset where section 10 begins, checks that
+     the section 10 it writes starts EXACTLY there and runs exactly to the end of the bytes, and is byte for byte
+     the Rust bytes from there;
   3. the length of the Rust bytes is the pinned one (10, 273, 509, 235, 329, 163), and the 128-bit hash of the bytes,
      computed here by a hash of its own, is the pinned one (`the_compact_golden_hashes_with_the_order_state_are_pinned`).
 Exit status 0 and one line per golden when everything matches; any mismatch prints the first differing offset and exits 1.
@@ -27,6 +29,12 @@ PINS = {
     "delete": ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0),
     "obs": ("1714242f8331d6b9ca194c73191730ed", 329, 2),
     "small": ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2),
+    # NEW pins (`the_order_section_corpus_is_pinned`): states a Rust Writer builds, with every floor kind, a level mark,
+    # the root key, several writers' firsts and positions of 128 and up (see `ord_section_states`).
+    "floors_u": ("a9a3d1f267ae32cd8a3de81f1297f4af", 666, 9),
+    "floor_r": ("382bb664c7fbba70de55f428285bc2bf", 752, 11),
+    "merged": ("f0a1a9745f28949792f933ad926e68a3", 765, 11),
+    "wide": ("07488610e95f806772a5d0f593d017c0", 8226, 140),
 }
 
 M64 = (1 << 64) - 1
@@ -161,6 +169,152 @@ def section10(ords, writers, lives):
     return bytes(out)
 
 
+# ---- sections 3 to 9: a walker that only finds where each one ends ----------------------------------------------------
+
+class Walk:
+    def __init__(self, buf, pos):
+        self.b, self.p = buf, pos
+
+    def u8(self):
+        v = self.b[self.p]
+        self.p += 1
+        return v
+
+    def var(self):
+        n, self.p = read_varint(self.b, self.p)
+        return n
+
+    def skip(self, n):
+        self.p += n
+
+    def string(self):
+        self.skip(self.var())
+
+    def path(self):
+        for _ in range(self.var()):
+            self.string()
+
+    def stamp(self):
+        self.skip(10)
+        self.var()
+
+    def opt_stamp(self):
+        if self.u8():
+            self.stamp()
+
+    def payload(self, ty):
+        if ty == 2:
+            self.skip(16)
+        else:
+            self.var()
+
+    def total(self):
+        self.payload(self.u8())
+
+    def value(self):
+        tag = self.u8()
+        if tag in (0, 5, 6, 15):
+            pass
+        elif tag in (1, 2, 10):
+            self.skip(8)
+        elif tag == 3:
+            self.string()
+        elif tag == 4:
+            for _ in range(self.var()):
+                self.value()
+        elif tag == 7:
+            self.skip(4)
+        elif tag == 8:
+            self.skip(16)
+        elif tag == 9:
+            self.skip(1)
+        elif tag == 11:
+            self.skip(12)
+        elif tag == 12:
+            self.skip(1)
+            self.skip(self.var())
+        elif tag == 13:
+            self.skip(8)
+        elif tag == 14:
+            self.string()
+            self.string()
+        elif tag == 16:
+            for _ in range(self.var()):
+                self.string()
+                self.value()
+        else:
+            raise SystemExit("unknown value tag %d at %d" % (tag, self.p))
+
+    def vv(self):
+        for _ in range(self.var()):
+            self.var()
+            self.skip(10)
+
+
+def section10_start(buf):
+    """The offset at which section 10 begins: the end of section 9, found by walking sections 1 to 9."""
+    w = Walk(buf, 0)
+    for _ in range(w.var()):            # 1 writers
+        w.skip(34)
+    for _ in range(w.var()):            # 2 lives table
+        w.stamp()
+    for _ in range(w.var()):            # 3 lives
+        w.var()
+        for _ in range(w.var()):
+            w.stamp()
+        for _ in range(w.var()):
+            w.path()
+        w.u8()
+    for _ in range(w.var()):            # 4 dead
+        w.var()
+    for _ in range(w.var()):            # 5 deletes
+        w.stamp()
+        w.vv()
+    for _ in range(w.var()):            # 6 regs
+        w.var()
+        w.path()
+        flags = w.u8()
+        if not flags & 8:
+            w.stamp()
+        w.value()
+        if flags & 3:
+            if flags & 3 == 2:
+                w.stamp()
+            for _ in range(w.var()):    # the generation's seen: (life, writer, opt stamp) -> typed total
+                w.var()
+                w.var()
+                w.opt_stamp()
+                w.total()
+    for _ in range(w.var()):            # 7 slots
+        w.var()
+        w.path()
+        w.var()
+        w.opt_stamp()
+        w.stamp()
+        flags = w.u8()
+        w.payload((flags >> 1) & 3)
+        if flags & 1:
+            w.stamp()
+            w.payload((flags >> 3) & 3)
+    w.vv()                              # 8 version vector
+    for _ in range(w.var()):            # 9 losses
+        w.u8()
+        if w.u8():
+            w.path()
+        w.stamp()
+        tag = w.u8()
+        if tag == 0:
+            w.value()
+        elif tag == 1:
+            w.total()
+        elif tag == 2:
+            for _ in range(w.var()):
+                w.path()
+        else:
+            raise SystemExit("unknown loss value tag %d" % tag)
+    return w.p
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "ord_section_goldens.json")
     with open(path) as f:
@@ -174,14 +328,19 @@ def main():
         want_hash, want_len, want_entries = PINS[g["name"]]
         writers, lives = read_tables(buf)
         sec = section10(g["ords"], writers, lives)
-        tail = buf[len(buf) - len(sec):]
-        problems = []
+        start = section10_start(buf)
+        tail = buf[start:]
+        if start + len(sec) != len(buf):
+            problems_pre = ["section 10 begins at %d and the writer's takes %d B, the bytes end at %d" % (start, len(sec), len(buf))]
+        else:
+            problems_pre = []
+        problems = list(problems_pre)
         if len(g["ords"]) != want_entries:
             problems.append("entries %d, pinned %d" % (len(g["ords"]), want_entries))
         if len(buf) != want_len:
             problems.append("length %d, pinned %d" % (len(buf), want_len))
         if tail != sec:
-            first = next(i for i in range(len(sec)) if tail[i] != sec[i])
+            first = next((i for i in range(min(len(sec), len(tail))) if tail[i] != sec[i]), min(len(sec), len(tail)))
             problems.append("section 10 differs from the Rust tail at its offset %d (python %s, rust %s)" % (first, sec.hex(), tail.hex()))
         if hash128(buf).hex() != want_hash:
             problems.append("hash %s, pinned %s" % (hash128(buf).hex(), want_hash))
