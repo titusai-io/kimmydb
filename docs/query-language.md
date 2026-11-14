@@ -1329,7 +1329,11 @@ queue never hands out the same job twice.
   equalities that overlap, the same path twice or one path inside another
   (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
   and are a `400` when the upsert would insert, through every one of those forms
-  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
+  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. An `$all` of two or
+  more values is the same refusal (`path 'a' is matched twice`), where an `$all` of
+  one seeds. A filter with an `$expr` anywhere in it, beside other conditions or
+  under `$or`, is a `400` when the upsert would insert (`$expr is not allowed in
+  the query predicate for an upsert`). `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that

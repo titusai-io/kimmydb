@@ -1212,7 +1212,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
 }
 
 /// Whether a filter holds a `$expr` anywhere it is evaluated from.
-fn filter_has_expr(filter: &Filter) -> bool {
+pub(crate) fn filter_has_expr(filter: &Filter) -> bool {
     match filter {
         Filter::AlwaysTrue => false,
         Filter::And(branches) | Filter::Or(branches) => branches.iter().any(filter_has_expr),
