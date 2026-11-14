@@ -19,9 +19,9 @@ Status meanings:
 
 <a id="field-merge-refusals-q7"></a>
 
-## 🟡 Under the `field` merge policy two more updates are refused with a 400 than under `document` (Q7 step 2)
+## 🟡 Under the `field` merge policy four kinds of update are refused with a 400 where the reference applies them (Q7 step 2)
 
-**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: a 65th contributing writer to a counter; a double increment of an integer or decimal counter; an increment that takes an Int64 counter past either bound; a decimal total that cannot represent the increment; and a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has none of the 65-contributor and 256-writer limits (the `document` policy has neither). The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
+**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: (1) a 65th contributing writer to a counter; (2) a double increment of an integer or decimal counter, which the reference accepts (an integer field becomes a double; a `Decimal128` field stays a `Decimal128`, per the arithmetic table in [query-language.md](query-language.md#decimal128-arithmetic-in-updates), not a recording); (3) an increment whose `Decimal128` total cannot represent the increment exactly, where the documented arithmetic rounds once to 34 digits half to even (ADR-252) and the counter must stay exact to merge; and (4) a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has neither the 65-contributor nor the 256-writer limit. Not listed: an `$inc` past the Int64 range is refused by the reference too, so it is not a deviation. Not established from a recording: `reference-6.0.5` holds no `$inc` recording, so (2) and (3) rest on the documented behaviour above. The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
 
 **To close:** none planned; the limits are the design's (D5, Q11).
 
@@ -29,9 +29,9 @@ Status meanings:
 
 <a id="upsert-filter-field-incremented-q7"></a>
 
-## 🟡 Under the `field` merge policy an upsert that increments a field its own filter names is refused with a 400
+## 🟡 Under the `field` merge policy an upsert that creates a document and increments a field its own filter names is refused with a 400
 
-**Raised with the Q7 step 2 effects interface.** `update` with `upsert: true`, a filter `{a: 5}` and `{$inc: {a: 1}}`, matching nothing, creates `{a: 6}` in the reference. Here it is refused (`Overlap`) at parse time: the filter's field is written by the creation, and a counter slot beside a creation register belongs to no generation of it (the design's overlap refusal). The same holds when the `$inc` path is an ancestor or a descendant of a filter path. Giving a creation register a slot of its own write is a merge-model change, not in scope.
+**Raised with the Q7 step 2 effects interface.** `update` with `upsert: true`, a filter `{a: 5}` and `{$inc: {a: 1}}`, matching nothing, creates `{a: 6}` in the reference. Here the creation path refuses it (`Overlap`): when no document matches, the filter's field is written by the creation, and a counter slot beside a creation register belongs to no generation of it (the design's overlap refusal). The same holds when the `$inc` path is above or below a filter leaf. An upsert that MATCHES a document is an ordinary update and is not refused (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})` increments). Giving a creation register a slot of its own write is a merge-model change, not in scope.
 
 **Workaround:** increment a field the filter does not name, or `$set` the computed value.
 
