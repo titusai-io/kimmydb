@@ -17,6 +17,26 @@ Status meanings:
 
 ---
 
+<a id="field-merge-refusals-q7"></a>
+
+## 🟡 Under the `field` merge policy two more updates are refused with a 400 than under `document` (Q7 step 2)
+
+**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: a 65th contributing writer to a counter; a double increment of an integer or decimal counter; an increment that takes an Int64 counter past either bound; a decimal total that cannot represent the increment; and a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has none of the 65-contributor and 256-writer limits (the `document` policy has neither). The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
+
+**To close:** none planned; the limits are the design's (D5, Q11).
+
+---
+
+<a id="rename-of-a-counter-q7"></a>
+
+## 🟡 Under the `field` merge policy `$rename` of any integer or decimal field, or of a sub-document holding one, is refused with a 400
+
+**Raised with the Q7 step 2 effects interface.** A counter's slots cannot move, and the writer cannot tell a field that was ever incremented from a plain integer: every visible `Int32`, `Int64` or `Decimal128` cell at the source path or below it counts (a double, a string and an array do not). The reference renames them. A concurrent first `$inc` elsewhere can still race a rename that was accepted, and its increments reappear on the source path (design U2). Chris has been told and may narrow it.
+
+**To close:** a rename that carries the slots, or a rule that narrows the refusal to fields that were incremented. S2a and S2b record the choice.
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches
