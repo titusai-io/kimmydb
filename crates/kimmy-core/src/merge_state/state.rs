@@ -569,6 +569,7 @@ pub(crate) fn sub_ret(h: Hlc, ret: u64) -> Hlc {
 }
 
 impl MergeState {
+    #[cfg(any(test, feature = "merge-mutants"))]
     /// Every counter amount the state holds: slot totals, their absorbed totals, the `seen`
     /// entries of the generations of the registers, and the lost totals.
     pub(crate) fn totals(&self) -> impl Iterator<Item = &Num> {

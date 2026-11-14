@@ -2293,7 +2293,8 @@ fn a_null_and_an_unset_merge_and_encode_as_different_values() {
 
 #[test]
 fn the_pinned_mixed_golden_holds_a_whole_document_loss() {
-    // This is why the version 1 form keeps its ambiguous key: a pinned golden has the record.
+    // The version 1 form keeps its ambiguous key (the legacy bytes are pinned, and the golden holds the
+    // record); the compact form, which is the hash, tags the document and has no ambiguity.
     let st = golden_mixed();
     assert!(
         st.losses.keys().any(|k| k.kind == LossKind::InsertLost && k.at == LossAt::Document),
