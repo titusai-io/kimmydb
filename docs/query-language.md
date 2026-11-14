@@ -687,6 +687,19 @@ through an array by a field name, is refused as a traverse whether or not
 anything lies beyond it, naming the part that holds the value, and without
 looking at the destination.
 
+**Under the `field` merge policy, `$rename` of a number that has been incremented
+is a `400`.** An increment keeps its own slot per member, and a slot cannot move,
+so a field that is an integer or decimal now and has been incremented (or a
+sub-document that holds one) keeps its name, even after a numeric `$set` has
+replaced its value. An integer or decimal field that was only inserted, set or
+replaced is renamed like any other, and so is an incremented field that is no
+longer a number (set to a string, a document or an array, or unset), until it
+holds a number again: a name that was incremented, freed and used as a number
+again in the same document is refused again, because the slot lives as long as
+the document does (a delete and re-insert clears it). To move an
+incremented field, `$set` the new name and `$unset` the old one. Under the
+`document` policy the rename always applies.
+
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator

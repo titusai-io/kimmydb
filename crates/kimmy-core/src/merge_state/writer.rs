@@ -395,17 +395,25 @@ impl Writer {
             matches!(v.get(p), Some(Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_)))
         })
     }
-    /// Read-only: is `p` itself, or any path below it, a counter cell the writer sees (see
-    /// [`Writer::sees_counter`])? A `$rename` is leaf effects, so renaming a sub-document renames
-    /// every counter cell under it and the slots cannot move. An array is an atomic register: its
-    /// elements are never counters.
-    pub fn sees_counter_at_or_under(&self, p: &Path) -> bool {
-        self.visible().is_some_and(|v| {
-            v.iter().any(|(k, val)| {
-                matches!(val, Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_))
-                    && (k == p || k.ancestors().any(|a| a == *p))
-            })
-        })
+    /// Read-only: is `p` itself, or any path below it, AT THIS MOMENT a visible `Int32`, `Int64` or
+    /// `Decimal128` cell that holds a counter SLOT in an alive life the writer sees (a slot of any
+    /// generation, absorbed or not)? This is the `$rename` test: a slot cannot move, so a numeric
+    /// field that an integer or decimal `$inc` has written a slot for keeps its name, and so does a
+    /// sub-document holding one. A numeric cell with a base and no slot (an insert, a `$set`, a
+    /// replace, a creating upsert's filter, `$set` or `$setOnInsert`) is a register and is renamed
+    /// as `Unset(source)` + `Set(target, value)`. A field that was incremented and is no longer a
+    /// number (set to a string, a document or an array, unset, replaced away) is renamed like any
+    /// other; a numeric `$set` over an incremented field does not free it. An array is an atomic
+    /// register and never holds a slot. A slot of a dead life does not count. Only the writer's own
+    /// state decides, never a `Document`.
+    pub fn is_incremented_number_at_or_under(&self, p: &Path) -> bool {
+        let Some(vis) = self.visible() else { return false };
+        let alive: BTreeSet<MStamp> = self.alive().into_iter().collect();
+        let slotted: BTreeSet<&Path> =
+            self.state.slots.keys().filter(|k| alive.contains(&k.0)).map(|k| &k.1).collect();
+        let numeric =
+            |v: &Value| matches!(v, Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_));
+        vis.iter().any(|(k, v)| (k == p || k.is_below(p)) && numeric(v) && slotted.contains(k))
     }
     pub fn hidden_all(&self) -> BTreeMap<Path, i128> {
         self.state.hidden_all(&self.opts)
@@ -1390,11 +1398,13 @@ pub enum UpdateRefused {
     /// The document already has [`MAX_WRITERS`] writers and this writer is not one.
     #[error("merge state: the document has {MAX_WRITERS} writers already")]
     WriterCap,
-    /// A `$rename` whose source, or any path below it, this writer sees as a counter (an `Int32`,
-    /// `Int64` or `Decimal128` cell, base and/or slots, see [`Writer::sees_counter_at_or_under`]): a
-    /// counter cannot be renamed. Raised by
+    /// A `$rename` whose source, or a path below it, is at this moment a number (`Int32`, `Int64`
+    /// or `Decimal128`) that an `$inc` has written a slot for (see
+    /// [`Writer::is_incremented_number_at_or_under`]): a slot cannot be renamed. Raised by
     /// the effects layer (`kimmy_core::effects::Effects::apply`) before anything is written.
-    #[error("merge state: {0} is a counter and cannot be renamed")]
+    #[error(
+        "merge state: {0}, or a field below it, is a number that has been incremented and cannot be renamed ($set the new name and $unset the old one)"
+    )]
     RenameOfCounter(Path),
 }
 
@@ -1463,8 +1473,9 @@ impl Writer {
     /// [`Writer::write_update`] for an update that also holds `$rename`s, whose sources are
     /// `renames` (the `Unset(from)` and `Set(to, value)` of each are in `ops`). It refuses with
     /// [`UpdateRefused::RenameOfCounter`] before anything else when a source, or any path below
-    /// it, is a counter the writer sees ([`Writer::sees_counter_at_or_under`]): no stamp, no clock
-    /// move. `kimmy_core::effects::Effects::apply` is its caller.
+    /// it, is an incremented number the writer sees
+    /// ([`Writer::is_incremented_number_at_or_under`]): no stamp, no clock move.
+    /// `kimmy_core::effects::Effects::apply` is its caller.
     pub fn write_update_renaming(
         &mut self,
         ops: &[UpdateOp],
@@ -1488,7 +1499,7 @@ impl Writer {
     }
 
     fn refuse_counter_rename(&self, renames: &[Path]) -> Result<(), UpdateRefused> {
-        match renames.iter().find(|p| self.sees_counter_at_or_under(p)) {
+        match renames.iter().find(|p| self.is_incremented_number_at_or_under(p)) {
             Some(p) => Err(UpdateRefused::RenameOfCounter(p.clone())),
             None => Ok(()),
         }
