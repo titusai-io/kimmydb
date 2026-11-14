@@ -332,6 +332,9 @@ fn between_stages_id_is_whatever_the_stages_made_it() {
     assert_eq!(out, doc! {"_id": 1, "seen": "missing"});
 }
 
+/// A result numerically equal to the stored `_id` in another numeric type is accepted and the
+/// new type is stored (q7s2s.jsonl cases 1-2 `$toLong`, 5-6 `$toDecimal`, 11-12 a long
+/// literal, 29-30 `$add` of a long zero, 41-42 `$replaceWith`, 53-54 `$replaceRoot`).
 #[test]
 fn id_changed_to_the_same_id_of_another_type_is_stored_as_it_is() {
     let out =
@@ -497,4 +500,107 @@ fn an_update_pipeline_is_held_to_a_thousand_stages() {
         refused(sets(1_001)),
         "invalid update: an update pipeline has 1001 stages, over the limit of 1000"
     );
+}
+
+fn stored_one() -> Document {
+    doc! {"_id": 1, "a": 1}
+}
+
+fn id_after(pipeline: Vec<Document>) -> Option<Bson> {
+    apply(pipeline, stored_one()).unwrap().get("_id").cloned()
+}
+
+#[test]
+fn a_pipeline_storing_the_same_number_in_another_type_stores_the_new_type() {
+    let long = Some(Bson::Int64(1));
+    assert_eq!(id_after(vec![doc! {"$set": {"_id": {"$toLong": "$_id"}}}]), long);
+    assert_eq!(id_after(vec![doc! {"$set": {"_id": 1_i64}}]), long);
+    assert_eq!(id_after(vec![doc! {"$set": {"_id": {"$add": ["$_id", 0_i64]}}}]), long);
+    let replaced = apply(vec![doc! {"$replaceWith": {"_id": 1_i64, "z": 1}}], stored_one());
+    assert_eq!(replaced.unwrap(), doc! {"_id": 1_i64, "z": 1});
+    let root =
+        apply(vec![doc! {"$replaceRoot": {"newRoot": {"_id": 1_i64, "z": 1}}}], stored_one());
+    assert_eq!(root.unwrap(), doc! {"_id": 1_i64, "z": 1});
+    let decimal = id_after(vec![doc! {"$set": {"_id": {"$toDecimal": "$_id"}}}]);
+    assert!(matches!(decimal, Some(Bson::Decimal128(_))));
+}
+
+/// A double `_id` is stored by the reference (jsonl 3-4 `$toDouble`, 13-14, 47-48) and is
+/// refused here, as a double `_id` is everywhere (the `_id` types deviation).
+#[test]
+fn a_pipeline_making_the_id_a_double_is_refused() {
+    for stage in [
+        doc! {"$set": {"_id": {"$toDouble": "$_id"}}},
+        doc! {"$set": {"_id": 1.0}},
+        doc! {"$replaceWith": {"_id": {"$toDouble": "$_id"}, "z": 1}},
+    ] {
+        let message = apply(vec![stage.clone()], stored_one()).unwrap_err().to_string();
+        assert!(message.contains("_id is immutable"), "{stage}: {message}");
+    }
+}
+
+/// A result of the same type and value is no change (jsonl 7-8 `$toInt`, 17-18 a literal,
+/// 25-26 `$add` of 0, 33-34 `"$_id"`, 63-64 a long and back, 65-66 `_id` unset and set from
+/// a field).
+#[test]
+fn a_pipeline_leaving_the_same_id_changes_nothing() {
+    for pipeline in [
+        vec![doc! {"$set": {"_id": {"$toInt": "$_id"}}}],
+        vec![doc! {"$set": {"_id": 1}}],
+        vec![doc! {"$set": {"_id": {"$add": ["$_id", 0]}}}],
+        vec![doc! {"$set": {"_id": "$_id"}}],
+        vec![doc! {"$set": {"_id": 1_i64}}, doc! {"$set": {"_id": {"$toInt": "$_id"}}}],
+        vec![doc! {"$unset": "_id"}, doc! {"$set": {"_id": "$$ROOT.a"}}],
+    ] {
+        assert_eq!(apply(pipeline.clone(), stored_one()).unwrap(), stored_one(), "{pipeline:?}");
+    }
+}
+
+/// A result that differs in value, or is a string, null, document or array where a number
+/// was, is refused (jsonl 9 `$toString`, 19, 23, 27, 35, 37, 39 an array, 49), and the
+/// mirror over a string `_id` (79 a long over "a").
+#[test]
+fn a_pipeline_changing_the_id_is_refused() {
+    for stage in [
+        doc! {"$set": {"_id": {"$toString": "$_id"}}},
+        doc! {"$set": {"_id": "a"}},
+        doc! {"$set": {"_id": {"$literal": 2}}},
+        doc! {"$set": {"_id": {"$add": ["$_id", 1]}}},
+        doc! {"$set": {"_id": Bson::Null}},
+        doc! {"$set": {"_id": {"k": 1}}},
+        doc! {"$set": {"_id": [1]}},
+        doc! {"$replaceWith": {"_id": {"$add": ["$_id", 1]}, "z": 1}},
+    ] {
+        let message = apply(vec![stage.clone()], stored_one()).unwrap_err().to_string();
+        assert!(message.contains("_id is immutable"), "{stage}: {message}");
+    }
+    let over_string = apply(vec![doc! {"$set": {"_id": 1_i64}}], doc! {"_id": "a", "a": 1});
+    assert!(over_string.unwrap_err().to_string().contains("_id is immutable"));
+    let same = apply(vec![doc! {"$set": {"_id": {"$toString": "$_id"}}}], doc! {"_id": "a"});
+    assert_eq!(same.unwrap(), doc! {"_id": "a"});
+}
+
+/// A pipeline that removes `_id` is applied and the stored `_id` is put back, first, with
+/// its stored value and type (jsonl 55-56 `$project {_id: 0}`, 57-58, 59-60 `$unset`, 61-62,
+/// 51-52 `$replaceWith {z: 1}`).
+#[test]
+fn a_pipeline_removing_the_id_has_it_restored() {
+    let want = |rest: Document| {
+        let mut d = doc! {"_id": 1};
+        d.extend(rest);
+        d
+    };
+    let cases: Vec<(Vec<Document>, Document)> = vec![
+        (vec![doc! {"$project": {"_id": 0}}], want(doc! {"a": 1})),
+        (vec![doc! {"$project": {"_id": 0, "a": 1}}], want(doc! {"a": 1})),
+        (vec![doc! {"$unset": "_id"}], want(doc! {"a": 1})),
+        (vec![doc! {"$unset": ["_id", "a"]}], want(doc! {})),
+        (vec![doc! {"$replaceWith": {"z": 1}}], want(doc! {"z": 1})),
+    ];
+    for (pipeline, expected) in cases {
+        let out = apply(pipeline.clone(), stored_one()).unwrap();
+        assert_eq!(out, expected, "{pipeline:?}");
+        assert_eq!(out.get("_id"), Some(&Bson::Int32(1)), "{pipeline:?}");
+        assert_eq!(out.keys().next().map(String::as_str), Some("_id"));
+    }
 }

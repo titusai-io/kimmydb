@@ -209,10 +209,6 @@ pub fn parse(doc: &Document) -> Result<Update> {
 /// always a misspelt identifier, and applying the update regardless would
 /// change elements the caller never selected.
 pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<Update> {
-    parse_operators(doc, array_filters, false)
-}
-
-fn parse_operators(doc: &Document, array_filters: &[Document], upsert: bool) -> Result<Update> {
     // One date for every `$$NOW` of the update and its `arrayFilters` (ADR-253).
     let _clock = crate::expr::RequestClock::open();
     let has_operators = doc.keys().any(|k| k.starts_with('$'));
@@ -242,7 +238,10 @@ fn parse_operators(doc: &Document, array_filters: &[Document], upsert: bool) -> 
             return Err(Error::InvalidUpdate(format!("${op} requires a document")));
         };
         for (target_path, arg) in targets {
-            if touches_id(target_path) && !upsert {
+            // `_id` itself may be named: a matched document is judged by the result
+            // (see `settle_matched_id`), an inserted one by `settle_inserted_id`. A path
+            // below it is refused, whatever the document holds (q7s2r.out r0177).
+            if under_id(target_path) {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
             let kind = parse_op(op, arg)?;
@@ -681,6 +680,10 @@ fn conflict(
 /// past a check that only knew the literal name. That relocates the document
 /// out from under every index entry and oplog record that named it, silently.
 /// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
+fn under_id(path: &str) -> bool {
+    path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
+}
+
 fn touches_id(path: &str) -> bool {
     path == ID_FIELD || path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
 }
@@ -780,16 +783,6 @@ fn parse_pull(arg: &Bson) -> Result<OpKind> {
         )));
     }
     Ok(OpKind::Pull(arg.clone()))
-}
-
-/// Parse an update that an upsert may insert with. [`apply_on_insert`] is the
-/// entry point for the document it creates.
-///
-/// It differs from [`parse_with_filters`] in one thing: an operator may name
-/// `_id`. The refusal moves to the application: the document an upsert inserts
-/// may take it (see [`apply_on_insert`]), a document that matched never does.
-pub fn parse_for_upsert(doc: &Document, array_filters: &[Document]) -> Result<Update> {
-    parse_operators(doc, array_filters, true)
 }
 
 /// `$bit`'s specification: a non-empty document of `and`, `or` and `xor`, each
@@ -985,7 +978,62 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
     apply_to_at(update, doc, now_ms, target, None)
 }
 
+/// Every update of every document goes through here, and a document that matched
+/// leaves through [`settle_matched_id`]: the one place its `_id` is judged. The
+/// routes (`update`, `find_and_modify`, `multi`, a pipeline update) reach it by
+/// [`apply`] and [`apply_matched`] and have no other way to a post-image.
 fn apply_to_at(
+    update: &Update,
+    doc: &mut Document,
+    now_ms: i64,
+    target: Target,
+    at: Option<&ArrayPosition>,
+) -> Result<()> {
+    let stored_id = (target == Target::Existing).then(|| doc.get(ID_FIELD).cloned());
+    apply_update_at(update, doc, now_ms, target, at)?;
+    if let Some(stored_id) = stored_id {
+        settle_matched_id(update, stored_id, doc)?;
+    }
+    Ok(())
+}
+
+/// The `_id` of a document that matched, once the update has run, judged by the result.
+///
+/// An operator update leaves it as it was, in value and type, compared as stored (`$set: {_id: 1}` over `1` is no change, over `1i64` or `1.0` it is a refusal:
+/// q7s2r.out r0137-r0148, r0163-r0176, r0191-r0194). A replacement keeps it as the same
+/// `DocId`, stored as the body wrote it (r0183-r0188), and so does a pipeline update
+/// (q7s2s.jsonl 1-2, 5-6, 11-12, 29-30, 41-42, 53-54). A result that dropped it, as `$unset`
+/// and a rename do, is refused (r0149-r0152); a pipeline that drops it has had the stored
+/// one put back before this runs (r0195; q7s2s.jsonl 51-62).
+fn settle_matched_id(update: &Update, stored: Option<Bson>, doc: &Document) -> Result<()> {
+    let now = doc.get(ID_FIELD);
+    let kept = match (update, stored.as_ref(), now) {
+        (_, None, None) => true,
+        // The same document id, stored as written: a replacement (r0185) and a pipeline
+        // update, which may leave `1` as `1i64` (UNRECORDED for a pipeline).
+        (Update::Replace(_) | Update::Pipeline(_), Some(was), Some(is)) => {
+            matches!(
+                (DocId::try_from_bson(was), DocId::try_from_bson(is)),
+                (Ok(was), Ok(is)) if was == is
+            )
+        }
+        (Update::Replace(_), ..) => false,
+        (_, Some(was), Some(is)) => was == is,
+        _ => false,
+    };
+    if kept {
+        return Ok(());
+    }
+    let show = |id: Option<&Bson>| id.map_or_else(|| "none".to_string(), ToString::to_string);
+    Err(Error::InvalidUpdate(format!(
+        "_id is immutable and cannot be updated: the document's is {}, and the update would \
+         make it {}",
+        show(stored.as_ref()),
+        show(now)
+    )))
+}
+
+fn apply_update_at(
     update: &Update,
     doc: &mut Document,
     now_ms: i64,
@@ -1072,13 +1120,11 @@ fn apply_to_at(
                 .into(),
         ));
     }
-    // An operator names `_id` only in an upsert's update (see [`parse_for_upsert`]).
-    // A document that matched has its id and keeps it; the one an upsert inserts
-    // may take the operators' (see `settle_inserted_id`).
-    let names_id = operations.iter().any(|op| applies(op) && touches_id(&op.path));
-    if names_id && target == Target::Existing {
-        return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
-    }
+    // The document an upsert inserts may take the id the operators give it, if the
+    // filter gave none (see `settle_inserted_id`); a matched one is judged by
+    // `settle_matched_id`, which `apply_to_at` runs for every update.
+    let names_id = target == Target::Inserted
+        && operations.iter().any(|op| applies(op) && touches_id(&op.path));
     let seeded_id = if names_id { doc.get(ID_FIELD).cloned() } else { None };
     let concrete = concrete_paths(operations, doc, at, applies)?;
     if operations.iter().any(|op| has_positional(&op.path)) {
@@ -2345,10 +2391,89 @@ mod tests {
         assert!(err.contains("cannot mix"), "unhelpful error: {err}");
     }
 
+    /// An operator may name `_id`; a matched document is judged by the result, so the
+    /// operators that leave it as stored apply and no write is made (q7s2r.out lines
+    /// are those of the plain variant: r0137 2101, r0163 2257, r0165 2269, r0169 2293,
+    /// r0173 2317, r0175 2329). Every update here is a refusal in the old reading.
+    #[test]
+    fn a_matched_document_takes_an_operator_that_leaves_its_id_as_it_is() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        for update in [
+            doc! { "$set": { "_id": 1 } },
+            doc! { "$min": { "_id": 1 } },
+            doc! { "$max": { "_id": 1 } },
+            doc! { "$inc": { "_id": 0 } },
+            doc! { "$mul": { "_id": 1 } },
+            doc! { "$bit": { "_id": { "or": 0 } } },
+            // `$setOnInsert` is for an insert: skipped, whatever it holds (r0159 2233, r0161 2245).
+            doc! { "$setOnInsert": { "_id": 1 } },
+            doc! { "$setOnInsert": { "_id": 2 } },
+            // A rename of a field that is not there moves nothing (r0155 2209).
+            doc! { "$rename": { "y": "_id" } },
+        ] {
+            assert_eq!(applied(update.clone(), stored()), stored(), "{update}");
+        }
+        // Beside a real change, r0179 line 2353.
+        assert_eq!(
+            applied(doc! { "$set": { "_id": 1, "a": 2 } }, stored()),
+            doc! { "_id": 1, "a": 2 }
+        );
+    }
+
+    /// The result decides: another value, another type of the same number, a lost `_id`
+    /// and a write below it are refused with the document as it was (q7s2r.out r0139 2113,
+    /// r0141 2125, r0143 2137, r0145 2149, r0147 2161, r0149 2173, r0151 2185, r0153 2197,
+    /// r0157 2221, r0167 2281, r0171 2305, r0177 2341, r0181 2365).
+    #[test]
+    fn a_matched_document_refuses_an_operator_that_changes_its_id() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        let decimal = Bson::Decimal128("1".parse().unwrap());
+        for update in [
+            doc! { "$set": { "_id": 1_i64 } },
+            doc! { "$set": { "_id": 1.0 } },
+            doc! { "$set": { "_id": decimal } },
+            doc! { "$set": { "_id": 2 } },
+            doc! { "$set": { "_id": "1" } },
+            doc! { "$unset": { "_id": "" } },
+            doc! { "$rename": { "_id": "y" } },
+            doc! { "$rename": { "a": "_id" } },
+            doc! { "$max": { "_id": 5 } },
+            doc! { "$inc": { "_id": 1 } },
+            doc! { "$set": { "_id.x": 1 } },
+            doc! { "$set": { "a": 2, "_id": 2 } },
+        ] {
+            let message = apply_err(update.clone(), stored());
+            assert!(message.contains("_id is immutable"), "{update}: {message}");
+        }
+    }
+
+    /// `$rename _id -> _id` is refused too (r0157 2221, a refusal of its own there).
+    #[test]
+    fn a_rename_of_the_id_onto_itself_is_refused() {
+        assert!(!apply_err(doc! { "$rename": { "_id": "_id" } }, doc! { "_id": 1 }).is_empty());
+    }
+
+    /// A replacement keeps the same `DocId`, stored as the body wrote it (r0183 2377,
+    /// r0185 2389), and another is refused (r0187 2401); a body with no `_id` keeps the
+    /// stored one (r0189).
+    #[test]
+    fn a_replacement_of_a_matched_document_keeps_the_same_doc_id() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        assert_eq!(applied(doc! { "_id": 1, "z": 1 }, stored()), doc! { "_id": 1, "z": 1 });
+        let out = applied(doc! { "_id": 1_i64, "z": 1 }, stored());
+        assert_eq!(out.get("_id"), Some(&Bson::Int64(1)));
+        assert_eq!(applied(doc! { "z": 1 }, stored()), doc! { "_id": 1, "z": 1 });
+        assert!(apply_err(doc! { "_id": 2, "z": 1 }, stored()).contains("_id is immutable"));
+    }
+
     #[test]
     fn operators_may_not_touch_id() {
-        assert!(parse(&doc! { "$set": { "_id": 1 } }).is_err());
-        assert!(parse(&doc! { "$unset": { "_id": "" } }).is_err());
+        // Naming `_id` parses; what a matched document may do with it is judged by the
+        // result (see `a_matched_document_takes_an_operator...`). An `$unset` is refused.
+        assert!(parse(&doc! { "$set": { "_id": 1 } }).is_ok());
+        assert!(
+            apply_err(doc! { "$unset": { "_id": "" } }, doc! { "_id": 1 }).contains("immutable")
+        );
         assert!(parse(&doc! { "$rename": { "a": "_id" } }).is_ok_and(|u| {
             let mut d = doc! { "_id": 1, "a": 2 };
             apply(&u, &mut d, NOW).is_err()
@@ -3553,9 +3678,18 @@ mod tests {
         assert!(err.contains(&format!("at \"items.{}.a\"", n - 1)), "{err}");
     }
 
+    /// `$setOnInsert` of `_id` parses, and on a document that matched it is skipped, whatever
+    /// it holds: q7s2r.out r0159 (line 2233) and r0161 (line 2245). It is for an insert, where
+    /// the filter's id decides (see `settle_inserted_id`).
     #[test]
-    fn set_on_insert_may_not_touch_id() {
-        assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_err());
+    fn set_on_insert_of_id_is_skipped_on_a_matched_document() {
+        assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_ok());
+        for id in [1, 2] {
+            assert_eq!(
+                applied(doc! { "$setOnInsert": { "_id": id } }, doc! { "_id": 1, "a": 1 }),
+                doc! { "_id": 1, "a": 1 }
+            );
+        }
     }
 
     fn dec(text: &str) -> Bson {

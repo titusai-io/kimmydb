@@ -1091,7 +1091,7 @@ fn m_two_digit_names_of_one_value_are_told_apart_by_their_bytes() {
 
 /// The update, parsed as an upsert's, applied to the seed an upsert inserts.
 fn upserted_id(update: Document, mut seed: Document) -> Result<Document, String> {
-    let parsed = update::parse_for_upsert(&update, &[]).map_err(|e| e.to_string())?;
+    let parsed = update::parse(&update).map_err(|e| e.to_string())?;
     update::apply_on_insert(&parsed, &mut seed, NOW).map_err(|e| e.to_string())?;
     Ok(seed)
 }
@@ -1164,14 +1164,21 @@ fn n_an_upsert_whose_filter_gives_no_id_may_set_any() {
 }
 
 #[test]
-fn n_a_stored_document_still_cannot_be_given_an_id_by_operators() {
-    // UNRECORDED for an operator update of a stored document: refused, as it was.
-    let parsed = update::parse_for_upsert(&doc! { "$set": { "_id": 5 } }, &[]).unwrap();
-    let mut stored = doc! { "_id": 5, "a": 1 };
-    let err = update::apply(&parsed, &mut stored, NOW).unwrap_err().to_string();
-    assert!(err.contains("_id is immutable"), "{err}");
-    // And an update that is not an upsert's still refuses it as it parses.
-    refused(updated(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5 }), "_id is immutable");
+fn n_a_stored_document_is_judged_by_the_result_on_its_id() {
+    // q7s2r.out r0137 (line 2101): the same id is accepted and is no change; r0145 (line
+    // 2149) and r0139 (line 2113): another id, or another type of the number, is refused.
+    same(
+        updated(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5, "a": 1 }),
+        doc! { "_id": 5, "a": 1 },
+    );
+    refused(updated(doc! { "$set": { "_id": 6 } }, doc! { "_id": 5 }), "_id is immutable");
+    refused(updated(doc! { "$set": { "_id": 5_i64 } }, doc! { "_id": 5 }), "_id is immutable");
+    // r0155 (line 2209): a rename of a missing field onto `_id`, on a matched document that
+    // is not an upsert's, moves nothing.
+    same(
+        updated(doc! { "$rename": { "y": "_id" } }, doc! { "_id": 5, "a": 1 }),
+        doc! { "_id": 5, "a": 1 },
+    );
 }
 
 #[test]

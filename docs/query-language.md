@@ -1175,19 +1175,38 @@ another numeric type it is stored as written, `NumberLong(1)` over the 32-bit
 as `1.0`, is refused, and a body with no `_id` keeps the stored one.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
-document:
+document, and a document that matched is **judged by the result**, in one place for
+every route (`update`, `multi`, `find_and_modify`, an operator update and a pipeline
+update):
 
 ```javascript
-// Rejected at parse time (an update that cannot insert)
-{ "$set": { "_id": 2 } }
-// Rejected when the result is known (a pipeline update)
+// Accepted, and no change (modified 0): the result is the stored _id, in value and type
+{ "$set": { "_id": 1 } }            // over _id: 1
+{ "$inc": { "_id": 0 } }  { "$mul": { "_id": 1 } }  { "$max": { "_id": 1 } }
+{ "$setOnInsert": { "_id": 2 } }    // skipped on a document that matched, whatever it holds
+{ "$rename": { "y": "_id" } }       // y is not there: nothing is moved
+[ { "$set": { "_id": 1 } } ]
+
+// Refused, 400: another value, another type of the same number (operators), a lost _id, a write below it
+{ "$set": { "_id": 2 } }  { "$set": { "_id": NumberLong(1) } }  { "$set": { "_id": 1.0 } }
+{ "$unset": { "_id": "" } }  { "$rename": { "_id": "y" } }  { "$rename": { "a": "_id" } }
+{ "$inc": { "_id": 1 } }  { "$max": { "_id": 5 } }  { "$set": { "_id.x": 1 } }
 [ { "$set": { "_id": 2 } } ]
 
+// A pipeline that leaves no _id has the stored one put back
+[ { "$unset": "_id" } ]
+
+// A replacement keeps the same _id as a document id, stored as the body wrote it
+{ "_id": 1, "item": "widget" }      // and {_id: NumberLong(1)} over _id: 1 stores the long
 // A replacement naming another _id is a 400 — the document is not relocated
 { "_id": 999, "item": "widget" }
-// Accepted: the same _id, or none (the stored one is kept)
-{ "_id": 7, "item": "widget" }
 ```
+
+The comparison of an operator result is of the value and its type as stored, so the
+same number of another type is a change of `_id` and is refused; a replacement and a
+pipeline update read `1` and `NumberLong(1)` as one id and store it as written (a result
+that is a double is refused, as a double `_id` is everywhere), and a pipeline that removes
+`_id` has the stored one put back.
 
 **An upsert's operators may name `_id`, so long as the id the filter gives
 holds.** With `upsert`, an operator update of `_id` is applied to the document
