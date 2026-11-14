@@ -32,9 +32,16 @@
 //!    "a.1": 2}` is `Set(a, [1, 2, ..])`; expressed as two leaf `Set`s of `a.0` and `a.1` it is
 //!    `BelowScalar`, and `Set(a)` beside `Set(a.0)` is `Overlap`.
 //! 5. Order is the POST-IMAGE order: S2b lists the effects (and the new fields of an upsert) in the
-//!    order of the existing engine's post-image (what `apply_to_at` in `kimmy-query/src/update.rs`
-//!    produces today), so `field` and `document` collections give the same field order; the same
-//!    update on the same document yields the same list. No sorting here, no guessing.
+//!    order of the engine's post-image (`apply_to_at` in `kimmy-query/src/update.rs`, and the
+//!    `UpsertPlan`'s `post_image` for an upsert), so `field` and `document` collections give the
+//!    same field order; the same update on the same document yields the same list. RECORDED
+//!    (`q7s2-probes/reference-6.0.5/q7s2.out`): the reference adds new fields in SORTED order at
+//!    each level (`_id` first, existing fields in place; lines 143-173); in an upsert the filter's
+//!    equality fields come first, sorted, then every new field from `$set`, `$setOnInsert`, `$inc`
+//!    and the register operators, sorted TOGETHER (lines 189-204). The engine is being fixed on
+//!    main to do this (separate PRs: new-field order; numeric path components and `$set` below a
+//!    scalar; `$rename` inside arrays), so ONE engine stays the source of truth and the effects
+//!    follow its (fixed) post-image order. No sorting here, no guessing.
 //! 6. `Set(path, Value::Unset)` is an `Unset`; the writer normalises it.
 //! 7. A refusal changes nothing (no stamp, no clock move): the whole update is refused.
 //! 8. A [`Path`]'s `Display` is LOSSY (it joins the segments with `.`, so `a.b` as one segment and
@@ -60,10 +67,15 @@
 //! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded); NO effects when the source is absent (a no-op, as in the reference) | disjoint paths required (else `Overlap`); `a` or any path below it that the WRITER sees as a counter is `RenameOfCounter(a)` (400), see below; a target that is a counter is just a `Set` (folds), allowed |
 //! | `$setOnInsert` | none on update; `UpsertEffects::set_on_insert` on an insert | no-op on an existing document |
 //! | pipeline update (ADR-265) | `Set(top_field, Document)` per CHANGED top-level field (or `Unset(top_field)`), one list, never an ancestor and a descendant together | not `write_replace` (a replace reorders fields); the writer's diff writes only the changed leaves and unsets only what it saw; each path is a [`Path`] of one segment per name (S2b item below) |
-//! | replace-style update | not an effect list | stays the replace path of the storage layer |
+//! | replace-style update | not an effect list | stays the replace path of the storage layer; RECORDED (`q7s2b.out` 112-158, `runCommand`): a replacement upsert creates `{_id: generated}` plus the body, the filter field is NOT carried (q `{k: 1}`, u `{v: 2}` gives `{_id: generated, v: 2}`), an `_id` in the filter or the body is used, a different `_id` in both is code 66, a replacement of an existing document drops the other fields, the operator form `{$set: {v: 2}}` keeps the filter field |
 //! | any operator on a missing document | `UpdateRefused::NoLife` | not a 400: matched 0 (see "Outcome mapping"); an upsert goes through [`UpsertEffects`] |
 //! | any two operators on overlapping paths | `UpdateRefused::Overlap` | whole update refused |
 //! | a new writer past the caps | `UpdateRefused::WriterCap` | whole update refused |
+//!
+//! Note on `$rename` in arrays: the reference refuses a `$rename` whose source or destination is an
+//! array element, or goes through an array (`q7s2.out` lines 101-121, 586). Once the engine refuses
+//! it too (a separate PR on main), the array-crossing `$rename` decomposition is dead code and S2b
+//! removes it.
 //!
 //! # Counters: `$rename`, and `$mul`/`$min`/`$max` over a counter
 //!
@@ -116,16 +128,24 @@
 //!   cell `a.x` is a leaf beside `a.n`), and so is filter `{"a.b": 1}` with `$inc a.c`; filter
 //!   `{a: {b: 1}}` with `$inc a.c` is refused (`a` is one Document cell and `a.c` is below it). The
 //!   two filters are different queries in the reference (whole-document equality against field
-//!   equality), and the second is a deviation (`docs/deviations.md`,
-//!   "upsert-filter-field-incremented-q7"), as is `{a: 5}` with `$inc a 1`. A MATCHED upsert is an
+//!   equality). RECORDED (`q7s2.out`, `q7s2b.out`, same directory): the reference accepts `{a: 5}`
+//!   with `$inc a 1` and gives `a: 6` (`q7s2.out` line 435), `{"a.b": 1}` with `$inc a.b` and gives
+//!   `a: {b: 2}` (`q7s2b.out` line 204), and `{a: {b: 1}}` with `$inc a.c` and gives `{b: 1, c: 1}`
+//!   (`q7s2.out` line 440); `{"a.b": 1}` with `$inc a.c` gives the same (`q7s2.out` line 445). The
+//!   deviations are EXACTLY the equal path (the first two) and an `$inc` BELOW a Document filter
+//!   value (the third) (`docs/deviations.md`, "upsert-filter-field-incremented-q7"). Not
+//!   deviations, the reference refuses them too: an `$inc` ABOVE a filter cell, `{"a.b": 1}` with
+//!   `$inc a` (code 14, `q7s2b.out` line 163) and `{"a.b.c": 1}` with `$inc a.b` (line 208), also
+//!   `{a: {b: 1}}` with `$inc a` (`q7s2.out` line 454); and an `$inc` below a scalar, `{a: 5}` with
+//!   `$inc a.x` ("Cannot create field", `q7s2.out` line 449). A MATCHED upsert is an
 //!   ordinary update and is never refused for it (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})`).
 //!   In short: an `$inc` equal to, above or below ANY creation cell is `Overlap`, only "beside"
-//!   passes. Where that concerns a non-document it matches the reference (`{"a.b": 1}` with `$inc
-//!   a.b.k` cannot create a field in a non-document there either; `{"a.b": 1}` with `$inc a` is an
-//!   increment of a document), so it is NOT a deviation: the deviations entry keeps only
-//!   `{a: 5}` with `$inc a` and the filter-document case `{a: {b: 1}}` with `$inc a.c`.
+//!   passes.
 //!   A Document-valued `$setOnInsert` or `$set` with an `$inc` below it is refused by the reference
-//!   at parse time too, so it is no deviation.
+//!   at parse time too (code 40, "would create a conflict", upsert or matched, and in a plain
+//!   update: `q7s2b.out` lines 5, 10, 15, 20, 25, 30, 45), so it is no deviation: RECORDED.
+//!   Leaves beside leaves are accepted: `$set a.x` with `$inc a.n` gives `{a: {n: 1, x: 1}}` (lines
+//!   35-36), `$setOnInsert a.x` with `$set a.y` and `$inc a.n` gives `{n: 1, x: 1, y: 2}` (40-41).
 //! * (b2) Composition, before the writer ([`UpsertEffects::creation_cells`]), at AS-WRITTEN
 //!   granularity: each cell sits at the path its layer wrote it at. A dotted leaf (`$set
 //!   {"a.x": 1}`, filter `{"a.b": 1}`) stays a LEAF cell (D4); a Document-valued entry
@@ -139,7 +159,13 @@
 //!   reference cannot create a field in a non-document). A cell is tagged `Creation` only when it
 //!   came entirely from the filter and/or `$setOnInsert`, `Plain` when any part came from `$set`
 //!   (`$set` data is never dropped by a later insert; the filter part surviving is the safe side;
-//!   `$setOnInsert` with `$set` in one subtree is already an `Overlap`). An `$unset`
+//!   `$setOnInsert` with `$set` in one subtree is already an `Overlap`). The rules are RECORDED
+//!   (`q7s2b.out`): `{"a.b": 1}` with `$set a: 2` gives `a: 2` (168-169), `{a: {b: 1}}` with
+//!   `$set a: 2` gives `a: 2` (173-174), with `$set a: {c: 2}` gives `a: {c: 2}` (178-179, the
+//!   dotted filter the same, 183-184), `{"a.b": 1}` with `$setOnInsert a: 2` gives `a: 2`
+//!   (188-189), `{a: {b: 1}}` with `$setOnInsert a.c` merges into `{b: 1, c: 2}` (193-194),
+//!   `{"a.b": 1}` with `$unset a` removes `a` and keeps the other filter field (198-199), and
+//!   `$setOnInsert {a: {x: 1}}` with `$set a.y` is a conflict (45). An `$unset`
 //!   (`Set(p, Value::Unset)`) in a higher layer removes the cell at or below `p`, or the nested field
 //!   of a Document cell, and is a NO-OP, with no refusal, when absent or below a scalar (`{a: 5}`
 //!   with `$unset a.y`). `_id`: any filter path whose FIRST segment is `_id` (`{"_id.x": 1}`
@@ -148,12 +174,16 @@
 //!   is a defensive check only: the update parse (`kimmy-query/src/update.rs`) refuses ANY write to
 //!   `_id`, for both merge policies, so it never fires from the product. Every value of every layer, and every composed cell, passes
 //!   `Value::check_input` (a repeated or NUL field name, a map marker, nesting past the depth
-//!   limit are `BadValue`), so the writer is never the first to see them. `$inc` is not a cell. Field
-//!   ORDER: filter fields in filter order; an override keeps its field in place; new fields are
-//!   appended in the order the caller lists them, `set_on_insert` first, then `set`. The caller
-//!   (S2b) lists them in the order of the existing engine's post-image (what `apply_to_at` in
-//!   `kimmy-query/src/update.rs` produces today), as invariant 5 says. The cells go to the writer as `fields` (the `Creation` cells) and
-//!   `sets` (the `Plain` cells) of `upsert_soi_create` in the tests; the S2a item above makes the entry one ordered list.
+//!   limit are `BadValue`), so the writer is never the first to see them. `$inc` is not a cell.
+//!   Field ORDER is NOT the layer order of [`UpsertEffects::creation_cells`] (filter, then
+//!   `$setOnInsert`, then `$set`): that would be wrong, because the reference interleaves them
+//!   sorted (invariant 5, `q7s2.out` lines 189-204): the filter's equality fields, sorted, come
+//!   first, then every new field from `$set`, `$setOnInsert`, `$inc` and the register operators,
+//!   sorted together; an override keeps its place. The ORDER comes from the post-image
+//!   (`apply_to_at`, the `UpsertPlan`'s `post_image`); `creation_cells` composes the layers and its
+//!   own order is only deterministic. The cells go to the writer as `fields` (the `Creation` cells)
+//!   and `sets` (the `Plain` cells) of `upsert_soi_create` in the tests; the S2a item below makes
+//!   the entry one ordered list.
 //! * (c) Creation values of `$mul`, `$min`, `$max`, `$currentDate`, `$push`, `$addToSet` and `$bit`
 //!   are computed by S2b and go in `set`.
 //! * (d) One write or two, from the existing code (`merge_state/writer.rs`): `upsert_inc` is ONE
@@ -167,7 +197,11 @@
 //!   reference refuses at parse): `$inc` plus `$setOnInsert` (or `$set`) on the same path, or any
 //!   overlap among the three lists `set_on_insert`, `set`, `inc` (a path equal to or below another),
 //!   is [`UpdateRefused::Overlap`] ([`UpsertEffects::check`]); there is no splitting logic.
-//!   Several `$inc` on DISTINCT paths are allowed.
+//!   Several `$inc` on DISTINCT paths are allowed. RECORDED (`q7s2b.out`): every overlap in one
+//!   update is refused with code 40, matched or upserted, whatever the operator pair, nothing
+//!   written (lines 51-101: `$set a` with `$inc a`, `$set a.b` with `$inc a`, `$set {a: {b: 1}}`
+//!   with `$inc a.b`, `$setOnInsert a` with `$inc a`, `$set a` with `$unset a.b`, `$set a.b` with
+//!   `$set a`, `$inc a` with `$inc a.b`); the control with distinct paths works (106-107).
 //!
 //! # S2a work item (not implemented here)
 //!
@@ -181,15 +215,24 @@
 //! The same item fixes the creation FIELD ORDER: `upsert_soi_create_m` takes `fields` (the tagged
 //! cells) and `sets` as two lists and feeds all fields before all sets, so filter `{a: 1, b: 2}`
 //! with `$set {a: 5}` would come out `b`, `a`. The creation entry must take the cells as ONE ordered
-//! list with a per-cell tag ([`CellTag`]), in the order [`UpsertEffects::creation_cells`] returns
-//! them, and S2a adds a test of the order at the writer. The writer is not changed here (the tests
-//! below split the cells by tag, so they do not see the order).
+//! list with a per-cell tag ([`CellTag`]), in the order of the `UpsertPlan`'s `post_image`
+//! (including the `$inc` entries, which the reference sorts in with the other new fields), NOT the
+//! layer order `creation_cells` returns; S2a adds a test of the order at the writer. The writer is
+//! not changed here (the tests below split the cells by tag, so they do not see the order).
 //!
 //! The same item widens `upsert_soi*` and `upsert_inc_on` from `i64` to typed operands (as
 //! [`UpdateOp::Inc`] already is: Int32, Int64, Double or Decimal128; the 2026-11-03 ruling already
 //! says to extend `upsert_inc` to Decimal128 operands). On a counter, an Int or Decimal operand is
 //! a counter increment and a Double is a 400 (`IncDoubleOnCounter`); on a Double base it is a
 //! register write; on creation the operand's type sets the cell's type. Not implemented here.
+//!
+//! Typed-`$inc` tests of that item, against the recording (`q7s2.out`): `Int32` + `Int64` gives
+//! `Int64`; `Int32` max + 1 gives `Int64` (lines 264-273); `Int64` max + 1 is refused (code 2, line
+//! 277); `Int32` 5 + `Int64` 0 gives `5L` and counts as MODIFIED (lines 378-382, reply on 381);
+//! `Int32` 5 + `Double` 0 gives `5.0d` and counts as MODIFIED (lines 383-387, reply on 386). If the
+//! writer's counter does not promote `Int32` to `Int64` like this, that is a writer bug for W3 to
+//! fix, not a deviation, unless the merge model cannot express it, in which case it goes to the
+//! manager.
 //!
 //! # Outcome mapping (for S2a)
 //!
@@ -234,19 +277,23 @@
 //!   reference); the layers compose filter, then `$setOnInsert`, then `$set`, see (b1), (b2).
 //! * RESOLVED: a higher-layer path below a NON-document filter value is `BelowScalar` (400, as the
 //!   reference); an empty-document filter value gives way to what is set below it.
-//! * RESOLVED (withdrawn ruling): `$inc` on a filter field is not `{a: 5}` gives 6 but an
-//!   `Overlap` refusal, recorded as a deviation.
+//! * RESOLVED: `$inc` on a path the filter writes is an `Overlap` refusal on the creation path; the
+//!   reference accepts `{a: 5}` with `$inc a` (gives 6) and `{a: {b: 1}}` with `$inc a.c`, recorded
+//!   (lines 435, 440) and kept as a deviation.
 //! * RESOLVED (supersedes the one-cell-per-top-level-field ruling): creation cells are AS WRITTEN, and
 //!   `check_creation` mirrors the writer, see (b1), (b2).
-//! * TO BE RECORDED (S2a and S2b items, they do not block this interface): (1) the new-field ORDER
-//!   of operator updates and upserts (the mars recording confirms the post-image order or it
-//!   becomes a deviation for BOTH policies, a separate decision later), and (2) the reference's result of a double `$inc` on an
-//!   integer or `Decimal128` field and of an unrepresentable `Decimal128` total. Neither has a
-//!   recording: `reference-6.0.5` holds none. S2a and S2b record reference probes in the same way as
-//!   the existing recordings: `mongosh --quiet <probe>.js` scripts (see `q8-probes/acc.js` and
-//!   `q8-probes/pipeline-updates.js`) run against a MongoDB 6.0 reference server, the output saved
-//!   under `reference-6.0.5/`. The order and the deviation text of "field-merge-refusals-q7" are
-//!   then settled from the recordings before S2b and S2a finish.
+//! * RECORDED (`q7s2-probes/reference-6.0.5/q7s2.out`, with `NOTES.md`): the new-field ORDER of
+//!   updates and upserts (lines 143-173, 189-204, invariant 5); the double `$inc` on an integer
+//!   field (a Double result, lines 230-247) and on a `Decimal128` (stays `Decimal128`, 15 digits,
+//!   line 252); the unrepresentable `Decimal128` total (rounds to 34 digits, or stores `Infinity`,
+//!   lines 330-355); `Int64` overflow is refused (line 277). The deviations text follows them.
+//! * RECORDED besides (`q7s2b.out`): the Document-valued `$setOnInsert`/`$set` with an `$inc`
+//!   below it, `$set` with `$inc` on overlapping paths, the replacement upserts, and `{"a.b": 1}`
+//!   with `$inc a`; see (b1), (b2), (e) and the operator table. Probes are `mongosh --quiet
+//!   <probe>.js` scripts (see `q8-probes/acc.js` and `q8-probes/pipeline-updates.js`) run against a
+//!   MongoDB 6.0 reference server, the output saved under `reference-6.0.5/`.
+//! * OPEN, not recorded: the pair `a.1` / `a.01` in one update: the product refuses it as a path
+//!   conflict (engine fix pending on main); no reference answer is recorded.
 
 pub use crate::merge_state::{InvalidPath, MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
