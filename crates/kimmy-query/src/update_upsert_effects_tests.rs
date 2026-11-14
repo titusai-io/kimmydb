@@ -95,6 +95,7 @@ fn a_set_overrides_the_filter_and_dotted_leaves_merge() {
     assert_eq!(post, doc! {"a": {"x": 1, "y": 2}});
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the order of the listed new fields is the engine's, the reference sorts them. Flip this test with that PR.
 #[test]
 fn the_creation_values_of_the_register_operators_go_in_set() {
     let (fx, post) = creates(
@@ -145,6 +146,7 @@ fn an_unset_removes_the_filter_field_and_a_rename_moves_it() {
     assert_eq!(post, doc! {"b": 1});
 }
 
+/// PINNED TO THE ENGINE until the main PR (A)-(D) lands: the engine inserts new fields in the order of the update, the reference sorts them (the filter fields too). Flip this test with that PR.
 #[test]
 fn new_fields_are_in_the_order_of_the_inserted_document() {
     // $setOnInsert first in the document, then $set: the engine inserts the $setOnInsert fields
