@@ -280,13 +280,13 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
 }
 
 /// Whether a path has any `$`, `$[]` or `$[<identifier>]` segment.
-fn has_positional(path: &str) -> bool {
+pub(crate) fn has_positional(path: &str) -> bool {
     path::segments(path).iter().any(|segment| *segment == "$" || segment.starts_with("$["))
 }
 
 /// Whether a path has a `$` segment, which reads the position the filter
 /// matched.
-fn has_matched_position(path: &str) -> bool {
+pub(crate) fn has_matched_position(path: &str) -> bool {
     path::segments(path).contains(&"$")
 }
 
@@ -943,7 +943,7 @@ pub fn apply_on_insert(update: &Update, doc: &mut Document, now_ms: i64) -> Resu
 
 /// Which kind of document an update is being applied to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Target {
+pub(crate) enum Target {
     Existing,
     Inserted,
 }
@@ -952,7 +952,7 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
     apply_to_at(update, doc, now_ms, target, None)
 }
 
-fn apply_to_at(
+pub(crate) fn apply_to_at(
     update: &Update,
     doc: &mut Document,
     now_ms: i64,
@@ -1020,7 +1020,7 @@ fn apply_to_at(
 /// Each operation's concrete paths in `doc`, in operation order: its own path
 /// when it has no positional segment, the paths its positional segments
 /// select otherwise, and none for an operation that does not apply.
-fn concrete_paths(
+pub(crate) fn concrete_paths(
     operations: &[Operation],
     doc: &Document,
     at: Option<&ArrayPosition>,

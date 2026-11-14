@@ -29,6 +29,7 @@ pub mod plan;
 pub mod shape;
 pub mod stages;
 pub mod update;
+pub mod update_effects;
 pub mod update_pipeline;
 pub mod window;
 pub mod window_acc;
@@ -75,6 +76,8 @@ mod stage_tests;
 #[cfg(test)]
 mod trig_tests;
 
+#[cfg(test)]
+mod update_effects_tests;
 #[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
