@@ -3,7 +3,7 @@
 
 use bson::{Bson, Document, doc};
 use kimmy_core::effects::{CellTag, UpsertEffects};
-use kimmy_core::merge_state::{JoinOptions, Path, Value, Writer};
+use kimmy_core::merge_state::{JoinOptions, LossKind, Path, Value, Writer};
 
 use crate::update::{self, Update};
 use crate::update_effects::{UpsertPlan, plan_upsert};
@@ -29,11 +29,16 @@ fn refused(filter: Document, u: Document) -> String {
 /// are `fields`, the `Plain` ones `sets`, then every `$inc` (an Int32 or Int64 operand: the entry
 /// takes an `i64` until S2a widens it).
 fn create(fx: &UpsertEffects) -> Writer {
+    create_as(fx, 5)
+}
+
+/// [`create`] by the writer numbered `who`: another member making the same creation.
+fn create_as(fx: &UpsertEffects, who: u8) -> Writer {
     let cells = fx.creation_cells().expect("the creation composes");
     let part = |t: CellTag| -> Vec<(Path, Value)> {
         cells.iter().filter(|c| c.tag == t).map(|c| (c.path.clone(), c.value.clone())).collect()
     };
-    let mut w = Writer::new(wid(5), JoinOptions::default());
+    let mut w = Writer::new(wid(who), JoinOptions::default());
     let none = p("__no_inc__");
     let inc_path = fx.inc.first().map(|(q, _)| q).unwrap_or(&none);
     let made = w
@@ -320,9 +325,12 @@ fn a_replacement_upsert_is_not_an_effect_list() {
 
 #[test]
 fn the_refusals_of_the_creation_are_400s_at_plan_time() {
-    // an $inc on a path the filter writes (a deviation, docs/deviations.md)
-    assert!(refused(doc! {"a": 5}, doc! {"$inc": {"a": 1}}).contains("a"));
-    assert!(refused(doc! {"a": {"b": 1}}, doc! {"$inc": {"a.c": 1}}).contains("a"));
+    // an `$inc` ABOVE a filter path, or below a scalar one: the reference refuses them too
+    // (q7s2.out f4 line 449, f5 line 454; q7s2b.out 4j line 208 and line 163)
+    assert!(!refused(doc! {"a": {"b": 1}}, doc! {"$inc": {"a": 1}}).is_empty());
+    assert!(!refused(doc! {"a.b": 1}, doc! {"$inc": {"a": 1}}).is_empty());
+    assert!(!refused(doc! {"a.b.c": 1}, doc! {"$inc": {"a.b": 1}}).is_empty());
+    assert!(!refused(doc! {"a": 5}, doc! {"$inc": {"a.x": 1}}).is_empty());
     // below a scalar filter value
     assert!(!refused(doc! {"a": 5}, doc! {"$set": {"a.x": 1}}).is_empty());
     // a `$` on an insert is the engine's refusal
@@ -336,4 +344,148 @@ fn a_filter_leaf_beside_an_inc_is_accepted() {
     let (fx, post) = creates(doc! {"a.b": 1}, doc! {"$inc": {"a.c": 1i64}});
     assert_eq!(fx.inc, vec![(np(&["a", "c"]), v(1i64))]);
     assert_eq!(post, doc! {"a": {"b": 1, "c": 1i64}});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Amendment 7: an `$inc` on a filter-written path is a creation-tagged `$setOnInsert` of the
+// engine's value (no slot, nothing silent)
+// ---------------------------------------------------------------------------------------------
+
+/// The recorded cases: no `inc`, the reference's document (q7s2.out 431-445, q7s2b.out 200-204,
+/// q7s2g.out 307-311).
+#[test]
+fn an_inc_on_a_filter_path_is_a_creation_value_not_a_slot() {
+    // q7s2.out f1, line 435: {a: 5} + $inc a 1 creates a: 6
+    let (fx, post) = creates(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
+    assert_eq!(post, doc! {"a": 6});
+    assert!(fx.inc.is_empty() && fx.set.is_empty());
+    assert_eq!(fx.from_filter, vec![(p("a"), v(5))]);
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(6))]);
+    // q7s2b.out 4i, line 204: {"a.b": 1} + $inc a.b 1 creates {a: {b: 2}}
+    let (fx, post) = creates(doc! {"a.b": 1}, doc! {"$inc": {"a.b": 1}});
+    assert_eq!(post, doc! {"a": {"b": 2}});
+    assert!(fx.inc.is_empty());
+    assert_eq!(fx.set_on_insert, vec![(np(&["a", "b"]), v(2))]);
+    // q7s2.out f2, line 440: {a: {b: 1}} + $inc a.c 1 creates {a: {b: 1, c: 1}}
+    let (fx, post) = creates(doc! {"a": {"b": 1}}, doc! {"$inc": {"a.c": 1}});
+    assert_eq!(post, doc! {"a": {"b": 1, "c": 1}});
+    assert!(fx.inc.is_empty());
+    assert_eq!(fx.set_on_insert, vec![(np(&["a", "c"]), v(1))]);
+    // an empty Document filter value counts as a Document: {a: {}} + $inc a.c
+    let (fx, post) = creates(doc! {"a": {}}, doc! {"$inc": {"a.c": 1}});
+    assert_eq!(post, doc! {"a": {"c": 1}});
+    assert!(fx.inc.is_empty());
+    // q7s2.out f3, line 445: {"a.b": 1} + $inc a.c is NOT routed: it stays a counter slot
+    let (fx, post) = creates(doc! {"a.b": 1}, doc! {"$inc": {"a.c": 1}});
+    assert_eq!(post, doc! {"a": {"b": 1, "c": 1}});
+    assert_eq!(fx.inc, vec![(np(&["a", "c"]), v(1))]);
+    assert!(fx.set_on_insert.is_empty());
+    // q7s2g.out g3i, lines 307-311: filter {9: 2, 10: 1} + $inc 9, 10, a + $set 5, z: the two
+    // filter paths are creation values (3 and 2), `a` (not in the filter) stays an `$inc`
+    let (fx, post) = plan(
+        doc! {"9": 2, "10": 1},
+        doc! {"$inc": {"9": 1, "10": 1, "a": 1}, "$set": {"5": 1, "z": 1}},
+    );
+    assert_eq!(post.get("9"), Some(&Bson::Int32(3)));
+    assert_eq!(post.get("10"), Some(&Bson::Int32(2)));
+    let mut routed = fx.set_on_insert.clone();
+    routed.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(routed, vec![(p("10"), v(2)), (p("9"), v(3))]);
+    assert_eq!(fx.inc, vec![(p("a"), v(1))]);
+    assert_eq!(fx.set.len(), 2);
+}
+
+/// The creation value is the engine's post-image, whatever the type of the operand and of the
+/// filter's value (amendment 7, item 4). UNRECORDED against the reference except the Int32 cases
+/// above: these follow the engine's typing (q7s2.out d1-d8 for the same sums on a stored value).
+#[test]
+fn the_creation_value_of_a_routed_inc_is_typed_by_the_engine() {
+    // a Double result is a register, not a counter
+    let (fx, post) = creates(doc! {"a": 5}, doc! {"$inc": {"a": 1.5}});
+    assert_eq!(post, doc! {"a": 6.5});
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(6.5))]);
+    assert!(fx.inc.is_empty());
+    // an Int64 operand widens the Int32 filter value
+    let (fx, _) = creates(doc! {"a": 5}, doc! {"$inc": {"a": 2i64}});
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(7i64))]);
+    // a Decimal128 operand
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    let (fx, _) = creates(doc! {"a": 5}, doc! {"$inc": {"a": dec("1.5")}});
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(dec("6.5")))]);
+    // a Double filter value
+    let (fx, _) = creates(doc! {"a": 1.5}, doc! {"$inc": {"a": 1}});
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(2.5))]);
+}
+
+/// `$mul` on a filter-named path: the creation value goes in `set` (the register operators of
+/// (c)), over the filter's cell. UNRECORDED against the reference: the document is the engine's.
+#[test]
+fn a_mul_on_a_filter_path_is_a_creation_value_in_set() {
+    let (fx, post) = creates(doc! {"a": 5}, doc! {"$mul": {"a": 3}});
+    assert_eq!(post, doc! {"a": 15});
+    assert_eq!(fx.from_filter, vec![(p("a"), v(5))]);
+    assert_eq!(fx.set, vec![(p("a"), v(15))]);
+    assert!(fx.inc.is_empty() && fx.set_on_insert.is_empty());
+}
+
+fn int_of(d: &Document, name: &str) -> i64 {
+    match d.get(name) {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        other => panic!("{name}: {other:?} in {d}"),
+    }
+}
+
+/// Amendment 7, item 5, first bullet: two identical concurrent creating upserts read the
+/// reference's value (6), and leave ONE `clash` record for the lower-stamped equal register (the
+/// join has no equal-value exemption): EXPECTED, not a defect. Every join order.
+#[test]
+fn two_identical_creating_upserts_read_the_reference_value_and_leave_one_clash() {
+    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
+    for (first, second) in [(5u8, 6u8), (6, 5)] {
+        let mut x = create_as(&fx, first);
+        let y = create_as(&fx, second);
+        let fresh = x.receive(&y.state);
+        assert_eq!(int_of(&render(&x), "a"), 6, "order {first} then {second}");
+        let clashes = fresh.iter().filter(|k| k.kind == LossKind::Clash).count();
+        assert_eq!(clashes, 1, "order {first} then {second}: {fresh:?}");
+    }
+}
+
+/// Item 5, second bullet: `{$inc: {a: 1, n: 1}}` over filter `{a: 5}` gives `a` by last writer
+/// (6) and `n` summed (2): no serial order of the reference produces it (its second upsert fails
+/// whole). Stated, not hidden; the same class as `$set`/`$mul` beside an `$inc`.
+#[test]
+fn a_routed_inc_beside_a_counter_inc_gives_a_by_last_writer_and_n_summed() {
+    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1, "n": 1}});
+    assert_eq!(fx.inc, vec![(p("n"), v(1))]);
+    assert_eq!(fx.set_on_insert, vec![(p("a"), v(6))]);
+    for (first, second) in [(5u8, 6u8), (6, 5)] {
+        let mut x = create_as(&fx, first);
+        let y = create_as(&fx, second);
+        x.receive(&y.state);
+        let d = render(&x);
+        assert_eq!((int_of(&d, "a"), int_of(&d, "n")), (6, 2), "order {first} then {second}");
+    }
+}
+
+/// Item 1: the routed value is creation-TAGGED, so an explicit insert racing the upsert-creation
+/// is never silent: both members converge and an `insertLost` is reported (no plain computed
+/// cell survives beside the insert's fields).
+#[test]
+fn a_routed_inc_never_survives_silently_beside_an_explicit_insert() {
+    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
+    for order in [0, 1] {
+        let mut inserter = Writer::new(wid(7), JoinOptions::default());
+        inserter.insert(&[(p("x"), v(1))], 0).expect("the insert writes");
+        let mut creator = create_as(&fx, 6);
+        let (fresh_a, fresh_b) = if order == 0 {
+            (inserter.receive(&creator.state), creator.receive(&inserter.state))
+        } else {
+            (creator.receive(&inserter.state), inserter.receive(&creator.state))
+        };
+        assert_eq!(render(&inserter), render(&creator), "the members converge");
+        let lost = fresh_a.iter().chain(fresh_b.iter()).any(|k| k.kind == LossKind::InsertLost);
+        assert!(lost, "no insertLost: {fresh_a:?} {fresh_b:?} over {}", render(&creator));
+    }
 }

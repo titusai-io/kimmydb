@@ -153,19 +153,28 @@
 //!   cell `a.x` is a leaf beside `a.n`), and so is filter `{"a.b": 1}` with `$inc a.c`; filter
 //!   `{a: {b: 1}}` with `$inc a.c` is refused (`a` is one Document cell and `a.c` is below it). The
 //!   two filters are different queries in the reference (whole-document equality against field
-//!   equality). RECORDED (`q7s2.out`, `q7s2b.out`, same directory): the reference accepts `{a: 5}`
-//!   with `$inc a 1` and gives `a: 6` (`q7s2.out` line 435), `{"a.b": 1}` with `$inc a.b` and gives
-//!   `a: {b: 2}` (`q7s2b.out` line 204), and `{a: {b: 1}}` with `$inc a.c` and gives `{b: 1, c: 1}`
-//!   (`q7s2.out` line 440); `{"a.b": 1}` with `$inc a.c` gives the same (`q7s2.out` line 445). The
-//!   deviations are EXACTLY the equal path (the first two) and an `$inc` BELOW a Document filter
-//!   value (the third) (`docs/deviations.md`, "upsert-filter-field-incremented-q7"). Not
-//!   deviations, the reference refuses them too: an `$inc` ABOVE a filter cell, `{"a.b": 1}` with
+//!   equality). RECORDED (`q7s2.out`, `q7s2b.out`, `q7s2g.out`, same directory): the reference
+//!   accepts `{a: 5}` with `$inc a 1` and gives `a: 6` (`q7s2.out` line 435), `{"a.b": 1}` with
+//!   `$inc a.b` and gives `a: {b: 2}` (`q7s2b.out` line 204), and `{a: {b: 1}}` with `$inc a.c`
+//!   and gives `{b: 1, c: 1}` (`q7s2.out` line 440); `{"a.b": 1}` with `$inc a.c` gives the same
+//!   (`q7s2.out` line 445). Amendment 7 of the Q7 design (no deviation is left): on the creation
+//!   path an `$inc p n` where `p` equals a `from_filter` path whose value is not a Document, or
+//!   lies strictly below one whose value is a Document (the empty Document included), IS a
+//!   `$setOnInsert p: <the engine's post-image value at p>`: S2b's `plan_upsert` puts it in
+//!   `set_on_insert`, creation-tagged, with no counter slot (the decision is on `from_filter` as
+//!   written, never on the seed). The creation value follows the engine's typing: `{a: 5}` with
+//!   `$inc a 1.5` creates a Double `6.5` register. An explicit insert that wins drops it and
+//!   reports `insertLost`. By the time an `$inc` reaches this check on a filter path it has been
+//!   routed away, so [`UpsertEffects::check_creation`] keeps the refusal below only as a guard
+//!   (a hand-built list). The `$inc` that stays an `$inc`: a path the filter does not name, and
+//!   filter `{"a.b": 1}` with `$inc a.c` (a counter slot beside the leaf). Not
+//!   routed, the reference refuses them too: an `$inc` ABOVE a filter cell, `{"a.b": 1}` with
 //!   `$inc a` (code 14, `q7s2b.out` line 163) and `{"a.b.c": 1}` with `$inc a.b` (line 208), also
 //!   `{a: {b: 1}}` with `$inc a` (`q7s2.out` line 454); and an `$inc` below a scalar, `{a: 5}` with
 //!   `$inc a.x` ("Cannot create field", `q7s2.out` line 449). A MATCHED upsert is an
 //!   ordinary update and is never refused for it (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})`).
-//!   In short: an `$inc` equal to, above or below ANY creation cell is `Overlap`, only "beside"
-//!   passes.
+//!   In short, for a list as it stands (a hand-built one, or S2b's after the routing): an `$inc`
+//!   equal to, above or below ANY creation cell is `Overlap`, only "beside" passes.
 //!   A Document-valued `$setOnInsert` or `$set` with an `$inc` below it is refused by the reference
 //!   at parse time too (code 40, "would create a conflict", upsert or matched, and in a plain
 //!   update: `q7s2b.out` lines 5, 10, 15, 20, 25, 30, 45), so it is no deviation: RECORDED.

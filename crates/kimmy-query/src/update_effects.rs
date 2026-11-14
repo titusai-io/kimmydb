@@ -382,6 +382,19 @@ pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<Upse
     Ok(UpsertPlan::Effects { effects: fx, post_image: post })
 }
 
+/// Whether an `$inc` at `at` is routed to `set_on_insert` (amendment 7 of the Q7 design): `at`
+/// equals a path the filter wrote, whose value is not a Document, or lies strictly below one
+/// whose value is a Document (the empty one included). Decided on `from_filter` AS WRITTEN, never
+/// on the seed: filter `{"a.b": 1}` with `$inc a.c` is not routed, it stays a counter slot beside
+/// the leaf (the seed would have made `a` a Document). An `$inc` above a filter path, or below a
+/// scalar one, is the engine's refusal.
+fn inc_on_filter_path(fx: &UpsertEffects, at: &Path) -> bool {
+    fx.from_filter.iter().any(|(written, value)| match value {
+        Value::Document(_) => at.is_below(written),
+        _ => at == written,
+    })
+}
+
 /// One operation's part of the creation.
 fn creation_of(
     op: &Operation,
@@ -411,6 +424,14 @@ fn creation_of(
         }
         OpKind::Set(v) if !crosses(&segs) => fx.set.push((to_path(&segs)?, value_of(v)?)),
         OpKind::Unset if !crosses(&segs) => fx.set.push((to_path(&segs)?, Value::Unset)),
+        // Amendment 7: an `$inc` on a path the filter wrote is the engine's post-image value at
+        // that path, as a creation-tagged `$setOnInsert`: no slot, nothing silent when an
+        // explicit insert wins (it drops it and reports `insertLost`)
+        OpKind::Inc(_) if !crosses(&segs) && inc_on_filter_path(fx, &to_path(&segs)?) => {
+            if let Some(after) = get_in(post, &segs) {
+                fx.set_on_insert.push((to_path(&segs)?, value_of(after)?));
+            }
+        }
         OpKind::Inc(by) if !crosses(&segs) => fx.inc.push((to_path(&segs)?, value_of(by)?)),
         OpKind::Rename(target) => {
             if let Some(source) = get_in(seed, &segs) {
