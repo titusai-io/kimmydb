@@ -367,6 +367,9 @@ pub struct CollectionState {
     /// a stamped local value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_changed: Option<Stamp>,
+    /// The collection's merge policy (`CollectionMeta::merge_policy`), fixed at creation. No
+    /// serde default: a page without it does not decode.
+    pub merge_policy: kimmy_core::MergePolicy,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -383,6 +386,7 @@ impl From<CollectionMeta> for CollectionState {
             incarnation_floor: meta.incarnation_floor,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
+            merge_policy: meta.merge_policy,
         }
     }
 }
@@ -2609,6 +2613,7 @@ impl Engine {
                 redated_from,
                 adopted,
                 None,
+                state.merge_policy,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {

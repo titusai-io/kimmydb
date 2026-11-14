@@ -174,7 +174,7 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
-    create_collection_validated(state, auth, db, name, None)
+    create_collection_validated(state, auth, db, name, None, kimmy_core::MergePolicy::DEFAULT)
 }
 
 /// [`create_collection`] with a validator set at creation (ADR-257).
@@ -189,6 +189,7 @@ pub fn create_collection_validated(
     db: &str,
     name: &str,
     validator: Option<kimmy_core::ValidatorSpec>,
+    policy: kimmy_core::MergePolicy,
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Ddl, db, Some(name))?;
@@ -199,11 +200,10 @@ pub fn create_collection_validated(
     // drop takes as long as the data under it, and any of them can wait for
     // the single writer for the whole of the request's budget. A handler that
     // holds a worker stalls every task queued on it (ADR-153).
-    let meta = kimmy_storage::blocking(|| match validator {
-        Some(spec) => state.engine.create_collection_with_validator(db, name, spec),
-        None => state.engine.create_collection(db, name),
+    let meta = kimmy_storage::blocking(|| {
+        state.engine.create_collection_with_policy(db, name, policy, validator)
     })?;
-    Ok(json!({ "created": meta.name, "id": meta.id.0 }))
+    Ok(json!({ "created": meta.name, "id": meta.id.0, "mergePolicy": meta.merge_policy.as_str() }))
 }
 
 /// The id a drop of `db.coll` strands a vector index under.
@@ -1657,6 +1657,32 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
     }
 }
 
+/// Equality constraints a match necessarily satisfies, for seeding an upsert.
+///
+/// Only `$and`-reachable `$eq` on a plain path counts. An equality inside `$or`
+/// is **not** implied by a match, so seeding from it would invent a field the
+/// caller never asked for — the kind of quiet wrongness that is hard to notice
+/// in a document that otherwise looks right.
+fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
+    match filter {
+        filter::Filter::And(branches) => {
+            for branch in branches {
+                implied_equalities(branch, out);
+            }
+        }
+        filter::Filter::Field { path, conditions } => {
+            for condition in conditions {
+                if let filter::Condition::Eq(value) = condition {
+                    // Dotted paths go through `path::set` so `{"a.b": 1}`
+                    // seeds a nested document rather than a literal key.
+                    let _ = kimmy_core::path::set(out, path, value.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// A step a test runs between the engine's commit and the answer of `find_and_modify`,
@@ -1739,19 +1765,8 @@ pub fn find_and_modify(
     let failures = std::sync::Mutex::new(Vec::new());
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
-        // Refused like any refusal of the seed: said only if nothing matches.
-        let seeded = kimmy_query::seed::implied_equalities(&filter, &mut seed, &mut Vec::new())
-            .map(|()| {
-                // The seed's top-level fields are in name order, `_id` first,
-                // whichever order the filter wrote them in and whatever kind of
-                // update runs over it: the fields the update adds follow them.
-                let mut fields: Vec<(String, bson::Bson)> =
-                    std::mem::take(&mut seed).into_iter().collect();
-                fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
-                seed.extend(fields);
-            });
+        implied_equalities(&filter, &mut seed);
         match &update {
-            _ if seeded.is_err() => seeded.err().map(Err),
             // The seed is run through the update only to be inserted, so a refusal
             // (a `$` with no matched element, a pipeline that cannot read the seed, an
             // `_id` it would change) is said only if nothing matches: a document that

@@ -889,7 +889,12 @@ impl MergeState {
         if base.is_none() && terms.is_empty() {
             return None;
         }
-        let kind = terms.iter().map(|t| t.2.kind()).chain(base.map(|b| b.kind())).max()?;
+        // R1: the type of a counter is a function of the merged state, which has no order of
+        // contributions. Its width is the widest LABEL among the base and every slot that
+        // contributes (a label is the join of the operand types a writer has added, never the
+        // value its running sum has had), and an integer total that does not fit an `i32` is an
+        // `Int64` whatever the labels are (`Num::into_value`).
+        let kind = terms.iter().map(|t| t.2.label()).chain(base.map(|b| b.label())).max()?;
         let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
         for (_, _, d) in &terms {
             acc = if o.no_decimal_saturation() {

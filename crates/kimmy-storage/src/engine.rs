@@ -4476,6 +4476,38 @@ impl Engine {
             .expect("a creation that judges nothing history always creates"))
     }
 
+    /// Create a collection with an explicit merge policy and, optionally, a validator (ADR-257).
+    /// The policy is fixed for the collection's life; system and shadow names are always
+    /// `document` whatever is asked. [`Engine::create_collection`] (the helper for internal
+    /// and test use) creates `document` collections; the HTTP route defaults to
+    /// [`kimmy_core::MergePolicy::DEFAULT`] and calls this.
+    pub fn create_collection_with_policy(
+        &self,
+        db: &str,
+        name: &str,
+        policy: kimmy_core::MergePolicy,
+        validator: Option<kimmy_core::ValidatorSpec>,
+    ) -> Result<CollectionMeta> {
+        CoreError::validate_name(db)?;
+        CoreError::validate_name(name)?;
+        if let Some(spec) = &validator {
+            crate::validator::check_validator_spec(spec)?;
+        }
+        Ok(self
+            .create_collection_marked(
+                db,
+                name,
+                true,
+                None,
+                &|_| false,
+                None,
+                None,
+                validator.as_ref().map(|spec| (spec, None)),
+                policy,
+            )?
+            .expect("a creation that judges nothing history always creates"))
+    }
+
     /// `log = false` when applying a replicated creation. See
     /// `create_index_inner` for why a replicated change must not mint an entry.
     ///
@@ -4494,7 +4526,17 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
-        self.create_collection_marked(db, name, log, origin, history, None, None, None)
+        self.create_collection_marked(
+            db,
+            name,
+            log,
+            origin,
+            history,
+            None,
+            None,
+            None,
+            kimmy_core::MergePolicy::Document,
+        )
     }
 
     /// Create a collection **with its validator, in one transaction** (ADR-257).
@@ -4524,6 +4566,7 @@ impl Engine {
                 None,
                 None,
                 Some((&validator, None)),
+                kimmy_core::MergePolicy::Document,
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -4544,6 +4587,7 @@ impl Engine {
         redated_from: Option<Hlc>,
         sender_floor: Option<Hlc>,
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
+        policy: kimmy_core::MergePolicy,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -4564,7 +4608,9 @@ impl Engine {
         // that reason: a caller that mints one mints it with the writer held,
         // and a replicated shadow takes its configuration entry's stamp.
         let mint = || self.next_stamp();
-        match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint, validator) {
+        match self
+            .create_collection_in_txn(&txn, db, name, log, origin, history, mint, validator, policy)
+        {
             Ok(InTxn::Created(mut meta, logged)) => {
                 let mut changed = false;
                 if let Some(from) = redated_from {
@@ -4636,7 +4682,10 @@ impl Engine {
         history: &dyn Fn(Stamp) -> bool,
         mint: impl FnOnce() -> Stamp,
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
+        policy: kimmy_core::MergePolicy,
     ) -> Result<InTxn> {
+        // System collections and vector shadows are `document`, whatever was asked.
+        let policy = policy.fixed_for(name);
         let id = CollectionId::derive(db, name);
         let (meta, stamp) = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -4764,6 +4813,7 @@ impl Engine {
             // misjudge a legitimate drop stamped just before a late apply.
             let mut meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
+            meta.merge_policy = policy;
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.
@@ -4818,6 +4868,7 @@ impl Engine {
                 &kimmy_core::CollectionCreate {
                     db: db.to_string(),
                     name: name.to_string(),
+                    merge_policy: policy,
                     validator: validator.map(|(spec, _)| spec.clone()),
                 },
             )?;
