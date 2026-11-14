@@ -338,6 +338,20 @@ impl Writer {
         Ok(stamp)
     }
 
+    /// Is this writer one the document does not mention yet, with [`MAX_WRITERS`] writers already
+    /// in it? A write adds the writer to the version vector, so every writer of the version vector is
+    /// mentioned and the walk over the whole state is only needed for a writer that has not written
+    /// yet. Looked at before any stamp is minted or pulled: a refusal never takes one.
+    fn at_writer_cap(&self) -> bool {
+        if self.opts.no_writer_cap() || self.state.vv.contains_key(&self.id) {
+            return false;
+        }
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::WriterScans, 1);
+        let ws = self.state.writers();
+        ws.len() >= MAX_WRITERS && !ws.contains(&self.id)
+    }
+
     /// Mint the stamp of one write from `m`. A refused stamp is kept in `m` and reported as
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
@@ -345,13 +359,8 @@ impl Writer {
         // write adds the writer to the version vector). Every writer of the version vector is
         // mentioned, so the walk over the whole state is only needed for a writer that has not
         // written yet.
-        if !self.opts.no_writer_cap() && !self.state.vv.contains_key(&self.id) {
-            #[cfg(test)]
-            super::work::bump(super::work::Counter::WriterScans, 1);
-            let ws = self.state.writers();
-            if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
-                return None;
-            }
+        if self.at_writer_cap() {
+            return None;
         }
         let r = match &mut m.source {
             Source::Skew(skew) => Ok(self.tick(*skew)),
@@ -1087,6 +1096,9 @@ impl Writer {
         let two_writes = others > 0 && !incs.is_empty();
         // The stamps of a caller are all taken and checked now, before the first write, so a bad
         // second stamp cannot leave the creation written.
+        if two_writes && matches!(m.source, Source::Given(_)) && self.at_writer_cap() {
+            return Err(UpdateRefused::WriterCap);
+        }
         if two_writes && let Source::Given(f) = &mut m.source {
             let (first, second) = (f(), f());
             let mut top = self.top();

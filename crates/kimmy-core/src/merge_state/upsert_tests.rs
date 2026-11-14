@@ -1,10 +1,11 @@
 //! The upsert entries of the effects layer: `upsert_create` (every shape), `upsert_cells` (the
 //! creation cells in list order) and `UpsertEffects::apply`.
 
-use super::tests::{f, i, opts, p, s, wid};
+use super::tests::{f, fl, i, opts, p, s, wid};
 use super::*;
 use crate::effects::{CellTag, CreationCell, UpsertEffects};
 use crate::hlc::Hlc;
+use crate::ids::NodeId;
 
 fn cell(name: &str, v: Value, tag: CellTag) -> CreationCell {
     CreationCell { path: p(name), value: v, tag }
@@ -278,4 +279,88 @@ fn the_effects_apply_helper_returns_both_writes() {
     let mut w = writer();
     assert!(matches!(bad.apply(&mut w, &[], 0), Err(UpdateRefused::Overlap(..))));
     assert!(w.state.lives.is_empty());
+}
+
+/// A state with `MAX_WRITERS` writers and no life alive, and a writer that is none of them.
+fn full_of_writers() -> (MergeState, Writer) {
+    let mut state = MergeState::default();
+    let mut last = None;
+    for k in 0..MAX_WRITERS {
+        let id = WriterId {
+            node: NodeId::from_bytes([(k % 200) as u8 + 1; 16]),
+            epoch: Epoch::from_u64((k / 200) as u64),
+        };
+        let mut w = Writer::new(id, opts());
+        w.receive(&state);
+        if k == 0 {
+            w.insert(&fl(&[("n", i(0))]), 0).unwrap();
+        }
+        w.write_set(&p(&format!("f{k}")), i(k as i64), 0).unwrap();
+        state = w.state.clone();
+        last = Some(w);
+    }
+    // the document is deleted: no life is alive, so the cap is what refuses the next writer
+    let mut last = last.expect("some writers");
+    last.write_delete(0).expect("the delete");
+    let state = last.state;
+    assert!(state.alive(&opts()).is_empty());
+    let late_id = WriterId { node: NodeId::from_bytes([250; 16]), epoch: Epoch::from_u64(9) };
+    let mut late = Writer::new(late_id, opts());
+    late.receive(&state);
+    (state, late)
+}
+
+/// A caller's stamps are asked for once the upsert is known to be writable: a writer past the
+/// writer cap is refused BEFORE any stamp is pulled, in the two-write shape as in the one-write
+/// one ("never for a refusal").
+#[test]
+fn the_writer_cap_refuses_before_a_caller_stamp_is_pulled() {
+    let shapes = [
+        vec![cell("a", s("x"), CellTag::Creation), inc("n", i(1))], // two writes
+        vec![inc("n", i(1))],                                       // one write
+        vec![cell("a", s("x"), CellTag::Creation)],                 // creation only
+    ];
+    for list in shapes {
+        let (_, mut late) = full_of_writers();
+        let before = (late.state.clone(), late.clock);
+        let id = late.id;
+        let pulled = std::cell::Cell::new(0u64);
+        let mut stamp = || {
+            pulled.set(pulled.get() + 1);
+            MStamp { hlc: Hlc::new(10_000_000 + pulled.get(), 0), writer: id }
+        };
+        let r = late.upsert_create_stamped(&list, &mut stamp);
+        assert!(matches!(r, Err(UpdateError::Refused(UpdateRefused::WriterCap))), "{r:?}");
+        assert_eq!(pulled.get(), 0, "a stamp was pulled for a refusal");
+        assert_eq!((late.state.clone(), late.clock), before);
+    }
+}
+
+/// A `Decimal128` operand through the creation entry: one write for increments alone, and the
+/// two-write shape beside a creation cell; the counter is created in the operand's type.
+#[test]
+fn a_decimal_operand_creates_a_decimal_counter_through_upsert_create() {
+    let dec = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
+    let text = |v: &Value| match v {
+        Value::Decimal128(b) => bson::Decimal128::from_bytes(*b).to_string(),
+        v => panic!("not a decimal: {v:?}"),
+    };
+    let mut w = writer();
+    let (_, second) =
+        w.upsert_create(&[inc("d", dec("1.5")), inc("n", Value::Int32(2))], 0).unwrap();
+    assert!(second.is_none(), "increments alone are one write");
+    let vis = w.visible().unwrap();
+    assert_eq!(text(&vis[&p("d")]), "1.5");
+    assert_eq!(vis[&p("n")], Value::Int32(2));
+    // beside a creation cell: two writes, the decimal in the second
+    let mut w = writer();
+    let (_, second) = w
+        .upsert_create(&[cell("a", s("x"), CellTag::Creation), inc("d", dec("-0.25"))], 0)
+        .unwrap();
+    assert!(second.is_some());
+    let vis = w.visible().unwrap();
+    assert_eq!(text(&vis[&p("d")]), "-0.25");
+    // and the same increment after the creation adds in Decimal128
+    w.write_update(&[UpdateOp::Inc(p("d"), Value::Int32(1))], 0).unwrap();
+    assert_eq!(text(&w.visible().unwrap()[&p("d")]), "0.75");
 }
