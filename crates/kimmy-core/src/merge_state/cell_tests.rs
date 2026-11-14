@@ -429,13 +429,18 @@ fn stamp_bytes(wall: u64) -> Vec<u8> {
 #[test]
 fn the_slot_flag_byte_spells_the_pair_and_both_types() {
     let zig = |v: i128| ((v << 1) ^ (v >> 127)) as u8; // small values: one byte
-    let tail = |flags: u8, total: &[u8], abs: Option<(u64, &[u8])>| {
+    // the slot's bytes: its stamp, the flag byte, the total, the pair (its stamp and total), then the operand
+    // stamps (`wide_at`, then `decimal_at`) that `stamps` says: 11 bytes each, at the slot's own stamp
+    let tail = |flags: u8, total: &[u8], abs: Option<(u64, &[u8])>, stamps: usize| {
         let mut t = stamp_bytes(5);
         t.push(flags);
         t.extend_from_slice(total);
         if let Some((w, a)) = abs {
             t.extend(stamp_bytes(w));
             t.extend_from_slice(a);
+        }
+        for _ in 0..stamps {
+            t.extend(stamp_bytes(5));
         }
         t
     };
@@ -444,35 +449,35 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
         Slot::new(st(5, 'A'), total, absorbed.map(|(w, n)| (st(w, 'A'), n)))
     };
     let cases: Vec<(&str, Slot, Vec<u8>)> = vec![
-        // Int64, no pair: flags 0
-        ("int64", slot(Num::Int64(3), None), tail(0, &[zig(3)], None)),
-        // Int32, no pair: type 1 in bits 1-2
-        ("int32", slot(Num::Int32(3), None), tail(2, &[zig(3)], None)),
-        // Decimal128, no pair: type 2
-        ("decimal", slot(dec("1.5"), None), tail(4, &dec_bytes("1.5"), None)),
+        // Int64, no pair: type 0, and the stamp of its latest wide operand (bit 5, `wide_at`)
+        ("int64", slot(Num::Int64(3), None), tail(0x20, &[zig(3)], None, 1)),
+        // Int32, no pair: type 1 in bits 1-2, no operand stamp
+        ("int32", slot(Num::Int32(3), None), tail(2, &[zig(3)], None, 0)),
+        // Decimal128, no pair: type 2, both operand stamps (bits 5 and 6: `wide_at`, `decimal_at`)
+        ("decimal", slot(dec("1.5"), None), tail(4 | 0x60, &dec_bytes("1.5"), None, 2)),
         // Int64 with an Int64 pair: bit 0
         (
             "int64 pair",
             slot(Num::Int64(3), Some((4, Num::Int64(-2)))),
-            tail(1, &[zig(3)], Some((4, &[zig(-2)]))),
+            tail(1 | 0x20, &[zig(3)], Some((4, &[zig(-2)])), 1),
         ),
         // Int64 total, Int32 pair: the pair's type in bits 3-4
         (
             "int64 with int32 pair",
             slot(Num::Int64(3), Some((4, Num::Int32(3)))),
-            tail(1 | 1 << 3, &[zig(3)], Some((4, &[zig(3)]))),
+            tail(1 | 1 << 3 | 0x20, &[zig(3)], Some((4, &[zig(3)])), 1),
         ),
         // Int32 total, Decimal128 pair
         (
             "int32 with decimal pair",
             slot(Num::Int32(3), Some((4, dec("0.25")))),
-            tail(1 | 1 << 1 | 2 << 3, &[zig(3)], Some((4, &dec_bytes("0.25")))),
+            tail(1 | 1 << 1 | 2 << 3, &[zig(3)], Some((4, &dec_bytes("0.25"))), 0),
         ),
         // Decimal128 total and pair
         (
             "decimal pair",
             slot(dec("3"), Some((4, dec("2")))),
-            tail(1 | 2 << 1 | 2 << 3, &dec_bytes("3"), Some((4, &dec_bytes("2")))),
+            tail(1 | 2 << 1 | 2 << 3 | 0x60, &dec_bytes("3"), Some((4, &dec_bytes("2"))), 2),
         ),
     ];
     for (name, sl, want_tail) in cases {
@@ -508,27 +513,100 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
         t.extend_from_slice(rest);
         hand_slot_bytes(&t)
     };
+    // the total, then the operand stamps (`wide_at`, `decimal_at`) a flag byte announces
+    let total_and = |stamps: &[u64]| {
+        let mut r = vec![zig3];
+        stamps.iter().for_each(|w| r.extend(stamp_bytes(*w)));
+        r
+    };
     let pair = |w: u64| {
         let mut r = vec![zig3];
         r.extend(stamp_bytes(w));
         r.push(zig3);
         r
     };
+    let dec3 = "3".parse::<bson::Decimal128>().unwrap().bytes();
+    let dec_and = |stamps: &[u64]| {
+        let mut r = dec3.to_vec();
+        stamps.iter().for_each(|w| r.extend(stamp_bytes(*w)));
+        r
+    };
     let dec_check = |b: &[u8]| MergeState::decode_compact(b).map(|_| ());
-    // the neighbours that are accepted
-    assert_eq!(dec_check(&with(0, &[zig3])), Ok(()));
-    assert_eq!(dec_check(&with(1, &pair(5))), Ok(()));
+    // the neighbours that are accepted: an Int32 total has no operand stamp, an Int64 one the stamp
+    // `wide_at` (bit 5), a Decimal128 one both (bits 5 and 6)
+    assert_eq!(dec_check(&with(2, &[zig3])), Ok(()));
+    assert_eq!(dec_check(&with(0x20, &total_and(&[5]))), Ok(()));
+    assert_eq!(dec_check(&with(0x20, &total_and(&[4]))), Ok(()));
+    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[5, 5]))), Ok(()));
+    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[4, 3]))), Ok(()));
+    let mut r = pair(5);
+    r.extend(stamp_bytes(5));
+    assert_eq!(dec_check(&with(1 | 0x20, &r)), Ok(()));
     assert_eq!(dec_check(&with(1 | 1 << 1 | 1 << 3, &pair(5))), Ok(()));
+    // an Int64 total without its stamp is a slot no writer keeps (flag 0 was one before the stamps):
+    // the type the stamps spell is Int32
+    let inconsistent = || -> Result<(), DecodeError> { Err(DecodeError::SlotWidthsInconsistent) };
+    assert_eq!(dec_check(&with(0, &[zig3])), inconsistent());
+    assert_eq!(dec_check(&with(1, &pair(5))), inconsistent());
+    assert_eq!(dec_check(&with(4, &dec3)), inconsistent());
+    // the stamps spell a type that is not the total's: a stamp on an Int32 total, a Decimal128 total
+    // with only `wide_at`, an Int64 total with both
+    assert_eq!(dec_check(&with(2 | 0x20, &total_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(4 | 0x20, &dec_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(0x60, &total_and(&[5, 5]))), inconsistent());
+    // `decimal_at` with no `wide_at` (bit 6 alone), and above `wide_at`
+    assert_eq!(dec_check(&with(4 | 0x40, &dec_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[3, 4]))), inconsistent());
     // type 3 of the total, type 3 of the pair
     assert_eq!(dec_check(&with(3 << 1, &[zig3])), Err(DecodeError::BadTag(6)));
     assert_eq!(dec_check(&with(1 | 3 << 3, &pair(5))), Err(DecodeError::BadTag(25)));
     // a pair type with no pair
     assert_eq!(dec_check(&with(1 << 3, &[zig3])), Err(DecodeError::BadTag(8)));
     assert_eq!(dec_check(&with(2 << 3, &[zig3])), Err(DecodeError::BadTag(16)));
-    // any other bit
-    for bit in [0x20u8, 0x40, 0x80] {
-        assert_eq!(dec_check(&with(bit, &[zig3])), Err(DecodeError::BadTag(bit)), "{bit:#x}");
+    // the bit that is no flag
+    assert_eq!(dec_check(&with(0x80, &[zig3])), Err(DecodeError::BadTag(0x80)));
+    // each clause of the check on the stamps, by a slot that breaks that one clause alone (the
+    // versions vector covers every stamp, so the clause is the refusal and not the vector)
+    let broken = |wide_at: Option<MStamp>, decimal_at: Option<MStamp>, total: Num| {
+        let mut s = state_with_total(total);
+        s.vv.insert(wid('B', 0), h(9));
+        s.slots.values_mut().for_each(|x| {
+            x.wide_at = wide_at;
+            x.decimal_at = decimal_at;
+        });
+        s
+    };
+    let case = |s: MergeState| {
+        assert_eq!(s.check_decoded(), inconsistent(), "{s:?}");
+        refuses(&s, DecodeError::SlotWidthsInconsistent);
+    };
+    // the honest ones, below the slot's stamp (5, A) or at it
+    for s in [
+        broken(Some(st(5, 'A')), None, Num::Int64(3)),
+        broken(Some(st(2, 'A')), None, Num::Int64(3)),
+        broken(Some(st(2, 'A')), Some(st(2, 'A')), dec("3")),
+        broken(Some(st(4, 'A')), Some(st(2, 'A')), dec("3")),
+    ] {
+        accepts(&s);
     }
+    // a stamp of another writer than the slot's key (the stamp itself is below the slot's)
+    case(broken(Some(st(3, 'B')), None, Num::Int64(3)));
+    case(broken(Some(st(3, 'B')), Some(st(2, 'A')), dec("3")));
+    case(broken(Some(st(4, 'A')), Some(st(2, 'B')), dec("3")));
+    case(broken(Some(MStamp { hlc: h(3), writer: wid('A', 1) }), None, Num::Int64(3)));
+    // a stamp above the slot's own stamp
+    case(broken(Some(st(6, 'A')), None, Num::Int64(3)));
+    case(broken(Some(st(6, 'A')), Some(st(2, 'A')), dec("3")));
+    case(broken(Some(st(6, 'A')), Some(st(6, 'A')), dec("3")));
+    // `decimal_at` with no `wide_at` at or above it
+    case(broken(None, Some(st(2, 'A')), dec("3")));
+    case(broken(Some(st(2, 'A')), Some(st(4, 'A')), dec("3")));
+    // the stamps spell a type that is not the total's label
+    case(broken(None, None, Num::Int64(3)));
+    case(broken(Some(st(5, 'A')), None, Num::Int32(3)));
+    case(broken(Some(st(5, 'A')), None, dec("3")));
+    case(broken(None, None, dec("3")));
+    case(broken(Some(st(5, 'A')), Some(st(5, 'A')), Num::Int64(3)));
     // a total that is not the shortest varint, and one past the bound
     assert_eq!(dec_check(&with(0, &[0x86, 0x00])), Err(DecodeError::NotCanonical));
     let mut big = state_with_total(Num::Int64(MAX_TOTAL + 1));
@@ -702,6 +780,12 @@ fn paired() -> MergeState {
     state
 }
 
+/// Every slot of the state replaced by the honest one of this total and pair, stamped at its own stamp:
+/// `Slot::new` spells the operand stamps of the total's type, as a writer's slot of that width does.
+fn honest(state: &mut MergeState, total: Num, absorbed: Option<(MStamp, Num)>) {
+    state.slots.values_mut().for_each(|x| *x = Slot::new(x.stamp, total, absorbed));
+}
+
 fn refuses(state: &MergeState, err: DecodeError) {
     assert_eq!(MergeState::decode_compact(&state.encode_compact()), Err(err));
 }
@@ -823,10 +907,7 @@ fn decode_refuses_an_absorbed_total_of_a_wider_type_than_the_slot() {
     // the slot (5, A) with `slot` as its total, the pair (3, A) with `pair`
     let with = |slot: Num, pair: Num| {
         let mut s = paired();
-        s.slots.values_mut().for_each(|x| {
-            x.total = slot;
-            x.absorbed = Some((st(3, 'A'), pair));
-        });
+        honest(&mut s, slot, Some((st(3, 'A'), pair)));
         s
     };
     let (i32n, i64n, d) = (Num::Int32(4), Num::Int64(4), dec("4"));
@@ -849,10 +930,7 @@ fn decode_refuses_an_absorbed_total_of_a_wider_type_than_the_slot() {
     // at the slot's own stamp the totals are equal, so the labels are: the type clause never
     // reports what the total clause does
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| {
-        x.total = i64n;
-        x.absorbed = Some((st(5, 'A'), d));
-    });
+    honest(&mut s, i64n, Some((st(5, 'A'), d)));
     refuses(&s, DecodeError::AbsorbedTotalMismatch);
     // the clauses before it keep their verdicts
     let mut s = with(i64n, d);
@@ -1146,24 +1224,15 @@ fn a_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot
         assert!(payload.is_canonical(), "{what}");
         // as the slot's total, alone
         let mut slot_only = paired();
-        slot_only.slots.values_mut().for_each(|x| {
-            x.total = payload;
-            x.absorbed = None;
-        });
+        honest(&mut slot_only, payload, None);
         accepts(&slot_only);
         // as the absorbed total, below a Decimal128 slot (the pair is not wider than its slot)
         let mut pair_only = paired();
-        pair_only.slots.values_mut().for_each(|x| {
-            x.total = dec("7");
-            x.absorbed = Some((st(3, 'A'), payload));
-        });
+        honest(&mut pair_only, dec("7"), Some((st(3, 'A'), payload)));
         accepts(&pair_only);
         // as both, at the slot's own stamp: equal bytes, accepted
         let mut both = paired();
-        both.slots.values_mut().for_each(|x| {
-            x.total = payload;
-            x.absorbed = Some((x.stamp, payload));
-        });
+        honest(&mut both, payload, Some((st(5, 'A'), payload)));
         accepts(&both);
         // and the exact bytes are the ones that come back
         for state in [&slot_only, &pair_only, &both] {
@@ -1186,10 +1255,8 @@ fn a_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot
         }
         // at the slot's own stamp the pair must equal the slot byte for byte: another (canonical) total is another total
         let mut mismatch = paired();
-        mismatch.slots.values_mut().for_each(|x| {
-            x.total = payload;
-            x.absorbed = Some((x.stamp, if payload == dec("1") { dec("2") } else { dec("1") }));
-        });
+        let other = if payload == dec("1") { dec("2") } else { dec("1") };
+        honest(&mut mismatch, payload, Some((st(5, 'A'), other)));
         refuses(&mismatch, DecodeError::AbsorbedTotalMismatch);
     }
 }
