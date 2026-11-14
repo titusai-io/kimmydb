@@ -30,7 +30,7 @@
 //! same field order. Unsets come first, in operator order.
 
 use bson::{Bson, Document};
-use kimmy_core::effects::Effects;
+use kimmy_core::effects::{Effects, UpsertEffects};
 use kimmy_core::merge_state::bridge::bson_to_value;
 use kimmy_core::merge_state::{Path, Value};
 use kimmy_core::{Error, Result};
@@ -265,4 +265,135 @@ fn build(mut items: Vec<Item>, next: &Document) -> Effects {
         };
     }
     fx
+}
+
+// ---------------------------------------------------------------------------------------------
+// Upserts
+// ---------------------------------------------------------------------------------------------
+
+/// The plan of an upsert that matched no document.
+#[derive(Debug)]
+pub enum UpsertPlan {
+    /// An operator or pipeline update: the creation as [`UpsertEffects`] (the filter's equality
+    /// fields, `$setOnInsert`, `$set` and the computed values of the register operators, `$inc`),
+    /// already checked ([`UpsertEffects::check`] and [`UpsertEffects::check_creation`]), and the
+    /// document the engine inserts (what a `document` collection stores).
+    Effects { effects: UpsertEffects, post_image: Document },
+    /// A replacement document: the creation is the replacement, not an effect list.
+    Replace { post_image: Document },
+}
+
+/// The equality constraints a match necessarily satisfies, as `(dotted path, value)`: only
+/// `$and`-reachable `$eq` on a plain path counts (an equality inside `$or` is not implied).
+fn implied_equalities(f: &Filter, seed: &mut Document, out: &mut Vec<(String, Bson)>) {
+    match f {
+        Filter::And(branches) => branches.iter().for_each(|b| implied_equalities(b, seed, out)),
+        Filter::Field { path: field, conditions } => {
+            for c in conditions {
+                if let filter::Condition::Eq(value) = c {
+                    // as the seed of the stored-document policy: a dotted path seeds a nested field
+                    let _ = path::set(seed, field, value.clone());
+                    out.push((field.clone(), value.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dotted(p: &str) -> Result<Path> {
+    to_path(&path::segments(p))
+}
+
+/// Plan the creation of an upsert whose `filter` matched nothing. The engine builds the inserted
+/// document as it always did (the filter's equalities, then the update); the effects are the
+/// layers of the creation, each as written: `from_filter` (an `_id` path is left out, the upsert's
+/// `_id` logic owns it), `set_on_insert`, `set` (including the creation value of `$mul`, `$min`,
+/// `$max`, `$currentDate`, `$push`, `$addToSet`, `$bit` and the other register operators) and
+/// `inc`. New fields of `set_on_insert` and `set` are listed in the order of the inserted
+/// document. A positional `$` is refused by the engine on an insert, as before.
+pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<UpsertPlan> {
+    let mut seed = Document::new();
+    let mut equalities = Vec::new();
+    implied_equalities(filter, &mut seed, &mut equalities);
+    let mut post = seed.clone();
+    apply_to_at(update, &mut post, now_ms, Target::Inserted, None)?;
+    let mut fx = UpsertEffects::default();
+    for (p, v) in &equalities {
+        if p.split('.').next() != Some("_id") {
+            fx.from_filter.push((dotted(p)?, value_of(v)?));
+        }
+    }
+    match update {
+        Update::Replace(_) => return Ok(UpsertPlan::Replace { post_image: post }),
+        Update::Pipeline(_) => {
+            for item in pipeline_items(&seed, &post)? {
+                fx.set.push(match item {
+                    Item::Set(p, v) => (p, v),
+                    Item::Unset(p) => (p, Value::Unset),
+                    _ => unreachable!("a pipeline diff holds sets and unsets"),
+                });
+            }
+        }
+        Update::Operators(operations) => {
+            let concrete = concrete_paths(operations, &seed, None, |_| true)?;
+            let mut hoisted = HashSet::new();
+            for (op, paths) in operations.iter().zip(&concrete) {
+                for p in paths {
+                    creation_of(op, p, &seed, &post, &mut hoisted, &mut fx)?;
+                }
+            }
+        }
+    }
+    let rank_of = |p: &Path, v: &Value| if *v == Value::Unset { Vec::new() } else { rank(&post, p) };
+    fx.set.sort_by_cached_key(|(p, v)| rank_of(p, v));
+    fx.set_on_insert.sort_by_cached_key(|(p, v)| rank_of(p, v));
+    fx.check().map_err(bad)?;
+    fx.check_creation().map_err(bad)?;
+    Ok(UpsertPlan::Effects { effects: fx, post_image: post })
+}
+
+/// One operation's part of the creation.
+fn creation_of(
+    op: &Operation,
+    concrete: &str,
+    seed: &Document,
+    post: &Document,
+    hoisted: &mut HashSet<Path>,
+    fx: &mut UpsertEffects,
+) -> Result<()> {
+    let segs = path::segments(concrete);
+    let crosses = |segs: &[&str]| outermost_array(seed, segs).is_some_and(|n| n < segs.len());
+    let generic = |segs: &[&str], hoisted: &mut HashSet<Path>, fx: &mut UpsertEffects| {
+        let mut items = Vec::new();
+        write_of(segs, seed, post, hoisted, &mut items)?;
+        for item in items {
+            fx.set.push(match item {
+                Item::Set(p, v) => (p, v),
+                Item::Unset(p) => (p, Value::Unset),
+                _ => unreachable!("a write is a set or an unset"),
+            });
+        }
+        Ok::<(), Error>(())
+    };
+    match &op.kind {
+        OpKind::SetOnInsert(v) if !crosses(&segs) => {
+            fx.set_on_insert.push((to_path(&segs)?, value_of(v)?));
+        }
+        OpKind::Set(v) if !crosses(&segs) => fx.set.push((to_path(&segs)?, value_of(v)?)),
+        OpKind::Unset if !crosses(&segs) => fx.set.push((to_path(&segs)?, Value::Unset)),
+        OpKind::Inc(by) if !crosses(&segs) => fx.inc.push((to_path(&segs)?, value_of(by)?)),
+        OpKind::Rename(target) => {
+            let to_segs = path::segments(target);
+            if crosses(&segs) || crosses(&to_segs) {
+                generic(&segs, hoisted, fx)?;
+                generic(&to_segs, hoisted, fx)?;
+            } else if let Some(source) = get_in(seed, &segs) {
+                fx.set.push((to_path(&segs)?, Value::Unset));
+                fx.set.push((to_path(&to_segs)?, value_of(source)?));
+            }
+        }
+        _ => generic(&segs, hoisted, fx)?,
+    }
+    Ok(())
 }
