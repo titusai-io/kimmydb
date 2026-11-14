@@ -41,29 +41,65 @@
 //! | `$set p v` | `Set(p, v)` | a document `v` is expanded by the writer, only changed leaves are written; below a scalar or array: `BelowScalar`; illegal value: `BadValue`/`BadPath` |
 //! | `$unset p` | `Unset(p)` | absent path: no write of its own |
 //! | `$inc p n` | `Inc(p, n)` | counter slot on an Int32/Int64/Decimal128 base, register write on a Double base (the writer decides); refusals `IncOperandNotANumber`, `IncTargetNotANumber`, `IncTargetIsAContainer`, `IncDoubleOnCounter`, `IncOutOfRange`, `TooManyContributors`; absent target: counter created |
-//! | `$mul` | `Set(p, product)` | register write; computed by the product |
+//! | `$mul`, `$bit` | `Set(p, computed)` | register write (a base write); computed by the product |
 //! | `$min`, `$max` | `Set(p, v)` only if it changes, else no effect | register write |
-//! | `$bit` | `Set(p, result)` | register write |
-//! | `$currentDate` | `Set(p, now)` | register write; one `now` per update |
+//! | `$currentDate` | `Set(p, now)` | ONE `now` per update, from the product clock as today's `apply(update, doc, now_ms)`; NOT derived from the stamp (the `document` policy stays byte-identical to 0.59) |
 //! | `$push`, `$addToSet`, `$pull`, `$pullAll`, `$pop` | `Set(p, whole_array)` | arrays atomic; no effect if the array is unchanged |
 //! | positional `$`, `$[]`, `$[id]` (with `arrayFilters`) | `Set(array_path, whole_array)` | the product resolves the position; the array is the leaf |
-//! | `$rename a b` | `Unset(a)` + `Set(b, value)` | disjoint paths required (else `Overlap`); a COUNTER at `a` is refused by the product |
+//! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded) | disjoint paths required (else `Overlap`); a path the WRITER sees as a counter at `a` is `RenameOfCounter(a)` (400), see below |
 //! | `$setOnInsert` | none on update; `UpsertEffects::set_on_insert` on an insert | no-op on an existing document |
-//! | pipeline update (ADR-265) | per-leaf `Set`/`Unset` of what differs, one list | not `write_replace` (a replace reorders fields); each written path is a one-segment-per-name [`Path`] |
+//! | pipeline update (ADR-265) | per-leaf `Set`/`Unset` of what differs, one list | not `write_replace` (a replace reorders fields); each written path is a [`Path`] of one segment per name |
 //! | replace-style update | not an effect list | stays the replace path of the storage layer |
 //! | any operator on a missing document | `UpdateRefused::NoLife` | upsert goes through [`UpsertEffects`] |
 //! | any two operators on overlapping paths | `UpdateRefused::Overlap` | whole update refused |
 //! | a new writer past the caps | `UpdateRefused::WriterCap` | whole update refused |
 //!
-//! # Open questions (not settled by the spec)
+//! # Counters: `$rename`, and `$mul`/`$min`/`$max` over a counter
 //!
-//! * Whether the product can know that a path holds a counter (for the `$rename` refusal) from the
-//!   document it sees, or needs a writer query.
-//! * `$min`/`$max`/`$mul` on a counter path: a `Set` over a counter slot is not specified here.
-//! * An upsert with more than one `$inc`, or `$inc` and `$setOnInsert` on the same path:
-//!   `Writer::upsert_soi*` takes exactly one `(inc_path, n)`.
-//! * Whether a pipeline update's no-op comparison is by value and type or by representation.
-//! * `$currentDate` and the stamp: whether `now` is the update's stamp time or the product's clock.
+//! A path is a COUNTER when, in the writer's state, its visible cell in an alive life is an
+//! `Int32`, `Int64` or `Decimal128` (its base and/or slots, design D5/NB1); a `Double` is not.
+//! Only the writer's state knows this, so it is decided at the writer
+//! ([`Writer::sees_counter`], read-only), never inferred from the `Document` by the product.
+//! [`Effects::apply`] and [`Effects::apply_stamped`] refuse the whole update with
+//! [`UpdateRefused::RenameOfCounter`] (400) BEFORE writing or moving the clock when a recorded
+//! rename source is a counter. Race (U2, as the Q7 design words it): a counter field THIS member
+//! sees as a counter cannot be renamed (400); a concurrent first `$inc` elsewhere races the rename
+//! and its increments reappear on the source path (U2), documented, not "always a 400".
+//!
+//! `$mul`, `$min`, `$max` (and `$bit`) over a counter path are a register write, a base write:
+//! `Set(path, computed)`. The fold rule applies (it folds every slot of the path that it holds in
+//! an alive life); increments it has not seen add on top (design line 117). Nothing new in the API.
+//!
+//! # Upserts
+//!
+//! [`UpsertEffects`] is `{ set_on_insert, set, inc }`. `$inc` plus `$setOnInsert` (or `$set`) on the
+//! same path, or any overlap among the three lists (a path equal to or below another), is refused
+//! up front as [`UpdateRefused::Overlap`] ([`UpsertEffects::check`]); there is no splitting logic.
+//! Several `$inc` on DISTINCT paths are allowed.
+//!
+//! # S2a work item (not implemented here)
+//!
+//! `Writer::upsert_soi*` takes exactly one `(inc_path, n)`. S2a generalises the two-write upsert to
+//! a list of `(path, n)` at ONE stamp for the increments, validated as a whole together with the
+//! creation before anything is written or the clock moves. One write = one stamp, as
+//! `write_update` already does, so no model rerun; extend the Rust oracle and property generator
+//! to multi-`$inc` upserts.
+//!
+//! # No-op test
+//!
+//! By representation, as for every write ([`Value::same`]): doubles compare by bit pattern
+//! (`-0.0` is not `0.0`; a NaN over the same NaN is a no-op), a `Decimal128` by its 16 bytes, an
+//! `Int` never equals a `Double`, a type change is a write, `Null` is distinct from unset.
+//!
+//! # Questions: resolved by ruling, and still open
+//!
+//! * RESOLVED: `$rename` of a counter is decided at the writer, see above.
+//! * RESOLVED: `$mul`/`$min`/`$max` over a counter is `Set(computed)`, see above.
+//! * RESOLVED: upserts refuse overlap, several `$inc` on distinct paths; generalisation is S2a's.
+//! * RESOLVED: pipeline no-op is by representation (`Value::same`).
+//! * RESOLVED: `$currentDate` is one product-clock `now` per update.
+//! * OPEN: `$rename` of a sub-document that holds counters: only the source path's own cell is
+//!   checked by [`Writer::sees_counter`].
 
 pub use crate::merge_state::{MStamp, Path, UpdateOp, UpdateRefused, Value, Written};
 use crate::merge_state::{UpdateError, Writer};
@@ -73,6 +109,8 @@ use crate::merge_state::{UpdateError, Writer};
 #[derive(Clone, Debug, Default)]
 pub struct Effects {
     ops: Vec<UpdateOp>,
+    /// The source paths of the renames recorded by [`Effects::rename`], in order.
+    renames: Vec<Path>,
 }
 
 impl Effects {
@@ -83,7 +121,7 @@ impl Effects {
 
     /// Effects from a ready list, kept in order.
     pub fn from_ops(ops: Vec<UpdateOp>) -> Self {
-        Self { ops }
+        Self { ops, renames: Vec::new() }
     }
 
     /// Append an effect, after the ones already there.
@@ -108,9 +146,24 @@ impl Effects {
     }
 
     /// Append `$rename from to`: `Unset(from)` then `Set(to, value)`, where `value` is what the
-    /// product read at `from`. The product must refuse a counter at `from` BEFORE calling this.
+    /// product read at `from`. The source is recorded ([`Effects::renames`]) so that `apply`
+    /// can refuse a counter at `from` at the writer ([`UpdateRefused::RenameOfCounter`]).
     pub fn rename(&mut self, from: Path, to: Path, value: Value) -> &mut Self {
+        self.renames.push(from.clone());
         self.unset(from).set(to, value)
+    }
+
+    /// The sources of the recorded renames, in order.
+    pub fn renames(&self) -> &[Path] {
+        &self.renames
+    }
+
+    /// The first recorded rename source that the writer sees as a counter, as the refusal.
+    fn rename_refusal(&self, writer: &Writer) -> Option<UpdateRefused> {
+        self.renames
+            .iter()
+            .find(|p| writer.sees_counter(p))
+            .map(|p| UpdateRefused::RenameOfCounter(p.clone()))
     }
 
     /// No effect at all: nothing to write, no stamp.
@@ -137,6 +190,9 @@ impl Effects {
         if self.is_empty() {
             return Outcome::Unchanged;
         }
+        if let Some(r) = self.rename_refusal(writer) {
+            return Outcome::Refused(r);
+        }
         writer.write_update(&self.ops, skew).into()
     }
 
@@ -149,6 +205,9 @@ impl Effects {
         if self.is_empty() {
             return Ok(Outcome::Unchanged);
         }
+        if let Some(r) = self.rename_refusal(writer) {
+            return Ok(Outcome::Refused(r));
+        }
         match writer.write_update_stamped(&self.ops, stamp) {
             Err(UpdateError::Refused(r)) => Ok(Outcome::Refused(r)),
             Err(e) => Err(e),
@@ -159,7 +218,7 @@ impl Effects {
 
 impl FromIterator<UpdateOp> for Effects {
     fn from_iter<I: IntoIterator<Item = UpdateOp>>(it: I) -> Self {
-        Self { ops: it.into_iter().collect() }
+        Self { ops: it.into_iter().collect(), renames: Vec::new() }
     }
 }
 
@@ -200,17 +259,35 @@ impl From<Result<Option<Written>, UpdateRefused>> for Outcome {
     }
 }
 
-/// The effects of an upsert (`update` with `upsert: true`), for the case where no document
-/// matches. `set_on_insert` are the `$setOnInsert` fields, written tagged by the creation;
-/// `update` is the rest of the operators, applied to the document the creation makes.
-/// On an existing document `set_on_insert` is ignored and `update` is an ordinary update.
-///
-/// The writer's `upsert_soi*` takes one `$inc` as `(path, n)`; mapping `update` to those calls is
-/// the storage layer's (S2a) and is an open question for more than one `$inc` (module docs).
+/// The effects of an upsert (`update` with `upsert: true`) when no document matches.
+/// `set_on_insert` are the `$setOnInsert` fields (written tagged by the creation), `set` the
+/// `$set` fields and `inc` the `$inc` operands (an `Int32`, `Int64`, `Decimal128` or `Double`, as
+/// [`UpdateOp::Inc`]). The three lists must be pairwise disjoint, within and across: see
+/// [`UpsertEffects::check`]. On an existing document `set_on_insert` is ignored and `set`/`inc`
+/// are an ordinary update. Several `$inc` on distinct paths are allowed; the storage side (S2a)
+/// must generalise `Writer::upsert_soi*` to them (module docs, "S2a work item").
 #[derive(Clone, Debug, Default)]
 pub struct UpsertEffects {
     pub set_on_insert: Vec<(Path, Value)>,
-    pub update: Effects,
+    pub set: Vec<(Path, Value)>,
+    pub inc: Vec<(Path, Value)>,
+}
+
+impl UpsertEffects {
+    /// Refuse up front any two paths, in one list or across the three, where one is equal to or
+    /// below the other: [`UpdateRefused::Overlap`] (the first pair found, in sorted order).
+    pub fn check(&self) -> Result<(), UpdateRefused> {
+        let mut all: Vec<&Path> =
+            self.set_on_insert.iter().chain(&self.set).chain(&self.inc).map(|(p, _)| p).collect();
+        // sorted, a path is followed by its extensions, so an overlap is between neighbours
+        all.sort();
+        for w in all.windows(2) {
+            if w[0] == w[1] || w[1].is_below(w[0]) {
+                return Err(UpdateRefused::Overlap(w[0].clone(), w[1].clone()));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +376,60 @@ mod tests {
         // a double against an integer counter is a refusal
         let o = Effects::from_ops(vec![UpdateOp::Inc(p("n"), Value::Double(1.5))]).apply(&mut w, 0);
         assert!(matches!(o.refusal(), Some(UpdateRefused::IncDoubleOnCounter(_))));
+    }
+
+    #[test]
+    fn rename_records_its_source_and_a_counter_source_is_refused_before_any_write() {
+        let mut w = writer(); // n is an Int64 counter, x too
+        let before = w.state.clone();
+        let mut e = Effects::new();
+        e.rename(p("n"), p("m"), i(10));
+        assert_eq!(e.renames(), &[p("n")]);
+        assert_eq!(e.len(), 2);
+        let o = e.apply(&mut w, 0);
+        assert_eq!(o.refusal(), Some(&UpdateRefused::RenameOfCounter(p("n"))));
+        assert_eq!(w.state, before, "no write, no clock move");
+        // a string or a double, and a missing source, are renamed
+        w.write_set(&p("s"), Value::String("v".into()), 0).unwrap();
+        w.write_set(&p("d"), Value::Double(1.5), 0).unwrap();
+        let mut r = Effects::new();
+        r.rename(p("s"), p("s2"), Value::String("v".into()));
+        assert!(r.apply(&mut w, 0).modified());
+        let mut r = Effects::new();
+        r.rename(p("d"), p("d2"), Value::Double(1.5));
+        assert!(r.apply(&mut w, 0).modified());
+        let mut r = Effects::new();
+        r.rename(p("gone"), p("g2"), i(1));
+        assert!(!matches!(r.apply(&mut w, 0), Outcome::Refused(UpdateRefused::RenameOfCounter(_))));
+    }
+
+    #[test]
+    fn upsert_effects_shape_and_overlap_refusal() {
+        let u = UpsertEffects {
+            set_on_insert: vec![(p("a"), i(1))],
+            set: vec![(p("b"), i(2))],
+            inc: vec![(p("c"), i(1)), (p("d"), Value::Double(0.5))],
+        };
+        assert!(u.check().is_ok(), "several $inc on distinct paths are allowed");
+        let same = UpsertEffects { inc: vec![(p("a"), i(1))], ..u.clone() };
+        assert!(matches!(same.check(), Err(UpdateRefused::Overlap(..))));
+        let below =
+            UpsertEffects { set: vec![(Path::new(["c", "x"]).unwrap(), i(1))], ..u.clone() };
+        assert!(matches!(below.check(), Err(UpdateRefused::Overlap(..))));
+        let twice = UpsertEffects { inc: vec![(p("c"), i(1)), (p("c"), i(2))], ..u };
+        assert!(matches!(twice.check(), Err(UpdateRefused::Overlap(..))));
+    }
+
+    #[test]
+    fn the_no_op_test_is_by_representation() {
+        let same = |a: Option<&Value>, b: &Value| Value::same(a, b);
+        assert!(!same(Some(&Value::Double(0.0)), &Value::Double(-0.0)));
+        let nan = Value::Double(f64::NAN);
+        assert!(same(Some(&nan), &nan));
+        assert!(!same(Some(&Value::Decimal128([1; 16])), &Value::Decimal128([2; 16])));
+        assert!(!same(Some(&i(2)), &Value::Double(2.0)));
+        assert!(!same(Some(&Value::Int32(2)), &i(2)));
+        assert!(!same(None, &Value::Null));
+        assert!(same(None, &Value::Unset));
     }
 }
