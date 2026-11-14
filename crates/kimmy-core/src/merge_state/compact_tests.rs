@@ -106,6 +106,8 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0)),
         ("obs", golden_obs(), ("09c078603374ae19df49d4aa38faed7c", 362, 2)),
         ("small", golden_small(), ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2)),
+        // a NEW key: the typed golden, whose section 10 the independent Python checker also writes and hashes
+        ("typed", golden_typed(), ("2961d2eaafc362352575c540c8cac389", 382, 3)),
     ] {
         assert_eq!(
             (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
@@ -171,6 +173,7 @@ fn ord_section_states() -> Vec<(&'static str, MergeState)> {
         ("delete", golden_delete()),
         ("obs", golden_obs()),
         ("small", golden_small()),
+        ("typed", golden_typed()),
     ];
     let np = |segs: &[&str]| Path::new(segs.iter().copied()).unwrap();
     let doc = |names: &[&str]| -> Vec<(Path, Value)> {
