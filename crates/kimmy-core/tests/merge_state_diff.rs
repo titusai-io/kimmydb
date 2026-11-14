@@ -758,6 +758,10 @@ fn golden_vectors_match_the_model() {
         "mixed-compact": ["cb5e6838859904b50d3a0a03c290410d", 349],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
         "obs-compact": ["01ed28ab7e196e406d1c7f38d0af7b2b", 285],
+        // the typed state: no version 1 spelling (it holds absorbed pairs); its compact form is pinned by the writer and
+        // by the independent encoder alike (`the_typed_golden_vector_matches_the_model`)
+        "typed": J::Null,
+        "typed-compact": ["8291f85d0c22817da0032635387e1351", 286],
     });
     assert_eq!(got, want);
 }
