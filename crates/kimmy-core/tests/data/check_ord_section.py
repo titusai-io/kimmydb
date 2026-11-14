@@ -13,7 +13,7 @@ module documentation of `compact.rs` (primitives and section 10), the bytes of s
   2. it walks sections 3 to 9 (skipping values; no semantics), finds the offset where section 10 begins, checks that
      the section 10 it writes starts EXACTLY there and runs exactly to the end of the bytes, and is byte for byte
      the Rust bytes from there;
-  3. the length of the Rust bytes is the pinned one (10, 273, 509, 235, 329, 163), and the 128-bit hash of the bytes,
+  3. the length of the Rust bytes is the pinned one (10, 295, 520, 235, 362, 163), and the 128-bit hash of the bytes,
      computed here by a hash of its own, is the pinned one (`the_compact_golden_hashes_with_the_order_state_are_pinned`).
 Exit status 0 and one line per golden when everything matches; any mismatch prints the first differing offset and exits 1.
 """
