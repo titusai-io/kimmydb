@@ -64,7 +64,7 @@
 //! | `$currentDate` | `Set(p, now)` | ONE `now` per update, from the product clock as today's `apply(update, doc, now_ms)`; NOT derived from the stamp (the `document` policy stays byte-identical to 0.59) |
 //! | `$push`, `$addToSet`, `$pull`, `$pullAll`, `$pop` | `Set(p, whole_array)` | arrays atomic; no effect if the array is unchanged |
 //! | positional `$`, `$[]`, `$[id]` (with `arrayFilters`), or any path through an array (`a.0`, `a.0.b`, nested arrays) | ONE `Set(outermost_array, whole_array)` per array | the product resolves the position and combines every operator of the update on that array into its final value (invariant 4); `$inc` on an element is a register write; `$unset` of an element writes `null` |
-//! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded); NO effects when the source is absent (a no-op, as in the reference) | disjoint paths required (else `Overlap`); `a` or a path below it that is, at this moment, a number holding a counter SLOT in an alive life the WRITER sees is `RenameOfCounter(a)` (400), see below; a target that is a counter is just a `Set` (folds), allowed |
+//! | `$rename a b` | `Unset(a)` + `Set(b, value)` (source recorded); NO effects when the source is absent (a no-op, as in the reference) | disjoint paths required (else `Overlap`); `a` or any path below it that the WRITER sees as a counter is `RenameOfCounter(a)` (400), see below; a target that is a counter is just a `Set` (folds), allowed |
 //! | `$setOnInsert` | none on update; `UpsertEffects::set_on_insert` on an insert | no-op on an existing document |
 //! | pipeline update (ADR-265) | `Set(top_field, Document)` per CHANGED top-level field (or `Unset(top_field)`), one list, never an ancestor and a descendant together | not `write_replace` (a replace reorders fields); the writer's diff writes only the changed leaves and unsets only what it saw; each path is a [`Path`] of one segment per name (S2b item below) |
 //! | replace-style update | not an effect list | stays the replace path of the storage layer; RECORDED (`q7s2b.out` 112-158, `runCommand`): a replacement upsert creates `{_id: generated}` plus the body, the filter field is NOT carried (q `{k: 1}`, u `{v: 2}` gives `{_id: generated, v: 2}`), an `_id` in the filter or the body is used, a different `_id` in both is code 66, a replacement of an existing document drops the other fields, the operator form `{$set: {v: 2}}` keeps the filter field |
@@ -83,43 +83,21 @@
 //! `Int32`, `Int64` or `Decimal128` (its base and/or slots, design D5/NB1); a `Double` is not.
 //! Only the writer's state knows this, so it is decided at the writer
 //! ([`Writer::sees_counter`], read-only), never inferred from the `Document` by the product.
-//!
-//! `$rename` has its own, narrower test. It is leaf effects (D4): a numeric register that no
-//! `$inc` has written a slot for carries nothing that cannot move, and is renamed as
-//! `Unset(source)` + `Set(target, value)`, like any register (an insert, a `$set`, a replace, or a
-//! creating upsert's filter, `$set` or `$setOnInsert` writes such a register). A slot cannot move,
-//! so the rename is refused when the source path, or a path below it, is AT THIS MOMENT a visible
-//! `Int32`, `Int64` or `Decimal128` cell AND holds a counter slot in an alive life, of any
-//! generation, absorbed or not ([`Writer::is_incremented_number_at_or_under`]): in words, a
-//! numeric field that an integer or decimal `$inc` has written a slot for keeps its name, and so
-//! does a sub-document that holds one. A field that was incremented and is no longer a number (set
-//! to a string, a document or an array, unset, or replaced away) is renamed like any other, and
-//! so is a parent whose incremented child is gone; a numeric `$set` over an incremented field does
-//! not free it, and neither does time: the slot lives as long as the document's life, so a name
-//! that was incremented, freed and holds a number again in the same life is refused again (only a
-//! delete and re-insert clears it). An array holding ints is an atomic register. The TARGET side is unchanged: a
-//! rename onto a counter path is a `Set`, which folds, and is allowed. Every rename the writer
-//! accepts writes exactly the register operations of `$set b v` + `$unset a`, so the refusal
-//! protects no merge invariant: it spares a developer the surprise of increments reappearing
-//! under the old name.
+//! `$rename` is leaf effects (D4): renaming a sub-document renames every counter cell under it and
+//! the slots cannot move, so the refusal applies when the source path OR ANY DESCENDANT is a
+//! counter cell in an alive life ([`Writer::sees_counter_at_or_under`]). An array holding ints is
+//! an atomic register, not a counter. The TARGET side is unchanged: a rename onto a counter path is
+//! a `Set`, which folds, and is allowed.
 //! The check lives IN THE WRITER ([`Writer::write_update_renaming`] and its `_stamped` form take
 //! the ops plus the rename sources and refuse first); [`Effects::apply`] and
 //! [`Effects::apply_stamped`] call them. A rename enters an [`Effects`] only through
-//! [`Effects::rename`], and the ops list is not exposed, so a rename of an incremented number
-//! cannot be written around the check: S2a MUST use `apply*`, never `write_update` with the ops.
-//! The whole update is refused with [`UpdateRefused::RenameOfCounter`] (400) BEFORE writing or
-//! moving the clock when a rename source is one (the deviation `rename-of-a-counter-q7` records
-//! this and the cases below).
-//! Race (U2, Q7 amendment 8): a member renames the plain `a` to `b` while another, which has not
-//! seen the rename, makes the first `$inc a 5`; when the two writers saw the same winning base,
-//! every member reads `{a: 5, b: v}`, the reference's serial order "rename, then increment" (an
-//! increment of an absent field creates it), with no loss record. Stated, not hidden: a renamer that had seen a
-//! newer non-numeric generation leaves the increment in the hidden figure, and the type of the
-//! reappearing `a` is the slot's (an `Int32` operand on an `Int64` base reads `Int64` 5);
-//! concurrent `$rename a b` and `$rename a c` leave `{b: v, c: v}` on every member (one clash
-//! record on `a`); and a renamed creation cell (a `$setOnInsert` or upsert-filter field) loses its
-//! creation tag, so an explicit insert of the same `_id` that wins leaves the copy beside the
-//! insert's fields with no `insertLost` (Step 4 checklist).
+//! [`Effects::rename`], and the ops list is not exposed, so a counter rename cannot be written
+//! around the check: S2a MUST use `apply*`, never `write_update` with the ops. The whole update is
+//! refused with [`UpdateRefused::RenameOfCounter`] (400) BEFORE writing or moving the clock when a
+//! rename source is a counter. Every Int32/Int64/Decimal128 cell counts, whether or not it was
+//! ever incremented (a deviation entry records this; the owner may narrow it). Race (U2, as the Q7 design words it): a counter field THIS member
+//! sees as a counter cannot be renamed (400); a concurrent first `$inc` elsewhere races the rename
+//! and its increments reappear on the source path (U2), documented, not "always a 400".
 //!
 //! `$mul`, `$min`, `$max` (and `$bit`) over a counter path are a register write, a base write:
 //! `Set(path, computed)`. The fold rule applies (it folds every slot of the path that it holds in
@@ -225,7 +203,7 @@
 //!   with `$inc a.b`, `$setOnInsert a` with `$inc a`, `$set a` with `$unset a.b`, `$set a.b` with
 //!   `$set a`, `$inc a` with `$inc a.b`); the control with distinct paths works (106-107).
 //!
-//! # S2a work item (not implemented here)
+//! # S2a work item (implemented in `Writer::upsert_create`, `Writer::upsert_cells`)
 //!
 //! `Writer::upsert_soi*` takes exactly one `(inc_path, n)`. S2a generalises the two-write upsert to
 //! a list of `(path, n)` at ONE stamp for the increments, validated as a whole together with the
@@ -246,7 +224,10 @@
 //! [`UpdateOp::Inc`] already is: Int32, Int64, Double or Decimal128; the 2026-11-03 ruling already
 //! says to extend `upsert_inc` to Decimal128 operands). On a counter, an Int or Decimal operand is
 //! a counter increment and a Double is a 400 (`IncDoubleOnCounter`); on a Double base it is a
-//! register write; on creation the operand's type sets the cell's type. Not implemented here.
+//! register write; on creation the operand's type sets the cell's type. Implemented: [`Writer::upsert_create`]
+//! takes typed operands, a LIST of increments (one stamp for all of them, validated with the
+//! creation before anything is written), an empty list, the cells in list order and the filter layer
+//! (as `Creation` cells); the `i64` entries (`upsert_soi*`, `upsert_inc*`) stay for the model harness.
 //!
 //! Typed-`$inc` tests of that item, against the recording (`q7s2.out`): `Int32` + `Int64` gives
 //! `Int64`; `Int32` max + 1 gives `Int64` (lines 264-273); `Int64` max + 1 is refused (code 2, line
@@ -322,7 +303,7 @@ use crate::merge_state::{UpdateError, Writer};
 
 /// The effects of one update: an ordered list of per-leaf [`UpdateOp`]s that make ONE write with
 /// ONE stamp. See the module docs for the operator table and the invariants.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
     ops: Vec<UpdateOp>,
     /// The source paths of the renames recorded by [`Effects::rename`], in order.
@@ -376,6 +357,11 @@ impl Effects {
     }
 
     /// The sources of the recorded renames, in order.
+    /// The operators, in order (read-only: a rename enters only through [`Effects::rename`]).
+    pub fn ops(&self) -> impl Iterator<Item = &UpdateOp> {
+        self.ops.iter()
+    }
+
     pub fn renames(&self) -> &[Path] {
         &self.renames
     }
@@ -495,6 +481,10 @@ pub enum CellTag {
     Creation,
     /// Some part from `$set` (`sets` of `Writer::upsert_soi_create`): untagged.
     Plain,
+    /// An `$inc`: the cell's value is the typed operand, no register is written; the field takes
+    /// its place in the creation order, the slot is written by the increment write that follows.
+    /// Only [`UpsertEffects::creation_list`] produces it.
+    Inc,
 }
 
 /// One cell of the composed creation, AS WRITTEN: a dotted leaf is a leaf cell at its own path, a
@@ -506,7 +496,76 @@ pub struct CreationCell {
     pub tag: CellTag,
 }
 
+/// What [`UpsertEffects::apply`] wrote: the creation and, when there were increments beside
+/// creation cells, the increment write (its own stamp: the later one is the document's).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpsertWritten {
+    pub created: Written,
+    pub incremented: Option<Written>,
+}
+
 impl UpsertEffects {
+    /// The creation as ONE ordered list, the increments in it: [`UpsertEffects::creation_cells`]
+    /// followed by an [`CellTag::Inc`] cell per `inc` entry, then put in the post-image order the
+    /// caller names. `order` is the post-image order the product computed (S2b's `UpsertPlan`
+    /// `post_image`, new fields sorted at each level, the filter's equality fields first): it lists
+    /// the paths of the NEW fields (every `set_on_insert`, `set` and
+    /// `inc` path, as written) in the order the product's post-image has them; empty means the
+    /// default sequence (filter cells, then `set_on_insert`, `set`, `inc`). With an order, the
+    /// cells the order does not name (the filter's, and a cell a merge placed at another path)
+    /// stay first in their sequence, then the named ones follow in the order's sequence; an order
+    /// that leaves out a `set_on_insert`, `set` or `inc` path is [`UpdateRefused::BadPath`].
+    pub fn creation_list(&self, order: &[Path]) -> Result<Vec<CreationCell>, UpdateRefused> {
+        let mut list = self.creation_cells()?;
+        list.extend(self.inc.iter().map(|(p, v)| CreationCell {
+            path: p.clone(),
+            value: v.clone(),
+            tag: CellTag::Inc,
+        }));
+        if order.is_empty() {
+            return Ok(list);
+        }
+        let new = self.set_on_insert.iter().chain(&self.set).chain(&self.inc);
+        if new.into_iter().any(|(p, _)| !order.contains(p)) {
+            return Err(UpdateRefused::BadPath(InvalidPath(
+                "the field order of the creation leaves out a new field",
+            )));
+        }
+        let rank = |c: &CreationCell| order.iter().position(|p| *p == c.path);
+        let (mut named, mut rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|c| rank(c).is_some());
+        named.sort_by_key(|c| rank(c));
+        rest.extend(named);
+        Ok(rest)
+    }
+
+    /// Create the document: [`UpsertEffects::creation_list`] (the checks included), then
+    /// [`Writer::upsert_create`]. On a document that already exists the caller applies the
+    /// `set` and `inc` lists as an ordinary update ([`Effects`]) and never calls this.
+    pub fn apply(
+        &self,
+        writer: &mut Writer,
+        order: &[Path],
+        skew: u64,
+    ) -> Result<UpsertWritten, UpdateRefused> {
+        let cells = self.creation_list(order)?;
+        let (created, incremented) = writer.upsert_create(&cells, skew)?;
+        Ok(UpsertWritten { created, incremented })
+    }
+
+    /// [`UpsertEffects::apply`] with the stamps taken from `stamp` (two for creation cells plus
+    /// increments, one otherwise); a rejected stamp is the `Err` and nothing has moved.
+    pub fn apply_stamped(
+        &self,
+        writer: &mut Writer,
+        order: &[Path],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<UpsertWritten, UpdateError> {
+        let cells = self.creation_list(order)?;
+        let (created, incremented) = writer.upsert_create_stamped(&cells, stamp)?;
+        Ok(UpsertWritten { created, incremented })
+    }
+
     /// The PARSE-time check, run on every update and upsert, matched or not: refuse any two paths
     /// of `set_on_insert`, `set` and `inc`, in or across the lists, where one is equal to or below
     /// the other ([`UpdateRefused::Overlap`], the first pair found, in sorted order). It never
@@ -544,7 +603,8 @@ impl UpsertEffects {
         first_overlap(&mut written)?;
         let mut leaves = Vec::new();
         for (p, v) in &filter {
-            v.check_input().map_err(|e| UpdateRefused::BadValue((*p).clone(), e))?;
+            v.check_input_under(p.segments().len())
+                .map_err(|e| UpdateRefused::BadValue((*p).clone(), e))?;
             leaf_paths(p, v, &mut leaves)?;
         }
         let mut sorted: Vec<&Path> = leaves.iter().collect();
@@ -552,7 +612,8 @@ impl UpsertEffects {
 
         let mut cells: Vec<CreationCell> = Vec::new();
         for (p, v) in filter {
-            v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
+            v.check_input_under(p.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
             place(&mut cells, p, v, CellTag::Creation)?;
         }
         let higher = self
@@ -566,7 +627,8 @@ impl UpsertEffects {
                     "_id is the upsert's key: S2b owns it, not the effects",
                 )));
             }
-            v.check_input().map_err(|e| UpdateRefused::BadValue(q.clone(), e))?;
+            v.check_input_under(q.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(q.clone(), e))?;
             if *v == Value::Unset {
                 unset_at(&mut cells, q);
             } else {
@@ -575,7 +637,9 @@ impl UpsertEffects {
         }
         // a merge can nest deeper than either part: check the composed values too
         for c in &cells {
-            c.value.check_input().map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
+            c.value
+                .check_input_under(c.path.segments().len())
+                .map_err(|e| UpdateRefused::BadValue(c.path.clone(), e))?;
         }
         // the writer's rule: an `$inc` path must not be equal to, above or below a cell path
         for c in &cells {
@@ -833,11 +897,10 @@ mod tests {
 
     #[test]
     fn a_counter_rename_is_refused_before_any_write_or_clock_move() {
-        let mut w = writer(); // n is a plain Int64 until it is incremented
-        w.write_inc(&p("n"), 1, 0).unwrap(); // n now holds a slot
+        let mut w = writer(); // n is an Int64 counter
         let before = snap(&w);
         let mut e = Effects::new();
-        e.rename(p("n"), p("m"), i(11));
+        e.rename(p("n"), p("m"), i(10));
         assert_eq!(e.len(), 2);
         let o = e.apply(&mut w, 0);
         assert_eq!(o.refusal(), Some(&UpdateRefused::RenameOfCounter(p("n"))));
@@ -891,23 +954,10 @@ mod tests {
     }
 
     #[test]
-    fn rename_of_a_sub_document_with_an_incremented_field_is_refused_and_onto_a_counter_is_a_set() {
+    fn rename_of_a_sub_document_with_a_counter_is_refused_and_onto_a_counter_is_a_set() {
         let mut w = writer();
         let doc = Value::Document(vec![("c".into(), i(1)), ("t".into(), st("v"))]);
         w.write_set(&p("sub"), doc.clone(), 0).unwrap();
-        // the sub-document holds only plain numbers: it is renamed (on a copy)
-        let mut plain = w.clone();
-        let mut e = Effects::new();
-        e.rename(p("sub"), p("moved"), doc.clone());
-        assert!(e.apply(&mut plain, 0).modified());
-        let got = plain.visible().unwrap();
-        assert!(
-            got.keys().all(|k| *k != p("sub") && !k.is_below(&p("sub"))),
-            "the source stays: {got:?}"
-        );
-        assert_eq!(got.get(&np(&["moved", "c"])), Some(&i(1)));
-        // one incremented field below it makes the whole sub-document a refusal
-        w.write_inc(&np(&["sub", "c"]), 1, 0).unwrap();
         let before = snap(&w);
         let mut e = Effects::new();
         e.rename(p("sub"), p("moved"), doc);
@@ -920,55 +970,36 @@ mod tests {
         r.rename(p("s"), p("n"), st("v"));
         assert!(r.apply(&mut w, 0).modified());
         assert_eq!(w.visible().unwrap()[&p("n")], st("v"));
-        // onto an INCREMENTED counter, the source a plain number: a `Set` that folds, so the
-        // target reads the source's value and not the base plus the slot
-        let mut w = writer();
-        w.write_inc(&p("n"), 5, 0).unwrap();
-        assert_eq!(w.visible().unwrap()[&p("n")], i(15));
-        w.write_set(&p("k"), i(7), 0).unwrap();
-        let mut r = Effects::new();
-        r.rename(p("k"), p("n"), i(7));
-        assert!(r.apply(&mut w, 0).modified());
-        let got = w.visible().unwrap();
-        assert_eq!(got[&p("n")], i(7));
-        assert_eq!(got.get(&p("k")), None);
     }
 
     #[test]
     fn a_one_segment_dotted_field_holding_an_int_does_not_block_renaming_its_prefix() {
         let mut w = writer_of(3);
         w.insert(&[(p("a"), st("s")), (np(&["a.b"]), i(1))], 0).unwrap();
-        // the one-segment `a.b` is incremented: it is not below `a`, so `a` is renamed
-        w.write_inc(&np(&["a.b"]), 1, 0).unwrap();
-        assert!(w.is_incremented_number_at_or_under(&np(&["a.b"])));
-        assert!(!w.is_incremented_number_at_or_under(&p("a")));
         let mut e = Effects::new();
         e.rename(p("a"), p("z"), st("s"));
         assert!(e.apply(&mut w, 0).modified());
     }
 
     #[test]
-    fn a_plain_field_inserted_again_after_a_delete_is_renamed() {
-        // `n` is incremented, the document is deleted and inserted again with a plain `n`. The
-        // deleted life's slot is not in the state any more: a join drops the cells of dead lives
-        // (`join.rs`, `out.slots.retain` over the alive lives) and a local write normalises its
-        // result as a join does (D11), so the `alive` filter of
-        // `is_incremented_number_at_or_under` cannot be observed through a writer: a mutant that
-        // counts the slots of dead lives is EQUIVALENT for every normalised state (every state a writer
-        // or a join produces), and a hand-built state would be dishonest.
+    fn a_counter_in_a_dead_life_does_not_block_a_rename() {
+        // (a superseded life cannot be built: concurrent first inserts leave both lives alive.)
+        // Every join drops the cells of a dead life, so such cells exist only in a state that is
+        // not normalised: mark the life dead by hand, keeping its cells, so that a check that
+        // ignores life state would see the counter.
         let mut w = writer();
-        w.write_inc(&p("n"), 1, 0).unwrap();
+        let life = *w.state.lives.keys().next().unwrap();
+        w.state.dead.insert(life);
+        assert!(w.state.regs.keys().any(|(_, k)| *k == p("n")), "the dead life still holds n");
+        assert!(!w.sees_counter_at_or_under(&p("n")));
+        // deleted and re-inserted without `n`: nothing to refuse, the rename of the absent source
+        // has no effects
+        let mut w = writer();
         w.write_delete(0).unwrap();
-        w.insert(&[(p("x"), i(2)), (p("n"), i(2))], 0).unwrap();
-        assert!(w.state.slots.keys().all(|k| k.1 != p("n")), "no slot of the dead life is held");
-        assert!(!w.is_incremented_number_at_or_under(&p("n")));
+        w.insert(&[(p("x"), i(2))], 0).unwrap();
+        assert!(!w.sees_counter_at_or_under(&p("n")));
         let mut e = Effects::new();
-        e.rename(p("n"), p("m"), i(2));
-        assert!(e.apply(&mut w, 0).modified());
-        assert_eq!(w.visible().unwrap().get(&p("m")), Some(&i(2)));
-        // the source is absent: the rename has no effects
-        let mut e = Effects::new();
-        e.rename(p("gone"), p("m2"), Value::Unset);
+        e.rename(p("n"), p("m"), Value::Unset);
         assert_eq!(e.apply(&mut w, 0), Outcome::Unchanged);
     }
 

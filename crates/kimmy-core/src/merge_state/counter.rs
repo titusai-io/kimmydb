@@ -23,10 +23,12 @@
 //!   an `Int32`, `Int64` or `Decimal128` counter (the 400 of Q9; this one predicate decides it).
 //! * A MERGED cell has no one to refuse. Its type is the JOIN of the types of its parts: the
 //!   base and every slot that contributes. Its value is promoted to `Int64` when the total does
-//!   not fit an `i32`. It never narrows through a write: a writer whose increment made the
-//!   visible value `Int64` marks its slot `Int64`, so a total that later dips back under the
-//!   `i32` range stays `Int64` in that writer's slot. THE ONE DEVIATION: a total that crossed
-//!   the range only in a merge, and dips back by a merge, narrows again, because no write saw it.
+//!   not fit an `i32`. R1: the type is a function of the merged state (increments have no order): the
+//!   narrowest of `Int32` and `Int64` that holds the TOTAL, never narrower than the widest label
+//!   among the base and every slot, a slot's label being the join of the operand types it has added.
+//!   THE ONE DEVIATION: a sequential history whose running value leaves the `i32` range and comes
+//!   back is `Int32` again here, where the reference stays `Int64` (`docs/deviations.md`,
+//!   `counter-type-q7`).
 //! * Integer totals are exact (`i128`, bounded by [`MAX_TOTAL`](super::MAX_TOTAL)); a
 //!   `Decimal128` total is a running sum rounded once per addition to 34 digits (ADR-252, the
 //!   production `add`).
@@ -219,14 +221,6 @@ impl Num {
         match self {
             Num::Decimal128(b) => dec_bytes(dec_raw(b)) == *b,
             _ => true,
-        }
-    }
-
-    /// Relabel an integer amount as an `Int64` (it never narrows again); a decimal as it is.
-    pub(super) fn widened(self) -> Num {
-        match self {
-            Num::Int32(v) => Num::Int64(v),
-            n => n,
         }
     }
 

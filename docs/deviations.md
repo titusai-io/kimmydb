@@ -27,6 +27,16 @@ Status meanings:
 
 ---
 
+<a id="counter-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a counter's type is read from the merged state, so a sequential history that leaves the 32-bit range and comes back ends as an `Int32` where the reference stays an `Int64`
+
+**Raised with the Q7 step 2 counter rule R1.** Concurrent increments have no order, so the type of a counter cannot depend on the order or the partial sums they were added in. The type of a counter here is the narrowest of `Int32` and `Int64` that holds its TOTAL, never narrower than the widest type among the base and every increment operand the counter has seen (an `Int64` operand keeps it an `Int64`; a `Decimal128` makes it a `Decimal128`). This gives the reference's answer in every recorded case: an `Int32` plus an `Int64` is an `Int64`, an `Int32` maximum plus 1 is an `Int64`, an `Int32` 5 plus an `Int64` 0 is the long 5 and counts as modified (`q7s2.out`, d8, d9, z2).
+
+**What differs.** The reference remembers the type a running value has had. A single writer who adds `2000000000` to the `Int32` `2000000000` (the cell is now the long `4000000000`) and then adds `-2000000000` and `-1000000000` leaves the long `1000000000` in the reference, and the `Int32` `1000000000` here, because every operand was an `Int32` and the total fits. Two writers who add `7` and `2147483647` to the `Int32` minimum, concurrently or one after the other, get the `Int32` `6`, the same as the engine's update.
+
+**Workaround:** none needed for a counter that is read as a number; `$set` the value as a long (`NumberLong`) or add a long operand when the type matters.
+
 <a id="upsert-filter-field-incremented-q7"></a>
 
 ## 🟡 Under the `field` merge policy an upsert that creates a document and increments a field its own filter names is refused with a 400
@@ -41,17 +51,11 @@ Status meanings:
 
 <a id="rename-of-a-counter-q7"></a>
 
-## 🟡 Under the `field` merge policy `$rename` of a number that has been incremented, or of a sub-document holding one, is refused with a 400
+## 🟡 Under the `field` merge policy `$rename` of any integer or decimal field, or of a sub-document holding one, is refused with a 400
 
-**Raised with the Q7 step 2 effects interface, narrowed by the owner (Q7 amendment 8, revised).** A counter's slots cannot move. A `$rename` is refused (`RenameOfCounter`, 400) only when the source path, or a path below it, is at this moment an integer or decimal cell that an `$inc` has written a slot for, in an alive life the member sees (any generation, absorbed or not): a numeric field that has been incremented keeps its name, and a numeric `$set` over it does not free it. The answer reads "{path}, or a field below it, is a number that has been incremented and cannot be renamed ($set the new name and $unset the old one)". An integer or decimal field with a value and no slot (inserted, `$set`, replaced, or created by an upsert's filter, `$set` or `$setOnInsert`) is renamed like any other field, and so is a field that was incremented and is no longer a number (set to a string, a document or an array, unset, replaced away), or a parent whose incremented child is gone. The slot lives as long as the document's life, so a name that was incremented, freed and holds a number again in the same document is refused again; only a delete and re-insert clears it. The reference renames every field. A rename onto a counter is a `$set` and is allowed. Every rename that is accepted writes the register operations of `$set` new + `$unset` old, so the refusal protects no merge invariant; it only spares a developer the surprise of increments reappearing under the old name. Three cases are stated, not hidden:
+**Raised with the Q7 step 2 effects interface.** A counter's slots cannot move, and the writer cannot tell a field that was ever incremented from a plain integer: every visible `Int32`, `Int64` or `Decimal128` cell at the source path or below it counts (a double, a string and an array do not). The reference renames them. A concurrent first `$inc` elsewhere can still race a rename that was accepted, and its increments reappear on the source path (design U2). Chris has been told and may narrow it.
 
-- Two concurrent renames of one source (`$rename a b` and `$rename a c`) leave `{b: v, c: v}` on every member; no serial order of the reference gives both. One `clash` record is kept on `a`.
-- A rename that races a first `$inc` of the source reads `{a: 5, b: v}` (the reference's order "rename, then increment"), but only when both writers saw the same winning base. If the renamer had seen a newer non-numeric generation, the increment shows in the hidden figure, and the type of the reappearing `a` is the slot's (an `Int32` operand on an `Int64` base reads `Int64` 5).
-- A renamed creation cell loses its tag: renaming a `$setOnInsert` or upsert-filter field writes an untagged register, so if an explicit insert of the same `_id` wins, the copy survives beside the insert's fields with no `insertLost` on members that already hold the rename (Step 4 checklist).
-
-**Workaround:** `$set` the new name to the value read and `$unset` the old one.
-
-**To close:** a rename that carries the slots, and the creation tag on the rename's `Set` (Step 4).
+**To close:** a rename that carries the slots, or a rule that narrows the refusal to fields that were incremented. S2a and S2b record the choice.
 
 ---
 

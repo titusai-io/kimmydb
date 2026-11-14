@@ -199,25 +199,7 @@ pub fn update_parse_apply(data: &[u8]) {
         let mut target = fixture.clone();
         let id_before = target.get("_id").cloned();
         if update::apply(&update, &mut target, NOW_MS).is_ok() {
-            // The same `_id` is the same `DocId`: a replacement may restate
-            // `1` as `1i64`, which is one id (ADR-111's guard is that the
-            // document is not relocated, not that its bytes are equal).
-            let same_id = match (target.get("_id"), id_before.as_ref()) {
-                (None, None) => true,
-                (Some(now), Some(was)) => {
-                    matches!(
-                        (kimmy_core::DocId::try_from_bson(now), kimmy_core::DocId::try_from_bson(was)),
-                        (Ok(now), Ok(was)) if now == was
-                    )
-                }
-                _ => false,
-            };
-            assert!(
-                same_id,
-                "an update changed _id from {:?} to {:?}: {doc:?}",
-                id_before,
-                target.get("_id")
-            );
+            assert_eq!(target.get("_id"), id_before.as_ref(), "an update changed _id: {doc:?}");
             // Arithmetic writes a canonical Decimal128 or leaves the field as
             // it was: a result is never a coefficient above 10^34 - 1 or an
             // exponent out of range, in a field the update changed.
@@ -604,14 +586,6 @@ mod tests {
                 harness(&bytes);
             }
         }
-    }
-
-    /// A replacement that restates the `_id` in another numeric type is the
-    /// same document, and is not a change of `_id`.
-    #[test]
-    fn a_replacement_restating_the_id_as_another_numeric_type_is_not_a_change() {
-        update_parse_apply(br#"{"_id": {"$numberLong": "1"}, "v": 1}"#);
-        update_parse_apply(br#"{"_id": {"$numberDecimal": "2"}, "v": 1}"#);
     }
 
     /// The inputs a fuzzer finds first, without waiting for it to find them.

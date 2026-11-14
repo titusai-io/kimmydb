@@ -1536,6 +1536,7 @@ mod tests {
             incarnation_floor: Some(Hlc::new(200, 0)),
             validator: None,
             validator_changed: None,
+            merge_policy: kimmy_core::MergePolicy::Document,
         };
         let mut written = Vec::new();
         write_frame(

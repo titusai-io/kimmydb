@@ -98,30 +98,22 @@ fn promotion_scenario(o: &JoinOptions) -> Result<(), String> {
     (v == i64v(4_000_000_000)).then_some(()).ok_or(format!("read {v:?}"))
 }
 
-/// A writer whose increment made the cell an Int64 leaves it one: the total dips back under the
-/// i32 range and the type stays.
-fn no_narrowing_scenario(o: &JoinOptions) -> Result<(), String> {
-    let mut w = Writer::new(wid('A', 0), o.clone());
+/// R1: the type is a function of the merged state. A sequential history whose running value leaves
+/// the i32 range and comes back is an Int32 again (the reference stays an Int64: the deviation
+/// `counter-type-q7`).
+#[test]
+fn a_sequential_history_that_leaves_the_i32_range_and_returns_is_an_int32_again() {
+    let mut w = Writer::new(wid('A', 0), opts());
     w.insert(&fl(&[("n", i32v(2_000_000_000))]), 0).unwrap();
     w.write_inc_value(&p("n"), &i32v(2_000_000_000), 0).unwrap();
-    let up = w.visible().unwrap()[&p("n")].clone();
-    if up != i64v(4_000_000_000) {
-        return Err(format!("up: {up:?}"));
-    }
+    assert_eq!(w.visible().unwrap()[&p("n")], i64v(4_000_000_000));
     w.write_inc_value(&p("n"), &i32v(-2_000_000_000), 0).unwrap();
     w.write_inc_value(&p("n"), &i32v(-1_000_000_000), 0).unwrap();
-    let down = w.visible().unwrap()[&p("n")].clone();
-    // 1e9 fits an i32, and the cell stays an Int64
-    (down == i64v(1_000_000_000)).then_some(()).ok_or(format!("down: {down:?}"))
+    assert_eq!(w.visible().unwrap()[&p("n")], i32v(1_000_000_000));
 }
 
-#[test]
-fn a_cell_that_became_an_int64_by_a_write_never_narrows_again() {
-    no_narrowing_scenario(&opts()).unwrap();
-}
-
-/// THE ONE DEVIATION: a total that crossed the i32 range only in a merge narrows when a later
-/// merge brings it back, because no write saw it.
+/// R1 for a merge: a total that crossed the i32 range only in a merge narrows when a later
+/// merge brings it back (the same rule as for a sequential history).
 #[test]
 fn a_total_that_crossed_only_in_a_merge_narrows_again() {
     let o = opts();
@@ -474,7 +466,7 @@ fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts
 fn the_counter_mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
     type Scenario = fn(&JoinOptions) -> Result<(), String>;
-    let cases: [(&str, Switch, Scenario); 5] = [
+    let cases: [(&str, Switch, Scenario); 4] = [
         (
             "slots are added in the order of their stamps, not of their writers",
             |o| o.set_sum_in_stamp_order(true),
@@ -484,11 +476,6 @@ fn the_counter_mutants_are_caught() {
             "an Int32 cell saturates instead of becoming an Int64",
             |o| o.set_int32_saturates(true),
             promotion_scenario,
-        ),
-        (
-            "a slot stays an Int32 when the cell became an Int64",
-            |o| o.set_slot_never_widens(true),
-            no_narrowing_scenario,
         ),
         (
             "an Int64 cell wraps instead of saturating",
