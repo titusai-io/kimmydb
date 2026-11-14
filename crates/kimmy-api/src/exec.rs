@@ -1663,6 +1663,10 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 /// is **not** implied by a match, so seeding from it would invent a field the
 /// caller never asked for — the kind of quiet wrongness that is hard to notice
 /// in a document that otherwise looks right.
+///
+/// A dotted key seeds nested documents, and their fields are in name order at
+/// each level whatever order the filter wrote its keys in; a whole document
+/// given as the value of a key keeps its own order.
 fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
     match filter {
         filter::Filter::And(branches) => {
@@ -1676,6 +1680,9 @@ fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
                     // Dotted paths go through `path::set` so `{"a.b": 1}`
                     // seeds a nested document rather than a literal key.
                     let _ = kimmy_core::path::set(out, path, value.clone());
+                    // The levels a dotted key creates are sorted, at every
+                    // depth; a document given as the value of a key is not.
+                    kimmy_core::path::sort_levels_through(out, path);
                 }
             }
         }

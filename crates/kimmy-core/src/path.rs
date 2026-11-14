@@ -321,6 +321,21 @@ fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
     level.extend(kept.into_iter().chain(fresh));
 }
 
+/// Sort by name the keys of every sub-document a dot path goes through, the
+/// root and the path's own last key excepted: the levels a write at `path`
+/// created. A document that is the value at the path is left as it is.
+pub fn sort_levels_through(doc: &mut Document, path: &str) {
+    let segs = segments(path);
+    let mut level = doc;
+    for seg in &segs[..segs.len() - 1] {
+        let Some(Bson::Document(child)) = level.get_mut(*seg) else { return };
+        let mut fields: Vec<(String, Bson)> = std::mem::take(child).into_iter().collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        child.extend(fields);
+        level = child;
+    }
+}
+
 /// Remove the value at a dot path. Returns whether anything was removed.
 pub fn unset(doc: &mut Document, path: &str) -> bool {
     let segs = segments(path);

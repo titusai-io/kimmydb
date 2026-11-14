@@ -21820,3 +21820,66 @@ async fn a_replacement_of_a_stored_document_may_not_name_another_id() {
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["document"], json!({ "_id": 1, "v": 2 }));
 }
+
+#[tokio::test]
+async fn an_upsert_seeds_the_nested_fields_of_dotted_filter_keys_in_name_order() {
+    // q7s2d.out lines 6-71: the levels a dotted filter key creates are sorted
+    // at every depth, a whole document given as a filter value keeps its
+    // order, and the fields the update adds follow all the filter's.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![]).await;
+    let cases = [
+        (json!({ "a.c": 1, "a.b": 2 }), json!({ "a": { "b": 2, "c": 1 } })),
+        (json!({ "a.b": 2, "a.c": 1 }), json!({ "a": { "b": 2, "c": 1 } })),
+        (json!({ "a": { "c": 1, "b": 2 } }), json!({ "a": { "c": 1, "b": 2 } })),
+        (json!({ "a.c": 1, "a.b": 2, "b": 3 }), json!({ "a": { "b": 2, "c": 1 }, "b": 3 })),
+        (json!({ "a.c": 1, "b": 3, "a.b": 2 }), json!({ "a": { "b": 2, "c": 1 }, "b": 3 })),
+        (json!({ "x.y.z2": 1, "x.y.z1": 2 }), json!({ "x": { "y": { "z1": 2, "z2": 1 } } })),
+        (
+            json!({ "zz": 1, "aa": 2, "m.q": 3, "m.p": 4 }),
+            json!({ "aa": 2, "m": { "p": 4, "q": 3 }, "zz": 1 }),
+        ),
+    ];
+    for (n, (filter, seeded)) in cases.into_iter().enumerate() {
+        let id = i64::try_from(n).unwrap() + 1;
+        let mut filter = filter;
+        let mut with_id = serde_json::Map::new();
+        with_id.insert("_id".into(), json!(id));
+        with_id.extend(filter.as_object().unwrap().clone());
+        filter = Value::Object(with_id);
+        let mut want = serde_json::Map::new();
+        want.insert("_id".into(), json!(id));
+        want.extend(seeded.as_object().unwrap().clone());
+        // The seed's top-level fields are in name order, `_id` first, then the update's.
+        let mut top: Vec<(String, Value)> = want.into_iter().skip(1).collect();
+        top.sort_by(|a, b| a.0.cmp(&b.0));
+        for (set, adds) in
+            [(json!({ "z": 1 }), vec!["z"]), (json!({ "zz2": 1, "aa2": 2 }), vec!["aa2", "zz2"])]
+        {
+            let id = if adds.len() == 1 { id } else { id + 100 };
+            let mut filter = filter.clone();
+            filter["_id"] = json!(id);
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/pu/find_and_modify",
+                    Some(&token),
+                    json!({ "filter": filter, "update": { "$set": set }, "upsert": true,
+                            "returnDocument": "after" }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+            let mut expected = serde_json::Map::new();
+            expected.insert("_id".into(), json!(id));
+            expected.extend(top.clone());
+            for name in &adds {
+                expected.insert((*name).to_string(), set[*name].clone());
+            }
+            assert_eq!(
+                res.body["document"].to_string(),
+                Value::Object(expected).to_string(),
+                "{filter}"
+            );
+        }
+    }
+}
