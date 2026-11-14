@@ -205,7 +205,7 @@ fn an_increment_field_takes_its_place_in_the_creation_order() {
         inc: vec![(p("c"), i(1)), (p("a0"), i(1))],
         ..Default::default()
     };
-    let order = [p("a0"), p("b"), p("c")];
+    let order = [p("a"), p("a0"), p("b"), p("c")];
     let listed = fx.creation_list(&order).unwrap();
     assert_eq!(
         listed.iter().map(|c| (c.path.to_string(), c.tag)).collect::<Vec<_>>(),
@@ -224,8 +224,39 @@ fn an_increment_field_takes_its_place_in_the_creation_order() {
         fx.creation_list(&[]).unwrap().iter().map(|c| c.path.to_string()).collect::<Vec<_>>(),
         ["a", "b", "c", "a0"]
     );
-    // an order that leaves out a new field is refused
+    // an order that leaves out a cell is refused
     assert!(matches!(fx.creation_list(&[p("b")]), Err(UpdateRefused::BadPath(_))));
+}
+
+/// The creation order is the FULL post-image order of the plan, the filter's cells included: a
+/// filter field that a `$set` overrides keeps its place (filter {a: 1, b: 2} with $set {a: 5}
+/// is `a`, `b`, as the reference has it), and an order that leaves out ANY cell is refused,
+/// a filter cell as much as a `$set` one.
+#[test]
+fn the_creation_order_names_every_cell_the_filter_cells_included() {
+    let fx = UpsertEffects {
+        from_filter: vec![(p("a"), i(1)), (p("b"), i(2))],
+        set: vec![(p("a"), i(5))],
+        ..Default::default()
+    };
+    let order = [p("a"), p("b")];
+    let listed = fx.creation_list(&order).unwrap();
+    assert_eq!(listed.iter().map(|c| c.path.to_string()).collect::<Vec<_>>(), ["a", "b"]);
+    let mut w = writer();
+    fx.apply(&mut w, &order, 0).unwrap();
+    assert_eq!(names(&w), ["a", "b"]);
+    let vis = w.visible().unwrap();
+    assert_eq!((vis.get(&p("a")), vis.get(&p("b"))), (Some(&i(5)), Some(&i(2))));
+    // a filter cell left out of the order is refused
+    assert!(matches!(fx.creation_list(&[p("a")]), Err(UpdateRefused::BadPath(_))));
+    // the order puts a filter cell after a new one when the post-image does
+    let fx = UpsertEffects {
+        from_filter: vec![(p("b"), i(1))],
+        set_on_insert: vec![(p("a"), i(2))],
+        ..Default::default()
+    };
+    let listed = fx.creation_list(&[p("a"), p("b")]).unwrap();
+    assert_eq!(listed.iter().map(|c| c.path.to_string()).collect::<Vec<_>>(), ["a", "b"]);
 }
 
 #[test]
