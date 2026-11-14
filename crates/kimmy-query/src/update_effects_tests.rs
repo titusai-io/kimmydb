@@ -42,6 +42,7 @@ pub(crate) fn writer_with(doc: &Document) -> Writer {
 /// What the writer renders, fields in the order of the read.
 pub(crate) fn render(w: &Writer) -> Document {
     ordered_to_document(&w.state.ordered_document(&JoinOptions::default()).expect("alive"))
+        .expect("the writer renders documents")
 }
 
 /// A document as bytes: field order and every bit of every value count.
