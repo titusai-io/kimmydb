@@ -291,6 +291,32 @@ fn an_upsert_with_a_multi_field_filter_by_body() {
     assert_eq!(bytes(&post_image), bytes(&doc! {"a": {"b": 2, "c": 1}, "b": 3, "z": 1}), "2j");
 }
 
+/// The seed forms of the shared function (`kimmy-query/src/seed.rs`): a single-value `$in`, a
+/// single-value `$all` and a one-branch `$or` pin `a` to 5, so `from_filter` has the leaf
+/// `a = 5`, a creation cell; a `$in` of two values pins nothing. The SEED is recorded (q7s2g.out
+/// g4.2 `$in` of one, g4.3 `$in` of two, g4.4 `$all` of one, g4.5 `$or` of one; g4.1-g4.12 in
+/// all). That `from_filter` follows the shared function is by construction, so the effects-layer
+/// side of these forms is UNRECORDED.
+#[test]
+fn the_new_seed_forms_give_from_filter_a_creation_leaf() {
+    for (label, filter) in [
+        ("g4.2 $in of one", doc! {"a": {"$in": [5]}}),
+        ("g4.4 $all of one", doc! {"a": {"$all": [5]}}),
+        ("g4.5 $or of one", doc! {"$or": [{"a": 5}]}),
+    ] {
+        let (fx, post) = plan(filter, doc! {"$set": {"z": 1}});
+        assert_eq!(fx.from_filter, vec![(p("a"), v(5))], "{label}");
+        assert_eq!(post, doc! {"a": 5, "z": 1}, "{label}");
+        let cells = fx.creation_cells().unwrap();
+        let a = cells.iter().find(|c| c.path == p("a")).expect("a cell");
+        assert_eq!((a.tag, &a.value), (CellTag::Creation, &v(5)), "{label}");
+    }
+    // g4.3: a `$in` of two values pins nothing: no seed, no from_filter
+    let (fx, post) = plan(doc! {"a": {"$in": [5, 6]}}, doc! {"$set": {"z": 1}});
+    assert!(fx.from_filter.is_empty());
+    assert_eq!(post, doc! {"z": 1});
+}
+
 #[test]
 fn the_filters_id_paths_are_left_out() {
     let (fx, _) = plan(doc! {"_id": 7, "k": 1}, doc! {"$set": {"a": 1}});
