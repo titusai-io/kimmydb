@@ -1011,9 +1011,8 @@ fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
 }
 
 /// A numeric segment below an array that is itself an element sets the element of the INNER
-/// array, as the reference does (q7s2.out a1-a4 for two levels, a8-a10 for three, a17 for a
+/// array, as the reference does (q7s2.out a1-a4 for two levels, a8-a10 for three, q7s2t t0003 for a
 /// document element); the effect is still one `Set` of the outermost array.
-// expected red until the a17 engine fix arrives by merge (manager ruling 2026-11-14)
 #[test]
 fn a_write_below_a_nested_array_sets_the_inner_element() {
     use bson::bson;
@@ -1048,14 +1047,17 @@ fn a_write_below_a_nested_array_sets_the_inner_element() {
     nested(doc! {"$set": {"d.0.0.1": 9}}, &deep, "d", bson!([[[1, 9], [3]], [[4]]]), "a8 d.0.0.1");
     nested(doc! {"$set": {"d.1.0.0": 9}}, &deep, "d", bson!([[[1, 2], [3]], [[9]]]), "a9 d.1.0.0");
     nested(doc! {"$set": {"d.0.1.0": 9}}, &deep, "d", bson!([[[1, 2], [9]], [[4]]]), "a10 d.0.1.0");
-    // a17: a number below a document element is a field named by it, sorted in
+    // a number below a document element is a field named by it, APPENDED after the existing
+    // ones (q7s2t.out t0003 line 14 and t0122 line 728: `[{k: 1, "1": 9}]`). q7s2.out a17
+    // (`{"1": 9, "k": 1}`) is a recording artifact of the first harness, which read `after`
+    // through JS objects that move integer-like names to the front.
     let a17 = doc! { "_id": 1, "a": [{ "k": 1 }] };
     nested(
         doc! {"$set": {"a.0.1": 9}},
         &a17,
         "a",
-        bson!([{ "1": 9, "k": 1 }]),
-        "a17 a.0.1 over a document element",
+        bson!([{ "k": 1, "1": 9 }]),
+        "a17 a.0.1 over a document element (q7s2t t0003, t0122)",
     );
 }
 
