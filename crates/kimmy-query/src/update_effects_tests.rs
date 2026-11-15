@@ -770,28 +770,57 @@ fn a_double_on_an_integer_counter_is_the_writers_refusal() {
     ));
 }
 
+/// Amendment 8 (the design page, in force with rename-narrow): a rename is refused only for a
+/// number that has been incremented, at the source or below it. The fixture increments `n` and
+/// `sub.k` first, through the writer, so that each holds a slot.
 #[test]
 fn renaming_a_counter_is_the_writers_refusal_and_a_string_rename_is_not() {
     let d = base();
-    for (u, counter) in [
-        (doc! {"$rename": {"n": "m"}}, true),
-        (doc! {"$rename": {"sub": "sub2"}}, true),
-        (doc! {"$rename": {"f": "g"}}, false),
-        (doc! {"$rename": {"s": "t"}}, false),
-        (doc! {"$rename": {"arr": "arr2"}}, false),
+    for (u, incremented) in [
+        (doc! {"$rename": {"n": "m"}}, Some(p("n"))),
+        (doc! {"$rename": {"sub": "sub2"}}, Some(np(&["sub", "k"]))),
+        (doc! {"$rename": {"f": "g"}}, None),
+        (doc! {"$rename": {"s": "t"}}, None),
+        (doc! {"$rename": {"arr": "arr2"}}, None),
     ] {
         let (effects, _) = plan_of(&parse(u.clone()), None, &d);
         let mut w = writer_with(&d);
+        if let Some(at) = &incremented {
+            w.write_inc(at, 1, 0).expect("the increment writes");
+        }
         let outcome = effects.apply(&mut w, 0);
         assert_eq!(
             matches!(
                 outcome,
                 Outcome::Refused(kimmy_core::effects::UpdateRefused::RenameOfCounter(_))
             ),
-            counter,
+            incremented.is_some(),
             "{u}: {outcome:?}"
         );
+        // the narrowed side: over the plain inserted numbers the same rename is accepted
+        if incremented.is_some() {
+            let mut plain = writer_with(&d);
+            let outcome = effects.apply(&mut plain, 0);
+            assert!(outcome.refusal().is_none(), "{u}: {outcome:?}");
+        }
     }
+    // and its effects are the Unset of the source with the Set of the destination
+    let (effects, _) = plan_of(&parse(doc! {"$rename": {"n": "m"}}), None, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.rename(p("n"), p("m"), v(5));
+        }),
+        "n to m",
+    );
+    let (effects, _) = plan_of(&parse(doc! {"$rename": {"sub": "sub2"}}), None, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.rename(p("sub"), p("sub2"), v(d.get("sub").unwrap().clone()));
+        }),
+        "sub to sub2",
+    );
 }
 
 #[test]
@@ -984,6 +1013,7 @@ fn indexes_and_nested_arrays_are_one_set_of_the_outermost_array() {
 /// A numeric segment below an array that is itself an element sets the element of the INNER
 /// array, as the reference does (q7s2.out a1-a4 for two levels, a8-a10 for three, a17 for a
 /// document element); the effect is still one `Set` of the outermost array.
+// expected red until the a17 engine fix arrives by merge (manager ruling 2026-11-14)
 #[test]
 fn a_write_below_a_nested_array_sets_the_inner_element() {
     use bson::bson;

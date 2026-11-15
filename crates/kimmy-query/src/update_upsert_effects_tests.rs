@@ -379,6 +379,8 @@ fn a_filter_leaf_beside_an_inc_is_accepted() {
 
 /// The recorded cases: no `inc`, the reference's document (q7s2.out 431-445, q7s2b.out 200-204,
 /// q7s2g.out 307-311).
+// expected red until S2a's typed operands are in q7 (the writer creates Int64 where the plan says
+// Int32; q7s2.out d19 records Int32; manager ruling 2026-11-14)
 #[test]
 fn an_inc_on_a_filter_path_is_a_creation_value_not_a_slot() {
     // q7s2.out f1, line 435: {a: 5} + $inc a 1 creates a: 6

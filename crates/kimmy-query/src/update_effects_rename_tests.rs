@@ -102,23 +102,39 @@ fn the_recorded_refusals_of_a_rename() {
     }
 }
 
-/// The failing input of the review: an integer counter renamed into an array element.
+/// The failing input of the review: an integer counter renamed into an array element. The
+/// counter is a number that has been incremented (Amendment 8: a rename is refused only for
+/// those).
 #[test]
 fn a_counter_cannot_get_into_an_array_by_a_rename() {
     let d = counter();
     let update = parse(doc! {"$rename": {"n": "arr.1"}});
     assert!(apply_with_effects(&update, None, &d, NOW).is_err());
-    // and the writer still refuses a plain rename of the counter, the check it owns
+    // Amendment 8: the writer refuses a rename only for a number that has been incremented, so
+    // the fixture increments `n` first (through the writer, so that it holds a slot)
     let (effects, _) =
         match apply_with_effects(&parse(doc! {"$rename": {"n": "m"}}), None, &d, NOW).unwrap() {
             crate::update_effects::Plan::Effects { effects, post_image } => (effects, post_image),
             _ => panic!("effects"),
         };
     let mut w = writer_with(&d);
+    w.write_inc(&p("n"), 1, 0).expect("the increment writes");
     assert!(matches!(
         effects.apply(&mut w, 0),
         Outcome::Refused(kimmy_core::effects::UpdateRefused::RenameOfCounter(_))
     ));
+    // the narrowed side: the same rename over the plain inserted number is accepted, as an
+    // Unset of the source and a Set of the destination
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.rename(p("n"), p("m"), v(5));
+        }),
+        "a plain number is renamed",
+    );
+    let mut plain = writer_with(&d);
+    assert!(effects.apply(&mut plain, 0).refusal().is_none());
+    assert_eq!(crate::update_effects_tests::render(&plain).get("m"), Some(&bson::Bson::Int32(5)));
 }
 
 /// Allowed, as in the reference: a whole array, a field of a sub-document, a rename beside an
