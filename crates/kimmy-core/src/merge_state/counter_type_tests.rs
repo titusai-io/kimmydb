@@ -347,7 +347,10 @@ fn r1_case(
 }
 
 /// The cases, fixed ones first (the minimised input, a decimal base, a wider operand, five
-/// writers), then random ones with up to five writers, partial receives and decimal operands.
+/// writers), then random ones with up to five writers, partial receives and decimal operands. Each case
+/// is joined three ways, all of them LEFT FOLDS of the writers' states into the root's: in ascending
+/// order, in descending order, and in the ascending order rotated by half (`n / 2`); the states are
+/// not joined as a tree and not in every permutation.
 fn r1_check(o: &JoinOptions) -> Result<usize, String> {
     use Amt::{Dec, I32, I64};
     let fixed: Vec<(Amt, Vec<Vec<Amt>>)> = vec![
@@ -402,8 +405,9 @@ fn r1_check(o: &JoinOptions) -> Result<usize, String> {
     Ok(cases)
 }
 
-/// R1 holds for every order of the joins, with partial receives, decimal operands and up to five
-/// writers: the answer is the expected one, not only the same one.
+/// R1 holds for the three left folds of `r1_check` (ascending, descending, rotated by half), with
+/// partial receives, decimal operands and up to five writers: the answer is the expected one, not
+/// only the same one.
 #[test]
 fn the_counter_is_the_base_and_every_operand_whatever_the_joins_and_the_receives() {
     let cases = r1_check(&opts()).unwrap();
@@ -521,8 +525,16 @@ fn r1_absorb_check(o: &JoinOptions) -> Result<AbsorbRun, String> {
     one(&[Dec("1.50")], &I32(5), &[I32(1)], &[])?;
     one(&[I64(1)], &I32(5), &[I32(1)], &[])?;
     let bases = [I32(5), I32(i32::MAX), I64(7), Dec("2.00"), Dec("-0.50")];
-    let operands =
-        [I32(1), I32(-3), I32(i32::MAX), I64(2), I64(-(1 << 33)), Dec("1.50"), Dec("-0.25")];
+    let operands = [
+        I32(1),
+        I32(-3),
+        I32(i32::MAX),
+        I64(2),
+        I64(-(1 << 33)),
+        Dec("1.50"),
+        Dec("-0.25"),
+        Dec("2.00"),
+    ];
     let mut seed = 23u64;
     let pick = |xs: &[Amt], seed: &mut u64| xs[(lcg(seed) % xs.len() as u64) as usize].clone();
     for _ in 0..300 {
@@ -562,4 +574,212 @@ fn a_label_that_survives_the_absorb_is_killed() {
     o.set_counter_label_survives_absorb(true);
     let err = r1_absorb_check(&o).unwrap_err();
     assert!(err.contains("Int32(6)"), "{err}");
+}
+
+/// An integral Decimal128 gain after the absorb reads a Decimal128: `{n: Int32 1}`, `$inc` Decimal 1.5,
+/// `$set` Int32 5, `$inc` Decimal 2.00 is a Decimal 7.00, not an integer. A slot whose latest
+/// decimal operand did not move past the absorb (the mutant that keeps the FIRST stamp of `decimal_at`) reads
+/// the gain as an integer, which this kills.
+#[test]
+fn an_integral_decimal_gain_after_the_absorb_reads_a_decimal() {
+    let mut w = base(i32v(1));
+    w.write_inc_value(&p("n"), &dec("1.5"), 0).unwrap();
+    w.write_set(&p("n"), i32v(5), 0).unwrap();
+    w.write_inc_value(&p("n"), &dec("2.00"), 0).unwrap();
+    assert_eq!(n(&w), dec("7.00"));
+    assert_eq!(dec_text(&n(&w)), "7.00");
+}
+
+/// Fixed cases of the absorb. A base write that LOSES to a concurrent base still absorbed the slots it
+/// held: the pair is the maximum over all the base writes, so what the winner did not absorb is what
+/// came after the latest of them, and the type is the base's and the width of those operands.
+#[test]
+fn an_absorbing_base_that_loses_to_a_concurrent_base_still_absorbs() {
+    let o = opts();
+    let root = base(i32v(1));
+    let (mut a, mut w, mut b) = (
+        Writer::new(wid('A', 0), o.clone()),
+        Writer::new(wid('W', 0), o.clone()),
+        Writer::new(wid('B', 0), o.clone()),
+    );
+    a.receive(&root.state);
+    b.receive(&root.state);
+    a.write_inc_value(&p("n"), &i64v(3), 0).unwrap();
+    w.receive(&a.state);
+    w.write_set(&p("n"), i32v(10), 0).unwrap(); // absorbs A's Int64 operand
+    b.write_set(&p("n"), i32v(20), 50).unwrap(); // a concurrent base, newer: it wins
+    for (x, y) in [(&w.state, &b.state), (&b.state, &w.state)] {
+        let all = join(&join(&a.state, x, &o).0, y, &o).0;
+        assert_eq!(all.visible(&o).unwrap()[&p("n")], i32v(20));
+    }
+    // when the absorbing base is the one that wins, the same: nothing of A's remains, in the Int32 base's width
+    w.write_set(&p("n"), i32v(30), 100).unwrap();
+    for (x, y) in [(&w.state, &b.state), (&b.state, &w.state)] {
+        let all = join(&join(&a.state, x, &o).0, y, &o).0;
+        assert_eq!(all.visible(&o).unwrap()[&p("n")], i32v(30));
+    }
+}
+
+/// Two bases absorb one slot at different stamps (the second after one more operand): the pair of the
+/// slot is the later one, whichever base wins, and the operand between them is not counted twice.
+#[test]
+fn two_bases_absorbing_one_slot_at_different_stamps() {
+    let o = opts();
+    let root = base(i32v(1));
+    let (mut a, mut w1, mut w2) = (
+        Writer::new(wid('A', 0), o.clone()),
+        Writer::new(wid('B', 0), o.clone()),
+        Writer::new(wid('C', 0), o.clone()),
+    );
+    a.receive(&root.state);
+    a.write_inc_value(&p("n"), &i32v(1), 0).unwrap();
+    w1.receive(&a.state);
+    w1.write_set(&p("n"), i32v(10), 50).unwrap(); // absorbs the first operand; the newer base
+    a.write_inc_value(&p("n"), &i32v(2), 0).unwrap();
+    w2.receive(&a.state);
+    w2.write_set(&p("n"), i32v(100), 0).unwrap(); // absorbs both
+    for (x, y) in [(&w1.state, &w2.state), (&w2.state, &w1.state)] {
+        let all = join(&join(x, y, &o).0, &a.state, &o).0;
+        assert_eq!(all.visible(&o).unwrap()[&p("n")], i32v(10));
+    }
+}
+
+/// An older-generation slot with an operand no base absorbed does not leak its width into the type: the
+/// string base starts a generation, a numeric base after it carries that generation, and an `Int64`
+/// operand of a writer that never saw the string is not counted, so the counter stays an `Int32`.
+#[test]
+fn an_older_generation_slot_with_an_unabsorbed_int64_operand_does_not_leak_into_the_type() {
+    let o = opts();
+    let root = base(i32v(1));
+    let (mut w, mut b) = (Writer::new(wid('W', 0), o.clone()), Writer::new(wid('B', 0), o.clone()));
+    w.receive(&root.state);
+    b.receive(&root.state);
+    b.write_inc_value(&p("n"), &i64v(7), 1).unwrap();
+    w.write_set(&p("n"), Value::String("t".into()), 0).unwrap();
+    w.write_set(&p("n"), i32v(100), 0).unwrap();
+    for (x, y) in [(&w.state, &b.state), (&b.state, &w.state)] {
+        let all = join(x, y, &o).0;
+        assert_eq!(all.visible(&o).unwrap()[&p("n")], i32v(100));
+    }
+}
+
+/// Amendment 9, ruling 2: a Decimal128 increment is refused (`IncOutOfRange`) when the writer's resulting SLOT
+/// total is not exactly representable in 34 digits, as it is when the sum overflows. `{n: Int32 0}`, `$inc` by
+/// 1E+33, `$set` Int32 0, `$inc` by 0.5: the slot total 1E+33 + 0.5 has 35 digits and was rounded at the write,
+/// so the counter read a Decimal 0 where the true answer is 0.5. An increment that fits (1E+33 + 1) is accepted.
+#[test]
+fn a_decimal_increment_whose_slot_total_is_not_exact_is_refused() {
+    let mut w = base(i32v(0));
+    w.write_inc_value(&p("n"), &dec("1E+33"), 0).unwrap();
+    w.write_set(&p("n"), i32v(0), 0).unwrap();
+    let before = (w.state.clone(), w.clock);
+    assert_eq!(inc(&mut w, dec("0.5")), Err(UpdateRefused::IncOutOfRange(p("n"))));
+    assert_eq!((w.state.clone(), w.clock), before, "nothing moved");
+    assert!(inc(&mut w, dec("1")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), "1");
+}
+
+/// What the same increment gives where the writer's slot is not the one holding 1E+33: in a new generation (a
+/// non-numeric base started it, so the writer has no slot in it yet) and on another writer (its own slot, which
+/// holds the operand alone). Both are accepted and read the reference's 0.5: the slot total is the operand.
+#[test]
+fn the_same_increment_is_accepted_in_a_new_generation_and_by_another_writer() {
+    let mut w = base(i32v(0));
+    w.write_inc_value(&p("n"), &dec("1E+33"), 0).unwrap();
+    w.write_set(&p("n"), Value::String("t".into()), 0).unwrap();
+    w.write_set(&p("n"), i32v(0), 0).unwrap();
+    assert!(inc(&mut w, dec("0.5")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), "0.5");
+    let mut a = base(i32v(0));
+    a.write_inc_value(&p("n"), &dec("1E+33"), 0).unwrap();
+    a.write_set(&p("n"), i32v(0), 0).unwrap();
+    let mut b = Writer::new(wid('B', 0), opts());
+    b.receive(&a.state);
+    assert!(inc(&mut b, dec("0.5")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&b)), "0.5");
+}
+
+/// The recorded Decimal128 cases past 34 digits (`q7s2.out` lines 326-345), decided by NUMERIC exactness: a sum is
+/// accepted when its exact value is a Decimal128 at some exponent, refused when it would round or overflow.
+/// x1 (326-330) 34 nines + Int32 1 and x3 (336-340) + Decimal 1 are exactly 10^34, which the reference stores as
+/// `1.000000000000000000000000000000000E+34`: accepted, and read as that value (the text is what this build
+/// stores; a different cohort than the recorded one would be a difference of representation). x2 (331-335)
+/// 34 nines + 0.5 rounds (the true sum is 10^34 - 0.5): refused. x4 (341-345) the largest decimal added to
+/// itself is `Infinity` there: refused. Two halves of 10^34 are accepted.
+#[test]
+fn the_recorded_decimal_sums_past_34_digits_are_decided_by_numeric_exactness() {
+    let nines = "9999999999999999999999999999999999";
+    let max = "9.999999999999999999999999999999999E+6144";
+    let ten_34 = "1.000000000000000000000000000000000E+34";
+    let refused = Err(UpdateRefused::IncOutOfRange(p("n")));
+    for (what, by, accepted) in [
+        ("x1 (326-330): + Int32 1", i32v(1), true),
+        ("x2 (331-335): + 0.5", dec("0.5"), false),
+        ("x3 (336-340): + Decimal 1", dec("1"), true),
+    ] {
+        let mut w = base(dec(nines));
+        let before = (w.state.clone(), w.clock);
+        if accepted {
+            assert!(inc(&mut w, by).unwrap().is_some(), "{what}");
+            assert_eq!(dec_text(&n(&w)), ten_34, "{what}");
+        } else {
+            assert_eq!(inc(&mut w, by), refused, "{what}");
+            assert_eq!((w.state.clone(), w.clock), before, "{what}: nothing moved");
+        }
+    }
+    let mut w = base(dec(max));
+    assert_eq!(inc(&mut w, dec(max)), refused, "x4 (341-345): overflow");
+    // two 34-digit halves of 10^34 are exactly 10^34
+    let mut w = base(dec("5000000000000000000000000000000000"));
+    assert!(inc(&mut w, dec("5000000000000000000000000000000000")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), ten_34);
+    // sums that fit without a rise of the exponent
+    let mut w = base(dec(nines));
+    assert!(inc(&mut w, dec("0")).unwrap().is_some());
+    assert!(inc(&mut w, dec("-1")).unwrap().is_some());
+    assert_eq!(dec_text(&n(&w)), "9999999999999999999999999999999998");
+}
+
+/// An ordinary money-like history is never refused: three writers add and subtract two-decimal amounts, `$set`
+/// a price now and then and receive each other's states, 300 steps; and the counters converge.
+#[test]
+fn an_ordinary_money_like_history_is_never_refused() {
+    let o = opts();
+    let mut root = Writer::new(wid('R', 0), o.clone());
+    root.insert(&fl(&[("n", dec("100.00"))]), 0).unwrap();
+    let mut ws: Vec<Writer> = ['A', 'B', 'C']
+        .into_iter()
+        .map(|c| {
+            let mut w = Writer::new(wid(c, 0), o.clone());
+            w.receive(&root.state);
+            w
+        })
+        .collect();
+    let mut seed = 5u64;
+    for step in 0..300 {
+        let k = (lcg(&mut seed) % 3) as usize;
+        let amount = format!("{}.{:02}", lcg(&mut seed) % 5000, lcg(&mut seed) % 100);
+        match lcg(&mut seed) % 10 {
+            0 => {
+                let _ = ws[k].write_set(&p("n"), dec(&amount), 0);
+            }
+            1 | 2 => {
+                let j = (lcg(&mut seed) % 3) as usize;
+                let theirs = ws[j].state.clone();
+                ws[k].receive(&theirs);
+            }
+            r => {
+                let by = dec(&format!("{}{amount}", if r % 2 == 0 { "-" } else { "" }));
+                assert!(matches!(inc(&mut ws[k], by), Ok(Some(_))), "step {step}: refused");
+            }
+        }
+    }
+    let all = |order: [usize; 3]| {
+        let mut acc = ws[order[0]].state.clone();
+        for &i in &order[1..] {
+            acc = join(&acc, &ws[i].state, &o).0;
+        }
+        acc.visible(&o).unwrap()[&p("n")].clone()
+    };
+    assert_eq!(all([0, 1, 2]), all([2, 1, 0]));
 }

@@ -26,8 +26,9 @@
 //!   not fit an `i32`. R1: the type is a function of the merged state (increments have no order): the
 //!   narrowest of `Int32` and `Int64` that holds the TOTAL, never narrower than the widest label
 //!   among the base and every slot, a slot's label being the join of the operand types it has added
-//!   SINCE a base write absorbed the slot (the operands the current base has not seen; the ones it
-//!   absorbed leave no trace in the type). The slot carries, per width above `Int32`, the stamp of its
+//!   SINCE a base write absorbed the slot (the operands no base write absorbed: the pair is the
+//!   maximum over ALL the base writes on the path, the ones that lost included, and everything at or
+//!   below it is left out of the type as it is of the value; the ones absorbed leave no trace in the type). The slot carries, per width above `Int32`, the stamp of its
 //!   latest operand of that width ([`Slot::wide_at`](super::Slot), [`Slot::decimal_at`](super::Slot)):
 //!   the width of what it gained since an absorb at stamp `a` is the widest of the two whose stamp is
 //!   above `a` (`Int32` when neither is), and a writer's slot with the higher stamp holds all of its
@@ -35,9 +36,16 @@
 //!   THE ONE DEVIATION: a sequential history whose running value leaves the `i32` range and comes
 //!   back is `Int32` again here, where the reference stays `Int64` (`docs/deviations.md`,
 //!   `counter-type-q7`).
+//! * A `Decimal128` slot total is EXACT: a writer's `$inc` is refused (`IncOutOfRange`) when the sum would
+//!   round ([`sum_exact`]; the design's D5, "exact or 400"). So what a slot gained since an absorb is its
+//!   total minus the absorbed total, and with only integer operands since the absorb that difference is the
+//!   integer sum itself, which a correctly rounded subtraction returns exactly. A `Decimal128` operand after
+//!   the absorb is read the same way and can round when the two totals are far apart
+//!   (`docs/deviations.md`, `counter-gain-after-absorb-q7`).
 //! * Integer totals are exact (`i128`, bounded by [`MAX_TOTAL`](super::MAX_TOTAL)); a
-//!   `Decimal128` total is a running sum rounded once per addition to 34 digits (ADR-252, the
-//!   production `add`).
+//!   `Decimal128` total is the writer's running sum, exact (a sum that would round is refused); the
+//!   READ rounds, once per addition to 34 digits (ADR-252, the production `add`): the gains of concurrent
+//!   writers are added in the canonical order, and a join of writers, each exact at home, can round.
 //! * A merge that crosses a bound SATURATES (Q11): the visible `Int64` stops at the integer
 //!   bound, a `Decimal128` at the largest finite value of its sign (never an infinity). Nothing
 //!   is stored: [`MergeState::excess`](super::MergeState::excess) derives what was cut off, as
@@ -406,13 +414,83 @@ pub(super) fn inc_result(cur: Option<&Value>, op: &Value, bound: i64) -> Option<
             },
         ));
     }
-    sum_checked(&a, &o).map(Inc::Slot)
+    sum_exact(&a, &o).map(Inc::Slot)
 }
 
 /// `a + b` for a writer: `None` when a decimal sum overflows from finite inputs.
 pub(super) fn sum_checked(a: &Num, b: &Num) -> Option<Num> {
     let r = a.add(b);
     (!Num::decimal_overflowed(&r, a, b)).then_some(r)
+}
+
+/// `a + b` for the `$inc` of a counter under the `field` merge policy (the visible value and the writer's slot
+/// total; the `document` policy does its arithmetic in the engine and never reaches this module): [`sum_checked`],
+/// and `None` also when a decimal sum would round. "Exact or 400" (the design's D5, Chris's Q6 ruling): a total
+/// that rounded at the write would read a wrong value after a base write absorbed it, and each writer's slot
+/// would round on its own, so the visible value would depend on who added what (Amendment 9).
+pub(super) fn sum_exact(a: &Num, b: &Num) -> Option<Num> {
+    let r = sum_checked(a, b)?;
+    (!matches!(r, Num::Decimal128(_)) || decimal_sum_is_exact(&a.as_raw(), &b.as_raw()))
+        .then_some(r)
+}
+
+/// Are two amounts the same NUMBER (`1.0` and `1.00` are, an `Int32` 1 and an `Int64` 1 are)? Two non-finite
+/// numbers are the same only by kind and sign (a NaN and a NaN, `Infinity` and `Infinity`); a finite number is
+/// never the same as one that is not. It never answers "the same" when it cannot tell.
+pub(super) fn same_number(a: &Num, b: &Num) -> bool {
+    match (a.as_raw(), b.as_raw()) {
+        (x @ Raw::Finite { .. }, y @ Raw::Finite { .. }) => arith::sub(&x, &y).is_zero(),
+        (Raw::Nan, Raw::Nan) => true,
+        (Raw::Inf { negative: p }, Raw::Inf { negative: q }) => p == q,
+        _ => false,
+    }
+}
+
+/// Is the exact sum of two decimals NUMERICALLY representable: some coefficient of at most 34 digits at some
+/// exponent, whatever exponent that needs (trailing zeros need no digit)? 34 nines + 1 is 10^34, exactly
+/// `1E+34`: accepted, the exponent rises and no digit is lost (the reference stores `1.000...E+34`, `q7s2.out`
+/// x1); 34 nines + 0.5 is not representable and rounds (x2): refused. A NaN, an infinity and a zero are exact.
+/// When the sum does not fit `u128` after aligning the exponents it needs more than 34 digits and is not
+/// taken for exact. (The exponent range is `sum_checked`'s: an overflow is refused there.)
+fn decimal_sum_is_exact(a: &Raw, b: &Raw) -> bool {
+    let (
+        Raw::Finite { negative: na, coefficient: ca, exponent: ea },
+        Raw::Finite { negative: nb, coefficient: cb, exponent: eb },
+    ) = (a, b)
+    else {
+        return true;
+    };
+    if *ca == 0 || *cb == 0 {
+        return true;
+    }
+    // Drop the trailing zeros of both coefficients first (raising the exponents): the last digit of the lower
+    // operand is then not a zero, so when the alignment or the addition overflows 128 bits the exact sum has
+    // more than 34 digits and no trailing zero can save it. (1E+39 + 1000000 is 1 at 39 and 1 at 6: 33 places
+    // apart, 34 digits, accepted; aligned without the strip it needed 10^39.)
+    let strip = |mut c: u128, mut x: i16| {
+        while c.is_multiple_of(10) {
+            c /= 10;
+            x += 1;
+        }
+        (c, x)
+    };
+    let ((ca, ea), (cb, eb)) = (strip(*ca, *ea), strip(*cb, *eb));
+    let e = ea.min(eb);
+    let aligned = |c: u128, x: i16| {
+        let shift = u32::try_from(i32::from(x) - i32::from(e)).ok()?;
+        10u128.checked_pow(shift)?.checked_mul(c)
+    };
+    let (Some(xa), Some(xb)) = (aligned(ca, ea), aligned(cb, eb)) else {
+        return false;
+    };
+    let sum = if na == nb { xa.checked_add(xb) } else { Some(xa.abs_diff(xb)) };
+    let Some(mut sum) = sum else {
+        return false;
+    };
+    while sum != 0 && sum % 10 == 0 {
+        sum /= 10;
+    }
+    sum <= MAX_COEFFICIENT
 }
 
 #[cfg(test)]
@@ -433,6 +511,22 @@ mod tests {
             Num::Decimal128(b) => bson::Decimal128::from_bytes(*b).to_string(),
             n => format!("{n:?}"),
         }
+    }
+
+    /// `same_number` never answers "the same" when it cannot tell: a finite number is not a NaN or an infinity,
+    /// two non-finite numbers are the same only by kind and sign.
+    #[test]
+    fn same_number_decides_every_pair_of_kinds() {
+        let (nan, inf, ninf, one) = (dec("NaN"), dec("Infinity"), dec("-Infinity"), dec("1"));
+        assert!(!same_number(&one, &nan) && !same_number(&nan, &one));
+        assert!(!same_number(&one, &inf) && !same_number(&inf, &one));
+        assert!(!same_number(&inf, &ninf) && !same_number(&ninf, &inf));
+        assert!(!same_number(&nan, &inf));
+        assert!(same_number(&nan, &nan) && same_number(&inf, &inf) && same_number(&ninf, &ninf));
+        assert!(
+            same_number(&dec("1.0"), &dec("1.00")) && same_number(&Num::Int32(1), &Num::Int64(1))
+        );
+        assert!(!same_number(&dec("1.0"), &dec("1.1")));
     }
 
     #[test]

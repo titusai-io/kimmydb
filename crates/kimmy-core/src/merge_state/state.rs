@@ -217,6 +217,23 @@ impl Slot {
         Slot { stamp, total, absorbed, wide_at, decimal_at }
     }
 
+    /// The slot a write stores: the held slot of the writer at the path (if any) grown by an operand of the
+    /// type `op`, with the new `total`, at `stamp`. The absorbed pair is kept, and the stamps of the latest
+    /// operand of each width above `Int32` (`wide_at`, `decimal_at`) move to `stamp` for the widths the operand
+    /// has. The writer stores exactly this (`Writer::put_slot`), and judges an `$inc` by it.
+    pub(super) fn grown(held: Option<&Slot>, stamp: MStamp, total: Num, op: Kind) -> Slot {
+        let absorbed = held.and_then(|s| s.absorbed);
+        let (mut wide_at, mut decimal_at) =
+            held.map_or((None, None), |s| (s.wide_at, s.decimal_at));
+        if op >= Kind::Int64 {
+            wide_at = Some(stamp);
+        }
+        if op == Kind::Decimal128 {
+            decimal_at = Some(stamp);
+        }
+        Slot { stamp, total, absorbed, wide_at, decimal_at }
+    }
+
     /// Does the version 1 form spell this slot's operand stamps? It spells none: its decoder
     /// reads a slot whose operands were all of its total's width and the latest at its stamp
     /// ([`Slot::new`]), so it holds a slot of exactly that shape.
@@ -307,7 +324,8 @@ impl MergeState {
     ///    is not dead in the first, so an unlisted dead life makes `lives` depend on the order.
     /// 2. The version vector covers every stamp an honest state's vector covers, loss records
     ///    excepted. CHECKED here ([`DecodeError::VersionVectorBehind`]). The stamps are: every
-    ///    life, delete, register and slot stamp; the absorbed stamp of a slot; the generation
+    ///    life, delete, register and slot stamp; the absorbed stamp of a slot; the operand stamps of a slot
+    ///    (`wide_at`, `decimal_at`); the generation
     ///    stamp of a slot key; the stamp of a register's generation; the life and generation
     ///    stamps of a generation's `seen` keys; the delete stamps a life has seen (`Life.seen`);
     ///    and the entries of the version vector of each delete. Clash and `typeClash` detection
@@ -473,7 +491,7 @@ impl MergeState {
     ///     writer's running sum, `sum_checked(old total, operand)` (`Writer::inc_plan`), and
     ///     `Num::combine` labels an integer sum `Int32` only when both parts are, otherwise
     ///     `Int64`, and a sum with a `Decimal128` part a `Decimal128`; a visible `Int64` only
-    ///     widens the label (`Num::widened`, `Int32` to `Int64`); nothing converts a decimal back.
+    ///     widens the label (an `Int32` to an `Int64`); nothing converts a decimal back.
     ///     So the LABEL of the slot (the variant as spelled, not `Num::kind`, which promotes an
     ///     `Int32` amount outside the `i32` range, and so can fall again) never drops across the
     ///     writes of its writer. The pair is a past state of that slot (item 24), so its label
@@ -522,6 +540,15 @@ impl MergeState {
     ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
     ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
     ///     (a decoded state has no `obs` to show it).
+    ///
+    /// 29b. The slot's operand stamps are its writer's, not above its own stamp, `decimal_at` implies a
+    ///     `wide_at` at or above it, and the type they spell (`Decimal128` with `decimal_at`, else `Int64`
+    ///     with `wide_at`, else `Int32`) is the label of the total
+    ///     ([`DecodeError::SlotWidthsInconsistent`]). They tell the width of the operands a slot gained since
+    ///     a base write absorbed it (`Slot::width_since`, R1), which is a function of the merged state only
+    ///     if a slot's stamps are its writer's history: a stamp of another writer, above the slot's, or a type
+    ///     other than the total's is not one a writer or the join makes. Checked after the clauses of items
+    ///     24 to 28.
     ///
     /// 31. NOT checked, NOT relied on: other single-state shapes that honest writers keep and that nothing
     ///     reads as an error. Two are known: a slot whose key's generation stamp is above the slot's own
@@ -912,7 +939,7 @@ impl MergeState {
     }
 
     /// [`MergeState::cell_in`] from the winner of `p` and its alive slots.
-    fn cell_with<'a>(
+    pub(super) fn cell_with<'a>(
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
@@ -937,6 +964,8 @@ impl MergeState {
         let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
         for (k, s) in counted_among(g, slots) {
             let ob = s.absorbed.as_ref();
+            // A slot total is exact (a counter is exact or refused), so with only integer operands since the
+            // absorb this difference is the integer sum itself, which a correctly rounded subtraction returns
             let d = ob.map_or(s.total, |x| {
                 if o.no_decimal_saturation() {
                     s.total.sub(&x.1)

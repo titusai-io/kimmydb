@@ -661,7 +661,11 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// the same draws): 38,435 steps in common, 20,321 steps whose state holds no slot are identical, 0 slotless steps differ, 18,114 steps
 /// whose state holds a slot differ, 0 steps with a slot are identical. The replay still agrees with the model (0 scripts disagree).
 /// 0xccb0_e0db_c8f1_83b7 to 0x6369_2db0_1289_772a.
-const PINNED_300: u64 = 0x6369_2db0_1289_772a;
+///
+/// RE-PINNED for Amendment 9: the operand stamps are spelled only when they are not the usual ones, and the fingerprint is the pre-stamp value
+/// again (compared step by step against the series before the stamps: slot-bearing steps identical 18,114 of 18,114, slotless differing 0).
+/// 0x6369_2db0_1289_772a to 0xccb0_e0db_c8f1_83b7.
+const PINNED_300: u64 = 0xccb0_e0db_c8f1_83b7;
 
 #[test]
 fn differential_against_the_python_model() {
@@ -736,7 +740,7 @@ fn the_typed_golden_vector_matches_the_model() {
     let out = run_python(&["--golden".to_string()]);
     let got: J = serde_json::from_str(out.trim()).expect("json");
     assert_eq!(got["typed"], J::Null, "an absorbed pair: no version 1 spelling");
-    assert_eq!(got["typed-compact"], json!(["8291f85d0c22817da0032635387e1351", 286]));
+    assert_eq!(got["typed-compact"], json!(["d11ec34731c1adb4ec0a0ae4be757d20", 371]));
 }
 
 /// The golden vectors of `merge_state/tests.rs`, hashed by the model's independent
@@ -754,14 +758,14 @@ fn golden_vectors_match_the_model() {
         "obs": J::Null,
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
         "empty-compact": ["6a9f06d361f4fb8c789c079f6563280a", 10],
-        "170-compact": ["06b5f3340937c85eca242ec49b53fa83", 237],
-        "mixed-compact": ["cb5e6838859904b50d3a0a03c290410d", 349],
+        "170-compact": ["abedfb140b687b3671abd3023efa93a8", 215],
+        "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
-        "obs-compact": ["01ed28ab7e196e406d1c7f38d0af7b2b", 285],
+        "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
         // the typed state: no version 1 spelling (it holds absorbed pairs); its compact form is pinned by the writer and
         // by the independent encoder alike (`the_typed_golden_vector_matches_the_model`)
         "typed": J::Null,
-        "typed-compact": ["8291f85d0c22817da0032635387e1351", 286],
+        "typed-compact": ["d11ec34731c1adb4ec0a0ae4be757d20", 371],
     });
     assert_eq!(got, want);
 }
