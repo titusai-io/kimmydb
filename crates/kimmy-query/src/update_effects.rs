@@ -40,10 +40,6 @@
 //!
 //! # Pending
 //!
-//! * The seeding of an upsert from the filter (`implied_equalities` here) is a copy of the one in
-//!   `kimmy-api` (`exec.rs`), with the same name order of its levels and top-level fields. One
-//!   function in `kimmy-query`, used by both, is to replace the two; `from_filter` is then built
-//!   from it, as written, and the seed from the same call.
 //! * Costs to measure with L34-B B2-1 (no change now): the update runs on a clone of the
 //!   document, the effects convert before and after values to merge-state values twice, and the
 //!   order of the effects ([`build`]) ranks each effect against the post-image, O(effects x
@@ -301,26 +297,6 @@ pub enum UpsertPlan {
     Replace { post_image: Document },
 }
 
-/// The equality constraints a match necessarily satisfies, as `(dotted path, value)`: only
-/// `$and`-reachable `$eq` on a plain path counts (an equality inside `$or` is not implied).
-fn implied_equalities(f: &Filter, seed: &mut Document, out: &mut Vec<(String, Bson)>) {
-    match f {
-        Filter::And(branches) => branches.iter().for_each(|b| implied_equalities(b, seed, out)),
-        Filter::Field { path: field, conditions } => {
-            for c in conditions {
-                if let filter::Condition::Eq(value) = c {
-                    // as the seed of the stored-document policy: a dotted path seeds a nested field
-                    let _ = path::set(seed, field, value.clone());
-                    // the levels a dotted key creates are in name order (q7s2d.out 3 f1-f7)
-                    kimmy_core::path::sort_levels_through(seed, field);
-                    out.push((field.clone(), value.clone()));
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 fn dotted(p: &str) -> Result<Path> {
     to_path(&path::segments(p))
 }
@@ -336,11 +312,21 @@ fn dotted(p: &str) -> Result<Path> {
 /// document. A positional `$` is refused by the engine on an insert, as before.
 pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<UpsertPlan> {
     let mut seed = Document::new();
-    let mut equalities = Vec::new();
-    implied_equalities(filter, &mut seed, &mut equalities);
+    // the shared seed (`crate::seed`, the one `kimmy-api` uses): the filter's equalities at their
+    // paths, the levels a dotted key makes in name order; `claimed` lists the paths as written
+    let mut claimed = Vec::new();
+    crate::seed::implied_equalities(filter, &mut seed, &mut claimed)
+        .map_err(Error::InvalidUpdate)?;
+    // `from_filter` is built from it, as written: each claimed path with the value found at it
+    let mut equalities: Vec<(String, Bson)> = Vec::new();
+    for p in claimed {
+        if let Some(v) = path::resolve(&seed, &p).first() {
+            equalities.push((p, (*v).clone()));
+        }
+    }
     // the seed's top-level fields are in name order, `_id` first, whichever order the filter
-    // wrote them in (q7s2.out u1, u2); the fields the update adds follow them. This is the
-    // seed `kimmy-api` builds, until the one shared function replaces both.
+    // wrote them in (q7s2.out u1, u2); the fields the update adds follow them. The shared
+    // function leaves this to its callers, as `kimmy-api` does.
     let mut fields: Vec<(String, Bson)> = std::mem::take(&mut seed).into_iter().collect();
     fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
     seed.extend(fields);
