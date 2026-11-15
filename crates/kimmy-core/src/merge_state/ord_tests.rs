@@ -182,7 +182,7 @@ pub(super) fn state(j: &J) -> MergeState {
     for sl in j["slots"].as_array().unwrap() {
         let key = (stamp(&sl[0]), path(&sl[1]), writer(&sl[2]), stamp_opt(&sl[3]));
         let absorbed = absorbed.get(&key).copied();
-        s.slots.insert(key, Slot { stamp: stamp(&sl[4]), total: num(&sl[5]), absorbed });
+        s.slots.insert(key, Slot::new(stamp(&sl[4]), num(&sl[5]), absorbed));
     }
     assert!(
         absorbed.keys().all(|k| s.slots.contains_key(k)),
@@ -2083,10 +2083,7 @@ fn maps_under_floors(n: usize) -> MergeState {
             if j < 2 {
                 s.regs.insert((life, q), reg(Value::Int64(1)));
             } else {
-                s.slots.insert(
-                    (life, q, a, None),
-                    Slot { stamp: at(3, b'A'), total: Num::Int64(5), absorbed: None },
-                );
+                s.slots.insert((life, q, a, None), Slot::new(at(3, b'A'), Num::Int64(5), None));
             }
         }
         s.ords.insert(

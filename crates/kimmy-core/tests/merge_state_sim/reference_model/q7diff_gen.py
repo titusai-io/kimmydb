@@ -75,6 +75,10 @@ I64_MAX = 2 ** 63 - 1
 # ---------------------------------------------------------------------------------------------
 # the model, as pullmodel6.Node runs it, without the oplog
 # ---------------------------------------------------------------------------------------------
+class I32(int):
+    """An Int32 value of a register, for the encoder only (the model's own values are Int64s): tag 7."""
+
+
 class D(M.Member):
     def finish(self, st, log, meta):
         s = self.state
@@ -349,6 +353,16 @@ class EncCompact:
         """The payload of an integer total: the zigzag as a varint."""
         self.vi((v << 1) if v >= 0 else (((-v) << 1) - 1))
 
+    def slot_payload(self, label, v):
+        """The payload of a slot's total or pair: a Decimal128 (label 2) is the 16 bytes of its canonical word
+        (the model's integer v, as a coefficient at exponent 0), any other type the zigzag varint."""
+        if isinstance(v, bytes):
+            self.raw(v)
+        elif label == 2:
+            self.raw(((6176 << 113) | v).to_bytes(16, "little"))
+        else:
+            self.payload(v)
+
     def total(self, v):
         """A typed total (a generation's seen entry, a lost total): the type byte (0, Int64), then the payload."""
         self.u8(0)
@@ -393,6 +407,9 @@ class EncCompact:
             self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
+        elif isinstance(v, I32):
+            self.u8(7)
+            self.raw(int(v).to_bytes(4, "big", signed=True))
         elif isinstance(v, int):
             self.u8(1)
             self.i64(v)
@@ -475,7 +492,7 @@ class EncCompact:
             self.u8(flags)
             if stamp != life:
                 self.stamp(stamp)
-            self.value(r[1])
+            self.value(I32(self.i32[k[1]]) if k[1] in getattr(self, "i32", {}) else r[1])
             if gen is not None:
                 if gen[0] != stamp:
                     self.stamp(gen[0])
@@ -488,13 +505,32 @@ class EncCompact:
             self.wid(k[2])
             self.opt_stamp(k[3])
             self.stamp(sl[0])
-            # the flag byte: bit 0 an absorbed pair follows; the types (bits 1-4) are Int64 = 0 here
+            # the flag byte: bit 0 an absorbed pair follows; bits 1-2 the total's type and bits 3-4 the pair's (0 Int64,
+            # 1 Int32, 2 Decimal128); bit 7: the operand stamps are spelled, then bit 5 says the stamp of the slot's
+            # latest Int64-or-wider operand (`wide_at`) follows and bit 6 that of its latest Decimal128 operand
+            # (`decimal_at`). The usual stamps of a slot whose operands were all of its total's width, the latest at its
+            # own stamp (none for an Int32 total, the slot's own for an Int64 one, twice for a Decimal128 one), are not
+            # spelled and have no bit. Every operand of the model is an Int64, so by default the slot is Int64 with the
+            # usual stamp; a state that is typed on purpose (`typed`, keyed by path) is given the labels and the stamps
+            # it has, a Decimal128 payload as its 16 bytes
             pair = st.absorbed.get(k)
-            self.u8(1 if pair is not None else 0)
-            self.payload(sl[1])
+            ty = getattr(self, "typed", {}).get(k[1], {})
+            tl, pl = ty.get("total", 0), ty.get("pair", 0)
+            usual = (None if tl == 1 else sl[0], sl[0] if tl == 2 else None)
+            wide = ty["wide"] if "wide" in ty else usual[0]
+            dec = ty["dec"] if "dec" in ty else usual[1]
+            spelled = (wide, dec) != usual
+            self.u8((1 if pair is not None else 0) | tl << 1 | pl << 3
+                    | ((0x80 | (0x20 if wide is not None else 0) | (0x40 if dec is not None else 0)) if spelled else 0))
+            self.slot_payload(tl, ty.get("total_raw", sl[1]))
             if pair is not None:
                 self.stamp(pair[0])
-                self.payload(pair[1])
+                self.slot_payload(pl, ty.get("pair_raw", pair[1]))
+            if spelled:
+                if wide is not None:
+                    self.stamp(wide)
+                if dec is not None:
+                    self.stamp(dec)
         self.vv(st.vv)
         self.vi(len(st.losses))
         for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):
@@ -877,9 +913,11 @@ def golden():
     M.BOUND = I64_MAX
     out = {}
 
-    def h(name, st, log):
+    def h(name, st, log, typed=None, i32=None):
         check_obs_dead(st)
-        cb = EncCompact(log).state(st)
+        enc = EncCompact(log)
+        enc.typed, enc.i32 = typed or {}, i32 or {}
+        cb = enc.state(st)
         if st.absorbed:
             out[name] = None          # no version 1 spelling: the state has absorbed pairs
         else:
@@ -946,6 +984,34 @@ def golden():
     for e in (e0, e1, e2):
         o.absorb(e)
     h("obs", o.state, log)
+    # typed: one writer, four counters whose slots are not all Int64 (the model's operands are, so the encoder is
+    # told the labels and the stamps the Rust writer keeps):
+    #   a: an Int32 slot (an Int32 operand), no operand stamps
+    #   b: a Decimal128 slot (one Decimal128 operand): both stamps, at its one write
+    #   c: a Decimal128 operand, an Int64 operand, a base write of an Int32 that absorbs them, then an Int32 operand:
+    #      decimal_at < wide_at < stamp, the pair (at wide_at) between them, the base an Int32
+    log = {}
+    a = D("A")
+    a.insert({"a": 1, "b": 1, "c": 1, "d": 0}, log)
+    a.write("inc", "a", 5, log)
+    sb = a.write("inc", "b", 3, log)
+    sd = a.write("inc", "c", 1, log)
+    sw = a.write("inc", "c", 2, log)
+    a.write("set", "c", 7, log)
+    a.write("inc", "c", 5, log)
+    #   d: a Decimal128 operand of 1E-33, a base write of an Int32 that absorbs it, an Int32 operand: the total is
+    #      1.000000000000000000000000000000001 (10^33 + 1 at exponent -33, exact), the pair 1E-33
+    sd1 = a.write("inc", "d", 1, log)
+    a.write("set", "d", 5, log)
+    a.write("inc", "d", 1, log)
+    dec_word = lambda coefficient, exponent: ((6176 + exponent) << 113 | coefficient).to_bytes(16, "little")
+    h("typed", a.state, log,
+      typed={"a": {"total": 1, "wide": None},
+             "b": {"total": 2, "wide": sb, "dec": sb},
+             "c": {"total": 2, "pair": 2, "wide": sw, "dec": sd},
+             "d": {"total": 2, "pair": 2, "wide": sd1, "dec": sd1,
+                   "total_raw": dec_word(10 ** 33 + 1, -33), "pair_raw": dec_word(1, -33)}},
+      i32={"c": 7, "d": 5})
     print(json.dumps(out))
 
 

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::counter::{self, Inc, Num};
+use super::counter::{self, Inc, Kind, Num};
 use super::join::{JoinOptions, join, join_into};
 use super::ord::{OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events};
 use super::state::{
@@ -291,6 +291,9 @@ pub struct Writer {
     pub opts: JoinOptions,
 }
 
+/// The key of a counter slot: its life, path, writer and generation.
+type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
+
 impl Writer {
     pub fn new(id: WriterId, opts: JoinOptions) -> Self {
         Self { id, clock: Hlc::ZERO, state: MergeState::default(), opts }
@@ -496,17 +499,20 @@ impl Writer {
         }
     }
 
-    /// Store the slot at `key` with the write `stamp` and the new `total`. The absorbed pair of a
-    /// slot the writer already holds is kept: an increment moves the slot, not what a base write
-    /// absorbed of it.
+    /// Store the slot at `key` with the write `stamp`, the new `total` and the type `op` of the
+    /// operand the write added. The absorbed pair of a slot the writer already holds is kept: an
+    /// increment moves the slot, not what a base write absorbed of it. The slot keeps the stamp of
+    /// its latest operand of each width above `Int32` (`Slot::wide_at`, `Slot::decimal_at`), which
+    /// tell the type of what it gained since an absorb.
     fn put_slot(
         &mut self,
         key: (MStamp, Path, WriterId, Option<MStamp>),
         stamp: MStamp,
         total: Num,
+        op: Kind,
     ) {
-        let absorbed = self.state.slots.get(&key).and_then(|s| s.absorbed);
-        self.state.slots.insert(key, Slot { stamp, total, absorbed });
+        let slot = Slot::grown(self.state.slots.get(&key), stamp, total, op);
+        self.state.slots.insert(key, slot);
     }
 
     /// Set the register of `p` in the life `l` (the newest of the alive lives `al`), stamp `st`.
@@ -667,7 +673,8 @@ impl Writer {
 
     /// The increment write of an upsert on the life `life` (the stamp of its
     /// creation write): a slot of `path` for this writer, with the write's own
-    /// stamp. Refused (`None`) unless `life` is alive and its creation did not write `path`.
+    /// stamp. Refused (`None`) unless `life` is alive, its creation did not write `path` and this
+    /// writer holds no slot of `path` in it yet.
     pub fn upsert_inc_on(
         &mut self,
         life: MStamp,
@@ -1208,10 +1215,7 @@ impl Writer {
                 Inc::Slot(_) => {
                     let op = Num::from_value(by).expect("the operand was checked");
                     let total = op.first_amount();
-                    s.slots.insert(
-                        (st, p.clone(), self.id, None),
-                        Slot { stamp: st, total, absorbed: None },
-                    );
+                    s.slots.insert((st, p.clone(), self.id, None), Slot::new(st, total, None));
                     slot_amounts.push(op);
                 }
             }
@@ -1252,10 +1256,21 @@ impl Writer {
         if self.state.regs.contains_key(&(life, path.clone())) {
             return None;
         }
+        // The writer's FIRST slot at the path: over one it already holds the write would put an `Int64`
+        // total under the operand stamps (and the exact integer sum) of the slot it replaces, a state
+        // whose own decoder refuses it
+        if self.state.slots.contains_key(&(life, path.clone(), self.id, None)) {
+            return None;
+        }
         let known = self.known();
         let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.put_slot((life, path.clone(), self.id, None), st2, Num::from(i128::from(n)));
+        self.put_slot(
+            (life, path.clone(), self.id, None),
+            st2,
+            Num::from(i128::from(n)),
+            Kind::Int64,
+        );
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
         items.push((OrdAt::Field(path.clone()), OrdMode::Write));
@@ -1284,7 +1299,7 @@ impl Writer {
         );
         s.slots.insert(
             (st, path.clone(), self.id, None),
-            Slot { stamp: st, total: Num::from(i128::from(n)), absorbed: None },
+            Slot::new(st, Num::from(i128::from(n)), None),
         );
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
@@ -1462,7 +1477,7 @@ impl Writer {
         // The production rule decides: a string or a map is refused, so is an integer past the
         // bound, a decimal that overflows and a double operand against a counter. A double base
         // is no counter: its `$inc` is a register write of the computed value.
-        match counter::inc_result(vis.get(p), by, self.opts.int_bound())
+        let expected = match counter::inc_result(vis.get(p), by, self.opts.int_bound())
             .ok_or_else(|| inc_refusal(vis.get(p), by, p))?
         {
             Inc::Register(v) => {
@@ -1473,8 +1488,8 @@ impl Writer {
                 }
                 return Ok(IncPlan::Register(v));
             }
-            Inc::Slot(_) => {}
-        }
+            Inc::Slot(n) => n,
+        };
         let op =
             Num::from_value(by).ok_or_else(|| UpdateRefused::IncOperandNotANumber(p.clone()))?;
         let al = self.state.alive_set(self.opts.retention);
@@ -1489,9 +1504,21 @@ impl Writer {
             // the writer's first amount at the path is the product's stored form of the operand
             // (a canonical encoding of the operand, its cohort member kept), never the operand's own bytes
             None => op.first_amount(),
-            Some(s) => counter::sum_checked(&s.total, &op).ok_or_else(out_of_range)?,
+            Some(s) => counter::sum_exact(&s.total, &op).ok_or_else(out_of_range)?,
         };
         if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
+            return Err(out_of_range());
+        }
+        // A DECIMAL counter reads `base + (total - absorbed)` per slot, which can round although the visible sum
+        // and the slot total are exact (a total of 1E-34 against an absorbed total of -1E+34 needs 69 digits).
+        // The write is accepted only if the counter, read from this writer's own
+        // state with the planned slot, equals the visible sum: otherwise it would answer 200 and read a value
+        // that lost the operand. This also refuses an increment at a writer whose counter a join already
+        // rounded, when the result would not be what it read plus the operand: the way out is a `$set`.
+        // Integers are untouched (their sums are exact).
+        if matches!(expected, Num::Decimal128(_))
+            && !self.read_with_slot_equals(&al, win, &key, total, op.label(), &expected)
+        {
             return Err(out_of_range());
         }
         // The contributor cap: a writer the counter does not have yet is refused at the cap.
@@ -1506,6 +1533,36 @@ impl Writer {
         // running sum has been: the type of the counter is read from the merged state, not from the
         // history of one writer's partial sums.
         Ok(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
+    }
+
+    /// Does the counter at `p`, read from the writer's own state with its slot at `key` holding `total` after an
+    /// operand of the type `op`, equal `expected` (the visible sum of the `$inc`)?
+    fn read_with_slot_equals(
+        &self,
+        al: &BTreeSet<MStamp>,
+        win: Option<&Reg>,
+        key: &SlotKey,
+        total: Num,
+        op: Kind,
+        expected: &Num,
+    ) -> bool {
+        // the slot the write will store: the same constructor, at the stamp `tick(0)` would mint (above every
+        // stamp the writer holds; a skew only raises it)
+        let stamp =
+            MStamp { hlc: Hlc::new(self.top().wall_ms.saturating_add(1), 0), writer: self.id };
+        let planned = Slot::grown(self.state.slots.get(key), stamp, total, op);
+        let mut slots: Vec<(&SlotKey, &Slot)> =
+            self.state.slots_at(&key.1, al).into_iter().filter(|(k, _)| *k != key).collect();
+        slots.push((key, &planned));
+        let read = self.state.cell_with(&key.1, al, win, slots, &self.opts);
+        // A read that cannot be evaluated does not make the increment acceptable. This refusal (the `None`) is
+        // believed UNREACHABLE and is NOT a tested rule, only the safe answer: the counter at `key.1` has the
+        // slot just planned for this writer, so `cell_with` finds a term (`terms` is not empty) and returns a
+        // value; a counter value is a number, which `Num::from_value` reads (a base that is not a number does
+        // not reach here: `inc_result` has refused it or made a register). No test reaches it, and no mutant
+        // is kept for it.
+        read.and_then(|(v, _)| Num::from_value(&v))
+            .is_some_and(|n| counter::same_number(&n, expected))
     }
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
@@ -1536,7 +1593,7 @@ impl Writer {
                 for q in &eff.order {
                     self.setreg(q, eff.vals[q].clone(), st, &al);
                 }
-                self.put_slot(key, st, total);
+                self.put_slot(key, st, total, op.label());
                 self.feed(life, st, known, &items);
                 let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![p.clone()]);
                 rec.n = op.int().and_then(|v| i64::try_from(v).ok());
@@ -1894,8 +1951,8 @@ impl Writer {
                             changed = true;
                         }
                         IncPlan::Slot(plan) => {
-                            let SlotPlan { life, key, total, .. } = *plan;
-                            slots.push((life, key, total));
+                            let SlotPlan { life, key, total, op, .. } = *plan;
+                            slots.push((life, key, total, op.label()));
                             changed = true;
                         }
                     }
@@ -1920,9 +1977,9 @@ impl Writer {
             self.setreg(q, eff.vals[q].clone(), st, &al);
         }
         let mut paths = eff.order.clone();
-        for (_, key, total) in slots {
+        for (_, key, total, op) in slots {
             paths.push(key.1.clone());
-            self.put_slot(key, st, total);
+            self.put_slot(key, st, total, op);
         }
         if let Some(life) = l {
             self.feed(life, st, known, &items);
