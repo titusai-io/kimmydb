@@ -1289,7 +1289,11 @@ fn apply_one(
     ) {
         refuse_untraversable(doc, op)?;
     }
-    let current = path::resolve(doc, &op.path).first().cloned().cloned();
+    // The value an operator computes from is read where its write goes: documents by key,
+    // arrays by position only. `path::resolve` reads a position as a field of the elements
+    // too and fans out, which made `$inc` of `a.3` over `{a: [{"3": 5}]}` compute from 5 and
+    // write 6 at position 3.
+    let current = path::get_checked(doc, &op.path).cloned();
 
     let invalid = |msg: String| Error::InvalidUpdate(msg);
     let mut set = |doc: &mut Document, value: Bson| -> Result<()> {
@@ -4042,6 +4046,99 @@ mod tests {
                 assert!(message.contains("cannot use the part"), "{label}: {update}: {message}");
             }
         }
+    }
+
+    /// An operator computes from the value at the place it writes: a path segment that is
+    /// a position reads an element and never a field of the elements, as the write
+    /// addresses it. `$inc` of `a.3` over `{a: [{"3": 5}]}` read 5 from the field and wrote
+    /// 6 at position 3; it writes 1 there (q7s3j.jsonl case 21; `$mul` 31, `$bit` 61,
+    /// `$push` 71-72, `$addToSet` 81-82, `$max` 52, `$pull` 92, `$pop` 102). The whole
+    /// table of 150 is `update_digit_tests.rs`.
+    #[test]
+    fn an_operator_reads_where_it_writes_and_not_a_field_named_like_the_position() {
+        let field = |v: Bson| doc! { "a": [{ "1": v }] };
+        let cases: Vec<(&str, Document, Document, Document)> = vec![
+            (
+                "$inc a.3",
+                doc! { "$inc": { "a.3": 1 } },
+                doc! { "a": [{ "3": 5 }] },
+                doc! { "a": [{ "3": 5 }, Bson::Null, Bson::Null, 1] },
+            ),
+            (
+                "$push a.1",
+                doc! { "$push": { "a.1": 7 } },
+                field(bson::bson!([1])),
+                doc! { "a": [{ "1": [1] }, [7]] },
+            ),
+            (
+                "$addToSet a.1",
+                doc! { "$addToSet": { "a.1": 8 } },
+                field(bson::bson!([7])),
+                doc! { "a": [{ "1": [7] }, [8]] },
+            ),
+            (
+                "$min a.1 (10 over the field 9)",
+                doc! { "$min": { "a.1": 10 } },
+                field(Bson::Int32(9)),
+                doc! { "a": [{ "1": 9 }, 10] },
+            ),
+            (
+                "$max a.1 (3 over the field 9)",
+                doc! { "$max": { "a.1": 3 } },
+                field(Bson::Int32(9)),
+                doc! { "a": [{ "1": 9 }, 3] },
+            ),
+            (
+                "$mul a.1",
+                doc! { "$mul": { "a.1": 2 } },
+                field(Bson::Int32(5)),
+                doc! { "a": [{ "1": 5 }, 0] },
+            ),
+            (
+                "$bit a.1",
+                doc! { "$bit": { "a.1": { "or": 1 } } },
+                field(Bson::Int32(4)),
+                doc! { "a": [{ "1": 4 }, 1] },
+            ),
+            // Nothing at the position: a pull or a pop has nothing to take from.
+            (
+                "$pull a.1",
+                doc! { "$pull": { "a.1": 1 } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+            (
+                "$pullAll a.1",
+                doc! { "$pullAll": { "a.1": [1] } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+            (
+                "$pop a.1",
+                doc! { "$pop": { "a.1": 1 } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+        ];
+        for (label, update, stored, want) in cases {
+            assert_eq!(applied(update, stored), want, "{label}");
+        }
+    }
+
+    /// The read and the write of a path through nested arrays are one place: `a.0.1` is
+    /// the second member of the first element, not the field `0` of a later element
+    /// (q7s3j.jsonl cases 24, 30, 34, 40, 64, 70 record the nested forms over a document
+    /// and an array element).
+    #[test]
+    fn the_read_and_the_write_of_a_path_through_nested_arrays_are_one_place() {
+        assert_eq!(
+            applied(doc! { "$inc": { "a.0.1": 1 } }, doc! { "a": [[5, 6], { "0": [1, 2] }] }),
+            doc! { "a": [[5, 7], { "0": [1, 2] }] }
+        );
+        assert_eq!(
+            applied(doc! { "$inc": { "a.0.1": 1 } }, doc! { "a": [[], { "0": [1, 2] }] }),
+            doc! { "a": [[Bson::Null, 1], { "0": [1, 2] }] }
+        );
     }
 
     /// A path with nothing at it is no change, and a path that reaches an

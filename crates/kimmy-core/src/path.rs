@@ -453,6 +453,28 @@ fn unset_in_document(doc: &mut Document, segs: &[&str]) -> bool {
     }
 }
 
+/// The value at a dot path, read as [`set_checked`] writes it: a document by key, an array
+/// by position only (`array_index`), and nothing else. A segment that is a position
+/// addresses an element and never a field of the elements, a name never addresses an
+/// array, nothing is read through a scalar, and there is no fan-out: one place, the one a
+/// write to the same path would change. `None` where nothing is there.
+///
+/// An update reads the value it computes from here, so that what it reads and what it
+/// writes are one place.
+pub fn get_checked<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
+    let segs = segments(path);
+    let (head, rest) = segs.split_first()?;
+    let mut value = doc.get(*head)?;
+    for seg in rest {
+        value = match value {
+            Bson::Document(child) => child.get(*seg)?,
+            Bson::Array(items) => items.get(array_index(seg)?)?,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
 /// Remove the value at a dot path as an update does: through a numeric
 /// segment at any depth of nested arrays, leaving a `null` hole where an
 /// element was. Returns whether anything was removed.
@@ -492,6 +514,28 @@ fn unset_deep_in_array(items: &mut [Bson], segs: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use bson::doc;
+
+    #[test]
+    fn get_checked_reads_the_place_a_write_addresses() {
+        let d = doc! { "a": [{ "3": 5, "x": 1 }, [7, 8]], "b": { "c": [10, 11] }, "n": 1 };
+        let at = |p: &str| get_checked(&d, p).cloned();
+        // Documents by key, arrays by position only.
+        assert_eq!(at("b.c.1"), Some(Bson::Int32(11)));
+        assert_eq!(at("a.1.0"), Some(Bson::Int32(7)));
+        assert_eq!(at("a.0.x"), Some(Bson::Int32(1)));
+        assert_eq!(at("a.0.3"), Some(Bson::Int32(5)));
+        // A position never reads a field of the elements, and a name never reads an array.
+        assert_eq!(at("a.3"), None);
+        assert_eq!(at("a.x"), None);
+        assert_eq!(at("b.c.x"), None);
+        // Nothing through a scalar, nothing past the end, a sign is a name, a leading zero a position.
+        assert_eq!(at("n.x"), None);
+        assert_eq!(at("n.0"), None);
+        assert_eq!(at("a.9"), None);
+        assert_eq!(at("b.c.+1"), None);
+        assert_eq!(at("b.c.01"), Some(Bson::Int32(11)));
+        assert_eq!(at("zzz"), None);
+    }
 
     use super::*;
 
