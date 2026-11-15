@@ -132,6 +132,10 @@ pub struct JoinOptions {
     /// the base's own label does not count.
     #[cfg(any(test, feature = "merge-mutants"))]
     counter_ignores_base: bool,
+    /// R1 mutant: the type of what a slot gained keeps the width of the operands a base write
+    /// absorbed (the slot's label is the join of every operand it ever took).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_label_survives_absorb: bool,
     /// R1 mutant: the type of a counter is read from the VALUE of each part (an `Int32` amount past
     /// the `i32` range counts as an `Int64`), not from its label: the sticky widening R1 replaced.
     #[cfg(any(test, feature = "merge-mutants"))]
@@ -252,6 +256,8 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             counter_ignores_base: false,
             #[cfg(any(test, feature = "merge-mutants"))]
+            counter_label_survives_absorb: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
             counter_kind_by_value: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             ord_keep_all: false,
@@ -357,6 +363,7 @@ impl JoinOptions {
     switch!(no_contributor_cap, set_no_contributor_cap, false);
     switch!(no_writer_cap, set_no_writer_cap, false);
     switch!(counter_ignores_base, set_counter_ignores_base, false);
+    switch!(counter_label_survives_absorb, set_counter_label_survives_absorb, false);
     switch!(counter_kind_by_value, set_counter_kind_by_value, false);
     switch!(ord_keep_all, set_ord_keep_all, false);
     switch!(ord_latest, set_ord_latest, false);
@@ -689,10 +696,17 @@ pub(super) fn join_into(
                     (None, b) => b,
                     (a, _) => a,
                 };
+                // the stamps of the latest wide and decimal operands: the slot is one writer's
+                // history, so the later of two states of it holds the later stamps, and the join
+                // takes the later of each (the same answer for honest states, a join for any)
+                let (wide_at, decimal_at) =
+                    (x.wide_at.max(v.wide_at), x.decimal_at.max(v.decimal_at));
                 if v.stamp > x.stamp {
                     *x = v.clone();
                 }
                 x.absorbed = absorbed;
+                x.wide_at = wide_at;
+                x.decimal_at = decimal_at;
             }
         }
     }

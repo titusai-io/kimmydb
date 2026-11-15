@@ -50,6 +50,34 @@ fn concurrent(
     v
 }
 
+/// `concurrent` for any number of writers: `I` creates the document with `init`; each of `parts` (a writer's
+/// name, the operand, the clock skew) holds it and `$inc`s `path` once, concurrently. The value in every
+/// delivery order of the entries, which must be one value with one state hash.
+fn concurrent_n(
+    o: &JoinOptions,
+    init: &[(&str, Value)],
+    path: &str,
+    parts: &[(char, &Value, u64)],
+) -> Value {
+    let mut mi = Mem::new('I', o);
+    let i0 = mi.ins(init, 0).unwrap();
+    let mut ents = Vec::new();
+    for &(name, by, skew) in parts {
+        let mut m = Mem::new(name, o);
+        m.receive_entry(&mi.ent(i0));
+        let s = inc_v(&mut m, path, by, skew);
+        ents.push(m.ent(s));
+    }
+    let orders = all_orders(o, &ents, &[mi.ent(i0)]);
+    let first = orders[0].1.w.state.compact_hash();
+    let v = orders[0].1.visible().unwrap()[&p(path)].clone();
+    for (ord, m) in &orders {
+        assert_eq!(m.visible().unwrap()[&p(path)], v, "delivery {ord:?}");
+        assert_eq!(m.w.state.compact_hash(), first, "hash, delivery {ord:?}");
+    }
+    v
+}
+
 fn i32v(n: i32) -> Value {
     Value::Int32(n)
 }
@@ -182,12 +210,20 @@ fn a_local_inc_follows_the_production_rule_and_refuses_what_it_refuses() {
 
 // ---- the canonical order ---------------------------------------------------------------------
 
-/// `1E+34 + 5 - 1E+34`: `1E+34 + 5` rounds to `1E+34` (a tie to even), so the order the two
-/// writers' parts are added in decides between `0` and `5`. The canonical order is the writers'
-/// `(node, epoch)`: A's `+5` goes first and is lost. A's stamp is the LATER one (skew 9), so
-/// the order of the stamps would add B's `-1E+34` first and keep the 5.
+/// `1E+34 - 1E+34 + 5` in three parts: A adds `1E+34`, B adds `5`, C adds `-1E+34` to the base `0`. Each writer's
+/// own total is exact at home (a Decimal128 counter is exact or refused: `1E+34 + 5` at ONE writer is a 400),
+/// so a rounding order arises only in a JOIN of concurrent writers: `1E+34 + 5` rounds to `1E+34` (a tie to
+/// even), so the order the three parts are added in decides between `0` and `5`. The canonical order is the
+/// writers' `(node, epoch)`: A's `1E+34`, B's `+5` (lost in the rounding), C's `-1E+34`: `0E+1`. With C's stamp
+/// the earliest (skew 0) and B's the latest (skew 9) the order of the stamps would add `-1E+34` and `1E+34` first
+/// and keep the 5.
 fn decimal_order_scenario(o: &JoinOptions) -> Result<(), String> {
-    let v = concurrent(o, &[("x", dec("1E+34"))], "x", (&dec("5"), 9), (&dec("-1E+34"), 0));
+    let v = concurrent_n(
+        o,
+        &[("x", dec("0"))],
+        "x",
+        &[('A', &dec("1E+34"), 3), ('B', &dec("5"), 9), ('C', &dec("-1E+34"), 0)],
+    );
     (text(&v) == "0E+1").then_some(()).ok_or(format!("read {}, want the canonical 0E+1", text(&v)))
 }
 
@@ -195,7 +231,12 @@ fn decimal_order_scenario(o: &JoinOptions) -> Result<(), String> {
 fn decimal_cells_add_their_parts_in_the_canonical_order() {
     decimal_order_scenario(&opts()).unwrap();
     // the stamps in the other order: the same value, whatever the stamps say
-    let v = concurrent(&opts(), &[("x", dec("1E+34"))], "x", (&dec("5"), 0), (&dec("-1E+34"), 9));
+    let v = concurrent_n(
+        &opts(),
+        &[("x", dec("0"))],
+        "x",
+        &[('A', &dec("1E+34"), 0), ('B', &dec("5"), 3), ('C', &dec("-1E+34"), 9)],
+    );
     assert_eq!(text(&v), "0E+1");
 }
 

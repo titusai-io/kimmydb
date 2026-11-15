@@ -3,7 +3,7 @@
 Run:  python3 -I -B check_ord_section.py [ord_section_goldens.json]      (default: the file next to this script)
 
 `ord_section_goldens.json` is written by the Rust test `the_order_section_fixture_of_the_python_writer_is_current`
-(`src/merge_state/compact_tests.rs`): for each of the six goldens, the full compact bytes the Rust side produces and
+(`src/merge_state/compact_tests.rs`): for each of the six goldens and the typed one, the full compact bytes the Rust side produces and
 the order state spelled out BY VALUE (stamps and writers, no table indexes).
 
 This script shares no code with the Rust side and imports nothing from the model. It re-derives, from the spec in the
@@ -13,7 +13,7 @@ module documentation of `compact.rs` (primitives and section 10), the bytes of s
   2. it walks sections 3 to 9 (skipping values; no semantics), finds the offset where section 10 begins, checks that
      the section 10 it writes starts EXACTLY there and runs exactly to the end of the bytes, and is byte for byte
      the Rust bytes from there;
-  3. the length of the Rust bytes is the pinned one (10, 273, 509, 235, 329, 163), and the 128-bit hash of the bytes,
+  3. the length of the Rust bytes is the pinned one (10, 273, 509, 235, 329, 163, 499 for typed), and the 128-bit hash of the bytes,
      computed here by a hash of its own, is the pinned one (`the_compact_golden_hashes_with_the_order_state_are_pinned`).
 Exit status 0 and one line per golden when everything matches; any mismatch prints the first differing offset and exits 1.
 """
@@ -29,6 +29,8 @@ PINS = {
     "delete": ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0),
     "obs": ("1714242f8331d6b9ca194c73191730ed", 329, 2),
     "small": ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2),
+    # NEW pin: the typed golden (an Int32 slot, a Decimal128 slot, the counter of Amendment 6), by the Rust writer
+    "typed": ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4),
     # NEW pins (`the_order_section_corpus_is_pinned`): states a Rust Writer builds, with every floor kind, a level mark,
     # the root key, several writers' firsts and positions of 128 and up (see `ord_section_states`).
     "floors_u": ("a9a3d1f267ae32cd8a3de81f1297f4af", 666, 9),
@@ -296,6 +298,11 @@ def section10_start(buf):
         if flags & 1:
             w.stamp()
             w.payload((flags >> 3) & 3)
+        if flags & 0x80:                # the operand stamps are spelled (not the usual ones of the total's type)
+            if flags & 0x20:            # wide_at: the latest Int64-or-wider operand
+                w.stamp()
+            if flags & 0x40:            # decimal_at: the latest Decimal128 operand
+                w.stamp()
     w.vv()                              # 8 version vector
     for _ in range(w.var()):            # 9 losses
         w.u8()

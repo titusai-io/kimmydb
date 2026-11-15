@@ -654,6 +654,17 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// derived Debug of the type now prints `Origin {..}` where it printed `WriterId {..}`. States and reads are unchanged: with a temporary Debug
 /// impl printing `WriterId`, every pin matched; the Python differential still reports 0 scripts disagreeing.
 /// 0x3ddd_f823_ee88_e7c7 to 0xccb0_e0db_c8f1_83b7.
+///
+/// RE-PINNED when a counter slot began to spell the stamps of its latest wide and decimal operands (`wide_at`, `decimal_at`; Amendment 6
+/// of the Q7 design): the fingerprint hashes the `{:?}` text of the states, and a slot now prints those two fields. Every operand of this
+/// differential is an Int64, so every slot holds `wide_at`. Compared step by step against the series before the change (the same 300 scripts,
+/// the same draws): 38,435 steps in common, 20,321 steps whose state holds no slot are identical, 0 slotless steps differ, 18,114 steps
+/// whose state holds a slot differ, 0 steps with a slot are identical. The replay still agrees with the model (0 scripts disagree).
+/// 0xccb0_e0db_c8f1_83b7 to 0x6369_2db0_1289_772a.
+///
+/// RE-PINNED for Amendment 9: the operand stamps are spelled only when they are not the usual ones, and the fingerprint is the pre-stamp value
+/// again (compared step by step against the series before the stamps: slot-bearing steps identical 18,114 of 18,114, slotless differing 0).
+/// 0x6369_2db0_1289_772a to 0xccb0_e0db_c8f1_83b7.
 const PINNED_300: u64 = 0xccb0_e0db_c8f1_83b7;
 
 #[test]
@@ -721,6 +732,17 @@ fn planted_type_blind_diff_is_detected() {
     planted("same-ignores-type", 300);
 }
 
+/// The `typed` golden (a NEW key, so a test of its own): the model's operands are Int64s, so its encoder is
+/// told the labels and the operand stamps of the typed slots it spells. `compact_tests` pins the same numbers
+/// against the Rust writer's bytes.
+#[test]
+fn the_typed_golden_vector_matches_the_model() {
+    let out = run_python(&["--golden".to_string()]);
+    let got: J = serde_json::from_str(out.trim()).expect("json");
+    assert_eq!(got["typed"], J::Null, "an absorbed pair: no version 1 spelling");
+    assert_eq!(got["typed-compact"], json!(["d11ec34731c1adb4ec0a0ae4be757d20", 371]));
+}
+
 /// The golden vectors of `merge_state/tests.rs`, hashed by the model's independent
 /// implementation of the canonical encoding and the hash.
 #[test]
@@ -740,6 +762,10 @@ fn golden_vectors_match_the_model() {
         "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
         "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
+        // the typed state: no version 1 spelling (it holds absorbed pairs); its compact form is pinned by the writer and
+        // by the independent encoder alike (`the_typed_golden_vector_matches_the_model`)
+        "typed": J::Null,
+        "typed-compact": ["d11ec34731c1adb4ec0a0ae4be757d20", 371],
     });
     assert_eq!(got, want);
 }
