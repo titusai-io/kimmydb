@@ -295,6 +295,23 @@ fn documented(r: &UpdateRefused) -> bool {
 /// not there (a no-op): both must happen, or the generators prove nothing.
 static REFUSED_RENAMES: AtomicUsize = AtomicUsize::new(0);
 static NOOP_RENAMES: AtomicUsize = AtomicUsize::new(0);
+/// Steps whose update holds a `$rename` and is refused for another reason (printed, not floored).
+static OTHER_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a refusal text names a `$rename` of `operations`: it says `$rename` (the source and
+/// array-element cases, q7s2f.out), or it is the recorded "cannot create field '<x>' in element
+/// {...}" (q7s2d.out 4e) and `<x>` is a segment of the DESTINATION of one of the renames.
+fn names_a_rename(text: &str, operations: &[Operation]) -> bool {
+    if text.contains("$rename") {
+        return true;
+    }
+    let Some(rest) = text.split("cannot create field '").nth(1) else { return false };
+    let Some(x) = rest.split("' in element").next() else { return false };
+    operations.iter().any(|op| match &op.kind {
+        OpKind::Rename(target) => target.split('.').any(|seg| seg == x),
+        _ => false,
+    })
+}
 
 /// One run: the steps applied in turn to an engine document and to a writer holding the same one.
 fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
@@ -340,11 +357,16 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
             }
             // both refuse: the engine's `$rename` rules (a source or a destination in an array
             // element, below a scalar) are counted so that the run proves it reaches them
-            (Err(_), Err(_)) => {
+            // (counted only when BOTH refusal texts name the rename: any other refusal of an
+            // update that holds a `$rename` goes to `OTHER_REFUSALS`)
+            (Err(from_engine), Err(from_plan)) => {
                 if let Update::Operators(operations) = &update
                     && operations.iter().any(|op| matches!(op.kind, OpKind::Rename(_)))
                 {
-                    REFUSED_RENAMES.fetch_add(1, Ordering::Relaxed);
+                    let named = names_a_rename(&from_engine.to_string(), operations)
+                        && names_a_rename(&from_plan.to_string(), operations);
+                    let counter = if named { &REFUSED_RENAMES } else { &OTHER_REFUSALS };
+                    counter.fetch_add(1, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -419,6 +441,7 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
 fn effects_through_the_writer_render_the_engines_post_image() {
     REFUSED_RENAMES.store(0, Ordering::Relaxed);
     NOOP_RENAMES.store(0, Ordering::Relaxed);
+    OTHER_REFUSALS.store(0, Ordering::Relaxed);
     std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(|| {
@@ -433,7 +456,12 @@ fn effects_through_the_writer_render_the_engines_post_image() {
         .unwrap();
     let (refused, noop) =
         (REFUSED_RENAMES.load(Ordering::Relaxed), NOOP_RENAMES.load(Ordering::Relaxed));
-    eprintln!("renames: {refused} steps with a rename refused, {noop} of a missing source");
+    eprintln!(
+        "renames: {refused} refused with a text that names the rename, {} other refusals of an \
+         update holding a rename, {noop} of a missing source",
+        OTHER_REFUSALS.load(Ordering::Relaxed)
+    );
+    // the floor was `> 0` (r1 and r2); the hold prints the count, to be pinned from the run
     assert!(refused > 0, "no generated step hit a refused rename");
     assert!(noop > 0, "no generated step renamed a missing source");
 }
