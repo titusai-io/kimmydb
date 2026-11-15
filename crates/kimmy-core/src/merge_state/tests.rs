@@ -1035,16 +1035,25 @@ pub(super) fn golden_obs() -> MergeState {
 /// stamps exist for: a `Decimal128` operand, an `Int64` operand, a base write of an `Int32` that absorbs
 /// them, then an `Int32` operand. Its slot has `decimal_at < wide_at < stamp`, its absorbed pair is at
 /// `wide_at`, and what it gained since that pair is an `Int32`: the counter reads 7 + 5 = 12, an `Int32`.
+/// `d` is the shape of Amendment 9: the slot keeps the exact integer sum (1) that its 34-digit total
+/// cannot show after a `1E-34` operand, and the counter reads 5 + 1 = 6, an `Int32`.
 pub(super) fn golden_typed() -> MergeState {
     let dv = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("a", i(1)), ("b", i(1)), ("c", i(1))]), 0).unwrap();
+    w.insert(&fl(&[("a", i(1)), ("b", i(1)), ("c", i(1)), ("d", i(0))]), 0).unwrap();
     w.write_inc_value(&p("a"), &Value::Int32(5), 0).unwrap();
     w.write_inc_value(&p("b"), &dv("3"), 0).unwrap();
     w.write_inc_value(&p("c"), &dv("1"), 0).unwrap();
     w.write_inc_value(&p("c"), &Value::Int64(2), 0).unwrap();
     w.write_set(&p("c"), Value::Int32(7), 0).unwrap();
     w.write_inc_value(&p("c"), &Value::Int32(5), 0).unwrap();
+    // d: the shape of Amendment 9 at the edge of 34 digits: a Decimal128 operand of 1E-33 whose sum with
+    // the integer after it (1.000000000000000000000000000000001) is the last 34-digit total (1E-34 would be
+    // refused: its sum needs 35), a base write of an Int32 that absorbs it, then an Int32 operand: the slot
+    // gained the exact integer 1, so the counter reads 5 + 1 = 6, an Int32
+    w.write_inc_value(&p("d"), &dv("1E-33"), 0).unwrap();
+    w.write_set(&p("d"), Value::Int32(5), 0).unwrap();
+    w.write_inc_value(&p("d"), &Value::Int32(1), 0).unwrap();
     w.state.clone()
 }
 

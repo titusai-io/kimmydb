@@ -604,13 +604,16 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // inputs are different ones. Accepted 10,601 -> 10,453; the laws over the accepted damaged entries moved with the accepted set: triples
     // 140,112 -> 131,748, agreeing 110,634 -> 106,374, not associative 444 -> 456; `not_associative_agreeing` is still 0, and the arbitrary
     // (undamaged) candidates, the hand-built closed states and the simulation are the same figures.
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_453));
+    // RE-PINNED for Amendment 9 (the operand stamps are spelled only when they are not the usual ones): the corpus is again 243 states of
+    // 72,990 B, the seeded damage is the damage of before the stamps, and so are the figures: accepted 10,453 -> 10,601; the laws over the
+    // accepted damaged entries triples 131,748 -> 140,112, agreeing 106,374 -> 110,634, not associative 456 -> 444.
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_601));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (131_748, 106_374, 456));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_112, 110_634, 444));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }

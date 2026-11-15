@@ -430,8 +430,9 @@ fn stamp_bytes(wall: u64) -> Vec<u8> {
 fn the_slot_flag_byte_spells_the_pair_and_both_types() {
     let zig = |v: i128| ((v << 1) ^ (v >> 127)) as u8; // small values: one byte
     // the slot's bytes: its stamp, the flag byte, the total, the pair (its stamp and total), then the operand
-    // stamps (`wide_at`, then `decimal_at`) that `stamps` says: 11 bytes each, at the slot's own stamp
-    let tail = |flags: u8, total: &[u8], abs: Option<(u64, &[u8])>, stamps: usize| {
+    // stamps (`wide_at`, then `decimal_at`) of the walls `stamps` names, 11 bytes each, spelled only when
+    // the flag byte has bit 7 (the stamps the slot has are not the usual ones of its total's type)
+    let tail = |flags: u8, total: &[u8], abs: Option<(u64, &[u8])>, stamps: &[u64]| {
         let mut t = stamp_bytes(5);
         t.push(flags);
         t.extend_from_slice(total);
@@ -439,45 +440,63 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
             t.extend(stamp_bytes(w));
             t.extend_from_slice(a);
         }
-        for _ in 0..stamps {
-            t.extend(stamp_bytes(5));
+        for w in stamps {
+            t.extend(stamp_bytes(*w));
         }
         t
     };
     let dec_bytes = |t: &str| t.parse::<bson::Decimal128>().unwrap().bytes();
+    // a Decimal128 total or pair is its 16 bytes and nothing else
+    let dfig = |t: &str| dec_bytes(t).to_vec();
     let slot = |total: Num, absorbed: Option<(u64, Num)>| {
         Slot::new(st(5, 'A'), total, absorbed.map(|(w, n)| (st(w, 'A'), n)))
     };
     let cases: Vec<(&str, Slot, Vec<u8>)> = vec![
-        // Int64, no pair: type 0, and the stamp of its latest wide operand (bit 5, `wide_at`)
-        ("int64", slot(Num::Int64(3), None), tail(0x20, &[zig(3)], None, 1)),
+        // Int64, no pair: flags 0 (its `wide_at` is its own stamp and is not spelled)
+        ("int64", slot(Num::Int64(3), None), tail(0, &[zig(3)], None, &[])),
         // Int32, no pair: type 1 in bits 1-2, no operand stamp
-        ("int32", slot(Num::Int32(3), None), tail(2, &[zig(3)], None, 0)),
-        // Decimal128, no pair: type 2, both operand stamps (bits 5 and 6: `wide_at`, `decimal_at`)
-        ("decimal", slot(dec("1.5"), None), tail(4 | 0x60, &dec_bytes("1.5"), None, 2)),
+        ("int32", slot(Num::Int32(3), None), tail(2, &[zig(3)], None, &[])),
+        // Decimal128, no pair: type 2, the usual stamps (both its own) not spelled
+        ("decimal", slot(dec("1.5"), None), tail(4, &dfig("1.5"), None, &[])),
+        // Int64 whose latest wide operand is below its stamp: bit 7 and bit 5, `wide_at` (11 bytes)
+        (
+            "int64 with an older wide_at",
+            Slot { wide_at: Some(st(3, 'A')), ..slot(Num::Int64(3), None) },
+            tail(0x80 | 0x20, &[zig(3)], None, &[3]),
+        ),
+        // Decimal128 whose latest decimal operand is below its latest wide one: bits 7, 5 and 6
+        (
+            "decimal with both stamps spelled",
+            Slot {
+                wide_at: Some(st(4, 'A')),
+                decimal_at: Some(st(2, 'A')),
+                ..slot(dec("1.5"), None)
+            },
+            tail(4 | 0x80 | 0x20 | 0x40, &dfig("1.5"), None, &[4, 2]),
+        ),
         // Int64 with an Int64 pair: bit 0
         (
             "int64 pair",
             slot(Num::Int64(3), Some((4, Num::Int64(-2)))),
-            tail(1 | 0x20, &[zig(3)], Some((4, &[zig(-2)])), 1),
+            tail(1, &[zig(3)], Some((4, &[zig(-2)])), &[]),
         ),
         // Int64 total, Int32 pair: the pair's type in bits 3-4
         (
             "int64 with int32 pair",
             slot(Num::Int64(3), Some((4, Num::Int32(3)))),
-            tail(1 | 1 << 3 | 0x20, &[zig(3)], Some((4, &[zig(3)])), 1),
+            tail(1 | 1 << 3, &[zig(3)], Some((4, &[zig(3)])), &[]),
         ),
         // Int32 total, Decimal128 pair
         (
             "int32 with decimal pair",
             slot(Num::Int32(3), Some((4, dec("0.25")))),
-            tail(1 | 1 << 1 | 2 << 3, &[zig(3)], Some((4, &dec_bytes("0.25"))), 0),
+            tail(1 | 1 << 1 | 2 << 3, &[zig(3)], Some((4, &dfig("0.25"))), &[]),
         ),
         // Decimal128 total and pair
         (
             "decimal pair",
             slot(dec("3"), Some((4, dec("2")))),
-            tail(1 | 2 << 1 | 2 << 3 | 0x60, &dec_bytes("3"), Some((4, &dec_bytes("2"))), 2),
+            tail(1 | 2 << 1 | 2 << 3, &dfig("3"), Some((4, &dfig("2"))), &[]),
         ),
     ];
     for (name, sl, want_tail) in cases {
@@ -532,39 +551,43 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
         r
     };
     let dec_check = |b: &[u8]| MergeState::decode_compact(b).map(|_| ());
-    // the neighbours that are accepted: an Int32 total has no operand stamp, an Int64 one the stamp
-    // `wide_at` (bit 5), a Decimal128 one both (bits 5 and 6)
+    // the neighbours that are accepted: the usual stamps of the total's type are not spelled (an Int32
+    // total has none, an Int64 one `wide_at` at its own stamp, a Decimal128 one both), and a slot whose
+    // stamps are not the usual ones spells them under bit 7
     assert_eq!(dec_check(&with(2, &[zig3])), Ok(()));
-    assert_eq!(dec_check(&with(0x20, &total_and(&[5]))), Ok(()));
-    assert_eq!(dec_check(&with(0x20, &total_and(&[4]))), Ok(()));
-    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[5, 5]))), Ok(()));
-    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[4, 3]))), Ok(()));
-    let mut r = pair(5);
-    r.extend(stamp_bytes(5));
-    assert_eq!(dec_check(&with(1 | 0x20, &r)), Ok(()));
+    assert_eq!(dec_check(&with(0, &[zig3])), Ok(()));
+    assert_eq!(dec_check(&with(1, &pair(5))), Ok(()));
     assert_eq!(dec_check(&with(1 | 1 << 1 | 1 << 3, &pair(5))), Ok(()));
-    // an Int64 total without its stamp is a slot no writer keeps (flag 0 was one before the stamps):
-    // the type the stamps spell is Int32
+    assert_eq!(dec_check(&with(4, &dec_and(&[]))), Ok(()));
+    assert_eq!(dec_check(&with(0x80 | 0x20, &total_and(&[4]))), Ok(()));
+    assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[5, 4]))), Ok(()));
+    assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[4, 3]))), Ok(()));
+    let mut r = pair(5);
+    r.extend(stamp_bytes(4));
+    assert_eq!(dec_check(&with(1 | 0x80 | 0x20, &r)), Ok(()));
+    // one spelling: bit 7 with the usual stamps is refused, and so is a stamp bit without bit 7
+    assert_eq!(dec_check(&with(0x80 | 0x20, &total_and(&[5]))), Err(DecodeError::NotCanonical));
+    assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[5, 5]))), Err(DecodeError::NotCanonical));
+    assert_eq!(dec_check(&with(0x20, &total_and(&[5]))), Err(DecodeError::BadTag(0x20)));
+    assert_eq!(dec_check(&with(4 | 0x40, &dec_and(&[5]))), Err(DecodeError::BadTag(4 | 0x40)));
+    // an Int64 total whose spelled stamps are none is a slot no writer keeps: the type the stamps
+    // spell is Int32
     let inconsistent = || -> Result<(), DecodeError> { Err(DecodeError::SlotWidthsInconsistent) };
-    assert_eq!(dec_check(&with(0, &[zig3])), inconsistent());
-    assert_eq!(dec_check(&with(1, &pair(5))), inconsistent());
-    assert_eq!(dec_check(&with(4, &dec3)), inconsistent());
+    assert_eq!(dec_check(&with(0x80, &[zig3])), inconsistent());
     // the stamps spell a type that is not the total's: a stamp on an Int32 total, a Decimal128 total
     // with only `wide_at`, an Int64 total with both
-    assert_eq!(dec_check(&with(2 | 0x20, &total_and(&[5]))), inconsistent());
-    assert_eq!(dec_check(&with(4 | 0x20, &dec_and(&[5]))), inconsistent());
-    assert_eq!(dec_check(&with(0x60, &total_and(&[5, 5]))), inconsistent());
+    assert_eq!(dec_check(&with(2 | 0x80 | 0x20, &total_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(4 | 0x80 | 0x20, &dec_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(0xe0, &total_and(&[5, 5]))), inconsistent());
     // `decimal_at` with no `wide_at` (bit 6 alone), and above `wide_at`
-    assert_eq!(dec_check(&with(4 | 0x40, &dec_and(&[5]))), inconsistent());
-    assert_eq!(dec_check(&with(4 | 0x60, &dec_and(&[3, 4]))), inconsistent());
+    assert_eq!(dec_check(&with(4 | 0x80 | 0x40, &dec_and(&[5]))), inconsistent());
+    assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[3, 4]))), inconsistent());
     // type 3 of the total, type 3 of the pair
     assert_eq!(dec_check(&with(3 << 1, &[zig3])), Err(DecodeError::BadTag(6)));
     assert_eq!(dec_check(&with(1 | 3 << 3, &pair(5))), Err(DecodeError::BadTag(25)));
     // a pair type with no pair
     assert_eq!(dec_check(&with(1 << 3, &[zig3])), Err(DecodeError::BadTag(8)));
     assert_eq!(dec_check(&with(2 << 3, &[zig3])), Err(DecodeError::BadTag(16)));
-    // the bit that is no flag
-    assert_eq!(dec_check(&with(0x80, &[zig3])), Err(DecodeError::BadTag(0x80)));
     // each clause of the check on the stamps, by a slot that breaks that one clause alone (the
     // versions vector covers every stamp, so the clause is the refusal and not the vector)
     let broken = |wide_at: Option<MStamp>, decimal_at: Option<MStamp>, total: Num| {
@@ -1350,9 +1373,9 @@ fn an_honest_total_with_a_positive_exponent_is_accepted_for_the_slot_the_pair_se
         n => panic!("{n:?}"),
     };
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.insert(&fl(&[("x", i(0))]), 0).unwrap();
     w.write_inc_value(&p("x"), &dval("9999999999999999999999999999999999"), 0).unwrap();
-    w.write_inc_value(&p("x"), &dval("1"), 0).unwrap(); // the sum needs 35 digits: rounded, the exponent rises
+    w.write_inc_value(&p("x"), &dval("1"), 0).unwrap(); // the sum is exactly 10^34: the exponent rises, no digit is lost
     w.write_set(&p("x"), s("t"), 0).unwrap(); // a base write: the pair, and a generation that has seen the slot
     let mut good = w.state.without_ords();
     let slot = good.slots.values().next().unwrap().total;
@@ -1493,4 +1516,67 @@ fn a_decimal_inc_reads_as_the_products_stored_decimal() {
         let want = product(&pack_raw(arith::from_i64(0)), &d(op));
         assert_eq!(read(&w), Value::Decimal128(want.bytes()), "absent + {op}");
     }
+}
+
+// ---- Amendment 9: the exact integer gain after an absorb, and `upsert_inc_on` -----------------
+
+/// Finding 1 of the review of the typed counters: after a base write absorbs a slot whose total is a
+/// Decimal128, the integer operands added since are read exactly. The two histories of the review (a
+/// Decimal operand too small to move the total, 1E-34, and one too large for the total to keep the integer
+/// added to it, 1E+34, then a base write of an Int32 and an Int32 operand) have a slot total of 35 digits
+/// and the last `$inc` is refused now (a Decimal128 counter is exact or refused); the same histories at the
+/// edge of 34 digits (1E-33 and 1E+33) have exact totals and the counter reads the base plus the operand, an
+/// Int32, as the reference does (the public-API form of both is `tests/amendment9_gain.rs`).
+#[test]
+fn the_integer_gain_after_a_decimal_slot_is_absorbed_is_exact() {
+    let o = opts();
+    let n = p("n");
+    let history = |dec_op: &str, int_op: i32| {
+        let mut w = Writer::new(wid('A', 0), o.clone());
+        w.insert(&fl(&[("n", Value::Int32(0))]), 0).unwrap();
+        w.write_inc_value(&n, &dval(dec_op), 0).unwrap();
+        w.write_set(&n, Value::Int32(5), 0).unwrap();
+        let last = w.write_update(&[UpdateOp::Inc(n.clone(), Value::Int32(int_op))], 0);
+        (w, last)
+    };
+    for (what, dec_op, int_op, want) in
+        [("1E-33 then 1", "1E-33", 1, 6), ("1E+33 then 7", "1E+33", 7, 12)]
+    {
+        let (w, last) = history(dec_op, int_op);
+        assert!(last.unwrap().is_some(), "{what}");
+        assert_eq!(w.state.value(&n, &o), Some(Value::Int32(want)), "{what}");
+        // and from the bytes
+        let back = MergeState::decode_compact(&w.state.encode_compact()).unwrap();
+        assert_eq!(back.value(&n, &o), Some(Value::Int32(want)), "{what}: decoded");
+    }
+    for (what, dec_op, int_op) in [("1E-34 then 1", "1E-34", 1), ("1E+34 then 7", "1E+34", 7)] {
+        let (mut w, last) = history(dec_op, int_op);
+        assert_eq!(last, Err(UpdateRefused::IncOutOfRange(n.clone())), "{what}");
+        assert_eq!(w.state.value(&n, &o), Some(Value::Int32(5)), "{what}: nothing moved");
+        assert!(w.write_inc_value(&n, &Value::Int32(0), 0).is_some());
+    }
+    // the gain first, then the base: {n: 0}, +1E+33 (a decimal), $set 0.5, +7 (an Int32): the slot gained 7
+    // (its total 1E+33 + 7 minus the absorbed 1E+33), so the counter reads 0.5 + 7
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.insert(&fl(&[("n", Value::Int32(0))]), 0).unwrap();
+    w.write_inc_value(&n, &dval("1E+33"), 0).unwrap();
+    w.write_set(&n, dval("0.5"), 0).unwrap();
+    w.write_inc_value(&n, &Value::Int32(7), 0).unwrap();
+    assert_eq!(w.state.value(&n, &o), Some(dval("7.5")));
+}
+
+/// Finding 3: `upsert_inc_on` writes the first slot of a writer at the path. When the writer
+/// already holds the slot key it is refused, instead of putting an `Int64` total under the stamps of a
+/// Decimal128 slot, a state every other member's decoder refuses.
+#[test]
+fn upsert_inc_on_is_refused_when_the_writer_holds_the_slot() {
+    let o = opts();
+    let n = p("n");
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    let life = w.upsert_soi_create(&[], &n, &[], 0).unwrap().stamp;
+    w.write_inc_value(&n, &dval("1.5"), 0).unwrap();
+    let before = w.state.clone();
+    assert!(w.upsert_inc_on(life, &n, 3, 0).is_none());
+    assert_eq!(w.state, before, "nothing moved");
+    assert_eq!(MergeState::decode_compact(&w.state.encode_compact()).unwrap(), w.state);
 }

@@ -13,7 +13,7 @@ module documentation of `compact.rs` (primitives and section 10), the bytes of s
   2. it walks sections 3 to 9 (skipping values; no semantics), finds the offset where section 10 begins, checks that
      the section 10 it writes starts EXACTLY there and runs exactly to the end of the bytes, and is byte for byte
      the Rust bytes from there;
-  3. the length of the Rust bytes is the pinned one (10, 295, 520, 235, 362, 163, 382 for typed), and the 128-bit hash of the bytes,
+  3. the length of the Rust bytes is the pinned one (10, 273, 509, 235, 329, 163, 499 for typed), and the 128-bit hash of the bytes,
      computed here by a hash of its own, is the pinned one (`the_compact_golden_hashes_with_the_order_state_are_pinned`).
 Exit status 0 and one line per golden when everything matches; any mismatch prints the first differing offset and exits 1.
 """
@@ -24,13 +24,13 @@ import sys
 # The pins of `the_compact_golden_hashes_with_the_order_state_are_pinned`: name -> (hash, length, order entries).
 PINS = {
     "empty": ("6a9f06d361f4fb8c789c079f6563280a", 10, 0),
-    "170": ("c0a384f4112088636753e3948b1e1e13", 295, 1),
-    "mixed": ("d42951acd96e914ff082bf04c19a3a9d", 520, 5),
+    "170": ("79f811df1f679ba13896538b36c9e324", 273, 1),
+    "mixed": ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5),
     "delete": ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0),
-    "obs": ("09c078603374ae19df49d4aa38faed7c", 362, 2),
+    "obs": ("1714242f8331d6b9ca194c73191730ed", 329, 2),
     "small": ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2),
     # NEW pin: the typed golden (an Int32 slot, a Decimal128 slot, the counter of Amendment 6), by the Rust writer
-    "typed": ("2961d2eaafc362352575c540c8cac389", 382, 3),
+    "typed": ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4),
     # NEW pins (`the_order_section_corpus_is_pinned`): states a Rust Writer builds, with every floor kind, a level mark,
     # the root key, several writers' firsts and positions of 128 and up (see `ord_section_states`).
     "floors_u": ("a9a3d1f267ae32cd8a3de81f1297f4af", 666, 9),
@@ -298,10 +298,11 @@ def section10_start(buf):
         if flags & 1:
             w.stamp()
             w.payload((flags >> 3) & 3)
-        if flags & 0x20:                # wide_at: the latest Int64-or-wider operand
-            w.stamp()
-        if flags & 0x40:                # decimal_at: the latest Decimal128 operand
-            w.stamp()
+        if flags & 0x80:                # the operand stamps are spelled (not the usual ones of the total's type)
+            if flags & 0x20:            # wide_at: the latest Int64-or-wider operand
+                w.stamp()
+            if flags & 0x40:            # decimal_at: the latest Decimal128 operand
+                w.stamp()
     w.vv()                              # 8 version vector
     for _ in range(w.var()):            # 9 losses
         w.u8()

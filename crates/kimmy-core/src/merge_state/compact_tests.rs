@@ -71,18 +71,18 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
 /// hashes were re-pinned once for the counter cell (the slot flag byte and the
 /// absorbed pair, the type byte, no register obs, no ESCAPE): the model's Python writer, rewritten from
 /// the documentation, gives the same five hashes and lengths (170: 214 B to 215, mixed 341 to 338, delete 234
-/// to 235, obs 256 to 252; empty unchanged). They moved once more with the slots' operand stamps: every slot
-/// spells `wide_at` (11 bytes) and a Decimal128 one also `decimal_at`, so 170 (two slots) 215 B to 237, mixed
-/// (one) 338 to 349, obs (three) 252 to 285; the same Python model gives the same three hashes.
+/// to 235, obs 256 to 252; empty unchanged). The slots' operand stamps (`wide_at`, `decimal_at`) are spelled only
+/// when they are not the usual ones of the slot's type (Amendment 9), and the slots of these three goldens are all
+/// usual, so their bytes are the same as before the stamps existed: the same Python model gives the same hashes.
 #[test]
 fn the_compact_golden_hashes_agree_with_the_reference_model() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     for (name, st, want) in [
         ("empty", golden_empty(), ("6a9f06d361f4fb8c789c079f6563280a", 10)),
-        ("170", golden_170(), ("06b5f3340937c85eca242ec49b53fa83", 237)),
-        ("mixed", golden_mixed(), ("cb5e6838859904b50d3a0a03c290410d", 349)),
+        ("170", golden_170(), ("abedfb140b687b3671abd3023efa93a8", 215)),
+        ("mixed", golden_mixed(), ("d368f0edd26e1ed5e300dd97df80065e", 338)),
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235)),
-        ("obs", golden_obs(), ("01ed28ab7e196e406d1c7f38d0af7b2b", 285)),
+        ("obs", golden_obs(), ("3894def7793a573b2dad9a4de56bf7cc", 252)),
     ] {
         // NAMED RESTRICTION: the goldens are the stage-A reference model's, which has no order state
         let st = st.without_ords();
@@ -101,13 +101,13 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     for (name, st, want) in [
         ("empty", golden_empty(), ("6a9f06d361f4fb8c789c079f6563280a", 10, 0)),
-        ("170", golden_170(), ("c0a384f4112088636753e3948b1e1e13", 295, 1)),
-        ("mixed", golden_mixed(), ("d42951acd96e914ff082bf04c19a3a9d", 520, 5)),
+        ("170", golden_170(), ("79f811df1f679ba13896538b36c9e324", 273, 1)),
+        ("mixed", golden_mixed(), ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5)),
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0)),
-        ("obs", golden_obs(), ("09c078603374ae19df49d4aa38faed7c", 362, 2)),
+        ("obs", golden_obs(), ("1714242f8331d6b9ca194c73191730ed", 329, 2)),
         ("small", golden_small(), ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2)),
         // a NEW key: the typed golden, whose section 10 the independent Python checker also writes and hashes
-        ("typed", golden_typed(), ("2961d2eaafc362352575c540c8cac389", 382, 3)),
+        ("typed", golden_typed(), ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4)),
     ] {
         assert_eq!(
             (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
@@ -138,12 +138,6 @@ fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
         hex(&st.encode_compact())
     );
     round_trip(&st);
-    // a NEW pin: the hash and length the reference model's independent encoder gives for the bare state
-    let hex16 = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    assert_eq!(
-        (hex16(bare.compact_hash()).as_str(), bare.compact_bytes().len()),
-        ("8291f85d0c22817da0032635387e1351", 286)
-    );
     let slot = |name: &str| st.slots.iter().find(|(k, _)| k.1 == p(name)).unwrap().1.clone();
     let (a, b, c) = (slot("a"), slot("b"), slot("c"));
     assert_eq!((a.total.label(), a.wide_at, a.decimal_at), (Kind::Int32, None, None));
@@ -157,9 +151,20 @@ fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
     assert_eq!(at, wide, "the absorbed pair is at the last wide operand");
     assert_eq!(st.value(&p("c"), &o), Some(Value::Int32(12)));
     assert_eq!(c.width_since(), Kind::Int32);
+    // d, Amendment 9: the gain is the exact integer 1, a Decimal128 slot whose total is exact
+    let d = slot("d");
+    assert_eq!(st.value(&p("d"), &o), Some(Value::Int32(6)));
+    assert_eq!(d.width_since(), Kind::Int32);
     // and as the compact bytes say it
     let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
     assert_eq!(back.value(&p("c"), &o), Some(Value::Int32(12)));
+    assert_eq!(back.value(&p("d"), &o), Some(Value::Int32(6)));
+    // the pin LAST (a NEW pin; the typed state gained the counter d and the stamps are spelled only when unusual): the hash and length the reference model's independent encoder gives for the bare state
+    let hex16 = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(
+        (hex16(bare.compact_hash()).as_str(), bare.compact_bytes().len()),
+        ("d11ec34731c1adb4ec0a0ae4be757d20", 371)
+    );
 }
 
 /// The states of the Python writer's fixture: the six goldens, then states a `Writer` builds that exercise what
