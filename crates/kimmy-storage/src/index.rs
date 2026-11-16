@@ -3511,9 +3511,10 @@ mod tests {
         for (filter_doc, want) in [
             // 9, the decimal 9.0, the array holding the decimal 6, Infinity.
             (doc! { "k": { "$gt": 5 } }, 4),
-            // 1, the decimal 1, both arrays holding it, and the decimal NaN,
-            // which the order places below every number.
-            (doc! { "k": { "$lte": dec("1.0") } }, 5),
+            // 1, the decimal 1 and both arrays holding it. The decimal NaN is not
+            // held: a NaN is ordered against no number in a comparison (q7s3a0187
+            // and q7s3a0222, and the partial indexes of q7s3k0067 to 0070).
+            (doc! { "k": { "$lte": dec("1.0") } }, 4),
             // 9 and the decimal 9.0.
             (doc! { "k": dec("9") }, 2),
         ] {

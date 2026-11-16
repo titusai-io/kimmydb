@@ -106,14 +106,15 @@ struct Bounds {
 /// A further shortcut, concluding that a lower and an upper bound of
 /// different types admit nothing, is not taken. It is sound only when the
 /// types are compared by the filter's **type groups** (`same_type_group` in
-/// `kimmy-core`, where `MinKey`, `MaxKey`, regular expressions and the code
-/// types are one group) and only on an index that has never seen an array,
-/// whose plan must still re-check that flag in the scan's snapshot. Keyed on
-/// the key order's type **ranks** it is wrong even there:
-/// `{$gt: MinKey, $lte: MaxKey}` matches a `MaxKey`. On a multikey index it is
-/// wrong either way, since an array can satisfy two groups with two
-/// elements. `kimmy-storage/tests/bound_intersection.rs` compares every pair
-/// against a scan and fails on the rank-keyed version.
+/// `kimmy-core`) and only on an index that has never seen an array, whose plan
+/// must still re-check that flag in the scan's snapshot. Keyed on the key
+/// order's type **ranks** it is wrong even there: `{$gt: MinKey, $lte: MaxKey}`
+/// matches a `MaxKey`. Nor is the group the filter's for `MinKey` and `MaxKey`
+/// themselves: as a bound each is ordered against every type, a missing field
+/// (keyed as null) included, so `[MinKey..]` and `[..MaxKey]` cover every key.
+/// On a multikey index it is wrong either way, since an array can satisfy two
+/// groups with two elements. `kimmy-storage/tests/bound_intersection.rs`
+/// compares every pair against a scan and fails on the rank-keyed version.
 fn tighten(held: &mut Option<Bson>, value: &Bson, tighter: Ordering) {
     let replace = match held {
         None => true,
@@ -256,9 +257,10 @@ fn usable_partial(index: &IndexMeta, proven: &[(String, PartialOp)]) -> bool {
 ///   reason one step removed: null is where the query language's treatment of
 ///   absence and the index's stop agreeing.
 ///
-/// Everything else is safe because a comparison never matches an absent field:
-/// `condition_matches` evaluates them over the resolved values, which are empty
-/// when the path is missing.
+/// Everything else is safe because a comparison matches an absent field only
+/// when the bound is `MinKey`, `MaxKey` or (for `$gte` and `$lte`) null, and
+/// [`PartialOp::implies`] asks the operator itself whether it holds on a
+/// missing field before it takes it to prove the field is there.
 fn containment_predicates(filter: &Filter) -> Vec<(String, PartialOp)> {
     let mut out = Vec::new();
     gather_containment(filter, &mut out);
@@ -1475,7 +1477,10 @@ mod containment_is_sound {
         }
         assert!(used > 100, "premise: the corpus lets the planner use a partial index: {used}");
         assert!(decimal_bound_used > 20, "premise: a decimal bound is used: {decimal_bound_used}");
-        assert!(decimal_matched > 150, "premise: decimal documents match: {decimal_matched}");
+        // The floor was 150. The Decimal128 NaN of the corpus no longer answers the eight
+        // upper-bound queries (a NaN is ordered against no number in a comparison, q7s3a0187 and
+        // q7s3a0222), so the count is 145 (observed); the soundness loop above is unchanged.
+        assert!(decimal_matched > 140, "premise: decimal documents match: {decimal_matched}");
     }
 
     #[test]

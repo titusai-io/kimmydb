@@ -266,9 +266,11 @@ fn r_every_shape_a_regex_arrives_in_is_a_pattern() {
     let found = ids_over(&stored, &doc! { "v": { "$in": [{ "$regex": "^a" }] } });
     assert_eq!(found, [2], "the pattern, and not the stored document of that shape");
     assert_eq!(ids_over(&stored, &doc! { "v": { "$eq": { "$regex": "^a" } } }), [1]);
-    // A document that is not a regex's shape is a value, as before.
+    // A document that is not a regex's shape and has a `$`-led key is no value of an `$in`
+    // (q7s3f0299), and is still found by `$eq` of the whole document.
     let other = [doc! { "_id": 1, "v": { "$regex": "x", "kind": 1 } }];
-    assert_eq!(ids_over(&other, &doc! { "v": { "$in": [{ "$regex": "x", "kind": 1 }] } }), [1]);
+    refused(&doc! { "v": { "$in": [{ "$regex": "x", "kind": 1 }] } });
+    assert_eq!(ids_over(&other, &doc! { "v": { "$eq": { "$regex": "x", "kind": 1 } } }), [1]);
 }
 
 /// `$nin` is the exact complement of `$in` over the sixteen documents, for every list the

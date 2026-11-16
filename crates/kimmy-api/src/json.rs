@@ -139,6 +139,106 @@ where
     deserializer.deserialize_option(RequirePresent(std::marker::PhantomData))
 }
 
+/// A `limit` or a `skip` of a find in a body: a number that is not negative, `null` refused as
+/// [`non_null_field`] refuses it.
+///
+/// A whole number is the count it is, and so is a double, which is **truncated**: `2.0` is `2`,
+/// `2.5` and `2.99` are `2`, `0.5` is `0`, as the reference reads them (q7s3f0168 to f0179 and
+/// f0198 and f0199). A negative number of any kind, and a NaN or an infinity, is refused, as
+/// the reference refuses it (code 51024, f0180 to f0191); here that is the request's usual
+/// `4xx` for a field of the wrong type. A string stays refused, as it is there (q7s3c0053).
+pub fn count_field<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    count(deserializer, false)
+}
+
+/// [`count_field`] for the same parameter written in a query string (`?limit=2.5`), where a
+/// value is text: it is read as a number by the same rule, so one parameter has one behaviour
+/// whichever way it is sent.
+pub fn count_param<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    count(deserializer, true)
+}
+
+fn count<'de, D>(deserializer: D, text: bool) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+
+    struct Count {
+        text: bool,
+    }
+
+    impl Visitor<'_> for Count {
+        type Value = usize;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a number that is not negative")
+        }
+
+        fn visit_u64<E: Error>(self, n: u64) -> Result<usize, E> {
+            Ok(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+
+        fn visit_i64<E: Error>(self, n: i64) -> Result<usize, E> {
+            usize::try_from(n).map_err(|_| E::invalid_value(Unexpected::Signed(n), &self))
+        }
+
+        fn visit_f64<E: Error>(self, n: f64) -> Result<usize, E> {
+            if n.is_finite() && n >= 0.0 {
+                // `as` saturates, and truncates toward zero.
+                Ok(n as usize)
+            } else {
+                Err(E::invalid_value(Unexpected::Float(n), &self))
+            }
+        }
+
+        // Text is a number only in a query string.
+        fn visit_str<E: Error>(self, v: &str) -> Result<usize, E> {
+            if !self.text {
+                return Err(E::invalid_type(Unexpected::Str(v), &self));
+            }
+            if let Ok(n) = v.parse::<u64>() {
+                return self.visit_u64(n);
+            }
+            match v.parse::<f64>() {
+                Ok(n) => self.visit_f64(n),
+                Err(_) => Err(E::invalid_value(Unexpected::Str(v), &self)),
+            }
+        }
+    }
+
+    struct Present {
+        text: bool,
+    }
+
+    impl<'de> Visitor<'de> for Present {
+        type Value = Option<usize>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a non-null number that is not negative")
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(Count { text: self.text }).map(Some)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Unit, &self))
+        }
+    }
+
+    deserializer.deserialize_option(Present { text })
+}
+
 /// Convert a JSON value into BSON, honouring Extended JSON wrappers.
 pub fn json_to_bson(value: &Value) -> Result<Bson, ApiError> {
     Ok(match value {

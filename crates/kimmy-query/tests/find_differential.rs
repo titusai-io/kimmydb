@@ -338,6 +338,10 @@ fn numeric_classes() -> Vec<Vec<Bson>> {
 /// Every comparison operator, with every number of the corpus as the operand,
 /// against every number of the corpus stored, answers by the exact values
 /// alone: the hand-written order of [`numeric_classes`] says what each must be.
+/// Except for a NaN, which equals a NaN and is ordered against no number: `$gt`
+/// and `$lt` hold for no pair with a NaN in it, `$gte` and `$lte` for the pairs of
+/// two NaNs (q7s3a.out, the sweep over 50 values). The sort and the index order
+/// still place it first, and `canonical_cmp` is what says so.
 #[test]
 fn every_numeric_comparison_answers_by_exact_value() {
     let classes = numeric_classes();
@@ -353,19 +357,24 @@ fn every_numeric_comparison_answers_by_exact_value() {
         for s in stored {
             let d = doc! {"k": s.clone()};
             for (ro, operands) in classes.iter().enumerate() {
+                // Class 0 is the NaN class.
+                let ordered = rs != 0 && ro != 0;
+                let both_nan = rs == 0 && ro == 0;
+                let (gt, gte) = if ordered { (rs > ro, rs >= ro) } else { (false, both_nan) };
+                let (lt, lte) = if ordered { (rs < ro, rs <= ro) } else { (false, both_nan) };
                 for o in operands {
                     let want = [
                         (doc! {"k": o.clone()}, rs == ro),
                         (doc! {"k": {"$eq": o.clone()}}, rs == ro),
                         (doc! {"k": {"$ne": o.clone()}}, rs != ro),
-                        (doc! {"k": {"$gt": o.clone()}}, rs > ro),
-                        (doc! {"k": {"$gte": o.clone()}}, rs >= ro),
-                        (doc! {"k": {"$lt": o.clone()}}, rs < ro),
-                        (doc! {"k": {"$lte": o.clone()}}, rs <= ro),
+                        (doc! {"k": {"$gt": o.clone()}}, gt),
+                        (doc! {"k": {"$gte": o.clone()}}, gte),
+                        (doc! {"k": {"$lt": o.clone()}}, lt),
+                        (doc! {"k": {"$lte": o.clone()}}, lte),
                         (doc! {"k": {"$in": [o.clone()]}}, rs == ro),
                         (doc! {"k": {"$nin": [o.clone()]}}, rs != ro),
                         (doc! {"k": {"$all": [o.clone()]}}, rs == ro),
-                        (doc! {"k": {"$not": {"$lte": o.clone()}}}, rs > ro),
+                        (doc! {"k": {"$not": {"$lte": o.clone()}}}, !lte),
                     ];
                     for (f, expected) in want {
                         let got = answer(&f, &d);

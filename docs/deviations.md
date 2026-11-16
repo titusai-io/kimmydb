@@ -17,6 +17,14 @@ Status meanings:
 
 ---
 
+## 🟡 A `find` is bounded: no `limit` is 100, more than 10,000 is 10,000, and `limit: 0` is an empty page, where the reference returns every match for a missing limit and for 0
+
+**Raised 2026-11-14, from the query sweep q7s3c and q7s3f.** In the reference a `find` with no `limit`, with `limit: 0` and with `limit: 0.0` returns every document it matches: `skip 10 limit 0` over 40 documents answers the remaining 30 in sort order (`q7s3c.out` c0031 line 1384, c0032 line 1430), and a `limit` of `0`, `0.0` and `0.5` (a double is truncated, so the last is `0` too), with and without a `skip`, answers all eight documents (`q7s3f.jsonl` lines 192 to 199). Here a find is bounded by design ([ADR-098](decisions.md)): a missing `limit` is **100**, a `limit` over **10,000** is clamped to 10,000, both silently, and `limit: 0`, or a double that truncates to `0`, is a window of nothing, an empty page with no `nextCursor` on every access path and every sort order. A client that passes `0` as the driver idiom for "no limit" gets an empty `200` and no error. The rest of the reference's rule is followed: a negative `limit` or `skip` of any type is refused (its code 51024, a `4xx` here: `q7s3c.out` c0048 line 2166, c0049 line 2212; `q7s3f.jsonl` lines 180 to 191), and a double that is not negative is truncated (`2.0`, `2.5`, `2.7` and `2.99` are `2`: lines 168 to 179, c0050 line 2258, c0051 line 2304).
+
+**To close:** reading `0` as "no limit" is not planned, since it would make a value that is more often a bug the unbounded one; a client that reads everything walks with a cursor ([Cursors](query-language.md#cursors)). Refusing `0` with a `400`, so that the difference is loud, is open.
+
+---
+
 ## 🟡 An `$inc` or `$mul` that leaves a NaN, and a `$push` whose `$slice` leaves the array as it was, count as modified in the reference and not here
 
 **Raised 2026-11-14, from the update probes q7s2j and q7s2k on the reference (6.0.5).** A write that leaves the stored bytes as they were is not written and is not counted in `modified` ([ADR-208](decisions.md)). The reference counts two kinds of such write as modified (`nModified` 1), and answers the same document. **A stored NaN**: `$inc` and `$mul` of a number over a stored double or decimal `NaN` give `NaN` again, which the reference compares as unequal to itself, so it counts and writes it (`q7s2k.out` k0277 line 1661, k0376 line 2255, k0726 line 4355, k0826 line 4955: 64 cases over the integer, long, double and decimal operands). **A `$push` whose `$slice` leaves the array unchanged**: `{$each: [8, 9], $slice: 0}` over `[]` (`q7s2j.out` j1017 line 6098), `$slice: 2.0` over `[1, 2]`, `[{a: 1}, {a: 2}]` and `[[1, 2], [3]]` (j1039 line 6230 to j1041), and `$slice: 0` with `$sort: 1` over `[]` (j1115 line 6686): the reference does not compare the array it built with the one it held. Here nothing is written and `modified` is 0 for all five forms and all 64 NaN cases; the document, the stamp and the oplog are as they were.
@@ -55,7 +63,7 @@ Status meanings:
 
 ## 🟡 A `find` or `find_and_modify` projection that names a path and a path below it lets the shorter path decide, where the reference refuses it
 
-**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `fields: {c: 1, "c.d": 1}` is refused by the reference (code 31249, `Path collision at c.d remaining portion d`) and the update is not applied (`q7s2p.out` p0179 line 1770, p0180 line 1779). Here the projection is applied: where one path is a prefix of another the shorter one decides, so `c` is included whole ([ADR-214](decisions.md)). The other order, an exclusion pair and a `find` are not recorded; the same reading holds for them here.
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `fields: {c: 1, "c.d": 1}` is refused by the reference (code 31249, `Path collision at c.d remaining portion d`) and the update is not applied (`q7s2p.out` p0179 line 1770, p0180 line 1779). Here the projection is applied: where one path is a prefix of another the shorter one decides, so `c` is included whole ([ADR-214](decisions.md)). The other order and an exclusion pair are not recorded; the same reading holds for them here. A `find` is: `{c: 1, "c.d": 1}`, its other order and an exclusion pair over four documents are refused with 31249 or 31250 (`q7s3d.out` q7s3d0027 line 236, d0028 line 245, d0029 line 254), and here the shorter path decides.
 
 **To close:** a refusal of an ancestor and its descendant in the projection parse, which is small. Not planned until the reference's answer is wanted.
 
@@ -137,7 +145,7 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 - **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `ValueTooLarge` (code `answer_too_large`), where the reference's is `51151`; its message names the output and the limit. A string of 16 MiB or more built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413` ("the string $concat builds is N bytes, over the 16 MiB string limit"), where the reference's codes are `16493` and `13548`.
 - **An array or a document an expression builds is held to 16 MiB of BSON,** with the same `413` ([ADR-267](decisions.md#adr-267--the-documents-an-expression-builds-are-held-to-16-mib-an-accumulator-takes-one-expression-a-regex-as-a-fields-value-is-a-pattern)). Arrays: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray`, `$range` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. Documents: an object literal, `$mergeObjects` (the expression and the `$group` accumulator), `$setField`, `$arrayToObject`, and the fields `$addFields`, `$set` and `$project` write (a `{copy: "$$ROOT"}` repeated would double the document). A `$reduce` that doubles a document (`{l: "$$value", r: "$$value"}`, or a `$mergeObjects` of two copies) stops at the step that would pass the limit; before this it copied the document twice a step, reached 5.3 GiB in 21 steps and ended a member at `$range: [0, 30]`. The size is counted as the value is built and a field is refused before it is stored, so what is held is the limit and one element; counted as BSON, a document of many tiny nested documents takes several times its BSON size in memory, so a refused doubling still holds a few copies of a document just under the limit. The reference shares the values (the same pipeline at 40 steps answers in 15 ms) and refuses only when a document is written out, at 64 MB, so a document between 16 MiB and that is answered there and refused here. `$range` has no count cap of its own now: its bytes are worked out first, so `[0, 200000]` answers, as there, and `[0, 2147483647]` is a `413` before anything is allocated. Its limit is the array's 16 MiB, which is **1,376,024 integers**; the reference's is 100 MB of memory (`ExceededMemoryLimit`, 16 bytes an element in its message), about **6.5 million**, so `[0, 2000000]` answers there and is a `413` here. `$zip` keeps its 1,000,000 cells, a `400` raised before anything is built. The arrays a `$group` (and `$bucket`, `$bucketAuto`) builds with `$push`, `$addToSet`, `$firstN`, `$lastN`, `$maxN`, `$minN`, `$topN` and `$bottomN` are held to the same 16 MiB, counted as the group grows (a buffer that gives rows back is counted for what it keeps) and refused at the row that takes the array over it, and so are the `as` arrays of `$lookup` and `$graphLookup`, counted before each document is copied in; the reference refuses only the document that carries the result, past 16 MB, at the end. A group's document is the sum of its accumulators' arrays, each held to the limit, so it can pass 16 MiB by the number of accumulators.
 - **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
-- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null. As the value of a field in `$addFields`/`$set`, `$project` or an object expression a missing path leaves the field out, as there (see the small stages' entry).
+- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry), and so does a `$expr` in a filter: `{$expr: {$eq: ["$a", null]}}` matches a document without `a` here and only one with `a: null` there, and `{$expr: {$ne: ["$a", null]}}` leaves the document without `a` out here and includes it there (`q7s3b.out` b0256 line 7400, b0274 line 7922; for `$$REMOVE` as the operand, b0257 line 7429, see the `$$REMOVE` entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null. As the value of a field in `$addFields`/`$set`, `$project` or an object expression a missing path leaves the field out, as there (see the small stages' entry).
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
 - **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
@@ -616,7 +624,9 @@ holds one level into an element — `{"p.q.r": 1}` over `p: [{q: {x: 1}}]` is
 `p: [{}]` here and `p: [{q: {}}]` there. The field a caller asked for is
 absent either way; only the empty container around it differs. It is the rule
 KimmyDB's projection has always had for documents, and changing it is a change
-of its own that nobody has asked for.
+of its own that nobody has asked for. The recorded case of a find is `{"c.f.g": 1}` over
+`c: {d: 2}`: the reference answers `c: {}` and this build leaves `c` out
+(`q7s3d.out` q7s3d0025, line 218).
 
 **Three smaller points, same entry.** `{"a": 1, "a.b": 1}` is accepted and
 includes `a` whole, where MongoDB refuses the overlap as a path collision; a
@@ -792,10 +802,10 @@ cannot be told from a real one.
 
 **Now** (closed 2026-09-29, [ADR-196](decisions.md)). An unknown alias, and an
 empty list, are a `400` at parse, naming the alias; the aliases are the names a
-stored value can report (which include `symbol` and `dbPointer`, and have no
-code) and `number`. A `$regex` flag other than `i`, `m`, `s` and `x` is a
+stored value can report (which include `symbol` and `dbPointer`, codes 14 and
+12 since the codes were widened) and `number`. A `$regex` flag other than `i`, `m`, `s` and `x` is a
 `400` naming it, wherever it is written: a sibling `$options`, the flags of a
-regex literal, or a lone `$options`. `number`, which matched nothing (it was
+regex literal. A `$options` with no `$regex` is refused as well. `number`, which matched nothing (it was
 never refused), is now the alias for `double`, `int`, `long` and `decimal`, expanded
 when the filter is parsed.
 
@@ -1082,7 +1092,11 @@ under [Positional updates](query-language.md#positional-updates) and
 
 - **A `$` the filter did not earn is a `400`.** The filter must match on an
   array field, and the `$` path must go through that same array; `items.$.x`
-  under a filter positioned on `scores` is refused, naming both arrays.
+  under a filter positioned on `scores` is refused, naming both arrays. The
+  reference answers a `$` over a match that is not an array element: `{"a.$": 1}`
+  under `{a: 1}` returns `a: 1` for a scalar and `[1]` for `[1, 2]`, and `{"c.d.$": 1}`
+  returns `c: {d: 1}` and `c: [{d: 1}]` (`q7s3d.out` d0110 line 983, d0108 line 965); here
+  that request is the `400`.
 - **Several conditions on one array path** leave the first element satisfying
   the *last* condition evaluated. `$nor`, `$not`, `$ne`, `$nin`, `$exists`,
   `$size`, `$all` and `$expr` record no position; an explicit index in the

@@ -67,8 +67,18 @@ fn tree() -> impl Strategy<Value = Tree> {
 }
 
 fn numeric_guard(v: &str) -> Bson {
-    // Numbers sort strictly between null and strings, NaN included.
-    Bson::Document(doc! { "$and": [ { "$gt": [v, Bson::Null] }, { "$lt": [v, ""] } ] })
+    // Numbers sort strictly between null and strings, NaN included. A NaN is left out of the
+    // guard: an expression compares in the value order, where a NaN is below every number
+    // (`$lt: [NaN, -Infinity]` is true, `$lt: [NaN, 0]` is true: q7s4b3020, q7s4b3025; `$gt` and
+    // `$gte` of a NaN against a number are false, q7s4b2968, q7s4b2994), and a field condition
+    // orders a NaN against no number (`{$lt: 5}` and `{$lte: 5}` answer no NaN: q7s3a0187,
+    // q7s3a0222). Both answers are right, so the two forms select the same elements only for
+    // a value that is not a NaN, and `$gte: [v, -Infinity]` is false for a NaN alone.
+    Bson::Document(doc! { "$and": [
+        { "$gt": [v, Bson::Null] },
+        { "$lt": [v, ""] },
+        { "$gte": [v, f64::NEG_INFINITY] },
+    ] })
 }
 
 fn render(t: &Tree, force_fields: bool) -> Document {

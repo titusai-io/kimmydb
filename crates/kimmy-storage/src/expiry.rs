@@ -922,14 +922,15 @@ mod tests {
             dec("NaN"),
         ];
         for (filter, expired) in [
-            // 1, the decimal 1, the decimal just below 3, -Infinity, and the
-            // decimal NaN, which the order places below every number.
-            (doc! {"tier": {"$lt": 3}}, vec![0, 1, 2, 6, 7]),
+            // 1, the decimal 1, the decimal just below 3 and -Infinity. The decimal NaN
+            // (id 7) is not below 3: a NaN is ordered against no number in a comparison
+            // (q7s3a0187 and q7s3a0222, and the partial indexes of q7s3k0067 to 0070).
+            (doc! {"tier": {"$lt": 3}}, vec![0, 1, 2, 6]),
             // The reverse: 3 in either type and 5, and none of the decimals
             // below 3 that 0.50 ranked equal to it.
             (doc! {"tier": {"$gte": 3}}, vec![3, 4, 5]),
             // A decimal bound: the double 3.0 is the decimal 3.00, not below it.
-            (doc! {"tier": {"$lt": dec("3.00")}}, vec![0, 1, 2, 6, 7]),
+            (doc! {"tier": {"$lt": dec("3.00")}}, vec![0, 1, 2, 6]),
             (doc! {"tier": {"$gt": dec("2.999999999999999999999999999999999")}}, vec![3, 4, 5]),
         ] {
             let (engine, _, _dir) = engine();

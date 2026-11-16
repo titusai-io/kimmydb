@@ -62,7 +62,7 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
     for key in keys {
         let va = sort_value(a, &key.path, key.descending);
         let vb = sort_value(b, &key.path, key.descending);
-        let ordering = canonical_cmp(&va, &vb);
+        let ordering = sort_cmp(&va, &vb);
         if ordering != Ordering::Equal {
             return if key.descending { ordering.reverse() } else { ordering };
         }
@@ -83,14 +83,14 @@ pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Vec<Bson> {
 
 /// [`compare`], over values already taken by [`sort_keys`].
 ///
-/// The same ordering, arrived at from the same values: `canonical_cmp` on each
+/// The same ordering, arrived at from the same values: [`sort_cmp`] on each
 /// key in turn, reversed where the key is descending, `Equal` when every key
 /// agrees. A vector shorter than `keys` — which nothing this crate produces
 /// can be — compares as though the missing keys were absent from both sides.
 pub fn compare_keys(keys: &[SortKey], a: &[Bson], b: &[Bson]) -> Ordering {
     for (i, key) in keys.iter().enumerate() {
         let (Some(va), Some(vb)) = (a.get(i), b.get(i)) else { break };
-        let ordering = canonical_cmp(va, vb);
+        let ordering = sort_cmp(va, vb);
         if ordering != Ordering::Equal {
             return if key.descending { ordering.reverse() } else { ordering };
         }
@@ -104,27 +104,74 @@ pub fn compare_keys(keys: &[SortKey], a: &[Bson], b: &[Bson]) -> Ordering {
 /// document sorts by one of them: the **smallest** for an ascending key and the
 /// **largest** for a descending one, as the reference's sort does. So `{a: [0, 5]}`
 /// sorts before `{a: 3}` ascending (by 0) and before it descending too (by 5).
+///
+/// **An empty array that a path reaches is the lowest key but `MinKey`**: below `null`, which
+/// a missing field and `[null]` sort as, and above a `MinKey`, in both directions (q7s3c0001
+/// and c0002, q7s3f0274 to f0281). It is the path's own value that counts, wherever the path
+/// leads and whether by name or by position: `a` over `a: []`, `a.b` over `a: [{b: []}]`. An
+/// empty array that is an *element* of the array the path reaches is an array like another
+/// (`a` over `a: [[]]` or `[[1], []]`), and sorts at the rank arrays hold, by the arrays' own
+/// order, where `[]` is the least. `canonical_cmp` and the order of an index are not changed:
+/// the key of an empty array is [`empty_array_key`], which [`sort_cmp`] places.
 fn sort_value(doc: &Document, path: &str, descending: bool) -> Bson {
     let values = path::resolve(doc, path);
     if values.is_empty() {
         return Bson::Null;
     }
+    let empty = empty_array_key();
     // Flatten a terminal array so that sorting by an array field orders by its
     // elements rather than by the array as a whole.
     let mut candidates: Vec<&Bson> = Vec::new();
     for value in &values {
         match value {
-            Bson::Array(items) if !items.is_empty() => candidates.extend(items.iter()),
+            Bson::Array(items) if items.is_empty() => candidates.push(&empty),
+            Bson::Array(items) => candidates.extend(items.iter()),
             other => candidates.push(other),
         }
     }
-    let pick = |a: &&Bson, b: &&Bson| canonical_cmp(a, b);
+    let pick = |a: &&Bson, b: &&Bson| sort_cmp(a, b);
     let best = if descending {
         candidates.into_iter().max_by(pick)
     } else {
         candidates.into_iter().min_by(pick)
     };
     best.cloned().unwrap_or(Bson::Null)
+}
+
+/// What a sort holds for an empty array that a path reaches: an array no value is, so that it
+/// is never taken for an element or a stored value, which [`sort_cmp`] places between `MinKey`
+/// and `null`. It is still an array to anything that reads the keys apart from the order.
+fn empty_array_key() -> Bson {
+    Bson::Array(vec![Bson::Undefined, Bson::MinKey, Bson::Undefined, Bson::MaxKey])
+}
+
+fn is_empty_array_key(value: &Bson) -> bool {
+    matches!(value, Bson::Array(items)
+        if matches!(items.as_slice(),
+            [Bson::Undefined, Bson::MinKey, Bson::Undefined, Bson::MaxKey]))
+}
+
+/// The order of two sort keys: [`canonical_cmp`], except that an [`empty_array_key`] is above a
+/// `MinKey` and below everything else, another empty array key excepted, which it equals.
+fn sort_cmp(a: &Bson, b: &Bson) -> Ordering {
+    match (is_empty_array_key(a), is_empty_array_key(b)) {
+        (false, false) => canonical_cmp(a, b),
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if matches!(b, Bson::MinKey) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, true) => {
+            if matches!(a, Bson::MinKey) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+    }
 }
 
 /// Sort documents in place.
@@ -620,6 +667,9 @@ impl FindProjection {
 /// empty cannot have matched an element, so [`FindProjection::project`] has
 /// nothing to keep for it; the caller says so before reading any document.
 pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
+    for name in doc.keys() {
+        check_field_path(name)?;
+    }
     let positional: Vec<&String> =
         doc.keys().filter(|path| path::segments(path).contains(&"$")).collect();
     let Some(entry) = positional.first() else {
@@ -655,6 +705,32 @@ pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
     // `parse_projection` already makes.
     let projection = parse_projection(&named)?.expect("one entry was kept");
     Ok(Some(FindProjection { projection, positional: Some(array) }))
+}
+
+/// Refuse a projection field name that is no path: the empty name, a path that ends in a `.`, an
+/// empty segment (`.a`, `a..b`) and a segment that starts with a `$`, in an inclusion and an
+/// exclusion alike (q7s3d0047 to d0051, q7s3d.out:416 to 455, and q7s3i.jsonl lines 187 to 228:
+/// code 40352, 40353, 15998 and 16410). A segment that is exactly `$` is the positional operator,
+/// which [`parse_find_projection`] reads. A `$` inside or at the end of a segment is a name, and
+/// so is the segment `$ref`, which the reference accepts (`a.$ref`, `a.b$`: lines 208 to 210 and
+/// 217 to 219). A `$ref` as the first segment is UNRECORDED and is accepted too.
+fn check_field_path(name: &str) -> Result<()> {
+    let refuse = |why: &str| Err(Error::InvalidQuery(format!("projection field {name:?}: {why}")));
+    if name.is_empty() {
+        return refuse("FieldPath cannot be constructed with empty string");
+    }
+    if name.ends_with('.') {
+        return refuse("FieldPath must not end with a '.'.");
+    }
+    for segment in name.split('.') {
+        if segment.is_empty() {
+            return refuse("FieldPath field names may not be empty strings.");
+        }
+        if segment.starts_with('$') && segment != "$" && segment != "$ref" {
+            return refuse("FieldPath field names may not start with '$'.");
+        }
+    }
+    Ok(())
 }
 
 /// Whether a projection value includes, as [`parse_projection`] reads it.

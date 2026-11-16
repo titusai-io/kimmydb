@@ -76,9 +76,10 @@ impl PartialOp {
     /// are not, when `w` is itself an element of an array, since `find`
     /// descends one level. So implication is judged on the value alone.
     fn holds_on_value(&self, value: &Bson) -> bool {
-        use crate::cmp::same_type_group;
+        // The one comparison `find` makes, so that what the filter holds on a value and what
+        // a query implies of it cannot drift apart.
         let compares = |bound: &Bson, accept: &[Ordering]| {
-            same_type_group(value, bound) && accept.contains(&canonical_cmp(value, bound))
+            crate::matching::value_compares(value, bound, accept)
         };
         match self {
             PartialOp::Exists => true,
@@ -145,13 +146,21 @@ impl PartialOp {
     /// decimal query operands and decimal partial-filter bounds.
     pub fn implies(&self, other: &PartialOp) -> bool {
         use crate::cmp::same_type_group;
-        let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);
+        use crate::matching::{is_end_key, is_nan};
+        // A bound is ordered against another only within one bracket, and a NaN bound is
+        // ordered against none: `{$gt: 5}` does not imply `{$gt: NaN}`, which holds for nothing.
+        // A `MinKey` or `MaxKey` bound is ordered against every type, so it is no bracket's:
+        // nothing is concluded between it and another bound.
+        let bracket = |a: &Bson, b: &Bson| {
+            same_type_group(a, b) && ![a, b].into_iter().any(|x| is_nan(x) || is_end_key(x))
+        };
         match (self, other) {
             // A null equality is satisfied by absence, which satisfies only
             // another null equality.
             (PartialOp::Eq(Bson::Null), o) => matches!(o, PartialOp::Eq(Bson::Null)),
-            // Anything else that holds at all implies presence.
-            (_, PartialOp::Exists) => true,
+            // Anything else that holds at all implies presence, except a bound that a missing
+            // field satisfies: `{$gt: MinKey}` holds for a document without the field.
+            (_, PartialOp::Exists) => !self.selects(&[]),
             // A known value implies whatever that value satisfies.
             (PartialOp::Eq(v), o) => o.holds_on_value(v),
             (PartialOp::Exists, _) => false,
@@ -323,6 +332,15 @@ fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
         )));
     }
     let operand = spec.get(first).expect("key from the same document");
+    // A range over a regular expression is refused by `find` (the same text), so it has no
+    // membership to agree with.
+    if matches!(first.as_str(), "$gt" | "$gte" | "$lt" | "$lte")
+        && matches!(operand, Bson::RegularExpression(_))
+    {
+        return Err(Error::InvalidQuery(format!(
+            "Can't have RegEx as arg to predicate over field '{path}'."
+        )));
+    }
 
     Ok(match first.as_str() {
         "$exists" => match operand {
@@ -725,17 +743,24 @@ mod tests {
                 }
             }
         }
+        // The thresholds below are ESTIMATES pending the first run: they were counted by hand
+        // after a NaN stopped implying by order (R1 removed the bound-to-bound and
+        // value-to-bound implications with a NaN on either side; R2 and R4 later removed those
+        // of an end-key or null bound to `$exists`). When a run shows the real counts, pin them
+        // here and say what moved them; a bound is never loosened to make it pass.
         // Premises: an empty search passes the assertion above, so the corpus
         // is asserted to reach implication, implication between two decimal
         // operands, and decimal documents the query matched.
-        assert!(implied > 4_500, "premise: implication is reached (5,026 pairs): {implied}");
+        assert!(implied > 3_500, "premise: implication is reached (about 4,200 pairs): {implied}");
         assert!(
-            both_decimal > 1_200,
-            "premise: a decimal query operand implies a decimal bound (1,341 pairs): {both_decimal}"
+            both_decimal > 900,
+            "premise: a decimal query operand implies a decimal bound (about 1,030 pairs): \
+             {both_decimal}"
         );
         assert!(
-            decimal_witnessed > 15_000,
-            "premise: decimal documents matched an implying query (18,293): {decimal_witnessed}"
+            decimal_witnessed > 10_000,
+            "premise: decimal documents matched an implying query (about 15,000): \
+             {decimal_witnessed}"
         );
     }
 

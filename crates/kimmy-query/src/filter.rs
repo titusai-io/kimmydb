@@ -6,7 +6,6 @@
 //! optimisation — it is the shared representation.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::matching::{self, any_element};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
@@ -166,7 +165,8 @@ impl<'a> IntoIterator for &'a Branches {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Condition {
-    /// Imposes no constraint. Produced by a bare `$options`.
+    /// Imposes no constraint. Produced by the `$options` that sits beside a `$regex`, which the
+    /// pattern has already read; a `$options` with no `$regex` is refused.
     AlwaysTrue,
     /// Both must hold. Only produced when negating a multi-operator `$not`.
     Both(Box<Condition>, Box<Condition>),
@@ -186,7 +186,9 @@ pub enum Condition {
     Type(Vec<String>),
     /// `$regex`, compiled when the filter was parsed.
     Regex(RegexPattern),
-    /// Every listed value must be present in the field's array.
+    /// `$all` of values: the `$and` of an equality on the path for each, so each is held by
+    /// the field as `$eq` reads it (the field, or an element of it, equals it; a missing field
+    /// equals `null`), and the members may be held by different values of the path.
     All(Vec<Bson>),
     /// An `$all` that holds at least one regular expression: every value is present, as for
     /// [`Condition::All`], and every pattern matches a string the field holds (or an element
@@ -468,7 +470,13 @@ fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Co
     }
 
     // `$options` is a modifier on a sibling `$regex`, not an operator of its
-    // own, so it has to be read before the operators are parsed independently.
+    // own: with no `$regex` beside it there is nothing to modify, and it is refused
+    // (q7s3b0216, q7s3b.out:6240), where it once matched every document and so
+    // selected the whole collection for a multi update or a delete.
+    if doc.contains_key("$options") && !doc.contains_key("$regex") {
+        return Err(Error::InvalidQuery("$options needs a $regex".into()));
+    }
+    // It has to be read before the operators are parsed independently.
     let sibling_options = match doc.get("$options") {
         Some(Bson::String(s)) => s.clone(),
         Some(_) => return Err(Error::InvalidQuery("$options requires a string of flags".into())),
@@ -528,12 +536,14 @@ fn parse_condition(
     Ok(match op {
         "eq" => Condition::Eq(arg.clone()),
         "ne" => Condition::Ne(not_regex(arg)?.clone()),
-        "gt" => Condition::Gt(arg.clone()),
-        "gte" => Condition::Gte(arg.clone()),
-        "lt" => Condition::Lt(arg.clone()),
-        "lte" => Condition::Lte(arg.clone()),
+        "gt" => Condition::Gt(range_operand(path, arg)?.clone()),
+        "gte" => Condition::Gte(range_operand(path, arg)?.clone()),
+        "lt" => Condition::Lt(range_operand(path, arg)?.clone()),
+        "lte" => Condition::Lte(range_operand(path, arg)?.clone()),
         "in" => {
-            let (values, patterns) = split_members(array_arg(arg)?)?;
+            let list = array_arg(arg)?;
+            refuse_nested_operators("in", &list)?;
+            let (values, patterns) = split_members(list)?;
             if patterns.is_empty() {
                 Condition::In(values)
             } else {
@@ -543,7 +553,9 @@ fn parse_condition(
         // The exact complement of `$in`: a field that is missing or null is in it, unless
         // `null` is listed (q7s2r.out r0023 to r0027).
         "nin" => {
-            let (values, patterns) = split_members(array_arg(arg)?)?;
+            let list = array_arg(arg)?;
+            refuse_nested_operators("nin", &list)?;
+            let (values, patterns) = split_members(list)?;
             if patterns.is_empty() {
                 Condition::Nin(values)
             } else {
@@ -560,6 +572,13 @@ fn parse_condition(
             if list.is_empty() {
                 return Ok(Condition::In(Vec::new()));
             }
+            // `$all` is a list of values to be equal to, never of operators: `{$eq: 1}` there
+            // is no condition on the field, and the reference refuses it (q7s3a0021,
+            // q7s3a.out:302, code 2, "no $ expressions in $all"), as it refuses an operator
+            // among `$elemMatch` members (q7s2r.out r0055).
+            if list.iter().any(is_operator_document) {
+                return Err(Error::InvalidQuery("no $ expressions in $all".into()));
+            }
             let (values, patterns) = split_members(list)?;
             if patterns.is_empty() {
                 Condition::All(values)
@@ -570,17 +589,27 @@ fn parse_condition(
         // `$exists` reads its argument the way an expression reads a
         // condition, so `Decimal128("0")` asks for absence as `0` does.
         "exists" => Condition::Exists(expr::truthy(arg)),
-        "size" => match arg {
-            Bson::Int32(n) => Condition::Size(i64::from(*n)),
-            Bson::Int64(n) => Condition::Size(*n),
-            Bson::Double(n) if n.fract() == 0.0 => Condition::Size(*n as i64),
-            // A decimal by its value, as the double of that value is.
-            Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
-                Some(n) => Condition::Size(n),
-                None => return Err(Error::InvalidQuery("$size requires an integer".into())),
-            },
-            _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
-        },
+        "size" => {
+            let length = match arg {
+                Bson::Int32(n) => i64::from(*n),
+                Bson::Int64(n) => *n,
+                Bson::Double(n) if n.fract() == 0.0 => *n as i64,
+                // A decimal by its value, as the double of that value is.
+                Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+                    Some(n) => n,
+                    None => return Err(Error::InvalidQuery("$size requires an integer".into())),
+                },
+                _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
+            };
+            // A length below zero is no length: refused, where it matched nothing
+            // (q7s3b0132, q7s3b.out:3802, code 2, "Expected a non-negative number").
+            if length < 0 {
+                return Err(Error::InvalidQuery(format!(
+                    "Failed to parse $size. Expected a non-negative number in: $size: {length}"
+                )));
+            }
+            Condition::Size(length)
+        }
         "mod" => parse_mod(arg)?,
         "bitsAllSet" => parse_bits(BitTest::AllSet, arg)?,
         "bitsAnySet" => parse_bits(BitTest::AnySet, arg)?,
@@ -600,9 +629,10 @@ fn parse_condition(
             }
             _ => return Err(Error::InvalidQuery("$regex requires a string or regex".into())),
         },
-        // Already folded into the sibling `$regex` above. On its own it
-        // constrains nothing, but its flags are still checked: a flag this
-        // database does not implement is refused wherever it is written.
+        // Already folded into the sibling `$regex` above (`parse_conditions` refuses
+        // one with no `$regex` beside it). It constrains nothing itself, but its flags
+        // are still checked: a flag this database does not implement is refused
+        // wherever it is written.
         "options" => {
             check_regex_options(sibling_options)?;
             Condition::AlwaysTrue
@@ -762,6 +792,48 @@ fn not_regex(operand: &Bson) -> Result<&Bson> {
         )));
     }
     Ok(operand)
+}
+
+/// Refuse a regular expression as the operand of `$gt`, `$gte`, `$lt` or `$lte`.
+///
+/// A regex has no order a range could ask about: the reference refuses it (q7s3a0137, a0172, a0207
+/// and a0242, q7s3a.out:5527, 7452, 9377, 11302, code 2, "Can't have RegEx as arg to predicate
+/// over field 'v'"), where it was compared with the other regular expressions, `MinKey` and
+/// `MaxKey` as one group. `$eq` still compares a regex as a value.
+fn range_operand<'a>(path: &str, operand: &'a Bson) -> Result<&'a Bson> {
+    if matches!(operand, Bson::RegularExpression(_)) {
+        return Err(Error::InvalidQuery(format!(
+            "Can't have RegEx as arg to predicate over field '{path}'."
+        )));
+    }
+    Ok(operand)
+}
+
+/// Refuse a member of an `$in` or `$nin` list that is a document with a `$`-led key: the
+/// reference reads it as an operator nested under `$in` and refuses it, code 2, "cannot nest $
+/// under $in" (q7s3f0299, q7s3f.out:5247, with `{$options: "i"}`). The refusal is generalised to
+/// any `$`-led key, which is UNRECORDED. A regular expression in one of its shapes is a pattern
+/// and is not refused. `$eq` of the whole document is not touched: a stored document with a
+/// `$`-led key is still found by `{$eq: <that document>}`.
+fn refuse_nested_operators(op: &str, list: &[Bson]) -> Result<()> {
+    let nested = |member: &Bson| {
+        matches!(member, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')))
+            && !is_regex_shaped(member)
+    };
+    if list.iter().any(nested) {
+        return Err(Error::InvalidQuery(format!("cannot nest $ under ${op}")));
+    }
+    Ok(())
+}
+
+/// Whether an `$all` member is an operator document: one whose first key is an operator, and
+/// that is not a regular expression in one of its shapes or a document holding an `$elemMatch`
+/// (that one is read by [`is_elem_match_member`], and is a value when it has other keys).
+fn is_operator_document(member: &Bson) -> bool {
+    matches!(member, Bson::Document(d)
+        if d.keys().next().is_some_and(|k| k.starts_with('$'))
+            && !d.contains_key("$elemMatch")
+            && !is_regex_shaped(member))
 }
 
 /// Whether an `$all` member is an `$elemMatch`: a document whose only key is `$elemMatch`.
@@ -959,19 +1031,32 @@ fn truncate_to_i64(d: f64) -> Option<i64> {
 /// parsed and the evaluator only ever sees concrete names.
 const NUMBER_TYPES: [&str; 4] = ["double", "int", "long", "decimal"];
 
+/// The argument of `$type`: an alias, a code, or an array of them.
+///
+/// A code is a whole number, of any numeric type: a double or a decimal that is whole is the
+/// code it equals, as an integer is (`{$type: 2.0}` is `{$type: 2}`, q7s3f0253 to f0262,
+/// q7s3b0123 and b0097); a fractional or non-finite one is no code and is refused.
 fn parse_type_arg(arg: &Bson) -> Result<Vec<String>> {
     let one = |value: &Bson| -> Result<Vec<String>> {
         match value {
             Bson::String(s) if s == "number" => {
                 Ok(NUMBER_TYPES.iter().map(|n| (*n).to_string()).collect())
             }
-            Bson::String(s) if TYPE_NAMES.contains(&s.as_str()) => Ok(vec![s.clone()]),
+            Bson::String(s) if TYPE_NAMES.contains(&s.as_str()) || s == WITH_SCOPE => {
+                Ok(vec![s.clone()])
+            }
             Bson::String(s) => Err(Error::InvalidQuery(format!(
-                "unknown $type alias {s:?}; the aliases are number and {}",
+                "unknown $type alias {s:?}; the aliases are number, {WITH_SCOPE} and {}",
                 TYPE_NAMES.join(", ")
             ))),
-            Bson::Int32(n) => type_name_for_code(i64::from(*n)).map(|name| vec![name]),
-            Bson::Int64(n) => type_name_for_code(*n).map(|name| vec![name]),
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                match whole_i64(value) {
+                    Some(code) => type_name_for_code(code).map(|name| vec![name]),
+                    None => {
+                        Err(Error::InvalidQuery(format!("Invalid numerical type code: {value}")))
+                    }
+                }
+            }
             _ => Err(Error::InvalidQuery("$type requires a string alias or type code".into())),
         }
     };
@@ -991,6 +1076,15 @@ fn regex_condition(pattern: &str, options: &str) -> Result<Condition> {
     Ok(Condition::Regex(RegexPattern::new(pattern, options)?))
 }
 
+/// The name `$type` code 15 stands for: a value that is code with a scope, and no other. Also the
+/// alias `javascriptWithScope`.
+const WITH_SCOPE: &str = "javascriptWithScope";
+
+/// The type a code stands for. Code 13 (`javascript`) is code and code 15 is code with a scope,
+/// each only itself (q7s3f0240, f0242, f0264 and f0265: the one matches the code value and not
+/// the one with a scope, the other the reverse); 12 (`dbPointer`) and 14 (`symbol`) are the
+/// legacy types, a symbol held by a document (f0241) and a pointer that no client can store
+/// (f0239).
 fn type_name_for_code(code: i64) -> Result<String> {
     Ok(match code {
         1 => "double",
@@ -1004,14 +1098,19 @@ fn type_name_for_code(code: i64) -> Result<String> {
         9 => "date",
         10 => "null",
         11 => "regex",
+        12 => "dbPointer",
         13 => "javascript",
+        14 => "symbol",
+        15 => WITH_SCOPE,
         16 => "int",
         17 => "timestamp",
         18 => "long",
         19 => "decimal",
         -1 => "minKey",
         127 => "maxKey",
-        other => return Err(Error::InvalidQuery(format!("unknown $type code {other}"))),
+        other => {
+            return Err(Error::InvalidQuery(format!("Invalid numerical type code: {other}")));
+        }
     }
     .to_string())
 }
@@ -1396,7 +1495,13 @@ pub(crate) fn expr_evaluations() -> usize {
 
 /// `$type` on one value.
 fn type_holds(names: &[String], value: &Bson) -> bool {
-    names.iter().any(|n| n == type_name_of(value))
+    names.iter().any(|n| match n.as_str() {
+        // Each of the two is only itself, whether written as the alias or as the code
+        // (q7s3f0240, f0242, f0264, f0265); `type_name_of` calls both "javascript".
+        "javascript" => matches!(value, Bson::JavaScriptCode(_)),
+        WITH_SCOPE => matches!(value, Bson::JavaScriptCodeWithScope(_)),
+        name => name == type_name_of(value),
+    })
 }
 
 /// `$regex` on one value (and a regex written as a field's value, which is the same
@@ -1411,18 +1516,6 @@ fn regex_holds(re: &RegexPattern, value: &Bson) -> bool {
         }
         _ => false,
     }
-}
-
-/// One value member of an `$all` list: some value the path resolves to is an array that holds
-/// it, or is it. Each member is a clause of its own, as two equalities on the path would be, so
-/// the members of one list may be held by different values (`arr.a` over `[{a: 1}, {a: 2}]`).
-fn all_holds(values: &[&Bson], needle: &Bson) -> bool {
-    values.iter().any(|v| match v {
-        Bson::Array(items) => {
-            items.iter().any(|item| canonical_cmp(item, needle) == Ordering::Equal)
-        }
-        other => canonical_cmp(other, needle) == Ordering::Equal,
-    })
 }
 
 /// `$mod` on one value, numeric only. The value is truncated to an integer
@@ -1499,9 +1592,12 @@ fn condition_matches(
             _ => false,
         }),
 
-        Condition::All(required) => required.iter().all(|needle| all_holds(values, needle)),
+        // `$all` is the `$and` of one equality per member, each as `$eq` reads it on the path
+        // (q7s3a0001 to a0035, q7s3b0140 to b0154): the members may be held by different
+        // values, `arr.a` over `[{a: 1}, {a: 2}]`, and a missing field holds `null`.
+        Condition::All(required) => required.iter().all(|needle| matching::equals(values, needle)),
         Condition::AllPatterns(members) => {
-            members.values.iter().all(|needle| all_holds(values, needle))
+            members.values.iter().all(|needle| matching::equals(values, needle))
                 && members.patterns.iter().all(|re| any_element(values, |v| regex_holds(re, v)))
         }
 
@@ -2132,6 +2228,7 @@ mod tests {
         assert!(message.contains("nosuch"), "{message}");
         // The numeric spelling was already refused, and stays refused.
         assert!(refused(doc! { "a": { "$type": 999 } }).contains("999"));
+        assert!(refused(doc! { "a": { "$type": 2.5 } }).contains("2.5"));
     }
 
     #[test]
@@ -2197,8 +2294,15 @@ mod tests {
         ];
         let mut seen = std::collections::BTreeSet::new();
         for value in &samples {
+            // Code with a scope is the alias `javascriptWithScope`, which `type_name_of` does
+            // not report: it calls both forms of code "javascript", which holds for code alone.
             let name = type_name_of(value);
             seen.insert(name);
+            let name = if matches!(value, Bson::JavaScriptCodeWithScope(_)) {
+                "javascriptWithScope"
+            } else {
+                name
+            };
             let filter = parse(&doc! { "a": { "$type": name } })
                 .unwrap_or_else(|e| panic!("{name} must parse: {e}"));
             assert!(
@@ -2213,7 +2317,7 @@ mod tests {
         let table: std::collections::BTreeSet<&str> = TYPE_NAMES.iter().copied().collect();
         assert_eq!(seen, table, "the alias table and the names values report must be one set");
         // And every name a code spells is in it.
-        for code in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, -1, 127] {
+        for code in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, -1, 127] {
             let name = type_name_for_code(code).unwrap();
             assert!(table.contains(name.as_str()), "{name}");
         }
@@ -2284,9 +2388,9 @@ mod tests {
             assert!(message.contains("flag"), "{message}");
         }
         assert!(refused(doc! { "s": { "$regex": "s", "$options": "iI" } }).contains("'I'"));
-        // The literal's own flags, and a lone `$options`, are checked too.
+        // The literal's own flags, and a `$options` beside a `$regex`, are checked too.
         refused(doc! { "s": { "$regex": literal("s", "g") } });
-        refused(doc! { "s": { "$options": "I" } });
+        refused(doc! { "s": { "$regex": "s", "$options": "I" } });
         refused(doc! { "s": { "$not": literal("s", "g") } });
     }
 
@@ -2487,13 +2591,22 @@ mod tests {
 
     #[test]
     fn in_still_compares_documents_that_are_not_regex_shaped() {
-        // A stored document may hold a key beginning with `$`; only the exact
-        // regex shapes are refused.
+        // A stored document may hold a key beginning with `$`: `$eq` of the whole document finds
+        // it, and an `$in` or `$nin` member with a `$`-led key is refused (q7s3f0299), a regex
+        // in one of its shapes excepted.
         let d =
             doc! { "s": { "$regex": "x", "other": 1 }, "t": { "$options": "i" }, "u": { "a": 1 } };
         for q in [
             doc! { "s": { "$in": [ { "$regex": "x", "other": 1 } ] } },
-            doc! { "t": { "$in": [ { "$options": "i" } ] } },
+            doc! { "t": { "$nin": [ { "$options": "i" } ] } },
+            doc! { "t": { "$in": [ 1, { "$gt": 1 } ] } },
+        ] {
+            let message = refused(q.clone());
+            assert!(message.contains("cannot nest $ under"), "{message}");
+        }
+        for q in [
+            doc! { "s": { "$eq": { "$regex": "x", "other": 1 } } },
+            doc! { "t": { "$eq": { "$options": "i" } } },
             doc! { "u": { "$in": [ { "a": 1 }, "abc" ] } },
             doc! { "u": { "$all": [ { "a": 1 } ] } },
         ] {

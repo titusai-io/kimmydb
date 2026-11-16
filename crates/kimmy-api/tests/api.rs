@@ -22337,3 +22337,150 @@ async fn a_matched_documents_id_is_judged_by_the_result_on_every_route() {
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "a": 2 }));
 }
+
+#[tokio::test]
+async fn an_options_with_no_regex_is_refused_and_a_delete_by_it_removes_nothing() {
+    // `{a: {$options: "i"}}` is a `400`, `$options needs a $regex` (q7s3b0216, q7s3b.out:6240),
+    // on every route that takes a filter. It matched every document, so a multi delete by it,
+    // what a client is left with when `JSON.stringify` drops an `undefined` `$regex`, emptied
+    // the collection.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> =
+        (0..3i64).map(|i| json!({ "_id": i, "name": format!("n{i}") })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let coll = "/v1/db/shop/coll/posts";
+    let lone = json!({ "name": { "$options": "i" } });
+    for (route, body) in [
+        ("find", json!({ "filter": lone })),
+        ("count", json!({ "filter": lone })),
+        ("delete", json!({ "filter": lone, "multi": true })),
+        ("update", json!({ "filter": lone, "update": { "$set": { "hit": true } }, "multi": true })),
+    ] {
+        let res = server.post(&format!("{coll}/{route}"), Some(&token), body).await;
+        assert_eq!(res.status, 400, "{route}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap().contains("$options needs a $regex"),
+            "{route}: {:?}",
+            res.body
+        );
+    }
+    let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    let docs = all.body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 3, "{:?}", all.body);
+    assert!(docs.iter().all(|d| d.get("hit").is_none()), "{:?}", all.body);
+    // Beside a `$regex` it is the flags of the pattern.
+    let ok = server
+        .post(
+            &format!("{coll}/count"),
+            Some(&token),
+            json!({ "filter": { "name": { "$regex": "N1", "$options": "i" } } }),
+        )
+        .await;
+    assert_eq!(ok.body["count"], 1, "{:?}", ok.body);
+}
+
+#[tokio::test]
+async fn a_limit_or_skip_written_as_a_double_is_truncated_and_a_negative_one_is_refused() {
+    // q7s3f0165 to f0199 (q7s3f.jsonl lines 165 to 199), over eight documents in `_id` order:
+    // `limit` and `skip` of `2.0`, `2.5`, `2.7` and `2.99` are the count `2`, and a negative one
+    // of any type (`-1`, `-2.0`, `-2.5`) is refused, where a double was a `4xx` for its type.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> = (1..=8i64).map(|i| json!({ "_id": i })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let ids = |res: &Value| -> Vec<i64> {
+        res["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()).collect()
+    };
+    let find = |extra: Value| {
+        let mut body = json!({ "filter": {}, "sort": { "_id": 1 } });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let server = &server;
+        let token = &token;
+        async move { server.post("/v1/db/shop/coll/posts/find", Some(token), body).await }
+    };
+    let all: Vec<i64> = (1..=8).collect();
+    for (label, extra, want) in [
+        ("f0165 limit 2", json!({ "limit": 2 }), vec![1, 2]),
+        ("f0166 skip 2", json!({ "skip": 2 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0167 skip 2 limit 2", json!({ "skip": 2, "limit": 2 }), vec![3, 4]),
+        ("f0168 limit 2.0", json!({ "limit": 2.0 }), vec![1, 2]),
+        ("f0169 skip 2.0", json!({ "skip": 2.0 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0170 both 2.0", json!({ "skip": 2.0, "limit": 2.0 }), vec![3, 4]),
+        ("f0171 limit 2.5", json!({ "limit": 2.5 }), vec![1, 2]),
+        ("f0172 skip 2.5", json!({ "skip": 2.5 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0173 both 2.5", json!({ "skip": 2.5, "limit": 2.5 }), vec![3, 4]),
+        ("f0174 limit 2.7", json!({ "limit": 2.7 }), vec![1, 2]),
+        ("f0175 skip 2.7", json!({ "skip": 2.7 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0176 both 2.7", json!({ "skip": 2.7, "limit": 2.7 }), vec![3, 4]),
+        ("f0177 limit 2.99", json!({ "limit": 2.99 }), vec![1, 2]),
+        ("f0178 skip 2.99", json!({ "skip": 2.99 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0179 both 2.99", json!({ "skip": 2.99, "limit": 2.99 }), vec![3, 4]),
+        ("f0193 skip 0", json!({ "skip": 0 }), all.clone()),
+        ("f0196 skip 0.0", json!({ "skip": 0.0 }), all.clone()),
+        ("f0199 skip 0.5", json!({ "skip": 0.5 }), all.clone()),
+        // Kept apart from the reference: `limit` 0 is an empty page here, and a double that
+        // truncates to 0 (`0.0`, `0.5`) is the same count (f0192, f0195 and f0198, which are
+        // every document there; see docs/deviations.md, "`limit: 0`").
+        ("f0192 limit 0", json!({ "limit": 0 }), vec![]),
+        ("f0195 limit 0.0", json!({ "limit": 0.0 }), vec![]),
+        ("f0198 limit 0.5", json!({ "limit": 0.5 }), vec![]),
+    ] {
+        let res = find(extra.clone()).await;
+        assert_eq!(res.status, 200, "{label} {extra}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{label} {extra}: {:?}", res.body);
+    }
+    for (label, extra) in [
+        ("f0180 limit -1", json!({ "limit": -1 })),
+        ("f0181 skip -1", json!({ "skip": -1 })),
+        ("f0182 both -1", json!({ "skip": -1, "limit": -1 })),
+        ("f0183 limit -2.0", json!({ "limit": -2.0 })),
+        ("f0184 skip -2.0", json!({ "skip": -2.0 })),
+        ("f0185 both -2.0", json!({ "skip": -2.0, "limit": -2.0 })),
+        ("f0186 limit -2 (long)", json!({ "limit": -9_000_000_000i64 })),
+        ("f0189 limit -2.5", json!({ "limit": -2.5 })),
+        ("f0190 skip -2.5", json!({ "skip": -2.5 })),
+        ("f0191 both -2.5", json!({ "skip": -2.5, "limit": -2.5 })),
+        ("q7s3c0053 limit \"2\"", json!({ "limit": "2" })),
+        ("null", json!({ "limit": null })),
+    ] {
+        let res = find(extra.clone()).await;
+        assert!((400..500).contains(&res.status), "{label} {extra}: {} {:?}", res.status, res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_limit_or_skip_in_a_query_string_reads_as_the_body_does() {
+    // `GET .../docs?limit=2.5` is the one parameter of the find body: a double that is not
+    // negative is truncated, a negative one, a NaN and text are refused.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> = (1..=8i64).map(|i| json!({ "_id": i })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let ids = |res: &Value| -> Vec<i64> {
+        res["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()).collect()
+    };
+    for (query, want) in [
+        ("limit=2", vec![1, 2]),
+        ("limit=2.0", vec![1, 2]),
+        ("limit=2.5", vec![1, 2]),
+        ("limit=2.99", vec![1, 2]),
+        ("skip=2.7&limit=2.7", vec![3, 4]),
+        ("skip=6.5", vec![7, 8]),
+        ("limit=0.5", vec![]),
+        ("skip=0.0", (1..=8).collect()),
+    ] {
+        let res = server.get(&format!("/v1/db/shop/coll/posts/docs?{query}"), Some(&token)).await;
+        assert_eq!(res.status, 200, "{query}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{query}: {:?}", res.body);
+    }
+    for query in
+        ["limit=-1", "skip=-2.5", "limit=-0.5e1", "limit=NaN", "limit=inf", "limit=abc", "limit="]
+    {
+        let res = server.get(&format!("/v1/db/shop/coll/posts/docs?{query}"), Some(&token)).await;
+        assert!((400..500).contains(&res.status), "{query}: {} {:?}", res.status, res.body);
+    }
+}
