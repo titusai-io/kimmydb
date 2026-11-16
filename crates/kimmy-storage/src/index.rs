@@ -2368,12 +2368,30 @@ impl crate::Engine {
         coll: &crate::CollectionMeta,
         key: &[u8],
     ) -> Result<Option<(kimmy_core::Stamp, Document)>> {
+        Ok(self
+            .get_version_by_encoded_key(coll, key, &[])?
+            .map(|(s, doc)| (s.version.stamp(), doc)))
+    }
+
+    /// [`Engine::get_record_by_encoded_key`] with the document's version identity, taken from the
+    /// same record bytes as the document.
+    pub fn get_version_by_encoded_key(
+        &self,
+        coll: &crate::CollectionMeta,
+        key: &[u8],
+        asked: &[kimmy_core::Stamp],
+    ) -> Result<Option<(crate::docs::Seen, Document)>> {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         match docs.get((coll.id.0, key))? {
             Some(raw) => {
                 let record = crate::codec::decode_doc_record(raw.value())?;
-                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+                match record.document()? {
+                    Some(doc) => {
+                        Ok(Some((crate::codec::doc_record_seen(&record, raw.value(), asked)?, doc)))
+                    }
+                    None => Ok(None),
+                }
             }
             None => Ok(None),
         }
@@ -2455,6 +2473,14 @@ pub struct IndexScanOutcome {
     pub unkeyed: usize,
 }
 
+/// What an index scan carries besides where to look: the budget the keys of an inexact range are
+/// charged to, and the writes the read asked whether the copy has seen.
+#[derive(Clone, Copy, Default)]
+pub struct ScanExtras<'a> {
+    pub hold: Option<&'a dyn KeyHold>,
+    pub asked: &'a [kimmy_core::Stamp],
+}
+
 /// The tables one scan reads from, and the visitor it feeds.
 ///
 /// Documents are fetched from the **same snapshot** as the index entries —
@@ -2481,23 +2507,33 @@ struct Walk<'t, F> {
     /// Where the keys an inexact range holds are charged, if the caller budgets them (an
     /// aggregation's streamed source, which has no count to bound the set by).
     hold: Option<&'t dyn KeyHold>,
+    /// The writes a read asked whether the copy has seen (`covers`); empty for most reads.
+    asked: &'t [kimmy_core::Stamp],
     visit: F,
 }
 
 impl<F> Walk<'_, F>
 where
-    F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+    F: FnMut(&[u8], crate::docs::Seen, Document) -> Result<bool>,
 {
     /// The live document under a key, or `None` for a tombstone or a gap.
     ///
     /// A gap is an ordinary miss, not an error: index entries are removed
     /// lazily after a drop, and a candidate whose document is gone is simply
     /// not a candidate.
-    fn load(&self, key: &[u8]) -> Result<Option<(kimmy_core::Stamp, Document)>> {
+    fn load(&self, key: &[u8]) -> Result<Option<(crate::docs::Seen, Document)>> {
         match self.docs.get((self.coll.0, key))? {
             Some(raw) => {
                 let record = crate::codec::decode_doc_record(raw.value())?;
-                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+                // The identity and what the copy has seen come from the same bytes the document
+                // was decoded from.
+                match record.document()? {
+                    Some(doc) => Ok(Some((
+                        crate::codec::doc_record_seen(&record, raw.value(), self.asked)?,
+                        doc,
+                    ))),
+                    None => Ok(None),
+                }
             }
             None => Ok(None),
         }
@@ -2804,11 +2840,38 @@ impl crate::Engine {
         order: CandidateOrder<'_>,
         scope: WalkScope,
         hold: Option<&dyn KeyHold>,
-        visit: F,
+        mut visit: F,
     ) -> Result<Option<IndexScanOutcome>>
     where
         F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
     {
+        self.visit_index_candidates_versioned_held(
+            coll,
+            scan,
+            order,
+            scope,
+            ScanExtras { hold, asked: &[] },
+            |k, seen, d| visit(k, seen.version.stamp(), d),
+        )
+    }
+
+    /// [`Engine::visit_index_candidates_held`] handing the visitor each document's version
+    /// identity (its stamp, and under `field` the state hash too) and, for the writes in
+    /// `extras.asked`, whether the copy has seen each, taken from the same record bytes the
+    /// document was decoded from.
+    pub fn visit_index_candidates_versioned_held<F>(
+        &self,
+        coll: &crate::CollectionMeta,
+        scan: &IndexScan<'_>,
+        order: CandidateOrder<'_>,
+        scope: WalkScope,
+        extras: ScanExtras<'_>,
+        visit: F,
+    ) -> Result<Option<IndexScanOutcome>>
+    where
+        F: FnMut(&[u8], crate::docs::Seen, Document) -> Result<bool>,
+    {
+        let ScanExtras { hold, asked } = extras;
         let txn = self.db().begin_read()?;
         let index = {
             let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -2862,6 +2925,7 @@ impl crate::Engine {
             ranges: &ranges,
             outcome: IndexScanOutcome::default(),
             hold,
+            asked,
             visit,
         };
         match order {

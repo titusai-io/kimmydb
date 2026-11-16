@@ -278,6 +278,27 @@ impl WriteScope<'_> {
     }
 }
 
+/// What a read walk hands its visitor besides the document: the document's version identity and,
+/// when the read asked which writes the copy has seen (`covers`), the answer per write asked, in
+/// order. Both are computed from the record bytes the document was decoded from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub version: kimmy_core::DocVersion,
+    pub covers: Vec<bool>,
+}
+
+impl From<kimmy_core::DocVersion> for Seen {
+    fn from(version: kimmy_core::DocVersion) -> Self {
+        Self { version, covers: Vec::new() }
+    }
+}
+
+impl From<Stamp> for Seen {
+    fn from(stamp: Stamp) -> Self {
+        Self::from(kimmy_core::DocVersion::Stamp(stamp))
+    }
+}
+
 /// The version a conditional write is held to: the stamp of the live document and, for a `field`
 /// document, the hash of its merged state. The default is no condition.
 #[derive(Clone, Copy, Debug, Default)]
@@ -402,6 +423,25 @@ impl Engine {
     where
         F: FnMut(DocId, Stamp, Document) -> Result<bool>,
     {
+        self.for_each_version_after(coll, after, scope, &[], |id, seen, doc| {
+            f(id, seen.version.stamp(), doc)
+        })
+    }
+
+    /// [`Engine::for_each_record_after`] handing `f` each document's version identity and, for the
+    /// writes in `asked`, whether the copy has seen each, taken from the same record bytes as the
+    /// document.
+    pub fn for_each_version_after<F>(
+        &self,
+        coll: &CollectionMeta,
+        after: Option<&[u8]>,
+        scope: WalkScope,
+        asked: &[Stamp],
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DocId, Seen, Document) -> Result<bool>,
+    {
         let txn = self.db().begin_read()?;
         let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
         for entry in docs.range(doc_range_after(coll.id, after))? {
@@ -412,7 +452,7 @@ impl Engine {
             }
             let doc: Document = bson::deserialize_from_slice(&record.body)?;
             let id = extract_id(&doc)?;
-            if !f(id, record.stamp, doc)? {
+            if !f(id, codec::doc_record_seen(&record, value.value(), asked)?, doc)? {
                 break;
             }
         }
@@ -500,6 +540,55 @@ impl Engine {
             (MergePolicy::Document, _) => kimmy_core::DocVersion::Stamp(record.stamp),
         };
         Ok(Some((version, doc)))
+    }
+
+    /// [`Engine::get_versioned`], and for each of `asked` whether the stored document covers that
+    /// write: under `field`, whether the document's version vector has seen it (`vv[origin] >=
+    /// hlc`); under `document`, whether the stored stamp is at or above it. Read from the one
+    /// record, so the answer and the body are of the same state. A write that is covered is in
+    /// the body shown, and stays covered.
+    pub fn get_versioned_covering(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        asked: &[Stamp],
+    ) -> Result<Option<(kimmy_core::DocVersion, Document, Vec<bool>)>> {
+        let key = doc_key(id)?;
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+            return Ok(None);
+        };
+        let record = codec::decode_doc_record_with_meta(raw.value())?;
+        let Some(doc) = record.document()? else {
+            return Ok(None);
+        };
+        let (version, covers) = match (coll.merge_policy, record.meta.as_deref()) {
+            (MergePolicy::Field, Some(meta)) => {
+                let state = field_write::load(Some(meta))?;
+                let hash = kimmy_core::merge_state::MergeState::compact_hash_of(meta)
+                    .map_err(|e| StorageError::Corrupt(format!("the merge state: {e:?}")))?;
+                let covers = asked
+                    .iter()
+                    .map(|s| {
+                        let writer =
+                            kimmy_core::merge_state::WriterId { node: s.node, epoch: s.epoch };
+                        state.vv.get(&writer).is_some_and(|seen| *seen >= s.hlc)
+                    })
+                    .collect();
+                (kimmy_core::DocVersion::Etag(record.stamp, hash), covers)
+            }
+            (MergePolicy::Field, None) => {
+                return Err(StorageError::Corrupt(
+                    "a record of a field collection carries no merge state".into(),
+                ));
+            }
+            (MergePolicy::Document, _) => (
+                kimmy_core::DocVersion::Stamp(record.stamp),
+                asked.iter().map(|s| record.stamp >= *s).collect(),
+            ),
+        };
+        Ok(Some((version, doc, covers)))
     }
 
     /// The stamp of a live document, or `None` if it is absent or tombstoned.
@@ -610,6 +699,20 @@ impl Engine {
         coll: &CollectionMeta,
         docs: Vec<Document>,
     ) -> std::result::Result<Vec<(DocId, Stamp)>, BulkInsertError> {
+        Ok(self
+            .insert_many_versioned(coll, docs)?
+            .into_iter()
+            .map(|(id, version)| (id, version.stamp()))
+            .collect())
+    }
+
+    /// [`Engine::insert_many_stamped`] answering each document's version identity: its stamp, and
+    /// under `field` the etag.
+    pub fn insert_many_versioned(
+        &self,
+        coll: &CollectionMeta,
+        docs: Vec<Document>,
+    ) -> std::result::Result<Vec<(DocId, kimmy_core::DocVersion)>, BulkInsertError> {
         // Nothing to do, and nothing to log: an empty batch must not open a
         // transaction, or it would append an oplog entry for a write that
         // never happened.
@@ -647,7 +750,7 @@ impl Engine {
         for (index, checked) in pending.into_iter().enumerate() {
             match self.write_insert(&txn, coll, checked, None) {
                 Ok((id, entry)) => {
-                    ids.push((id, entry.stamp));
+                    ids.push((id, version_of_entry(&entry)));
                     entries.push(entry);
                 }
                 Err(source) => {

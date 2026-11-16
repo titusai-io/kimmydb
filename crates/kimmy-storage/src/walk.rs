@@ -761,7 +761,7 @@ mod tests {
                 let index = c.index("by_n").unwrap();
                 e.index_keyed_entries_after(c, index.id, &[], &[0xFF; 8], None, 100).map(drop)
             }),
-            // covers: docs::Engine::for_each_record_after
+            // covers: docs::Engine::for_each_version_after
             ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Background, |_, _| Ok(true))),
             // covers: digest_probe::Engine::scan_uncovered
             ("digest_plan", |e, _| {
@@ -778,9 +778,9 @@ mod tests {
         let request: &[(&str, Walk)] = &[
             // covers: backup::Engine::backup_to
             ("backup_to", |e, _| e.backup_to(&mut Vec::new(), WalkScope::Request).map(drop)),
-            // covers: docs::Engine::for_each_record_after
+            // covers: docs::Engine::for_each_version_after
             ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Request, |_, _| Ok(true))),
-            // covers: docs::Engine::for_each_record_after
+            // covers: docs::Engine::for_each_version_after
             ("for_each_record_after", |e, c| {
                 e.for_each_record_after(c, None, WalkScope::Request, |_, _, _| Ok(true))
             }),
@@ -795,7 +795,7 @@ mod tests {
             ("for_each_doc_or_undecodable", |e, c| {
                 e.for_each_doc_or_undecodable(c, WalkScope::Request, |_, _| Ok(true))
             }),
-            // covers: docs::Engine::for_each_record_after
+            // covers: docs::Engine::for_each_version_after
             ("count", |e, c| e.count(c, WalkScope::Request).map(drop)),
             // covers: docs::Engine::live_unique_violations_from_table
             ("live_unique_violations", |e, c| {

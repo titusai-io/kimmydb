@@ -40,7 +40,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "backup::Engine::backup_to",
     // Request scans of documents and of the oplog.
     "docs::Engine::for_each_doc_or_undecodable",
-    "docs::Engine::for_each_record_after",
+    "docs::Engine::for_each_version_after",
     // One document's vector chunks, its run and its 0.50 ids, in one read
     // (ADR-239).
     "docs::Engine::for_each_doc_after_each",
@@ -347,9 +347,12 @@ const DELEGATES: &[(&str, &str)] = &[
     ("docs::Engine::for_each_doc", "Engine::for_each_doc_after"),
     ("docs::Engine::live_unique_violations", "Engine::live_unique_violations_from_table"),
     ("docs::Engine::for_each_doc_after", "Engine::for_each_record_after"),
+    // The stamp-only form of the walk that hands the visitor each document's version identity.
+    ("docs::Engine::for_each_record_after", "Engine::for_each_version_after"),
     ("docs::Engine::count", "Engine::for_each_doc"),
     ("index::Engine::visit_index_candidates", "Engine::visit_index_candidates_held"),
-    ("index::Engine::visit_index_candidates_held", "Walk::in_index_order"),
+    ("index::Engine::visit_index_candidates_held", "Engine::visit_index_candidates_versioned_held"),
+    ("index::Engine::visit_index_candidates_versioned_held", "Walk::in_index_order"),
     ("index::Engine::create_index_with", "Engine::create_index_inner"),
     // An index's unkeyed run.
     ("index::Engine::unkeyed_count", "holders_of"),
