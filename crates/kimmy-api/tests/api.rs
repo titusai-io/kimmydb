@@ -23101,3 +23101,166 @@ async fn a_field_collections_writes_carry_an_etag_and_if_stamp_takes_it() {
         server.delete(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={after}"), Some(&token)).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
 }
+
+/// Every way a `field` document's version is read answers the same etag as the write that made it: the
+/// read by id (`ETag`), `find` with `stamps` (indexed, scanned, sorted and by `_id`), and a bulk insert.
+#[tokio::test]
+async fn a_field_documents_etag_is_the_same_whichever_way_it_is_read() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"f","mergePolicy":"field"}))
+        .await;
+    let bulk = server
+        .post("/v1/db/shop/coll/f/bulk", Some(&token), json!([{"_id":1,"n":2},{"_id":2,"n":1}]))
+        .await;
+    assert_eq!(bulk.status, 200, "{:?}", bulk.body);
+    let etags: Vec<String> = bulk.body["etags"]
+        .as_array()
+        .expect("a bulk insert into a field collection answers etags")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(etags.len(), 2);
+    assert_ne!(bulk.body["stamps"][0], bulk.body["etags"][0]);
+
+    let by_id = server.get("/v1/db/shop/coll/f/docs/1", Some(&token)).await;
+    assert_eq!(by_id.header("etag").as_deref(), Some(format!("\"{}\"", etags[0]).as_str()));
+
+    server.post("/v1/db/shop/coll/f/indexes", Some(&token), json!({"fields":[{"path":"n"}]})).await;
+    for filter in [json!({}), json!({"_id": 1}), json!({"n": {"$gte": 0}})] {
+        for sort in [None, Some(json!({"n": 1}))] {
+            let mut body = json!({"filter": filter, "stamps": true});
+            if let Some(sort) = &sort {
+                body["sort"] = sort.clone();
+            }
+            let found = server.post("/v1/db/shop/coll/f/find", Some(&token), body).await;
+            assert_eq!(found.status, 200, "{filter} {sort:?}: {:?}", found.body);
+            let docs = found.body["documents"].as_array().unwrap();
+            let stamps = found.body["stamps"].as_array().unwrap();
+            assert_eq!(docs.len(), stamps.len());
+            for (doc, token) in docs.iter().zip(stamps) {
+                let which = doc["_id"].as_i64().unwrap() as usize - 1;
+                assert_eq!(token, &json!(etags[which]), "{filter} {sort:?}");
+            }
+        }
+    }
+    // a document collection is as before: stamps are stamp tokens and there are no etags
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"d"})).await;
+    let bulk = server.post("/v1/db/shop/coll/d/bulk", Some(&token), json!([{"_id":1}])).await;
+    assert!(bulk.body.get("etags").is_none(), "{:?}", bulk.body);
+}
+
+/// `covers` on a read by id: for each stamp asked, whether this member's copy has seen that write, from
+/// the same record as the body. A write the copy has seen stays seen, and a stamp from the future is not.
+#[tokio::test]
+async fn a_read_by_id_answers_which_writes_the_copy_has_seen() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for (name, policy) in [("f", "field"), ("d", "document")] {
+        server
+            .post(
+                "/v1/db/shop/collections",
+                Some(&token),
+                json!({"name": name, "mergePolicy": policy}),
+            )
+            .await;
+        let first = server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":1,"n":0}))
+            .await;
+        let s1 = stamp_of(&first.body);
+        let second = server
+            .put(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token), json!({"n": 1}))
+            .await;
+        let s2 = stamp_of(&second.body);
+        // a stamp above anything written: the same node's clock, a day later
+        let future = {
+            let mut st = kimmy_core::Stamp::decode(&s2).unwrap();
+            st.hlc = kimmy_core::Hlc::new(st.hlc.wall_ms + 86_400_000, 0);
+            st.encode()
+        };
+        let res = server
+            .get(&format!("/v1/db/shop/coll/{name}/docs/1?covers={s1},{s2},{future}"), Some(&token))
+            .await;
+        assert_eq!(res.status, 200, "{name}: {:?}", res.body);
+        assert_eq!(res.header("kimmy-covers").as_deref(), Some("true,true,false"), "{name}");
+        assert_eq!(res.body["n"], 1);
+        // no `covers`, no header
+        let plain = server.get(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token)).await;
+        assert!(plain.header("kimmy-covers").is_none(), "{name}");
+        // a token that is not a stamp is a 400
+        let bad =
+            server.get(&format!("/v1/db/shop/coll/{name}/docs/1?covers=nope"), Some(&token)).await;
+        assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
+    }
+}
+
+/// `covers` on `find` with `stamps` answers, per document, what a read by id answers for the same
+/// document: the same record, the same rule (a `field` document's version vector, a `document`'s stamp).
+#[tokio::test]
+async fn covers_on_find_and_on_a_read_by_id_agree_for_the_same_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for (name, policy) in [("f", "field"), ("d", "document")] {
+        server
+            .post(
+                "/v1/db/shop/collections",
+                Some(&token),
+                json!({"name": name, "mergePolicy": policy}),
+            )
+            .await;
+        let first = server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":1,"n":0}))
+            .await;
+        let s1 = stamp_of(&first.body);
+        let second = server
+            .put(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token), json!({"n": 1}))
+            .await;
+        let s2 = stamp_of(&second.body);
+        server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":2,"n":9}))
+            .await;
+        let future = {
+            let mut st = kimmy_core::Stamp::decode(&s2).unwrap();
+            st.hlc = kimmy_core::Hlc::new(st.hlc.wall_ms + 86_400_000, 0);
+            st.encode()
+        };
+        let asked = format!("{s1},{s2},{future}");
+        let by_id = server
+            .get(&format!("/v1/db/shop/coll/{name}/docs/1?covers={asked}"), Some(&token))
+            .await;
+        let want = by_id.header("kimmy-covers").unwrap();
+        assert_eq!(want, "true,true,false", "{name}");
+        for sort in [None, Some(json!({"n": 1}))] {
+            let mut body = json!({"filter": {"_id": 1}, "stamps": true, "covers": asked});
+            if let Some(sort) = sort {
+                body["sort"] = sort;
+            }
+            let found =
+                server.post(&format!("/v1/db/shop/coll/{name}/find"), Some(&token), body).await;
+            assert_eq!(found.status, 200, "{name}: {:?}", found.body);
+            assert_eq!(found.body["covers"], json!([[true, true, false]]), "{name}");
+        }
+        // the whole collection: one list per document, the second document has seen neither of the
+        // first one's writes
+        let all = server
+            .post(
+                &format!("/v1/db/shop/coll/{name}/find"),
+                Some(&token),
+                json!({"filter": {}, "stamps": true, "covers": s1}),
+            )
+            .await;
+        let covers = all.body["covers"].as_array().unwrap();
+        assert_eq!(covers.len(), 2, "{name}: {:?}", all.body);
+        assert_eq!(covers[0], json!([true]), "{name}");
+        // `covers` without `stamps` is refused
+        let bad = server
+            .post(
+                &format!("/v1/db/shop/coll/{name}/find"),
+                Some(&token),
+                json!({"filter": {}, "covers": s1}),
+            )
+            .await;
+        assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
+    }
+}

@@ -246,6 +246,61 @@ fn decode_doc_record_inner(mut input: &[u8], keep_meta: bool) -> Result<DocRecor
     Ok(DocRecord { stamp, deleted, body: input.to_vec(), meta })
 }
 
+/// The hash of the merged state an encoded document record carries, read from the stored bytes
+/// without copying or decoding the state: `None` for a version 1 record (no state) or bytes
+/// that are not a record.
+pub fn doc_record_state_hash(input: &[u8]) -> Option<[u8; 16]> {
+    kimmy_core::merge_state::MergeState::compact_hash_of(doc_record_meta(input)?).ok()
+}
+
+/// The merged-state bytes of an encoded record, borrowed: `None` for a version 1 record.
+fn doc_record_meta(mut input: &[u8]) -> Option<&[u8]> {
+    if !check_version_meta(&mut input).ok()? {
+        return None;
+    }
+    take(&mut input, STAMP_LEN + 1).ok()?;
+    let len = take_varint(&mut input).ok()?;
+    take(&mut input, len).ok()
+}
+
+/// What a read of the record answers besides the document: its version identity and, for each
+/// write in `asked`, whether the record has seen it. Under `field` (a record with a merged state)
+/// a write is seen when the state's version vector holds its origin at or above its HLC; under
+/// `document` when the stored stamp is at or above it. The state is decoded only when something
+/// is asked.
+pub fn doc_record_seen(
+    record: &DocRecord,
+    raw: &[u8],
+    asked: &[Stamp],
+) -> Result<crate::docs::Seen> {
+    let version = doc_record_version(record, raw);
+    let covers = match (asked.is_empty(), doc_record_meta(raw)) {
+        (true, _) => Vec::new(),
+        (false, None) => asked.iter().map(|s| record.stamp >= *s).collect(),
+        (false, Some(meta)) => {
+            let state = kimmy_core::merge_state::MergeState::decode_compact(meta)
+                .map_err(|e| corrupt(&format!("the merge state of a record: {e:?}")))?;
+            asked
+                .iter()
+                .map(|s| {
+                    let writer = kimmy_core::merge_state::WriterId { node: s.node, epoch: s.epoch };
+                    state.vv.get(&writer).is_some_and(|seen| *seen >= s.hlc)
+                })
+                .collect()
+        }
+    };
+    Ok(crate::docs::Seen { version, covers })
+}
+
+/// The version identity of a record read from `raw`: its stamp, and the hash of the merged state
+/// its bytes carry when they carry one (an etag), else the stamp alone.
+pub fn doc_record_version(record: &DocRecord, raw: &[u8]) -> kimmy_core::DocVersion {
+    match doc_record_state_hash(raw) {
+        Some(hash) => kimmy_core::DocVersion::Etag(record.stamp, hash),
+        None => kimmy_core::DocVersion::Stamp(record.stamp),
+    }
+}
+
 /// Whether an encoded document record is live, read from its fixed-width header
 /// without touching the body.
 ///
