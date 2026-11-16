@@ -5,7 +5,7 @@
 
 use bson::{Bson, Document};
 
-use crate::filter::{Condition, Filter};
+use crate::filter::{Condition, Filter, filter_has_expr};
 
 /// The value a condition on a path pins that path to, if it pins one: an `$eq`,
 /// a `$in` of exactly one value, or an `$all` of exactly one value. A `$in` of
@@ -43,23 +43,41 @@ fn pinned(condition: &Condition) -> Option<&Bson> {
 /// Two of those equalities may not overlap, through any of the forms: the same
 /// path twice, or one path inside another (`a` with `a.b`), has no one
 /// document to seed, and is refused. `claimed` holds the paths taken so far.
+///
+/// A filter that holds a `$expr` anywhere refuses the upsert, as the reference
+/// does (code 224, q7s2n.out n0035, n0485); within an `$elemMatch` too
+/// (UNRECORDED). An `$all` of two or more values is the path matched twice,
+/// as two equalities on it would be (code 54, n0027, n0477).
 pub fn implied_equalities(
     filter: &Filter,
     out: &mut Document,
     claimed: &mut Vec<String>,
 ) -> Result<(), String> {
+    if filter_has_expr(filter) {
+        return Err("$expr is not allowed in the query predicate for an upsert".into());
+    }
+    seed_from(filter, out, claimed)
+}
+
+fn seed_from(filter: &Filter, out: &mut Document, claimed: &mut Vec<String>) -> Result<(), String> {
     match filter {
         Filter::And(branches) => {
             for branch in branches {
-                implied_equalities(branch, out, claimed)?;
+                seed_from(branch, out, claimed)?;
             }
         }
         Filter::Or(branches) => {
             if let [only] = &branches[..] {
-                implied_equalities(only, out, claimed)?;
+                seed_from(only, out, claimed)?;
             }
         }
         Filter::Field { path, conditions } => {
+            if conditions.iter().any(|c| matches!(c, Condition::All(values) if values.len() > 1)) {
+                return Err(format!(
+                    "cannot infer the fields an upsert seeds from the filter: path '{path}' is \
+                     matched twice"
+                ));
+            }
             for value in conditions.iter().filter_map(pinned) {
                 for taken in claimed.iter() {
                     let inside = |outer: &str, inner: &str| {

@@ -605,12 +605,12 @@ see [Pipeline updates](#pipeline-updates).
 |---|---|
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
-| `$inc` `$mul` | Arithmetic; a missing field starts at `0`. A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
+| `$inc` `$mul` | Arithmetic; a missing field starts at `0` (`$inc` creates it as its operand, `-0.0` included). A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
 | `$bit` | Bitwise `and`, `or`, `xor` of an integer field: `{"$bit": {"flags": {"or": 4}}}`. See [`$bit`](#bit) |
-| `$pull` `$pop` | Remove matching elements / one end. A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition: `$pull: {scores: {$gte: 6}}`. See [`$pull`](#pull-a-value-or-a-condition) |
+| `$pull` `$pop` | Remove matching elements / one end (`$pop` takes `1` or `-1`, as an integer or as the double `1.0` or `-1.0`; any other number is a `400`). A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition, `$pull: {scores: {$gte: 6}}`, and a document of fields is a query on each element, `$pull: {results: {score: 8}}`. See [`$pull`](#pull-a-value-a-condition-or-a-query) |
 | `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
@@ -689,44 +689,65 @@ looking at the destination.
 
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
-also takes a condition (below); `$pullAll` does not, and compares an operator
-document in its list as the plain document it is. `$pullAll` on a field that
+also takes a condition or a query (below); `$pullAll` does not, and compares an
+operator document in its list as the plain document it is. `$pullAll` on a field that
 is missing does nothing; on a field that is not an array it is a `400`,
 because the caller believes the field is an array and it is not. **So is `$pull`,
 of a value or a condition**: `cannot apply $pull to non-array field "v"`.
+**So is `$pop`**: a field that holds a string, a number, `null` or a document
+is a `400` (`cannot apply $pop to non-array field "v"`), and `$pop` of an empty
+array or of a missing field changes nothing.
 
-### `$pull`: a value or a condition
+**`$pull`, `$pullAll` and `$pop` do not look through a value they cannot
+enter.** A path that goes through a scalar or `null` by any segment (`f.a` or
+`f.0` over `f: 5`), or through an array by a field name (`f.a` over
+`f: [{a: [1, 2]}]`), is a `400` as a `$rename` source is
+(`cannot use the part (a of f.a) to traverse the element`), whether or not
+anything lies beyond it. A path that reaches nothing (`f.a` over a missing `f`,
+`f.0` over `f: []`) is no change, and an index into an array works
+(`f.0` over `f: [[1, 2], [3]]`). A `$min` or `$max` that would leave the field
+as it is refuses the same paths, as one that writes does.
 
-What `$pull` does with a **document** operand depends on its keys, and
-nothing else about it changes. A scalar or an array operand always removes the
-elements equal to it, as `$pull: {tags: "a"}` does.
+### `$pull`: a value, a condition or a query
+
+What `$pull` does with an operand depends on its shape. A scalar or an array
+operand always removes the elements equal to it, as `$pull: {tags: "a"}` does.
 
 | Operand | Reading | Example |
 |---|---|---|
-| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
-| A document with **no** key starting with `$` (the empty document too) | A **value**: removes the elements equal to the whole document, field order included | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}]` leaves `[{score: 8, item: "B"}]` |
-| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gte": 6, "score": 8 } } }` is a `400` |
+| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language: a comparison, `$in`, `$nin`, `$ne`, `$exists`, `$type`, `$size`, `$all`, `$mod`, `$regex` and the rest of the field operators, each as it reads a stored value (an element that is an array matches by its members: `{$gt: 1}` removes `[1, 2]`) | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
+| `$and`, `$or` or `$nor` of queries | A query, tested on the elements that are documents only: no scalar, array or `null` element is removed, a `$nor` included | `{ "$pull": { "r": { "$or": [{ "a": 1 }, { "a": 2 }] } } }` |
+| A document with **no** key starting with `$`, the empty document too | A **query** on each element: every element that is a document the query matches is removed, whatever else it holds and in whatever field order. A scalar, an array or a `null` element is never removed. The empty document is a query every document satisfies | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}, {score: 7}]` leaves `[{score: 7}]` |
+| A regular expression value (`{"$regularExpression": {...}}` in Extended JSON) | A pattern: the string elements it matches are removed | `{ "$pull": { "words": {"$regularExpression": {"pattern": "^tmp", "options": ""}} } }` |
+| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gt": 1, "score": 8 } } }` is a `400` |
 
 ```javascript
 { "$pull": { "scores": { "$gt": 1, "$lt": 5 } } }            // [1, 2, 4, 5] -> [1, 5]
 { "$pull": { "tags": { "$in": ["draft", "stale"] } } }
 { "$pull": { "words": { "$regex": "^tmp" } } }
 { "$pull": { "flags": { "$bitsAllSet": 4 } } }                // see the bit operators
-{ "$pull": { "scores": { "$not": { "$gt": 2 } } } }
-{ "$pull": { "results": { "$elemMatch": { "score": 8 } } } }  // removes {score: 8, item: "B"} too
+{ "$pull": { "results": { "score": { "$gte": 8 } } } }        // a query on each document element
+{ "$pull": { "grid": { "$elemMatch": { "$gt": 1 } } } }       // removes each array holding a member over 1
 ```
 
-A condition holds the operators of an `$elemMatch` over scalars, and an
-element is a scalar or a sub-document. To remove sub-documents by **some** of
-their fields, spell it `$elemMatch`: it matches the fields of a document
-element, where the plain `{ "score": 8 }` is a value and removes only a
-document equal to it. The condition is parsed once, with the update: an
-unknown operator or a bad argument (`{ "$in": 3 }`) is a `400` before any
-element is looked at. `$pull` from a field that is missing does nothing, and from
-one that is not an array is a `400`. A `$not` in a condition takes operators, as
-everywhere (`{ "$not": { "$gt": 2 } }`): `{ "$not": { "score": 8 } }` is a `400`
-naming `$ne` and `$elemMatch`, because a document with no operator in it would be
-read as the negation of an equality on a whole document.
+To remove the elements **equal to a whole document**, field order included, use
+`$pullAll` with that document in the list: `{ "$pullAll": { "results": [{ "score":
+8, "item": "A" }] } }` removes `{score: 8, item: "A"}` and neither `{score: 8}` nor an
+element with more fields. `$pull` of the same document is the query above, and
+removes by its fields.
+
+A top-level `$elemMatch` searches an element that is an **array** for a member
+that satisfies its body; a scalar element and a document element are not
+searched, so `{ "$pull": { "v": { "$elemMatch": { "$gt": 1 } } } }` over
+`[1, 2, 3]` removes nothing, and neither does `{ "$elemMatch": { "score": 8 } }`
+over an array of documents: write the fields as a query, `{ "score": 8 }`. A
+`$not` at the top of the operand is a `400` (`unknown top level operator:
+$not`), whatever it holds; an operator inside `$and`, `$or` or `$nor`
+(`{ "$or": [{ "$gt": 2 }] }`) is a `400` too, for the clauses are queries. The
+condition is parsed once, with the update: an unknown operator or a bad
+argument (`{ "$in": 3 }`) is a `400` before any element is looked at. `$pull`
+from a field that is missing does nothing, and from one that is not an array is
+a `400`.
 
 ### `$bit`
 
@@ -1154,19 +1175,54 @@ another numeric type it is stored as written, `NumberLong(1)` over the 32-bit
 as `1.0`, is refused, and a body with no `_id` keeps the stored one.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
-document:
+document, and a document that matched is **judged by the result**, in one place for
+every route (`update`, `multi`, `find_and_modify`, an operator update and a pipeline
+update):
 
 ```javascript
-// Rejected at parse time
-{ "$set": { "_id": 2 } }
-// Rejected when the result is known (a pipeline update)
+// Accepted, and no change (modified 0): the result is the stored _id, in value and type
+{ "$set": { "_id": 1 } }            // over _id: 1
+{ "$inc": { "_id": 0 } }  { "$mul": { "_id": 1 } }  { "$max": { "_id": 1 } }
+{ "$setOnInsert": { "_id": 2 } }    // skipped on a document that matched, whatever it holds
+{ "$rename": { "y": "_id" } }       // y is not there: nothing is moved
+[ { "$set": { "_id": 1 } } ]
+
+// Refused, 400: another value, another type of the same number (operators), a lost _id, a write below it
+{ "$set": { "_id": 2 } }  { "$set": { "_id": NumberLong(1) } }  { "$set": { "_id": 1.0 } }
+{ "$unset": { "_id": "" } }  { "$rename": { "_id": "y" } }  { "$rename": { "a": "_id" } }
+{ "$inc": { "_id": 1 } }  { "$max": { "_id": 5 } }  { "$set": { "_id.x": 1 } }
 [ { "$set": { "_id": 2 } } ]
 
+// A pipeline that leaves no _id has the stored one put back
+[ { "$unset": "_id" } ]
+
+// A replacement keeps the same _id as a document id, stored as the body wrote it
+{ "_id": 1, "item": "widget" }      // and {_id: NumberLong(1)} over _id: 1 stores the long
 // A replacement naming another _id is a 400 — the document is not relocated
 { "_id": 999, "item": "widget" }
-// Accepted: the same _id, or none (the stored one is kept)
-{ "_id": 7, "item": "widget" }
 ```
+
+The comparison of an operator result is of the value and its type as stored, so the
+same number of another type is a change of `_id` and is refused; a replacement and a
+pipeline update read `1` and `NumberLong(1)` as one id and store it as written (a result
+that is a double is refused, as a double `_id` is everywhere), and a pipeline that removes
+`_id` has the stored one put back.
+
+**An upsert's operators may name `_id`, so long as the id the filter gives
+holds.** With `upsert`, an operator update of `_id` is applied to the document
+that would be inserted, and judged by the result. Where the filter pins an `_id`
+(`{_id: 5}`, `{_id: {$in: [5]}}`), `{"$set": {"_id": 5}}` and `{"$setOnInsert":
+{"_id": 5}}` leave the document as it is, and any operator that would make it
+another id, or another type of the same number (`5` over a 64-bit `5`), is a
+`400` naming the immutable field: `{"$set": {"_id": 6}}`, `$inc`, `$unset`,
+`$min` or `$max` that moves it, and `{"$set": {"_id.x": 1}}` below a number. Where the filter pins none
+(`{}`, `{a: 5}`, `{_id: {$regex: "x"}}`), the operators' result is the id:
+`{"$set": {"_id": 6}}` inserts `{_id: 6, a: 5}`, `$inc` and `$min` create one,
+and `$unset` leaves a generated one. The id the document ends with is judged as an insert's (a double or a document is
+a `400`), and one that already exists is `409 duplicate_key`. A document that matched is never given an
+id this way: it is the same `400`. A `$rename` of a field that is not there onto
+`_id` changes nothing, as for any destination; of one that is there it is a
+`400`.
 
 ### `modified` counts changes
 
@@ -1198,6 +1254,7 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
 | `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
+| `$mul: {n: -1}` or `{n: -0.0}` | `n: -0.0` or `n: 0.0` (a double) | no: the result is a double equal to the one stored, so a stored zero keeps its sign. A `NaN` is never equal, so it is written |
 | `$bit: {n: {or: 0}}`, `{and: -1}`, `{xor: 0}`, or any operation that leaves the bits as they are | `n` a 32-bit integer, 32-bit operands | no |
 | `$bit: {n: {or: NumberLong(0)}}` | `n` a 32-bit integer | **yes**: a 64-bit operand makes the result a 64-bit integer |
 | `$pull` with a condition no element satisfies | | no |
@@ -1273,7 +1330,11 @@ queue never hands out the same job twice.
   equalities that overlap, the same path twice or one path inside another
   (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
   and are a `400` when the upsert would insert, through every one of those forms
-  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
+  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. An `$all` of two or
+  more values is the same refusal (`path 'a' is matched twice`), where an `$all` of
+  one seeds. A filter with an `$expr` anywhere in it, beside other conditions or
+  under `$or`, is a `400` when the upsert would insert (`$expr is not allowed in
+  the query predicate for an upsert`). `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that

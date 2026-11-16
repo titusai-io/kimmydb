@@ -77,6 +77,8 @@ mod stage_tests;
 mod trig_tests;
 
 #[cfg(test)]
+mod update_digit_tests;
+#[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
 mod window_deadline_tests;

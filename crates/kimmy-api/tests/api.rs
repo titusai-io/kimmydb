@@ -4627,24 +4627,22 @@ async fn pull_with_a_condition_removes_the_matching_elements() {
     assert_eq!(res.body["modified"], 1);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
     assert_eq!(doc["scores"], json!([1]), "{doc}");
+    // A top-level `$elemMatch` removes no document element (q7s2q.out q0221).
     let res = update(1, json!({"$pull": {"results": {"$elemMatch": {"score": 8}}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
-    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
+    assert_eq!(doc["results"], results, "{doc}");
 
-    // A plain document matches the whole element, so the supersets stay.
+    // A plain document is a query on each element (q7s2j.out j1254), so the
+    // supersets go too.
     let res = update(2, json!({"$pull": {"results": {"score": 8}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
-    assert_eq!(
-        doc["results"],
-        json!([{"score": 8, "item": "A"}, {"score": 8, "item": "B"}, {"score": 7, "item": "C"}]),
-        "{doc}"
-    );
+    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
 
     // A mixed document and a bad condition are 400s, and write nothing.
     for (spec, needle) in [
-        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "$elemMatch"),
+        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "cannot mix operators"),
         (json!({"$pull": {"scores": {"$nope": 1}}}), "unsupported operator"),
         (json!({"$pull": {"scores": {"$in": 3}}}), "$in requires an array"),
     ] {
@@ -21024,7 +21022,7 @@ async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipe
     assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 2, "u": 1 }));
     let res = update(json!([{ "$set": { "_id": 2 } }]), json!({})).await;
     assert_eq!(res.status, 400, "{:?}", res.body);
-    // The same `_id` as a long is the same `_id`.
+    // The same `_id` as a long is the same `_id` (UNRECORDED for a pipeline).
     let res = update(json!([{ "$set": { "_id": { "$toLong": "$_id" } } }]), json!({})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     // A stage after `$replaceWith` reads no `_id`; it is back at the end.
@@ -22046,4 +22044,122 @@ async fn an_upsert_seeds_the_filter_fields_in_name_order_for_every_kind_of_updat
     // 2e and 2f: a replacement keeps none of the filter's fields.
     let (id, got) = upsert(filter(), json!({ "v": 1 })).await;
     assert_eq!(got, want(id, json!({ "v": 1 })));
+}
+
+/// An upsert whose operators name `_id` inserts as any insert does (q7s2o.out o0692-o0799):
+/// the id it ends with is judged as an insert's, a duplicate is a conflict that overwrites
+/// nothing, and a document that matched is never given another `_id`.
+#[tokio::test]
+async fn an_upsert_that_names_its_id_is_inserted_as_any_insert_is() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 7, "k": "a" })]).await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    // The operators' id is the one inserted.
+    let res = fam(json!({ "filter": { "k": "new" }, "update": { "$set": { "_id": 8 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 8, "k": "new" }));
+    // The same id as the filter's is no change to the id the filter gave.
+    let res = fam(json!({ "filter": { "_id": 9 }, "update": { "$set": { "_id": 9 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 9 }));
+    // Another id than the filter's is refused, and nothing is inserted.
+    let res = fam(json!({ "filter": { "_id": 10 }, "update": { "$set": { "_id": 11 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/10", Some(&token)).await.status, 404);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/11", Some(&token)).await.status, 404);
+    // An id that exists is a duplicate, as an insert of it is, and the document stays.
+    let res = fam(json!({ "filter": { "k": "other" }, "update": { "$set": { "_id": 7 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+    // An id that is no document id (a double, a document) is refused as an insert's is.
+    for update in [json!({ "$set": { "_id": 5.5 } }), json!({ "$set": { "_id.x": 1 } })] {
+        let res = fam(json!({ "filter": { "k": "bad" }, "update": update, "upsert": true })).await;
+        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
+    }
+    // A document that matched keeps its `_id`: the same id is no change, another is refused.
+    let res = fam(json!({ "filter": { "_id": 7 }, "update": { "$set": { "_id": 7 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = fam(json!({ "filter": { "_id": 7 }, "update": { "$set": { "_id": 12 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("_id is immutable"),
+        "{:?}",
+        res.body
+    );
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+}
+
+/// A matched document's `_id` is judged by the result, on every route that writes a
+/// post-image: `update` (one document and `multi`), `find_and_modify`, with an operator
+/// update and with a pipeline update. They all end in `update::apply_matched`, whose
+/// `settle_matched_id` is the one judge (q7s2r.out r0137-r0196).
+#[tokio::test]
+async fn a_matched_documents_id_is_judged_by_the_result_on_every_route() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 1 }), json!({ "_id": 2, "a": 1 })])
+        .await;
+    let route = |name: &'static str, body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post(&format!("/v1/db/shop/coll/pu/{name}"), Some(token), body).await }
+    };
+    let same_ops = [
+        json!({ "$set": { "_id": 1 } }),
+        json!({ "$inc": { "_id": 0 } }),
+        json!({ "$mul": { "_id": 1 } }),
+        json!({ "$setOnInsert": { "_id": 9 } }),
+        json!([{ "$set": { "_id": 1 } }]),
+        json!([{ "$unset": "_id" }]),
+    ];
+    let changing = [
+        json!({ "$set": { "_id": 2 } }),
+        json!({ "$set": { "_id": { "$numberLong": "1" } } }),
+        json!({ "$inc": { "_id": 1 } }),
+        json!({ "$unset": { "_id": "" } }),
+        json!({ "$rename": { "_id": "y" } }),
+        json!([{ "$set": { "_id": 2 } }]),
+    ];
+    for name in ["update", "find_and_modify"] {
+        for update in &same_ops {
+            let res = route(name, json!({ "filter": { "_id": 1 }, "update": update })).await;
+            assert_eq!(res.status, 200, "{name} {update}: {:?}", res.body);
+            assert_eq!(res.body["modified"], 0, "{name} {update}: {:?}", res.body);
+        }
+        for update in &changing {
+            let res = route(name, json!({ "filter": { "_id": 1 }, "update": update })).await;
+            assert_eq!(res.status, 400, "{name} {update}: {:?}", res.body);
+            assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 1 }));
+        }
+    }
+    // `multi`: one document that would change refuses the request and writes nothing.
+    let res =
+        route("update", json!({ "filter": {}, "multi": true, "update": { "$set": { "_id": 1 } } }))
+            .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "a": 1 }));
+    let res = route(
+        "update",
+        json!({ "filter": {}, "multi": true, "update": { "$inc": { "_id": 0, "a": 1 } } }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "a": 2 }));
 }
