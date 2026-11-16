@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 596c32d7dac225900e416f897081e7d6a9ee873676f4be2a4e315d026e861094 # shrinks to t = And([And([Leaf(Some("a"), 4, Int32(0), true)])]), xs = [Document({"a": Double(NaN)})]
+cc dafa36a864b8111d0870e7745cae168d3f51bf0abfac902a947956d3f4ae791b # shrinks to t = Or([Leaf(Some("a"), 4, Int32(0), true)]), xs = [Document({"a": Double(NaN)})]
