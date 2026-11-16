@@ -5098,6 +5098,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 2
                 // Pulls refused for a hole a snapshot left (ADR-224).
                 + 1
+                // Entries of field collections refused until the field apply exists (Q7 S2c).
+                + 1
                 // The definition digest (B3 half 2): its gauge, three outcomes
                 // and one line per deferral reason.
                 + 1
