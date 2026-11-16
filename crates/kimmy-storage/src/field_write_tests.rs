@@ -76,7 +76,8 @@ fn a_document_collection_is_byte_for_byte_what_it_was() {
 }
 
 #[test]
-fn a_field_replace_keeps_the_order_of_the_fields_that_stay_and_a_no_change_writes_nothing() {
+fn an_identical_replace_writes_nothing_a_reorder_replace_stores_the_new_order_and_fields_that_stay_keep_theirs()
+ {
     let (e, _d) = open();
     let (f, _) = pair(&e);
     e.insert(&f, doc! { "_id": 1_i64, "a": 1, "b": 2 }).unwrap();
@@ -88,6 +89,18 @@ fn a_field_replace_keeps_the_order_of_the_fields_that_stay_and_a_no_change_write
     assert_eq!(raw(&e, &f, 1).unwrap(), before, "the same document changes nothing");
     assert_eq!(e.commits(), commits, "no commit");
     assert_eq!(entries(&e, &f).len(), 1);
+
+    // A reorder-only REPLACE is a write that stores the new order: docs/deviations.md
+    // `pipeline-reorder-only-q7` (a reorder-only pipeline update is no write, and its workaround
+    // is a replaceOne with the document in the wanted order).
+    let out =
+        e.replace(&f, &DocId::Int64(1), doc! { "_id": 1_i64, "b": 2, "a": 1 }, false).unwrap();
+    assert!(out.matched && out.modified && out.stamp.is_some(), "{out:?}");
+    let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
+    assert_eq!(rec.body, bytes(&doc! { "_id": 1_i64, "b": 2, "a": 1 }), "the new order is stored");
+    assert_eq!(e.commits(), commits + 1, "one commit");
+    assert_eq!(entries(&e, &f).len(), 2, "one new entry");
+    assert_eq!(entries(&e, &f)[1].stamp, rec.stamp);
 
     let out =
         e.replace(&f, &DocId::Int64(1), doc! { "_id": 1_i64, "c": 3, "b": 9 }, false).unwrap();
@@ -102,8 +115,8 @@ fn a_field_replace_keeps_the_order_of_the_fields_that_stay_and_a_no_change_write
     assert_eq!(state.vv.values().copied().max(), Some(rec.stamp.hlc));
     let es = entries(&e, &f);
     assert_eq!(
-        (es.len(), es[1].kind, es[1].meta.as_deref()),
-        (2, OpKind::Replace, rec.meta.as_deref())
+        (es.len(), es[2].kind, es[2].meta.as_deref()),
+        (3, OpKind::Replace, rec.meta.as_deref())
     );
 }
 
