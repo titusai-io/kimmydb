@@ -116,6 +116,43 @@ fn write(
     Ok(Some(Image { meta: w.state.encode_compact(), body, alive, stamp: minted }))
 }
 
+/// What joining a remote entry's state into the stored one leaves for the caller to store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Joined {
+    /// The compact bytes of the merged state: the record's `meta`.
+    pub meta: Vec<u8>,
+    /// The document the merged state renders; empty when no life is alive.
+    pub body: Vec<u8>,
+    /// Whether a life is alive in the merged state.
+    pub alive: bool,
+    /// Whether the merged state differs from the stored one. A join that does not change it is an
+    /// entry the member already covers: nothing is rewritten.
+    pub changed: bool,
+}
+
+/// The apply of one replicated entry of a `field` collection: the join of the state it carries
+/// into `prior` (the stored state, or `None` for a document never held). Pure, and a semilattice
+/// join: the same entries in any order, with repeats, give the same state. Loss records the join
+/// reports are not kept here (records are converged by Step 4).
+pub(crate) fn join(
+    writer: WriterId,
+    prior: Option<MergeState>,
+    other: &MergeState,
+) -> Result<Joined> {
+    let opts = options();
+    let mut w = Writer::from_state(writer, prior.unwrap_or_default(), opts.clone());
+    let received = w.receive_report(other);
+    let rendered = w.state.ordered_document(&opts);
+    let alive = rendered.is_some();
+    let body = match rendered {
+        Some(level) => bson::serialize_to_vec(
+            &ordered_to_document(&level).map_err(|e| refused("the document", e))?,
+        )?,
+        None => Vec::new(),
+    };
+    Ok(Joined { meta: w.state.encode_compact(), body, alive, changed: received.changed })
+}
+
 /// A stamp for a dry run: strictly above everything `prior` has seen, so the writer accepts it,
 /// and never minted by the engine. A replace is run once with it to learn what it would store
 /// (the validator and the indexes need the post-image before the engine mints the real stamp,

@@ -6082,6 +6082,13 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
             let Some(id) = entry.doc_id.as_ref() else {
                 continue;
             };
+            // An entry of a `field` collection carries a merge state: the stamp of the record
+            // that stands says nothing about whether the entry's own writes are in it, so its
+            // mark is never dropped by the stamp test (Step 3: the entry is asked for until
+            // the vectors cover it, and kept when it arrives).
+            if entry.meta.is_some() {
+                continue;
+            }
             let doc_key = crate::docs::doc_key(id)?;
             let superseded = match docs.get((entry.collection.0, doc_key.as_slice()))? {
                 Some(current) => codec::decode_doc_record(current.value())?.stamp.wins_over(&stamp),
@@ -6553,6 +6560,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// The sweep of covered held marks leaves the mark of a field entry alone: the stamp of the
+    /// record that stands says nothing about whether the entry's own writes are in it.
+    #[test]
+    fn the_covered_mark_sweep_leaves_a_field_mark() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let ca = a
+            .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+            .unwrap();
+        let all = |e: &Engine| {
+            e.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap().entries
+        };
+        let creation = all(&a);
+        p.apply_batch(&creation).unwrap();
+        let cut = creation.last().unwrap().stamp;
+        let x = a.insert(&ca, bson::doc! { "_id": 1 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        a.replace(&ca, &x, bson::doc! { "_id": 1, "a": 1 }, false).unwrap();
+        let entries: Vec<_> = all(&a).into_iter().filter(|e| e.stamp > cut).collect();
+        p.apply_batch(&entries).unwrap();
+        // a mark on a field entry that is in the oplog and covered by the vector, under a record
+        // that stands at a higher stamp
+        let first = entries[0].stamp;
+        let db = p.db();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::OPLOG_HELD)
+            .unwrap()
+            .insert(codec::oplog_key(&first).as_slice(), ())
+            .unwrap();
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        let dropped = drop_superseded_covered_marks(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(dropped, 0, "a field entry's mark is not dropped by the stamp test");
+        assert_eq!(p.held_len().unwrap(), 1);
+    }
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
