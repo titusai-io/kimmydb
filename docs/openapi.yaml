@@ -1263,6 +1263,8 @@ paths:
                 validator: { $ref: "#/components/schemas/ValidatorInput" }
                 validationAction: { $ref: "#/components/schemas/ValidationAction" }
                 validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
+                mergePolicy:
+                  $ref: "#/components/schemas/MergePolicy"
       responses:
         "200":
           description: |
@@ -1274,10 +1276,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [created, id]
+                required: [created, id, mergePolicy]
                 properties:
                   created:
                     type: string
+                  mergePolicy: { $ref: "#/components/schemas/MergePolicy" }
                   id:
                     type: integer
                     description: |
@@ -4525,14 +4528,32 @@ components:
         validationAction: { $ref: "#/components/schemas/ValidationAction" }
         validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
 
+    MergePolicy:
+      type: string
+      enum: [document, field]
+      description: |
+        How the collection merges concurrent writes to one document, chosen
+        when it is created and never changed. `field` merges per field and
+        keeps every concurrent `$inc`, at the cost of a merge state stored
+        with each document (about 45 bytes per field at 20 fields, measured);
+        `document` keeps the later whole document. **A create request that
+        names none gets `document` in this build**: a collection with policy
+        `field` is not replicated yet, and a remote write for one is refused
+        and counted (`kimmy_sync_field_refused_total`).
     CollectionDescription:
       type: object
       required:
-        [database, collection, documentCount, sampled, fields, indexes, vector, nodeDurability]
+        [database, collection, documentCount, sampled, fields, indexes, vector, nodeDurability, mergePolicy, mergePolicyGuidance]
       properties:
         database: { type: string }
         collection: { type: string }
         documentCount: { type: integer }
+        mergePolicy: { $ref: "#/components/schemas/MergePolicy" }
+        mergePolicyGuidance:
+          type: string
+          description: |
+            When to choose `field` and when `document`, with the measured
+            cost of the merge state a `field` document carries.
         validator:
           description: The collection's validator, or `null` when it has none (ADR-257).
           oneOf:

@@ -174,7 +174,14 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
-    create_collection_validated(state, auth, db, name, None, kimmy_core::MergePolicy::DEFAULT)
+    create_collection_validated(
+        state,
+        auth,
+        db,
+        name,
+        None,
+        kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
+    )
 }
 
 /// [`create_collection`] with a validator set at creation (ADR-257).
@@ -3362,12 +3369,12 @@ fn write_sink(
     let meta = match existing {
         Some(meta) => meta,
         // An implicit target is a collection like any created without a `mergePolicy`: the
-        // collection default, as over HTTP.
+        // create default, as over HTTP.
         None => match kimmy_storage::blocking(|| {
             state.engine.create_collection_with_policy(
                 &db,
                 &coll,
-                kimmy_core::MergePolicy::DEFAULT,
+                kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
                 None,
             )
         }) {
