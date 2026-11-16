@@ -10,6 +10,50 @@
 
 use bson::{Bson, Document};
 
+/// The most elements a write through an index may add to an array past its end.
+pub const MAX_BACKFILL: usize = 1_500_000;
+
+/// The array position a path segment names, if it names one.
+///
+/// A position is a non-empty run of ASCII digits, leading zeros allowed (`00`
+/// and `01` are positions), and nothing else: a sign (`+0`) makes it a field
+/// name. A run of digits too long for a `usize` names no position either.
+pub fn array_index(segment: &str) -> Option<usize> {
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    segment.parse::<usize>().ok()
+}
+
+/// Why a write cannot address a position of an array.
+enum IndexRefusal {
+    /// The segment is no position at all.
+    NotAnIndex,
+    /// A position, but too large to be an index of a document's array: a value
+    /// that does not fit an `i32`. UNRECORDED where the reference draws this
+    /// line, the recording has 99999999999 only.
+    TooLarge,
+    /// A position more than [`MAX_BACKFILL`] past the end of the array.
+    Backfill,
+}
+
+/// The position `segment` names for a write into an array of `len` elements.
+/// Checked before any element is added, by both [`set`] and [`set_checked`].
+fn index_to_write(segment: &str, len: usize) -> Result<usize, IndexRefusal> {
+    let index = array_index(segment).ok_or(IndexRefusal::NotAnIndex)?;
+    if i32::try_from(index).is_err() {
+        return Err(IndexRefusal::TooLarge);
+    }
+    if index > len && index - len > MAX_BACKFILL {
+        return Err(IndexRefusal::Backfill);
+    }
+    Ok(index)
+}
+
+fn backfill_refusal() -> String {
+    format!("can't backfill more than {MAX_BACKFILL} elements")
+}
+
 /// Split a dot path into its segments.
 pub fn segments(path: &str) -> Vec<&str> {
     path.split('.').collect()
@@ -51,7 +95,7 @@ fn descend<'a>(value: &'a Bson, segs: &[&str], out: &mut Vec<&'a Bson>) {
         }
         Bson::Array(items) => {
             // A numeric segment may address a position...
-            if let Ok(index) = head.parse::<usize>()
+            if let Some(index) = array_index(head)
                 && let Some(item) = items.get(index)
             {
                 descend(item, rest, out);
@@ -108,7 +152,7 @@ fn visit_arrays(
         }
         Bson::Array(items) => {
             // The same two readings of a segment as `descend`.
-            if let Ok(index) = head.parse::<usize>()
+            if let Some(index) = array_index(head)
                 && let Some(item) = items.get(index)
             {
                 visit_arrays(item, segs, depth + 1, out);
@@ -152,8 +196,12 @@ fn set_in_document(doc: &mut Document, segs: &[&str], value: Bson) -> Result<(),
         Bson::Document(child) => set_in_document(child, rest, value),
         Bson::Array(items) => {
             let (index_seg, tail) = rest.split_first().expect("rest is non-empty");
-            let index: usize = index_seg.parse().map_err(|_| {
-                format!("cannot traverse array with non-numeric segment {index_seg:?}")
+            let index = index_to_write(index_seg, items.len()).map_err(|why| match why {
+                IndexRefusal::NotAnIndex => {
+                    format!("cannot traverse array with non-numeric segment {index_seg:?}")
+                }
+                IndexRefusal::TooLarge => cannot_create_in_array(index_seg, head, items),
+                IndexRefusal::Backfill => backfill_refusal(),
             })?;
             while items.len() <= index {
                 items.push(Bson::Null);
@@ -174,6 +222,204 @@ fn set_in_document(doc: &mut Document, segs: &[&str], value: Bson) -> Result<(),
     }
 }
 
+/// The keys an update created, each as the full path of keys and array
+/// positions from the document root down to the new key.
+pub type Created = Vec<Vec<String>>;
+
+/// Set a value at a dot path the way an update writes it: a numeric segment
+/// addresses an array element at any depth, and a write below a scalar, a
+/// `null` or an array element that is not a document is refused rather than
+/// replacing the value.
+///
+/// Every key this call adds to a document is appended to `created`, for
+/// [`settle_created`] to put in order once the whole update has been applied.
+/// Unlike [`set`], which the aggregation stages share and which makes room by
+/// replacing a scalar with a document, this is the update language's write.
+pub fn set_checked(
+    doc: &mut Document,
+    path: &str,
+    value: Bson,
+    created: &mut Created,
+) -> Result<(), String> {
+    let segs = segments(path);
+    write_in_document(doc, &segs, value, &mut Vec::new(), created)
+}
+
+fn cannot_create(field: &str, under: &str, element: &Bson) -> String {
+    match element {
+        Bson::Array(items) => cannot_create_in_array(field, under, items),
+        _ => format!("cannot create field '{field}' in element {{{under}: {element}}}"),
+    }
+}
+
+/// [`cannot_create`] for an array, which the reference shows with a space inside
+/// its brackets: `{arr: [ 7, 8 ]}`.
+fn cannot_create_in_array(field: &str, under: &str, items: &[Bson]) -> String {
+    if items.is_empty() {
+        return format!("cannot create field '{field}' in element {{{under}: []}}");
+    }
+    let shown: Vec<String> = items.iter().map(ToString::to_string).collect();
+    format!("cannot create field '{field}' in element {{{under}: [ {} ]}}", shown.join(", "))
+}
+
+fn write_in_document(
+    doc: &mut Document,
+    segs: &[&str],
+    value: Bson,
+    trail: &mut Vec<String>,
+    created: &mut Created,
+) -> Result<(), String> {
+    let (head, rest) = segs.split_first().expect("non-empty path");
+    let present = doc.contains_key(*head);
+    if !present {
+        let mut key = trail.clone();
+        key.push((*head).to_string());
+        created.push(key);
+    }
+    if rest.is_empty() {
+        doc.insert(*head, value);
+        return Ok(());
+    }
+    if !present {
+        doc.insert(*head, Bson::Document(Document::new()));
+    }
+    trail.push((*head).to_string());
+    let outcome = match doc.get_mut(*head).expect("just ensured present") {
+        Bson::Document(child) => write_in_document(child, rest, value, trail, created),
+        Bson::Array(items) => write_in_array(items, head, rest, value, trail, created),
+        other => Err(cannot_create(rest[0], head, other)),
+    };
+    trail.pop();
+    outcome
+}
+
+fn write_in_array(
+    items: &mut Vec<Bson>,
+    under: &str,
+    segs: &[&str],
+    value: Bson,
+    trail: &mut Vec<String>,
+    created: &mut Created,
+) -> Result<(), String> {
+    let (index_seg, tail) = segs.split_first().expect("non-empty path");
+    let index = index_to_write(index_seg, items.len()).map_err(|why| match why {
+        IndexRefusal::NotAnIndex | IndexRefusal::TooLarge => {
+            cannot_create_in_array(index_seg, under, items)
+        }
+        IndexRefusal::Backfill => backfill_refusal(),
+    })?;
+    let existed = index < items.len();
+    while items.len() <= index {
+        items.push(Bson::Null);
+    }
+    if tail.is_empty() {
+        items[index] = value;
+        return Ok(());
+    }
+    if !existed {
+        items[index] = Bson::Document(Document::new());
+    }
+    trail.push(index.to_string());
+    let outcome = match &mut items[index] {
+        Bson::Document(child) => write_in_document(child, tail, value, trail, created),
+        Bson::Array(inner) => write_in_array(inner, index_seg, tail, value, trail, created),
+        other => Err(cannot_create(tail[0], index_seg, other)),
+    };
+    trail.pop();
+    outcome
+}
+
+/// Put the keys an update created in order: at each level, the fields that
+/// were there stay where they were and the new ones follow, sorted by
+/// [`new_key_order`]: the names made of digits by their numeric value, then the
+/// others in byte order.
+///
+/// A document an update was given as a value is not touched, only the levels
+/// the update's own paths created or wrote into.
+pub fn settle_created(doc: &mut Document, created: &[Vec<String>]) {
+    let mut levels: std::collections::BTreeMap<&[String], std::collections::HashSet<&str>> =
+        std::collections::BTreeMap::new();
+    for key in created {
+        if let Some((name, parent)) = key.split_last() {
+            levels.entry(parent).or_default().insert(name.as_str());
+        }
+    }
+    for (parent, names) in levels {
+        if let Some(level) = document_at(doc, parent) {
+            sort_new_keys(level, &names);
+        }
+    }
+}
+
+fn document_at<'a>(doc: &'a mut Document, trail: &[String]) -> Option<&'a mut Document> {
+    let Some((head, rest)) = trail.split_first() else { return Some(doc) };
+    match doc.get_mut(head)? {
+        Bson::Document(child) => document_at(child, rest),
+        Bson::Array(items) => array_document_at(items, rest),
+        _ => None,
+    }
+}
+
+fn array_document_at<'a>(items: &'a mut [Bson], trail: &[String]) -> Option<&'a mut Document> {
+    let (head, rest) = trail.split_first()?;
+    match items.get_mut(array_index(head)?)? {
+        Bson::Document(child) => document_at(child, rest),
+        Bson::Array(inner) => array_document_at(inner, rest),
+        _ => None,
+    }
+}
+
+/// The order the fields an update creates take at a level: a name made only of
+/// ASCII digits sorts before any other, by its numeric value (`9` before `10`),
+/// and the rest follow in byte order. UNRECORDED: two digit names of one value
+/// (`01` and `1`) are told apart by their bytes.
+pub fn new_key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match (digits(a), digits(b)) {
+        (true, true) => {
+            let (x, y) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+            x.len().cmp(&y.len()).then_with(|| x.cmp(y)).then_with(|| a.cmp(b))
+        }
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.cmp(b),
+    }
+}
+
+fn sort_new_keys(level: &mut Document, new: &std::collections::HashSet<&str>) {
+    let keys: Vec<&String> = level.keys().collect();
+    let first_new = keys.iter().position(|k| new.contains(k.as_str()));
+    let settled = match first_new {
+        None => true,
+        Some(at) => {
+            keys[at..].iter().all(|k| new.contains(k.as_str()))
+                && keys[at..].windows(2).all(|w| new_key_order(w[0], w[1]).is_lt())
+        }
+    };
+    if settled {
+        return;
+    }
+    let (mut fresh, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(level).into_iter().partition(|(k, _)| new.contains(k.as_str()));
+    fresh.sort_by(|a, b| new_key_order(&a.0, &b.0));
+    level.extend(kept.into_iter().chain(fresh));
+}
+
+/// Sort by name the keys of every sub-document a dot path goes through, the
+/// root and the path's own last key excepted: the levels a write at `path`
+/// created. A document that is the value at the path is left as it is.
+pub fn sort_levels_through(doc: &mut Document, path: &str) {
+    let segs = segments(path);
+    let mut level = doc;
+    for seg in &segs[..segs.len() - 1] {
+        let Some(Bson::Document(child)) = level.get_mut(*seg) else { return };
+        let mut fields: Vec<(String, Bson)> = std::mem::take(child).into_iter().collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        child.extend(fields);
+        level = child;
+    }
+}
+
 /// Remove the value at a dot path. Returns whether anything was removed.
 pub fn unset(doc: &mut Document, path: &str) -> bool {
     let segs = segments(path);
@@ -189,7 +435,7 @@ fn unset_in_document(doc: &mut Document, segs: &[&str]) -> bool {
         Some(Bson::Document(child)) => unset_in_document(child, rest),
         Some(Bson::Array(items)) => {
             let (index_seg, tail) = rest.split_first().expect("rest is non-empty");
-            let Ok(index) = index_seg.parse::<usize>() else {
+            let Some(index) = array_index(index_seg) else {
                 return false;
             };
             match items.get_mut(index) {
@@ -203,6 +449,42 @@ fn unset_in_document(doc: &mut Document, segs: &[&str]) -> bool {
                 _ => false,
             }
         }
+        _ => false,
+    }
+}
+
+/// Remove the value at a dot path as an update does: through a numeric
+/// segment at any depth of nested arrays, leaving a `null` hole where an
+/// element was. Returns whether anything was removed.
+pub fn unset_checked(doc: &mut Document, path: &str) -> bool {
+    let segs = segments(path);
+    unset_deep_in_document(doc, &segs)
+}
+
+fn unset_deep_in_document(doc: &mut Document, segs: &[&str]) -> bool {
+    let (head, rest) = segs.split_first().expect("non-empty path");
+    if rest.is_empty() {
+        return doc.remove(*head).is_some();
+    }
+    match doc.get_mut(*head) {
+        Some(Bson::Document(child)) => unset_deep_in_document(child, rest),
+        Some(Bson::Array(items)) => unset_deep_in_array(items, rest),
+        _ => false,
+    }
+}
+
+fn unset_deep_in_array(items: &mut [Bson], segs: &[&str]) -> bool {
+    let (index_seg, tail) = segs.split_first().expect("non-empty path");
+    let Some(index) = array_index(index_seg) else {
+        return false;
+    };
+    match items.get_mut(index) {
+        Some(slot) if tail.is_empty() => {
+            *slot = Bson::Null;
+            true
+        }
+        Some(Bson::Document(child)) => unset_deep_in_document(child, tail),
+        Some(Bson::Array(inner)) => unset_deep_in_array(inner, tail),
         _ => false,
     }
 }
@@ -345,5 +627,67 @@ mod tests {
         let mut d = doc! { "a": [1, 2, 3] };
         assert!(unset(&mut d, "a.1"));
         assert_eq!(d, doc! { "a": [1, Bson::Null, 3] });
+    }
+
+    #[test]
+    fn both_writes_refuse_an_index_far_past_the_end_before_pushing() {
+        // q7s2g.out lines 59-76. A modest index (5000000): a build that does not
+        // refuse allocates it, which a larger one would not survive.
+        let mut d = doc! { "arr": [7] };
+        let err = set(&mut d, "arr.5000000", Bson::Int32(1)).unwrap_err();
+        assert_eq!(err, "can't backfill more than 1500000 elements");
+        assert_eq!(d, doc! { "arr": [7] });
+        let err = set_checked(&mut d, "arr.5000000.x", Bson::Int32(1), &mut Vec::new());
+        assert_eq!(err.unwrap_err(), "can't backfill more than 1500000 elements");
+        assert_eq!(d, doc! { "arr": [7] });
+    }
+
+    #[test]
+    fn the_gap_that_is_allowed_is_exactly_one_and_a_half_million() {
+        // q7s2g.out lines 52-61: length 1, so index 1500001 is written and
+        // 1500002 is not.
+        let mut d = doc! { "arr": [7] };
+        set(&mut d, "arr.1500001", Bson::Int32(1)).unwrap();
+        assert_eq!(d.get_array("arr").unwrap().len(), 1_500_002);
+        let mut d = doc! { "arr": [7] };
+        set_checked(&mut d, "arr.1500001", Bson::Int32(1), &mut Vec::new()).unwrap();
+        assert_eq!(d.get_array("arr").unwrap().len(), 1_500_002);
+        let mut d = doc! { "arr": [7] };
+        assert!(set(&mut d, "arr.1500002", Bson::Int32(1)).is_err());
+        assert!(set_checked(&mut d, "arr.1500002", Bson::Int32(1), &mut Vec::new()).is_err());
+        assert_eq!(d.get_array("arr").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_segment_too_large_for_an_index_is_refused_by_both_writes() {
+        // q7s2g.out lines 76-116 (99999999999). UNRECORDED: the line between this
+        // and the backfill refusal; a value that does not fit an i32 is this one.
+        for index in ["99999999999", "2147483648"] {
+            let want = format!("cannot create field '{index}' in element {{arr: [ 7 ]}}");
+            let mut d = doc! { "arr": [7] };
+            assert_eq!(
+                set_checked(&mut d, &format!("arr.{index}.x"), Bson::Null, &mut vec![]),
+                Err(want)
+            );
+            assert_eq!(d, doc! { "arr": [7] });
+            assert!(set(&mut d, &format!("arr.{index}"), Bson::Null).is_err());
+            assert_eq!(d, doc! { "arr": [7] });
+        }
+        let mut d = doc! { "arr": [7] };
+        let err = set_checked(&mut d, "arr.2147483647", Bson::Null, &mut vec![]).unwrap_err();
+        assert_eq!(err, "can't backfill more than 1500000 elements");
+    }
+
+    #[test]
+    fn a_read_takes_a_run_of_digits_as_an_index_and_a_signed_segment_as_a_name() {
+        // UNRECORDED: the reference's answer for a find, projection or sort path
+        // with a signed or zero-led segment; the build reads them as the writes
+        // do (see NEXT-PROBE.md).
+        let d = doc! { "arr": [7, 8], "o": { "+0": 1, "00": 2, "01": 3 } };
+        assert_eq!(resolve(&d, "arr.00"), vec![&Bson::Int32(7)]);
+        assert_eq!(resolve(&d, "arr.01"), vec![&Bson::Int32(8)]);
+        assert!(resolve(&d, "arr.+0").is_empty());
+        assert_eq!(resolve(&d, "o.+0"), vec![&Bson::Int32(1)]);
+        assert_eq!(resolve(&d, "o.00"), vec![&Bson::Int32(2)]);
     }
 }

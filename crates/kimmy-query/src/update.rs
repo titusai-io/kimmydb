@@ -8,7 +8,7 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::decimal::arith;
 use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
-use kimmy_core::{Error, Result};
+use kimmy_core::{DocId, Error, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -622,9 +622,10 @@ impl<'a> Claims<'a> {
 }
 
 /// A path with every segment that addresses an array element by number in
-/// its decimal form: `a.01` and `a.+1` are `a.1`, because the path language
-/// reads all three as the element at index 1 (`usize::from_str`), and two
-/// writes to it are one path written twice. A positional segment is left as
+/// its decimal form: `a.01` is `a.1`, because the path language reads both as
+/// the element at index 1 (a run of ASCII digits, [`path::array_index`]), and
+/// two writes to it are one path written twice. `a.+1` is not: a sign makes
+/// the segment a field name, so it stays as written. A positional segment is left as
 /// it is. Over a document whose `a` holds an object, `01` and `1` would be
 /// two keys; they are still read as one path here, so such a pair is refused
 /// rather than told apart. The first segment is left as written: it names a
@@ -634,8 +635,8 @@ fn canonical(path: &str) -> String {
     path::segments(path)
         .iter()
         .enumerate()
-        .map(|(at, segment)| match segment.parse::<usize>() {
-            Ok(index) if at > 0 => index.to_string(),
+        .map(|(at, segment)| match path::array_index(segment) {
+            Some(index) if at > 0 => index.to_string(),
             _ => (*segment).to_string(),
         })
         .collect::<Vec<_>>()
@@ -666,8 +667,10 @@ fn conflict(
 /// Whether a target path is `_id` or anything beneath it.
 ///
 /// The exact match alone was not enough. `_id` holds a scalar in almost every
-/// document, and `path::set` on `"_id.x"` replaces a scalar with a document to
-/// make room — so `{$set: {"_id.x": 1}}` turned `_id: 7` into `_id: {x: 1}`,
+/// document, and a write at `"_id.x"` once replaced a scalar with a document
+/// to make room (`path::set` still does, for the stages that share it; the
+/// update's own `path::set_checked` refuses it) — so `{$set: {"_id.x": 1}}`
+/// turned `_id: 7` into `_id: {x: 1}`,
 /// past a check that only knew the literal name. That relocates the document
 /// out from under every index entry and oplog record that named it, silently.
 /// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
@@ -966,8 +969,48 @@ fn apply_to_at(
             // replacement that left it last would be a different document,
             // byte for byte, from the same fields stored by a `PUT`, and
             // would count as a change every time it was sent (ADR-208).
+            //
+            // The body may name an `_id`, and then it must be the one the
+            // document has: the stored one, or the filter's in an upsert's
+            // seed. An equal one of another numeric type is stored as written.
+            // A body that names none keeps the document's, and in an upsert
+            // with no filter `_id` the body's is the one inserted (q7s2b.out
+            // lines 133, 138, 142; q7s2d.out lines 122-168).
+            //
+            // "The same `_id`" is the same `DocId`, as a pipeline update reads
+            // it: `1`, `1i64` and `Decimal128("1")` are one id, and a value
+            // that is no id at all (a double) is refused, so the document can
+            // never be stored under a key the store cannot read.
+            let id = match (doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
+                (Some(held), Some(named)) => {
+                    let same = match (DocId::try_from_bson(held), DocId::try_from_bson(named)) {
+                        (Ok(was), Ok(is)) => was == is,
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(Error::InvalidUpdate(format!(
+                            "_id is immutable and cannot be updated: the replacement names _id \
+                             {named}, and the document's is {held}"
+                        )));
+                    }
+                    Some(named)
+                }
+                // Only the document an upsert inserts takes the body's `_id`; a
+                // stored one has its own, and is not given one.
+                (None, Some(named)) if target == Target::Inserted => {
+                    DocId::try_from_bson(named)?;
+                    Some(named)
+                }
+                (None, Some(named)) => {
+                    return Err(Error::InvalidUpdate(format!(
+                        "_id is immutable and cannot be updated: the replacement names _id \
+                         {named}, and the document has none"
+                    )));
+                }
+                (held, None) => held,
+            };
             let mut next = Document::new();
-            if let Some(id) = doc.get(ID_FIELD) {
+            if let Some(id) = id {
                 next.insert(ID_FIELD, id.clone());
             }
             for (key, value) in replacement {
@@ -1005,15 +1048,17 @@ fn apply_to_at(
     }
 
     // Then `$setOnInsert`, only for an inserted document, and everything else.
+    let mut created = path::Created::new();
     let on_insert = |op: &Operation| matches!(op.kind, OpKind::SetOnInsert(_));
     let passes: [&dyn Fn(&Operation) -> bool; 2] = [&on_insert, &|op| !on_insert(op)];
     for pass in passes {
         for (op, paths) in operations.iter().zip(&concrete) {
             if applies(op) && pass(op) {
-                apply_at(op, paths, doc, now_ms)?;
+                apply_at(op, paths, doc, now_ms, &mut created)?;
             }
         }
     }
+    path::settle_created(doc, &created);
     Ok(())
 }
 
@@ -1067,13 +1112,19 @@ fn claim_concrete(operations: &[Operation], concrete: &[Vec<String>]) -> Result<
 ///
 /// Positions stay valid across those applications because `$unset` leaves a
 /// null hole rather than shifting the elements after it.
-fn apply_at(op: &Operation, paths: &[String], doc: &mut Document, now_ms: i64) -> Result<()> {
+fn apply_at(
+    op: &Operation,
+    paths: &[String],
+    doc: &mut Document,
+    now_ms: i64,
+    created: &mut path::Created,
+) -> Result<()> {
     if !has_positional(&op.path) {
-        return apply_one(op, doc, now_ms);
+        return apply_one(op, doc, now_ms, created);
     }
     for path in paths {
         let at = Operation { path: path.clone(), kind: op.kind.clone(), array_filters: Vec::new() };
-        apply_one(&at, doc, now_ms)?;
+        apply_one(&at, doc, now_ms, created)?;
     }
     Ok(())
 }
@@ -1197,7 +1248,7 @@ fn expand_into(
     // an absent path means (`$set` creates it, `$pull` ignores it).
     let next = match value {
         Some(Bson::Document(child)) => child.get(*head),
-        Some(Bson::Array(items)) => head.parse::<usize>().ok().and_then(|i| items.get(i)),
+        Some(Bson::Array(items)) => path::array_index(head).and_then(|i| items.get(i)),
         _ => None,
     };
     prefix.push((*head).to_string());
@@ -1206,12 +1257,17 @@ fn expand_into(
     Ok(())
 }
 
-fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
+fn apply_one(
+    op: &Operation,
+    doc: &mut Document,
+    now_ms: i64,
+    created: &mut path::Created,
+) -> Result<()> {
     let current = path::resolve(doc, &op.path).first().cloned().cloned();
 
     let invalid = |msg: String| Error::InvalidUpdate(msg);
-    let set = |doc: &mut Document, value: Bson| -> Result<()> {
-        path::set(doc, &op.path, value).map_err(invalid)
+    let mut set = |doc: &mut Document, value: Bson| -> Result<()> {
+        path::set_checked(doc, &op.path, value, created).map_err(invalid)
     };
 
     match &op.kind {
@@ -1219,7 +1275,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         OpKind::Set(value) | OpKind::SetOnInsert(value) => set(doc, value.clone())?,
 
         OpKind::Unset => {
-            path::unset(doc, &op.path);
+            path::unset_checked(doc, &op.path);
         }
 
         OpKind::Inc(delta) => {
@@ -1357,10 +1413,52 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             if touches_id(target) {
                 return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
+            match rename_source(doc, &op.path) {
+                // A source that is not there is nothing to move, and nothing
+                // else is looked at, the destination included (q7s2e.out lines
+                // 5-46, q7s2f.out lines 37, 42, 69).
+                Source::Missing => return Ok(()),
+                // A value that is there inside an array element cannot be moved.
+                Source::InArray { prefix } => {
+                    return Err(invalid(format!(
+                        "$rename: the source field cannot be an array element: {:?} goes through \
+                         the array {prefix:?}",
+                        op.path
+                    )));
+                }
+                // A path that goes through a value it cannot enter is refused
+                // whether or not anything lies beyond it (q7s2f.out lines 5-63).
+                Source::Blocked { part, held } => {
+                    return Err(invalid(traverse_refusal(&part, &op.path, &held)));
+                }
+                Source::Found => {}
+            }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
-                path::unset(doc, &op.path);
-                path::set(doc, target, value).map_err(invalid)?;
+                match rename_way(doc, target) {
+                    Way::Clear => {}
+                    Way::Array { prefix, .. } => {
+                        return Err(invalid(format!(
+                            "$rename: the destination field cannot be an array element: \
+                             {target:?} goes through the array {prefix:?}"
+                        )));
+                    }
+                    // Refused here, before the source is cleared. That keeps a
+                    // document updated in place as it was for this refusal
+                    // alone: an update with several operators writes as it
+                    // goes, and callers apply it to a copy.
+                    Way::Scalar { prefix } => {
+                        let part = prefix.rsplit('.').next().unwrap_or(&prefix);
+                        let below = target[prefix.len() + 1..].split('.').next().unwrap_or("");
+                        let held = path::resolve(doc, &prefix).first().map(|v| v.to_string());
+                        return Err(invalid(format!(
+                            "cannot create field '{below}' in element {{{part}: {}}}",
+                            held.unwrap_or_default()
+                        )));
+                    }
+                }
+                path::unset_checked(doc, &op.path);
+                path::set_checked(doc, target, value, created).map_err(invalid)?;
             }
         }
 
@@ -1369,6 +1467,88 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What lies in the way of a `$rename` destination in a document: the first
+/// value on the path, above its last segment, that is not a sub-document.
+enum Way {
+    /// A sub-document at every step, or nothing at some step.
+    Clear,
+    /// An array at `prefix`.
+    Array { prefix: String },
+    /// A scalar at `prefix`, with a segment still to go through it.
+    Scalar { prefix: String },
+}
+
+fn rename_way(doc: &Document, path: &str) -> Way {
+    let segments = path::segments(path);
+    let mut level = doc;
+    for (at, segment) in segments[..segments.len() - 1].iter().enumerate() {
+        let prefix = || segments[..=at].join(".");
+        match level.get(*segment) {
+            None => return Way::Clear,
+            Some(Bson::Document(child)) => level = child,
+            Some(Bson::Array(_)) => {
+                return Way::Array { prefix: prefix() };
+            }
+            Some(_) => return Way::Scalar { prefix: prefix() },
+        }
+    }
+    Way::Clear
+}
+
+/// Where a `$rename` source leads in a document.
+enum Source {
+    /// Nothing is there: a missing key, an index past the end, a missing leaf.
+    Missing,
+    /// A value is there, reached through an array by an index.
+    InArray { prefix: String },
+    /// The path goes through a value it cannot enter, an array by a name or a
+    /// scalar or `null` by any segment: `part` is the segment that names it
+    /// and `held` the value.
+    Blocked { part: String, held: Bson },
+    /// A value is there, reached through documents alone.
+    Found,
+}
+
+/// Walk a `$rename` source: documents by key, arrays by numeric index. A step
+/// that finds nothing ends the walk as [`Source::Missing`] before anything
+/// further is judged, so an index past the end is a no-op however the path
+/// goes on.
+fn rename_source(doc: &Document, path: &str) -> Source {
+    let segments = path::segments(path);
+    let Some(mut value) = doc.get(segments[0]) else { return Source::Missing };
+    let mut array: Option<String> = None;
+    for (at, segment) in segments.iter().enumerate().skip(1) {
+        let named = segments[at - 1];
+        let next = match value {
+            Bson::Document(child) => child.get(*segment),
+            Bson::Array(items) => match path::array_index(segment) {
+                Some(index) => {
+                    array.get_or_insert_with(|| segments[..at].join("."));
+                    items.get(index)
+                }
+                None => {
+                    return Source::Blocked { part: named.to_string(), held: value.clone() };
+                }
+            },
+            other => return Source::Blocked { part: named.to_string(), held: other.clone() },
+        };
+        let Some(next) = next else { return Source::Missing };
+        value = next;
+    }
+    match array {
+        Some(prefix) => Source::InArray { prefix },
+        None => Source::Found,
+    }
+}
+
+/// The refusal for a `$rename` source that goes through a value it cannot
+/// enter, naming the part of the path that names it.
+fn traverse_refusal(part: &str, path: &str, held: &Bson) -> String {
+    format!(
+        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
+    )
 }
 
 /// `$bit` over the stored value: each step in turn, the result an `Int32`
@@ -2030,17 +2210,17 @@ mod tests {
         // replacement names it, and wherever it names it (ADR-208).
         let keys = |d: &Document| d.keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys(&out), ["_id", "x"]);
-        let out = applied(doc! { "x": 1, "_id": 999, "y": 2 }, doc! { "_id": 7, "a": 1 });
+        let out = applied(doc! { "x": 1, "_id": 7, "y": 2 }, doc! { "_id": 7, "a": 1 });
         assert_eq!(keys(&out), ["_id", "x", "y"]);
         assert_eq!(out.get_i32("_id").unwrap(), 7);
     }
 
     #[test]
-    fn a_replacement_preserves_the_existing_id() {
-        // Even when the replacement names a different one: _id is identity,
-        // not content, and a replace must not relocate the document.
-        let out = applied(doc! { "_id": 999, "x": 1 }, doc! { "_id": 7, "a": 1 });
-        assert_eq!(out.get_i32("_id").unwrap(), 7);
+    fn a_replacement_naming_a_different_id_is_refused() {
+        // _id is identity, not content: a replace must not relocate the
+        // document (q7s2d.out lines 122, 143, 153, 158).
+        let err = apply_err(doc! { "_id": 999, "x": 1 }, doc! { "_id": 7, "a": 1 });
+        assert!(err.contains("_id is immutable"), "{err}");
     }
 
     #[test]
@@ -2061,9 +2241,10 @@ mod tests {
 
     #[test]
     fn operators_may_not_reach_under_id_either() {
-        // `_id.x` is not `_id`, so the exact check let it through — and
-        // `path::set` replaces a scalar `_id` with a document to make room for
-        // `x`, which changes the document's identity. Every operator goes
+        // `_id.x` is not `_id`, so the exact check let it through — and a write
+        // there once replaced a scalar `_id` with a document to make room for
+        // `x` (`path::set` still does, for the stages that share it), which
+        // changes the document's identity. Every operator goes
         // through the same check, so `$unset` and `$rename` are pinned too.
         assert!(parse(&doc! { "$set": { "_id.x": 1 } }).is_err());
         assert!(parse(&doc! { "$unset": { "_id.x": "" } }).is_err());
@@ -3149,9 +3330,10 @@ mod tests {
 
     #[test]
     fn an_index_segment_is_one_path_however_it_is_spelled() {
-        // The path language reads `01` and `+1` as index 1, so each was a
-        // second write to `a.1`, and the result followed the key order.
-        for spelling in ["a.01", "a.+1", "a.001"] {
+        // The path language reads `01` as index 1, so each was a second write
+        // to `a.1`, and the result followed the key order. A sign makes `+1` a
+        // field name, so it is no spelling of that index.
+        for spelling in ["a.01", "a.001"] {
             for update in [
                 doc! { "$set": { "a.1": 5 }, "$inc": { spelling: 1 } },
                 doc! { "$inc": { spelling: 1 }, "$set": { "a.1": 5 } },
@@ -3200,16 +3382,15 @@ mod tests {
             ) && err.contains("at \"items.1.qty\""),
             "{err}"
         );
-        // Onto a field no positional path reaches, it applies.
-        let out = applied_with(
+        // Onto a field no positional path reaches there is no conflict, but a
+        // rename into an array element is refused all the same (q7s2.out
+        // line 111).
+        let err = apply_err_with(
             doc! { "$rename": { "x": "items.1.note" }, "$inc": { "items.$[].qty": 1 } },
             vec![],
             start,
         );
-        assert_eq!(
-            out.get_array("items").unwrap()[1].as_document().unwrap().get_i32("note").unwrap(),
-            7
-        );
+        assert!(err.contains("destination field cannot be an array element"), "{err}");
     }
 
     #[test]
