@@ -124,6 +124,16 @@ equality join.
   access, like a `$lookup`'s. A `from` that does not exist reads as empty on a node with no peers, and
   is a `404` with a retry hint on a node with peers, as for `$lookup`.
 
+### A `$group` key over null and missing
+
+A missing value and a `null` are one group (`_id: "$v"` is `null` for both, and `["$v"]` is
+`[null]`). An `_id` object of **exactly one field** reads a missing value as `null` too:
+`{_id: {k: "$v"}}` over `v: null` and no `v` is one group, `{k: null}`, whichever is scanned
+first (q7s4g:106, 114). With **two fields or more**, or a field that is itself an object
+(`{a: {k: "$v"}}`), a missing value stays apart and is left out of the key: `{k: "$v", j:
+"$w"}` makes `{k: null, j: 1}`, `{j: 1}`, `{k: null}` and `{}` four groups (q7s4g:107, 110,
+112, 113).
+
 ### `$bucket` and `$bucketAuto`
 
 ```json
@@ -235,6 +245,57 @@ reference's is, and as `$group`'s `{$sum: 1}` is ([ADR-268](decisions.md#adr-268
 counts is unspecified**, as it is in the reference (two runs of it differ): this build
 happens to keep the order each value was first seen, and that is not a promise. It holds its groups, and one group per distinct value counts against the pipeline's
 document limit like `$group`.
+
+### A `$sort` on `_id` alone
+
+A sort whose **only key is `_id`**, `{_id: 1}` or `{_id: -1}`, compares the `_id` values
+**whole**, wherever the `_id` came from (`$group`, `$sortByCount`, `$replaceWith`,
+`$project`, `$addFields`, `$set`) and with any stages between the source and the sort
+(`$match`, `$limit`, `$skip`, `$addFields`, `$project`), in a pipeline, a `$facet` branch, a
+sub-pipeline and the bounded sort of a `$sort` with a `$limit`; q7s4j (147 cases), q7s4f:31
+to 48, q7s4a:65, 277, 303. The order is that of [comparison](query-language.md#sort-and-projection):
+`null`, numbers, strings, documents, then arrays; documents by the type of each field's
+value, then its name, then the value, recursively; an array element by element, a shorter
+one first, `[]` the least array. `[1]` is after `"b"` and `{a: 1}`, and `[]` is not below
+`null` (q7s4f:31: `null < 0 < 2 < "b" < {a: 1} < [] < [0, 9] < [1] < [1, 2] < [3, 1] < [5] <
+["a"] < [[2]]`; q7s4j:1 to 8 for sixteen document shapes, q7s4j:17 for documents beside
+arrays). **Every other sort**, with a second key (`{_id: 1, n: 1}`: q7s4j:99), a path inside
+the key (`{"_id.a": 1}`: q7s4j:43) or another field (`{x: 1}`: q7s4j:97), reads an array by
+its least element ascending and its greatest descending, and keeps `[]` below `null`.
+A `find` `sort: {_id: 1}` follows the same rule, with no effect on a stored `_id`, which
+is never an array or a document here. `$bucket` and `$bucketAuto` keys are scalars and
+`{min, max}` documents that both rules order alike (q7s4f:39, 48).
+
+**Keys that read arrays.** Two sort keys that meet **different arrays** of one document are
+refused, `400`, `cannot sort with keys that are parallel arrays`, in a `$sort` stage and in a
+`find` `sort` alike (q7s4k, 140 cases). An empty array counts, a position does not help
+(`a.0` with `b.0`), `{a: [1, 2], b: [[3, 4]]}` is parallel, and so are two arrays inside one
+element or one sub-document (`a.b` and `a.c` over `a: [{b: [1, 2], c: [3, 4]}]`). One document
+among those the sort sees refuses the whole sort, whatever `skip` and `limit` say. Not refused:
+one array and a scalar, null or missing key; two paths through **one** array (`a.x`, `a.y`);
+arrays in **different elements** (`a: [{b: [1, 2]}, {c: [3, 4]}]`); `a.0` with `a.1` or `a`; a
+collection where one document has its array in `a` and another in `b`; a filter that leaves the
+offending document out. A filter that is **exactly one key `_id` with a literal value** reads the one document by its
+key and sorts nothing, so its document is returned: in `find` (with or without `limit`, `skip`,
+a projection or `_id` among the sort keys), in `findAndModify` (update, upsert and remove) and in a
+pipeline whose first stage is that `$match` with the `$sort` right after it or only a `$skip`
+between (q7s4k 103, 104; q7s4l). Every other filter that selects the document is refused, with
+the same text: `{_id: {$eq: v}}`, `{_id: {$in: [v]}}`, `{_id: v, a: {$exists: true}}`,
+`{$and: [{_id: v}]}`, `{_id: {$gte: v, $lte: v}}`, no filter, and `{_id: v}` followed by `$limit`,
+`$addFields` or `$project` before the `$sort`. The value is exempt of **every type but `null`**
+(q7s4m, 72 cases): a string, an ObjectId, a Long, a Double, a Decimal128, a boolean, a date, a
+document, a binary, a UUID and the empty string; `{_id: null}`, a regular expression in either
+spelling (`/^s/`, `{$regex: ...}`) and an operator document are refused, as is a second key beside
+`_id`; an array as the value (`[1, 2]`, `[]`, `[2]`) selects nothing and raises nothing, and
+`{_id: {}}` is exempt where `{_id: {$eq: {}}}` is refused (q7s2z 13 to 27). A `$match` that stands right after a `$sort` is
+applied before it, so the sort reads only what the match keeps (q7s4l 32), and a `$limit` before
+the `$sort` that keeps the document out leaves nothing to refuse (q7s4l 34, 35).
+
+**Keys that read one array together** make one tuple per element, and a document sorts by the
+tuple that comes first under the whole pattern with its directions, not by a minimum per key
+(q7s4k (d): `a.x, a.y` over `{a: [{x: 1, y: 2}, {x: 3, y: 0}]}` is `(1, 2)`, `a.y, a.x` is
+`(0, 3)`; (g): `a.0, a` over `{a: [0, 9]}` is `(0, 0)`). With at most one array among the keys,
+each key is its own least element ascending and greatest descending, as before.
 
 ### `$replaceWith`
 
@@ -474,6 +535,26 @@ check and the write, which is a `409` in the first chunk and `partially_applied`
 after it. The `timeseries` form,
 `{db, coll, timeseries: ...}`, is refused by name.
 
+### Names and paths a stage refuses
+
+A stage that takes a field name or a field path refuses one that is no path, `400`, at parse,
+as the reference does (q7s4d, q7s4a: 22 cases). Before, each was applied, and a pipeline update
+stored the result.
+
+- A `$project`, `$addFields` or `$set` name that is empty (`""`), ends in a `.` (`"a."`), has an
+  empty segment (`"a..b"`, `".a"`) or a segment that starts with `$` (`"$a"`, `"a.$b"`); a `$sort`
+  key of any of those. A segment that is exactly `$` or `$ref` is a name, as it is in a find
+  projection.
+- A field path written as an expression (`"$"`, `"$a."`, `"$.a"`, `"$a..b"`), in every stage
+  and operator that reads one. An empty segment and a `$`-led segment inside it are UNRECORDED in an
+  expression; they are refused as a projection name is.
+- `$project {}` and `$sort {}`. A find's empty projection and empty sort are no change.
+- `$set` or `$addFields` naming a path and one inside it (`{a: 1, "a.b": 2}`), which wrote one
+  or the other by the order they were written in. `$project` is unchanged: of two such paths the
+  shorter one wins.
+- A `$group` output name with a `.` or a leading `$`; a `$count` name with a `.` or a leading
+  `$`. A `$bucket` or `$bucketAuto` output name is UNRECORDED and is not refused.
+
 ### `$project`
 
 The flags are `find`'s projection, rule for rule — one implementation serves
@@ -494,15 +575,33 @@ element** ([Query language](query-language.md#sort-and-projection)):
 ```
 
 A computed field reads the input document, not the projection's output, and
-is written after the flags are applied. A computed field written *into* the
-kept array through a named segment — `{"p._id": 1, "p.total": …}` with `p` an
-array — has no one place to go and is refused, `400`, `cannot set "p.total"`,
-as `$addFields` refuses it; it is not written into a document standing in for
-the array. **A numeric segment is the exception, and it is a position:** a
-computed field is written the way an update writes, so `{"p._id": 1, "p.0":
-"$qty"}` over `p: [{_id: 1}, {_id: 2}]` and `qty: 2` replaces element `0` and
-answers `p: [2, {_id: 2}]`, exactly as `$addFields` with `"p.0"` does. The
-flags beside it read `p.0` as a field name; the write does not.
+is written after the flags are applied.
+
+**A document with no operator is its dotted spelling.** In `$project`, `$addFields` and
+`$set`, `{o: {z: 1}}` is `{"o.z": 1}` (q7s4g:1 and 7, 31 and 35): the stage merges it into
+the sub-document already there, two and three levels nest the same way, a dotted key of the
+same parent sits beside it in either order, and the leaves are written in the order they are
+given. In `$project` a `1` or `true` leaf includes, a `0` or `false` leaf excludes and any
+other leaf is computed. An empty document as a value is refused (`$addFields`/`$set`: "an
+empty object is not a valid value"; `$project`: "an empty sub-projection is not a valid
+value"), and so is a path that is a prefix of another (`{a: 1, "a.b": 2}`).
+
+**Every segment of a written path is a field name**, a run of digits included, and the write
+goes into **every element of an array** on the way (q7s4g:61 to 84). A document is entered,
+an existing field keeps its place and a new one is appended; an array is entered element by
+element, a nested array too, and an empty array stays `[]`; a scalar, a null or a missing
+value before the last segment is replaced by a new document, so a scalar element of an
+array becomes one. `{"arr.0": 9}` over `arr: [1, 2]` is `arr: [{"0": 9}, {"0": 9}]`, over
+`arr: 5` it is `arr: {"0": 9}`, and `{"arr.p": 9}` over `[{"p": 1}, 5]` is
+`[{"p": 9}, {"p": 9}]`. `$$REMOVE` as a leaf takes the field out and still makes a document
+of each parent it passes (`{o: {z: "$$REMOVE"}}` over `o: 5` is `o: {}`). Beside a computed
+leaf of `$project`, a scalar element of the array it is written into is kept, as an empty
+document that receives the field (q7s4g:33, 34).
+
+**A pipeline update stores exactly what the stage answers** (q7s4g:40 to 56, 85 to 96), so
+`[{$set: {address: {city: "X"}}}]` merges `city` into the stored `address`, and `"items.0"`
+writes a field named `0` into every element of `items`. The update operators keep their own
+rule for a digit (a position), which is [Update operators](query-language.md#update-operators)'.
 
 ### `$unwind`
 
@@ -519,53 +618,22 @@ The shorthand string form takes only a path. The document form takes:
 | `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it. Wrong-typed is a `400`, not read as `false` |
 | `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out. Cannot begin with `$` (this language cannot read such a field back) or name `path` itself (it would overwrite the unwound element) |
 
-**A path that crosses an array *by name* is refused outright, before
-anything at the far end of it is even read — see [ADR-130](decisions.md) and
-[Arrays](#arrays).** `$unwind` needs a single place to write the expanded
-element back to. Whenever a non-terminal segment of `path` is itself an
-array on a given document, and the segment after it **names a field rather
-than a numeric position** — `x.b` where `x` holds an array, at any length
-down to one — there is no such place, and the request is refused, `400`,
-naming `$unwind` and the path. This holds regardless of what that array
-turns out to contain: a scalar, another array, an empty array, nothing —
-none of it changes the answer, because the refusal is decided by the
-document's *shape* along the path, before `$unwind` looks at what is there
-to unwind.
+**`path` is read as field names only** (q7s4i 316, 317, 392, 411): every segment is a name, a
+run of digits included, and a path that meets an **array before its last segment is
+missing**. It is never read as a position, never traversed and never refused. `$unwind:
+"$items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` drops the document, and with
+`preserveNullAndEmptyArrays` keeps it unchanged; `$unwind: "$a.0.b"` over `a: [{b: [1, 2]}]`
+does the same, where it used to read `0` as a position and unwind `b`. A path through
+documents only unwinds as before. (Until this release a path that crossed an array by a name
+was a `400` for every such document, and a path with a position unwound it.)
 
-**A numeric segment addresses a position instead, and is not refused.**
-`$unwind: "$a.0"` writes into element `0` of `a` directly — a single place,
-the same as any array write by index — and reads it the same way `find` and
-every other field-path option here does: a numeric segment is read as
-*both* an index and a field literally named that number ([Arrays](#arrays)
-has the full rule and the one place it disagrees with an expression path).
-So `$unwind: "$a.0.b"` over `a: [{b: [1, 2]}, {b: [3]}]` does not cross
-anything by this rule — it finds `a.0.b` as `[1, 2]` (element `0`'s `b`) and
-unwinds it into **two rows, `a[0].b` replaced by `1` then by `2`, with the
-rest of `a` untouched** — `[{b: 1}, {b: [3]}]`, then `[{b: 2}, {b: [3]}]`.
-This is a genuine difference from a computed expression over the identical
-path: `{$addFields: {r: "$a.0.b"}}` reads `"0"` as a field name only, finds
-no element actually named `"0"`, and gives `r: []`.
-
-**This makes the refusal data-dependent: whether a pipeline is legal at all
-depends on the documents it meets, not on the pipeline text.** The same
-`{"$unwind": "$a.b"}` answers `200` for every document where `a` is a plain
-subdocument and `400` for any document where `a` is an array — a schemaless
-collection can hold both shapes under the same field name, so a pipeline
-that has run correctly for months can start answering `400` the day an
-ordinary write adds one document shaped that way, with nothing about the
-pipeline having changed. And it fails **the whole request**, not just the
-offending document: one such document among a thousand others refuses
-every row, because the refusal is a stage-level error, not a per-document
-skip. A field a pipeline unwinds should be one every document in the
-collection either holds as a plain field or never holds as an array at all.
-
-For every document where `path` does not cross an array this way, what is
-found there decides what happens:
+What is found at `path` decides what happens:
 
 | Value at `path` | Without `preserveNullAndEmptyArrays` | With it |
 |---|---|---|
 | A non-empty array | One row per element, `path` set to that element | Same |
-| Missing, `null`, or `[]` | Dropped | Kept once, `path` unset (removed) |
+| Missing or `[]` | Dropped | Kept once, `path` unset (removed) |
+| `null` | Dropped | Kept once, as the `null` it is (q7s4a:233, 235, 237) |
 | Any other scalar | One row, unchanged — the value unwinds to itself | Same |
 
 `includeArrayIndex` is `null` on every row in the second and third cases: a
@@ -987,6 +1055,14 @@ or exponent (`0`, `-0`, `0.000`, `0E-6176`). **Everything else is true**: `""`,
 like `{$cond: [{$gt: ["$n", 0]}, {$divide: [100, "$n"]}, null]}` works, rather
 than failing on exactly the inputs it exists to protect.
 
+**`$ifNull` takes two or more arguments**, `[e1, ..., en, replacement]`: the first `ei`
+that is neither `null` nor missing, and the replacement when there is none
+(`{$ifNull: [null, null, 3]}` is `3`, `{$ifNull: [null, 2, 3]}` is `2`; q7s4b:3657, 3658,
+3661). The arguments are read in order and no further than the one that answers, so a
+later one that would fail is not read (UNRECORDED in the reference: whether an erroring
+replacement that is not taken refuses). One argument and none are refused (q7s4b:3659,
+3660).
+
 **`$and` and `$or` fail only when the answer depends on the failure**
 ([ADR-211](decisions.md)). An `$and` is `false` if any argument is false, and
 an `$or` `true` if any is true, beside an argument that cannot be evaluated and
@@ -1018,6 +1094,8 @@ when the total does not fit (a chain is typed by its **final** total, so
 ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)).
 `$divide` is always a double — an integer result would make `{$divide: [1, 2]}`
 zero.
+The double a sum starts from is `+0.0`: `{$add: [-0.0, -0.0]}` and `{$add: [-0.0]}` are `0.0`, where a product keeps its sign (`{$multiply: [-0.0, 1]}` is `-0.0`; q7s4g:670 to 672).
+A `null` or missing operand of `$subtract`, `$divide` or `$mod` makes the answer `null` in either position, before the type of the other operand is looked at: `{$divide: ["s", null]}` is `null`, not a refusal (q7s4b:1556, 1576, 1596, 1956, 1976, 1996 and the missing-path lines after each).
 
 #### Integer result widths
 
@@ -1056,11 +1134,21 @@ with, and the rule applies to what an expression computes from now on.
 **Date arithmetic works.** `$add` shifts a date by milliseconds, `$subtract`
 between two dates gives the interval in milliseconds, and `$subtract` of a
 number from a date shifts it back.
+A double shift is cut toward zero (`Date(0) + 1.5` is `Date(1)`, `Date(0) - 1.5` is
+`Date(-1)`), and the shift is exact: a long is not read through a double. **A shift that
+no date can hold is refused, `400`**, as the reference refuses it: a `NaN` or an infinity
+(`date overflow in $add`; `Can't coerce out of range value nan to long` for `$subtract`),
+`Date - Int64.MIN` (`Cannot negate the minimum duration`), and, UNRECORDED, a finite
+double or a sum that is past the range of a long. It answered `Date(0)` for a `NaN` and
+saturated for the rest. Dates past &plusmn;8.64e15 ms are valid dates, whose
+shift answers a date that most clients cannot print (q7s4b:140, 387).
 
-**Strings are counted in code points, not bytes.** `$substr` is `$substrCP`.
-The byte-oriented `$substrBytes`, `$indexOfBytes` and `$strLenBytes` exist
-([Strings](#strings)); `$substrBytes` refuses an offset inside a character, so it
-cannot produce invalid UTF-8.
+**`$substrCP`, `$strLenCP` and `$indexOfCP` count code points; the legacy `$substr` counts
+bytes**, as `$substrBytes` does (q7s4g:674: `$substr` of `"aéb"` from 1 for 2 is `"é"`, and
+`$substrCP` of it is `"éb"`). A range that splits a character is refused by `$substr` and
+`$substrBytes` alike, so neither can produce invalid UTF-8; a negative length reads "to the end"
+for both (q7s4g:678), and `$substrCP` refuses it, `400`, as the reference does (q7s4d:137,
+code 34454). A negative start is refused by all of them.
 
 ### Dates and time zones
 
@@ -1365,7 +1453,7 @@ not added, and an existing field of that name is removed (`{$set: {p: "$nope"}}`
 **`$$REMOVE` leaves a field out.** As the value of a field in `$project` or
 `$addFields`, or in a document an expression builds, it drops that field, and in
 `$addFields` it removes a field the document already had:
-`{$addFields: {secret: "$$REMOVE"}}`. A path that names a field *through an array by a name* (`a.b` over `a: [{b: 1}]`) is refused as a value written there would be, with the same error; a numeric position (`a.0`) leaves a `null` in the array, as `$unset` does, so other positions keep their index. It works through the result position of
+`{$addFields: {secret: "$$REMOVE"}}`. A path through an array removes the field from every element, and a scalar element becomes an empty document (`a.b` and `a.0` alike: every segment is a field name; q7s4g 71, 72). It works through the result position of
 `$cond`, `$switch` and `$let`, so `{$cond: [{$gt: ["$qty", 0]}, "$qty", "$$REMOVE"]}`
 keeps the field only when it is positive. Anywhere else it reads as `null`, the
 same as a path to a missing field does in this engine (an expression always
@@ -1410,7 +1498,7 @@ and is null when the index is out of range on either side. **`$first`** and
 *present*. A later `$match` on `{head: {$exists:
 true}}` keeps the document here, and the same holds for an index out of range
 and for a field path that resolves to nothing.
-**A fractional index is refused**, not truncated.
+**A fractional index is refused**, not truncated. So is an index that is not a 32-bit integer (an `Int64` of `2147483648`), as the reference refuses it (q7s4c:136, code 28691); a 32-bit index past the array is still null.
 
 **A whole-number argument may be any number of whole value**: an integer, a
 double such as `2.0`, or a decimal such as `{"$numberDecimal": "2"}` or
@@ -1458,11 +1546,11 @@ filter language and a sort key read `items.0` both ways, and an update path
 writes by position; that is where an expression path and a filter path
 disagree — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
-**`$unwind` also has to write each expanded element back to its path**, not
-only read it, and a path crossing an array by a named segment has no single
-place to write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is
-refused, `400`, on every such document, regardless of what `b` holds at any
-element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
+**`$unwind` and `$densify` read a field name, not an expression**: a path that meets an
+array before its last segment is missing (see [`$unwind`](#unwind)). A `$lookup`
+`localField` takes a digit segment as a position only where the element is a document, and
+its `foreignField` follows the filter rule and keeps an array it reached by a position whole
+(q7s4i 321, 340, 359, 360, 417).
 
 **`$range`** is bounded as every array an expression builds is, to 16 MiB of
 BSON, which is 1,376,024 integers: `{$range: [0, 1000000000]}` is a memory
@@ -1762,7 +1850,7 @@ What converts to what:
 |---|---|
 | `double` | any number; bool (`0`/`1`); date (epoch milliseconds); string, parsed strictly — `"1.5"`, `"-1e3"`; not `"1.5kg"` |
 | `int`, `long` | any number, **truncated toward zero** and refused when out of range — `$toInt` of 2^40 is an error, not a wrap; bool; string as a base-10 integer — `"42"`, not `"1.5"`; date to `long` only (epoch milliseconds never fit an int) |
-| `string` | number (a whole double prints as `"2"`, not `"2.0"`, and a double never prints in exponent form); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
+| `string` | number (a whole double prints as `"2"`, not `"2.0"`; a double prints every digit and never in exponent form, where the reference keeps six significant digits and prints `1e20` as `"1e+20"`: [deviations.md](deviations.md) names it); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
 | `bool` | a number is `false` when zero, a stored `Decimal128` zero of any sign or exponent included; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
 | `date` | a number as epoch milliseconds (a double is truncated); a string in RFC 3339 / ISO 8601 with an offset or `Z`, or the looser forms `"2026-08-12"`, `"2026-08-12 13:45:07"` and a missing zone, all read as UTC; an ObjectId's creation time |
 | `objectId` | a string of 24 hex characters |
@@ -1993,7 +2081,9 @@ an index and a field name). Four rules decide the rest:
   them in. The reference behaviour does not promise an order here.
 - **Nothing at the path joins nothing.** An input document without the field
   attaches nothing, and a foreign document without it is never a candidate; an
-  explicit `null` joins an explicit `null`. A stored `Decimal128` joins by its
+  explicit `null` joins an explicit `null`, and **a local `[]` joins as `null`**, so it
+  meets a foreign `null` and a foreign `[null]` and not a foreign `[]`, which only a local
+  `[[]]` meets (q7s4g:627). A stored `Decimal128` joins by its
   value, like any number: `Decimal128("5.00")` joins `5`, and `[Decimal128("5.0"),
   5]` joins under the one key `5`. (Until 0.51.0 a decimal could not be a key
   and joined nothing.)
@@ -2225,7 +2315,9 @@ examined or read.
 
 **`explain` describes the pipeline that runs, and says how each stage runs.** The stages listed are
 the ones the executor runs, after it has moved a `$skip` and a `$limit` ahead of the stages they may
-pass ([Deviations](deviations.md#skipped-documents-adr-270)), and the `hold` of each is not written apart from
+pass ([Deviations](deviations.md#skipped-documents-adr-270)) and a `$match` that stands right after a
+`$sort` ahead of it, so `[$sort, $match]` is shown as `[$match, $sort]` with the match planned as the
+leading match; `explain` shows the pipeline after the documented stage moves. The `hold` of each is not written apart from
 the executor: the executor builds its chain of stages from the same function (`pipeline::segments`)
 that `explain` reads, so the two do not differ; a test pins what each stage kind and each fused
 shape holds, written out apart from that function. The field names that were there are unchanged; the fields below are **new**.

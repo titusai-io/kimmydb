@@ -796,6 +796,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         seed(&state, "a", 10, true);
+        // A `$match` after a stage the move does not touch (a `$project`, not a `$sort`) is an
+        // in-memory filter, never planned.
+        let out = explain(
+            &state,
+            &root(),
+            "a",
+            json!([{ "$sort": { "k": 1 } }, { "$project": { "k": 1 } }, { "$match": { "n": 1 } }]),
+        )
+        .unwrap();
+        let source = &out["explain"]["source"];
+        assert_eq!(
+            (source["strategy"].clone(), source["stages"].clone()),
+            (json!("collectionScan"), json!(0))
+        );
+        let stages = out["explain"]["stages"].as_array().unwrap();
+        assert_eq!(stages[2]["stage"], "$match");
+        assert!(stages[2]["detail"].as_str().unwrap().contains("never planned"));
+
+        // A `$match` right after a `$sort` runs before it (q7s4l 32), and explain shows the
+        // pipeline as it runs: the match is the leading match, planned on the index on `n`, and
+        // only the sort is left as a stage.
         let out = explain(
             &state,
             &root(),
@@ -806,12 +827,11 @@ mod tests {
         let source = &out["explain"]["source"];
         assert_eq!(
             (source["strategy"].clone(), source["stages"].clone()),
-            (json!("collectionScan"), json!(0))
+            (json!("index"), json!(1))
         );
-        // The `$match` after another stage is an in-memory filter, never planned.
         let stages = out["explain"]["stages"].as_array().unwrap();
-        assert_eq!(stages[1]["stage"], "$match");
-        assert!(stages[1]["detail"].as_str().unwrap().contains("never planned"));
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0]["stage"], "$sort");
     }
 
     /// The answer says it ran nothing, has no documents, and none of the keys that
@@ -1301,9 +1321,16 @@ mod tests {
         );
         // a stage that blocks, and a source read whole.
         pin(
-            json!([{"$sort": {"k": 1}}, {"$match": {"n": 1}}]),
+            json!([{"$sort": {"k": 1}}, {"$project": {"k": 1}}, {"$match": {"n": 1}}]),
             json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": false, "maxDocuments": 100000, "holds": "every document the read admits, charged as `the source read` until the first stage takes it; a read past maxDocuments is refused 400, and past the memory limit 413"}),
-            json!([{"stage": "$sort", "runs": "inMemory", "keys": ["k"], "hold": "blocks", "detail": format!("sorts the documents that reach it by the keys; {BLOCKS}")}, {"stage": "$match", "runs": "inMemory", "hold": "streams", "detail": format!("filters the documents that reach it, in memory; never planned, and no index is used; {STREAMS}")}]),
+            json!([{"stage": "$sort", "runs": "inMemory", "keys": ["k"], "hold": "blocks", "detail": format!("sorts the documents that reach it by the keys; {BLOCKS}")}, {"stage": "$project", "runs": "inMemory", "hold": "streams", "detail": format!("reshapes each document that reaches it; {STREAMS}")}, {"stage": "$match", "runs": "inMemory", "hold": "streams", "detail": format!("filters the documents that reach it, in memory; never planned, and no index is used; {STREAMS}")}]),
+        );
+        // a `$match` right after a `$sort` runs before it (q7s4l 32): explain shows the pipeline
+        // as it runs, the match planned as the leading match and only the sort left as a stage.
+        pin(
+            json!([{"$sort": {"k": 1}}, {"$match": {"n": 1}}]),
+            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": false, "maxDocuments": 100000, "holds": "every document the read admits, charged as `the source read` until the first stage takes it; a read past maxDocuments is refused 400, and past the memory limit 413"}),
+            json!([{"stage": "$sort", "runs": "inMemory", "keys": ["k"], "hold": "blocks", "detail": format!("sorts the documents that reach it by the keys; {BLOCKS}")}]),
         );
         // a sort and limit is a heap, and what follows it streams.
         pin(
@@ -1641,9 +1668,22 @@ mod tests {
                 vec![("state", "heap"), ("state", "heap"), ("streams", "")],
             ),
             (vec![sort(), json!({ "$skip": 2 })], vec![("blocks", ""), ("streams", "")]),
+            // A `$project` between the sort and the match: the match stays where it is, so the
+            // limit is not the sort's.
+            (
+                vec![
+                    sort(),
+                    json!({ "$project": { "k": 1 } }),
+                    json!({ "$match": { "k": 1 } }),
+                    json!({ "$limit": 3 }),
+                ],
+                vec![("blocks", ""), ("streams", ""), ("streams", ""), ("streams", "")],
+            ),
+            // A `$match` right after the `$sort` runs before it (q7s4l 32), so explain shows the
+            // pipeline as it runs: a heap of the sort with the limit folded into it.
             (
                 vec![sort(), json!({ "$match": { "k": 1 } }), json!({ "$limit": 3 })],
-                vec![("blocks", ""), ("streams", ""), ("streams", "")],
+                vec![("state", "heap"), ("state", "heap")],
             ),
             (
                 vec![json!({ "$group": { "_id": "$n" } }), json!({ "$count": "c" })],

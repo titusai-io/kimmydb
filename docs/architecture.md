@@ -199,7 +199,7 @@ publication *after* commit. Both are deliberate, and both are covered in
 ```mermaid
 graph LR
     subgraph OUT["Outside"]
-        J["JSON<br/>Extended JSON v2 for<br/>$oid, $date, $numberLong"]
+        J["JSON<br/>Extended JSON v2 for<br/>$oid, $date, $numberLong (read)"]
     end
     subgraph IN["Inside"]
         B["BSON<br/>typed, ordered,<br/>lossless"]

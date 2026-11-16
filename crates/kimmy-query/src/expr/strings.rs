@@ -585,10 +585,18 @@ pub(super) fn substr_bytes(args: &[Bson]) -> Result<Bson> {
             // Truncated toward zero.
             Bson::Double(d) if (i64::MIN as f64..-(i64::MIN as f64)).contains(d) => Ok(*d as i64),
             Bson::Double(d) => Err(out_of_range(format_g(*d))),
-            Bson::Decimal128(d) => match kimmy_core::decimal::integer_part(d) {
-                Some(part) if part.in_range => Ok(part.value),
-                _ => Err(out_of_range(d.to_string().to_lowercase())),
-            },
+            // A Decimal128 is rounded to the nearest whole number, halves to the even one (0.5 to 0,
+            // 1.5 to 2, 2.5 to 2, 3.5 to 4, -0.5 to 0: q7s4u), where a Double is truncated.
+            Bson::Decimal128(d) => {
+                let rounded = match super::math::round(Op::Round, v, None)? {
+                    Bson::Decimal128(rounded) => rounded,
+                    _ => *d,
+                };
+                match kimmy_core::decimal::integer_part(&rounded) {
+                    Some(part) if part.in_range => Ok(part.value),
+                    _ => Err(out_of_range(d.to_string().to_lowercase())),
+                }
+            }
             other => Err(Error::InvalidQuery(format!(
                 "$substrBytes: {what} must be a numeric type (is BSON type {})",
                 type_name(other)

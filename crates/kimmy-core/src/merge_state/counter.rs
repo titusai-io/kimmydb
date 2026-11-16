@@ -325,19 +325,6 @@ impl Num {
         }
     }
 
-    /// The zero of the type `k` (the start of a sum).
-    pub(super) fn zero(k: Kind) -> Num {
-        match k {
-            Kind::Int32 => Num::Int32(0),
-            Kind::Int64 => Num::Int64(0),
-            Kind::Decimal128 => Num::Decimal128(dec_bytes(Raw::Finite {
-                negative: false,
-                coefficient: 0,
-                exponent: 0,
-            })),
-        }
-    }
-
     /// `self` converted up to the type `k` (a type below is unchanged).
     pub(super) fn to_kind(self, k: Kind) -> Num {
         match (k, self) {
@@ -375,7 +362,8 @@ pub(super) enum Inc {
 pub(super) fn inc_result(cur: Option<&Value>, op: &Value, bound: i64) -> Option<Inc> {
     if let Value::Double(x) = op {
         return match cur {
-            None => Some(Inc::Register(Value::Double(0.0 + x))),
+            // the operand as it is: `0.0 + -0.0` would lose the sign (q7s2k.out k0010)
+            None => Some(Inc::Register(Value::Double(*x))),
             Some(Value::Double(d)) => Some(Inc::Register(Value::Double(d + x))),
             // THE predicate: a double operand on a counter is refused
             Some(_) => None,
@@ -578,6 +566,14 @@ mod tests {
             Some(Inc::Register(Value::Double(3.0)))
         );
         assert_eq!(inc_result(None, &d, b), Some(Inc::Register(Value::Double(0.5))));
+        // an absent field takes the operand as it is, so a negative zero keeps its sign (q7s2k.out
+        // k0010: `$inc -0.0` over an absent field stores `-0.0`)
+        match inc_result(None, &Value::Double(-0.0), b) {
+            Some(Inc::Register(Value::Double(x))) => {
+                assert_eq!(x.to_bits(), (-0.0_f64).to_bits(), "{x:?}");
+            }
+            r => panic!("{r:?}"),
+        }
         // a decimal operand on a double base is a decimal register
         match inc_result(Some(&Value::Double(0.5)), &dv("0.25"), b) {
             Some(Inc::Register(Value::Decimal128(x))) => {

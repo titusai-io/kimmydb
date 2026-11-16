@@ -514,3 +514,12 @@ fn a_routed_inc_never_survives_silently_beside_an_explicit_insert() {
         assert!(lost, "no insertLost: {fresh_a:?} {fresh_b:?} over {}", render(&creator));
     }
 }
+
+/// I8, q7s5a0011: an upsert of `{_id: 2}` (here a filter on `k`: the helper compares the creation without the `_id`) with `$inc x Decimal128 "-0"` stores `-0`, and I9,
+/// q7s5a0012: with `$inc x Double -0.0` stores `-0.0`; the writer creates the same bytes
+/// (`creates` compares them).
+#[test]
+fn an_upsert_creates_a_negative_zero_from_an_inc_as_the_operand() {
+    creates(doc! {"k": 2}, doc! {"$inc": {"x": Bson::Decimal128("-0".parse().unwrap())}});
+    creates(doc! {"k": 2}, doc! {"$inc": {"x": Bson::Double(-0.0)}});
+}

@@ -32,10 +32,7 @@ fn ref_inc_doc(doc: &Document, paths: &[Vec<String>]) -> Document {
         }
         match v {
             Bson::Document(d) => {
-                let r = ref_inc_doc(d, &rests);
-                if !r.is_empty() {
-                    out.insert(k.clone(), r);
-                }
+                out.insert(k.clone(), ref_inc_doc(d, &rests));
             }
             Bson::Array(items) => {
                 out.insert(k.clone(), ref_inc_arr(items, &rests));
