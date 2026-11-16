@@ -44,14 +44,17 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 24] = [
+const WALKS: [&str; 26] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
     ".for_each_record_after(",
+    // The same walk, handing the visitor each document's version identity.
+    ".for_each_version_after(",
     ".visit_index_candidates(",
     // The same walk with the keys of an inexact range charged to a hold (ADR-270).
     ".visit_index_candidates_held(",
+    ".visit_index_candidates_versioned_held(",
     ".count(&",
     ".live_unique_violations(",
     ".backup_to(",

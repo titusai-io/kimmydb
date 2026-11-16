@@ -170,7 +170,7 @@ pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
 };
-pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
+pub use docs::{BulkInsertError, ID_FIELD, Seen, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{
     CacheReading, DurabilityClass, Engine, NotClosed, OpenOptions, RepairsAtOpen,
@@ -184,7 +184,9 @@ pub use hold_meter::{
     Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
     ServeSnapshot, ServeWalk, WalkPath,
 };
-pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome, KeyHold, UnkeyedPage};
+pub use index::{
+    CandidateOrder, Dropped, IndexScan, IndexScanOutcome, KeyHold, ScanExtras, UnkeyedPage,
+};
 pub use merge::{SinkCounts, SinkMode, SinkOutcome, WhenMatched};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{

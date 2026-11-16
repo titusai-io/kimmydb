@@ -29,6 +29,12 @@ pub enum DocVersion {
     Etag(Stamp, StateHash),
 }
 
+impl From<Stamp> for DocVersion {
+    fn from(stamp: Stamp) -> Self {
+        Self::Stamp(stamp)
+    }
+}
+
 impl DocVersion {
     /// Length of an etag token's raw bytes.
     pub const ETAG_LEN: usize = 1 + Stamp::KEY_LEN + 16;

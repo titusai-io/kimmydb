@@ -544,6 +544,7 @@ impl KimmyMcp {
             // `limit` and a narrower filter are the right answers here.
             cursor: None,
             stamps: false,
+            covers: None,
         };
         render(exec::find(&self.state, &auth, &args.database, &args.collection, params))
     }
