@@ -281,3 +281,66 @@ fn an_increment_of_a_field_collection_is_a_counter_slot_and_not_a_register_write
     assert_eq!((out.matched, out.modified), (1, 0));
     assert_eq!(e.commits(), commits);
 }
+
+/// An upsert spec: nothing matches, the engine inserts `seed`, created as `fx`.
+struct SpecUpsert {
+    seed: Document,
+    fx: fn() -> kimmy_core::effects::UpsertEffects,
+}
+
+impl crate::ModifySpec for SpecUpsert {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(false)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+    fn apply(&self, _: &Document) -> Result<Option<Document>, String> {
+        Ok(None)
+    }
+    fn upsert(&self) -> Option<Result<Document, String>> {
+        Some(Ok(self.seed.clone()))
+    }
+    fn upsert_effects(
+        &self,
+        _: &Document,
+    ) -> Option<Result<kimmy_core::effects::UpsertEffects, String>> {
+        Some(Ok((self.fx)()))
+    }
+}
+
+#[test]
+fn an_upsert_into_a_field_collection_is_created_through_the_typed_entry_with_one_record_and_one_entry()
+ {
+    use crate::Candidates;
+    use kimmy_core::merge_state::{Path, Value};
+    let (e, _d) = open();
+    let (f, _) = pair(&e);
+    let spec = SpecUpsert {
+        seed: doc! { "_id": 7_i64, "k": 5, "a": 1, "n": 3 },
+        fx: || kimmy_core::effects::UpsertEffects {
+            from_filter: vec![(Path::flat("k").unwrap(), Value::Int32(5))],
+            set: vec![(Path::flat("a").unwrap(), Value::Int32(1))],
+            inc: vec![(Path::flat("n").unwrap(), Value::Int32(3))],
+            ..Default::default()
+        },
+    };
+    let out = e.modify_where(&f, &Candidates::Scan, &spec, Some(1)).unwrap();
+    assert_eq!(out.matched, 0);
+    let _ = out;
+    let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 7).unwrap()).unwrap();
+    assert_eq!(rec.body, bytes(&doc! { "_id": 7_i64, "k": 5, "a": 1, "n": 3 }));
+    let state = MergeState::decode_compact(rec.meta.as_deref().unwrap()).unwrap();
+    assert!(!state.slots.is_empty(), "the $inc of the creation is a counter slot");
+    assert_eq!(
+        state.vv.values().copied().max(),
+        Some(rec.stamp.hlc),
+        "the later of the two stamps"
+    );
+    let es = entries(&e, &f);
+    assert_eq!(es.len(), 1, "one entry");
+    assert_eq!(
+        (es[0].kind, es[0].stamp, es[0].meta.as_deref()),
+        (OpKind::Insert, rec.stamp, rec.meta.as_deref())
+    );
+}

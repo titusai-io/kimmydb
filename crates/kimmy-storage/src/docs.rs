@@ -583,7 +583,7 @@ impl Engine {
         let mut ids = Vec::with_capacity(pending.len());
         let mut entries = Vec::with_capacity(pending.len());
         for (index, checked) in pending.into_iter().enumerate() {
-            match self.write_insert(&txn, coll, checked) {
+            match self.write_insert(&txn, coll, checked, None) {
                 Ok((id, entry)) => {
                     ids.push((id, entry.stamp));
                     entries.push(entry);
@@ -613,7 +613,21 @@ impl Engine {
         doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
         let checked = self.check_insert(txn, coll, doc, None)?;
-        self.write_insert(txn, coll, checked)
+        self.write_insert(txn, coll, checked, None)
+    }
+
+    /// [`Self::insert_in_txn`] for the document an upsert creates: for a field collection the
+    /// creation is written through the writer's typed creation entry (`creation`), so its
+    /// increments are counters; a document collection ignores it.
+    pub(crate) fn insert_created_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        doc: Document,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
+    ) -> Result<(DocId, OplogEntry)> {
+        let checked = self.check_insert(txn, coll, doc, None)?;
+        self.write_insert(txn, coll, checked, creation)
     }
 
     /// The half of an insert that can refuse it: the id, the stored state, the
@@ -683,6 +697,7 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         checked: CheckedInsert,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
     ) -> Result<(DocId, OplogEntry)> {
         let CheckedInsert { id, key, body } = checked;
         // A field collection keeps the document's merge state with it: the writer renders the
@@ -698,11 +713,17 @@ impl Engine {
                 }
             };
             let doc: Document = bson::deserialize_from_slice(&body)?;
-            let image =
-                field_write::insert(self.field_writer(), prior, &doc, &mut || self.next_stamp())?
-                    .ok_or_else(|| {
-                    StorageError::Corrupt("an insert over a live field document".into())
-                })?;
+            let image = match creation {
+                Some(creation) => {
+                    field_write::upsert(self.field_writer(), prior, creation, &doc, &mut || {
+                        self.next_stamp()
+                    })?
+                }
+                None => field_write::insert(self.field_writer(), prior, &doc, &mut || {
+                    self.next_stamp()
+                })?,
+            }
+            .ok_or_else(|| StorageError::Corrupt("an insert over a live field document".into()))?;
             Some(image)
         } else {
             None

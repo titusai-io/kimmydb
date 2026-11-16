@@ -18,10 +18,10 @@
 //!   and entries as they were (version 1, no meta); the one `if` is at each call site.
 
 use bson::Document;
-use kimmy_core::effects::{Effects, Outcome};
-use kimmy_core::merge_state::bridge::{document_to_fields, ordered_to_document};
+use kimmy_core::effects::{Effects, Outcome, UpsertEffects};
+use kimmy_core::merge_state::bridge::{bson_to_value, document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
-    JoinOptions, MStamp, MergeState, StampError, UpdateError, Writer, WriterId, Written,
+    JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, Writer, WriterId, Written,
 };
 use kimmy_core::{Error as CoreError, Hlc, Stamp};
 
@@ -156,6 +156,59 @@ pub(crate) fn update(
         })?;
     match refusal {
         Some(r) => Err(refused("the update", r)),
+        None => Ok(image),
+    }
+}
+
+/// The path of every field of `doc`, in its order, a document-valued field before its members:
+/// the order `UpsertEffects::creation_list` asks for.
+fn post_image_order(doc: &Document) -> Vec<Path> {
+    fn walk(d: &Document, at: &mut Vec<String>, out: &mut Vec<Path>) {
+        for (name, value) in d {
+            at.push(name.clone());
+            if let Ok(p) = Path::new(at.iter().cloned()) {
+                out.push(p);
+            }
+            if let bson::Bson::Document(inner) = value {
+                walk(inner, at, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The creation of an upsert that matched nothing, as the writer's typed creation entry: the
+/// filter's equalities, `$setOnInsert`, `$set` and the increments (typed, as counters) in the
+/// order of `doc`, the document the engine would insert, which names the `_id`. One record, one
+/// entry: the stamp is the later of the two the writer takes (the creation and, beside creation
+/// cells, the increment write).
+pub(crate) fn upsert(
+    writer: WriterId,
+    prior: Option<MergeState>,
+    fx: &UpsertEffects,
+    doc: &Document,
+    mint: &mut dyn FnMut() -> Stamp,
+) -> Result<Option<Image>> {
+    let mut fx = fx.clone();
+    if let Some(id) = doc.get("_id") {
+        let value = bson_to_value(id).map_err(|e| refused("the _id", e))?;
+        fx.set.insert(0, (Path::flat("_id").map_err(|e| refused("the _id", e))?, value));
+    }
+    let order = post_image_order(doc);
+    let mut refusal = None;
+    let image = write(writer, prior, mint, |w, stamp| match fx.apply_stamped(w, &order, stamp) {
+        Ok(written) => Ok(Some(written.created)),
+        Err(UpdateError::Refused(r)) => {
+            refusal = Some(r);
+            Ok(None)
+        }
+        Err(UpdateError::Stamp(e)) => Err(e),
+    })?;
+    match refusal {
+        Some(r) => Err(refused("the creation", r)),
         None => Ok(image),
     }
 }
