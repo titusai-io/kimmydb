@@ -345,7 +345,7 @@ fn runner() {
     // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (3), the nested rules (8), the rules of Q3
     // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
     // writer's feed of the order state (O2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 37, "the mutant list changed");
+    assert_eq!(mutants::mutants().len(), 38, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
@@ -618,6 +618,24 @@ fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
     );
     assert!(last > 1000 && seeds_trailing >= 4, "the rule is exercised: {last} {trailing}");
     assert!(failing.is_empty(), "{failing:?}");
+}
+
+/// Step 3, ruling 9 (two documents, three members): an entry joined below the receiver's newest stamp is
+/// appended, so a puller of the receiver reads the whole state with no snapshot and nothing moves on a
+/// following round to the origin. The mutant "joined but not appended" leaves P with `{b}`.
+#[test]
+fn an_entry_joined_below_the_receivers_newest_stamp_is_still_served_onward() {
+    let design = Cfg::default_ret();
+    let d = probes::omitted_lower_stamp_entry(&design);
+    assert!(d.p_reads_a_and_b, "P reads X = {{a, b}}");
+    assert!(d.same_state, "P holds M's state");
+    assert_eq!(d.snapshots, 0, "no snapshot");
+    assert!(!d.follow_up_moved, "nothing is transferred on the following P-to-A round");
+
+    let mut mutant = Cfg::default_ret();
+    mutant.flags.append_only_newest = true;
+    let m = probes::omitted_lower_stamp_entry(&mutant);
+    assert!(!m.p_reads_a_and_b, "the mutant leaves P without a");
 }
 
 /// The default protocol (the covered-entry skip and the start-HLC rule on) passes the five seeds.

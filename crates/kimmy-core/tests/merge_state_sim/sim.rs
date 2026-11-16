@@ -80,6 +80,10 @@ pub struct SimFlags {
     /// of a restore's epoch; zero for a first epoch), not at 0, so a restored member's first pulls
     /// do not replay its whole oplog. On (the design); off is the mutant `no start-HLC`.
     pub start_hlc: bool,
+    /// Mutant `joined but not appended` (Step 3): an entry the receiver's newest oplog stamp
+    /// out-stamps is joined into the state but not appended to the oplog, so the receiver cannot
+    /// serve it onward. Off (the design: a joined entry is appended whatever its stamp).
+    pub append_only_newest: bool,
 }
 
 impl Default for SimFlags {
@@ -96,6 +100,7 @@ impl Default for SimFlags {
             covered_skip: true,
             covered_skip_by_stamp: false,
             start_hlc: true,
+            append_only_newest: false,
         }
     }
 }
@@ -126,14 +131,28 @@ pub fn nid(c: char) -> NodeId {
 /// An oplog entry: a writer entry carries the writer's full state (and the
 /// oracle-only set of contained writes), a loss entry one loss record.
 pub enum Ent {
-    W { st: MStamp, state: MergeState, contained: BTreeSet<MStamp> },
-    L { st: MStamp, key: LossKey, val: LossValue },
+    W {
+        st: MStamp,
+        state: MergeState,
+        contained: BTreeSet<MStamp>,
+    },
+    L {
+        st: MStamp,
+        key: LossKey,
+        val: LossValue,
+    },
+    /// A write of ANOTHER document: it carries no state of this one, and only moves the origin's
+    /// servable vector past it (Step 3: a second document is what raises a servable vector without
+    /// carrying the first document's state).
+    O {
+        st: MStamp,
+    },
 }
 
 impl Ent {
     fn st(&self) -> MStamp {
         match self {
-            Ent::W { st, .. } | Ent::L { st, .. } => *st,
+            Ent::W { st, .. } | Ent::L { st, .. } | Ent::O { st } => *st,
         }
     }
 }
@@ -283,6 +302,14 @@ impl Node {
         Some(st)
     }
 
+    /// A write of another document: ticks the clock and logs an entry that carries none of this
+    /// document's state.
+    pub fn other_document_write(&mut self) -> MStamp {
+        let st = self.w.tick(0);
+        self.append(Rc::new(Ent::O { st }));
+        st
+    }
+
     /// The join as this node's cluster runs it (a mutant may wrap it).
     fn receive(&mut self, other: &MergeState) -> Received {
         let f = self.flags;
@@ -417,7 +444,17 @@ impl Node {
         }
         match &**ent {
             Ent::W { st, state, contained } => {
-                if self.absorb(state, contained, true) && !self.oplog.contains_key(st) {
+                let outstamped = self.flags.append_only_newest
+                    && self.oplog.keys().next_back().is_some_and(|newest| newest > st);
+                if self.absorb(state, contained, true)
+                    && !self.oplog.contains_key(st)
+                    && !outstamped
+                {
+                    self.append(Rc::clone(ent));
+                }
+            }
+            Ent::O { st } => {
+                if !self.oplog.contains_key(st) {
                     self.append(Rc::clone(ent));
                 }
             }
