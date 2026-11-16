@@ -1060,14 +1060,21 @@ and [query-language.md](query-language.md#decimal128-arithmetic-in-updates).
 It differs from MongoDB's in four places (verified against its source and manual
 on 2026-10-16, except the n-ary `$add`, which is by reading):
 
-- **A double converts exactly, not at 15 digits.** MongoDB converts a double to a
-  decimal at 15 significant digits, with trailing zeros kept, in `$add`,
-  `$subtract`, `$multiply` and `$divide` (`Value::coerceToDecimal`, the
-  `kRoundTo15Digits` default), in `$toDecimal`, and in `$inc` and `$mul`
-  (`SafeNum::getDecimal`). Here it is the double's exact binary value rounded
-  once to 34 digits, half to even, everywhere. `0.1 + Decimal128("0.2")` is
-  `0.3000000000000000055511151231257827` here and `0.300000000000000` there.
-  Only MongoDB's own `$sum` converts the double part at 34 digits.
+- **A double converts exactly in `$inc` and `$mul`, where the reference rounds it at 15 digits.**
+  The reference converts a double that meets a `Decimal128` in an update (the stored one, or the
+  operand) to a decimal rounded to 15 significant digits, half to even, with a positive exponent
+  folded into the coefficient (exponent 0) and a negative zero made a positive zero: `$inc` of
+  `Decimal128("0")` over a stored `5.0` stores `5.00000000000000`, over `0.1` stores
+  `0.100000000000000`, over `1234567890123465.0` (a tie at the 15th digit) stores
+  `1234567890123460`, and `$mul` converts the same way (`q7s5e.out` 0001-0006, `q7s5f.out`
+  0001-0005, 0007 and 0009, `q7s5g.out` 0001 and 0003). Here it is the double's exact binary value
+  rounded once to 34 digits, half to even (ADR-252, Chris's ruling, which rejects the 15-digit
+  convention: it can reverse an ordering and merges distinct doubles), so the same updates store `5`,
+  `0.1000000000000000055511151231257827` and `1234567890123465`. In an expression the reference keeps
+  the exact value as well, so there is no difference there: `$add` of a double and a decimal
+  (`q7s5e.out` 0007-0009, and inside a pipeline update 0011) and `$sum` (0010) give the digits of the
+  exact binary value. `$subtract`, `$multiply`, `$divide` and `$toDecimal` have no recording of a
+  double yet.
 - **`$sum` and `$avg` are exact and independent of order.** MongoDB's `$sum`
   rounds decimals at each document (`decimalTotal.add`), so the total depends on
   document order: over `1E+34`, `0.5`, `0.5`, `-1E+34` one order gives `0E+1`

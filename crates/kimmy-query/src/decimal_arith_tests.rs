@@ -848,8 +848,9 @@ fn an_inc_of_a_decimal_zero_over_an_int32_writes_the_decimal() {
 
 /// E7, q7s5c0007: a double plus a decimal zero is a decimal, so it is WRITTEN, and the value is 5.
 /// The form differs from the reference's, which stores `5.00000000000000`: the reference converts a
-/// double to a decimal at 15 significant digits where this arithmetic converts it exactly (`5`). That
-/// is a conversion rule apart from this one, with reach beyond `$inc`; it is not asserted here.
+/// double to a decimal at 15 significant digits where this arithmetic converts it exactly (`5`): a
+/// difference kept on purpose (ADR-252, Chris's ruling), listed in docs/deviations.md under "Arithmetic
+/// on a `Decimal128` differs from MongoDB's in four places"; it is not asserted here.
 #[test]
 fn an_inc_of_a_decimal_zero_over_a_double_writes_a_decimal_of_the_same_value() {
     match inc_over(Bson::Double(5.0), dec("0E+3")) {
