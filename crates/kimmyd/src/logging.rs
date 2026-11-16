@@ -1641,6 +1641,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.field_refused",
+            "{entry}",
+            "Remote writes and snapshot documents refused because their collection has merge policy field.",
+            sync_field_refused
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.tls.reloads.ok",
             "{reload}",
             "Certificate reloads that succeeded.",

@@ -643,6 +643,18 @@ impl MergeState {
         out
     }
 
+    /// The state hash of an encoded state (what [`MergeState::compact_hash`] gives for the state
+    /// that [`MergeState::decode_compact`] would return), read from the bytes alone: the header
+    /// is checked and the body hashed, with no decode. It does not check that the body is
+    /// canonical; a caller that has not written the bytes itself decodes them.
+    pub fn compact_hash_of(bytes: &[u8]) -> Result<[u8; 16], DecodeError> {
+        let mut r = R::new(bytes);
+        if r.take(3)? != MAGIC || r.u8()? != VERSION {
+            return Err(DecodeError::BadHeader);
+        }
+        Ok(hash128(&bytes[4..]))
+    }
+
     /// The inverse of [`MergeState::encode_compact`].
     pub fn decode_compact(bytes: &[u8]) -> Result<MergeState, DecodeError> {
         let mut r = R::new(bytes);

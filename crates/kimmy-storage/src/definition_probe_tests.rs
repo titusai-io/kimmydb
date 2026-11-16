@@ -392,6 +392,7 @@ fn a_covered_drop_defers_a_life_that_owes_the_sweep_until_its_floor_is_at_the_dr
             collection: items,
             doc_id: Some(kimmy_core::DocId::Int64(8_000)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+            meta: None,
         };
         let meta = node.get_collection("shop", "items").unwrap();
         node.apply_remote(&meta, &entry).unwrap();

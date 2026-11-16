@@ -2034,6 +2034,7 @@ mod tests {
             collection: coll.id,
             doc_id: None,
             body: None,
+            meta: None,
         };
         let txn = engine.begin_write(WriterHolder::Write).unwrap();
         crate::engine::append_oplog(&txn, &violation).unwrap();

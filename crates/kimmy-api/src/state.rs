@@ -245,6 +245,7 @@ impl AppState {
             index_unkeyed_refusals: self.engine.unkeyed_refusals(),
             sync_ddl_relogged: self.engine.ddl_relogged(),
             sync_horizon_state_held: self.engine.state_held_refusals(),
+            sync_field_refused: self.engine.field_replication_refusals(),
             // What a write costs *before* it starts (ADR-151): the wait for
             // the single writer, which no latency figure separates from the
             // work, and the two summaries of it an alert can be written on.

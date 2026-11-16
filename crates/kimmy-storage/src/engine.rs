@@ -153,6 +153,9 @@ pub struct Engine {
     /// which is what M11 task 1 needed: the daemon was paying two commits per
     /// insert where a bare engine paid one, and nothing said so.
     commits: std::sync::atomic::AtomicU64,
+    /// Remote writes and snapshot documents refused because their collection has merge policy
+    /// `field` (the apply of Step 3 does not exist yet): counted per entry.
+    field_replication_refusals: std::sync::atomic::AtomicU64,
     /// The parsed validators and their counters (ADR-257).
     pub(crate) validators: crate::validator::ValidatorState,
     /// Documents a `multi: true` filtered write commits per transaction
@@ -1598,6 +1601,7 @@ impl Engine {
             definition_fail_in: std::sync::atomic::AtomicU32::new(0),
             hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
+            field_replication_refusals: std::sync::atomic::AtomicU64::new(0),
             validators: Default::default(),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -2191,6 +2195,17 @@ impl Engine {
     /// oplog since start, so that it can serve them onward (ADR-180).
     pub fn ddl_relogged(&self) -> u64 {
         self.ddl_relogged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many remote writes and snapshot documents this node has refused since start because
+    /// their collection has merge policy `field`, whose apply does not exist yet.
+    pub fn field_replication_refusals(&self) -> u64 {
+        self.field_replication_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count `n` entries refused for a `field` collection (a remote write, a snapshot document).
+    pub(crate) fn count_field_replication_refused(&self, n: u64) {
+        self.field_replication_refusals.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How many windows this node has refused a peer since start because they
@@ -5648,6 +5663,7 @@ pub(crate) fn ddl_entry<T: serde::Serialize>(
         collection,
         doc_id: None,
         body: Some(bson::serialize_to_vec(payload)?),
+        meta: None,
     })
 }
 

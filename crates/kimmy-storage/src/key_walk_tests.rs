@@ -54,6 +54,7 @@ fn entry_of(row: &Row) -> OplogEntry {
         collection: CollectionId(7),
         doc_id: None,
         body: Some(vec![row.origin as u8; 3]),
+        meta: None,
     }
 }
 
@@ -796,6 +797,7 @@ async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 99i64 }).unwrap()),
+            meta: None,
         };
         assert!(engine.apply_remote(&coll, &relayed).unwrap());
         // Damage the index the way the counts cannot see.
