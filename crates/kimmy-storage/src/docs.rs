@@ -134,7 +134,7 @@ impl WriteScope<'_> {
         self.refuse_if_poisoned()?;
         let (outcome, entry) = self
             .engine
-            .replace_in_txn(&self.txn, coll, id, doc, upsert, None)
+            .replace_in_txn(&self.txn, coll, id, doc, upsert, None, None)
             .map_err(|e| self.poison(e))?;
         self.wrote |= entry.is_some();
         self.entries.extend(entry);
@@ -205,7 +205,7 @@ impl WriteScope<'_> {
         self.refuse_if_poisoned()?;
         let entry = self
             .engine
-            .delete_in_txn(&self.txn, coll, id, |_, _| Ok(true))
+            .delete_in_txn(&self.txn, coll, id, None, |_, _| Ok(true))
             .map_err(|e| self.poison(e))?;
         let removed = entry.is_some();
         self.wrote |= removed;
@@ -458,6 +458,36 @@ impl Engine {
         id: &DocId,
     ) -> Result<Option<(Stamp, Document)>> {
         self.get_record_by_encoded_key(coll, &doc_key(id)?)
+    }
+
+    /// One live document with its version identity: its stamp under the `document` policy, its
+    /// stamp and the hash of its merged state (an etag) under `field`. `None` if it is absent or
+    /// tombstoned.
+    pub fn get_versioned(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+    ) -> Result<Option<(kimmy_core::DocVersion, Document)>> {
+        let key = doc_key(id)?;
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+            return Ok(None);
+        };
+        let record = codec::decode_doc_record_with_meta(raw.value())?;
+        let Some(doc) = record.document()? else {
+            return Ok(None);
+        };
+        let version = match (coll.merge_policy, state_hash_of(Some(&record))) {
+            (MergePolicy::Field, Some(hash)) => kimmy_core::DocVersion::Etag(record.stamp, hash),
+            (MergePolicy::Field, None) => {
+                return Err(StorageError::Corrupt(
+                    "a record of a field collection carries no merge state".into(),
+                ));
+            }
+            (MergePolicy::Document, _) => kimmy_core::DocVersion::Stamp(record.stamp),
+        };
+        Ok(Some((version, doc)))
     }
 
     /// The stamp of a live document, or `None` if it is absent or tombstoned.
@@ -794,12 +824,27 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
+        self.replace_if_state(coll, id, doc, upsert, expected, None)
+    }
+
+    /// [`Engine::replace_if`] with the version of a `field` document, which is a stamp and the
+    /// hash of the merged state (an etag): the write happens only if both match what is stored.
+    /// A state hash against a `document` collection never matches.
+    pub fn replace_if_state(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        doc: Document,
+        upsert: bool,
+        expected: Option<Stamp>,
+        expected_state: Option<kimmy_core::StateHash>,
+    ) -> Result<WriteOutcome> {
         // The client's admission point for a replace and an upsert (ADR-250).
         if self.caps_apply() {
             kimmy_core::limits::check_id(id)?;
         }
         let txn = self.begin_write(WriterHolder::Write)?;
-        match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
+        match self.replace_in_txn(&txn, coll, id, doc, upsert, expected, expected_state) {
             Ok((outcome, Some(entry))) => {
                 txn.commit()?;
                 self.publish(vec![entry]);
@@ -845,6 +890,7 @@ impl Engine {
         doc: Document,
         upsert: bool,
         expected: Option<Stamp>,
+        expected_state: Option<kimmy_core::StateHash>,
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
         let key = doc_key(id)?;
 
@@ -903,6 +949,11 @@ impl Engine {
             }
 
             if expected.is_some() && current != expected {
+                return Err(StorageError::Stale { current });
+            }
+            if let Some(want) = expected_state
+                && state_hash_of(existing.as_ref()) != Some(want)
+            {
                 return Err(StorageError::Stale { current });
             }
             if !existed && !upsert {
@@ -1000,7 +1051,7 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        Ok(self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true))?.is_some())
+        Ok(self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true))?.is_some())
     }
 
     /// [`Engine::delete`], conditional on the document's current version,
@@ -1019,12 +1070,24 @@ impl Engine {
         id: &DocId,
         expected: Option<Stamp>,
     ) -> Result<Option<Stamp>> {
+        self.delete_if_state(coll, id, expected, None)
+    }
+
+    /// [`Engine::delete_if`] with the version of a `field` document: a stamp and the hash of the
+    /// merged state, both of which must match what is stored.
+    pub fn delete_if_state(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        expected: Option<Stamp>,
+        expected_state: Option<kimmy_core::StateHash>,
+    ) -> Result<Option<Stamp>> {
         let Some(expected) = expected else {
-            return self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true));
+            return self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true));
         };
         // The absent case is decided here rather than in the guard, which
         // only ever sees a live document.
-        match self.delete_where(WriterHolder::Write, coll, id, |current, _| {
+        match self.delete_where(WriterHolder::Write, coll, id, expected_state, |current, _| {
             if current == expected {
                 Ok(true)
             } else {
@@ -1055,7 +1118,9 @@ impl Engine {
         // The expiry pass's own hold, not a client's: a TTL delete costs the
         // same transaction as a client's delete, and an operator asking what
         // held the writer needs the two apart (ADR-159).
-        Ok(self.delete_where(WriterHolder::Expiry, coll, id, |_, doc| Ok(guard(doc)))?.is_some())
+        Ok(self
+            .delete_where(WriterHolder::Expiry, coll, id, None, |_, doc| Ok(guard(doc)))?
+            .is_some())
     }
 
     /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
@@ -1078,10 +1143,11 @@ impl Engine {
         holder: WriterHolder,
         coll: &CollectionMeta,
         id: &DocId,
+        expected_state: Option<kimmy_core::StateHash>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<Stamp>> {
         let txn = self.begin_write(holder)?;
-        match self.delete_in_txn(&txn, coll, id, guard) {
+        match self.delete_in_txn(&txn, coll, id, expected_state, guard) {
             Ok(Some(entry)) => {
                 txn.commit()?;
                 let stamp = entry.stamp;
@@ -1118,6 +1184,7 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         id: &DocId,
+        expected_state: Option<kimmy_core::StateHash>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<OplogEntry>> {
         let key = doc_key(id)?;
@@ -1132,6 +1199,12 @@ impl Engine {
                     } else {
                         codec::decode_doc_record(raw.value())?
                     };
+                    if record.is_live()
+                        && let Some(want) = expected_state
+                        && state_hash_of(Some(&record)) != Some(want)
+                    {
+                        return Err(StorageError::Stale { current: Some(record.stamp) });
+                    }
                     let state = if field && record.is_live() {
                         Some(field_write::load(record.meta.as_deref())?)
                     } else {
@@ -3763,4 +3836,11 @@ mod tests {
         // The body's own `_id` is kept as written, as an insert keeps it.
         assert_eq!(stored_id(&engine, &coll, &DocId::Int64(8)), Bson::Int64(8));
     }
+}
+
+/// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read
+/// from the stored bytes without decoding the state. `None` for a record with no meta.
+pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
+    let meta = record?.meta.as_deref()?;
+    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
 }

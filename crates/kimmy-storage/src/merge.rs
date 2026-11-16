@@ -401,7 +401,7 @@ impl Engine {
                 next
             }
         };
-        let (_, entry) = self.replace_in_txn(txn, coll, &id, next, false, None)?;
+        let (_, entry) = self.replace_in_txn(txn, coll, &id, next, false, None, None)?;
         entries.extend(entry);
         Ok(())
     }

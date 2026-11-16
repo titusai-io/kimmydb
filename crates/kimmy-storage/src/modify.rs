@@ -166,6 +166,13 @@ pub trait ModifySpec {
         None
     }
 
+    /// With [`Self::expected_stamp`], for a `field` document: the hash of the merged state the
+    /// caller read (the second half of an etag). A match at the stamp with another state is
+    /// [`StorageError::Stale`] too.
+    fn expected_state(&self) -> Option<kimmy_core::StateHash> {
+        None
+    }
+
     /// Where the document keys an index range gathers are charged, if the caller budgets
     /// them (ADR-270's second addendum).
     ///
@@ -596,6 +603,17 @@ impl Engine {
             && expected != found.stamp
         {
             return Err(StorageError::Stale { current: Some(found.stamp) });
+        }
+        if let Some(want) = spec.expected_state() {
+            let key = crate::docs::doc_key(&extract_id(&found.doc)?)?;
+            let docs = txn.open_table(tables::DOCS)?;
+            let have = docs
+                .get((coll.id.0, key.as_slice()))?
+                .map(|raw| codec::decode_doc_record_with_meta(raw.value()))
+                .transpose()?;
+            if crate::docs::state_hash_of(have.as_ref()) != Some(want) {
+                return Err(StorageError::Stale { current: Some(found.stamp) });
+            }
         }
         let id = extract_id(&found.doc)?;
         let next = spec.apply(&found.doc).map_err(|e| match kimmy_core::deadline::check() {

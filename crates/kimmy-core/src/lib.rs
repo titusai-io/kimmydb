@@ -12,6 +12,7 @@ pub mod cursor;
 pub mod ddl;
 pub mod deadline;
 pub mod decimal;
+pub mod doc_version;
 pub mod effects;
 pub mod error;
 pub mod hlc;
@@ -45,6 +46,7 @@ pub use ddl::{
     FIELD_POLICY_STEERING_FIELDS, IndexCreate, IndexDrop, MergePolicy, ValidatorSet, VectorSet,
     database_drop_id, merge_policy_steering,
 };
+pub use doc_version::{DocVersion, StateHash};
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DECIMAL128_ID_LEN, Decimal128Id, DocId, NodeId};
