@@ -1273,3 +1273,13 @@ fn an_int32_maximum_that_widens_and_returns_is_an_int64_in_the_engine_and_an_int
     assert_eq!(seen[0], (Bson::Int64(2_147_483_648), Bson::Int64(2_147_483_648)));
     assert_eq!(seen[1], (Bson::Int64(2_147_483_647), Bson::Int32(i32::MAX)));
 }
+
+/// D5, q7s5b0005: `$inc -0` creates `-0`, and `$inc 0E+3` after it is no write (nModified 0, the
+/// stored `-0` stays): the engine finds the result equal to what is stored.
+#[test]
+fn an_inc_that_leaves_a_stored_decimal_zero_equal_is_no_write() {
+    let d = doc! { "_id": 1, "x": decimal("-0") };
+    let (effects, outcome) = parity_doc(doc! {"$inc": {"x": decimal("0E+3")}}, &d);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(outcome, Outcome::Unchanged);
+}

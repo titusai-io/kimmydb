@@ -6,7 +6,7 @@
 //! make a decimal, which are refused and in whose words.
 
 use bson::{Bson, Document, doc};
-use kimmy_core::decimal::parse;
+use kimmy_core::decimal::{arith, decode_raw, parse};
 
 use crate::aggregate::{self, Limits};
 use crate::expr::Expr;
@@ -534,15 +534,13 @@ fn inc_and_mul_take_a_decimal_operand() {
 #[test]
 fn inc_and_mul_over_zero_and_absent_as_recorded_in_q7s4h() {
     // (case, the text this arithmetic stores); the reference's is in the row.
-    const OURS: [(u32, &str); 9] = [
-        (29, "0.00"),
+    const OURS: [(u32, &str); 7] = [
         (121, "0E+3"),
         (122, "0.00"),
         (123, "0.0"),
         (124, "0E+3"),
         (125, "-0.00"),
         (126, "0.000"),
-        (206, "2.00"),
         (221, "2.00"),
     ];
     #[rustfmt::skip]
@@ -768,10 +766,16 @@ fn a_value_preserving_update_changes_the_bytes_only_when_the_cohort_member_chang
     assert!(same_bytes(doc! { "$mul": { "n": 1 } }, dec("1.5")));
     assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("0.00")));
     assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("NaN")));
-    // Another member of the cohort is a different value to a write.
-    assert!(!same_bytes(doc! { "$inc": { "n": dec("0.00") } }, dec("1.5")));
+    // An `$inc` of a decimal zero of another cohort member leaves the stored decimal as it is: the sum
+    // `1.50` is the number stored, and the reference writes nothing (q7s5c.out E2 `1.0` + `0.00`
+    // and E3 `1.50` + `0`, nModified 0).
+    assert!(same_bytes(doc! { "$inc": { "n": dec("0.00") } }, dec("1.5")));
+    // Another member of the cohort is a different value to a write (`$mul` has no recording).
     assert!(!same_bytes(doc! { "$mul": { "n": dec("1.0") } }, dec("1.5")));
-    assert!(!same_bytes(doc! { "$inc": { "n": 0 } }, dec("-0")));
+    // A stored `-0` plus the integer `0` is the number `0`: the stored decimal is kept, `-0` (the
+    // rule of q7s5c.out E5, a stored `-0` plus a decimal `0`, and E8, a stored decimal plus an integer
+    // `0`; this exact pair has no recording of its own).
+    assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("-0")));
     assert!(!same_bytes(doc! { "$inc": { "n": 0 } }, Bson::Decimal128(parse("-sNaN7").unwrap())));
     assert!(!same_bytes(doc! { "$inc": { "n": dec("0") } }, Bson::Int32(5)));
     let non_canonical = Bson::Decimal128(bson::Decimal128::from_bytes(
@@ -794,5 +798,75 @@ fn add_over_a_list_is_sum_over_the_same_values() {
     for values in lists {
         let added = val(op("$add", values.clone()), doc! {});
         assert_eq!(added, group("$sum", values.clone()), "{values:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `$inc` into a stored value: a result that is the stored value is not written (q7s5c.out)
+// ---------------------------------------------------------------------------
+
+/// `x` after `$inc x by` over `{_id: 1, x: stored}`.
+fn inc_over(stored: Bson, by: Bson) -> Bson {
+    let out = upd(doc! {"$inc": {"x": by}}, doc! {"_id": 1, "x": stored}).expect("applied");
+    out.get("x").cloned().expect("x")
+}
+
+/// The stored decimal stays as stored (the bytes, not only the number), as nModified 0 says.
+fn inc_keeps(label: &str, stored: Bson, by: Bson) {
+    assert_eq!(inc_over(stored.clone(), by), stored, "{label}");
+}
+
+#[test]
+fn an_inc_of_a_zero_with_a_finer_exponent_keeps_the_stored_decimal() {
+    inc_keeps("q7s5c0001 E1", dec("5000"), dec("0E-2"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_with_a_trailing_zero_as_it_is() {
+    inc_keeps("q7s5c0002 E2", dec("1.0"), dec("0.00"));
+    inc_keeps("q7s5c0003 E3", dec("1.50"), dec("0"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_zero_as_it_is() {
+    inc_keeps("q7s5c0004 E4", dec("0E+3"), dec("-0"));
+    inc_keeps("q7s5c0005 E5", dec("-0"), dec("0"));
+    // q7s5b0005 (D5): `-0` stays `-0` after an `$inc` of `0E+3`
+    inc_keeps("q7s5b0005 D5", dec("-0"), dec("0E+3"));
+}
+
+#[test]
+fn an_inc_of_an_integer_zero_keeps_a_stored_decimal() {
+    inc_keeps("q7s5c0008 E8", dec("5"), Bson::Int32(0));
+}
+
+/// E6, q7s5c0006: an `Int32` plus a decimal zero is a decimal, so it is written.
+#[test]
+fn an_inc_of_a_decimal_zero_over_an_int32_writes_the_decimal() {
+    same(inc_over(Bson::Int32(5), dec("0")), "5");
+}
+
+/// E7, q7s5c0007: a double plus a decimal zero is a decimal, so it is WRITTEN, and the value is 5.
+/// The form differs from the reference's, which stores `5.00000000000000`: the reference converts a
+/// double to a decimal at 15 significant digits where this arithmetic converts it exactly (`5`): a
+/// difference kept on purpose (ADR-252, Chris's ruling), listed in docs/deviations.md under "Arithmetic
+/// on a `Decimal128` differs from MongoDB's in four places"; it is not asserted here.
+#[test]
+fn an_inc_of_a_decimal_zero_over_a_double_writes_a_decimal_of_the_same_value() {
+    match inc_over(Bson::Double(5.0), dec("0E+3")) {
+        Bson::Decimal128(d) => {
+            let (got, want) = (decode_raw(&d), decode_raw(&parse("5").unwrap()));
+            assert!(arith::sub(&got, &want).is_zero(), "stored {d}, the number is not 5");
+        }
+        other => panic!("not a decimal: {other:?}"),
+    }
+}
+
+/// E9, q7s5c0009: a double that the `$inc` leaves equal stays as it is, with its sign.
+#[test]
+fn an_inc_of_a_zero_double_keeps_a_stored_negative_zero() {
+    match inc_over(Bson::Double(-0.0), Bson::Double(0.0)) {
+        Bson::Double(x) => assert_eq!(x.to_bits(), (-0.0_f64).to_bits()),
+        other => panic!("{other:?}"),
     }
 }
