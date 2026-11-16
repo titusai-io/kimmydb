@@ -75,6 +75,10 @@ harness = false
 name = "concurrent_writes"
 harness = false
 
+[[bench]]
+name = "field_policy_cost"
+harness = false
+
 [lints.rust]
 # `kimmy_bench_no_live_counts`: a control for the benchmarks behind ADR-174's
 # addendum, and nothing else. Set by hand, never by a feature:
