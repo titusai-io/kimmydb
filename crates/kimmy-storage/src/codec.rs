@@ -326,6 +326,46 @@ pub fn doc_record_header(mut input: &[u8]) -> Result<(Stamp, bool)> {
     Ok((stamp, take(&mut input, 1)?[0] == 0))
 }
 
+/// What the digest folds of an encoded record: its newest stamp, whether it is live and, for a
+/// record that carries a merged state (a `field` collection's), the hash of that state and the
+/// version vector of the state. A record without a merged state is its stamp alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordView {
+    pub stamp: Stamp,
+    pub live: bool,
+    /// The hash of the merged state's compact bytes; `None` for a `document` record.
+    pub state: Option<[u8; 16]>,
+    /// Every origin the merged state has seen, with its newest write: what the record vouches for
+    /// beyond the origin of its own newest stamp. Empty for a `document` record.
+    pub origins: Vec<(kimmy_core::Origin, Hlc)>,
+}
+
+impl RecordView {
+    /// A record of a `document` collection: the stamp and liveness, no state.
+    pub fn plain(stamp: Stamp, live: bool) -> Self {
+        Self { stamp, live, state: None, origins: Vec::new() }
+    }
+}
+
+/// [`RecordView`] of an encoded record. A version 1 record is read from its header alone, as
+/// [`doc_record_header`] does; a version 2 record's merged state is decoded.
+pub fn doc_record_view(input: &[u8]) -> Result<RecordView> {
+    let (stamp, live) = doc_record_header(input)?;
+    let Some(meta) = doc_record_meta(input) else {
+        return Ok(RecordView::plain(stamp, live));
+    };
+    let state = kimmy_core::merge_state::MergeState::decode_compact(meta)
+        .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
+    let hash = kimmy_core::merge_state::MergeState::compact_hash_of(meta)
+        .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
+    let origins = state
+        .vv
+        .iter()
+        .map(|(w, h)| (kimmy_core::Origin { node: w.node, epoch: w.epoch }, *h))
+        .collect();
+    Ok(RecordView { stamp, live, state: Some(hash), origins })
+}
+
 // ---------------------------------------------------------------------------
 // OplogEntry
 // ---------------------------------------------------------------------------

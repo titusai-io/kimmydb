@@ -333,12 +333,12 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                     last_collection = Some(collection);
                     cursor.collections += 1;
                 }
-                match codec::doc_record_header(value) {
-                    Ok((stamp, live)) => {
-                        if live {
+                match codec::doc_record_view(value) {
+                    Ok(view) => {
+                        if view.live {
                             *counts.entry(collection).or_default() += 1;
                         }
-                        live_digest::fold_walked(&mut digests, collection, doc_key, &stamp, live);
+                        live_digest::fold_walked(&mut digests, collection, doc_key, &view);
                     }
                     // Not counted, as no reader can return it either; refusing
                     // to open over one unreadable record would be worse than a
