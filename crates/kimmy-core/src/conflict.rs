@@ -49,8 +49,8 @@ pub struct UnkeyedDocumentDetail {
     pub index: String,
     /// The document filed unkeyed.
     pub id: DocId,
-    /// Why, as a short stable name: `parallel_arrays`, `too_many_keys` or
-    /// `unencodable`.
+    /// Why, as a short stable name: `parallel_arrays`, `too_many_keys`,
+    /// `ambiguous_position` or `unencodable`.
     pub reason: String,
 }
 

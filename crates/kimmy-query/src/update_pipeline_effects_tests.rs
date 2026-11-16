@@ -59,6 +59,10 @@ fn a_pipeline_that_changes_nothing_has_no_effects() {
     }
 }
 
+/// A nested document in a `$set` stage MERGES into the stored one, as the reference does (q7s4g0040:
+/// `$set {o: {z: 1}}` over `o: {a: 1, b: 2}` gives `{a: 1, b: 2, z: 1}`; q7s4g0051: a field of the
+/// same name is replaced where it is): the result of the stage is the document with `j` kept, and
+/// the effect is still one `Set` of the whole top-level field.
 #[test]
 fn a_set_of_a_sub_document_is_one_set_of_the_whole_field() {
     let d = doc! { "_id": 1, "sub": { "k": 1, "j": 2 } };
@@ -67,7 +71,7 @@ fn a_set_of_a_sub_document_is_one_set_of_the_whole_field() {
     same_effects(
         &effects,
         &fx(|e| {
-            e.set(p("sub"), v(doc! {"k": 1, "n": 3}));
+            e.set(p("sub"), v(doc! {"k": 1, "j": 2, "n": 3}));
         }),
         "whole field",
     );
@@ -340,24 +344,34 @@ fn the_recorded_reference_answers_are_what_the_writer_renders() {
     );
 }
 
-/// Not a deviation (nothing in docs/deviations.md): a `$set` of a sub-document whose fields are
-/// only reordered IS a write on a `field` collection, as it is on a `document` one (the bytes
-/// differ). The writer counts an order-only change of a sub-document as a change
-/// (`Writer::reordered`), so the answer is `modified: true` under both policies, for an operator
-/// update and for a pipeline update, and the written document has the new order. Only a
-/// TOP-LEVEL reorder of a pipeline result is no write (`pipeline-reorder-only-q7`).
+/// Not a deviation (nothing in docs/deviations.md): an OPERATOR `$set` of a sub-document whose fields
+/// are only reordered IS a write, on a `field` collection as on a `document` one (the bytes differ):
+/// the operator replaces the sub-document, the writer counts an order-only change of it as a change
+/// (`Writer::reordered`), the answer is `modified: true` and the written document has the new
+/// order. Recorded: q7s5a0003 (stored `{j, k}`, nModified 1). The pipeline form is the next test.
 #[test]
-fn a_set_of_a_sub_document_with_its_fields_reordered_is_a_write() {
+fn an_operator_set_of_a_sub_document_with_its_fields_reordered_is_a_write() {
     let d = doc! { "_id": 1, "sub": { "k": 1, "j": 2 } };
-    for (label, update) in [
-        ("operator", crate::update_effects_tests::parse(doc! {"$set": {"sub": {"j": 2, "k": 1}}})),
-        ("pipeline", pipe(vec![doc! {"$set": {"sub": {"j": 2, "k": 1}}}])),
-    ] {
-        let (effects, outcome) = parity(&update, None, &d);
-        assert!(outcome.modified(), "{label}: {outcome:?} for {effects:?}");
-        let mut w = writer_with(&d);
-        effects.apply(&mut w, 0);
-        let sub = render(&w).get_document("sub").unwrap().clone();
-        assert_eq!(keys(&sub), ["j", "k"], "{label}");
-    }
+    let update = crate::update_effects_tests::parse(doc! {"$set": {"sub": {"j": 2, "k": 1}}});
+    let (effects, outcome) = parity(&update, None, &d);
+    assert!(outcome.modified(), "{outcome:?} for {effects:?}");
+    let mut w = writer_with(&d);
+    effects.apply(&mut w, 0);
+    let sub = render(&w).get_document("sub").unwrap().clone();
+    assert_eq!(keys(&sub), ["j", "k"]);
+}
+
+/// A pipeline `$set` stage MERGES a sub-document into the stored one, so the same fields in another
+/// order leave the stored order and the update is no write: no effect, `Unchanged`. Recorded:
+/// q7s5a0002 (nModified 0, stored `{k, j}`); the merge itself, q7s4g0040 and q7s5a0001.
+#[test]
+fn a_pipeline_set_of_a_sub_document_with_its_fields_reordered_is_no_write() {
+    let d = doc! { "_id": 1, "sub": { "k": 1, "j": 2 } };
+    let update = pipe(vec![doc! {"$set": {"sub": {"j": 2, "k": 1}}}]);
+    let (effects, outcome) = parity(&update, None, &d);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(outcome, Outcome::Unchanged);
+    let mut w = writer_with(&d);
+    effects.apply(&mut w, 0);
+    assert_eq!(keys(render(&w).get_document("sub").unwrap()), ["k", "j"]);
 }

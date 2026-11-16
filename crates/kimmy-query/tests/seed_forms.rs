@@ -1,9 +1,8 @@
 //! Which filter forms seed an upsert, as recorded in `q7s2g.out` (cases g4.1 to
 //! g4.12, reference 6.0.5, a filter that matches nothing, update `{$set: {z: 1}}`).
 //!
-//! Not recorded, so not seeded here: a `$in` or an `$all` of one regular
-//! expression, and an `$all` with an `$elemMatch` (UNRECORDED). Both are refused
-//! when the filter is parsed, so no seed is asked of them. Also UNRECORDED: an
+//! The seeds of a regular expression and of an `$elemMatch` in a list are in
+//! `patterns_in_lists.rs`. UNRECORDED: an
 //! array or a document as the single `$all` member, and `null` (`{a: null}`,
 //! `$eq: null`); the build seeds the value as given.
 
@@ -90,4 +89,47 @@ fn g4_11_and_g4_12_an_overlap_is_refused_through_every_form() {
     assert!(err.contains("path 'a' is matched twice"), "{err}");
     // A form that seeds nothing cannot overlap.
     seeded(doc! { "a": { "$in": [5, 6] }, "a.b": 1 }).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The filters an upsert refuses, as recorded in `q7s2n.out` (reference 6.0.5)
+// ---------------------------------------------------------------------------
+
+/// n0027 (q7s2n.out line 157), n0477 (line 2817): an `$all` of two values is the path
+/// matched twice, code 54, where an `$all` of one seeds (g4.4). UNRECORDED: three values.
+#[test]
+fn n_an_all_of_two_or_more_values_is_the_path_matched_twice() {
+    for filter_doc in [
+        doc! { "a": { "$all": [5, 6] } },
+        doc! { "$or": [{ "a": { "$all": [5, 6] } }] },
+        doc! { "a": { "$all": [5, 6, 7] } },
+    ] {
+        let err = seeded(filter_doc.clone()).unwrap_err();
+        assert!(err.contains("path 'a' is matched twice"), "{filter_doc}: {err}");
+    }
+    // An `$all` of one still seeds.
+    assert_eq!(seeded(doc! { "a": { "$all": [5] } }).unwrap(), doc! { "a": 5 }.to_string());
+}
+
+/// n0035 (q7s2n.out line 204), n0485 (line 2864): code 224, whatever else the filter says.
+/// UNRECORDED: beside another condition, under `$and`, and under `$nor`.
+#[test]
+fn n_an_expr_anywhere_in_the_filter_refuses_the_upsert() {
+    let expr = || doc! { "$expr": { "$eq": ["$a", 5] } };
+    for filter_doc in [
+        expr(),
+        doc! { "$or": [expr()] },
+        doc! { "b": 1, "$expr": { "$eq": ["$a", 5] } },
+        doc! { "$and": [{ "b": 1 }, expr()] },
+        doc! { "$nor": [expr()] },
+        doc! { "$or": [{ "b": 1 }, expr()] },
+        // UNRECORDED: an `$expr` inside an `$elemMatch` is refused too.
+        doc! { "lines": { "$elemMatch": { "$expr": { "$eq": ["$q", 5] } } } },
+    ] {
+        let err = seeded(filter_doc.clone()).unwrap_err();
+        assert!(
+            err.contains("$expr is not allowed in the query predicate for an upsert"),
+            "{filter_doc}: {err}"
+        );
+    }
 }
