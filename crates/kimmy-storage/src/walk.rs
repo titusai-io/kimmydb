@@ -638,6 +638,7 @@ mod tests {
                 collection: orders.id,
                 doc_id: Some(kimmy_core::DocId::Int64(101)),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 101, "u": 1 }).unwrap()),
+                meta: None,
             };
             assert!(engine.apply_remote(&orders, &clash).unwrap());
             let field = |path: &str| crate::IndexField { path: path.into(), descending: false };

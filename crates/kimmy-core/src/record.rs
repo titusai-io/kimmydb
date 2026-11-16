@@ -31,15 +31,27 @@ pub struct DocRecord {
     pub deleted: bool,
     /// BSON-encoded document body. Empty when `deleted`.
     pub body: Vec<u8>,
+    /// The merge state of a `field` collection's document, in the compact form (a tombstone
+    /// keeps it: the version vector runs through deletes). `None` for a `document`
+    /// collection, whose record is the version 1 bytes it always was. A record decoded by the
+    /// body-only reader carries `None` whatever was stored; only the reader that is named
+    /// `with_meta` fills it.
+    pub meta: Option<Vec<u8>>,
 }
 
 impl DocRecord {
     pub fn live(stamp: Stamp, body: Vec<u8>) -> Self {
-        Self { stamp, deleted: false, body }
+        Self { stamp, deleted: false, body, meta: None }
     }
 
     pub fn tombstone(stamp: Stamp) -> Self {
-        Self { stamp, deleted: true, body: Vec::new() }
+        Self { stamp, deleted: true, body: Vec::new(), meta: None }
+    }
+
+    /// The record with the merge state `meta` (compact bytes) attached.
+    pub fn with_meta(mut self, meta: Vec<u8>) -> Self {
+        self.meta = Some(meta);
+        self
     }
 
     pub fn is_live(&self) -> bool {

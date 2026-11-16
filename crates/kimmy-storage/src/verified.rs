@@ -607,6 +607,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+            meta: None,
         }
     }
 

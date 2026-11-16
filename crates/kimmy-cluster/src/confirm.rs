@@ -1320,7 +1320,14 @@ mod tests {
     }
 
     fn entry(at: Stamp, kind: OpKind) -> OplogEntry {
-        OplogEntry { stamp: at, kind, collection: CollectionId(1), doc_id: None, body: None }
+        OplogEntry {
+            stamp: at,
+            kind,
+            collection: CollectionId(1),
+            doc_id: None,
+            body: None,
+            meta: None,
+        }
     }
 
     fn waiter(at: Stamp, pre_queued: bool) -> Waiter {

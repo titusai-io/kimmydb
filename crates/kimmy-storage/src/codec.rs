@@ -90,6 +90,42 @@ fn check_version(input: &mut &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The format version of a record that carries the merge state of a `field` collection's
+/// document: `version ‖ stamp ‖ deleted ‖ varint meta_len ‖ meta ‖ body` for a document
+/// record, and the same flag for an oplog entry. A `document` collection never writes it.
+pub const META_FORMAT_VERSION: u8 = 2;
+
+/// The version byte of a document record or an oplog entry: 1, or 2 when it carries `meta`.
+/// Returns whether `meta` follows the header.
+fn check_version_meta(input: &mut &[u8]) -> Result<bool> {
+    let version = take(input, 1)?[0];
+    match version {
+        FORMAT_VERSION => Ok(false),
+        META_FORMAT_VERSION => Ok(true),
+        found => Err(StorageError::UnsupportedFormat { found, expected: META_FORMAT_VERSION }),
+    }
+}
+
+fn put_varint(mut n: usize, out: &mut Vec<u8>) {
+    while n >= 0x80 {
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+fn take_varint(input: &mut &[u8]) -> Result<usize> {
+    let mut n = 0usize;
+    for shift in (0..35).step_by(7) {
+        let b = take(input, 1)?[0];
+        n |= usize::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+    Err(corrupt("a length is longer than five bytes"))
+}
+
 // ---------------------------------------------------------------------------
 // DocId
 // ---------------------------------------------------------------------------
@@ -169,20 +205,45 @@ pub fn decode_doc_id(input: &mut &[u8]) -> Result<DocId> {
 // ---------------------------------------------------------------------------
 
 pub fn encode_doc_record(record: &DocRecord) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + STAMP_LEN + 1 + record.body.len());
-    out.push(FORMAT_VERSION);
+    let meta_len = record.meta.as_ref().map_or(0, Vec::len);
+    let mut out = Vec::with_capacity(1 + STAMP_LEN + 1 + 5 + meta_len + record.body.len());
+    out.push(if record.meta.is_some() { META_FORMAT_VERSION } else { FORMAT_VERSION });
     put_stamp(&record.stamp, &mut out);
     out.push(u8::from(record.deleted));
+    if let Some(meta) = &record.meta {
+        put_varint(meta.len(), &mut out);
+        out.extend_from_slice(meta);
+    }
     out.extend_from_slice(&record.body);
     out
 }
 
-pub fn decode_doc_record(mut input: &[u8]) -> Result<DocRecord> {
-    check_version(&mut input)?;
+/// The record without its merge state: the body-only reader, for every site that reads and
+/// does not write the record back. `meta` is skipped, not copied, and is `None` in the result.
+pub fn decode_doc_record(input: &[u8]) -> Result<DocRecord> {
+    decode_doc_record_inner(input, false)
+}
+
+/// The record with its merge state, for a site that reads a record and writes it back (a
+/// body-only read there would drop the state without a sound).
+pub fn decode_doc_record_with_meta(input: &[u8]) -> Result<DocRecord> {
+    decode_doc_record_inner(input, true)
+}
+
+fn decode_doc_record_inner(mut input: &[u8], keep_meta: bool) -> Result<DocRecord> {
+    let has_meta = check_version_meta(&mut input)?;
     let stamp = take_stamp(&mut input)?;
     let deleted = take(&mut input, 1)?[0] != 0;
+    let mut meta = None;
+    if has_meta {
+        let len = take_varint(&mut input)?;
+        let bytes = take(&mut input, len)?;
+        if keep_meta {
+            meta = Some(bytes.to_vec());
+        }
+    }
     // The body is the remainder; no length prefix needed since it is last.
-    Ok(DocRecord { stamp, deleted, body: input.to_vec() })
+    Ok(DocRecord { stamp, deleted, body: input.to_vec(), meta })
 }
 
 /// Whether an encoded document record is live, read from its fixed-width header
@@ -194,7 +255,7 @@ pub fn decode_doc_record(mut input: &[u8]) -> Result<DocRecord> {
 /// key — but the copy [`decode_doc_record`] makes of every body, and the BSON
 /// parse a document read adds to it, are not (ADR-133's addendum).
 pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     take(&mut input, STAMP_LEN)?;
     Ok(take(&mut input, 1)?[0] == 0)
 }
@@ -205,7 +266,7 @@ pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
 /// For a walk that asks only whether any record was written after a point, as
 /// [`doc_record_is_live`] is for one that only counts.
 pub fn doc_record_header(mut input: &[u8]) -> Result<(Stamp, bool)> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     let stamp = take_stamp(&mut input)?;
     Ok((stamp, take(&mut input, 1)?[0] == 0))
 }
@@ -258,7 +319,7 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
 /// stamp back. The entry on the wire (serde) keeps its stamp.
 pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
-    out.push(FORMAT_VERSION);
+    out.push(if entry.meta.is_some() { META_FORMAT_VERSION } else { FORMAT_VERSION });
     out.push(op_kind_tag(entry.kind));
     out.extend_from_slice(&entry.collection.0.to_be_bytes());
 
@@ -272,6 +333,10 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     }
 
     put_opt_bytes(entry.body.as_deref(), &mut out);
+    // version 2 only: the merge state follows the body
+    if let Some(meta) = &entry.meta {
+        put_bytes(meta, &mut out);
+    }
     out
 }
 
@@ -282,7 +347,7 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
 /// entry is judged on these nine bytes, and only a match pays for
 /// [`decode_oplog_entry`] and the copy of its body.
 pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, CollectionId)> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
@@ -293,7 +358,7 @@ pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, Col
 /// ([`decode_oplog_key`]), the rest is the value ([`encode_oplog_entry`]).
 pub fn decode_oplog_entry(key: &[u8], mut input: &[u8]) -> Result<OplogEntry> {
     let stamp = decode_oplog_key(key)?;
-    check_version(&mut input)?;
+    let has_meta = check_version_meta(&mut input)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
@@ -303,8 +368,9 @@ pub fn decode_oplog_entry(key: &[u8], mut input: &[u8]) -> Result<OplogEntry> {
         None => None,
     };
     let body = take_opt_bytes(&mut input)?.map(<[u8]>::to_vec);
+    let meta = if has_meta { Some(take_bytes(&mut input)?.to_vec()) } else { None };
 
-    Ok(OplogEntry { stamp, kind, collection, doc_id, body })
+    Ok(OplogEntry { stamp, kind, collection, doc_id, body, meta })
 }
 
 /// An entry encoded for the `OPLOG` table and read back under its own key: the round trip a
@@ -342,6 +408,81 @@ mod tests {
 
     fn stamp(ms: u64, n: u8) -> Stamp {
         Stamp::new(Hlc::new(ms, 3), NodeId::from_bytes([n; 16]), Epoch::ZERO)
+    }
+
+    fn meta_of(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_record_without_meta_is_the_version_1_bytes_it_always_was() {
+        let r = DocRecord::live(stamp(100, 1), b"body".to_vec());
+        let bytes = encode_doc_record(&r);
+        let mut want = vec![FORMAT_VERSION];
+        put_stamp(&r.stamp, &mut want);
+        want.push(0);
+        want.extend_from_slice(b"body");
+        assert_eq!(bytes, want, "a document record's bytes do not change");
+        assert_eq!(bytes.len(), 1 + STAMP_LEN + 1 + 4);
+        let t = encode_doc_record(&DocRecord::tombstone(stamp(5, 2)));
+        assert_eq!((t[0], t[1 + STAMP_LEN], t.len()), (1, 1, 1 + STAMP_LEN + 1));
+    }
+
+    #[test]
+    fn a_record_with_meta_round_trips_live_tombstone_empty_and_large() {
+        for meta in [meta_of(0), meta_of(1), meta_of(127), meta_of(128), meta_of(65_536)] {
+            for base in [
+                DocRecord::live(stamp(100, 1), b"body-bytes".to_vec()),
+                DocRecord::live(stamp(0, 0), Vec::new()),
+                DocRecord::tombstone(stamp(200, 2)),
+            ] {
+                let record = base.with_meta(meta.clone());
+                let bytes = encode_doc_record(&record);
+                assert_eq!(bytes[0], META_FORMAT_VERSION);
+                assert_eq!(decode_doc_record_with_meta(&bytes).unwrap(), record);
+                // the body-only reader: the same stamp, flag and body, and no meta
+                let body_only = decode_doc_record(&bytes).unwrap();
+                assert_eq!(body_only.meta, None);
+                assert_eq!(
+                    (body_only.stamp, body_only.deleted, &body_only.body),
+                    (record.stamp, record.deleted, &record.body)
+                );
+                // the headers read the same two facts from either version
+                assert_eq!(doc_record_header(&bytes).unwrap(), (record.stamp, record.is_live()));
+                assert_eq!(doc_record_is_live(&bytes).unwrap(), record.is_live());
+            }
+        }
+    }
+
+    #[test]
+    fn the_with_meta_reader_reads_a_version_1_record_as_no_meta() {
+        let r = DocRecord::live(stamp(9, 9), b"x".to_vec());
+        assert_eq!(decode_doc_record_with_meta(&encode_doc_record(&r)).unwrap(), r);
+    }
+
+    #[test]
+    fn a_meta_length_past_the_end_is_corrupt_and_version_3_is_unsupported() {
+        let good =
+            encode_doc_record(&DocRecord::live(stamp(1, 1), Vec::new()).with_meta(meta_of(10)));
+        // cut inside the meta
+        let cut = &good[..good.len() - 3];
+        for f in [decode_doc_record, decode_doc_record_with_meta] {
+            assert!(matches!(f(cut), Err(StorageError::Corrupt(_))), "{:?}", f(cut));
+        }
+        // a length of 2^31 and a length that never ends
+        let at = 1 + STAMP_LEN + 1;
+        let mut big = good[..at].to_vec();
+        big.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x08]);
+        assert!(decode_doc_record(&big).is_err());
+        let mut endless = good[..at].to_vec();
+        endless.extend_from_slice(&[0xff; 8]);
+        assert!(decode_doc_record(&endless).is_err());
+        let mut v3 = good.clone();
+        v3[0] = 3;
+        for r in [decode_doc_record(&v3), decode_doc_record_with_meta(&v3)] {
+            assert!(matches!(r, Err(StorageError::UnsupportedFormat { found: 3, .. })));
+        }
+        assert!(doc_record_header(&v3).is_err() && doc_record_is_live(&v3).is_err());
     }
 
     #[test]
@@ -406,6 +547,63 @@ mod tests {
     }
 
     #[test]
+    fn an_oplog_entry_without_meta_is_the_version_1_bytes_and_one_with_meta_round_trips() {
+        let base = OplogEntry {
+            stamp: stamp(100, 1),
+            kind: OpKind::Insert,
+            collection: CollectionId(7),
+            doc_id: Some(DocId::String("k".into())),
+            body: Some(b"doc".to_vec()),
+            meta: None,
+        };
+        let v1 = encode_oplog_entry(&base);
+        assert_eq!(v1[0], FORMAT_VERSION);
+        // version 1: kind, collection, id (length-prefixed), body (length-prefixed), nothing after
+        let id_len = 1 + 4 + 1; // tag, length, "k"
+        assert_eq!(v1.len(), 1 + 1 + 8 + 4 + id_len + 4 + 3);
+        for meta in [Vec::new(), vec![1, 2, 3], vec![9; 70_000]] {
+            let with = OplogEntry { meta: Some(meta), ..base.clone() };
+            let bytes = encode_oplog_entry(&with);
+            assert_eq!(bytes[0], META_FORMAT_VERSION);
+            assert_eq!(
+                &bytes[1..v1.len()],
+                &v1[1..],
+                "the rest of the entry is the version 1 layout"
+            );
+            assert_eq!(oplog_round_trip(&with).unwrap(), with);
+            assert_eq!(
+                decode_oplog_kind_and_collection(&bytes).unwrap(),
+                (OpKind::Insert, CollectionId(7))
+            );
+            let mut cut = bytes.clone();
+            cut.truncate(bytes.len() - 1);
+            assert!(decode_oplog_entry(&oplog_key(&with.stamp), &cut).is_err());
+        }
+        assert_eq!(oplog_round_trip(&base).unwrap(), base);
+    }
+
+    #[test]
+    fn the_wire_form_of_an_entry_without_meta_has_no_meta_key_and_one_with_meta_is_binary() {
+        let base = OplogEntry {
+            stamp: stamp(100, 1),
+            kind: OpKind::Insert,
+            collection: CollectionId(7),
+            doc_id: Some(DocId::String("k".into())),
+            body: Some(b"doc".to_vec()),
+            meta: None,
+        };
+        let plain = bson::serialize_to_vec(&base).unwrap();
+        assert!(!plain.windows(5).any(|w| w == b"meta\0"), "no meta key without meta");
+        let with = OplogEntry { meta: Some(vec![7; 1000]), ..base.clone() };
+        let wire = bson::serialize_to_vec(&with).unwrap();
+        assert!(wire.len() < plain.len() + 1100, "binary, not an int32 per byte: {}", wire.len());
+        let back: OplogEntry = bson::deserialize_from_slice(&wire).unwrap();
+        assert_eq!(back, with);
+        let back: OplogEntry = bson::deserialize_from_slice(&plain).unwrap();
+        assert_eq!(back, base);
+    }
+
+    #[test]
     fn oplog_entry_round_trips() {
         let entries = [
             OplogEntry {
@@ -414,6 +612,7 @@ mod tests {
                 collection: CollectionId(7),
                 doc_id: Some(DocId::String("k".into())),
                 body: Some(b"doc".to_vec()),
+                meta: None,
             },
             // A delete carries no body.
             OplogEntry {
@@ -422,6 +621,7 @@ mod tests {
                 collection: CollectionId(7),
                 doc_id: Some(DocId::Int64(42)),
                 body: None,
+                meta: None,
             },
             // A collection-level op carries neither id nor body.
             OplogEntry {
@@ -430,6 +630,7 @@ mod tests {
                 collection: CollectionId(u64::MAX),
                 doc_id: None,
                 body: None,
+                meta: None,
             },
         ];
         for entry in entries {
@@ -448,6 +649,7 @@ mod tests {
             collection: CollectionId(1),
             doc_id: Some(DocId::Int64(1)),
             body: Some(Vec::new()),
+            meta: None,
         };
         let none = OplogEntry { body: None, ..base.clone() };
         assert_ne!(encode_oplog_entry(&base), encode_oplog_entry(&none));
@@ -483,7 +685,7 @@ mod tests {
     #[test]
     fn a_future_format_version_is_rejected() {
         let mut bytes = encode_doc_record(&DocRecord::tombstone(stamp(1, 1)));
-        bytes[0] = FORMAT_VERSION + 1;
+        bytes[0] = META_FORMAT_VERSION + 1;
         assert!(matches!(decode_doc_record(&bytes), Err(StorageError::UnsupportedFormat { .. })));
     }
 
@@ -495,6 +697,7 @@ mod tests {
             collection: CollectionId(1),
             doc_id: Some(DocId::String("abc".into())),
             body: Some(b"xyz".to_vec()),
+            meta: None,
         };
         let key = oplog_key(&entry.stamp);
         let full = encode_oplog_entry(&entry);

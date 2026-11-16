@@ -123,6 +123,13 @@ pub struct OplogEntry {
     /// the document's own length plus a few bytes.
     #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
+    /// The writer's merge state of the document after this write, in the compact form, for an
+    /// entry of a `field` collection: what a rewind joins and what a member that applies the
+    /// entry joins into its own state. `None` for a `document` collection's entry, which then
+    /// encodes to the bytes it always did, on the wire and in the table. Binary, for the same
+    /// reason as `body`.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub meta: Option<Vec<u8>>,
 }
 
 impl OplogEntry {

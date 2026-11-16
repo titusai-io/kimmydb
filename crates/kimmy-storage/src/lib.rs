@@ -30,6 +30,8 @@ pub mod expiry;
 pub mod faults;
 pub mod format;
 pub mod gc;
+// The field path of a write (insert, replace, delete) over a record's merge state.
+mod field_write;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
@@ -79,6 +81,9 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod epoch_tests;
+
+#[cfg(test)]
+mod field_write_tests;
 
 #[cfg(test)]
 mod merge_policy_tests;

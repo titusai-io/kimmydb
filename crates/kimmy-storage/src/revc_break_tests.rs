@@ -410,6 +410,7 @@ fn insert_entry(collection: CollectionId, id: i64, at: Stamp) -> OplogEntry {
         collection,
         doc_id: Some(DocId::Int64(id)),
         body: Some(bson::serialize_to_vec(&doc! { "_id": id, "v": 1 }).unwrap()),
+        meta: None,
     }
 }
 
@@ -420,6 +421,7 @@ fn delete_entry(collection: CollectionId, id: i64, at: Stamp) -> OplogEntry {
         collection,
         doc_id: Some(DocId::Int64(id)),
         body: None,
+        meta: None,
     }
 }
 

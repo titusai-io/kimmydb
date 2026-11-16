@@ -534,6 +534,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(DocId::String(id.into())),
             body: body.map(|d| bson::serialize_to_vec(&d).unwrap()),
+            meta: None,
         }
     }
 
@@ -1105,6 +1106,7 @@ mod tests {
                 collection: coll.id,
                 doc_id: Some(DocId::String(name.into())),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": name }).unwrap()),
+                meta: None,
             };
             // The newer arrives first, so the older arrives last, and is what
             // retention removes (the newer is its origin's newest, and stays).
@@ -1338,6 +1340,7 @@ mod tests {
                 collection: coll.id,
                 doc_id: Some(id(name)),
                 body: live.then_some(body),
+                meta: None,
             };
             let oplog_key = codec::oplog_key(&stamp);
             txn.open_table(tables::OPLOG)
@@ -1776,6 +1779,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(id("two")),
             body: Some(bson::serialize_to_vec(&doc! { "_id": "two" }).unwrap()),
+            meta: None,
         };
         crate::engine::append_oplog(&txn, &entry).unwrap();
         carry_mark(&txn, b"before", b"after").unwrap();
@@ -1809,6 +1813,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(id("two")),
             body: Some(bson::serialize_to_vec(&doc! { "_id": "two" }).unwrap()),
+            meta: None,
         };
         crate::engine::append_oplog(&txn, &entry).unwrap();
         // No assertion fired, and the flush wrote the append's fresh mark.

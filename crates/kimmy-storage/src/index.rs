@@ -3633,6 +3633,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(id),
             body: Some(bson::serialize_to_vec(&doc).unwrap()),
+            meta: None,
         };
         assert!(engine.apply_remote(coll, &entry).unwrap());
     }

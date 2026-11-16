@@ -1564,6 +1564,7 @@ pub(crate) mod tests {
             collection: watched.id,
             doc_id: Some(DocId::Int64(n)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": n }).unwrap()),
+            meta: None,
         };
         // More than a window of `Q`'s entries, and one early entry of `X`, all of it
         // covered by a record another node wrote.
@@ -1671,6 +1672,7 @@ pub(crate) mod tests {
             collection: kimmy_core::CollectionId(1),
             doc_id: Some(DocId::Int64(1)),
             body: None,
+            meta: None,
         };
         let window = |exhausted: bool, scanned_to: u64| kimmy_storage::OplogWindow {
             entries: vec![entry(10, 1), entry(20, 2)],
@@ -2362,6 +2364,7 @@ pub(crate) mod tests {
             collection: kimmy_core::ids::CollectionId(collection),
             doc_id: Some(DocId::Int64(1)),
             body: None,
+            meta: None,
         }
     }
 

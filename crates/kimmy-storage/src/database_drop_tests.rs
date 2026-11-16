@@ -1375,6 +1375,7 @@ async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_the_tombstones_stamp()
         collection: x,
         doc_id: Some(kimmy_core::DocId::String(id.into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+        meta: None,
     };
     let drop = crate::engine::ddl_entry(
         stamp_of(5_000, 1),
@@ -1721,6 +1722,7 @@ async fn a_dropped_collections_stream_skips_an_old_entry_stamped_after_its_drop(
         collection: x,
         doc_id: Some(kimmy_core::DocId::String(id.into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+        meta: None,
     };
     for entry in [create_entry("shop", "x", stamp_of(4_900, 1)), insert(stamp_of(6_000, 3), "o")] {
         e.apply_batch(std::slice::from_ref(&entry)).unwrap();

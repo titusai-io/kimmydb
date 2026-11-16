@@ -1481,6 +1481,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
+                    meta: None,
                 };
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
@@ -1732,6 +1733,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
+                    meta: None,
                 };
                 if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
@@ -2021,6 +2023,7 @@ impl Engine {
                 collection: collection.id,
                 doc_id: Some(id),
                 body: None,
+                meta: None,
             };
             if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                 self.apply_remote_in_txn(txn, &collection, &entry, Position::Hold)?
@@ -7444,6 +7447,7 @@ mod tests {
             collection: cb.id,
             doc_id: Some(DocId::Int64(2)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            meta: None,
         };
 
         b.apply_batch(std::slice::from_ref(&forged)).unwrap();
@@ -7541,7 +7545,14 @@ mod tests {
         coll: &CollectionMeta,
         body: Option<Vec<u8>>,
     ) -> OplogEntry {
-        OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(DocId::Int64(2)), body }
+        OplogEntry {
+            stamp,
+            kind,
+            collection: coll.id,
+            doc_id: Some(DocId::Int64(2)),
+            body,
+            meta: None,
+        }
     }
 
     fn entries_at(engine: &Engine, stamp: Stamp) -> usize {
@@ -7660,6 +7671,7 @@ mod tests {
             collection: cb.id,
             doc_id: Some(DocId::Int64(2)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            meta: None,
         };
 
         // By entries, against the bare tombstone and then against the appended one.

@@ -81,6 +81,7 @@ fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
                 body: Some(
                     bson::serialize_to_vec(&bson::doc! { "_id": format!("third{k}") }).unwrap(),
                 ),
+                meta: None,
             })
             .collect();
         for chunk in entries.chunks(500) {
@@ -186,6 +187,7 @@ fn own_entry(f: &Fixture, hlc: Hlc, id: &str) -> OplogEntry {
         collection: orders.id,
         doc_id: Some(kimmy_core::DocId::String(id.into())),
         body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
+        meta: None,
     }
 }
 
@@ -504,6 +506,7 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
         collection: elsewhere.id,
         doc_id: Some(kimmy_core::DocId::String("lost".into())),
         body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "lost" }).unwrap()),
+        meta: None,
     };
     c.apply_batch(std::slice::from_ref(&lost)).unwrap();
 
@@ -1380,6 +1383,7 @@ fn tied_fixture(before: i64, big: usize, tied_big: usize) -> (Fixture, [String; 
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::String(id.clone())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id, "pad": &pad }).unwrap()),
+            meta: None,
         })
         .collect();
     for entry in &entries {
@@ -1674,6 +1678,7 @@ async fn a_budget_cut_just_before_two_epochs_at_one_hlc_drops_neither() {
         collection: orders.id,
         doc_id: Some(kimmy_core::DocId::String("lowest".into())),
         body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "lowest" }).unwrap()),
+        meta: None,
     }])
     .unwrap();
     // The walk starts at the replay's floor, and the budget is the rows up to and including
