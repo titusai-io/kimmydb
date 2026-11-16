@@ -11183,3 +11183,53 @@ async fn a_fourth_member_joining_after_a_restore_holds_every_epoch_of_the_node()
         "and the member that had both covers what the joiner holds"
     );
 }
+
+/// Step 3 (S3a): three members over the real sync loop, a collection created with merge policy
+/// `field`, a document that each of them writes a different field of while they are apart. The entries
+/// alone carry them to one state: the same document and the same version identity (the stamp of
+/// the newest write and the hash of the merged state) on every member.
+#[tokio::test]
+async fn three_members_writing_different_fields_of_one_field_document_converge_by_entries() {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    converge(&a, &b, &c).await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        cb.merge_policy,
+        kimmy_core::MergePolicy::Field,
+        "the policy travels with the creation"
+    );
+    assert_eq!(cc.merge_policy, kimmy_core::MergePolicy::Field);
+
+    let x = a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    converge(&a, &b, &c).await;
+    for (n, coll) in [(&b, &cb), (&c, &cc)] {
+        assert!(
+            n.engine.get(coll, &x).unwrap().is_some(),
+            "premise: the document reached every member"
+        );
+    }
+
+    // apart: each writes its own field
+    std::thread::sleep(Duration::from_millis(5));
+    a.engine.replace(&ca, &x, doc! { "_id": 1, "a": 1 }, false).unwrap();
+    b.engine.replace(&cb, &x, doc! { "_id": 1, "b": 2 }, false).unwrap();
+    c.engine.replace(&cc, &x, doc! { "_id": 1, "c": 3 }, false).unwrap();
+    converge(&a, &b, &c).await;
+
+    let mut seen = Vec::new();
+    for (n, coll) in [(&a, &ca), (&b, &cb), (&c, &cc)] {
+        let (version, document) = n.engine.get_versioned(coll, &x).unwrap().expect("the document");
+        assert_eq!(document.get_i32("a").unwrap(), 1, "{document:?}");
+        assert_eq!(document.get_i32("b").unwrap(), 2, "{document:?}");
+        assert_eq!(document.get_i32("c").unwrap(), 3, "{document:?}");
+        seen.push(version);
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "one version identity everywhere: {seen:?}");
+}

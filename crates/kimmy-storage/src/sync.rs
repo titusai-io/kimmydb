@@ -116,14 +116,6 @@ pub struct SyncOutcome {
     /// keeps the refusals its commits made final and may list a decline that
     /// did not land, which no reader of a failed batch uses.
     pub refused_at: Vec<kimmy_core::Stamp>,
-    /// Entries of a collection with merge policy `field`, taken without being applied: the
-    /// apply of such a collection is Step 3's, so a remote write for one is refused by name,
-    /// counted, and the position moves past it. The rest of the batch is applied. See
-    /// [`Self::field_refused_in`].
-    pub field_refused: usize,
-    /// The `db.name` of every collection [`Self::field_refused`] counted an entry of, once each
-    /// in the order met: what the batch's one log line names.
-    pub field_refused_in: Vec<String>,
     /// Entries this round left for a later window rather than witnessing
     /// (ADR-148): above the vector the peer introduced the window with, so
     /// nothing says the entries between this node's position and them were
@@ -1264,17 +1256,7 @@ impl Engine {
         let (unknown, deferred, purging) =
             (outcome.unknown_collection, outcome.deferred, outcome.purge_pending);
         let mut run = Run::default();
-        let (field_before, named_before) = (outcome.field_refused, outcome.field_refused_in.len());
         let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
-        if outcome.field_refused > field_before {
-            // One line per batch, naming the collections, not one per entry.
-            self.count_field_replication_refused((outcome.field_refused - field_before) as u64);
-            warn!(
-                entries = outcome.field_refused - field_before,
-                collections = %outcome.field_refused_in[named_before..].join(", "),
-                "refused remote writes for collections with merge policy `field`: their replication is not built yet; the rest of the batch was applied"
-            );
-        }
         let refused = std::mem::take(&mut run.refused);
         match &applied {
             Ok(()) => {
@@ -2292,17 +2274,6 @@ impl Engine {
         } else {
             collection
         };
-        // A collection with merge policy `field` has no apply yet (Step 3): the entry is refused
-        // and counted, the position moves past it, and the batch goes on. Failing the batch
-        // here would hold the puller at this entry and stall every other collection behind it.
-        if collection.merge_policy == kimmy_core::MergePolicy::Field {
-            outcome.field_refused += 1;
-            let name = format!("{}.{}", collection.db, collection.name);
-            if !outcome.field_refused_in.contains(&name) {
-                outcome.field_refused_in.push(name);
-            }
-            return Ok(Step::Taken);
-        }
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, position)? {
             RemoteApplied::Applied { id, violations, unkeyed, released } => {

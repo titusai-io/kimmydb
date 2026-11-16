@@ -628,9 +628,10 @@ bytes per field at 20 fields (the measured figure, which later measurements
 revise), so it costs most on documents of many small fields. `document` stores
 nothing extra and the later write of a whole document wins: choose it for
 documents written whole, for large values and for write-once data. A collection
-with policy `field` is not replicated yet: a remote write for one is refused,
-counted by `kimmy_sync_field_refused_total`, and the rest of the batch is
-applied. Under `field` a document's version is its **etag**: every write answers it
+with policy `field` replicates by its entries (each carries the document's merge
+state and is joined into the stored one); a snapshot page document for one is
+not applied yet: it is refused, counted by `kimmy_sync_field_refused_total`, and
+the rest of the page is applied. Under `field` a document's version is its **etag**: every write answers it
 beside the `stamp`, `find` with `stamps` returns it, a read by id serves it as
 the `ETag`, a bulk insert answers `etags`, and `if_stamp` takes it (a stamp is
 `400` there, an etag is `400` on a `document` collection). It names the merged
