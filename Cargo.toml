@@ -30,7 +30,6 @@ edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
 repository = "https://github.com/titusai-io/kimmydb"
-homepage = "https://github.com/titusai-io/kimmydb"
 authors = ["Titus AI LLC <licensing@titusai.io>"]
 
 [workspace.dependencies]
@@ -55,7 +54,6 @@ stacker = "0.1"
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors"] }
 http-body-util = "0.1"
 # The `Frame` and `SizeHint` types a body wrapper's signature has to name;
 # axum re-exports the trait but not those.
