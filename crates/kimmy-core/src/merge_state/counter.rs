@@ -325,19 +325,6 @@ impl Num {
         }
     }
 
-    /// The zero of the type `k` (the start of a sum).
-    pub(super) fn zero(k: Kind) -> Num {
-        match k {
-            Kind::Int32 => Num::Int32(0),
-            Kind::Int64 => Num::Int64(0),
-            Kind::Decimal128 => Num::Decimal128(dec_bytes(Raw::Finite {
-                negative: false,
-                coefficient: 0,
-                exponent: 0,
-            })),
-        }
-    }
-
     /// `self` converted up to the type `k` (a type below is unchanged).
     pub(super) fn to_kind(self, k: Kind) -> Num {
         match (k, self) {
