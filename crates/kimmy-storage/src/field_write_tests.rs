@@ -224,3 +224,60 @@ fn an_update_of_a_field_collection_writes_the_state_and_a_removal_leaves_a_tombs
     assert_eq!(raw(&e, &dc, 1).unwrap()[0], 1);
     assert!(entries(&e, &dc).iter().all(|x| x.meta.is_none()));
 }
+
+/// A spec whose update is the effects `fx`, with the post-image `post`.
+struct SpecFx {
+    post: Document,
+    fx: fn() -> kimmy_core::effects::Effects,
+}
+
+impl crate::ModifySpec for SpecFx {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(true)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+    fn apply(&self, _: &Document) -> Result<Option<Document>, String> {
+        Ok(Some(self.post.clone()))
+    }
+    fn effects(&self, _: &Document) -> Option<Result<kimmy_core::effects::Effects, String>> {
+        Some(Ok((self.fx)()))
+    }
+    fn upsert(&self) -> Option<Result<Document, String>> {
+        None
+    }
+}
+
+#[test]
+fn an_increment_of_a_field_collection_is_a_counter_slot_and_not_a_register_write() {
+    use crate::Candidates;
+    use kimmy_core::merge_state::{Path, Value};
+    let (e, _d) = open();
+    let (f, _) = pair(&e);
+    e.insert(&f, doc! { "_id": 1_i64, "n": 1, "k": "x" }).unwrap();
+    let inc = SpecFx {
+        post: doc! { "_id": 1_i64, "n": 2, "k": "x" },
+        fx: || {
+            let mut fx = kimmy_core::effects::Effects::new();
+            fx.inc(Path::flat("n").unwrap(), Value::Int32(1));
+            fx
+        },
+    };
+    let out = e.modify_where(&f, &Candidates::Scan, &inc, None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 1));
+    let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
+    assert_eq!(rec.body, bytes(&doc! { "_id": 1_i64, "n": 2, "k": "x" }));
+    let state = MergeState::decode_compact(rec.meta.as_deref().unwrap()).unwrap();
+    assert!(!state.slots.is_empty(), "the increment is a slot of the counter, not a register");
+    assert_eq!(state.vv.values().copied().max(), Some(rec.stamp.hlc));
+    // effects that change nothing write nothing
+    let commits = e.commits();
+    let none = SpecFx {
+        post: doc! { "_id": 1_i64, "n": 2, "k": "x" },
+        fx: kimmy_core::effects::Effects::new,
+    };
+    let out = e.modify_where(&f, &Candidates::Scan, &none, None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 0));
+    assert_eq!(e.commits(), commits);
+}

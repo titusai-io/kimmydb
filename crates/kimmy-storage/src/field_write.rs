@@ -18,9 +18,10 @@
 //!   and entries as they were (version 1, no meta); the one `if` is at each call site.
 
 use bson::Document;
+use kimmy_core::effects::{Effects, Outcome};
 use kimmy_core::merge_state::bridge::{document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
-    JoinOptions, MStamp, MergeState, StampError, Writer, WriterId, Written,
+    JoinOptions, MStamp, MergeState, StampError, UpdateError, Writer, WriterId, Written,
 };
 use kimmy_core::{Error as CoreError, Hlc, Stamp};
 
@@ -131,6 +132,32 @@ pub(crate) fn replace(
 ) -> Result<Option<Image>> {
     let fields = document_to_fields(doc).map_err(|e| refused("the document", e))?;
     write(writer, Some(prior), mint, |w, stamp| w.write_replace_stamped(&fields, stamp))
+}
+
+/// An operator update as effects: the writer applies them as one write at one stamp, so a
+/// concurrent write of another field, or another member's increment, is kept by the join. `None`
+/// when nothing changes (no stamp is minted). A refusal of the writer is an error here; W6 maps it.
+pub(crate) fn update(
+    writer: WriterId,
+    prior: MergeState,
+    effects: &Effects,
+    mint: &mut dyn FnMut() -> Stamp,
+) -> Result<Option<Image>> {
+    let mut refusal = None;
+    let image =
+        write(writer, Some(prior), mint, |w, stamp| match effects.apply_stamped(w, stamp) {
+            Ok(Outcome::Modified(written)) => Ok(Some(*written)),
+            Ok(Outcome::Unchanged) => Ok(None),
+            Ok(Outcome::Refused(r)) | Err(UpdateError::Refused(r)) => {
+                refusal = Some(r);
+                Ok(None)
+            }
+            Err(UpdateError::Stamp(e)) => Err(e),
+        })?;
+    match refusal {
+        Some(r) => Err(refused("the update", r)),
+        None => Ok(image),
+    }
 }
 
 /// A delete: the state keeps the delete and its context, so the record is a tombstone that

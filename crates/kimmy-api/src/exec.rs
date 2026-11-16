@@ -1657,6 +1657,25 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         Ok(Some(next))
     }
 
+    /// The update as effects, for a document of a `field` collection. A replacement document (and
+    /// so every spec that is a removal) has none and is written as a replace.
+    fn effects(
+        &self,
+        doc: &Document,
+    ) -> Option<std::result::Result<kimmy_core::effects::Effects, String>> {
+        let update = self.update?;
+        match kimmy_query::update_effects::apply_with_effects(
+            update,
+            Some(self.filter),
+            doc,
+            self.now,
+        ) {
+            Ok(kimmy_query::update_effects::Plan::Effects { effects, .. }) => Some(Ok(effects)),
+            Ok(kimmy_query::update_effects::Plan::Replace { .. }) => None,
+            Err(e) => Some(Err(Self::reported(&self.failures, e))),
+        }
+    }
+
     fn upsert(&self) -> Option<std::result::Result<Document, String>> {
         self.upsert.clone()
     }
