@@ -620,6 +620,19 @@ curl -XDELETE localhost:7878/v1/db/shop -H "$A"           # every collection in 
 set the collection's validator ([Validators](validation.md)); a schema that does
 not parse is `400` and creates nothing.
 
+`mergePolicy` is `document` or `field`, chosen here and never changed; any other
+value is `400`. A request that names none gets **`document`** in this build.
+`field` merges concurrent writes to different fields of one document and keeps
+every concurrent `$inc`; it stores a merge state with each document, about 45
+bytes per field at 20 fields (the measured figure, which later measurements
+revise), so it costs most on documents of many small fields. `document` stores
+nothing extra and the later write of a whole document wins: choose it for
+documents written whole, for large values and for write-once data. A collection
+with policy `field` is not replicated yet: a remote write for one is refused,
+counted by `kimmy_sync_field_refused_total`, and the rest of the batch is
+applied. The create answer and `describe` both carry the policy, and `describe`
+the guidance above as `mergePolicyGuidance`.
+
 Databases are created implicitly by their first collection and removed
 implicitly with their last: dropping the last collection takes the database
 out of listings on every member, because the drop replicates and the

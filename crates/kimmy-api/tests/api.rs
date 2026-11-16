@@ -19024,7 +19024,8 @@ async fn a_merge_into_another_database_needs_the_grant_there() {
 }
 
 /// An implicitly created `$out` or `$merge` target is a collection like one created over HTTP
-/// without a `mergePolicy`: it has the collection default (`field`), not `document`.
+/// without a `mergePolicy`: it has the create default. Until Step 3's apply commit that is the interim
+/// `document` (`MergePolicy::INTERIM_CREATE_DEFAULT`); the commit flips it to `DEFAULT`, `field`.
 #[tokio::test]
 async fn an_implicitly_created_sink_target_has_the_default_merge_policy() {
     let server = Server::start().await;
@@ -19044,7 +19045,11 @@ async fn an_implicitly_created_sink_target_has_the_default_merge_policy() {
     assert_eq!(made.status, 200, "{:?}", made.body);
     for name in ["snap", "joined", "made"] {
         let meta = server.state.engine.get_collection("shop", name).unwrap();
-        assert_eq!(meta.merge_policy, kimmy_core::MergePolicy::DEFAULT, "shop.{name}");
+        assert_eq!(
+            meta.merge_policy,
+            kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
+            "shop.{name}"
+        );
     }
 }
 
@@ -22986,4 +22991,44 @@ async fn a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_
             assert!(refused(&res), "{what} {filter}: {:?}", res.body);
         }
     }
+}
+
+/// The merge policy over HTTP: named at creation or the interim default, answered by the create and by
+/// `describe` with the guidance, and a value that is neither `field` nor `document` is a `400`.
+#[tokio::test]
+async fn the_merge_policy_is_chosen_at_creation_and_described_with_its_guidance() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for (name, body, want) in [
+        ("plain", json!({"name": "plain"}), "document"),
+        ("wide", json!({"name": "wide", "mergePolicy": "field"}), "field"),
+        ("whole", json!({"name": "whole", "mergePolicy": "document"}), "document"),
+    ] {
+        let made = server.post("/v1/db/shop/collections", Some(&token), body).await;
+        assert_eq!(made.status, 200, "{:?}", made.body);
+        assert_eq!(made.body["mergePolicy"], want, "{name}");
+        let described =
+            server.get(&format!("/v1/db/shop/coll/{name}/describe"), Some(&token)).await;
+        assert_eq!(described.status, 200, "{:?}", described.body);
+        assert_eq!(described.body["mergePolicy"], want, "{name}");
+        assert_eq!(
+            described.body["mergePolicyGuidance"],
+            kimmy_core::merge_policy_steering(),
+            "{name}"
+        );
+    }
+    let bad = server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({"name": "odd", "mergePolicy": "both"}),
+        )
+        .await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+    assert!(server.state.engine.get_collection("shop", "odd").is_err(), "nothing was created");
+    let steering = kimmy_core::merge_policy_steering();
+    assert!(
+        steering.contains(&kimmy_core::FIELD_POLICY_BYTES_PER_FIELD.to_string()),
+        "the measured figure is in the text: {steering}"
+    );
 }

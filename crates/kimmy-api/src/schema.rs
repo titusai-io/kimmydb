@@ -140,6 +140,10 @@ pub fn describe_collection(
         // that the one call a client makes before writing already says
         // what an acknowledged write means on this node.
         "nodeDurability": state.engine.durability().as_str(),
+        // Fixed at creation; with the guidance for choosing one, in the words the documentation
+        // uses (`kimmy_core::merge_policy_steering`).
+        "mergePolicy": meta.merge_policy.as_str(),
+        "mergePolicyGuidance": kimmy_core::merge_policy_steering(),
     });
     // The validator, and its two policies when there is one (ADR-257).
     if let Value::Object(validator) = crate::validator::describe_json(&meta) {
