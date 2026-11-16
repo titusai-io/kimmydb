@@ -25,48 +25,47 @@ fn refused(filter: Document, u: Document) -> String {
     }
 }
 
-/// Create the document through the writer's creation entries, as S2a will: the `Creation` cells
-/// are `fields`, the `Plain` ones `sets`, then every `$inc` (an Int32 or Int64 operand: the entry
-/// takes an `i64` until S2a widens it).
-fn create(fx: &UpsertEffects) -> Writer {
-    create_as(fx, 5)
+/// The path of every field of `post`, in the order of the document: a depth-first walk that names a
+/// document-valued field before its members. It is the order `creation_list` asks for: it holds
+/// the path of every cell of the creation, the filter's cells included.
+fn post_image_order(post: &Document) -> Vec<Path> {
+    fn walk(d: &Document, at: &mut Vec<String>, out: &mut Vec<Path>) {
+        for (name, value) in d {
+            at.push(name.clone());
+            out.push(Path::new(at.iter().cloned()).expect("a path of the post-image"));
+            if let Bson::Document(inner) = value {
+                walk(inner, at, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(post, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Create the document through the writer's typed creation entry, [`UpsertEffects::apply`]: the
+/// cells (the increments' typed operands among them) in the order of the post-image `post`.
+fn create(fx: &UpsertEffects, post: &Document) -> Writer {
+    create_as(fx, post, 5)
 }
 
 /// [`create`] by the writer numbered `who`: another member making the same creation.
-fn create_as(fx: &UpsertEffects, who: u8) -> Writer {
-    let cells = fx.creation_cells().expect("the creation composes");
-    let part = |t: CellTag| -> Vec<(Path, Value)> {
-        cells.iter().filter(|c| c.tag == t).map(|c| (c.path.clone(), c.value.clone())).collect()
-    };
+fn create_as(fx: &UpsertEffects, post: &Document, who: u8) -> Writer {
     let mut w = Writer::new(wid(who), JoinOptions::default());
-    let none = p("__no_inc__");
-    let inc_path = fx.inc.first().map(|(q, _)| q).unwrap_or(&none);
-    let made = w
-        .upsert_soi_create(&part(CellTag::Creation), inc_path, &part(CellTag::Plain), 0)
-        .expect("the creation writes");
-    for (q, by) in &fx.inc {
-        let n = match by {
-            Value::Int32(n) => i64::from(*n),
-            Value::Int64(n) => *n,
-            other => panic!("tests use Int32 and Int64 operands, not {other:?}"),
-        };
-        w.upsert_inc_on(made.stamp, q, n, 0).expect("the increment writes");
-    }
+    fx.apply(&mut w, &post_image_order(post), 0).expect("the creation writes");
     w
 }
 
-/// The writer renders the inserted document (the order of the inc fields is the creation's, then
-/// the increments': compare without order when there is an `$inc`).
+/// The writer renders the inserted document: the same fields in the same order, the same bytes.
 fn creates(filter: Document, u: Document) -> (UpsertEffects, Document) {
     let (fx, post) = plan(filter, u);
-    let got = render(&create(&fx));
+    let got = render(&create(&fx, &post));
     assert_eq!(got, post, "the writer creates another document");
-    if fx.inc.is_empty() {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        got.to_writer(&mut a).unwrap();
-        post.to_writer(&mut b).unwrap();
-        assert_eq!(a, b, "same fields, other order: {got} / {post}");
-    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    got.to_writer(&mut a).unwrap();
+    post.to_writer(&mut b).unwrap();
+    assert_eq!(a, b, "same fields, other order or types: {got} / {post}");
     (fx, post)
 }
 
@@ -337,7 +336,7 @@ fn a_pipeline_upsert_sets_what_the_stages_changed() {
     assert_eq!(effects.from_filter, vec![(p("k"), v(1))]);
     assert_eq!(effects.set, vec![(p("k"), v(9)), (p("t"), v(2))]);
     assert_eq!(post_image, doc! {"k": 9, "t": 2});
-    assert_eq!(render(&create(&effects)), post_image);
+    assert_eq!(render(&create(&effects, &post_image)), post_image);
 }
 
 #[test]
@@ -379,8 +378,6 @@ fn a_filter_leaf_beside_an_inc_is_accepted() {
 
 /// The recorded cases: no `inc`, the reference's document (q7s2.out 431-445, q7s2b.out 200-204,
 /// q7s2g.out 307-311).
-// expected red until S2a's typed operands are in q7 (the writer creates Int64 where the plan says
-// Int32; q7s2.out d19 records Int32; manager ruling 2026-11-14)
 #[test]
 fn an_inc_on_a_filter_path_is_a_creation_value_not_a_slot() {
     // q7s2.out f1, line 435: {a: 5} + $inc a 1 creates a: 6
@@ -469,10 +466,10 @@ fn int_of(d: &Document, name: &str) -> i64 {
 /// join has no equal-value exemption): EXPECTED, not a defect. Every join order.
 #[test]
 fn two_identical_creating_upserts_read_the_reference_value_and_leave_one_clash() {
-    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
+    let (fx, post) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
     for (first, second) in [(5u8, 6u8), (6, 5)] {
-        let mut x = create_as(&fx, first);
-        let y = create_as(&fx, second);
+        let mut x = create_as(&fx, &post, first);
+        let y = create_as(&fx, &post, second);
         let fresh = x.receive(&y.state);
         assert_eq!(int_of(&render(&x), "a"), 6, "order {first} then {second}");
         let clashes = fresh.iter().filter(|k| k.kind == LossKind::Clash).count();
@@ -485,12 +482,12 @@ fn two_identical_creating_upserts_read_the_reference_value_and_leave_one_clash()
 /// whole). Stated, not hidden; the same class as `$set`/`$mul` beside an `$inc`.
 #[test]
 fn a_routed_inc_beside_a_counter_inc_gives_a_by_last_writer_and_n_summed() {
-    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1, "n": 1}});
+    let (fx, post) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1, "n": 1}});
     assert_eq!(fx.inc, vec![(p("n"), v(1))]);
     assert_eq!(fx.set_on_insert, vec![(p("a"), v(6))]);
     for (first, second) in [(5u8, 6u8), (6, 5)] {
-        let mut x = create_as(&fx, first);
-        let y = create_as(&fx, second);
+        let mut x = create_as(&fx, &post, first);
+        let y = create_as(&fx, &post, second);
         x.receive(&y.state);
         let d = render(&x);
         assert_eq!((int_of(&d, "a"), int_of(&d, "n")), (6, 2), "order {first} then {second}");
@@ -502,11 +499,11 @@ fn a_routed_inc_beside_a_counter_inc_gives_a_by_last_writer_and_n_summed() {
 /// cell survives beside the insert's fields).
 #[test]
 fn a_routed_inc_never_survives_silently_beside_an_explicit_insert() {
-    let (fx, _) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
+    let (fx, post) = plan(doc! {"a": 5}, doc! {"$inc": {"a": 1}});
     for order in [0, 1] {
         let mut inserter = Writer::new(wid(7), JoinOptions::default());
         inserter.insert(&[(p("x"), v(1))], 0).expect("the insert writes");
-        let mut creator = create_as(&fx, 6);
+        let mut creator = create_as(&fx, &post, 6);
         let (fresh_a, fresh_b) = if order == 0 {
             (inserter.receive(&creator.state), creator.receive(&inserter.state))
         } else {
