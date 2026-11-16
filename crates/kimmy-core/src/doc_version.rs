@@ -107,7 +107,7 @@ mod tests {
     fn both_tokens_round_trip_and_anything_else_is_malformed() {
         for v in [DocVersion::Stamp(stamp(5)), DocVersion::Etag(stamp(6), [1; 16])] {
             assert_eq!(DocVersion::decode(&v.encode()).unwrap(), v);
-            assert_eq!(v.stamp().hlc.wall_ms >= 5, true);
+            assert!(v.stamp().hlc.wall_ms >= 5);
         }
         let e = DocVersion::Etag(stamp(6), [1; 16]).encode();
         for bad in ["", "!!", &e[..e.len() - 4], &format!("{e}AAAA")] {

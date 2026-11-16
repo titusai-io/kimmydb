@@ -2265,6 +2265,22 @@ pub(crate) fn refuse_field_replication() -> StorageError {
     ))
 }
 
+/// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read
+/// from the stored bytes without decoding the state. `None` for a record with no meta.
+pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
+    let meta = record?.meta.as_deref()?;
+    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
+}
+
+/// The version identity an oplog entry's write produced: the stamp, and for a `field` entry the
+/// hash of the merged state it carries.
+pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
+    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::compact_hash_of) {
+        Some(Ok(hash)) => kimmy_core::DocVersion::Etag(entry.stamp, hash),
+        _ => kimmy_core::DocVersion::Stamp(entry.stamp),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bson::doc;
@@ -3894,21 +3910,5 @@ mod tests {
         assert_eq!(stored_id(&engine, &coll, &DocId::Int64(1 << 40)), Bson::Int64(1 << 40));
         // The body's own `_id` is kept as written, as an insert keeps it.
         assert_eq!(stored_id(&engine, &coll, &DocId::Int64(8)), Bson::Int64(8));
-    }
-}
-
-/// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read
-/// from the stored bytes without decoding the state. `None` for a record with no meta.
-pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
-    let meta = record?.meta.as_deref()?;
-    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
-}
-
-/// The version identity an oplog entry's write produced: the stamp, and for a `field` entry the
-/// hash of the merged state it carries.
-pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
-    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::compact_hash_of) {
-        Some(Ok(hash)) => kimmy_core::DocVersion::Etag(entry.stamp, hash),
-        _ => kimmy_core::DocVersion::Stamp(entry.stamp),
     }
 }

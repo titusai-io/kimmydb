@@ -489,10 +489,7 @@ fn a_write_conditional_on_an_etag_needs_the_stamp_and_the_state_to_match() {
     assert!(matches!(r, Err(StorageError::Stale { .. })), "{r:?}");
     let (v2, _) = e.get_versioned(&f, &id).unwrap().unwrap();
     assert_ne!(v2, v);
-    assert_eq!(
-        e.delete_if_state(&f, &id, Some(v2.stamp()), v2.state_hash()).unwrap().is_some(),
-        true
-    );
+    assert!(e.delete_if_state(&f, &id, Some(v2.stamp()), v2.state_hash()).unwrap().is_some());
 }
 
 #[test]
