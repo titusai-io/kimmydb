@@ -42,6 +42,7 @@
 use std::cmp::Ordering;
 
 use bson::Document;
+use kimmy_core::effects::Effects;
 use kimmy_core::{DocId, DocRecord, MergePolicy, OpKind, OplogEntry, Stamp};
 use redb::ReadableTable;
 
@@ -124,6 +125,15 @@ pub trait ModifySpec {
 
     /// The new document, or `None` to remove it.
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String>;
+
+    /// The update as effects, for a document of a `field` collection: what `apply` changes,
+    /// as writes the document's merge state can keep next to a concurrent write of another
+    /// field. `None` (the default) for a replacement or a spec that has none: the post-image
+    /// is then written as a replace. Called only for a `field` collection, on the document
+    /// `apply` was given; the post-image it carries must be the one `apply` answered.
+    fn effects(&self, _doc: &Document) -> Option<std::result::Result<Effects, String>> {
+        None
+    }
 
     /// The document to insert when nothing matched, if this is an upsert.
     fn upsert(&self) -> Option<std::result::Result<Document, String>>;
@@ -589,7 +599,20 @@ impl Engine {
                 )));
             }
         }
-        let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
+        // A field collection takes an operator update as effects when the spec has them.
+        let effects = match (coll.merge_policy == MergePolicy::Field, next.as_ref()) {
+            (true, Some(_)) => match spec.effects(&found.doc) {
+                Some(Ok(effects)) => Some(effects),
+                Some(Err(e)) => {
+                    return Err(StorageError::Core(
+                        spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
+                    ));
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        let entry = self.write_chosen(txn, coll, &id, found, next.as_ref(), effects.as_ref())?;
         Ok((next, entry))
     }
 
@@ -789,6 +812,7 @@ impl Engine {
         id: &DocId,
         found: &Match,
         next: Option<&Document>,
+        effects: Option<&Effects>,
     ) -> Result<Option<OplogEntry>> {
         let key = crate::docs::doc_key(id)?;
         let mut body = match next {
@@ -811,12 +835,23 @@ impl Engine {
             None
         };
         let writer = self.field_writer();
+        // What the writer stores, which is what the validator and the indexes look at.
+        let mut rendered: Option<Document> = None;
         match (&state, next) {
             (Some(state), Some(doc)) => {
                 let probe = field_write::provisional(writer, state);
-                match field_write::replace(writer, state.clone(), doc, &mut || probe)? {
+                let image = match effects {
+                    Some(effects) => {
+                        field_write::update(writer, state.clone(), effects, &mut || probe)?
+                    }
+                    None => field_write::replace(writer, state.clone(), doc, &mut || probe)?,
+                };
+                match image {
                     None => return Ok(None),
-                    Some(image) => body = Some(image.body),
+                    Some(image) => {
+                        rendered = Some(bson::deserialize_from_slice(&image.body)?);
+                        body = Some(image.body);
+                    }
                 }
             }
             (Some(_), None) => {}
@@ -831,6 +866,7 @@ impl Engine {
         if let Some(body) = body.as_ref().filter(|_| self.caps_apply()) {
             kimmy_core::limits::check_document(body.len())?;
         }
+        let next = rendered.as_ref().or(next);
         // The collection's validator, on the result, against the document as it stood
         // (ADR-257). A removal is not an update to be validated.
         if let Some(next) = next {
@@ -846,10 +882,15 @@ impl Engine {
         // (ADR-148): an unchanged document must not advance the clock.
         let (stamp, meta) = match (state, next) {
             (Some(state), Some(doc)) => {
-                let image = field_write::replace(writer, state, doc, &mut || self.next_stamp())?
-                    .ok_or_else(|| {
-                        StorageError::Corrupt("a write the dry run made was refused".into())
-                    })?;
+                let image = match effects {
+                    Some(effects) => {
+                        field_write::update(writer, state, effects, &mut || self.next_stamp())?
+                    }
+                    None => field_write::replace(writer, state, doc, &mut || self.next_stamp())?,
+                }
+                .ok_or_else(|| {
+                    StorageError::Corrupt("a write the dry run made was refused".into())
+                })?;
                 (image.stamp.expect("a write that changes mints a stamp"), Some(image.meta))
             }
             (Some(state), None) => {
