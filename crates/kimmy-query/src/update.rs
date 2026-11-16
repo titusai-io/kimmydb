@@ -1468,7 +1468,7 @@ fn apply_one(
                 return set(doc, delta.clone());
             };
             let result = arithmetic(&base, delta, Arith::Add, &op.path)?;
-            if !same_double(&base, &result) {
+            if !same_double(&base, &result) && !same_decimal(&base, &result) {
                 set(doc, result)?;
             }
         }
@@ -1686,6 +1686,29 @@ fn apply_one(
 /// k0677-k0710, k0686).
 fn same_double(stored: &Bson, result: &Bson) -> bool {
     matches!((stored, result), (Bson::Double(old), Bson::Double(new)) if old == new)
+}
+
+/// Whether an `$inc` result is a `Decimal128` numerically equal to the `Decimal128` stored, which
+/// the reference does not write: the stored value stays as it is, bytes included (`5000` plus
+/// `0E-2` leaves `5000`, `1.50` plus `0` leaves `1.50`, `-0` plus `0` leaves `-0`, a stored
+/// decimal `5` plus the integer `0` leaves `5`; q7s5c.out E1-E5, E8, q7s5b.out D5). A result of
+/// another type is written (an `Int32` or a `Double` plus a decimal zero is a decimal: E6, E7),
+/// and a NaN is never equal. Two infinities of the same sign are equal: that is the implementation's rule,
+/// not a recorded answer. `$mul` is not covered: no recording of it.
+fn same_decimal(stored: &Bson, result: &Bson) -> bool {
+    let (Bson::Decimal128(old), Bson::Decimal128(new)) = (stored, result) else {
+        return false;
+    };
+    // A stored word the arithmetic cannot produce (a non-canonical coefficient) is rewritten in the
+    // canonical form, as it was: it cannot come from the reference, so it is no recorded case.
+    if pack_raw(decode_raw(old)) != *old {
+        return false;
+    }
+    match (decode_raw(old), decode_raw(new)) {
+        (a @ Raw::Finite { .. }, b @ Raw::Finite { .. }) => arith::sub(&a, &b).is_zero(),
+        (Raw::Inf { negative: x }, Raw::Inf { negative: y }) => x == y,
+        _ => false,
+    }
 }
 
 /// What lies in the way of a `$rename` destination in a document: the first

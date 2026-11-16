@@ -1097,9 +1097,10 @@ and 18 `$mul` cases such as k0493 (line 2957); here each is the `400`.
 reference's.** The same number is stored as another member of its cohort: `$mul` of
 `Decimal128("1E+3")`, `100E-2`, `1.50E+1`, `0E+3`, `-0E-2` or `1.000` over a stored
 `Decimal128("0")` is `0E+3`, `0.00`, `0.0`, `0E+3`, `-0.00` or `0.000` here and `0` there
-(`q7s4h.jsonl` 121-126); `$inc` of `-0E-2` over a stored `Decimal128("0")` is `0.00` here and `0`
-there (29); and an upsert that seeds a `Decimal128("2")` and applies `$inc` of `-0E-2` or `$mul`
-of `100E-2` stores `2.00` here and `2` there (206, 221). A representation difference, not a value
+(`q7s4h.jsonl` 121-126); and an upsert that seeds a `Decimal128("2")` and applies `$mul` of
+`100E-2` stores `2.00` here and `2` there (221). An `$inc` of a decimal zero that leaves the stored
+decimal equal leaves it as it is, as the reference does (29 and 206 matched since `q7s5c.out`
+E1-E5). A representation difference, not a value
 difference: the values are equal and compare equal. The rows are pinned both ways in
 `decimal_arith_tests.rs` (ours and the recorded text), so a change on either side fails the test.
 `$inc` over an absent field stores the operand as given, as the reference does (1-6, 193-208).
