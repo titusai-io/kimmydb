@@ -40,10 +40,11 @@
 //!   disjoint paths ([`UpdateOp`]) under ONE stamp, atomic. A refusal is `Err` with its reason
 //!   ([`UpdateRefused`]) and changes nothing; `Ok(None)` is a no-op. The other update operators of the
 //!   product are computed by the caller and sent as a `$set` of the new value (an array is one atomic value).
-//! * [`MergeState::canonical_bytes`] and [`MergeState::state_hash`] give a
-//!   deterministic encoding and a 128-bit digest; [`MergeState::encode`] and
-//!   [`MergeState::decode`] round-trip a whole state. `compact.rs` is the compact
-//!   form (`QMS` version 2) that will replace them; nothing hashes or stores it yet.
+//! * [`MergeState::compact_bytes`] and [`MergeState::compact_hash`] give the canonical encoding and a
+//!   128-bit digest of it (the state hash); [`MergeState::encode_compact`] and
+//!   [`MergeState::decode_compact`] round-trip a whole state. `compact.rs` is THE canonical form
+//!   (`QMS` version 2). The version 1 form (`codec.rs`) is a legacy decode path ([`MergeState::decode`]),
+//!   with an encoder for tests only.
 //!
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
@@ -62,6 +63,7 @@
 //! than 2^56 maximal increments to reach, `decode` and `receive_loss` refuse a total past it,
 //! and `write_inc` refuses an `$inc` that would carry a writer's slot past it.
 
+pub mod bridge;
 mod codec;
 mod compact;
 mod counter;
@@ -80,7 +82,9 @@ mod compact_tests;
 #[cfg(test)]
 mod counter_tests;
 #[cfg(test)]
-mod d7_equivalence_tests;
+mod counter_type_tests;
+#[cfg(test)]
+mod depth_tests;
 #[cfg(test)]
 mod hand_built;
 #[cfg(test)]
@@ -94,7 +98,11 @@ mod prop_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod typed_inc_tests;
+#[cfg(test)]
 mod update_tests;
+#[cfg(test)]
+mod upsert_tests;
 #[cfg(test)]
 mod work_tests;
 
@@ -164,9 +172,13 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> OverCaps = MergeState::over_caps;
     let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, Excess> = MergeState::excess;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
+    #[cfg(any(test, feature = "merge-mutants"))]
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
+    #[cfg(any(test, feature = "merge-mutants"))]
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_encode;
+    #[cfg(any(test, feature = "merge-mutants"))]
     let _: fn(&MergeState) -> bool = MergeState::v1_can_hold;
+    #[cfg(any(test, feature = "merge-mutants"))]
     let _: fn(&MergeState) -> Result<[u8; 16], V1CannotHold> = MergeState::try_state_hash;
     let _: fn(MStamp, Value, Option<Gen>, bool) -> Result<Reg, InvalidValue> = Reg::new;
     let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_register;

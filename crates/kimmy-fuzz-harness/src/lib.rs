@@ -186,28 +186,67 @@ pub fn filter_parse(data: &[u8]) {
 /// An update document: parse, then apply to each fixture.
 ///
 /// Beyond "no panic", one promise is checked: an update that applies never
-/// changes `_id`. The parser refuses operators that name it directly, but the
-/// path language reaches under it (`_id.x`) and the replacement form carries
-/// its own — an `_id` that changes under an update is a document that has
-/// silently left every index that pointed at it.
+/// changes `_id`. An operator update leaves it as it was, byte for byte (a result of
+/// the same number in another type is a change, and refused); a replacement or a
+/// pipeline update keeps the same `DocId`, which it may restate as `1i64` for `1`.
+/// An `_id` that changes under an update is a document that has silently left
+/// every index that pointed at it (ADR-111).
 pub fn update_parse_apply(data: &[u8]) {
     use kimmy_query::update;
 
-    let Some(doc) = json_document(data) else { return };
-    let Ok(update) = update::parse(&doc) else { return };
+    let Ok(value) = serde_json::from_slice::<Value>(data) else { return };
+    // An array is a pipeline update, a document is operators or a replacement.
+    let parsed = match &value {
+        Value::Array(stages) => {
+            let Ok(stages) =
+                stages.iter().map(kimmy_api::json::json_to_bson).collect::<Result<Vec<_>, _>>()
+            else {
+                return;
+            };
+            update::parse_pipeline(&stages, &[])
+        }
+        _ => {
+            let Some(doc) = json_document(data) else { return };
+            update::parse(&doc)
+        }
+    };
+    let Ok(update) = parsed else { return };
+    let by_doc_id = matches!(update, update::Update::Replace(_) | update::Update::Pipeline(_));
     for fixture in FIXTURES.iter() {
         let mut target = fixture.clone();
         let id_before = target.get("_id").cloned();
         if update::apply(&update, &mut target, NOW_MS).is_ok() {
-            assert_eq!(target.get("_id"), id_before.as_ref(), "an update changed _id: {doc:?}");
+            let same_id = if by_doc_id {
+                match (target.get("_id"), id_before.as_ref()) {
+                    (None, None) => true,
+                    (Some(now), Some(was)) => {
+                        matches!(
+                            (
+                                kimmy_core::DocId::try_from_bson(now),
+                                kimmy_core::DocId::try_from_bson(was)
+                            ),
+                            (Ok(now), Ok(was)) if now == was
+                        )
+                    }
+                    _ => false,
+                }
+            } else {
+                target.get("_id") == id_before.as_ref()
+            };
+            assert!(
+                same_id,
+                "an update changed _id from {:?} to {:?}: {value}",
+                id_before,
+                target.get("_id")
+            );
             // Arithmetic writes a canonical Decimal128 or leaves the field as
             // it was: a result is never a coefficient above 10^34 - 1 or an
             // exponent out of range, in a field the update changed.
-            for (key, value) in &target {
-                if let Bson::Decimal128(d) = value
-                    && fixture.get(key) != Some(value)
+            for (key, v) in &target {
+                if let Bson::Decimal128(d) = v
+                    && fixture.get(key) != Some(v)
                 {
-                    assert_canonical(d, &doc);
+                    assert_canonical(d, &value);
                 }
             }
         }
@@ -216,12 +255,12 @@ pub fn update_parse_apply(data: &[u8]) {
 
 /// A decimal arithmetic wrote is canonical BID: reading it and packing it again
 /// gives the same 16 bytes.
-fn assert_canonical(d: &bson::Decimal128, update: &Document) {
+fn assert_canonical(d: &bson::Decimal128, update: &Value) {
     use kimmy_core::decimal::{decode_raw, pack_raw};
     assert_eq!(
         pack_raw(decode_raw(d)).bytes(),
         d.bytes(),
-        "an update wrote a non-canonical Decimal128 {d}: {update:?}"
+        "an update wrote a non-canonical Decimal128 {d}: {update}"
     );
 }
 
@@ -586,6 +625,14 @@ mod tests {
                 harness(&bytes);
             }
         }
+    }
+
+    /// A replacement that restates the `_id` in another numeric type is the
+    /// same document, and is not a change of `_id`.
+    #[test]
+    fn a_replacement_restating_the_id_as_another_numeric_type_is_not_a_change() {
+        update_parse_apply(br#"{"_id": {"$numberLong": "1"}, "v": 1}"#);
+        update_parse_apply(br#"{"_id": {"$numberDecimal": "2"}, "v": 1}"#);
     }
 
     /// The inputs a fuzzer finds first, without waiting for it to find them.

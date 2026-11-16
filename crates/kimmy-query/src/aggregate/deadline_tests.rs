@@ -186,7 +186,7 @@ fn facet_looks_between_facets_and_at_each_document_it_measures() {
 
 #[test]
 fn a_sort_stops_while_it_keys_and_while_it_merges() {
-    let keys = vec![SortKey { path: "v".into(), descending: true }];
+    let keys = vec![SortKey::new("v", true)];
     {
         let _deadline = expired();
         assert!(is_deadline(shape::sort_until_deadline(&keys, rows(1))));

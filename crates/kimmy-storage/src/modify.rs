@@ -113,6 +113,14 @@ pub trait ModifySpec {
     /// which is `_id` order for an index scan and storage order otherwise.
     fn compare(&self, a: &Document, b: &Document) -> Ordering;
 
+    /// Whether a match can be ordered, asked of **every** match before any two are compared. An
+    /// `Err` is the caller's refusal of the sort for this document, which fails the write before
+    /// anything is written (the reference's 16746, for a sort that reads a position beside a
+    /// field of that name). The default orders everything.
+    fn check_sortable(&self, _doc: &Document) -> kimmy_core::Result<()> {
+        Ok(())
+    }
+
     /// The new document, or `None` to remove it.
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String>;
 
@@ -567,6 +575,19 @@ impl Engine {
                 spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
             ),
         })?;
+        // The last guard (ADR-111) for a store keyed by `_id`: whatever a spec answers, a
+        // post-image under another key is not written. `update::apply_matched` judges
+        // the `_id` first and by the stricter rule; this is the one that keeps the key.
+        if let Some(next) = next.as_ref() {
+            let kept = next
+                .get("_id")
+                .is_some_and(|now| DocId::try_from_bson(now).is_ok_and(|now| now == id));
+            if !kept {
+                return Err(StorageError::Core(kimmy_core::Error::InvalidUpdate(
+                    "_id is immutable and cannot be updated".into(),
+                )));
+            }
+        }
         let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
         Ok((next, entry))
     }
@@ -588,6 +609,11 @@ impl Engine {
 
         if matches.is_empty() {
             return Ok(None);
+        }
+        // The keys of every match are taken before any two are compared, so a document the sort
+        // cannot read refuses it whether or not it would have been compared.
+        for found in &matches {
+            spec.check_sortable(&found.doc).map_err(StorageError::Core)?;
         }
         // `sort_by` rather than picking a minimum: the comparator is the
         // caller's whole sort specification, and a stable sort keeps the
@@ -1006,6 +1032,35 @@ mod tests {
         let event = rx.try_recv().unwrap();
         assert_eq!(event.kind, OpKind::Delete);
         assert!(engine.get(&coll, &DocId::Int64(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_post_image_under_another_id_is_not_written() {
+        // A spec that answers a document whose `_id` is not the key's, or none, is
+        // refused and nothing is written, whatever judged the update before.
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        for changed in [doc! {"_id": 99, "status": "x"}, doc! {"status": "x"}] {
+            let spec = TestSpec {
+                matches: |d: &Document| d.get_i64("_id").is_ok_and(|id| id == 1),
+                compare: |_: &Document, _: &Document| Ordering::Equal,
+                apply: |_: &Document| Ok(Some(changed.clone())),
+                upsert: None,
+            };
+            let err = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap_err();
+            assert!(err.to_string().contains("_id is immutable"), "{err}");
+        }
+        let kept = engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        assert_eq!(kept.get_str("status").unwrap(), "pending");
+        assert!(engine.get(&coll, &DocId::Int64(99)).unwrap().is_none());
+        // The same id of another numeric type is the same document and is written.
+        let spec = TestSpec {
+            matches: |d: &Document| d.get_i64("_id").is_ok_and(|id| id == 1),
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| Ok(Some(doc! {"_id": 1, "status": "y"})),
+            upsert: None,
+        };
+        assert!(engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap().modified);
     }
 
     #[test]

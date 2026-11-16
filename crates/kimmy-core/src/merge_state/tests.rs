@@ -1030,6 +1030,33 @@ pub(super) fn golden_obs() -> MergeState {
     st
 }
 
+/// Three counters of one writer whose slots are not all `Int64`: `a` has an `Int32` slot (no operand
+/// stamp); `b` a `Decimal128` slot (`wide_at` and `decimal_at`, both its one write); `c` the shape the
+/// stamps exist for: a `Decimal128` operand, an `Int64` operand, a base write of an `Int32` that absorbs
+/// them, then an `Int32` operand. Its slot has `decimal_at < wide_at < stamp`, its absorbed pair is at
+/// `wide_at`, and what it gained since that pair is an `Int32`: the counter reads 7 + 5 = 12, an `Int32`.
+/// `d` is the shape of Amendment 9: the slot keeps the exact integer sum (1) that its 34-digit total
+/// cannot show after a `1E-34` operand, and the counter reads 5 + 1 = 6, an `Int32`.
+pub(super) fn golden_typed() -> MergeState {
+    let dv = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("a", i(1)), ("b", i(1)), ("c", i(1)), ("d", i(0))]), 0).unwrap();
+    w.write_inc_value(&p("a"), &Value::Int32(5), 0).unwrap();
+    w.write_inc_value(&p("b"), &dv("3"), 0).unwrap();
+    w.write_inc_value(&p("c"), &dv("1"), 0).unwrap();
+    w.write_inc_value(&p("c"), &Value::Int64(2), 0).unwrap();
+    w.write_set(&p("c"), Value::Int32(7), 0).unwrap();
+    w.write_inc_value(&p("c"), &Value::Int32(5), 0).unwrap();
+    // d: the shape of Amendment 9 at the edge of 34 digits: a Decimal128 operand of 1E-33 whose sum with
+    // the integer after it (1.000000000000000000000000000000001) is the last 34-digit total (1E-34 would be
+    // refused: its sum needs 35), a base write of an Int32 that absorbs it, then an Int32 operand: the slot
+    // gained the exact integer 1, so the counter reads 5 + 1 = 6, an Int32
+    w.write_inc_value(&p("d"), &dv("1E-33"), 0).unwrap();
+    w.write_set(&p("d"), Value::Int32(5), 0).unwrap();
+    w.write_inc_value(&p("d"), &Value::Int32(1), 0).unwrap();
+    w.state.clone()
+}
+
 pub(super) fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
     w.insert(&fl(&[("x", i(1)), ("s", s("t"))]), 0).unwrap();
@@ -1412,10 +1439,7 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     let life = *st.lives.keys().next().unwrap();
     for c in ['B', 'C'] {
         let stamp = MStamp { hlc: h(1), writer: wid(c, 0) };
-        st.slots.insert(
-            (life, p("x"), wid(c, 0), None),
-            Slot { stamp, total: total.into(), absorbed: None },
-        );
+        st.slots.insert((life, p("x"), wid(c, 0), None), Slot::new(stamp, total.into(), None));
     }
     st.vv.insert(wid('B', 0), h(1)); // B and C wrote the slots
     st.vv.insert(wid('C', 0), h(1));
@@ -1536,15 +1560,11 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     w.state.slots.insert(
         (life, p("x"), wid('A', 0), None),
-        Slot {
-            stamp: w.state.slots.values().next().unwrap().stamp,
-            total: (MAX_TOTAL - 2).into(),
-            absorbed: None,
-        },
+        Slot::new(w.state.slots.values().next().unwrap().stamp, (MAX_TOTAL - 2).into(), None),
     );
     w.state.slots.insert(
         (life, p("x"), wid('B', 0), None),
-        Slot { stamp, total: (-(MAX_TOTAL - 2)).into(), absorbed: None },
+        Slot::new(stamp, (-(MAX_TOTAL - 2)).into(), None),
     );
     assert_eq!(w.visible().unwrap()[&p("x")], i(0));
     let clock = w.clock;
@@ -1622,10 +1642,7 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
         // a slot is stamped by the writer of its key
         let stamp = MStamp { hlc: h(1), writer: wr };
         st.vv.insert(wr, h(1));
-        st.slots.insert(
-            (life, p("x"), wr, None),
-            Slot { stamp, total: MAX_TOTAL.into(), absorbed: None },
-        );
+        st.slots.insert((life, p("x"), wr, None), Slot::new(stamp, MAX_TOTAL.into(), None));
     }
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(
@@ -1693,10 +1710,8 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     let gen_stamp = MStamp { hlc: h(9), writer: wid('A', 0) };
     let slot_stamp = MStamp { hlc: h(2), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert(
-            (life, p("x"), wid(c, 0), None),
-            Slot { stamp: slot_stamp, total: i128::MAX.into(), absorbed: None },
-        );
+        st.slots
+            .insert((life, p("x"), wid(c, 0), None), Slot::new(slot_stamp, i128::MAX.into(), None));
     }
     let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
     // B's slot was seen at -1: i128::MAX - (-1) overflows a plain subtraction
@@ -2293,7 +2308,8 @@ fn a_null_and_an_unset_merge_and_encode_as_different_values() {
 
 #[test]
 fn the_pinned_mixed_golden_holds_a_whole_document_loss() {
-    // This is why the version 1 form keeps its ambiguous key: a pinned golden has the record.
+    // The version 1 form keeps its ambiguous key (the legacy bytes are pinned, and the golden holds the
+    // record); the compact form, which is the hash, tags the document and has no ambiguity.
     let st = golden_mixed();
     assert!(
         st.losses.keys().any(|k| k.kind == LossKind::InsertLost && k.at == LossAt::Document),
@@ -2477,11 +2493,7 @@ fn decode_refuses_a_version_vector_that_does_not_cover_a_stamp() {
             st.regs.insert((life, Path::flat("x").unwrap()), r.unwrap());
         }),
         ("a slot", |st, life, _| {
-            let slot = Slot {
-                stamp: MStamp { hlc: h(9), writer: life.writer },
-                total: 1.into(),
-                absorbed: None,
-            };
+            let slot = Slot::new(MStamp { hlc: h(9), writer: life.writer }, 1.into(), None);
             st.slots.insert((life, Path::flat("x").unwrap(), life.writer, None), slot);
         }),
     ];

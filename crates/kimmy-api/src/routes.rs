@@ -1032,6 +1032,9 @@ struct CreateCollectionRequest {
     /// `strict` (the default) or `moderate`.
     #[serde(default, rename = "validationLevel")]
     validation_level: Option<String>,
+    /// `field` (the default) or `document`. Fixed for the collection's life.
+    #[serde(default, rename = "mergePolicy")]
+    merge_policy: Option<String>,
 }
 
 async fn create_collection(
@@ -1046,7 +1049,15 @@ async fn create_collection(
         validation_level: body.validation_level,
     }
     .into_spec()?;
-    Ok(Json(exec::create_collection_validated(&state, &auth, &db, &body.name, validator)?))
+    let policy = match body.merge_policy.as_deref() {
+        None => kimmy_core::MergePolicy::DEFAULT,
+        Some(text) => kimmy_core::MergePolicy::parse(text).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "`mergePolicy` must be `field` or `document`, not `{text}`"
+            ))
+        })?,
+    };
+    Ok(Json(exec::create_collection_validated(&state, &auth, &db, &body.name, validator, policy)?))
 }
 
 async fn drop_collection(
@@ -1104,9 +1115,9 @@ struct FindRequest {
     sort: Option<Value>,
     #[serde(deserialize_with = "crate::json::non_null_field")]
     projection: Option<Value>,
-    #[serde(deserialize_with = "crate::json::non_null_field")]
+    #[serde(deserialize_with = "crate::json::count_field")]
     limit: Option<usize>,
-    #[serde(deserialize_with = "crate::json::non_null_field")]
+    #[serde(deserialize_with = "crate::json::count_field")]
     skip: Option<usize>,
     /// Report how the query was answered alongside the results.
     explain: bool,
@@ -1135,7 +1146,9 @@ impl From<FindRequest> for exec::FindParams {
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct FindQuery {
+    #[serde(deserialize_with = "crate::json::count_param")]
     limit: Option<usize>,
+    #[serde(deserialize_with = "crate::json::count_param")]
     skip: Option<usize>,
 }
 

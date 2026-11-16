@@ -50,6 +50,34 @@ fn concurrent(
     v
 }
 
+/// `concurrent` for any number of writers: `I` creates the document with `init`; each of `parts` (a writer's
+/// name, the operand, the clock skew) holds it and `$inc`s `path` once, concurrently. The value in every
+/// delivery order of the entries, which must be one value with one state hash.
+fn concurrent_n(
+    o: &JoinOptions,
+    init: &[(&str, Value)],
+    path: &str,
+    parts: &[(char, &Value, u64)],
+) -> Value {
+    let mut mi = Mem::new('I', o);
+    let i0 = mi.ins(init, 0).unwrap();
+    let mut ents = Vec::new();
+    for &(name, by, skew) in parts {
+        let mut m = Mem::new(name, o);
+        m.receive_entry(&mi.ent(i0));
+        let s = inc_v(&mut m, path, by, skew);
+        ents.push(m.ent(s));
+    }
+    let orders = all_orders(o, &ents, &[mi.ent(i0)]);
+    let first = orders[0].1.w.state.compact_hash();
+    let v = orders[0].1.visible().unwrap()[&p(path)].clone();
+    for (ord, m) in &orders {
+        assert_eq!(m.visible().unwrap()[&p(path)], v, "delivery {ord:?}");
+        assert_eq!(m.w.state.compact_hash(), first, "hash, delivery {ord:?}");
+    }
+    v
+}
+
 fn i32v(n: i32) -> Value {
     Value::Int32(n)
 }
@@ -98,30 +126,22 @@ fn promotion_scenario(o: &JoinOptions) -> Result<(), String> {
     (v == i64v(4_000_000_000)).then_some(()).ok_or(format!("read {v:?}"))
 }
 
-/// A writer whose increment made the cell an Int64 leaves it one: the total dips back under the
-/// i32 range and the type stays.
-fn no_narrowing_scenario(o: &JoinOptions) -> Result<(), String> {
-    let mut w = Writer::new(wid('A', 0), o.clone());
+/// R1: the type is a function of the merged state. A sequential history whose running value leaves
+/// the i32 range and comes back is an Int32 again (the reference stays an Int64: the deviation
+/// `counter-type-q7`).
+#[test]
+fn a_sequential_history_that_leaves_the_i32_range_and_returns_is_an_int32_again() {
+    let mut w = Writer::new(wid('A', 0), opts());
     w.insert(&fl(&[("n", i32v(2_000_000_000))]), 0).unwrap();
     w.write_inc_value(&p("n"), &i32v(2_000_000_000), 0).unwrap();
-    let up = w.visible().unwrap()[&p("n")].clone();
-    if up != i64v(4_000_000_000) {
-        return Err(format!("up: {up:?}"));
-    }
+    assert_eq!(w.visible().unwrap()[&p("n")], i64v(4_000_000_000));
     w.write_inc_value(&p("n"), &i32v(-2_000_000_000), 0).unwrap();
     w.write_inc_value(&p("n"), &i32v(-1_000_000_000), 0).unwrap();
-    let down = w.visible().unwrap()[&p("n")].clone();
-    // 1e9 fits an i32, and the cell stays an Int64
-    (down == i64v(1_000_000_000)).then_some(()).ok_or(format!("down: {down:?}"))
+    assert_eq!(w.visible().unwrap()[&p("n")], i32v(1_000_000_000));
 }
 
-#[test]
-fn a_cell_that_became_an_int64_by_a_write_never_narrows_again() {
-    no_narrowing_scenario(&opts()).unwrap();
-}
-
-/// THE ONE DEVIATION: a total that crossed the i32 range only in a merge narrows when a later
-/// merge brings it back, because no write saw it.
+/// R1 for a merge: a total that crossed the i32 range only in a merge narrows when a later
+/// merge brings it back (the same rule as for a sequential history).
 #[test]
 fn a_total_that_crossed_only_in_a_merge_narrows_again() {
     let o = opts();
@@ -190,12 +210,20 @@ fn a_local_inc_follows_the_production_rule_and_refuses_what_it_refuses() {
 
 // ---- the canonical order ---------------------------------------------------------------------
 
-/// `1E+34 + 5 - 1E+34`: `1E+34 + 5` rounds to `1E+34` (a tie to even), so the order the two
-/// writers' parts are added in decides between `0` and `5`. The canonical order is the writers'
-/// `(node, epoch)`: A's `+5` goes first and is lost. A's stamp is the LATER one (skew 9), so
-/// the order of the stamps would add B's `-1E+34` first and keep the 5.
+/// `1E+34 - 1E+34 + 5` in three parts: A adds `1E+34`, B adds `5`, C adds `-1E+34` to the base `0`. Each writer's
+/// own total is exact at home (a Decimal128 counter is exact or refused: `1E+34 + 5` at ONE writer is a 400),
+/// so a rounding order arises only in a JOIN of concurrent writers: `1E+34 + 5` rounds to `1E+34` (a tie to
+/// even), so the order the three parts are added in decides between `0` and `5`. The canonical order is the
+/// writers' `(node, epoch)`: A's `1E+34`, B's `+5` (lost in the rounding), C's `-1E+34`: `0E+1`. With C's stamp
+/// the earliest (skew 0) and B's the latest (skew 9) the order of the stamps would add `-1E+34` and `1E+34` first
+/// and keep the 5.
 fn decimal_order_scenario(o: &JoinOptions) -> Result<(), String> {
-    let v = concurrent(o, &[("x", dec("1E+34"))], "x", (&dec("5"), 9), (&dec("-1E+34"), 0));
+    let v = concurrent_n(
+        o,
+        &[("x", dec("0"))],
+        "x",
+        &[('A', &dec("1E+34"), 3), ('B', &dec("5"), 9), ('C', &dec("-1E+34"), 0)],
+    );
     (text(&v) == "0E+1").then_some(()).ok_or(format!("read {}, want the canonical 0E+1", text(&v)))
 }
 
@@ -203,7 +231,12 @@ fn decimal_order_scenario(o: &JoinOptions) -> Result<(), String> {
 fn decimal_cells_add_their_parts_in_the_canonical_order() {
     decimal_order_scenario(&opts()).unwrap();
     // the stamps in the other order: the same value, whatever the stamps say
-    let v = concurrent(&opts(), &[("x", dec("1E+34"))], "x", (&dec("5"), 0), (&dec("-1E+34"), 9));
+    let v = concurrent_n(
+        &opts(),
+        &[("x", dec("0"))],
+        "x",
+        &[('A', &dec("1E+34"), 0), ('B', &dec("5"), 3), ('C', &dec("-1E+34"), 9)],
+    );
     assert_eq!(text(&v), "0E+1");
 }
 
@@ -474,7 +507,7 @@ fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts
 fn the_counter_mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
     type Scenario = fn(&JoinOptions) -> Result<(), String>;
-    let cases: [(&str, Switch, Scenario); 5] = [
+    let cases: [(&str, Switch, Scenario); 4] = [
         (
             "slots are added in the order of their stamps, not of their writers",
             |o| o.set_sum_in_stamp_order(true),
@@ -484,11 +517,6 @@ fn the_counter_mutants_are_caught() {
             "an Int32 cell saturates instead of becoming an Int64",
             |o| o.set_int32_saturates(true),
             promotion_scenario,
-        ),
-        (
-            "a slot stays an Int32 when the cell became an Int64",
-            |o| o.set_slot_never_widens(true),
-            no_narrowing_scenario,
         ),
         (
             "an Int64 cell wraps instead of saturating",
@@ -671,4 +699,49 @@ fn the_cap_mutants_are_caught() {
         mutate(&mut o);
         assert!(scenario(&o).is_err(), "not caught: {what}");
     }
+}
+
+/// A counter with NO base reads its first part as it is, with no implicit zero to add it to: a field
+/// an `$inc` created holds the operand exactly, sign and exponent (the reference, q7s5a.out I2-I5:
+/// `-0`, `0E+3`, `-0.00`, `1.50`). `0 + -0` is `+0` and `0 + 0E+3` is `0`, and a non-zero operand with
+/// a positive exponent lost it the same way: `0 + 5E+3` read `5000` where the reference stores `5E+3`.
+#[test]
+fn a_counter_with_no_base_reads_its_operand_exactly() {
+    let o = opts();
+    // q7s5a0005-0008, q7s5b0001 and q7s5b0002
+    for t in ["-0", "0E+3", "-0E-2", "1.50", "5E+3", "-5E+3"] {
+        let mut w = Writer::new(wid('A', 0), o.clone());
+        w.insert(&fl(&[("k", Value::Int32(1))]), 0).unwrap();
+        w.write_inc_value(&p("x"), &dec(t), 0).expect("the $inc was refused");
+        let got = w.visible().unwrap()[&p("x")].clone();
+        assert_eq!(got, dec(t), "{t} read as {}", text(&got));
+    }
+}
+
+/// Two writers that each added to a field with no base: the sum starts from the first part in the
+/// canonical order, so `5E+3` and `2E+3` read `7E+3` (the exponent of both), in every delivery order
+/// of the two entries and with one state hash: the reference's serial answer in either order
+/// (q7s5b0003, q7s5b0004).
+#[test]
+fn two_writers_with_no_base_sum_from_the_first_part_in_every_delivery_order() {
+    let o = opts();
+    let v = concurrent_n(
+        &o,
+        &[("k", Value::Int32(1))],
+        "x",
+        &[('A', &dec("5E+3"), 0), ('B', &dec("2E+3"), 0)],
+    );
+    assert_eq!(v, dec("7E+3"), "read as {}", text(&v));
+}
+
+/// With a base the first part is the base and the sum takes the smaller exponent, as for any
+/// base (q7s5b0006: over a present `0`, `$inc 5E+3` stores `5000`): only a counter with NO base
+/// reads its operand as it is.
+#[test]
+fn a_counter_with_a_base_zero_adds_to_it() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", dec("0"))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &dec("5E+3"), 0).expect("the $inc was refused");
+    let got = w.visible().unwrap()[&p("x")].clone();
+    assert_eq!(got, dec("5000"), "read as {}", text(&got));
 }

@@ -17,6 +17,204 @@ Status meanings:
 
 ---
 
+<a id="field-merge-refusals-q7"></a>
+
+## 🟡 Under the `field` merge policy four kinds of update are refused with a 400 where the reference applies them (Q7 step 2)
+
+**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: (1) a 65th contributing writer to a counter; (2) a double increment of an integer or decimal counter that is MATCHED (an upsert that creates the document from a filter naming the field makes a Double register instead, with no deviation), which the reference accepts (an `Int32` or `Int64` field becomes a `Double`, `5` + `1.5` gives `6.5`, recorded in `q7s2-probes/reference-6.0.5/q7s2.out` lines 230-247; a `Decimal128` field stays a `Decimal128`, at 15 digits, line 252); (3) an increment of a MATCHED counter whose `Decimal128` total cannot be represented exactly: the reference ROUNDS the total to 34 digits (34 nines + 0.5 gives `1.000000000000000000000000000000000E+34`, lines 331-335, where the true sum is 10^34 - 0.5) or STORES `Infinity` on overflow (lines 341-345), where ours is refused with `IncOutOfRange`, because a counter must stay exact to merge (Chris's ruling, item 9: a deviation); the rule is that **a sum that would round is refused, for the visible value and for the writer's own running total** (a sum whose exact value is a `Decimal128` at some exponent is accepted: 34 nines + 1 is exactly 10^34, lines 326-330 and 336-340, and is stored as `1.000000000000000000000000000000000E+34`, as there) (see `counter-gain-after-absorb-q7`); this is the design's D5, "exact or 400", and the first implementation refused only the overflow; and (4) a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has neither the 65-contributor nor the 256-writer limit. Not listed: an `$inc` past the Int64 range is refused by the reference too (line 277), so it is not a deviation. The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
+
+**To close:** none planned; the limits are the design's (D5, Q11).
+
+---
+
+<a id="counter-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a counter's type is read from the merged state, so a sequential history that leaves the 32-bit range and comes back ends as an `Int32` where the reference stays an `Int64`
+
+**Raised with the Q7 step 2 counter rule R1.** Concurrent increments have no order, so the type of a counter cannot depend on the order or the partial sums they were added in. The type of a counter here is the narrowest of `Int32` and `Int64` that holds its TOTAL, never narrower than the widest type among the base and every increment operand the counter has seen (an `Int64` operand keeps it an `Int64`; a `Decimal128` makes it a `Decimal128`). This gives the reference's answer in every recorded case: an `Int32` plus an `Int64` is an `Int64`, an `Int32` maximum plus 1 is an `Int64`, an `Int32` 5 plus an `Int64` 0 is the long 5 and counts as modified (`q7s2.out`, d8, d9, z2).
+
+**What differs.** The reference remembers the type a running value has had. A single writer who adds `2000000000` to the `Int32` `2000000000` (the cell is now the long `4000000000`) and then adds `-2000000000` and `-1000000000` leaves the long `1000000000` in the reference, and the `Int32` `1000000000` here, because every operand was an `Int32` and the total fits. Two writers who add `7` and `2147483647` to the `Int32` minimum, concurrently or one after the other, get the `Int32` `6`, the same as the engine's update. Recorded directly in `q7s5d.out` (R1 to R3: once an `Int32` overflow made the stored number an `Int64`, every later step keeps it an `Int64`). Two writers that, concurrently, create an absent field or add to it with zeros of different forms (a `-0` and a `0E+3`) read the canonical sum, `0`, where either serial order keeps the first zero's form: the value is equal and only the form of the zero differs.
+
+**Workaround:** none needed for a counter that is read as a number; `$set` the value as a long (`NumberLong`) or add a long operand when the type matters.
+
+<a id="counter-gain-after-absorb-q7"></a>
+
+## 🟡 Under the `field` merge policy a `Decimal128` increment whose sum would round is refused, and after a base write absorbed the counter a decimal gain read from totals that cancel can differ from the reference
+
+**Raised with Amendment 9 of the Q7 design (the independent review of the typed counters).** A base write absorbs the slots it has seen; what a slot gained since is read as its total minus the total the base absorbed. A `Decimal128` slot total is exact (see (a)), so for the INTEGER operands added after the absorb the difference is the integer sum itself, which a correctly rounded subtraction returns exactly: an `Int32` or `Int64` operand after the absorb reads the reference's integer and type.
+
+(a) **A sum that would round is refused, for the visible value and for the writer's own running total** (`IncOutOfRange`, the 400 of `field-merge-refusals-q7` item 3), where the reference rounds it and applies it. This is the design's D5, "exact or 400" (Chris's Q6 ruling), which that entry already stated: the code refused only an overflow, and now refuses every sum whose exact value is not representable as a `Decimal128` (34 nines + 0.5, recorded in `q7s2.out` lines 331-335, which rounds; the overflow of lines 341-345 was refused already). A sum that is exact at a higher exponent is accepted (34 nines + 1, lines 326-330, is exactly 10^34). The writer's slot total is checked as well as the visible value: a slot total that rounded at the write would read a wrong value once a base write absorbed it, and under a merge each writer's slot would round separately, so the visible value would depend on who added what. `{n: Int32 0}`, `$inc` by `Decimal128("1E+33")`, `$set` `Int32 0`, `$inc` by `Decimal128("0.5")` read a `Decimal128` `0` where the reference reads `0.5`, because the slot's `1E+33 + 0.5` has 35 digits; that last `$inc` is refused. The same `$inc` is accepted, and reads `0.5`, in a new generation of the counter (a non-numeric base was written in between) and on a writer whose slot does not hold the `1E+33`, because the slot there holds the operand alone. The refusal covers a third place: a single writer's increment is accepted only if the counter, read from its own state with the planned slot, equals the visible sum (the read is `base + (total - absorbed)` per slot, and that gain can round although the visible sum and the slot total are exact: `{n: Int32 0}`, `$inc` -1E+34, `$set` the decimal -1E+34, `$inc` +1E+34, `$inc` +1E-34 would read 0, not 1E-34, and is refused; the way out is a `$set`). The same check refuses an increment at a writer whose counter a join of concurrent writers already rounded, when the result would not be what it read plus the operand. A JOIN of concurrent writers, each exact at home, still adds the gains in the canonical order and may round: deterministic and convergent, not the reference's. The `document` merge policy does its arithmetic in the engine and rounds as the reference does; it is not affected.
+
+**Workaround:** `$set` the value the decimal counter should have.
+
+(b) **The residual.** A `Decimal128` operand added after an absorb is still read as the difference of two 34-digit totals. When both the slot total and the absorbed total are exact but their DIFFERENCE needs more than 34 digits, and a new base cancels the high digits, the visible `Decimal128` differs from the reference (deterministic, the same on every member). Worked case: `$inc` by `1E+35`; `$set` to the `Decimal128` `1E+35`; `$inc` by `-1E+35`; `$inc` by `1`. The reference reads `1`. Here the slot's totals are exact (`1E+35`, then `0`, then `1`), their difference `1 - 1E+35` has 35 digits and rounds to `-1E+35`, and the counter reads `1E+35 - 1E+35 = 0`. The case shows that exact totals do not make the gain exact when the totals are far apart; it is the one such case recorded, not a bound on how far apart they must be.
+
+**To close:** keep the exact decimal gain with the slot (a second `Decimal128` per slot and pair), a change of the compact form; not planned.
+
+<a id="rename-of-a-counter-q7"></a>
+
+## 🟡 Under the `field` merge policy `$rename` of a number that has been incremented, or of a sub-document holding one, is refused with a 400
+
+**Raised with the Q7 step 2 effects interface, narrowed by the owner (Q7 amendment 8, revised).** A counter's slots cannot move. A `$rename` is refused (`RenameOfCounter`, 400) only when the source path, or a path below it, is at this moment an integer or decimal cell that an `$inc` has written a slot for, in an alive life the member sees (any generation, absorbed or not): a numeric field that has been incremented keeps its name, and a numeric `$set` over it does not free it. The answer reads "{path}, or a field below it, is a number that has been incremented and cannot be renamed ($set the new name and $unset the old one)". An integer or decimal field with a value and no slot (inserted, `$set`, replaced, or created by an upsert's filter, `$set` or `$setOnInsert`) is renamed like any other field, and so is a field that was incremented and is no longer a number (set to a string, a document or an array, unset, replaced away), or a parent whose incremented child is gone. The slot lives as long as the document's life, so a name that was incremented, freed and holds a number again in the same document is refused again; only a delete and re-insert clears it. The reference renames every field. A rename onto a counter is a `$set` and is allowed. Every rename that is accepted writes the register operations of `$set` new + `$unset` old, so the refusal protects no merge invariant; it only spares a developer the surprise of increments reappearing under the old name. Three cases are stated, not hidden:
+
+- Two concurrent renames of one source (`$rename a b` and `$rename a c`) leave `{b: v, c: v}` on every member; no serial order of the reference gives both. One `clash` record is kept on `a`.
+- A rename that races a first `$inc` of the source reads `{a: 5, b: v}` (the reference's order "rename, then increment"), but only when both writers saw the same winning base. If the renamer had seen a newer non-numeric generation, the increment shows in the hidden figure, and the type of the reappearing `a` is the slot's (an `Int32` operand on an `Int64` base reads `Int64` 5).
+- A renamed creation cell loses its tag: renaming a `$setOnInsert` or upsert-filter field writes an untagged register, so if an explicit insert of the same `_id` wins, the copy survives beside the insert's fields with no `insertLost` on members that already hold the rename (Step 4 checklist).
+
+**Workaround:** `$set` the new name to the value read and `$unset` the old one.
+
+**To close:** a rename that carries the slots, and the creation tag on the rename's `Set` (Step 4).
+
+---
+
+<a id="field-merge-unsupported-bson-types-q7"></a>
+
+## 🟡 Under the `field` merge policy six BSON types are refused with a 400 where the reference stores them (Q7 step 2)
+
+**Raised with the Q7 step 2 bridge between BSON and the merge state's value type.** The field-level merge state has a value variant for every BSON type except JavaScript code (with and without scope), symbol, DB pointer, min key, max key and undefined. A write that carries one of them, at any depth (a field, an element of an array, a field of a sub-document), is refused whole with a `400` (`BadValue`, naming the type) and changes nothing. The `document` policy stores them as before. The reference stores all six.
+
+**Workaround:** store the value as a string or a number, or keep the collection under the `document` policy.
+
+**To close:** give the merge state a variant for each of the six (a codec change, so a format decision).
+
+---
+
+<a id="pipeline-reorder-only-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that only reorders the fields of a document is not written, and a new field goes after the fields the document had
+
+**Raised with the Q7 step 2 pipeline-update effects.** A pipeline update (ADR-265) is diffed against the stored document, field by field: a changed or new top-level field is one write, a removed one an unset, and the order of the fields that stay is the writer's (the order they were first written in), not the order the pipeline's result lists them in. So over `{_id: 1, a: 1, b: 2}`, `[{$replaceWith: {_id: "$_id", b: "$b", a: "$a"}}]` changes nothing (`modified: false`), where the reference answers `modified: true` and stores `{_id, b, a}`; and `[{$replaceWith: {n: 9, b: "$b", _id: "$_id"}}]` stores `{_id, b, n}` (the kept field `b` first, then the new `n`), where the reference stores `{_id, n, b}`. A `document` collection stores the pipeline's result as it is. A reorder INSIDE a sub-document is a write (the writer counts an order-only change of a sub-document as a change), under both policies.
+
+**Workaround:** `replaceOne` with the document in the wanted order sets the order.
+
+**To close:** none planned; a pipeline update is a diff, not a replace (the 2026-11-04 ruling).
+
+---
+
+<a id="pipeline-id-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that restates `_id` as another numeric type of the same id keeps the stored `_id`
+
+**Raised with the Q7 step 2 pipeline-update effects.** ADR-265 stores a pipeline result whose `_id` is the same id of another type (`Int32 1` and `Int64 1` are one id) as the result gives it. On a `field` collection `_id` is never an effect: the document's identity is the one it was created with, so `[{$set: {_id: NumberLong(1)}}]` over `{_id: 1}` leaves `_id: 1` (an `Int32`) and answers `modified: false`, where a `document` collection stores the `Int64` and answers `modified: true`. A result with another document's id is refused under both policies.
+
+**Workaround:** none needed; the id is the same id.
+
+**To close:** none planned.
+
+---
+
+## 🟡 The reference's constant folding changes which operand it reads first, and ours reads the operands in the order they are written
+
+**Raised 2026-11-14, from the aggregation sweep q7s4b and q7s4g.** The reference folds the constants of an expression at optimize time, moving them behind the field paths and evaluating them, so the written order is lost. Four visible effects, none followed:
+
+- **A constant that is no number beside a missing path.** `{$add: ["s", "$nope"]}`, `{$add: [true, "$nope"]}`, `{$multiply: ["s", "$nope"]}`, `{$multiply: [true, "$nope"]}` and `{$multiply: [Date(0), "$nope"]}` over a document with no `nope` answer `null` (`q7s4b.jsonl` 357, 377, 1157, 1177, 1197; `q7s4g.jsonl` 602, 606, 607), and `{$add: [Date(0), null]}` is `null` (b:396), while the same constant beside a constant `null` is refused (`{$add: ["s", null]}` code 16554, `{$multiply: ["s", null]}` and `[Date(0), null]` code 14, "Failed to optimize pipeline": b:356, 1156, 1196). Ours reads left to right: `["$nope", "s"]` is `null` and `["s", "$nope"]` is a `400`.
+- **A leading null beside a field of a bad type.** `{$add: [null, "$s"]}` and `{$add: [null, 1, "$s"]}` with `s: "x"` are refused by the reference (q7s4g:605, 610); ours answers `null`, the first operand deciding.
+- **An `$ifNull` replacement that is not taken.** `{$ifNull: ["$a", {$divide: [1, 0]}]}` over a document where `a` is set is refused by the reference, which evaluated the replacement at optimize time (q7s4g:619 to 623); ours does not read it, as `$cond` does not read the branch it does not take.
+- The order between two **field** paths at run time is as written in both: `[$n, $s]` is `null` and `[$s, $n]` is refused (q7s4g:280 to 599, which agree).
+
+**Why.** The order is an artifact of an optimizer, not a rule of the language, and following it would mean this engine folding constants in the same way, for a difference that only a pipeline written with a constant first can meet.
+
+**To close:** none planned.
+
+---
+
+
+## 🟡 A date plus or minus a `Decimal128` is a `400`, where the reference answers
+
+**Raised 2026-11-14, from the aggregation sweep q7s4g.** `$add [date, Decimal]` works in the reference: the decimal is rounded to a whole number of milliseconds (`Decimal(1000)` is `+1000`, `Decimal(1.5)` is `+2`: q7s4g:212 to 220, 242), and a Decimal `NaN` gives the date `Long.MIN` for every date (221, 222, 224, 225, 227, 228); `$subtract [date, Decimal NaN]` is code 159. Ours refuses a decimal beside a date (`$add needs numbers or one date, found a decimal`), as the entry "Arithmetic on a `Decimal128` differs from MongoDB's in four places" records ("Date arithmetic with a decimal stays refused"). The other date rows fit: a double, a long, an overflow and a `NaN` or an infinity (q7s4g:140 to 246).
+
+**Why.** Following it needs a rule for the half (unrecorded beyond 1.5) and for the `NaN`, which is a date that no client can print; the refusal says what is not supported.
+
+**To close:** a ruling on the rounding and on the `NaN` row.
+
+---
+
+## 🟡 An empty argument list of `$add`, `$multiply`, `$and` and `$or` is a `400`, where the reference answers `0`, `1`, `true` and `false`
+
+**Raised 2026-11-14, from the aggregation sweep q7s4b.** `{$add: []}` is `0`, `{$multiply: []}` is `1`, `{$and: []}` is `true` and `{$or: []}` is `false` in the reference (`q7s4b.jsonl` 2516, 2524, 3540, 3541). Each is refused here for needing at least one argument, as `$concatArrays: []` and `$setUnion: []` are (see "Set operators answer in a fixed order": q7s4c:158, 228).
+
+**Why.** An empty list is a pipeline built by a program that forgot its input; the answer that is the identity of the operator hides it. Kept strict.
+
+**To close:** none planned. A pipeline that builds the list from data wraps it: `{$add: [0, ...]}`.
+
+---
+
+## 🟡 An empty `$addFields` or `$set`, and an `includeArrayIndex` that names the unwound path, are a `400`, where the reference answers
+
+**Raised 2026-11-14, from the aggregation sweep q7s4a.** `{$addFields: {}}` and `{$set: {}}` answer the documents unchanged in the reference (`q7s4a.jsonl` 42, 55), and `{$unwind: {path: "$arr", includeArrayIndex: "arr"}}` writes the index over the element (244). Here the first two are refused (`needs at least one field`) and the third is refused (`includeArrayIndex cannot be the same field as path`: it would overwrite the unwound element with its index on every row, which [aggregation.md](aggregation.md#unwind) states). The refused combined `$lookup` (q7s4a:265) is under "Array expression operators are lenient about null where MongoDB errors". `$project {}` is refused by both.
+
+**Why.** A stage that does nothing, and a field that is written and then overwritten, are mistakes; a refusal says so.
+
+**To close:** none planned.
+
+---
+
+## 🟡 A `find` is bounded: no `limit` is 100, more than 10,000 is 10,000, and `limit: 0` is an empty page, where the reference returns every match for a missing limit and for 0
+
+**Raised 2026-11-14, from the query sweep q7s3c and q7s3f.** In the reference a `find` with no `limit`, with `limit: 0` and with `limit: 0.0` returns every document it matches: `skip 10 limit 0` over 40 documents answers the remaining 30 in sort order (`q7s3c.out` c0031 line 1384, c0032 line 1430), and a `limit` of `0`, `0.0` and `0.5` (a double is truncated, so the last is `0` too), with and without a `skip`, answers all eight documents (`q7s3f.jsonl` lines 192 to 199). Here a find is bounded by design ([ADR-098](decisions.md)): a missing `limit` is **100**, a `limit` over **10,000** is clamped to 10,000, both silently, and `limit: 0`, or a double that truncates to `0`, is a window of nothing, an empty page with no `nextCursor` on every access path and every sort order. A client that passes `0` as the driver idiom for "no limit" gets an empty `200` and no error. The rest of the reference's rule is followed: a negative `limit` or `skip` of any type is refused (its code 51024, a `4xx` here: `q7s3c.out` c0048 line 2166, c0049 line 2212; `q7s3f.jsonl` lines 180 to 191), and a double that is not negative is truncated (`2.0`, `2.5`, `2.7` and `2.99` are `2`: lines 168 to 179, c0050 line 2258, c0051 line 2304).
+
+**To close:** reading `0` as "no limit" is not planned, since it would make a value that is more often a bug the unbounded one; a client that reads everything walks with a cursor ([Cursors](query-language.md#cursors)). Refusing `0` with a `400`, so that the difference is loud, is open.
+
+---
+
+## 🟡 An `$inc` or `$mul` that leaves a NaN, and a `$push` whose `$slice` leaves the array as it was, count as modified in the reference and not here
+
+**Raised 2026-11-14, from the update probes q7s2j and q7s2k on the reference (6.0.5).** A write that leaves the stored bytes as they were is not written and is not counted in `modified` ([ADR-208](decisions.md)). The reference counts two kinds of such write as modified (`nModified` 1), and answers the same document. **A stored NaN**: `$inc` and `$mul` of a number over a stored double or decimal `NaN` give `NaN` again, which the reference compares as unequal to itself, so it counts and writes it (`q7s2k.out` k0277 line 1661, k0376 line 2255, k0726 line 4355, k0826 line 4955: 64 cases over the integer, long, double and decimal operands). **A `$push` whose `$slice` leaves the array unchanged**: `{$each: [8, 9], $slice: 0}` over `[]` (`q7s2j.out` j1017 line 6098), `$slice: 2.0` over `[1, 2]`, `[{a: 1}, {a: 2}]` and `[[1, 2], [3]]` (j1039 line 6230 to j1041), and `$slice: 0` with `$sort: 1` over `[]` (j1115 line 6686), and an empty `$each` with a `$sort` that leaves the array in the order it had (q7s3j0201, q7s3m0031, q7s3m0032 and q7s3m0035, each `nModified` 1): the reference does not compare the array it built with the one it held. Here nothing is written and `modified` is 0 for all those forms and all 64 NaN cases; the document, the stamp and the oplog are as they were.
+
+**Why.** The count and the write are one decision here, made on the stored bytes. Counting a write that changes no byte would mean writing it, minting a stamp and replicating it, which is the cost [ADR-208](decisions.md) removed, for a number that says "something happened" about nothing.
+
+**To close:** none planned.
+
+---
+
+## 🟡 An invalid sort direction is refused on every `find_and_modify`, where the reference refuses it only when it has to sort
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `sort: {a: 2}` is a `400` here whatever the filter is. The reference refuses it (code 15975, `$sort key ordering must be 1 (for ascending) or -1 (for descending)`) for a filter that matches nothing, one document, several or all of them (`q7s2p.out` p0019 line 182 and the seven cases beside it), and **applies** the update, ignoring the sort, when the filter is a point lookup on `_id`: `query: {_id: 3}, sort: {a: 2}` updates the document and answers it (p0107 line 1054, p0108). The cause is not recorded; a point lookup on `_id` needs no sort. Here the sort is parsed with the request, before any plan, so a bad direction is refused the same way for every filter.
+
+**Why.** Here the sort is parsed with the request, before any plan, so its validity does not depend on the plan. The refusal stays (kept, as the reference's answer for a point lookup is not worth a plan-dependent refusal).
+
+**To close:** none planned.
+
+---
+
+## 🟡 `arrayFilters` with a replacement document is a `400`, where the reference ignores it
+
+**Raised 2026-11-14, from the positional probe q7s2l.** `{update: {arr: []}, arrayFilters: [{x: 2}]}` replaces the document in the reference, which reads `arrayFilters` as meaningful to operators only and does not look at it (`q7s2l.out` l0297 line 1778: `nModified` 1, `arr: []`; the update table's row `q7s2l0297`). Here it is `400` (`arrayFilters apply to update operators, not to a replacement document`), as it is for a pipeline update (the reference refuses that one too, and an empty list is accepted by both). The filters name identifiers a replacement cannot use, so a request that sends them has misunderstood its update, and applying it silently would hide that.
+
+**To close:** none planned.
+
+---
+
+## 🟡 A `null` `query` of `find_and_modify` is a `422`, where the reference reads it as no filter
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `{query: null, update: {$set: {z: 1}}}` updates the first document in the reference (`q7s2p.out` p0291 line 2903). A `null` `filter` is refused here at the body (`422`, `filter: invalid type: null, expected a non-null value`): a filter is a document, and `{}` says "every document" in the one way the API reads.
+
+**To close:** none planned.
+
+---
+
+## 🟡 A `find` or `find_and_modify` projection that names a path and a path below it lets the shorter path decide, where the reference refuses it
+
+**Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `fields: {c: 1, "c.d": 1}` is refused by the reference (code 31249, `Path collision at c.d remaining portion d`) and the update is not applied (`q7s2p.out` p0179 line 1770, p0180 line 1779). Here the projection is applied: where one path is a prefix of another the shorter one decides, so `c` is included whole ([ADR-214](decisions.md)). The other order and an exclusion pair are not recorded; the same reading holds for them here. A `find` is: `{c: 1, "c.d": 1}`, its other order and an exclusion pair over four documents are refused with 31249 or 31250 (`q7s3d.out` q7s3d0027 line 236, d0028 line 245, d0029 line 254), and here the shorter path decides.
+
+**To close:** a refusal of an ancestor and its descendant in the projection parse, which is small. Not planned until the reference's answer is wanted.
+
+---
+
+## 🟡 A projection value that is a `$slice` or an expression (a string, a `"$field"`) is a `400`, where the reference applies it
+
+**Raised 2026-11-14, from the probes q7s2p (`findAndModify`) and q7s3d (`find`).** The projection of a `find` and of a `find_and_modify` takes `0`, `1` or a boolean for a path. The reference also takes two other values, and answers them; here each is a `400`.
+
+**`{path: {$slice: n}}` and `{path: {$slice: [skip, n]}}`** (the refdiff's group of 22 cases: 18 finds of `q7s3d`, 4 `findAndModify` of `q7s2p`). The reference keeps the document whole and cuts the array at `path`: `{arr: {$slice: 2}}` over `[5, 6, 7, 8]` answers `[5, 6]` (`q7s3d0052`), `{$slice: [1, 2]}` answers `[6, 7]` (`q7s3d0056`), `{$slice: [-2, 1]}` answers `[7]` (`q7s3d0057`), `{$slice: 0}` answers `[]` (`q7s3d0054`), a Double count reads as its whole part (`q7s3d0061`, `q7s3d0062`: `2.5` answers two elements), a path through a document works (`{"c.e": {$slice: 2}}`, `q7s3d0066`), and a value that is not an array is left as it is (`{a: {$slice: 1}}`, `q7s3d0070`). It refuses `[1, 0]`, `[1, -1]` and a list of three (code 28724, `q7s3d0058`, `q7s3d0060`, `q7s3d0065`), and a string count or a list of one (code 28667, `q7s3d0063`, `q7s3d0064`); those refusals are also `400` here, with other words. A `findAndModify` that carries one applies its update (`q7s2p` p0185 to p0188: `fields: {"c.e": {$slice: 1}}` and `{a: {$slice: 1}}`, with `new` true and false); the recording holds the effect on the stored documents and `lastErrorObject` only. **`q7s2z`** records the three forms of `$slice` (`2`, `[1, 2]`, `-1`) over `a = [1, 2, 3, 4]` through `findAndModify` with `new` true, `new` false and `remove` (z0031 to z0033, z0035 to z0037, z0039 to z0041) and through `find` (z0034 answers `a: [1, 2]`, z0038 `[2, 3]`, z0042 `[4]`, the other fields whole), a `$slice` beside an inclusion (`{b: 1, a: {$slice: 2}}` answers `{_id, a: [1, 2], b}`, z0043 to z0046), and a path (`{"c.d": {$slice: 1}}` answers `c: {d: [5]}`, z0067 to z0070). The three `findAndModify` rows of each form apply (`lastErrorObject.n` 1, the update stored with `z` added), and the returned document is the top-level `value` of each record, the same shape as the `find` row: with `new` true the projection of the updated document (z0031 returns `{_id: 1, a: [1, 2], b: "x", c: {d: [5, 6]}, z: 1}`), with `new` false and with `remove` the projection of the document as it was (z0032, z0033: the same without `z`; z0036, z0037 `a: [2, 3]`; z0040, z0041 `a: [4]`), and `{b: 1, a: {$slice: 2}}` returns `{_id, a: [1, 2], b}` in all three (z0044, z0045; z0043). `{"c.d": {$slice: 1}}` returns the whole document with `c.d` cut to `[5]` (z0067 to z0069).
+
+**A literal or an expression as the value** (10 cases: 8 finds of `q7s3d`, 2 `findAndModify` of `q7s2p`). `{a: "x"}` answers `a: "x"` for every document (`q7s3d0021`), and `{a: "$b"}` answers `a` as the value of `b`, with no `a` where the document has no `b` (`q7s3d0087`). A `findAndModify` with `fields: {a: "$b"}` applies its update (`q7s2p` p0191, p0192); the document it returns is in `q7s2z` (below). **`q7s2z` (`find`, and its `findAndModify` twins, whose returned `value` has the shape of the `find` row, in `new` true, `new` false and `remove`):** `{a: "x"}` answers `a: "x"` (z0050; z0047 to z0049), `{a: "$b"}` answers `a: "x"`, the value of `b` (z0054; z0051 to z0053), `{a: {$add: [1, 2]}}` answers `a: 3` (z0058; z0055 to z0057), `{a: {$literal: 5}}` answers `a: 5` (z0062; z0059 to z0061), and `{a: 1, b: "$b"}` answers `a` whole with `b: "x"` (z0066; z0063 to z0065). A projection that mixes inclusion and exclusion (`{a: true, b: false}`) is refused with code 31254 in `find` and in the three `findAndModify` forms (z0071 to z0074), as an `$elemMatch` projection is answered (`{a: {$elemMatch: {$gt: 2}}}` answers `a: [3]`, z0078, and the `value` of z0075 to z0077 is `{_id: 1, a: [3]}`) and the positional `{"a.$": 1}` is refused: code 51246 on `find` and on `findAndModify` with `new` false and `remove` (z0080 to z0082), and code 2 ("cannot use a positional projection and return the new document") with `new` true (z0079). These are the cases of the same entry; every other expression the projection takes is not recorded.
+
+Here a `find_and_modify` that carries either value is the `400` as a whole, where the reference applies the update.
+
+**To close:** the `$slice` cut over the projected array is small and the forms above are recorded; the expression value is the aggregation `$project` engine over a single document and is larger. Not planned until the reference's answer is wanted.
+
+---
+
 <a id="memory-limit-adr-269"></a>
 
 ## 🟡 The stages that block hold their input and the answer is one body, refused past a memory limit, where the reference spills to disk and answers in cursor batches
@@ -93,7 +291,7 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 - **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `ValueTooLarge` (code `answer_too_large`), where the reference's is `51151`; its message names the output and the limit. A string of 16 MiB or more built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413` ("the string $concat builds is N bytes, over the 16 MiB string limit"), where the reference's codes are `16493` and `13548`.
 - **An array or a document an expression builds is held to 16 MiB of BSON,** with the same `413` ([ADR-267](decisions.md#adr-267--the-documents-an-expression-builds-are-held-to-16-mib-an-accumulator-takes-one-expression-a-regex-as-a-fields-value-is-a-pattern)). Arrays: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray`, `$range` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. Documents: an object literal, `$mergeObjects` (the expression and the `$group` accumulator), `$setField`, `$arrayToObject`, and the fields `$addFields`, `$set` and `$project` write (a `{copy: "$$ROOT"}` repeated would double the document). A `$reduce` that doubles a document (`{l: "$$value", r: "$$value"}`, or a `$mergeObjects` of two copies) stops at the step that would pass the limit; before this it copied the document twice a step, reached 5.3 GiB in 21 steps and ended a member at `$range: [0, 30]`. The size is counted as the value is built and a field is refused before it is stored, so what is held is the limit and one element; counted as BSON, a document of many tiny nested documents takes several times its BSON size in memory, so a refused doubling still holds a few copies of a document just under the limit. The reference shares the values (the same pipeline at 40 steps answers in 15 ms) and refuses only when a document is written out, at 64 MB, so a document between 16 MiB and that is answered there and refused here. `$range` has no count cap of its own now: its bytes are worked out first, so `[0, 200000]` answers, as there, and `[0, 2147483647]` is a `413` before anything is allocated. Its limit is the array's 16 MiB, which is **1,376,024 integers**; the reference's is 100 MB of memory (`ExceededMemoryLimit`, 16 bytes an element in its message), about **6.5 million**, so `[0, 2000000]` answers there and is a `413` here. `$zip` keeps its 1,000,000 cells, a `400` raised before anything is built. The arrays a `$group` (and `$bucket`, `$bucketAuto`) builds with `$push`, `$addToSet`, `$firstN`, `$lastN`, `$maxN`, `$minN`, `$topN` and `$bottomN` are held to the same 16 MiB, counted as the group grows (a buffer that gives rows back is counted for what it keeps) and refused at the row that takes the array over it, and so are the `as` arrays of `$lookup` and `$graphLookup`, counted before each document is copied in; the reference refuses only the document that carries the result, past 16 MB, at the end. A group's document is the sum of its accumulators' arrays, each held to the limit, so it can pass 16 MiB by the number of accumulators.
 - **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
-- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null. As the value of a field in `$addFields`/`$set`, `$project` or an object expression a missing path leaves the field out, as there (see the small stages' entry).
+- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry), and so does a `$expr` in a filter: `{$expr: {$eq: ["$a", null]}}` matches a document without `a` here and only one with `a: null` there, and `{$expr: {$ne: ["$a", null]}}` leaves the document without `a` out here and includes it there (`q7s3b.out` b0256 line 7400, b0274 line 7922; for `$$REMOVE` as the operand, b0257 line 7429, see the `$$REMOVE` entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null. As the value of a field in `$addFields`/`$set`, `$project` or an object expression a missing path leaves the field out, as there (see the small stages' entry).
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
 - **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
@@ -320,6 +518,11 @@ Also recorded here, so they are not read as bugs:
 
 **Recorded 2026-11-01.** Only an ObjectId, string, integer, `Decimal128` and binary value can be a document `_id`; an embedded document, an array, a double, a boolean, a date or `null` is refused at insert (`400 invalid document id`), where the reference stores any type but an array. A pipeline update that sets `_id` to a double is refused for the same reason (see the pipeline-update entry). An existing design decision on the key type; not changed by the query-language work.
 
+**Recorded 2026-11-14 (`q7s2o`), the routes the reference accepts and this refuses.** An upsert whose replacement names `_id: 5.0` (`q7s2o.out` o0592 line 3473, 6 cases; with a filter `_id` that equals it, o0599 line 3514, 4 cases) is stored under `5` there and is `400 invalid _id type` here; an upsert whose filter pins `_id` to `5.0` or to a document (`{_id: {k: 1}}`, `{"_id.k": 1}`) inserts there (o0723 line 4240, o0767 line 4487, 4 cases) and is `400` here. A pipeline update that makes `_id` a double (`$toDouble`, a double literal, a `$replaceWith` naming one) stores it there (`q7s2s.jsonl` cases 3-4, 13-14, 47-48) and is refused here; the same number in a long or a decimal is accepted on both.
+
+**The cases the refdiff counts as eleven (`q7s2o`, the update operators, an upsert that inserts, refused here as `invalid _id type`).** A `Double` `_id`: o0722 (`$rename y -> _id`, filter `{_id: 5.0}`) and o0723 (`$set z`, the same filter); the reference stores `_id: 5.0`, and `{_id: 5.0, z: 1}` for o0723. A document `_id`, six cases: o0765 (`$max _id 9`), o0766 (`$rename y -> _id`) and o0767 (`$set z 1`) over the filter `{_id: {k: 1}}`, and o0776, o0777, o0778 (the same three operators) over the filter `{"_id.k": 1}`; the reference stores `_id: {k: 1}` in all six, with `z: 1` for o0767 and o0778. **A `null` `_id`, three cases:** o0786 (`$min _id 1`), o0788 (`$rename y -> _id`) and o0789 (`$set z 1`), over the filter `{_id: null}`; the reference stores `_id: null` for the first two and `{_id: null, z: 1}` for o0789, where this is `400 invalid _id type "Null"`.
+**`$set "_id.x"` on an upsert that inserts** (the refdiff's three cases, `q7s2o`: o0746 over the filter `{}`, o0757 over `{a: 5}`, o0801 over `{_id: /x/}`). The reference inserts `{_id: {x: 1}}` (`{_id: {x: 1}, a: 5}` for o0757): the path creates an `_id` that is a document. Here the update is refused as a change of the immutable `_id` (`400`). That route is the same refusal as the document `_id` above, and is closed with it.
+
 **To close:** none planned.
 
 ---
@@ -528,20 +731,6 @@ systems use.
 
 ---
 
-## 🟡 A plain-document `$pull` matches the whole element, where MongoDB reads it as a query on the element's fields
-
-**Raised 2026-10-26, with ADR-253.** `{"$pull": {"results": {"score": 8}}}` removes the elements **equal** to `{score: 8}` and leaves `{score: 8, item: "B"}`, as `$pull` of a document always has here. MongoDB reads a document operand as a query against each element, and removes `{score: 8, item: "B"}` too. A document whose keys all start with `$` is a condition here (`{"$pull": {"scores": {"$gte": 6}}}`), as there, and a document mixing `$` keys and plain keys is a `400`.
-
-**The spelling that does what MongoDB's plain document does** is `$elemMatch`: `{"$pull": {"results": {"$elemMatch": {"score": 8}}}}` removes `{score: 8}` and `{score: 8, item: "B"}` alike, and takes the conditions a filter does (`{"$elemMatch": {"score": {"$gte": 8}, "item": "B"}}`).
-
-**Why.** Every `$pull` that worked before still does what it did, byte for byte: a plain document was always a value. Reading it as a query would have made an update that removed one element remove several, with a `200`, for a caller who changed nothing. Only a document that could not have matched anything before (an operator document compared as a value) changed meaning.
-
-**What it costs.** A port written against MongoDB's reading of a plain document removes less here, silently, and must spell it `$elemMatch`.
-
-**Closing it** means reading a plain document as a query, which changes the result of every existing partial-document `$pull`. Not planned.
-
----
-
 ## 🟡 `$zip` refuses an empty `inputs` and a result over a million values
 
 **Raised 2026-10-28, with ADR-255.** `{$zip: {inputs: []}}` is a `400` here; the reference answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built. (This entry also held `$sortArray`'s and `$sort`'s reading of a descending key through an array by its smallest element; that now takes the largest, as the reference does, since ADR-264.)
@@ -566,27 +755,17 @@ systems use.
 
 ---
 
-## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
+## 🟢 An inclusion projection left out a sub-document that held none of its paths, where MongoDB answers it empty
 
-**Raised 2026-10-01, with ADR-214.** A projection through an array now does
-what MongoDB's does: the array is kept, each document element is reduced to
-the included sub-paths (or has the excluded ones removed), an element that is
-not a document is dropped from an inclusion, an element holding none of the
-paths is `{}`, nested arrays recurse, and a numeric segment names a field
-rather than a position. Until then KimmyDB answered the first element alone,
-as a document (`p: {_id: 1}` for `{"p._id": 1}`), and an exclusion through an
-array removed nothing; both are fixed, not deviations, and are recorded under
-`### Changed` in the changelog.
+**Raised 2026-10-01, with ADR-214; closed 2026-11-15 (`q7s4q`, q7s3d0025, q7s4g0099).** A projection through an array does what MongoDB's does: the array is kept, each document element is reduced to the included sub-paths (or has the excluded ones removed), an element that is not a document is dropped from an inclusion, an element holding none of the paths is `{}`, nested arrays recurse, and a numeric segment names a field rather than a position. A **sub-document outside an array** was the exception: `{"a.b": 1}` over `{a: {c: 1}}` answered no `a`, where MongoDB answers `a: {}` (and `p: [{}]` where MongoDB answers `p: [{q: {}}]` for `{"p.q.r": 1}` over `p: [{q: {x: 1}}]`).
 
-What still differs is a **sub-document outside an array**: `{"a.b": 1}` over
-`{a: {c: 1}}` answers no `a` here, where MongoDB answers `a: {}`, and the same
-holds one level into an element — `{"p.q.r": 1}` over `p: [{q: {x: 1}}]` is
-`p: [{}]` here and `p: [{q: {}}]` there. The field a caller asked for is
-absent either way; only the empty container around it differs. It is the rule
-KimmyDB's projection has always had for documents, and changing it is a change
-of its own that nobody has asked for.
+**What changed.** An included dotted path keeps its parent whatever it finds inside, for a `find` projection and for a `$project` stage alike (both go through `shape::project`): a sub-document stays a document holding only what was selected, empty if nothing was; an array keeps one projected document per document element; only a parent that is a scalar, null or missing is left out. The recorded rows are the table `projection_included.tsv`. It is recorded under **Fixed** in the changelog.
 
-**Three smaller points, same entry.** `{"a": 1, "a.b": 1}` is accepted and
+---
+
+## 🟡 A projection accepts a path overlap MongoDB refuses, and `$project` reads `items.$` and a computed path into an array differently
+
+**Raised 2026-10-01, with ADR-214.** `{"a": 1, "a.b": 1}` is accepted and
 includes `a` whole, where MongoDB refuses the overlap as a path collision; a
 request MongoDB refuses means something here, so nothing ported changes
 meaning. In a `$project` stage `{"items.$": 1}` is a field called `$`, not the
@@ -760,10 +939,10 @@ cannot be told from a real one.
 
 **Now** (closed 2026-09-29, [ADR-196](decisions.md)). An unknown alias, and an
 empty list, are a `400` at parse, naming the alias; the aliases are the names a
-stored value can report (which include `symbol` and `dbPointer`, and have no
-code) and `number`. A `$regex` flag other than `i`, `m`, `s` and `x` is a
+stored value can report (which include `symbol` and `dbPointer`, codes 14 and
+12 since the codes were widened) and `number`. A `$regex` flag other than `i`, `m`, `s` and `x` is a
 `400` naming it, wherever it is written: a sibling `$options`, the flags of a
-regex literal, or a lone `$options`. `number`, which matched nothing (it was
+regex literal. A `$options` with no `$regex` is refused as well. `number`, which matched nothing (it was
 never refused), is now the alias for `double`, `int`, `long` and `decimal`, expanded
 when the filter is parsed.
 
@@ -781,84 +960,88 @@ pattern and flags (the flags compared as written, as the reference compares them
 
 ---
 
-## 🟡 A regular expression inside `$in`, `$nin` or `$all`, or under `$ne`, is refused, where MongoDB matches it as a pattern
+## 🟢 A regular expression inside `$in`, `$nin` or `$all` was refused; it is a pattern, and under `$ne` it is refused as the reference refuses it
 
-**Raised 2026-10-01, by the review of the change that keeps a `$regex`
-compiled.** The three operators compare values, and a regex among them was
-compared as one: `{"s": {"$in": [/abc/]}}` matched only a stored regex
-`/abc/` and never the string `"xabcx"`, and `$nin` matched every string.
-Over HTTP it was worse, because the JSON decoder has no
-`$regularExpression` form: `{"$in": [{"$regex": "abc"}]}` and the Extended
-JSON spelling both arrived as ordinary documents, matched nothing under `$in`
-and everything under `$nin`, and answered `200`. MongoDB matches each such
-element as a pattern.
+**Was** (raised 2026-10-01, by the review of the change that keeps a `$regex`
+compiled). The operators compare values, and a regex among them was compared as
+one: `{"s": {"$in": [/abc/]}}` matched only a stored regex `/abc/` and never the
+string `"xabcx"`, and `$nin` matched every string. Over HTTP it was worse,
+because the JSON decoder had no `$regularExpression` form:
+`{"$in": [{"$regex": "abc"}]}` arrived as an ordinary document, matched nothing
+under `$in` and everything under `$nin`, and answered `200`. The decoder reads
+`$regularExpression` since 0.59.0. Rather than answer that, a regex among the
+members of `$in`, `$nin` or `$all`, or as the operand of `$ne`, was a `400`.
 
-**The rule.** A regex literal, a document whose keys are `$regex` and
-optionally `$options`, or a document whose only key is `$regularExpression`,
-among the values of `$in`, `$nin` or `$all`, wherever the operator is written
-(under `$not` and inside `$elemMatch` too), is a `400` naming the operator and
-the value, and saying that alternatives belong in an `$or` of `$regex` clauses
-or in one pattern. The same shapes as the operand of `$ne` are refused too,
-pointing to `{"$not": {"$regex": ...}}`: `$ne` compared them as values, so
-`{"s": {"$ne": {"$regex": "abc"}}}` held for every string, the ones the pattern
-matches included (raised by the same review, a day later). `$eq` still compares
-a regex as a value.
+**Now** (closed 2026-11-14). A regex literal, a document whose keys are `$regex`
+and optionally `$options`, or a document whose only key is
+`$regularExpression`, among the members of `$in`, `$nin` or `$all`, is a
+pattern, as the reference reads it. In `$in` the field, or an element of the
+field, equals one of the other members or matches the pattern, and a stored
+regex of the same pattern and flags matches it too (`q7s2r.out` r0006 to
+r0022). `$nin` is the exact complement, a missing or null field included unless
+`null` is listed (r0023 to r0027). In `$all` each pattern is a clause of its
+own that the field, or an element of it, must match, beside the values it holds
+(r0028 to r0032). A regex inside an array member is part of that value and
+matches nothing (r0022). A filter holding one is never answered from an index
+(`explain` shows a collection scan), and an upsert it filters seeds nothing from
+a pattern. An invalid pattern is a `400`, where the reference answers its code
+51091.
 
-**What that costs.** A stored document may hold `$`-prefixed keys, so a
-document shaped exactly `{"$regex": ...}` cannot be found through `$in`; `$eq`
-still finds it, and `$in` still compares a document of any other shape, a
-`{"$regex": ..., "kind": ...}` among them. A filter written for MongoDB that
-uses a pattern inside `$in` must be rewritten as an `$or`.
-
-**Closing it** means matching a regex element as a pattern, as the reference does.
-The JSON decoder reads a `$regularExpression` form since 0.59.0, so a regex can
-be sent as a value. Not planned until someone needs patterns in a list; the
-`$or` says the same thing.
+**What stays.** A regex as the operand of `$ne` is refused, as the reference
+refuses it (code 2, "Can't have regex as arg to $ne.", r0033), pointing to
+`{"$not": {"$regex": ...}}`; `$eq` compares a regex as a value. The cost of the
+change: a stored document shaped exactly `{"$regex": ...}` (or
+`{"$regularExpression": ...}`) cannot be found through `$in`, `$nin` or `$all`;
+`$eq` still finds it, and a document of any other shape, a
+`{"$regex": ..., "kind": ...}` among them, is still compared as a value. The
+options `z` and `g` cannot be recorded from the client and are refused as
+before (UNRECORDED).
 
 ---
 
-## 🟡 An `$elemMatch` inside `$all` is refused, where MongoDB matches each one against an element
+## 🟢 An `$elemMatch` inside `$all` was refused; each is read as an `$elemMatch` of its own
 
-**Raised 2026-10-01, by the same review.** `$all` compares values, so
+**Was** (raised 2026-10-01, by the same review). `$all` compared values, so
 `{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` compared each element with
 the document `{"$elemMatch": {"qty": 5}}` and matched nothing, even over an
-element holding `qty: 5`, and even `{"$elemMatch": {"$eq": "q"}}` over an array
-holding `"q"`; it answered `200`. MongoDB reads each `$elemMatch` in the list as
-a condition some element must satisfy.
+element holding `qty: 5`; it answered `200`. A document whose only key is
+`$elemMatch` among the values of `$all` was a `400` instead.
 
-**The rule.** A document whose only key is `$elemMatch`, among the values of
-`$all`, wherever the operator is written, is a `400` naming the value and
-pointing to an `$and` of `$elemMatch` clauses, which says the same thing.
+**Now** (closed 2026-11-14). An `$all` whose members are all `$elemMatch`
+documents holds when the field has an element for each, each by an element of
+its own: `{"$all": [{"$elemMatch": {"a": 1}}, {"$elemMatch": {"a": 2}}]}` over
+`[{a: 1}, {a: 2}]` (`q7s2r.out` r0049 to r0066). The bodies are an
+`$elemMatch`'s: documents and conditions on scalars, `$elemMatch` and `$size`
+among them. A list that mixes an `$elemMatch` with another member is refused
+with the reference's own text: one that starts with an `$elemMatch` and holds a
+value, a document or a regex is "$all/$elemMatch has to be consistent" (r0054,
+r0056, r0063), one that starts with a value and holds an `$elemMatch` is "no $
+expressions in $all" (r0055). A document with another key beside `$elemMatch` is
+a value, as before. As the filter of an upsert it seeds nothing (r0118, r0120).
+Along with it, an `$elemMatch` reads an element that is an array as one value
+(the comparisons, `$in`, `$regex` and `$type` are made on the array and not on
+its members: r0040, r0052), and `{"$elemMatch": {}}` holds for a document or an
+array element and for no scalar (r0059).
 
-**What that costs.** A stored document shaped exactly `{"$elemMatch": ...}`
-cannot be found through `$all`; one with any other key beside it still can. A
-filter written for MongoDB that uses this form must be rewritten as the `$and`.
-
-**Closing it** means evaluating each such element as an `$elemMatch`, as MongoDB
-does. Not planned: the `$and` is the same query.
+**UNRECORDED.** The positional `$` of an update after an `$all` of `$elemMatch`
+documents: with one member it is the position of the `$elemMatch`, as if that were
+written alone; with several none is recorded.
 
 ---
 
-## 🟡 An empty `$all` is refused, where MongoDB matches no document
+## 🟢 An empty `$all` was refused; it matches no document
 
-**Raised 2026-10-01.** `{"tags": {"$all": []}}` matched every document whose
-`tags` holds an array, since every one of no values is in any array, and under
-`$not` every document whose `tags` does not; it answered `200`. A list that
-arrives empty is far more often a client's bug (a filter built from a
-selection nobody made) than a question, and on a `multi` update or delete it
-reached every such document. MongoDB matches no document.
+**Was** (raised 2026-10-01). `{"tags": {"$all": []}}` matched every document
+whose `tags` holds an array, since every one of no values is in any array, and
+under `$not` every document whose `tags` does not; it answered `200`. A list
+that arrives empty is far more often a client's bug than a question, and on a
+`multi` update or delete it reached every such document, so an empty list was a
+`400` naming the field.
 
-**The rule.** An empty `$all` list, wherever it is written (under `$not`, in
-an `$or` branch, inside `$elemMatch`), is a `400` naming the field (or "an
-array element") and asking for at least one value.
-
-**What that costs.** A caller relying on MongoDB's empty answer, for example to
-build a filter that matches nothing on purpose, gets a `400` instead and must
-leave the condition out or skip the request.
-
-**Closing it** means answering it as MongoDB does, matching nothing. Not
-planned: the refusal says more than an empty answer would, and an empty answer
-on a write would be just as silent about the bug.
+**Now** (closed 2026-11-14). An empty `$all` matches no document, as the
+reference answers it (`q7s2r.out` r0067, r0135, r0136): a find returns nothing, a
+`multi` update or delete touches nothing, and an upsert by it inserts a document
+seeded with nothing. Under `$not` it matches every document.
 
 ---
 
@@ -897,19 +1080,32 @@ operator; the entry below records how the conversion differs from MongoDB's.
   (`2026-8-12`), month names (`07 Sep 2026 10:00:00 GMT`) and `20260812`.
   MongoDB's parser accepts those and more, and a `timezone` argument applied
   to a zoneless string. A string neither accepts is an error in both.
-- **A double to a string is Rust's shortest round-trip digits, in plain
-  decimal, never in exponent form.** It agrees with MongoDB on every ordinary
-  value — `2` for `2.0`, `1.5`, `NaN`, `Infinity` — and disagrees on
-  magnitudes MongoDB prints in exponent form: `1e21` is
-  `"1000000000000000000000"` here and `"1e+21"` there, and `1e-7` is
-  `"0.0000001"`. The engine's own JSON edge prints doubles the same way, so a
-  converted string and a returned double read alike. A string built from a
-  large or small double therefore compares unequal to the same string built
-  there.
+- **A double to a string keeps every digit, in plain decimal, where the reference keeps
+  six significant digits and uses exponent form for a large or a small value.** The
+  reference's text is a `%g`, six significant digits and no trailing zeros. Recorded
+  (q7s4c:531, 532 and q7s4g:629 to 650): `1e20` is `"1e+20"` there and
+  `"100000000000000000000"` here; `-2147483649.0` is `"-2.14748e+09"` there and
+  `"-2147483649"` here; `1234567.5` is `"1.23457e+06"` there and `"1234567.5"` here;
+  `123456.7` is `"123457"` and `"123456.7"`; `3.14159265358979` is `"3.14159"` and
+  `"3.14159265358979"`; `1/3` is `"0.333333"` and `"0.3333333333333333"`;
+  `0.30000000000000004` is `"0.3"` and `"0.30000000000000004"`; `2^53` is `"9.0072e+15"` and
+  `"9007199254740992"`; `1e15` is `"1e+15"` and `"1000000000000000"`; `1e-7` is `"1e-07"`
+  and `"0.0000001"`; `5e-324` is `"4.94066e-324"` and a decimal of 324 places. So every
+  digit past the sixth is dropped there, for every double, and none is here, and the exponent form is used
+  there for `1234567.5` and up and for `1e-7`, never here (`123456.7` and `100000` are not
+  in the exponent form there; where it starts between `1e-7` and `0.1` is UNRECORDED). Ours is Rust's shortest round-trip digits. The two agree
+  where six digits and no exponent say the whole value: `0.1` is `"0.1"`, `2.5` is `"2.5"`,
+  `5.0` is `"5"`, `-0.0` is `"-0"`, `NaN` is `"NaN"` and `Infinity` is `"Infinity"`
+  (q7s4c:525 to 530, q7s4g:629, 641, 642, 645, 649, 650). The engine's own JSON edge prints
+  doubles as ours does, so a converted string and a returned double read alike. A string
+  built from a double therefore differs from the same string built there, and two doubles
+  that differ past the sixth digit are two strings here and one there.
 - **`decimal` converts a double by its exact binary value, rounded once to 34
   digits (ADR-252); MongoDB rounds it to 15 significant digits.** `{$toDecimal:
   0.1}` is `0.1000000000000000055511151231257827` here and `Decimal128("0.100000000000000")`
-  there, and `{$toDecimal: 2.5}` is `2.5` here and `2.50000000000000` there. The
+  there (`q7s5h.out` 0004), `{$toDecimal: 5.0}` is `5` here and `5.00000000000000`
+  there (0005), and `{$toDecimal: 1234567890123465.0}` is `1234567890123465` here and
+  `1.23456789012346E+15` there (0006). The
   15-digit rule reverses orders the comparator gives (`0.3` against
   `0.29999999999999999`), merges distinct doubles (`0.1 + 0.2` with `0.3`) and
   pads. This conversion is IEEE 754 `convertFormat`, never reverses an order,
@@ -952,14 +1148,23 @@ and [query-language.md](query-language.md#decimal128-arithmetic-in-updates).
 It differs from MongoDB's in four places (verified against its source and manual
 on 2026-10-16, except the n-ary `$add`, which is by reading):
 
-- **A double converts exactly, not at 15 digits.** MongoDB converts a double to a
-  decimal at 15 significant digits, with trailing zeros kept, in `$add`,
-  `$subtract`, `$multiply` and `$divide` (`Value::coerceToDecimal`, the
-  `kRoundTo15Digits` default), in `$toDecimal`, and in `$inc` and `$mul`
-  (`SafeNum::getDecimal`). Here it is the double's exact binary value rounded
-  once to 34 digits, half to even, everywhere. `0.1 + Decimal128("0.2")` is
-  `0.3000000000000000055511151231257827` here and `0.300000000000000` there.
-  Only MongoDB's own `$sum` converts the double part at 34 digits.
+- **A double converts exactly, where the reference rounds it at 15 digits in six places.**
+  The reference converts a double that meets a `Decimal128` to a decimal rounded to 15 significant
+  digits, half to even, in the update operators `$inc` and `$mul`, in `$subtract`, `$multiply` and
+  `$divide`, and in `$toDecimal`: `{$subtract: [0.1, Decimal128("0")]}`, `{$multiply: [0.1,
+  Decimal128("1")]}`, `{$divide: [0.1, Decimal128("1")]}` and `{$toDecimal: 0.1}` are
+  `0.100000000000000` there (`q7s5h.out` 0001-0004), `{$toDecimal: 5.0}` is `5.00000000000000`
+  (0005), and `$inc` of `Decimal128("0")` over a stored `5.0` or `0.1` stores `5.00000000000000` or
+  `0.100000000000000` (`q7s5e.out` 0001-0006, `q7s5f.out` 0001-0005, 0007 and 0009). The update
+  operators fold a positive exponent into the coefficient (exponent 0) and make a negative zero
+  positive: a stored `1234567890123465.0`, a tie at the 15th digit, becomes `1234567890123460`
+  (`q7s5g.out` 0001 and 0003), where `{$toDecimal: 1234567890123465.0}` keeps the exponent,
+  `1.23456789012346E+15` (`q7s5h.out` 0006). Here a double converts by its exact binary value
+  rounded once to 34 digits, half to even (ADR-252, Chris's ruling, which rejects the 15-digit
+  convention: it can reverse an ordering and merges distinct doubles), so the same operations give
+  `0.1000000000000000055511151231257827`, `5`, and `1234567890123465`. In `$add` and `$sum` the
+  reference keeps the exact value as well, so there is no difference there (`q7s5e.out` 0007-0011:
+  `$add` of a double and a decimal, also inside a pipeline update, and `$sum`).
 - **`$sum` and `$avg` are exact and independent of order.** MongoDB's `$sum`
   rounds decimals at each document (`decimalTotal.add`), so the total depends on
   document order: over `1E+34`, `0.5`, `0.5`, `-1E+34` one order gives `0E+1`
@@ -977,6 +1182,25 @@ on 2026-10-16, except the n-ary `$add`, which is by reading):
   `{"$numberDecimal": "0.01"}`, because widening the double exactly would store
   `20.00000000000000000020816681711722` in a field that kept cents. The
   exact doubles (`0.5`, `0.25`, `2.0`, integers) and every decimal are applied.
+  Recorded 2026-11-14 (`q7s2k.out`): `$inc: {f: 1e308}` over `Decimal128("5.5")`
+  (k0364 line 2183) and `$mul` (k0814 line 4883) apply there, 4 cases each, and
+  are the `400` here.
+
+Recorded 2026-11-14 (`q7s2k.out`): an overflow applies in the reference and
+stores `Infinity`, `$inc` of the largest decimal over itself (k0443 line 2657)
+and 18 `$mul` cases such as k0493 (line 2957); here each is the `400`.
+
+**The exponent a result over a stored zero or a seeded decimal is stored with can differ from the
+reference's.** The same number is stored as another member of its cohort: `$mul` of
+`Decimal128("1E+3")`, `100E-2`, `1.50E+1`, `0E+3`, `-0E-2` or `1.000` over a stored
+`Decimal128("0")` is `0E+3`, `0.00`, `0.0`, `0E+3`, `-0.00` or `0.000` here and `0` there
+(`q7s4h.jsonl` 121-126); and an upsert that seeds a `Decimal128("2")` and applies `$mul` of
+`100E-2` stores `2.00` here and `2` there (221). An `$inc` of a decimal zero that leaves the stored
+decimal equal leaves it as it is, as the reference does (29 and 206 matched since `q7s5c.out`
+E1-E5). A representation difference, not a value
+difference: the values are equal and compare equal. The rows are pinned both ways in
+`decimal_arith_tests.rs` (ours and the recorded text), so a change on either side fails the test.
+`$inc` over an absent field stores the operand as given, as the reference does (1-6, 193-208).
 
 Also decided with it: a zero divisor of any spelling is a `400` for a decimal as
 for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` and
@@ -1028,25 +1252,86 @@ under [Positional updates](query-language.md#positional-updates) and
 
 - **A `$` the filter did not earn is a `400`.** The filter must match on an
   array field, and the `$` path must go through that same array; `items.$.x`
-  under a filter positioned on `scores` is refused, naming both arrays.
+  under a filter positioned on `scores` is refused, naming both arrays. The
+  reference answers a `$` over a match that is not an array element: `{"a.$": 1}`
+  under `{a: 1}` returns `a: 1` for a scalar and `[1]` for `[1, 2]`, and `{"c.d.$": 1}`
+  returns `c: {d: 1}` and `c: [{d: 1}]` (`q7s3d.out` d0110 line 983, d0108 line 965); here
+  that request is the `400`.
+  **The update recorded for it (15 cases by the refdiff).** Where the filter
+  holds a condition that records no position, the reference still takes a `$`
+  and writes an element: `{arr: {$exists: true}}` over `[1, 2, 3, 2]` writes
+  index 0 (`q7s2l` l0034 to l0036: `$set` gives `[9, 2, 3, 2]`, `$unset` leaves
+  `null` at 0, `$inc` gives `[2, 2, 3, 2]`); `{arr: {$all: [2, 3]}}` writes
+  index 2 (l0052 to l0054), and `{arr: {$all: [6, 1]}}` over `[5, 1, 6, 2, 7]`
+  writes index 1 (`q7s2q` q0015): in both, the position of the last value
+  listed.
+  **The rows of the update table that keep this are `q7s2q0015`, `q7s2q0079`,
+  `q7s2q0080`, `q7s2l0052`, `q7s2l0053`, `q7s2l0054` and, below, `q7s2l0138`.** A condition on an element of an array that is itself an array,
+  `{"arr.0": {$elemMatch: {$gt: 1}}}` over `[[1, 2], [3, 4], [3, 5]]`, writes
+  index 1 (q0079, and `arr.$.0` gives `[X, 4]` at index 1, q0080); and
+  `{"items.c": {$exists: true}, "items.d": {$exists: true}}` and its
+  `$exists: false` pair apply with a `$` too (`q7s3i` 182 and 184). A `$` over `g = [[1, 2], [3, 4]]` under
+  `{"g.1": 4}`, which matches no document, is `n: 0` and no refusal there
+  (l0131, l0136, l0141, l0151); here it is the `400` above, because the filter
+  is not on an array that the path goes through. All of these are the `400`
+  here. Where the filter names no array at all (`{_id: 1}`, l0046 to l0048), or
+  holds `$size` or an index (`{"arr.0": 1}`, l0055 to l0063), the reference
+  refuses too, as here.
+- **`$` after an index, under a filter that matched an element of the array
+  before it, is applied there and refused here** (l0137 and l0138, `q7s2l`).
+  `{$set: {"g.0.$": 9}}` under `{g: [3, 4]}` over `g = [[1, 2], [3, 4]]`
+  writes `[[1, 9], [3, 4]]`: the matched element of `g` is index 1, and the
+  reference reads that 1 as the `$` inside `g.0`. Under `{g: {$elemMatch: {$gt:
+  3}}}` the same update matches nothing (`n: 0`). Here both are `400` (the `$` follows `g.0`
+  but the filter matched an element of `g`). Which index the reference takes for
+  `$` after other paths than these two is unrecorded.
 - **Several conditions on one array path** leave the first element satisfying
   the *last* condition evaluated. `$nor`, `$not`, `$ne`, `$nin`, `$exists`,
   `$size`, `$all` and `$expr` record no position; an explicit index in the
   filter (`items.0.sku`) records none either. The clauses of a filter are
   ordered as written for "the last array"; the conditions inside one field
   are in the filter's evaluation order, which puts one holding a `$expr` last.
-- **`$` under `$or` works here and is refused by the reference.** `$or` records
-  from the first branch, in the order written, that held, **passing over a branch
+- **`$` under `$or`: equal for equalities on one array, applied here and refused there for
+  the rest.** What is **equal** (recorded in `q7s2ab`, 102 rows, and the update table's
+  `q7s2q0001`, `q7s2q0003`, `q7s2l0040`, `q7s2l0041` and `q7s2l0042`): an `$or` whose
+  branches are all one equality on the same array path is one `$in` of their values, so `$`
+  takes the **smallest index** of an element equal to any of them, in whatever order the
+  branches are written, and a branch that matches nothing is ignored (`q7s2ab0001` to
+  `q7s2ab0036`); `{arr: {$in: [...]}}` takes the first element that matches any of the values
+  (`q7s2ab0037` to `q7s2ab0042`); an `$or` of that shape beside another condition on the same
+  array decides the position, whichever is written first (`{arr: 2, $or: [{arr: 7}, {arr: 1}]}`
+  and its swap, `q7s2ab0049` to `q7s2ab0054`; any other shape of that kind is UNRECORDED); an
+  explicit `$and` of conditions on the array takes the last one written (`q7s2ab0055` to
+  `q7s2ab0060`). The find projection `items.$` chooses its element by the same code
+  (`filter::position`); the reference's refusal of the projection under `$or` is the **kept**
+  difference below. **Kept:** every other `$or` records from the first branch, in the order
+  written, that held, **passing over a branch
   that draws a random number** (`$sampleRate`, `$rand`), which cannot be asked
   again after the match: the position can then come from a later branch, and a
   document that matched only through a random branch gives none, so the
   positional `$` is a `400` for it (`{$or: [{a: 2, $sampleRate: 0.9}, {b: 1}]}`
   over `{a: [1, 2, 3]}` with no `b`). That is not recorded against the
-  reference either (`q8-probes/q8d-m3.js`, not run). The reference's `$or` does
-  not pass match details to its branches, so an update that uses `$` under
-  `$or` fails there (*the positional operator did not find the match needed
-  from the query*). A filter written for this engine that relies on it does not
-  port.
+  reference either (`q8-probes/q8d-m3.js`, not run). For every shape but the
+  equalities above, an update that uses `$` under `$or` fails in the reference
+  (*the positional operator did not find the match needed from the query*, code
+  2). A filter written for this engine that relies on it does not port. **The find projection is the same:** `{"items.$": 1}` under
+  `{$or: [{"items.c": 2}, {"items.d": 1}]}` is refused by the reference (code 51246, the
+  positional operator could not find a matching element; q7s3i0173, q7s3i0175) and answered
+  here.
+  **Recorded in `q7s2ab` (30 rows of the table, kept; refused by the reference with
+  code 2 and applied here, each `$set`, `$inc` and `$unset` of `arr.$`):** an `$or` with a
+  range branch (`{$gt: 6}` and `{$lt: 2}`, in either order: `q7s2ab0043` to `q7s2ab0048`), an
+  `$or` with a branch on another field (`q7s2ab0061` to `q7s2ab0072`), a nested `$or`
+  (`q7s2ab0073` to `q7s2ab0078`) and `$or` branches of `$elemMatch` (`q7s2ab0088` to
+  `q7s2ab0093`): `q7s2ab0043`, `q7s2ab0044`, `q7s2ab0045`, `q7s2ab0046`, `q7s2ab0047`, `q7s2ab0048`, `q7s2ab0061`, `q7s2ab0062`, `q7s2ab0063`, `q7s2ab0064`, `q7s2ab0065`, `q7s2ab0066`, `q7s2ab0067`, `q7s2ab0068`, `q7s2ab0069`, `q7s2ab0070`, `q7s2ab0071`, `q7s2ab0072`, `q7s2ab0073`, `q7s2ab0074`, `q7s2ab0075`, `q7s2ab0076`, `q7s2ab0077`, `q7s2ab0078`, `q7s2ab0088`, `q7s2ab0089`, `q7s2ab0090`, `q7s2ab0091`, `q7s2ab0092`, `q7s2ab0093`.
+  **Recorded (11 cases by the refdiff, still applying):** `q7s2q` q0010,
+  q0014, q0021, q0022, q0029 and q0030 (six), among them `$set arr.$` under
+  `{$or: [{arr: {$gt: 5}}, {arr: {$lt: 2}}]}` (q0010) and
+  `{$or: [{arr: {$gt: 6}}, {x: 1}]}` (q0014) over `arr = [5, 1, 6, 2, 7]`, and
+  `$set arr.$.z` under `{$or: [{"arr.a": 2}, {"arr.b": 5}]}` over an array of
+  documents (q0021), refused by the reference with code 2 and applied here; the
+  other five are `q7s3g` (3 cases) and `q7s3i` (2 cases), which this entry
+  does not list (the two projection rows of `q7s3i` above are not among them).
 - **An upsert that inserts is a `400`** for a `$` path: there was no existing
   document to match, so no element. An upsert whose filter finds a document
   updates it and the `$` reads that document.
@@ -1166,7 +1451,7 @@ ignores it" clause above is scoped to the original four.
 
 **`$lookup` refuses the combined form.** MongoDB 5.0 accepts
 `localField`/`foreignField` *and* `pipeline` in one stage — the "concise
-correlated subquery". Here it is a 400 that points at the equivalent: join on
+correlated subquery". Here it is a 400 (recorded: q7s4a:265, which the reference answers) that points at the equivalent: join on
 the key with the equality form, then `$filter` or `$map` the attached array in
 the following stage, which keeps the single pass. Closing this would mean
 combining the indexed pass with the per-document loop; not planned until
@@ -1223,7 +1508,8 @@ dotted and `$`-prefixed ones included, so it is not an entry here.
 
 **Two smaller ones, same entry.** `$setUnion` and `$setIntersection` need at
 least one argument, the same minimum `$concatArrays` has here, where MongoDB
-accepts an empty list. A non-array argument is refused even beside a null, so the
+accepts an empty list (`$concatArrays: []` and `$setUnion: []` answer `[]` there,
+q7s4c:158 and 228; `$setIntersection: []` is UNRECORDED). A non-array argument is refused even beside a null, so the
 outcome does not depend on which argument is written first; what MongoDB
 answers for that pair is not verified here, so no claim is made about it.
 
@@ -1416,9 +1702,19 @@ as MongoDB does, and the concrete paths they reach are checked again in each
 document, where MongoDB reports *"Update created a conflict at 'items.1.qty'"*
 and this reports the same message as at parse, ending `in this document`;
 every positional path is expanded against the document before the update, so
-array filters select the same elements in any key order. An index segment is
-compared by its value (`a.01` is `a.1`).
+array filters select the same elements in any key order. A digit segment is
+compared as written at parse and, in each document, by its value where it
+steps into an array (`a.01` is `a.1` there) and as a field name where it steps
+into a document or into nothing (the entry on `a.01` and `a.1`, below).
 `$setOnInsert` is checked as before. Breaking for callers, in a `0.MINOR`.
+
+---
+
+## 🟡 Two `$push` to one array element under two spellings of its index are refused, where the reference applies both
+
+**Raised 2026-11-14, from the probe q7s2y (reference 6.0.5).** `{$push: {"a.01": 5, "a.1": 6}}` over `a = [[1], [2, 3], [4]]` appends both to the element at index 1 and leaves `[[1], [2, 3, 5, 6], [4]]`, in either order of the two keys (`q7s2y` y0060, y0061); each alone appends one (y0062, y0063). Here the pair is refused as a path conflict (`in this document`: where `a` is an array, `01` and `1` are one index, and two writes to one element are refused whatever the operator). The same two spellings under `$set` or `$inc` over an array abort the reference's server (`q7s2y` y0001 to y0016, y0025 to y0033, recorded with `serverAborted`), and are refused here too; a `$set` of one spelling with a `$push` of the other aborts it as well (y0064). Where the container is a document or is missing the two are two fields and both apply, as there (see the `update_table` test).
+
+**To close:** none planned; it is a kept difference, on the side of refusing a pair that names one element twice.
 
 ---
 
@@ -1446,6 +1742,15 @@ the conflicting-paths entry has closed.
   MongoDB appends the document literally with its `$each` key. A document with
   no `$`-prefixed key is a value, as before. `$addToSet` reads its argument the
   same way. A document with a `$`-prefixed key cannot be pushed as a value.
+- **A modifier document with no `$each` is refused, where the reference pushes it
+  as a value.** `{"$push": {"f": {"$slice": 1}}}` is `400` (`$push: a modifier
+  document requires $each (an array of values)`); the reference appends the
+  document `{$slice: 1}` to `f` literally, over an absent field, an empty array or
+  a longer one (`q7s2j.out` j1133 line 6794, j1136 line 6812 and the rest of the ten
+  cases). Raised 2026-11-14. The same reading of "any `$` key is a modifier" as
+  above, and kept for the same reason: a document that starts with `$` is not a
+  value anyone meant to store, and a `$slice` with no `$each` is almost always
+  a misspelt modifier.
 
 ---
 
@@ -3760,7 +4065,75 @@ keys per chunk and is unchanged here.
 **The behaviour change** is the sort window, recorded in
 [ADR-098](decisions.md) and in [Compatibility](compatibility.md).
 
+## 🟡 A sparse unique index is the partial `{$exists: true}`, which keeps the null key of an array's other elements, so it refuses what the reference's sparse unique index accepts
+
+**Raised with the path resolver rule (0.61.0).** On a path through an array, an element
+that lacks the field keys `null` beside the values the other elements hold, here and in
+the reference. The reference's sparse unique index leaves that `null` out and accepts
+`[{c: 1}, {d: 1}]` beside `[{c: 2}, {d: 2}]` (q7s3g 18-34, 77-84); here a sparse index is
+the partial `{c: {$exists: true}}`, whose documents keep every key they have, the `null`
+of the lacking element included, so the second is refused as the reference's own unique
+partial index refuses it (q7s3g 35-51, 85-92). There is no `sparse` flag to close this
+with. To close it: key a partial index's documents by the values its filter selected
+only, which is a different index.
+
+## 🟡 An index whose path has a digit position is not used for a predicate a `null` satisfies
+
+**Raised with the path resolver rule (0.61.0).** `{"a.0": null}` matches `{a: [{b: 1}]}`:
+the element at `0` is a document that lacks the field `0`, which a filter reads as `null`.
+The index on `a.0` keys that document under the element, not under `null`, so an index
+answer would miss it. The reference answers such a query from its index and returns less
+than a collection scan does (q7s3g 133: it returns `[6]` alone); KimmyDB's planner scans
+for an equality with `null`, a `$in` holding `null`, and a `$gte` or `$lte` of `null` on
+such a path, and answers what the filter says. Performance, not correctness: the query is
+a scan. To close it: key the lacked `null` of an in-range position in the index.
+
+## 🟡 A positional update over a matched document without the array is atomic per chunk, where the reference applies the earlier documents of the batch
+
+**Raised with the path resolver rule (0.61.0).** `{$set: {"items.$.z": 1}}` with `multi`
+over documents of which one has no `items` fails at that document in both. The reference
+had applied documents 1, 2, 4 and 5 (q7s3g 293); here the chunk holding the failing
+document is aborted whole, earlier chunks stay committed, and the reply is `500
+partially_applied` with their counts (or `400` with nothing written when no chunk
+committed): the chunk rule of [`multi` writes](http-api.md). The projection of a document
+with no array is not refused, as the reference's is not (q7s3g 291).
+
+## 🟡 A TTL index on a path with a position never expires a replicated document that is ambiguous there
+
+**Raised with the path resolver rule (0.61.0).** A document with a position beside a field of
+that name (`{a: [{"0": d}]}` under a TTL index on `a.0`) is refused by the member that takes
+the write, so it can only arrive replicated, where it is filed unkeyed. The TTL pass reads the
+index's keys and excludes the unkeyed run, so that document is never expired, on any member.
+To close it: have the TTL pass read the unkeyed run and decide by the filter.
+
+## 🟡 `{c: [[]]}` collides with `{c: []}` in a unique index, where the reference keeps them apart
+
+**Raised with the path resolver rule (0.61.0).** An array indexes its elements and itself,
+so `{c: [[]]}` is keyed under its element `[]` and under `[[]]`, and collides with a
+document holding `[]`. The reference does not (q7s3i 5). To close it: key an empty array
+element as a nested array only.
+
 ---
+
+## 🟡 A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+
+**Raised with the path resolver rule (0.61.0).** A find projection `items.$` follows the
+last condition as written (q7s3i 161-185), and so does ADR-256's update. The reference's
+update does not (q7s3i 162-172, 186: for some orders it takes the first; the rows of the resolver table that differ are q7s3g0328 to q7s3g0330 and q7s3i0164, q7s3i0168, q7s3i0172, q7s3i0186). KimmyDB keeps one
+rule for both. UNRECORDED beyond those cases. To close it: record more cases and give the
+update its own rule.
+
+## 🟡 With full or explicit bounds the order of the output of `$densify` is not a promise of the reference; ours is one order, and a `$sort` fixes it
+
+**Recorded 2026-11-15 (`q7s4t0015`, `q7s4t0017`, `q7s4v`, `q7s4v2`).** With bounds `"partition"` the reference's order is stable and this build keeps it: the partitions come in the order of their keys (the order of a sort on the key, document order for document keys), and inside one the documents with no numeric value for the field (absent or null) come first in stored order, then the values ascending with the generated rows between them (`q7s4t0016`, `q7s4t0018`, `q7s4v0001`, `q7s4v0007`). With bounds `"full"` and with explicit bounds `[lo, hi]`, with or without `partitionByFields`, the reference's own order is NOT reliable: the two full-bounds rows of `q7s4t` came out in a different order in two containers running the same script, and the rows of `q7s4v` that agree between its two containers (3 to 6 and 9 to 12) agreed by chance, so the tables compare those rows as a set (`q7s4t0015` and `q7s4t0017` are in the tester's `unstable.tsv`; the rest of `q7s4v` is not, and the generator marks them by rule). What this build does there: the documents with no value come first, all of them, as they arrived. With `"full"` the documents with a value follow in the order of the field across all partitions, the generated rows between them, and then the tail of each partition's grid, partition by partition in key order. With explicit bounds the partitions follow in key order, each with its values ascending and the generated rows between them, then the rest of its grid to the upper bound. How the reference places the tail of a partition (at the end of the stage, or before the next partition that has a value) is unexplained, which is why no order is built. **What to do:** add a `$sort` after the stage. **To close:** a recording that settles the order of the tails.
+
+## 🟡 A query hinted to a partial index that cannot answer it answers only what that index holds in the reference; this engine has no `hint` and answers the whole collection
+
+**Recorded 2026-11-15 (`q7s3k`, lines 67 to 74).** Over `{v: {$lt: 3}}`, `{v: {$lte: 1.0}}`, `{v: {$gte: NaN}}` and `{v: {$gt: -Infinity}}` as partial indexes, a query the filter does not contain (`{v: {$exists: true}}`, a bound outside it, a sort) answers from the index alone when it is hinted to it: 7 documents against the 15 an unhinted query returns in q7s3k0067. Here the planner uses a partial index only for a query it contains, and there is no `hint`, so the answer is the collection scan's, which the unhinted answer of the reference is too. The membership of those indexes is asserted by `nan_inf_index.rs`; the hinted answers are not compared. **To close:** a `hint` that names a partial index and answers from it.
+
+## 🟡 Ties in a sort with no unique key: ours keeps stored order in both directions; the reference reverses the ties when a descending sort is served by a backward index scan
+
+**Recorded 2026-11-15 (`q7s3n`, three containers; `q7s3k0001` and `q7s3k0008`).** A sort with no unique last key leaves the order of tied documents to the engine. Ours keeps the stored order, ascending and descending alike, for `find` and for a `$sort` stage. The reference does the same when it sorts in memory: with no index on `v`, `{v: -1}` answers `[1, 2, 13, 14, 3, 4, 5, 6, 7, 8, 11, 12, 9, 10]` and `{v: 1}` answers `[9, 10, 11, 12, 7, 8, 5, 6, 3, 4, 13, 14, 1, 2]`, the same lists as with `_id: 1` added. With an index on `v`, `{v: 1}` gives that same ascending list, and a sort that ends in `_id` gives the in-memory lists whatever the index. The reference reverses ties only when a descending sort without a unique key is served by a backward index scan: `{v: -1}` then answers `[2, 1, 14, 13, 4, 3, 6, 5, 8, 7, 12, 11, 10, 9]`, the exact reverse of the ascending list, ties included. Unhinted and hinted answers agree. `sort_ties.rs` compares the no-index rows and every row that ends in `_id` exactly, and the index-served `{v: -1}` rows (find and `$sort` stage) group by group: the sequence of distinct key values equal, each group of equal keys the same ids as a set. `nan_inf_index.rs` does the same for a sorted row of q7s3k whose sort has no unique last key. A kept difference: no engine change, since the order of ties is unspecified. **To close:** none planned; a descending read of an index would have to reverse its ties.
 
 ## How to use this document
 

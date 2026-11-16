@@ -6,7 +6,7 @@
 //! make a decimal, which are refused and in whose words.
 
 use bson::{Bson, Document, doc};
-use kimmy_core::decimal::parse;
+use kimmy_core::decimal::{arith, decode_raw, parse};
 
 use crate::aggregate::{self, Limits};
 use crate::expr::Expr;
@@ -484,9 +484,10 @@ fn field(doc: &Document, key: &str) -> Bson {
 
 #[test]
 fn inc_and_mul_take_a_decimal_operand() {
-    // An absent field starts as the integer 0.
+    // `$inc` over an absent field stores the operand as given (q7s4h.jsonl 1-6), `$mul` takes the
+    // field as the integer 0.
     same(field(&after(doc! { "$inc": { "n": dec("1.50") } }, doc! {}), "n"), "1.50");
-    same(field(&after(doc! { "$inc": { "n": dec("1E+3") } }, doc! {}), "n"), "1000");
+    same(field(&after(doc! { "$inc": { "n": dec("1E+3") } }, doc! {}), "n"), "1E+3");
     same(field(&after(doc! { "$mul": { "n": dec("1.50") } }, doc! {}), "n"), "0.00");
     // A double operand with no decimal in sight stays a double.
     assert_eq!(field(&after(doc! { "$inc": { "n": 0.5 } }, doc! {}), "n"), Bson::Double(0.5));
@@ -518,6 +519,126 @@ fn inc_and_mul_take_a_decimal_operand() {
         field(&after(doc! { "$inc": { "v": dec("1") } }, doc! { "v": 0.1 }), "v"),
         "1.100000000000000005551115123125783",
     );
+}
+
+/// `$inc` and `$mul` of a decimal over an absent field, over `Int32` 0 and over `Decimal128("0")`
+/// and over an upserted seed, one row per recorded case (q7s4h.jsonl lines 1-6, 13-18, 25-30,
+/// 97-102, 109-114, 121-126 and 193-226): the stored text, which keeps its cohort member.
+/// `$inc` over an absent field stores the operand as given (1-6, 193).
+///
+/// Nine rows give the same number in another cohort member than the reference prints (the
+/// exponent the `Decimal128` is stored with: "0" against "0E+3", "2" against "2.00"). A
+/// representation difference, not a value difference, and kept (docs/deviations.md). Each is
+/// asserted both ways: ours as it is, in `OURS`, and the reference's recorded text, which must
+/// differ from it, so the test fails the day either changes.
+#[test]
+fn inc_and_mul_over_zero_and_absent_as_recorded_in_q7s4h() {
+    // (case, the text this arithmetic stores); the reference's is in the row.
+    const OURS: [(u32, &str); 7] = [
+        (121, "0E+3"),
+        (122, "0.00"),
+        (123, "0.0"),
+        (124, "0E+3"),
+        (125, "-0.00"),
+        (126, "0.000"),
+        (221, "2.00"),
+    ];
+    #[rustfmt::skip]
+    let rows: Vec<(u32, bool, &str, Bson, Document, &str)> = vec![
+        (1, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "1E+3"),
+        (2, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "1.00"),
+        (3, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "15.0"),
+        (4, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (5, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (6, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "1.000"),
+        (13, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1000"),
+        (14, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1.00"),
+        (15, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "15.0"),
+        (16, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0"),
+        (17, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.00"),
+        (18, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1.000"),
+        (25, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1000"),
+        (26, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1.00"),
+        (27, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "15.0"),
+        (28, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (29, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (30, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1.000"),
+        (97, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (98, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "0.00"),
+        (99, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "0.0"),
+        (100, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (101, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (102, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "0.000"),
+        (109, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0E+3"),
+        (110, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.00"),
+        (111, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.0"),
+        (112, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0E+3"),
+        (113, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "-0.00"),
+        (114, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.000"),
+        (121, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (122, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (123, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (124, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (125, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (126, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (193, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "1E+3"),
+        (194, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "1002"),
+        (195, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "1002"),
+        (196, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "1.00"),
+        (197, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "3.00"),
+        (198, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "3.00"),
+        (199, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "15.0"),
+        (200, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "17.0"),
+        (201, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "17.0"),
+        (202, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (203, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (204, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2"),
+        (205, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (206, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (207, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2.00"),
+        (208, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "1.000"),
+        (209, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "3.000"),
+        (210, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "3.000"),
+        (211, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1) }, "5"),
+        (212, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "7"),
+        (213, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "7"),
+        (214, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1) }, "0"),
+        (215, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (216, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2"),
+        (217, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (218, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2E+3"),
+        (219, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2E+3"),
+        (220, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "0.00"),
+        (221, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (222, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2.00"),
+        (223, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "0.0"),
+        (224, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "30.0"),
+        (225, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "30.0"),
+        (226, true, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+    ];
+    let mut wrong = Vec::new();
+    for (case, upsert, op, operand, base, want) in rows {
+        let mut stored = base.clone();
+        let update = update::parse(&doc! { op: { "n": operand.clone() } }).unwrap();
+        let outcome = if upsert {
+            update::apply_on_insert(&update, &mut stored, 0)
+        } else {
+            update::apply(&update, &mut stored, 0)
+        };
+        let got = outcome.map(|()| text(stored.get("n").expect("n is stored")));
+        let ours = OURS.iter().find(|(c, _)| *c == case).map_or(want, |(_, text)| *text);
+        assert_eq!(
+            OURS.iter().any(|(c, _)| *c == case),
+            ours != want,
+            "case {case}: ours is listed in OURS exactly when it differs from the recorded {want}"
+        );
+        if !matches!(got.as_deref(), Ok(text) if text == ours) {
+            wrong.push(format!(
+                "case {case}: {op} {operand:?} over {base:?}: {got:?}, expected {ours} (recorded {want})"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]
@@ -645,10 +766,16 @@ fn a_value_preserving_update_changes_the_bytes_only_when_the_cohort_member_chang
     assert!(same_bytes(doc! { "$mul": { "n": 1 } }, dec("1.5")));
     assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("0.00")));
     assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("NaN")));
-    // Another member of the cohort is a different value to a write.
-    assert!(!same_bytes(doc! { "$inc": { "n": dec("0.00") } }, dec("1.5")));
+    // An `$inc` of a decimal zero of another cohort member leaves the stored decimal as it is: the sum
+    // `1.50` is the number stored, and the reference writes nothing (q7s5c.out E2 `1.0` + `0.00`
+    // and E3 `1.50` + `0`, nModified 0).
+    assert!(same_bytes(doc! { "$inc": { "n": dec("0.00") } }, dec("1.5")));
+    // Another member of the cohort is a different value to a write (`$mul` has no recording).
     assert!(!same_bytes(doc! { "$mul": { "n": dec("1.0") } }, dec("1.5")));
-    assert!(!same_bytes(doc! { "$inc": { "n": 0 } }, dec("-0")));
+    // A stored `-0` plus the integer `0` is the number `0`: the stored decimal is kept, `-0` (the
+    // rule of q7s5c.out E5, a stored `-0` plus a decimal `0`, and E8, a stored decimal plus an integer
+    // `0`; this exact pair has no recording of its own).
+    assert!(same_bytes(doc! { "$inc": { "n": 0 } }, dec("-0")));
     assert!(!same_bytes(doc! { "$inc": { "n": 0 } }, Bson::Decimal128(parse("-sNaN7").unwrap())));
     assert!(!same_bytes(doc! { "$inc": { "n": dec("0") } }, Bson::Int32(5)));
     let non_canonical = Bson::Decimal128(bson::Decimal128::from_bytes(
@@ -671,5 +798,75 @@ fn add_over_a_list_is_sum_over_the_same_values() {
     for values in lists {
         let added = val(op("$add", values.clone()), doc! {});
         assert_eq!(added, group("$sum", values.clone()), "{values:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `$inc` into a stored value: a result that is the stored value is not written (q7s5c.out)
+// ---------------------------------------------------------------------------
+
+/// `x` after `$inc x by` over `{_id: 1, x: stored}`.
+fn inc_over(stored: Bson, by: Bson) -> Bson {
+    let out = upd(doc! {"$inc": {"x": by}}, doc! {"_id": 1, "x": stored}).expect("applied");
+    out.get("x").cloned().expect("x")
+}
+
+/// The stored decimal stays as stored (the bytes, not only the number), as nModified 0 says.
+fn inc_keeps(label: &str, stored: Bson, by: Bson) {
+    assert_eq!(inc_over(stored.clone(), by), stored, "{label}");
+}
+
+#[test]
+fn an_inc_of_a_zero_with_a_finer_exponent_keeps_the_stored_decimal() {
+    inc_keeps("q7s5c0001 E1", dec("5000"), dec("0E-2"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_with_a_trailing_zero_as_it_is() {
+    inc_keeps("q7s5c0002 E2", dec("1.0"), dec("0.00"));
+    inc_keeps("q7s5c0003 E3", dec("1.50"), dec("0"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_zero_as_it_is() {
+    inc_keeps("q7s5c0004 E4", dec("0E+3"), dec("-0"));
+    inc_keeps("q7s5c0005 E5", dec("-0"), dec("0"));
+    // q7s5b0005 (D5): `-0` stays `-0` after an `$inc` of `0E+3`
+    inc_keeps("q7s5b0005 D5", dec("-0"), dec("0E+3"));
+}
+
+#[test]
+fn an_inc_of_an_integer_zero_keeps_a_stored_decimal() {
+    inc_keeps("q7s5c0008 E8", dec("5"), Bson::Int32(0));
+}
+
+/// E6, q7s5c0006: an `Int32` plus a decimal zero is a decimal, so it is written.
+#[test]
+fn an_inc_of_a_decimal_zero_over_an_int32_writes_the_decimal() {
+    same(inc_over(Bson::Int32(5), dec("0")), "5");
+}
+
+/// E7, q7s5c0007: a double plus a decimal zero is a decimal, so it is WRITTEN, and the value is 5.
+/// The form differs from the reference's, which stores `5.00000000000000`: the reference converts a
+/// double to a decimal at 15 significant digits where this arithmetic converts it exactly (`5`): a
+/// difference kept on purpose (ADR-252, Chris's ruling), listed in docs/deviations.md under "Arithmetic
+/// on a `Decimal128` differs from MongoDB's in four places"; it is not asserted here.
+#[test]
+fn an_inc_of_a_decimal_zero_over_a_double_writes_a_decimal_of_the_same_value() {
+    match inc_over(Bson::Double(5.0), dec("0E+3")) {
+        Bson::Decimal128(d) => {
+            let (got, want) = (decode_raw(&d), decode_raw(&parse("5").unwrap()));
+            assert!(arith::sub(&got, &want).is_zero(), "stored {d}, the number is not 5");
+        }
+        other => panic!("not a decimal: {other:?}"),
+    }
+}
+
+/// E9, q7s5c0009: a double that the `$inc` leaves equal stays as it is, with its sign.
+#[test]
+fn an_inc_of_a_zero_double_keeps_a_stored_negative_zero() {
+    match inc_over(Bson::Double(-0.0), Bson::Double(0.0)) {
+        Bson::Double(x) => assert_eq!(x.to_bits(), (-0.0_f64).to_bits()),
+        other => panic!("{other:?}"),
     }
 }

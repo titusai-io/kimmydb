@@ -8341,7 +8341,13 @@ mod tests {
             collection: CollectionId::derive("shop", "gone"),
             doc_id: None,
             body: Some(
-                bson::serialize_to_vec(&kimmy_core::CollectionRef::new("shop", "gone")).unwrap(),
+                bson::serialize_to_vec(&kimmy_core::CollectionCreate {
+                    db: "shop".into(),
+                    name: "gone".into(),
+                    merge_policy: kimmy_core::MergePolicy::Document,
+                    validator: None,
+                })
+                .unwrap(),
             ),
         };
         let window = vec![insert(base + 2_000, 1), create, insert(base + 4_000, 2)];
@@ -8707,6 +8713,8 @@ mod tests {
                 incarnation_floor: None,
                 validator: None,
                 validator_changed: None,
+                merge_policy: kimmy_core::MergePolicy::Document,
+                merge_policy_at: None,
             }]
         } else {
             Vec::new()
@@ -13012,7 +13020,13 @@ mod tests {
             collection: CollectionId::derive("shop", "gone"),
             doc_id: None,
             body: Some(
-                bson::serialize_to_vec(&kimmy_core::CollectionRef::new("shop", "gone")).unwrap(),
+                bson::serialize_to_vec(&kimmy_core::CollectionCreate {
+                    db: "shop".into(),
+                    name: "gone".into(),
+                    merge_policy: kimmy_core::MergePolicy::Document,
+                    validator: None,
+                })
+                .unwrap(),
             ),
         };
         let insert = OplogEntry {

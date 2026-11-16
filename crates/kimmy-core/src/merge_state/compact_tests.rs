@@ -4,8 +4,9 @@
 use std::collections::BTreeSet;
 
 use super::codec::MAX_VALUE_DEPTH;
+use super::counter::Kind;
 use super::tests::{
-    golden_170, golden_delete, golden_empty, golden_mixed, golden_obs, golden_small,
+    golden_170, golden_delete, golden_empty, golden_mixed, golden_obs, golden_small, golden_typed,
 };
 use super::*;
 use crate::hlc::Hlc;
@@ -64,11 +65,15 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
 
 /// The compact hash and length of the five golden states, as the reference model's independent
 /// encoder computes them (`merge_state_diff::golden_vectors_match_the_model` pins the same
-/// numbers). The compact form is not stored or hashed by anything yet, so these are a pin of the
-/// skeleton, not a released format. Re-pinned once for the counter cell (the slot flag byte and the
+/// numbers). They are of the states WITHOUT their order state, the reference model having none; the same
+/// states with it are pinned by the test below, whose section 10 an independent Python writer checks byte for
+/// byte. The compact form is the canonical form and the state hash, and nothing is stored in it yet. These five
+/// hashes were re-pinned once for the counter cell (the slot flag byte and the
 /// absorbed pair, the type byte, no register obs, no ESCAPE): the model's Python writer, rewritten from
 /// the documentation, gives the same five hashes and lengths (170: 214 B to 215, mixed 341 to 338, delete 234
-/// to 235, obs 256 to 252; empty unchanged).
+/// to 235, obs 256 to 252; empty unchanged). The slots' operand stamps (`wide_at`, `decimal_at`) are spelled only
+/// when they are not the usual ones of the slot's type (Amendment 9), and the slots of these three goldens are all
+/// usual, so their bytes are the same as before the stamps existed: the same Python model gives the same hashes.
 #[test]
 fn the_compact_golden_hashes_agree_with_the_reference_model() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -87,8 +92,10 @@ fn the_compact_golden_hashes_agree_with_the_reference_model() {
 
 /// The compact hash and length of the same golden states WITH their order state (section 10), which the test
 /// above leaves out because the reference model's Python writer has none. Pinned once with the counter cell, with
-/// the Rust writer's bytes: the order section meets an independent implementation only through the Ord
-/// differential (digests of the order state), not through bytes. The sixth golden, `small`, is pinned here too.
+/// the Rust writer's bytes; since then `tests/data/check_ord_section.py` (an independent byte writer, run by
+/// `the_python_writer_of_section_10_agrees_with_the_rust_bytes`) reproduces section 10 of each of these states
+/// byte for byte and their hashes and lengths, besides the Ord differential's digests. The sixth golden,
+/// `small`, is pinned here too.
 #[test]
 fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -99,6 +106,8 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0)),
         ("obs", golden_obs(), ("1714242f8331d6b9ca194c73191730ed", 329, 2)),
         ("small", golden_small(), ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2)),
+        // a NEW key: the typed golden, whose section 10 the independent Python checker also writes and hashes
+        ("typed", golden_typed(), ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4)),
     ] {
         assert_eq!(
             (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
@@ -106,6 +115,215 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
             "{name}"
         );
     }
+}
+
+/// The `typed` golden (a NEW key): its compact bytes agree with the reference model's independent encoder
+/// (`merge_state_diff::golden_vectors_match_the_model`), and the counter of the shape Amendment 6 exists for
+/// reads as what it is. Its slot has `decimal_at < wide_at < stamp` with the absorbed pair at `wide_at`, so
+/// `width_since` is Int32 and the counter, whose base is an Int32, reads 7 + 5 = 12 as an Int32. With its order
+/// state the golden's hash is printed (`CAPTURE`) and pinned once the run has produced it.
+#[test]
+fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
+    let o = opts();
+    let st = golden_typed();
+    let bare = st.without_ords();
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!(
+        "CAPTURE typed: bare=({}, {}) with_ords=({}, {}, {} ords) bytes={}",
+        hex(&bare.compact_hash()),
+        bare.compact_bytes().len(),
+        hex(&st.compact_hash()),
+        st.compact_bytes().len(),
+        st.ords.len(),
+        hex(&st.encode_compact())
+    );
+    round_trip(&st);
+    let slot = |name: &str| st.slots.iter().find(|(k, _)| k.1 == p(name)).unwrap().1.clone();
+    let (a, b, c) = (slot("a"), slot("b"), slot("c"));
+    assert_eq!((a.total.label(), a.wide_at, a.decimal_at), (Kind::Int32, None, None));
+    assert_eq!(
+        (b.total.label(), b.wide_at.is_some(), b.decimal_at),
+        (Kind::Decimal128, true, b.wide_at)
+    );
+    assert_eq!(c.total.label(), Kind::Decimal128);
+    let (wide, dec, at) = (c.wide_at.unwrap(), c.decimal_at.unwrap(), c.absorbed.unwrap().0);
+    assert!(dec < wide && wide < c.stamp, "decimal_at < wide_at < stamp");
+    assert_eq!(at, wide, "the absorbed pair is at the last wide operand");
+    assert_eq!(st.value(&p("c"), &o), Some(Value::Int32(12)));
+    assert_eq!(c.width_since(), Kind::Int32);
+    // d, Amendment 9: the gain is the exact integer 1, a Decimal128 slot whose total is exact
+    let d = slot("d");
+    assert_eq!(st.value(&p("d"), &o), Some(Value::Int32(6)));
+    assert_eq!(d.width_since(), Kind::Int32);
+    // and as the compact bytes say it
+    let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
+    assert_eq!(back.value(&p("c"), &o), Some(Value::Int32(12)));
+    assert_eq!(back.value(&p("d"), &o), Some(Value::Int32(6)));
+    // the pin LAST (a NEW pin; the typed state gained the counter d and the stamps are spelled only when unusual): the hash and length the reference model's independent encoder gives for the bare state
+    let hex16 = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(
+        (hex16(bare.compact_hash()).as_str(), bare.compact_bytes().len()),
+        ("d11ec34731c1adb4ec0a0ae4be757d20", 371)
+    );
+}
+
+/// The states of the Python writer's fixture: the six goldens, then states a `Writer` builds that exercise what
+/// the goldens do not: every floor kind (`u`, `u` with the update bit, `r`) with its `prev`, a level mark, the
+/// root key (segment count 0), several writers' firsts, and a position of 128 and up (a two-byte varint).
+fn ord_section_states() -> Vec<(&'static str, MergeState)> {
+    let mut out = vec![
+        ("empty", golden_empty()),
+        ("170", golden_170()),
+        ("mixed", golden_mixed()),
+        ("delete", golden_delete()),
+        ("obs", golden_obs()),
+        ("small", golden_small()),
+        ("typed", golden_typed()),
+    ];
+    let np = |segs: &[&str]| Path::new(segs.iter().copied()).unwrap();
+    let doc = |names: &[&str]| -> Vec<(Path, Value)> {
+        names.iter().enumerate().map(|(k, n)| (p(n), Value::Int64(k as i64))).collect()
+    };
+    // floors: an `$unset` alone, an update that unsets and sets, a replace; two writers
+    let mut a = Writer::new(wid(b'A', 1), opts());
+    a.insert(&doc(&["a", "b", "c", "d", "e"]), 0).unwrap();
+    a.write_set(&np(&["m", "x"]), Value::Int64(1), 0).unwrap();
+    a.write_set(&np(&["m", "y"]), Value::Int64(2), 0).unwrap();
+    let mut b = Writer::new(wid(b'B', 2), opts());
+    b.receive(&a.state);
+    a.write_unset(&p("a"), 0).unwrap();
+    a.write_update(&[UpdateOp::Unset(p("b")), UpdateOp::Set(p("c"), Value::Int64(9))], 0).unwrap();
+    b.write_set(&np(&["m", "z"]), Value::Int64(3), 3).unwrap();
+    b.write_set(&p("a"), Value::Int64(7), 3).unwrap();
+    a.receive(&b.state);
+    out.push(("floors_u", a.state.clone()));
+    let mut r = Writer::new(wid(b'C', 3), opts());
+    r.receive(&a.state);
+    r.write_replace(&doc(&["e", "a", "q"]), 5).unwrap();
+    out.push(("floor_r", r.state.clone()));
+    a.receive(&r.state);
+    b.receive(&a.state);
+    b.write_set(&p("q"), Value::Int64(5), 9).unwrap();
+    out.push(("merged", b.state.clone()));
+    // a wide document: positions of 128 and up
+    let names: Vec<String> = (0..140).map(|k| format!("f{k:03}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut w = Writer::new(wid(b'W', 4), opts());
+    w.insert(&doc(&refs), 0).unwrap();
+    w.write_unset(&p("f010"), 0).unwrap();
+    w.write_set(&p("f139"), Value::Int64(-1), 0).unwrap();
+    out.push(("wide", w.state.clone()));
+    out
+}
+
+/// The six goldens as the independent Python writer of section 10 reads them
+/// (`tests/data/check_ord_section.py`): each one's full compact bytes and its order state spelled out
+/// structurally (no indexes: stamps and writers by value). The checker parses the two tables from the bytes,
+/// writes section 10 itself and compares it with the tail of the Rust bytes, then checks the pinned length and
+/// the 128-bit hash with a hash of its own. Regenerate with `Q7_REGEN_ORD_SECTION=1`.
+fn ord_section_fixture() -> serde_json::Value {
+    use serde_json::{Value as J, json};
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let wj = |w: &WriterId| json!({"node": hex(&w.node.to_bytes()), "epoch": hex(&w.epoch.0)});
+    let sj = |s: &MStamp| json!({"hlc": hex(&s.hlc.to_bytes()), "writer": wj(&s.writer)});
+    let cj = |(s, pos): &(MStamp, u64)| json!({"stamp": sj(s), "pos": pos});
+    let mut out = Vec::new();
+    for (name, st) in ord_section_states() {
+        let ords: Vec<J> = st
+            .ords
+            .iter()
+            .map(|((life, at), x)| {
+                let floor = match &x.floor {
+                    None => J::Null,
+                    Some(Floor::U { stamp, prev, others }) => {
+                        json!({"kind": "u", "stamp": sj(stamp), "prev": hex(&prev.to_bytes()), "others": others})
+                    }
+                    Some(Floor::R { stamp }) => json!({"kind": "r", "stamp": sj(stamp)}),
+                };
+                json!({
+                    "life": sj(life),
+                    "at": match at { OrdAt::Root => J::Null, OrdAt::Field(p) => json!(p.segments()) },
+                    "floor": floor,
+                    "firsts": x.firsts.iter().map(|(w, c)| json!({"writer": wj(w), "cand": cj(c)})).collect::<Vec<_>>(),
+                    "last": x.last.as_ref().map_or(J::Null, cj),
+                    "lvl": x.lvl.as_ref().map_or(J::Null, sj),
+                })
+            })
+            .collect();
+        out.push(json!({"name": name, "bytes": hex(&st.compact_bytes()), "ords": ords}));
+    }
+    J::Array(out)
+}
+
+#[test]
+fn the_order_section_fixture_of_the_python_writer_is_current() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ord_section_goldens.json");
+    let now = serde_json::to_string_pretty(&ord_section_fixture()).unwrap() + "\n";
+    if std::env::var_os("Q7_REGEN_ORD_SECTION").is_some() {
+        std::fs::write(path, &now).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), now, "the fixture is stale");
+}
+
+/// NEW pins (not moved ones): the states of `ord_section_states` beyond the six goldens, pinned with the Rust
+/// bytes and reproduced byte for byte by the Python writer (`PINS` there carries the same numbers).
+#[test]
+fn the_order_section_corpus_is_pinned() {
+    let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let want: &[(&str, (&str, usize, usize))] = &[
+        ("floors_u", ("a9a3d1f267ae32cd8a3de81f1297f4af", 666, 9)),
+        ("floor_r", ("382bb664c7fbba70de55f428285bc2bf", 752, 11)),
+        ("merged", ("f0a1a9745f28949792f933ad926e68a3", 765, 11)),
+        ("wide", ("07488610e95f806772a5d0f593d017c0", 8226, 140)),
+    ];
+    let states = ord_section_states();
+    for (name, w) in want {
+        let st = &states.iter().find(|(n, _)| n == name).unwrap().1;
+        round_trip(st);
+        assert_eq!(
+            (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
+            *w,
+            "{name}"
+        );
+    }
+}
+
+/// The corpus has every shape of section 10 the Python writer must reproduce (the six goldens have none of
+/// these: no floor, no level mark, only field keys, positions 0 and 1).
+#[test]
+fn the_order_section_corpus_covers_every_shape() {
+    let (mut kinds, mut lvl, mut root, mut wide_pos, mut many_firsts) =
+        (BTreeSet::new(), false, false, false, false);
+    for (_, st) in ord_section_states() {
+        for ((_, at), x) in &st.ords {
+            kinds.insert(match &x.floor {
+                None => "none",
+                Some(Floor::U { others: false, .. }) => "u",
+                Some(Floor::U { others: true, .. }) => "u+bit",
+                Some(Floor::R { .. }) => "r",
+            });
+            lvl |= x.lvl.is_some();
+            root |= *at == OrdAt::Root;
+            many_firsts |= x.firsts.len() > 1;
+            wide_pos |= x.firsts.values().chain(x.last.iter()).any(|c| c.1 >= 128);
+        }
+    }
+    assert_eq!(kinds, BTreeSet::from(["none", "u", "u+bit", "r"]));
+    assert!(lvl && root && wide_pos && many_firsts, "{lvl} {root} {wide_pos} {many_firsts}");
+}
+
+/// Nothing silent: the Python writer must run and agree. `python3` must be on the PATH, or this test FAILS.
+#[test]
+fn the_python_writer_of_section_10_agrees_with_the_rust_bytes() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/check_ord_section.py");
+    let out = std::process::Command::new("python3")
+        .args(["-I", "-B", script])
+        .output()
+        .expect("python3 must be on the PATH (this test does not skip)");
+    let text =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the Python writer disagrees:\n{text}");
+    assert!(text.lines().filter(|l| l.ends_with("OK")).count() >= 10, "{text}");
 }
 
 #[test]
@@ -932,10 +1150,7 @@ fn every_table_of_one_to_three_hundred_writers_round_trips() {
                 epoch: Epoch::from_u64(0),
             };
             let at = MStamp { hlc: Hlc::new(2 + k as u64, 0), writer: w };
-            s.slots.insert(
-                (life, p("x"), w, None),
-                Slot { stamp: at, total: Num::Int64(k as i128 + 1), absorbed: None },
-            );
+            s.slots.insert((life, p("x"), w, None), Slot::new(at, Num::Int64(k as i128 + 1), None));
             s.vv.insert(w, at.hlc);
         }
         s.vv.insert(life.writer, life.hlc);

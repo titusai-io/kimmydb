@@ -596,6 +596,17 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // RE-PINNED on the rebase of the implicit map markers onto the counter cell's decode clauses: the corpus now holds
     // states with markers, so the seeded damage is other input, and the two clauses refuse other damaged encodings:
     // accepted 10,609 -> 10,601; triples 141,654 -> 140,112, agreeing 112,566 -> 110,634, not associative 440 -> 444.
+    // RE-PINNED for the slots' operand stamps (`wide_at`, `decimal_at`): the corpus is the same 243 states but 935 bytes larger
+    // (72,990 B to 73,925 B: every slot spells an 11-byte `wide_at`), so the same seeded stream damages other bytes, and the new clause
+    // `SlotWidthsInconsistent` refuses 507 of the damaged encodings. The two histograms of refusals differ in: `SlotWidthsInconsistent` 0 to
+    // 507, `SlotWriterMismatch` 25 to 15, `AbsorbedAboveSlot` 11 to 6, `AbsorbedTotalMismatch` 3 to 5, `BadHeader` 1,472 to 1,446, `BadIndex`
+    // 5,483 to 5,540, `BadPath` 4,443 to 4,429, `BadString` 201 to 182. A count of encodings that "moved from accepted to X" cannot be derived: the
+    // inputs are different ones. Accepted 10,601 -> 10,453; the laws over the accepted damaged entries moved with the accepted set: triples
+    // 140,112 -> 131,748, agreeing 110,634 -> 106,374, not associative 444 -> 456; `not_associative_agreeing` is still 0, and the arbitrary
+    // (undamaged) candidates, the hand-built closed states and the simulation are the same figures.
+    // RE-PINNED for Amendment 9 (the operand stamps are spelled only when they are not the usual ones): the corpus is again 243 states of
+    // 72,990 B, the seeded damage is the damage of before the stamps, and so are the figures: accepted 10,453 -> 10,601; the laws over the
+    // accepted damaged entries triples 131,748 -> 140,112, agreeing 106,374 -> 110,634, not associative 456 -> 444.
     assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_601));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
@@ -849,10 +860,7 @@ fn deep_states(n: usize) -> Vec<(&'static str, MergeState, bool)> {
     s.regs.insert((life, p.clone()), Reg::new(at(2, b'A'), Value::Int64(1), None, false).unwrap());
     out.push(("register", s, true));
     let mut s = deep_base();
-    s.slots.insert(
-        (life, p.clone(), a, None),
-        Slot { stamp: at(2, b'A'), total: Num::Int64(3), absorbed: None },
-    );
+    s.slots.insert((life, p.clone(), a, None), Slot::new(at(2, b'A'), Num::Int64(3), None));
     out.push(("slot", s, true));
     let mut s = deep_base();
     s.losses.insert(

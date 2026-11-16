@@ -1,34 +1,43 @@
-//! Canonical bytes, the state hash and the whole-state round trip.
+//! The version 1 form: LEGACY. Canonical bytes, state hash and whole-state round trip as they were
+//! before the compact form (`compact.rs`, `QMS` version 2) became THE canonical form: the state hash
+//! is [`MergeState::compact_hash`], the canonical bytes [`MergeState::compact_bytes`] and the whole-state
+//! form [`MergeState::encode_compact`]. Version 1 survives for two things only. [`MergeState::decode`]
+//! reads it (a decode-only legacy path), and the version 1 encoder (`try_canonical_bytes`, `try_state_hash`,
+//! `try_encode`, `v1_can_hold`) exists under `cfg(test)` and the `merge-mutants` feature, for the tests
+//! that pin the form against the reference model and its golden vectors. Nothing else calls it: it cannot
+//! spell a `Document` inside an array, a non-`Int64` total, an absorbed pair or an order state.
+//!
+//! What follows describes the form itself.
 //!
 //! The encoding is total and deterministic: every map is written in key order
 //! (the `BTreeMap` order, itself total), every length is a big-endian `u64`,
 //! integers are fixed width big-endian, doubles are their IEEE bit pattern
 //! (`to_bits`, big-endian). It is the binary form of the model's `canon()`.
 //!
-//! Stability: the bytes of [`MergeState::canonical_bytes`], of
-//! [`MergeState::encode`] and the [`MergeState::state_hash`] do not depend on
+//! Stability: the bytes of `MergeState::canonical_bytes`, of
+//! `MergeState::encode` and the `MergeState::state_hash` do not depend on
 //! the architecture, the word size, `std::hash`, hash-map order or float
 //! formatting. Every multi-byte integer is BIG-ENDIAN (`to_be_bytes`), no
 //! `usize` is written (lengths are `u64`), the hash mix reads its input as
 //! big-endian `u64` words.
 //!
-//! Canonical: [`MergeState::decode`] accepts only what [`MergeState::encode`] can write, so
+//! Canonical: [`MergeState::decode`] accepts only what `MergeState::encode` can write, so
 //! `encode(decode(b)) == b` for every accepted `b`: map and set entries must be strictly
 //! increasing in key order (no duplicates), and a flag byte is 0 or 1.
 //!
-//! Versions: [`MergeState::encode`] starts with the 3 bytes `QMS` and ONE format
+//! Versions: `MergeState::encode` starts with the 3 bytes `QMS` and ONE format
 //! version byte (currently 1), then the canonical body.
-//! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
+//! `MergeState::canonical_bytes` is the body alone and carries no tag; the
 //! hash covers the body. Mutant memory (`Gen::vv`, `MergeState::gens`) is in neither. The golden vectors in `tests.rs` pin all three: changing
 //! the bytes is a format change (a wipe release) and must be deliberate.
 //!
-//! Known defect of this form: a loss record about the whole document (`insertLost` of a
-//! superseded insert) is keyed by the path `_`, the same bytes as a record about a field
-//! literally named `_`. The pinned `mixed` golden holds a whole-document record, so the bytes
-//! stay. In memory the two are different ([`LossAt`]); `decode` tells them apart by the lost
-//! value (a field list is a whole document), which no record of a field has, so a state round
-//! trips, but the key bytes alone are ambiguous. The compact form (`compact.rs`) writes an
-//! explicit tag; this defect retires when it becomes the hash.
+//! Known defect of this form, RETIRED WITH IT: a loss record about the whole document
+//! (`insertLost` of a superseded insert) is keyed by the path `_`, the same bytes as a record
+//! about a field literally named `_`. In memory the two are different ([`LossAt`]); `decode`
+//! tells them apart by the lost value (a field list is a whole document), which no record of a
+//! field has, so a legacy state round trips, but the key bytes alone are ambiguous. The compact
+//! form, which is the hash and the stored form, writes an explicit "about" tag, so nothing that
+//! is hashed or stored carries the ambiguity; it remains only in the legacy bytes the tests pin.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +101,10 @@ pub enum DecodeError {
     SlotWriterMismatch,
     #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
     AbsorbedWiderThanSlot,
+    #[error(
+        "merge state: a slot's operand stamps are not its writer's, above its own, or do not match its total's type"
+    )]
+    SlotWidthsInconsistent,
     #[error("merge state: a Decimal128 total is not one a writer produces (not canonical)")]
     NotCanonicalDecimal,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
@@ -120,8 +133,10 @@ pub enum DecodeError {
 
 // ---- writing ---------------------------------------------------------------
 
+#[cfg(any(test, feature = "merge-mutants"))]
 struct W(Vec<u8>);
 
+#[cfg(any(test, feature = "merge-mutants"))]
 impl W {
     fn u8(&mut self, v: u8) {
         self.0.push(v);
@@ -135,7 +150,7 @@ impl W {
     fn i128(&mut self, v: i128) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    /// A counter total: version 1 spells an `Int64` amount only ([`MergeState::v1_can_hold`]).
+    /// A counter total: version 1 spells an `Int64` amount only (`MergeState::v1_can_hold`).
     fn num(&mut self, n: &Num) {
         self.i128(n.int().expect("v1_can_hold: a version 1 total is an Int64 amount"));
     }
@@ -292,6 +307,7 @@ impl W {
     }
 }
 
+#[cfg(any(test, feature = "merge-mutants"))]
 impl MergeState {
     fn write_body(&self, w: &mut W) {
         w.len(self.lives.len());
@@ -352,12 +368,12 @@ impl MergeState {
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
     /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
     /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
-    /// type; the compact form spells them), and not when a slot carries an absorbed pair (the
-    /// version 1 form has no place for it), and not when it carries an order state (the version
+    /// type; the compact form spells them), and not when a slot carries an absorbed pair or operand stamps that are not its own (the
+    /// version 1 form has no place for them), and not when it carries an order state (the version
     /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
         self.ords.is_empty()
-            && self.slots.values().all(|s| s.absorbed.is_none())
+            && self.slots.values().all(|s| s.absorbed.is_none() && s.v1_widths())
             && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
@@ -370,7 +386,7 @@ impl MergeState {
     /// binary (lives, dead, deletes, registers, slots, version vector, losses).
     /// Mutant memory (`Gen::vv`, `gens`) is not part of it.
     ///
-    /// An error when the version 1 form cannot spell the state ([`MergeState::v1_can_hold`]: a
+    /// An error when the version 1 form cannot spell the state (`MergeState::v1_can_hold`: a
     /// document inside an array, a total of another type than `Int64`, an order state). There is no
     /// infallible twin: a state a peer sent can be one of those, and a panic must not be reachable
     /// from decoded input (the tests have panicking helpers of their own).
@@ -383,7 +399,7 @@ impl MergeState {
         Ok(w.0)
     }
 
-    /// A 128-bit digest of [`MergeState::try_canonical_bytes`]. Not cryptographic:
+    /// A 128-bit digest of `MergeState::try_canonical_bytes`. Not cryptographic:
     /// it is a divergence detector. Two lanes of a multiply-rotate mix over
     /// big-endian 8-byte words (the tail zero-padded, the length folded in at
     /// the end), cross-fed, then each lane passed through the splitmix64
@@ -393,15 +409,18 @@ impl MergeState {
     }
 
     /// The whole state, for a round trip with [`MergeState::decode`]: the magic, the format
-    /// version, then [`MergeState::try_canonical_bytes`]; an error where that is one.
+    /// version, then `MergeState::try_canonical_bytes`; an error where that is one.
     pub fn try_encode(&self) -> Result<Vec<u8>, V1CannotHold> {
         let mut out = Vec::from(MAGIC);
         out.push(VERSION);
         out.extend_from_slice(&self.try_canonical_bytes()?);
         Ok(out)
     }
+}
 
-    /// The inverse of [`MergeState::encode`].
+impl MergeState {
+    /// The legacy version 1 decoder: the inverse of the version 1 encoder, which exists only for
+    /// tests and the differential. Nothing writes this form any more (see the module docs).
     pub fn decode(bytes: &[u8]) -> Result<MergeState, DecodeError> {
         let mut r = R(bytes);
         if r.take(3)? != MAGIC || r.u8()? != VERSION {
@@ -457,7 +476,7 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed: None })?;
+            put(&mut s.slots, (l, p, wr, g), Slot::new(stamp, total, None))?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
@@ -510,8 +529,8 @@ impl MergeState {
     /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
     pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
         let mut bare = self.without_ords();
-        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some());
-        bare.slots.values_mut().for_each(|s| s.absorbed = None);
+        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some() || !s.v1_widths());
+        bare.slots.values_mut().for_each(Slot::for_v1);
         had_pair && bare.v1_can_hold()
     }
 }
@@ -528,7 +547,7 @@ impl MergeState {
         }
         assert!(self.v1_refused_only_for_a_pair(), "version 1 refuses a state for another reason");
         let mut stripped = self.without_ords();
-        stripped.slots.values_mut().for_each(|s| s.absorbed = None);
+        stripped.slots.values_mut().for_each(Slot::for_v1);
         (stripped.canonical_bytes().len(), false)
     }
 }

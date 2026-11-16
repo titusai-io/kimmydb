@@ -556,7 +556,12 @@ fn create_entry(db: &str, name: &str, at: Stamp) -> kimmy_core::OplogEntry {
         at,
         OpKind::CreateCollection,
         CollectionId::derive(db, name),
-        &CollectionRef::new(db, name),
+        &kimmy_core::CollectionCreate {
+            db: db.into(),
+            name: name.into(),
+            merge_policy: kimmy_core::MergePolicy::Document,
+            validator: None,
+        },
     )
     .unwrap()
 }

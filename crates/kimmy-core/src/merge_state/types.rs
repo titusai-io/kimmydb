@@ -169,7 +169,7 @@ pub enum Value {
 }
 
 /// A value that is not legal where it was put.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvalidValue {
     /// A document as a register: only inside an array is a document a value.
     #[error("merge state: a document is a value only inside an array")]
@@ -183,6 +183,14 @@ pub enum InvalidValue {
     /// A written document names a field twice, or a field name has a NUL byte.
     #[error("merge state: a document field name is repeated or has a NUL byte")]
     BadFieldName,
+    /// A BSON type the merge state cannot hold (see `merge_state::bridge`): JavaScript code,
+    /// symbol, DB pointer, min key, max key and undefined. Refused on `field` collections.
+    #[error("merge state: the BSON type {0} cannot be stored under the field merge policy")]
+    UnsupportedType(&'static str),
+    /// A merge-state value with no BSON form (an unset where a value is wanted, a regex with a
+    /// NUL byte, a value that is not a document where one is wanted).
+    #[error("merge state: no BSON value for {0}")]
+    NoBsonForm(&'static str),
 }
 
 impl Value {
@@ -200,10 +208,16 @@ impl Value {
     /// May this value be a register of the state? Not a top-level `Document`; an array's
     /// elements may be anything but the map marker (documents among them, at any depth).
     pub fn check_register(&self) -> Result<(), InvalidValue> {
+        self.check_register_at(0)
+    }
+
+    /// [`Value::check_register`] for a value whose own level is `depth` (a cell at a path of
+    /// `depth` segments holds it).
+    fn check_register_at(&self, depth: usize) -> Result<(), InvalidValue> {
         match self {
             Value::Document(_) => Err(InvalidValue::DocumentAsRegister),
             Value::Map | Value::ImplicitMap => Ok(()),
-            v => v.check_element(0),
+            v => v.check_element(depth),
         }
     }
 
@@ -234,6 +248,14 @@ impl Value {
         self.check_input_at(0)
     }
 
+    /// [`Value::check_input`] for a value held by a cell at a path of `path_len` segments: the
+    /// path and the value nest in one document, so the path's segments count against the depth
+    /// limit with the value's own levels (a path of N segments holds a value at most 100 - N levels
+    /// deep; one level more is `TooDeep`). Every entry that takes a path and a value uses this one.
+    pub fn check_input_under(&self, path_len: usize) -> Result<(), InvalidValue> {
+        self.check_input_at(path_len)
+    }
+
     /// [`Value::check_input`] for a value `depth` documents down: a document nested as deep as the
     /// depth limit allows is refused (`TooDeep`) before the recursion goes past it.
     fn check_input_at(&self, depth: usize) -> Result<(), InvalidValue> {
@@ -251,10 +273,11 @@ impl Value {
                 f.iter().try_for_each(|(_, x)| x.check_input_at(depth + 1))
             }
             Value::Map | Value::ImplicitMap => Err(InvalidValue::MapMarker),
-            v => v.check_register(),
+            v => v.check_register_at(depth),
         }
     }
 
+    #[cfg(any(test, feature = "merge-mutants"))]
     /// Does this value hold a `Document` anywhere? The version 1 form cannot spell one.
     pub(super) fn contains_document(&self) -> bool {
         match self {
@@ -366,6 +389,7 @@ impl LossAt {
 
     /// The path the version 1 form writes for this record. A field literally named `_` has the
     /// same one, which is a known collision of that form (see `codec.rs`).
+    #[cfg(any(test, feature = "merge-mutants"))]
     pub(super) fn v1_path(&self) -> Path {
         match self {
             LossAt::Document => Path(vec!["_".to_string()]),

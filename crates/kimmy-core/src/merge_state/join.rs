@@ -122,16 +122,24 @@ pub struct JoinOptions {
     /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
     #[cfg(any(test, feature = "merge-mutants"))]
     int32_saturates: bool,
-    /// A writer whose increment made the visible value an `Int64` still leaves its slot an
-    /// `Int32`, so a total that dips back under the `i32` range narrows again.
-    #[cfg(any(test, feature = "merge-mutants"))]
-    slot_never_widens: bool,
     /// A local `$inc` by a 65th contributor is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_contributor_cap: bool,
     /// A local write by a 257th writer is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_writer_cap: bool,
+    /// R1 mutant: an `Int64` base that fits an `i32` counts as an `Int32` in the type of a counter:
+    /// the base's own label does not count.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_ignores_base: bool,
+    /// R1 mutant: the type of what a slot gained keeps the width of the operands a base write
+    /// absorbed (the slot's label is the join of every operand it ever took).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_label_survives_absorb: bool,
+    /// R1 mutant: the type of a counter is read from the VALUE of each part (an `Int32` amount past
+    /// the `i32` range counts as an `Int64`), not from its label: the sticky widening R1 replaced.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    counter_kind_by_value: bool,
     /// Order mutant: the candidates of an order entry are not voided by its floor.
     #[cfg(any(test, feature = "merge-mutants"))]
     ord_keep_all: bool,
@@ -242,11 +250,15 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             int32_saturates: false,
             #[cfg(any(test, feature = "merge-mutants"))]
-            slot_never_widens: false,
-            #[cfg(any(test, feature = "merge-mutants"))]
             no_contributor_cap: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_writer_cap: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            counter_ignores_base: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            counter_label_survives_absorb: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            counter_kind_by_value: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             ord_keep_all: false,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -348,9 +360,11 @@ impl JoinOptions {
     switch!(no_saturation, set_no_saturation, false);
     switch!(no_decimal_saturation, set_no_decimal_saturation, false);
     switch!(int32_saturates, set_int32_saturates, false);
-    switch!(slot_never_widens, set_slot_never_widens, false);
     switch!(no_contributor_cap, set_no_contributor_cap, false);
     switch!(no_writer_cap, set_no_writer_cap, false);
+    switch!(counter_ignores_base, set_counter_ignores_base, false);
+    switch!(counter_label_survives_absorb, set_counter_label_survives_absorb, false);
+    switch!(counter_kind_by_value, set_counter_kind_by_value, false);
     switch!(ord_keep_all, set_ord_keep_all, false);
     switch!(ord_latest, set_ord_latest, false);
     switch!(ord_no_last, set_ord_no_last, false);
@@ -682,10 +696,17 @@ pub(super) fn join_into(
                     (None, b) => b,
                     (a, _) => a,
                 };
+                // the stamps of the latest wide and decimal operands: the slot is one writer's
+                // history, so the later of two states of it holds the later stamps, and the join
+                // takes the later of each (the same answer for honest states, a join for any)
+                let (wide_at, decimal_at) =
+                    (x.wide_at.max(v.wide_at), x.decimal_at.max(v.decimal_at));
                 if v.stamp > x.stamp {
                     *x = v.clone();
                 }
                 x.absorbed = absorbed;
+                x.wide_at = wide_at;
+                x.decimal_at = decimal_at;
             }
         }
     }

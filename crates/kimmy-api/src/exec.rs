@@ -174,7 +174,7 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
-    create_collection_validated(state, auth, db, name, None)
+    create_collection_validated(state, auth, db, name, None, kimmy_core::MergePolicy::DEFAULT)
 }
 
 /// [`create_collection`] with a validator set at creation (ADR-257).
@@ -189,6 +189,7 @@ pub fn create_collection_validated(
     db: &str,
     name: &str,
     validator: Option<kimmy_core::ValidatorSpec>,
+    policy: kimmy_core::MergePolicy,
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Ddl, db, Some(name))?;
@@ -199,11 +200,10 @@ pub fn create_collection_validated(
     // drop takes as long as the data under it, and any of them can wait for
     // the single writer for the whole of the request's budget. A handler that
     // holds a worker stalls every task queued on it (ADR-153).
-    let meta = kimmy_storage::blocking(|| match validator {
-        Some(spec) => state.engine.create_collection_with_validator(db, name, spec),
-        None => state.engine.create_collection(db, name),
+    let meta = kimmy_storage::blocking(|| {
+        state.engine.create_collection_with_policy(db, name, policy, validator)
     })?;
-    Ok(json!({ "created": meta.name, "id": meta.id.0 }))
+    Ok(json!({ "created": meta.name, "id": meta.id.0, "mergePolicy": meta.merge_policy.as_str() }))
 }
 
 /// The id a drop of `db.coll` strands a vector index under.
@@ -361,7 +361,15 @@ pub fn find(
     // `_id` ascending is the order every access path already delivers, so it
     // is not a sort the executor has to perform — and, like no sort at all,
     // the scan can stop once it has `skip + limit` matches.
-    let sorted = !sort.is_empty() && !sort_is_id_ascending(&sort);
+    // A filter that is exactly one key `_id` with a literal value reads the one document by its
+    // key and sorts nothing ([`shape::is_one_by_id`]): a document with parallel arrays among the
+    // sort keys is returned (q7s4k 103, q7s4l, q7s4m).
+    let one_by_id = params
+        .filter
+        .as_ref()
+        .and_then(|f| json_to_document(f).ok())
+        .is_some_and(|f| shape::is_one_by_id(&f));
+    let sorted = !sort.is_empty() && !sort_is_id_ascending(&sort) && !one_by_id;
     let window = skip.saturating_add(limit);
 
     // Offered whenever this query *could* be continued, so a caller's first
@@ -408,9 +416,13 @@ pub fn find(
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
             let mut top = TopK::new(window, &order, projection.as_ref(), &filter);
-            let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                top.offer(stamp, doc);
-            })?;
+            // A sort key that reads a position beside a field of that name is refused, with the
+            // keys of every match taken before any is compared (the reference's 16746).
+            let stats =
+                visit_matching_until(state, &meta, &filter, Order::Any, None, |stamp, doc| {
+                    top.offer(stamp, doc)?;
+                    Ok(true)
+                })?;
             // The window shaped `skip + limit` documents and `skip` of them
             // are dropped here, with any refusal they hold. Nothing cheaper
             // is available: which matches the offset steps over is not known
@@ -532,7 +544,7 @@ fn next_cursor(last: Option<&bson::Bson>) -> Option<kimmy_core::Cursor> {
 fn with_id_tiebreak(sort: &[shape::SortKey]) -> Vec<shape::SortKey> {
     let mut order = sort.to_vec();
     if !order.iter().any(|key| key.path == kimmy_storage::ID_FIELD) {
-        order.push(shape::SortKey { path: kimmy_storage::ID_FIELD.to_string(), descending: false });
+        order.push(shape::SortKey::new(kimmy_storage::ID_FIELD, false));
     }
     order
 }
@@ -609,11 +621,11 @@ impl<'a> TopK<'a> {
         }
     }
 
-    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) {
+    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> kimmy_core::Result<()> {
         if self.n == 0 {
-            return;
+            return Ok(());
         }
-        let keys = shape::sort_keys(self.order, &doc);
+        let keys = shape::sort_keys(self.order, &doc)?;
         if self.heap.len() == self.n {
             // Would not displace the largest held, so it is dropped where it
             // stands — unprojected, and never a document this window holds.
@@ -621,7 +633,7 @@ impl<'a> TopK<'a> {
                 shape::compare_keys(self.order, &keys, &largest.keys).is_lt()
             });
             if !displaces {
-                return;
+                return Ok(());
             }
             self.heap.pop();
         }
@@ -633,6 +645,7 @@ impl<'a> TopK<'a> {
             Some(projection) => projection.project(self.filter, &doc),
         };
         self.heap.push(Ranked { order: self.order, stamp, keys, doc });
+        Ok(())
     }
 
     /// The page: everything held, least first, after `skip`. A projection
@@ -1612,6 +1625,12 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         shape::compare(self.sort, a, b)
     }
 
+    /// The keys of a match, taken before any two are compared: refused with the reference's
+    /// 16746 when the sort reads a position beside a field of that name.
+    fn check_sortable(&self, doc: &Document) -> kimmy_core::Result<()> {
+        shape::sort_keys(self.sort, doc).map(|_| ())
+    }
+
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
         let Some(update) = self.update else {
             // A removal answers with the document as it was.
@@ -1654,32 +1673,6 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn match_hold(&self) -> Option<&dyn kimmy_storage::MatchHold> {
         self.keys.as_ref().map(|keys| keys as &dyn kimmy_storage::MatchHold)
-    }
-}
-
-/// Equality constraints a match necessarily satisfies, for seeding an upsert.
-///
-/// Only `$and`-reachable `$eq` on a plain path counts. An equality inside `$or`
-/// is **not** implied by a match, so seeding from it would invent a field the
-/// caller never asked for — the kind of quiet wrongness that is hard to notice
-/// in a document that otherwise looks right.
-fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
-    match filter {
-        filter::Filter::And(branches) => {
-            for branch in branches {
-                implied_equalities(branch, out);
-            }
-        }
-        filter::Filter::Field { path, conditions } => {
-            for condition in conditions {
-                if let filter::Condition::Eq(value) = condition {
-                    // Dotted paths go through `path::set` so `{"a.b": 1}`
-                    // seeds a nested document rather than a literal key.
-                    let _ = kimmy_core::path::set(out, path, value.clone());
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1730,6 +1723,19 @@ pub fn find_and_modify(
         Some(value) => shape::parse_sort(&json_to_document(value)?)?,
         None => Vec::new(),
     };
+    // A filter that is exactly one key `_id` with a literal value reads the one document by its
+    // key and sorts nothing, for the update, the upsert and the removal alike (q7s4l 36, 37, 52;
+    // q7s4m).
+    let sort = if spec
+        .filter
+        .as_ref()
+        .and_then(|f| json_to_document(f).ok())
+        .is_some_and(|f| shape::is_one_by_id(&f))
+    {
+        Vec::new()
+    } else {
+        sort
+    };
     let projection = match &spec.projection {
         Some(value) => shape::parse_find_projection(&json_to_document(value)?)?,
         None => None,
@@ -1765,8 +1771,19 @@ pub fn find_and_modify(
     let failures = std::sync::Mutex::new(Vec::new());
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
-        implied_equalities(&filter, &mut seed);
+        // Refused like any refusal of the seed: said only if nothing matches.
+        let seeded = kimmy_query::seed::implied_equalities(&filter, &mut seed, &mut Vec::new())
+            .map(|()| {
+                // The seed's top-level fields are in name order, `_id` first,
+                // whichever order the filter wrote them in and whatever kind of
+                // update runs over it: the fields the update adds follow them.
+                let mut fields: Vec<(String, bson::Bson)> =
+                    std::mem::take(&mut seed).into_iter().collect();
+                fields.sort_by(|a, b| (a.0 != "_id", &a.0).cmp(&(b.0 != "_id", &b.0)));
+                seed.extend(fields);
+            });
         match &update {
+            _ if seeded.is_err() => seeded.err().map(Err),
             // The seed is run through the update only to be inserted, so a refusal
             // (a `$` with no matched element, a pipeline that cannot read the seed, an
             // `_id` it would change) is said only if nothing matches: a document that
@@ -3311,7 +3328,16 @@ fn write_sink(
     let _suspended = deadline::Deadline::suspend();
     let meta = match existing {
         Some(meta) => meta,
-        None => match kimmy_storage::blocking(|| state.engine.create_collection(&db, &coll)) {
+        // An implicit target is a collection like any created without a `mergePolicy`: the
+        // collection default, as over HTTP.
+        None => match kimmy_storage::blocking(|| {
+            state.engine.create_collection_with_policy(
+                &db,
+                &coll,
+                kimmy_core::MergePolicy::DEFAULT,
+                None,
+            )
+        }) {
             Ok(meta) => meta,
             // Created by someone else since the plan: it is theirs, and for `$out`
             // it is no longer new.
@@ -3448,7 +3474,7 @@ fn lookup(
     let mut attached: Vec<Vec<usize>> = Vec::with_capacity(input.len());
     for doc in &input {
         ticker.tick()?;
-        let mut at: Vec<usize> = join_keys(doc, local_field)
+        let mut at: Vec<usize> = local_join_keys(doc, local_field)
             .iter()
             .filter_map(|key| buckets.get(key))
             .flatten()
@@ -3842,7 +3868,7 @@ fn graph_lookup(
                 ticker.tick()?;
                 visited.insert(at);
                 reached.push((at, depth));
-                for key in link_keys(&foreign[at], &spec.connect_from) {
+                for key in follow_keys(&foreign[at], &spec.connect_from) {
                     if searched.insert(key.clone()) {
                         next.push(key);
                     }
@@ -3927,6 +3953,19 @@ fn read_foreign(
 /// undefined ones: a `null` link follows nothing, and nothing is filed under it.
 fn link_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = aggregate::join_values(doc, field)
+        .into_iter()
+        .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
+        .filter_map(encode_key)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// [`link_keys`] for the field a `$graphLookup` follows (`connectFromField`), where a position
+/// is a run of digits, leading zeros included (q7s4i 343; UNRECORDED beyond that case).
+fn follow_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = aggregate::link_values(doc, field)
         .into_iter()
         .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
         .filter_map(encode_key)
@@ -4134,7 +4173,17 @@ fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
 /// field yields no keys at all.
 fn join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> =
-        aggregate::join_values(doc, field).into_iter().filter_map(encode_key).collect();
+        aggregate::foreign_join_values(doc, field).into_iter().filter_map(encode_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// [`join_keys`] for the local side of a `$lookup`: an empty array joins as `null`
+/// ([`aggregate::local_join_values`]).
+fn local_join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> =
+        aggregate::local_join_values(doc, field).into_iter().filter_map(encode_key).collect();
     keys.sort_unstable();
     keys.dedup();
     keys
@@ -4537,7 +4586,7 @@ mod tests {
                 let all = filter::Filter::AlwaysTrue;
                 let mut top = TopK::new(skip + limit, &order, None, &all);
                 for (stamp, doc) in scrambled.iter().cloned() {
-                    top.offer(stamp, doc);
+                    top.offer(stamp, doc).unwrap();
                 }
                 let got: Vec<i64> = top
                     .into_sorted(skip)
@@ -5249,11 +5298,40 @@ mod tests {
         let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
 
         // After a stage that blocks, the source is the whole collection and is refused
-        // under the ceiling exactly as before.
-        let pipeline = json!([{ "$sort": { "_id": 1 } }, { "$match": { "n": 3 } }]);
+        // under the ceiling exactly as before. The `$match` follows a `$project`, not the
+        // `$sort`, so it stays where it is.
+        let pipeline = json!([{ "$sort": { "_id": 1 } }, { "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
         let err = agg_limits(&state, &superuser(), "app", "docs", &pipeline, limits.clone())
             .expect_err("the source is the whole collection");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
+
+        // A `$match` right after a `$sort` is the exception: it is applied before the sort
+        // (q7s4l 32), so it is the first stage, is pushed down to the source, and the pipeline
+        // answers under the same ceiling: the six documents with `n` 3, sorted by `_id`.
+        let pipeline = json!([{ "$sort": { "_id": 1 } }, { "$match": { "n": 3 } }]);
+        let (out, stats) = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(aggregate_run_stats(
+                &state,
+                &superuser(),
+                "app",
+                "docs",
+                &pipeline,
+                limits.clone(),
+            ))
+            .unwrap();
+        assert_eq!(out["count"], 6);
+        let ids: Vec<i64> = out["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, [3, 8, 13, 18, 23, 28]);
+        let stats = stats.expect("a filtered source");
+        assert_eq!((stats.examined, stats.matched), (6, 6));
+        assert!(stats.index.is_some(), "the match is narrowed by the index on n");
 
         // After a stage that streams, the source is streamed and has no ceiling (ADR-270):
         // the pipeline is answered, and what it read is the whole collection, not the
@@ -5332,7 +5410,7 @@ mod tests {
         let order = with_id_tiebreak(&[]);
         let mut top = TopK::new(0, &order, None, &filter);
         for (stamp, doc) in all {
-            top.offer(stamp, doc);
+            top.offer(stamp, doc).unwrap();
         }
         assert!(top.into_sorted(0).unwrap().is_empty());
     }
@@ -5609,6 +5687,20 @@ mod join_differential {
         out
     }
 
+    /// The local side's values: as [`expanded`], except that a value that is an empty array is
+    /// not itself a key and joins as `null` (q7s4g0627: a local `k: []` meets the foreign `null`
+    /// and `[null]`). A missing local field still contributes nothing: the documented difference.
+    fn expanded_local(values: Vec<&Bson>) -> Vec<Bson> {
+        let mut out = Vec::new();
+        for v in values {
+            match v {
+                Bson::Array(a) if a.is_empty() => out.push(Bson::Null),
+                _ => out.extend(expanded(vec![v])),
+            }
+        }
+        out
+    }
+
     #[test]
     fn a_join_agrees_with_a_naive_reference_over_generated_documents() {
         let dir = tempfile::tempdir().unwrap();
@@ -5628,6 +5720,9 @@ mod join_differential {
         let auth = Auth(kimmy_auth::Principal::superuser("test"));
 
         let mut attached_in_all = 0;
+        // The seeds in which a local document holds an empty array at the local path, which the
+        // join reads as `null`.
+        let mut empty_local = 0;
         for seed in 1..=120u64 {
             let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let (local_name, foreign_name) = (format!("l{seed}"), format!("f{seed}"));
@@ -5673,7 +5768,7 @@ mod join_differential {
             let want: Vec<Vec<i64>> = locals
                 .iter()
                 .map(|l| {
-                    let lv = expanded(kimmy_core::path::resolve(l, local_path));
+                    let lv = expanded_local(kimmy_core::path::resolve(l, local_path));
                     foreigns
                         .iter()
                         .filter(|f| {
@@ -5689,9 +5784,20 @@ mod join_differential {
                 "seed {seed}\nlocal {local_path} {locals:?}\nforeign {foreign_path} {foreigns:?}"
             );
             attached_in_all += got.iter().map(Vec::len).sum::<usize>();
+            empty_local += usize::from(locals.iter().any(|l| {
+                kimmy_core::path::resolve(l, local_path)
+                    .iter()
+                    .any(|v| matches!(v, Bson::Array(a) if a.is_empty()))
+            }));
         }
         // Not vacuous: most generated pairs join something.
         assert!(attached_in_all > 30, "{attached_in_all} attachments over 120 generated joins");
+        // The count is printed (`--nocapture` shows it): "above 5" holding is not the number.
+        println!("{empty_local} of 120 seeds draw a local empty array");
+        assert!(
+            empty_local > 5,
+            "{empty_local} of 120 generated joins have a local empty array: the rule is not exercised"
+        );
     }
 }
 

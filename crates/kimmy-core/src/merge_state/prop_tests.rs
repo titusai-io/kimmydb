@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use crate::effects::{CellTag, CreationCell};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -769,18 +770,6 @@ pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
     corpus
 }
 
-/// The compact encodings the compact decode fuzz damages: the same states, every fifth of the pools
-/// of 24 runs, all of them (the compact form spells every state).
-pub(super) fn fuzz_corpus_compact(o: &JoinOptions) -> Vec<Vec<u8>> {
-    let mut corpus: Vec<Vec<u8>> = Vec::new();
-    for pool in pools(24, 24, o) {
-        for st in pool.iter().step_by(5) {
-            corpus.push(st.encode_compact());
-        }
-    }
-    corpus
-}
-
 /// One damaged input: an encoding of the corpus with one to four bit flips, byte sets,
 /// truncations, insertions, deletions or rewritten length fields.
 pub(super) fn fuzz_mutate(rng: &mut Rng, corpus: &[Vec<u8>]) -> Vec<u8> {
@@ -822,7 +811,7 @@ fn decode_mutation_fuzz() {
     let o = opts(1_000_000_000);
     let corpus = fuzz_corpus(&o);
     // the corpus is the states version 1 can spell; the others (an absorbed pair) are fuzzed through the
-    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`, and the d7 sweep)
+    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`)
     let mut split = codec::V1Split::default();
     for pool in pools(24, 24, &o) {
         pool.iter().step_by(5).for_each(|st| {
@@ -1095,37 +1084,29 @@ fn a_nested_writers_hash_equals_every_receivers() {
 }
 
 #[test]
-fn state_equality_is_the_equality_of_the_version_1_bytes() {
-    // `Writer::receive_report` decides "changed" by comparing states, where it once compared the
-    // version 1 canonical bytes: the two verdicts agree on every state version 1 can spell.
+fn state_equality_is_the_equality_of_the_compact_bytes() {
+    // `Writer::receive_report` decides "changed" by comparing states. The compact form is the canonical
+    // form and the state hash, so state equality must be exactly the equality of its bytes (and an
+    // equal pair must hash alike): on EVERY state, including the ones the legacy version 1 form cannot
+    // spell (a document in an array, an absorbed pair, an order state).
     let o = opts(1_000_000_000);
     let mut pools_ = pools(40, 24, &o);
-    pools_.extend(
-        nested_pools(40, 24, &o)
-            .into_iter()
-            .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
-    );
-    let (mut same, mut differ) = (0, 0);
-    let (mut v1_pairs, mut v1_held_pairs) = (0, 0);
-    for (a, b, _) in triples(&pools_, 600) {
+    pools_.extend(nested_pools(40, 24, &o));
+    // `pools` and `nested_pools` clear the order state: these two keep it
+    pools_.extend(ord_pools(40, 24, &o));
+    pools_.extend(nested_ord_pools(40, 24, &o));
+    let (mut same, mut differ, mut with_ords) = (0, 0, 0);
+    for (a, b, _) in triples(&pools_, 1200) {
         let merged = join(a, b, &o).0;
         for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
             let by_state = x == y;
-            // the compact bytes, for every state (the version 1 form cannot spell a state with an
-            // absorbed pair)
+            with_ords += usize::from(!x.ords.is_empty());
             assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
-            // version 1, where it holds both states of the pair
-            let (hx, hy) = (x.without_ords().v1_can_hold(), y.without_ords().v1_can_hold());
-            if hx && hy {
-                assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
-                v1_held_pairs += 1;
-            } else {
-                assert!(
-                    (hx || x.v1_refused_only_for_a_pair())
-                        && (hy || y.v1_refused_only_for_a_pair())
-                );
-            }
-            v1_pairs += 1;
+            assert_eq!(
+                x.compact_hash() == y.compact_hash(),
+                by_state,
+                "the hash tells states apart"
+            );
             if by_state {
                 same += 1;
             } else {
@@ -1133,9 +1114,36 @@ fn state_equality_is_the_equality_of_the_version_1_bytes() {
             }
         }
     }
-    eprintln!("state_equality: {v1_held_pairs} of {v1_pairs} pairs also on version 1");
+    eprintln!(
+        "state_equality: {same} equal pairs, {differ} different, {with_ords} with an order state"
+    );
     assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
-    assert!(v1_held_pairs > 50, "version 1 still compares {v1_held_pairs} pairs");
+    assert!(with_ords > 500, "only {with_ords} states carry an order state");
+    // The random pairs seldom differ in their order state ALONE (it follows from the cells), so make such
+    // pairs: the same state with one order entry removed, or one part of the first entry changed. Equal bytes
+    // for these would mean section 10 does not tell the order states apart.
+    let mut tweaked = 0;
+    for x in pools_.iter().flatten().filter(|x| !x.ords.is_empty()) {
+        let key = x.ords.keys().next().unwrap().clone();
+        let mut removed = x.clone();
+        removed.ords.remove(&key);
+        let mut changed = x.clone();
+        let e = changed.ords.get_mut(&key).unwrap();
+        if let Some(c) = &mut e.last {
+            c.1 += 1;
+        } else if let Some(l) = e.lvl {
+            e.lvl = Some(MStamp { hlc: Hlc::new(l.hlc.wall_ms + 1, 0), ..l });
+        } else {
+            e.last = Some((key.0, 0));
+        }
+        for y in [removed, changed] {
+            assert_ne!(*x, y);
+            assert_ne!(x.compact_bytes(), y.compact_bytes(), "section 10 misses a change");
+            assert_ne!(x.compact_hash(), y.compact_hash());
+            tweaked += 1;
+        }
+    }
+    assert!(tweaked > 500, "{tweaked}");
 }
 
 // ---- typed counters --------------------------------------------------------------------------
@@ -1305,4 +1313,121 @@ fn the_states_writers_build_satisfy_the_invariants_decode_checks() {
             assert_eq!(MergeState::decode_compact(&st.encode_compact()).as_ref(), Ok(st));
         }
     }
+}
+
+/// An operand of an `$inc` from the typed pool: `Int32` (also at the `i32` range), `Int64`,
+/// `Decimal128`, and a `Double` (a register on an absent field).
+fn pool_typed_inc(rng: &mut Rng) -> Value {
+    let dec = |t: &str| Value::Decimal128(t.parse::<bson::Decimal128>().unwrap().bytes());
+    match rng.below(10) {
+        0 => Value::Int32(1),
+        1 => Value::Int32(-3),
+        2 => Value::Int32(i32::MAX),
+        3 => Value::Int32(i32::MIN),
+        4 => Value::Int64(5),
+        5 => Value::Int64(-(1 << 33)),
+        6 => dec("1.5"),
+        7 => dec("-0.25"),
+        8 => Value::Double(0.5),
+        _ => Value::Int32(0),
+    }
+}
+
+/// One random run of the one-entry upsert of the effects layer (`Writer::upsert_create`: plain,
+/// creation and `Inc` cells, several `$inc` cells at one stamp, typed operands) with typed
+/// increments, base writes and the exchange of states between the writers; returns every state any
+/// writer held. Its own random stream: the pools of [`run`] are not touched by it.
+pub(super) fn run_typed_upserts(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+    let n = 3 + rng.below(2);
+    let mut ws: Vec<Writer> = (0..n)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let names = ["x", "y", "n", "z", "", "_", "a.b"];
+    let mut pool = Vec::new();
+    for _ in 0..steps {
+        let m = rng.below(n);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 45 {
+            let mut other = rng.below(n);
+            if other == m {
+                other = (m + 1) % n;
+            }
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let w = &mut ws[m];
+            match rng.below(8) {
+                0..=2 => {
+                    let mut cells: Vec<CreationCell> = Vec::new();
+                    for name in names {
+                        match rng.below(4) {
+                            0 => cells.push(CreationCell {
+                                path: p(name),
+                                value: pool_value(&mut rng),
+                                tag: *rng.pick(&[CellTag::Plain, CellTag::Creation]),
+                            }),
+                            1 | 2 => cells.push(CreationCell {
+                                path: p(name),
+                                value: pool_typed_inc(&mut rng),
+                                tag: CellTag::Inc,
+                            }),
+                            _ => {}
+                        }
+                    }
+                    let _ = w.upsert_create(&cells, skew);
+                }
+                3 | 4 => {
+                    let path = p(rng.pick(&names));
+                    let _ = w.write_inc_value(&path, &pool_typed_inc(&mut rng), skew);
+                }
+                5 => {
+                    let path = p(rng.pick(&names));
+                    let v = if rng.below(2) == 0 { Value::Int32(5) } else { Value::Int64(7) };
+                    let _ = w.write_set(&path, v, skew);
+                }
+                6 => {
+                    let path = p(rng.pick(&names));
+                    let _ = w.write_unset(&path, skew);
+                }
+                _ => {
+                    let _ = w.write_delete(skew);
+                }
+            }
+        }
+        pool.push(ws[m].state.clone());
+    }
+    pool
+}
+
+/// The join laws over the typed upsert pools: several `$inc` cells at one stamp, typed slots, base
+/// writes that absorb them.
+#[test]
+fn join_laws_on_typed_upsert_pools() {
+    let o = opts(1_000_000_000);
+    let ps: Vec<Vec<MergeState>> = (1..=40).map(|s| run_typed_upserts(s, 24, &o)).collect();
+    check_laws_on(&o, true, &ps, 300);
+}
+
+/// Every state of the typed upsert pools round-trips through the compact form, and the hash does not
+/// depend on how the state was reached.
+#[test]
+fn typed_upsert_pools_round_trip_the_compact_form() {
+    let o = opts(1_000_000_000);
+    let mut slots = 0;
+    for s in 1..=40 {
+        for st in run_typed_upserts(s, 24, &o) {
+            slots += st.slots.len();
+            let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
+            assert_eq!(back, st, "seed {s}");
+            assert_eq!(back.compact_hash(), st.compact_hash(), "seed {s}");
+        }
+    }
+    assert!(slots > 200, "the pools hold counters: {slots}");
 }
