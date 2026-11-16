@@ -113,10 +113,12 @@ use bson::{Bson, Document, doc};
 """)
 for h, before in docsets.items():
     print("fn docs_%s() -> Vec<Document> {\n    vec![\n%s\n    ]\n}\n" % (h, "\n".join("        %s," % doc(d) for d in before)))
+print("/// The number of cases `cases_bounds` holds, written by the generator.\npub const CASES_BOUNDS_COUNT: usize = %d;\n" % len(bounds))
 print("pub fn cases_bounds() -> Vec<Bound> {\n    vec![")
 for label, line, h, sort, skip, limit, ids in bounds:
     print("        Bound {\n            label: \"%s\",\n            line: %d,\n            docs: docs_%s,\n            sort: %s,\n            skip: %d,\n            limit: %d,\n            ids: vec![%s],\n        }," % (label, line, h, doc(sort), skip, limit, ", ".join(map(str, ids))))
 print("    ]\n}\n")
+print("/// The number of cases `cases_whole` holds, written by the generator.\npub const CASES_WHOLE_COUNT: usize = %d;\n" % len(whole))
 print("pub fn cases_whole() -> Vec<Rec> {\n    vec![")
 for label, line, h, run, out in whole:
     print("        Rec {\n            label: \"%s\",\n            line: %d,\n            docs: docs_%s,\n            run: %s,\n            outcome: %s,\n        }," % (label, line, h, run, out))

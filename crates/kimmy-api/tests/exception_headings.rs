@@ -32,6 +32,10 @@ fn every_exception_cites_a_heading_of_the_deviations_that_exists() {
         "resolver_elements_exceptions.txt",
         include_str!("../../kimmy-query/tests/query_conformance/resolver_elements_exceptions.txt"),
     );
-    println!("exception headings checked: {checked}");
-    assert!(checked > 0, "the exceptions lists name no heading at all");
+    let table = assert_headings_exist(
+        "update_table_exceptions.txt",
+        include_str!("../../kimmy-query/tests/data/update_table_exceptions.txt"),
+    );
+    println!("exception headings checked: {checked} (resolver elements), {table} (update table)");
+    assert!(checked > 0 && table > 0, "an exceptions list names no heading at all");
 }

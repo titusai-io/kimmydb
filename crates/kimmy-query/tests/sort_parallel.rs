@@ -44,7 +44,8 @@ fn every_recorded_pair_answers_as_the_reference_does() {
         }
         rows += 1;
     }
-    assert!(rows >= 120, "{rows} rows");
+    assert_eq!(rows, 128, "the generator wrote 128 cases");
+    println!("sort_parallel: {rows} cases");
 }
 
 #[test]

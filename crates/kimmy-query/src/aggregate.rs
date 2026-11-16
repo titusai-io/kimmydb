@@ -598,8 +598,8 @@ fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Resu
     // exemption is judged on the moved pipeline.
     let mut raw: Vec<&Document> = pipeline.iter().collect();
     move_matches_before_sorts(&mut stages, &mut raw);
-    // A `$match` that is exactly `{_id: <number>}` ([`shape::is_one_by_id`]) at the head of the
-    // moved pipeline, with the `$sort` right after it or only a `$skip` between: the reference
+    // A `$match` that is exactly one key `_id` with a literal value ([`shape::is_one_by_id`]) at
+    // the head of the moved pipeline, with the `$sort` right after it or only a `$skip` between: the reference
     // reads the one document by its key and does not sort it, so a document with parallel arrays
     // is returned (q7s4k 103, 104; q7s4l 2, 29, and 32, where `[$sort, $match {_id: 2}]` is moved
     // to this form). A `$limit`, `$addFields` or `$project` between keeps the check (q7s4l 28,

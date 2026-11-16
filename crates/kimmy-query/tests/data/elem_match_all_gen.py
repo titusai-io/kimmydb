@@ -93,6 +93,7 @@ pub struct Case {
 """)
 for h, before in docsets.items():
     print("fn docs_%s() -> Vec<Document> {\n    vec![\n%s\n    ]\n}\n" % (h, "\n".join("        %s," % doc(d) for d in before)))
+print("/// The number of cases `cases` holds, written by the generator.\npub const CASES_COUNT: usize = %d;\n" % len(cases))
 print("pub fn cases() -> Vec<Case> {\n    vec![")
 for label, line, h, filt, ids in cases:
     print("        Case {\n            label: \"%s\",\n            line: %d,\n            docs: docs_%s,\n            filter: %s,\n            ids: vec![%s],\n        }," % (label, line, h, doc(filt), ", ".join(map(str, ids))))

@@ -41,6 +41,9 @@ fn docs_bf873d02() -> Vec<Document> {
     ]
 }
 
+/// The number of cases `cases` holds, written by the generator.
+pub const CASES_COUNT: usize = 22;
+
 pub fn cases() -> Vec<Case> {
     vec![
         Case {

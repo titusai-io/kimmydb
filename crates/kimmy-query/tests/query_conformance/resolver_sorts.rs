@@ -6,9 +6,11 @@
 //! case names its label (the set and the case number, the line of the set's `.jsonl`) and its
 //! line in the set's `.out`.
 
-use super::resolver_bound_cases::{cases_bounds, cases_whole};
-use super::resolver_order_cases::cases_document_order;
-use super::resolver_sort_cases::cases_sorts;
+use super::resolver_bound_cases::{
+    CASES_BOUNDS_COUNT, CASES_WHOLE_COUNT, cases_bounds, cases_whole,
+};
+use super::resolver_order_cases::{CASES_DOCUMENT_ORDER_COUNT, cases_document_order};
+use super::resolver_sort_cases::{CASES_SORTS_COUNT, cases_sorts};
 use bson::{Bson, Document, doc};
 use kimmy_query::aggregate::{self, Limits};
 use kimmy_query::{filter, shape, update};
@@ -28,6 +30,9 @@ pub enum Outcome {
     Ids(Vec<i32>),
     /// The documents an aggregation answers, or the collection after an update.
     Docs(Vec<Document>),
+    /// The documents an aggregation answers, whose ORDER the reference does not keep between two
+    /// runs (a tie): compared as a set. The generator lists each case with its reason.
+    DocsAsSet(Vec<Document>),
     /// Refused with this code (only 16746 is recorded here).
     Refused(i32),
 }
@@ -90,6 +95,29 @@ fn same_docs(got: &[Document], want: &[Document]) -> bool {
     got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| same_value(a, b))
 }
 
+/// Two values of the same type and value: an `Int32` is not an `Int64` or a double, a `NaN` is
+/// the `NaN` it was recorded as, and a document's fields are compared by name.
+fn same_typed(a: &Bson, b: &Bson) -> bool {
+    match (a, b) {
+        (Bson::Double(x), Bson::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Bson::Array(x), Bson::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_typed(p, q))
+        }
+        (Bson::Document(x), Bson::Document(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same_typed(v, w)))
+        }
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b) && a == b,
+    }
+}
+
+fn same_typed_docs(ours: &[Document], want: &[Document]) -> bool {
+    ours.len() == want.len()
+        && ours
+            .iter()
+            .zip(want)
+            .all(|(p, q)| same_typed(&Bson::Document(p.clone()), &Bson::Document(q.clone())))
+}
+
 fn ids(docs: &[Document]) -> Vec<i32> {
     docs.iter().map(|d| d.get_i32("_id").unwrap()).collect()
 }
@@ -128,39 +156,50 @@ fn run(rec: &Rec) -> Result<Vec<Document>, String> {
     }
 }
 
-/// A table of recordings run as they were recorded, each case answered as the reference
-/// answered it: the ids or the documents, or its 16746.
-fn assert_recorded_runs(set: &str, cases: Vec<Rec>) {
-    let mut wrong = Vec::new();
-    for rec in &cases {
-        let got = run(rec);
-        let ok = match (&rec.outcome, &got) {
-            (Outcome::Refused(_), Err(message)) => message.contains(AMBIGUOUS),
-            (Outcome::Ids(want), Ok(docs)) => &ids(docs) == want,
-            (Outcome::Docs(want), Ok(docs)) => same_docs(docs, want),
-            _ => false,
-        };
-        if !ok {
-            wrong.push(format!("{} (line {}): ours {got:?}", rec.label, rec.line));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{set}: {} of {} differ:\n{}",
-        wrong.len(),
-        cases.len(),
-        wrong.join("\n")
-    );
-}
-
 /// Documents compared with documents (q7s3g 98, 99; q7s3h 1-112; q7s3j 210-369): by the type of
 /// each field's value, then its name, then the value, in a sort, a `$cmp`, `$max` and `$min` as
 /// expressions and as `$group` accumulators, and the update operators `$max` and `$min`.
 #[test]
 fn every_recorded_comparison_of_documents_answers_as_recorded() {
     let cases = cases_document_order();
-    assert!(cases.len() > 150, "premise: {}", cases.len());
-    assert_recorded_runs("the document order", cases);
+    assert_eq!(
+        cases.len(),
+        CASES_DOCUMENT_ORDER_COUNT,
+        "order cases: the generator wrote CASES_DOCUMENT_ORDER_COUNT cases"
+    );
+    println!("order cases: {} cases", cases.len());
+    // Every one of these recordings is typed (`$numberInt`, `$numberLong`, `$numberDouble`,
+    // `$numberDecimal`), so the documents are compared by type and value: an `Int32` the
+    // reference answers is not met by a double. No case of this table keeps the width-blind
+    // `norm`; the other tables of this file still do.
+    let mut wrong = Vec::new();
+    for rec in &cases {
+        let got = run(rec);
+        let ok = match (&rec.outcome, &got) {
+            (Outcome::Refused(_), Err(message)) => message.contains(AMBIGUOUS),
+            (Outcome::Ids(want), Ok(docs)) => &ids(docs) == want,
+            (Outcome::Docs(want), Ok(docs)) => same_typed_docs(docs, want),
+            _ => false,
+        };
+        if !ok {
+            let recorded = match &rec.outcome {
+                Outcome::Docs(want) | Outcome::DocsAsSet(want) => format!("{want:?}"),
+                Outcome::Ids(want) => format!("{want:?}"),
+                Outcome::Refused(code) => format!("refused {code}"),
+            };
+            wrong.push(format!(
+                "{} (line {}): recorded {recorded}; ours {got:?}",
+                rec.label, rec.line
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the document order: {} of {} differ:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
 }
 
 /// Every recorded sort over arrays, in an aggregation's stages and a `find`'s sort, an update's
@@ -169,7 +208,12 @@ fn every_recorded_comparison_of_documents_answers_as_recorded() {
 #[test]
 fn every_recorded_sort_over_a_path_through_arrays_answers_as_recorded() {
     let cases = cases_sorts();
-    assert!(cases.len() > 100, "premise: {}", cases.len());
+    assert_eq!(
+        cases.len(),
+        CASES_SORTS_COUNT,
+        "sort cases: the generator wrote CASES_SORTS_COUNT cases"
+    );
+    println!("sort cases: {} cases", cases.len());
     let exceptions = exceptions();
     for (label, reason) in &exceptions {
         assert!(
@@ -191,6 +235,7 @@ fn every_recorded_sort_over_a_path_through_arrays_answers_as_recorded() {
             }
             (Outcome::Ids(want), Ok(docs)) => &ids(docs) == want,
             (Outcome::Docs(want), Ok(docs)) => same_docs(docs, want),
+            (Outcome::DocsAsSet(want), Ok(docs)) => same_set(docs, want),
             _ => false,
         };
         if !ok && !exceptions.contains_key(rec.label) {
@@ -228,7 +273,12 @@ fn exceptions() -> HashMap<&'static str, &'static str> {
 #[test]
 fn every_recorded_bound_of_the_two_key_sort_answers_as_recorded() {
     let cases = cases_bounds();
-    assert_eq!(cases.len(), 22, "premise: q7s3m 1 to 22");
+    assert_eq!(
+        cases.len(),
+        CASES_BOUNDS_COUNT,
+        "bound cases: the generator wrote CASES_BOUNDS_COUNT cases"
+    );
+    println!("bound cases: {} cases", cases.len());
     let exceptions = exceptions();
     let mut wrong = Vec::new();
     for case in &cases {
@@ -271,7 +321,12 @@ fn every_recorded_bound_of_the_two_key_sort_answers_as_recorded() {
 #[test]
 fn the_element_sorts_compare_whole_values_where_the_sort_takes_an_element() {
     let cases = cases_whole();
-    assert_eq!(cases.len(), 68, "premise: q7s3m 23 to 54, q7s4o 1 to 20 and q7s4p 1 to 16");
+    assert_eq!(
+        cases.len(),
+        CASES_WHOLE_COUNT,
+        "whole-value cases: the generator wrote CASES_WHOLE_COUNT cases"
+    );
+    println!("whole-value cases: {} cases", cases.len());
     let mut wrong = Vec::new();
     for rec in &cases {
         let got = run(rec);
@@ -285,6 +340,16 @@ fn the_element_sorts_compare_whole_values_where_the_sort_takes_an_element() {
         }
     }
     assert!(wrong.is_empty(), "{} of {} differ:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
+}
+
+/// The same documents in any order, each compared as `norm` reads it.
+fn same_set(got: &[Document], want: &[Document]) -> bool {
+    let sorted = |docs: &[Document]| {
+        let mut texts: Vec<String> = norm_all(docs).iter().map(ToString::to_string).collect();
+        texts.sort();
+        texts
+    };
+    sorted(got) == sorted(want)
 }
 
 fn ids_or_docs(docs: &[Document]) -> String {

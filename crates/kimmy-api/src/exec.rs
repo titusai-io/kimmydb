@@ -361,9 +361,9 @@ pub fn find(
     // `_id` ascending is the order every access path already delivers, so it
     // is not a sort the executor has to perform — and, like no sort at all,
     // the scan can stop once it has `skip + limit` matches.
-    // A filter that is exactly `{_id: <number>}` reads the one document by its key and sorts
-    // nothing ([`shape::is_one_by_id`]): a document with parallel arrays among the sort keys is
-    // returned (q7s4k 103, q7s4l).
+    // A filter that is exactly one key `_id` with a literal value reads the one document by its
+    // key and sorts nothing ([`shape::is_one_by_id`]): a document with parallel arrays among the
+    // sort keys is returned (q7s4k 103, q7s4l, q7s4m).
     let one_by_id = params
         .filter
         .as_ref()
@@ -1723,8 +1723,9 @@ pub fn find_and_modify(
         Some(value) => shape::parse_sort(&json_to_document(value)?)?,
         None => Vec::new(),
     };
-    // A filter that is exactly `{_id: <number>}` reads the one document by its key and sorts
-    // nothing, for the update, the upsert and the removal alike (q7s4l 36, 37, 52).
+    // A filter that is exactly one key `_id` with a literal value reads the one document by its
+    // key and sorts nothing, for the update, the upsert and the removal alike (q7s4l 36, 37, 52;
+    // q7s4m).
     let sort = if spec
         .filter
         .as_ref()

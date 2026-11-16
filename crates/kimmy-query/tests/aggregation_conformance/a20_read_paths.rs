@@ -93,7 +93,8 @@ fn a_path_through_an_array_before_the_last_segment_is_not_refused() {
     assert_eq!(out, vec![bson::doc! { "y": { "b": 1 } }, bson::doc! { "y": { "b": 2 } }]);
 }
 
-// The recorded data, generated from q7s4i.jsonl.
+// The recorded data: hand-written, no generator. The documents and commands are copied from the
+// cases of q7s4i named at the top of this file, whose records read `beforeOrdered` and `reply.docs`.
 
 fn fixture() -> Vec<Document> {
     documents(

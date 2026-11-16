@@ -366,16 +366,20 @@ fn b_an_upsert_writing_below_a_filter_scalar_is_refused() {
 }
 
 #[test]
-fn b_two_spellings_of_one_element_are_a_path_conflict() {
-    // No recorded answer. The product refuses the pair: `a.1` and `a.01` are
-    // one element, written twice.
+fn b_two_spellings_of_one_element_are_a_path_conflict_where_the_container_is_an_array() {
+    // q7s2y 1 to 16: the reference server aborts on `a.01` beside `a.1` over an array, which is
+    // read here as a refusal that writes nothing. Over a document, or where the container is
+    // missing, they are two fields and both apply (q7s2y 34 to 59; see `update_table`).
     for update in [
         doc! { "$set": { "a.1": 5 }, "$inc": { "a.01": 1 } },
         doc! { "$inc": { "a.01": 1 }, "$set": { "a.1": 5 } },
     ] {
-        let Err(err) = parsed(update) else { panic!("applied") };
-        assert!(err.contains("conflict"), "{err}");
+        refused(updated(update, doc! { "_id": 1, "a": [10, 20, 30] }), "conflict");
     }
+    same(
+        updated(doc! { "$set": { "o.01": 7, "o.1": 8 } }, doc! { "_id": 1, "o": { "k": 1 } }),
+        doc! { "_id": 1, "o": { "k": 1, "01": 7, "1": 8 } },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -600,14 +604,16 @@ fn decimal(text: &str) -> bson::Bson {
 fn h_a_body_id_that_is_no_document_id_is_refused() {
     // Not recorded: a double is equal to the stored 1 by value, but it is no
     // `DocId`, and a document stored under it could not be read back by key.
-    refused(updated(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1, "k": 1 }), "_id is immutable");
+    // The name is judged by the id types first (q7s2o0592, o0599, o0606), so the refusal is the
+    // id type's, not the immutable `_id`'s.
+    refused(updated(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1, "k": 1 }), "invalid _id type");
     refused(
         updated(doc! { "_id": decimal("7.5"), "v": 1 }, doc! { "_id": 7, "k": 1 }),
         "_id is immutable",
     );
     // A replacement upsert: the filter's `_id` against the body's, and a body
     // `_id` with no filter `_id`.
-    refused(upserted(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1 }), "_id is immutable");
+    refused(upserted(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1 }), "invalid _id type");
     assert!(upserted(doc! { "_id": 1.0, "v": 1 }, doc! {}).is_err());
     // A non-integral Decimal128 is a document id, so it is a valid body `_id`
     // when the filter names none, and differs from a stored integer id.
@@ -1413,5 +1419,70 @@ fn t_a_rename_that_touches_an_array_element_is_refused() {
         (doc! { "a.k": "a.n" }, stored()),
     ] {
         assert!(updated(doc! { "$rename": rename.clone() }, stored).is_err(), "{rename}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (U) `$pull` with `$elemMatch` over array elements (q7s3g)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn u_a_pull_of_an_elem_match_reads_an_array_element_as_a_find_does() {
+    // q7s3g0243 (line 2150): `{$elemMatch: {$gt: 1}}` over `a = [[1, [2, 3]], [4]]` removes
+    // `[4]` only. A member of an array element that is itself an array is one value, compared
+    // whole and not looked into, as `find` reads it: `[2, 3]` is not greater than 1.
+    let pull = || doc! { "$pull": { "a": { "$elemMatch": { "$gt": 1 } } } };
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [[1, [2, 3]], [4]] }),
+        doc! { "_id": 1, "a": [[1, [2, 3]]] },
+    );
+    // The neighbours: members that are scalars (q7s3g0162, `a = [[1, 2], [3]]`: both elements go; q7s3g0216, `[[1, 2], 3]`: the array goes and the scalar stays), and elements
+    // that are documents or `null`, which hold nothing to search (q7s3g0189, q7s3g0270).
+    same(updated(pull(), doc! { "_id": 1, "a": [[1, 2], [3]] }), doc! { "_id": 1, "a": [] });
+    same(updated(pull(), doc! { "_id": 1, "a": [[1, 2], 3] }), doc! { "_id": 1, "a": [3] });
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [{ "b": 1 }, bson::Bson::Null] }),
+        doc! { "_id": 1, "a": [{ "b": 1 }, bson::Bson::Null] },
+    );
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [{ "b": [1, 2] }, { "b": [3] }] }),
+        doc! { "_id": 1, "a": [{ "b": [1, 2] }, { "b": [3] }] },
+    );
+    // q7s2y y0069: a nested array is a member that does not pass, whatever its depth; `[5]` has
+    // a scalar member that does.
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [[[2, 3]], [[1]], [5]] }),
+        doc! { "_id": 1, "a": [[[2, 3]], [[1]]] },
+    );
+    // q7s2y y0078: a document member under a value-form body is compared whole, `{$eq: {k: 2}}`
+    // removes the element that holds `{k: 2}`.
+    same(
+        updated(
+            doc! { "$pull": { "a": { "$elemMatch": { "$eq": { "k": 2 } } } } },
+            doc! { "_id": 2, "a": [[{ "k": 2 }], [3], [{ "k": 0 }, 5]] },
+        ),
+        doc! { "_id": 2, "a": [[3], [{ "k": 0 }, 5]] },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (V) An upsert whose replacement names a Double `_id` (q7s2o)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v_a_double_id_in_a_replacement_is_refused_by_the_id_type_rule_wherever_it_is_named() {
+    // q7s2o0592 (filter `{a: 5}`), o0599 (filter `{_id: 5}`) and o0606 (filter `{_id: 5, a: 5}`):
+    // the reference stores `_id: 5.0`; this product has no Double `_id`, and says so the same way
+    // in the three, not as a change of an immutable `_id` where the filter names the equal
+    // integer 5 (`the replacement names _id 5, and the document's is 5`).
+    let replacement = || doc! { "_id": 5.0, "z": 1 };
+    for (case, seed) in [
+        ("o0592", doc! { "a": 5 }),
+        ("o0599", doc! { "_id": 5 }),
+        ("o0606", doc! { "_id": 5, "a": 5 }),
+    ] {
+        let message = upserted(replacement(), seed).unwrap_err();
+        assert!(message.contains("invalid _id type"), "{case}: {message}");
+        assert!(!message.contains("immutable"), "{case}: {message}");
     }
 }

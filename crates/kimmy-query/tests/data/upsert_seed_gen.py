@@ -8,6 +8,8 @@ document the reference inserted, each as JSON in the order recorded.
 """
 import json, sys
 
+ROWS = 0  # the rows written: the test asserts this count
+
 def plain(v):
     if isinstance(v, dict):
         if list(v) == ["$ordered"]:
@@ -32,5 +34,7 @@ for n, line in enumerate(open(base + "q7s2x.jsonl"), 1):
     cmd = plain(r["commandOrdered"])
     after = [plain(d) for d in r["afterOrdered"]]
     assert cmd.get("upsert") and len(after) == 1 and not r["beforeOrdered"], n
+    ROWS += 1
     print("\t".join([f"x{n:04d}", json.dumps(cmd["q"], ensure_ascii=False),
                      json.dumps(cmd["u"], ensure_ascii=False), json.dumps(after[0], ensure_ascii=False)]))
+print(f"upsert_seed: {ROWS} cases", file=sys.stderr)

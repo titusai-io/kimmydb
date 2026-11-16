@@ -16,6 +16,8 @@ mod a20_read_paths;
 mod a21_edges;
 mod a24_match_before_sort;
 mod a25_edges_two;
+mod a26_substr_splits;
+mod a27_document_order;
 mod a4_date_shift;
 mod a5_group_key_missing;
 mod a6_field_paths;

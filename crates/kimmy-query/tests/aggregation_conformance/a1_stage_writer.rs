@@ -108,7 +108,9 @@ fn a_path_that_is_the_prefix_of_another_is_still_refused() {
     }
 }
 
-// The recorded data, generated from q7s4g.jsonl.
+// The recorded data: hand-written, no generator. The documents and commands are copied from the
+// cases named at the top of this file (q7s4g 1 to 99 and 682 to 685; q7s4a 12, 34, 35, 37, 47, 48,
+// 50; q7s4d 35), whose records read `beforeOrdered` and `reply.docs`.
 
 fn set9() -> Vec<Document> {
     documents(

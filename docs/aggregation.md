@@ -275,16 +275,19 @@ among those the sort sees refuses the whole sort, whatever `skip` and `limit` sa
 one array and a scalar, null or missing key; two paths through **one** array (`a.x`, `a.y`);
 arrays in **different elements** (`a: [{b: [1, 2]}, {c: [3, 4]}]`); `a.0` with `a.1` or `a`; a
 collection where one document has its array in `a` and another in `b`; a filter that leaves the
-offending document out. A filter that is **exactly `{_id: <number>}`** reads the one document by its
+offending document out. A filter that is **exactly one key `_id` with a literal value** reads the one document by its
 key and sorts nothing, so its document is returned: in `find` (with or without `limit`, `skip`,
 a projection or `_id` among the sort keys), in `findAndModify` (update, upsert and remove) and in a
 pipeline whose first stage is that `$match` with the `$sort` right after it or only a `$skip`
 between (q7s4k 103, 104; q7s4l). Every other filter that selects the document is refused, with
 the same text: `{_id: {$eq: v}}`, `{_id: {$in: [v]}}`, `{_id: v, a: {$exists: true}}`,
 `{$and: [{_id: v}]}`, `{_id: {$gte: v, $lte: v}}`, no filter, and `{_id: v}` followed by `$limit`,
-`$addFields` or `$project` before the `$sort`. Only a **number** is recorded: a string, an
-ObjectId, a Long, a Double, a Decimal128, a boolean, `null`, a date or a document as the `_id` of
-the filter is unrecorded and is not exempt. A `$match` that stands right after a `$sort` is
+`$addFields` or `$project` before the `$sort`. The value is exempt of **every type but `null`**
+(q7s4m, 72 cases): a string, an ObjectId, a Long, a Double, a Decimal128, a boolean, a date, a
+document, a binary, a UUID and the empty string; `{_id: null}`, a regular expression in either
+spelling (`/^s/`, `{$regex: ...}`) and an operator document are refused, as is a second key beside
+`_id`; an array as the value (`[1, 2]`, `[]`, `[2]`) selects nothing and raises nothing, and
+`{_id: {}}` is exempt where `{_id: {$eq: {}}}` is refused (q7s2z 13 to 27). A `$match` that stands right after a `$sort` is
 applied before it, so the sort reads only what the match keeps (q7s4l 32), and a `$limit` before
 the `$sort` that keeps the document out leaves nothing to refuse (q7s4l 34, 35).
 

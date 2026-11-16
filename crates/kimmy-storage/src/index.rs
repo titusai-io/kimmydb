@@ -5950,30 +5950,103 @@ mod tests {
     ];
 
     /// The superset invariant of the key change, in the form a unit test can state: every
-    /// value the filter reads at a path *as it reads it until the read-position switch*
-    /// (`path::resolve`), and every item of such an array, has its key, and a document the
-    /// filter reads as null (no value) has the null key. An index never offers fewer
-    /// candidates than the scan's answer. A clash document is unkeyed, never keyed short.
+    /// value the filter reads at a path (`path::read_document`, the function the filter uses),
+    /// and every item of such an array not reached by a position, has its key, and a document
+    /// the filter reads as lacking a field has the null key (unless a segment of the path is a
+    /// position, which the read takes where the key walk files the lack differently). An index
+    /// never offers fewer candidates than the scan's answer. A clash document is unkeyed, never
+    /// keyed short.
     #[test]
     fn every_value_the_filter_reaches_is_keyed_and_so_is_the_null_it_reads() {
         for path in RESOLVER_PATHS {
             let idx = on(path);
             for d in resolver_corpus() {
-                let DocumentKeys::Keyed { keys, .. } = document_keys(&idx, &d).unwrap() else {
-                    continue;
-                };
-                let reached = path::resolve(&d, path);
-                for value in &reached {
-                    assert!(keys.contains(&key_of(value)), "{path} over {d}: {value}");
-                    if let Bson::Array(items) = value {
-                        for item in items {
-                            assert!(keys.contains(&key_of(item)), "{path} over {d}: item {item}");
+                assert_the_filter_reads_only_keys(&idx, path, &d);
+            }
+        }
+    }
+
+    /// What a filter reads at `path` in `d` is among the keys of `d` in `idx`, or `d` is unkeyed.
+    fn assert_the_filter_reads_only_keys(idx: &IndexMeta, path: &str, d: &Document) {
+        let DocumentKeys::Keyed { keys, .. } = document_keys(idx, d).unwrap() else {
+            return;
+        };
+        let walk = path::read_document(d, path);
+        for (value, by_position) in &walk.values {
+            assert!(keys.contains(&key_of(value)), "{path} over {d}: {value}");
+            if let (Bson::Array(items), false) = (value, by_position) {
+                for item in items {
+                    assert!(keys.contains(&key_of(item)), "{path} over {d}: item {item}");
+                }
+            }
+        }
+        let by_position = path.split('.').any(|segment| path::read_position(segment).is_some());
+        if walk.lacked && !by_position {
+            assert!(keys.contains(&null_key()), "{path} over {d}: a lacking field reads null");
+        }
+    }
+
+    mod property {
+        use super::*;
+        use proptest::prelude::*;
+
+        const NAMES: [&str; 8] = ["a", "b", "c", "0", "1", "00", "01", "99999999999"];
+
+        fn value(depth: u32) -> BoxedStrategy<Bson> {
+            let leaf = prop_oneof![
+                (0..4i32).prop_map(Bson::Int32),
+                Just(Bson::Null),
+                Just(Bson::String("s".into())),
+            ];
+            if depth == 0 {
+                return leaf.boxed();
+            }
+            let inner = value(depth - 1);
+            prop_oneof![
+                3 => leaf,
+                2 => prop::collection::vec(inner.clone(), 0..4).prop_map(Bson::Array),
+                2 => prop::collection::vec((prop::sample::select(&NAMES[..]), inner), 0..4)
+                    .prop_map(|fields| {
+                        let mut d = Document::new();
+                        for (name, v) in fields {
+                            d.insert(name, v);
                         }
+                        Bson::Document(d)
+                    }),
+            ]
+            .boxed()
+        }
+
+        fn document() -> impl Strategy<Value = Document> {
+            prop::collection::vec((prop::sample::select(&NAMES[..]), value(3)), 0..4).prop_map(
+                |fields| {
+                    let mut d = Document::new();
+                    for (name, v) in fields {
+                        d.insert(name, v);
                     }
-                }
-                if reached.is_empty() {
-                    assert!(keys.contains(&null_key()), "{path} over {d}: no value reads null");
-                }
+                    d
+                },
+            )
+        }
+
+        fn dotted_path() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(&NAMES[..]), 1..4)
+                .prop_map(|segments| segments.join("."))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(3_000))]
+
+            /// Over documents with nested arrays, arrays of arrays, digit-named fields beside
+            /// positions and leading zeros, and over dotted paths through them: every value the
+            /// filter's read reaches is among the keys the index writer emits, or the document is
+            /// filed as unkeyed.
+            #[test]
+            fn every_value_the_filters_read_reaches_is_among_the_keys_or_the_document_is_unkeyed(
+                d in document(),
+                path in dotted_path(),
+            ) {
+                assert_the_filter_reads_only_keys(&on(&path), &path, &d);
             }
         }
     }

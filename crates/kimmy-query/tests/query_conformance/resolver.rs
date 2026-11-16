@@ -6,7 +6,7 @@
 //! the line of the case in the set's `.out`.
 
 use super::common::{assert_partial_membership, assert_recorded};
-use super::resolver_cases::cases_filters;
+use super::resolver_cases::{CASES_FILTERS_COUNT, cases_filters};
 use bson::{Bson, Document, doc};
 use kimmy_core::{IndexField, IndexMeta};
 use kimmy_query::{filter, plan};
@@ -17,7 +17,12 @@ use kimmy_query::{filter, plan};
 #[test]
 fn every_recorded_filter_over_a_path_through_arrays_answers_as_recorded() {
     let cases = cases_filters();
-    assert!(cases.len() > 100, "premise: {}", cases.len());
+    assert_eq!(
+        cases.len(),
+        CASES_FILTERS_COUNT,
+        "resolver filter cases: the generator wrote CASES_FILTERS_COUNT cases"
+    );
+    println!("resolver filter cases: {} cases", cases.len());
     assert_recorded("the resolver rule", cases);
 }
 
@@ -27,6 +32,7 @@ fn every_recorded_filter_over_a_path_through_arrays_answers_as_recorded() {
 fn a_partial_index_holds_what_the_resolver_rule_selects() {
     let checked = assert_partial_membership("the resolver rule", &cases_filters());
     assert!(checked > 30, "premise: the cases a partial index can carry: {checked}");
+    println!("resolver partial-index cases: {checked} of {CASES_FILTERS_COUNT} filters");
 }
 
 fn ids(docs: &[Document], query: Document) -> Vec<i32> {

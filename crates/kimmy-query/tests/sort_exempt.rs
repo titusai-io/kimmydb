@@ -1,10 +1,9 @@
 //! The exemption from the parallel-arrays refusal (q7s4l, 52 cases: `find`, `$sort` stages and
 //! `findAndModify`): a filter that is exactly `{_id: <number>}` reads the one document by its key and
-//! sorts nothing, so the document is returned; every other filter that selects it is refused. In
+//! sorts nothing (the other types of `_id` are in `sort_exempt_types.rs`, q7s4m), so the document is returned; every other filter that selects it is refused. In
 //! a pipeline the `$match` is the first stage and the `$sort` follows it or only a `$skip` stands
 //! between; a `$match` right after a `$sort` is applied before it; a `$limit` that keeps the document
-//! out leaves the sort nothing to refuse. Only a number is recorded: the other types of `_id` are
-//! unrecorded.
+//! out leaves the sort nothing to refuse.
 //!
 //! `data/sort_exempt.tsv` is built from the recording by `data/sort_exempt_gen.py`.
 
@@ -45,7 +44,8 @@ fn every_recorded_row_answers_as_the_reference_does() {
         }
         rows += 1;
     }
-    assert_eq!(rows, 52);
+    assert_eq!(rows, 52, "the generator wrote 52 cases");
+    println!("sort_exempt: {rows} cases");
 }
 
 /// The three shapes of a `$match` and a `$sort` that the move can make or unmake, over a collection

@@ -1,3 +1,4 @@
+//! Rebuilt by `tests/data/resolver_sort_cases_gen.py`; its docstring has the command.
 //! Generated from the recordings q7s3f, q7s3g, q7s3i and q7s3j (reference 6.0.5): the sorts
 //! over arrays, 16746, `$sortArray` and `$push`'s `$sort`. The label is the case's, the line
 //! its place in the set's `.out`.
@@ -26,7 +27,7 @@ fn docs_2a0623ea() -> Vec<Document> {
     ]
 }
 
-fn docs_58c83d0b() -> Vec<Document> {
+fn docs_723f9d3b() -> Vec<Document> {
     vec![
         doc! { "_id": Bson::Int32(1), "a": Bson::Array(vec![Bson::Int32(5), Bson::Int32(6), Bson::Int32(7)]) },
         doc! { "_id": Bson::Int32(2), "a": Bson::Array(vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Array(vec![Bson::Int32(3), Bson::Int32(4)])]) },
@@ -174,6 +175,9 @@ fn docs_aade5ac6() -> Vec<Document> {
     ]
 }
 
+/// The number of cases `cases_sorts` holds, written by the generator.
+pub const CASES_SORTS_COUNT: usize = 172;
+
 pub fn cases_sorts() -> Vec<Rec> {
     vec![
         Rec {
@@ -313,7 +317,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0046",
             line: 922,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -323,7 +327,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0047",
             line: 938,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -333,7 +337,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0053",
             line: 1034,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.01": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -343,7 +347,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0054",
             line: 1050,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.01": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -353,7 +357,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0060",
             line: 1146,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.1": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -363,7 +367,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0061",
             line: 1162,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.1": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -373,7 +377,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0067",
             line: 1258,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.00": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -383,7 +387,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0068",
             line: 1274,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.00": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -393,7 +397,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0074",
             line: 1370,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.+0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -403,7 +407,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0075",
             line: 1386,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.+0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -413,7 +417,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0081",
             line: 1482,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.-1": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -423,7 +427,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0082",
             line: 1498,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.-1": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -433,7 +437,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0088",
             line: 1594,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.2": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -443,7 +447,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0089",
             line: 1610,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.2": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -453,7 +457,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0095",
             line: 1706,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -463,7 +467,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0096",
             line: 1722,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -473,7 +477,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0102",
             line: 1818,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.x": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -483,7 +487,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0103",
             line: 1834,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.x": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -493,7 +497,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0109",
             line: 1930,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.1.0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -503,7 +507,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0110",
             line: 1946,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.1.0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -513,7 +517,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0116",
             line: 2042,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.1": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -523,7 +527,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0117",
             line: 2058,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.0.1": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -533,7 +537,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0123",
             line: 2154,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.01.0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -543,7 +547,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0124",
             line: 2170,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.01.0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -553,7 +557,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0130",
             line: 2266,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.b.0": Bson::Int32(1), "_id": Bson::Int32(1) },
@@ -563,7 +567,7 @@ pub fn cases_sorts() -> Vec<Rec> {
         Rec {
             label: "q7s3f0131",
             line: 2282,
-            docs: docs_58c83d0b,
+            docs: docs_723f9d3b,
             run: Run::Find {
                 filter: Document::new(),
                 sort: doc! { "a.b.0": Bson::Int32(-1), "_id": Bson::Int32(1) },
@@ -1327,9 +1331,9 @@ pub fn cases_sorts() -> Vec<Rec> {
                 doc! { "$sort": Bson::Document(doc! { "a.0": Bson::Int32(1), "_id": Bson::Int32(1) }) },
                 doc! { "$group": Bson::Document(doc! { "_id": Bson::String("$k".to_string()), "f": Bson::Document(doc! { "$first": Bson::String("$_id".to_string()) }) }) },
             ]),
-            outcome: Outcome::Docs(vec![
-                doc! { "_id": Bson::Int32(1), "f": Bson::Int32(1) },
+            outcome: Outcome::DocsAsSet(vec![
                 doc! { "_id": Bson::Int32(0), "f": Bson::Int32(2) },
+                doc! { "_id": Bson::Int32(1), "f": Bson::Int32(1) },
             ]),
         },
         Rec {

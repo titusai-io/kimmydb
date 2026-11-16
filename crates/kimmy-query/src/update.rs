@@ -297,6 +297,19 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
     Ok(Update::Operators(operations))
 }
 
+/// Whether an operation writes a path with a digit segment that is spelled other than as the
+/// index it reads as (`01`, `00`): the only spelling that two writes can share without sharing
+/// the text, so the only one the document has to be asked about.
+fn has_padded_index(op: &Operation) -> bool {
+    let padded = |path: &str| {
+        path::segments(path)
+            .iter()
+            .skip(1)
+            .any(|segment| path::array_index(segment).is_some_and(|i| i.to_string() != *segment))
+    };
+    padded(&op.path) || matches!(&op.kind, OpKind::Rename(target) if padded(target))
+}
+
 /// Whether a path has any `$`, `$[]` or `$[<identifier>]` segment.
 fn has_positional(path: &str) -> bool {
     path::segments(path).iter().any(|segment| *segment == "$" || segment.starts_with("$["))
@@ -561,10 +574,12 @@ fn written_paths(op: &Operation) -> Vec<&str> {
 /// A positional segment is compared as written: `items.$[a].qty` and
 /// `items.$[b].qty` do not overlap here, because which elements each reaches
 /// depends on the document. [`apply_to`] checks the concrete paths they
-/// expand to, in each document. An index segment is compared by its value, so
-/// `a.1` and `a.01` are one path.
+/// expand to, in each document. A digit segment is compared as written too:
+/// `a.1` and `a.01` are one element where `a` is an array and two fields where
+/// it is a document or is missing (q7s2u, q7s2v, q7s2y), which only the
+/// document can tell, so [`claim_concrete`] reads them by its value there.
 fn reject_conflicting_paths(operations: &[Operation]) -> Result<()> {
-    let mut claims = Claims::new(operations, "");
+    let mut claims = Claims::new(operations, "", None);
     for (i, op) in operations.iter().enumerate() {
         for path in written_paths(op) {
             claims.claim(i, path)?;
@@ -588,6 +603,9 @@ struct Claims<'a> {
     operations: &'a [Operation],
     /// How the refusal says where the conflict was found.
     where_: &'static str,
+    /// The document the paths are read against, when they are: a digit segment is the index
+    /// it spells only where the value it steps into is an array.
+    doc: Option<&'a Document>,
     /// Each canonical path claimed, and the operation that claimed it first.
     exact: HashMap<String, usize>,
     /// Each proper prefix of a canonical path claimed, with the first
@@ -598,14 +616,14 @@ struct Claims<'a> {
 }
 
 impl<'a> Claims<'a> {
-    fn new(operations: &'a [Operation], where_: &'static str) -> Self {
-        Claims { operations, where_, exact: HashMap::new(), inner: HashMap::new(), probes: 0 }
+    fn new(operations: &'a [Operation], where_: &'static str, doc: Option<&'a Document>) -> Self {
+        Claims { operations, where_, doc, exact: HashMap::new(), inner: HashMap::new(), probes: 0 }
     }
 
     /// Refuse operation `i` writing `path` when another operation wrote it, a
     /// path inside it, or a path it lies inside; otherwise record it.
     fn claim(&mut self, i: usize, path: &str) -> Result<()> {
-        let path = canonical(path);
+        let path = canonical(path, self.doc);
         let prefixes: Vec<&str> = path.match_indices('.').map(|(at, _)| &path[..at]).collect();
         self.probes += 2 + prefixes.len();
         if let Some(&j) = self.exact.get(&path)
@@ -639,26 +657,41 @@ impl<'a> Claims<'a> {
     }
 }
 
-/// A path with every segment that addresses an array element by number in
-/// its decimal form: `a.01` is `a.1`, because the path language reads both as
-/// the element at index 1 (a run of ASCII digits, [`path::array_index`]), and
-/// two writes to it are one path written twice. `a.+1` is not: a sign makes
-/// the segment a field name, so it stays as written. A positional segment is left as
-/// it is. Over a document whose `a` holds an object, `01` and `1` would be
-/// two keys; they are still read as one path here, so such a pair is refused
-/// rather than told apart. The first segment is left as written: it names a
-/// field of the document itself, which is never an array, so `01` and `1`
-/// there are always two fields.
-fn canonical(path: &str) -> String {
-    path::segments(path)
-        .iter()
-        .enumerate()
-        .map(|(at, segment)| match path::array_index(segment) {
-            Some(index) if at > 0 => index.to_string(),
-            _ => (*segment).to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(".")
+/// A path as it is claimed. Without a document the path is as written. Against a document,
+/// a segment that is a run of digits is the element index it spells (`a.01` is `a.1`, by
+/// [`path::array_index`]) only where the value it steps into is an array; where that value is
+/// a document, or is not there, it is a field name and stays as written, so `o.01` and `o.1`
+/// are two fields (q7s2y 34 to 59, q7s2u, q7s2v), and two writes to one array element are one
+/// path written twice, which the reference's server aborts on (q7s2y 1 to 33 and 64). `a.+1`
+/// is not an index: a sign makes the segment a field name. A positional segment is left as it
+/// is. The first segment is left as written: it names a field of the document itself, which
+/// is never an array.
+fn canonical(path: &str, doc: Option<&Document>) -> String {
+    let segments = path::segments(path);
+    let Some(doc) = doc else { return segments.join(".") };
+    let mut held: Option<&Bson> = segments.first().and_then(|head| doc.get(*head));
+    let mut out = Vec::with_capacity(segments.len());
+    for (at, segment) in segments.iter().enumerate() {
+        if at == 0 {
+            out.push((*segment).to_string());
+            continue;
+        }
+        match (held, path::array_index(segment)) {
+            (Some(Bson::Array(items)), Some(index)) => {
+                out.push(index.to_string());
+                held = items.get(index);
+            }
+            (Some(Bson::Document(inner)), _) => {
+                out.push((*segment).to_string());
+                held = inner.get(*segment);
+            }
+            _ => {
+                out.push((*segment).to_string());
+                held = None;
+            }
+        }
+    }
+    out.join(".")
 }
 
 /// The refusal for two writes that overlap at `first` and `second`, which
@@ -1076,10 +1109,12 @@ fn apply_update_at(
             // never be stored under a key the store cannot read.
             let id = match (doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
                 (Some(held), Some(named)) => {
-                    let same = match (DocId::try_from_bson(held), DocId::try_from_bson(named)) {
-                        (Ok(was), Ok(is)) => was == is,
-                        _ => false,
-                    };
+                    // A name that is no id (a double) is refused by the id-type rule first,
+                    // wherever the document's own `_id` came from: `_id: 5.0` over a filter's
+                    // `_id: 5` is not "a change of `_id` to 5" (q7s2o0599, o0606; o0592 is the
+                    // same refusal where the filter names none).
+                    let is = DocId::try_from_bson(named)?;
+                    let same = DocId::try_from_bson(held).is_ok_and(|was| was == is);
                     if !same {
                         return Err(Error::InvalidUpdate(format!(
                             "_id is immutable and cannot be updated: the replacement names _id \
@@ -1142,8 +1177,8 @@ fn apply_update_at(
         && operations.iter().any(|op| applies(op) && touches_id(&op.path));
     let seeded_id = if names_id { doc.get(ID_FIELD).cloned() } else { None };
     let concrete = concrete_paths(operations, doc, at, applies)?;
-    if operations.iter().any(|op| has_positional(&op.path)) {
-        claim_concrete(operations, &concrete)?;
+    if operations.iter().any(|op| has_positional(&op.path) || has_padded_index(op)) {
+        claim_concrete(operations, &concrete, doc)?;
     }
 
     // Then `$setOnInsert`, only for an inserted document, and everything else.
@@ -1222,8 +1257,12 @@ fn concrete_paths(
 /// every element `a` selects, and `items.1.qty` and `items.$[].qty` meet at
 /// the second. Run only when some operation has a positional path; returns
 /// the lookups made.
-fn claim_concrete(operations: &[Operation], concrete: &[Vec<String>]) -> Result<usize> {
-    let mut claims = Claims::new(operations, " in this document");
+fn claim_concrete(
+    operations: &[Operation],
+    concrete: &[Vec<String>],
+    doc: &Document,
+) -> Result<usize> {
+    let mut claims = Claims::new(operations, " in this document", Some(doc));
     for (i, (op, paths)) in operations.iter().zip(concrete).enumerate() {
         for path in paths {
             claims.claim(i, path)?;
@@ -3467,8 +3506,23 @@ mod tests {
             applied(doc! { "$set": { "01": 1, "1": 2 } }, doc! {}),
             doc! { "01": 1, "1": 2 }
         );
-        let err = conflict_err(doc! { "$set": { "a.01": 1, "a.1": 2 } });
-        assert!(err.contains("would create a conflict at \"a.1\""), "{err}");
+        // `a.01` beside `a.1` parses, and is judged against the document: one element of an
+        // array (refused), two fields of a document or of one that is missing (q7s2y).
+        let update = doc! { "$set": { "a.01": 1, "a.1": 2 } };
+        let err = apply_err(update.clone(), doc! { "a": [10, 20, 30] });
+        assert!(
+            err.contains("in this document") && err.contains("would create a conflict at \"a.1\""),
+            "{err}"
+        );
+        for (held, keys) in
+            [(doc! { "a": { "k": 1 } }, vec!["k", "01", "1"]), (doc! {}, vec!["01", "1"])]
+        {
+            let stored = applied(update.clone(), held);
+            let inner = stored.get_document("a").unwrap();
+            assert_eq!(inner.keys().map(String::as_str).collect::<Vec<_>>(), keys);
+            assert_eq!(inner.get("01"), Some(&Bson::Int32(1)));
+            assert_eq!(inner.get("1"), Some(&Bson::Int32(2)));
+        }
     }
 
     #[test]
@@ -3678,17 +3732,23 @@ mod tests {
         // The path language reads `01` as index 1, so each was a second write
         // to `a.1`, and the result followed the key order. A sign makes `+1` a
         // field name, so it is no spelling of that index.
+        // Where `a` is an array (q7s2y 1 to 16, 25 to 29): refused, in the document.
         for spelling in ["a.01", "a.001"] {
             for update in [
                 doc! { "$set": { "a.1": 5 }, "$inc": { spelling: 1 } },
                 doc! { "$inc": { spelling: 1 }, "$set": { "a.1": 5 } },
             ] {
-                let err = conflict_err(update.clone());
-                assert!(err.contains("would create a conflict at \"a.1\""), "{update}: {err}");
+                let err = apply_err(update.clone(), doc! { "a": [10, 20, 30] });
+                assert!(
+                    err.contains("in this document")
+                        && err.contains("would create a conflict at \"a.1\""),
+                    "{update}: {err}"
+                );
             }
         }
+        // A path and its own prefix conflict as written, whatever holds the field.
         let err = conflict_err(doc! { "$set": { "a": [] }, "$inc": { "a.01.n": 1 } });
-        assert!(err.contains("updating the path \"a.1.n\" would create a conflict at \"a\""));
+        assert!(err.contains("updating the path \"a.01.n\" would create a conflict at \"a\""));
         // Against a positional path, in the document.
         let err = apply_err_with(
             doc! { "$inc": { "items.$[].qty": 1 }, "$set": { "items.01.qty": 0 } },
@@ -3769,7 +3829,7 @@ mod tests {
         let concrete = concrete_paths(operations, &doc, None, |_| true).unwrap();
         let paths: usize = concrete.iter().map(Vec::len).sum();
         assert_eq!(paths, 3 * n as usize);
-        let probes = claim_concrete(operations, &concrete).unwrap();
+        let probes = claim_concrete(operations, &concrete, &doc).unwrap();
         assert_eq!(probes, 4 * paths);
         // And a conflict at the last element is still found.
         let update = parse_with_filters(
@@ -4045,7 +4105,9 @@ mod tests {
     /// whole value: `{a: 1}` removes no `{a: 1, b: 5}` (q7s2j.out j1344, line 8094, and
     /// j1341, line 8076) and `{a: 1, b: 5}` removes that element alone (j1350, line 8131;
     /// j1347, line 8113). A `$pull` of the same document is a query and removes by fields.
-    /// UNRECORDED: an `$eq` of a document as a `$pull` condition.
+    /// A `$pull` of `{$eq: {k: 2}}` or `{$in: [{k: 2}]}` removes only the element equal to the
+    /// document, its field order counting, where a plain `{k: 2}` removes every document with `k`
+    /// 2 (q7s2z 1 to 12, run by the `update_table` test).
     #[test]
     fn pull_all_is_the_whole_element_form_that_pull_by_document_replaced() {
         let pull_all = |listed: Bson, before: Bson| -> Bson {
@@ -4114,7 +4176,7 @@ mod tests {
 
     /// Only a document element is tested: scalars, arrays and nulls stay,
     /// j1252 (lines 7527-7532), j1253 (7533-7538) and j1255 (7545-7550).
-    /// UNRECORDED: an array element that holds documents.
+    /// An array element that holds documents stays too (q7s2y y0075, y0083, y0091).
     #[test]
     fn pull_by_document_leaves_the_elements_that_are_not_documents() {
         assert_eq!(pulled(bson::bson!({ "a": 1 }), pull_mixed()), pull_mixed());

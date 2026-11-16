@@ -54,5 +54,6 @@ fn every_recorded_upsert_inserts_the_recorded_order() {
         );
         rows += 1;
     }
-    assert_eq!(rows, 308);
+    assert_eq!(rows, 308, "the generator wrote 308 cases");
+    println!("upsert_seed: {rows} cases");
 }

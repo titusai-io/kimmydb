@@ -93,7 +93,7 @@ Status meanings:
 
 ## 🟡 `arrayFilters` with a replacement document is a `400`, where the reference ignores it
 
-**Raised 2026-11-14, from the positional probe q7s2l.** `{update: {arr: []}, arrayFilters: [{x: 2}]}` replaces the document in the reference, which reads `arrayFilters` as meaningful to operators only and does not look at it (`q7s2l.out` l0297 line 1778: `nModified` 1, `arr: []`). Here it is `400` (`arrayFilters apply to update operators, not to a replacement document`), as it is for a pipeline update (the reference refuses that one too, and an empty list is accepted by both). The filters name identifiers a replacement cannot use, so a request that sends them has misunderstood its update, and applying it silently would hide that.
+**Raised 2026-11-14, from the positional probe q7s2l.** `{update: {arr: []}, arrayFilters: [{x: 2}]}` replaces the document in the reference, which reads `arrayFilters` as meaningful to operators only and does not look at it (`q7s2l.out` l0297 line 1778: `nModified` 1, `arr: []`; the update table's row `q7s2l0297`). Here it is `400` (`arrayFilters apply to update operators, not to a replacement document`), as it is for a pipeline update (the reference refuses that one too, and an empty list is accepted by both). The filters name identifiers a replacement cannot use, so a request that sends them has misunderstood its update, and applying it silently would hide that.
 
 **To close:** none planned.
 
@@ -112,6 +112,20 @@ Status meanings:
 **Raised 2026-11-14, from the `findAndModify` probe q7s2p.** `fields: {c: 1, "c.d": 1}` is refused by the reference (code 31249, `Path collision at c.d remaining portion d`) and the update is not applied (`q7s2p.out` p0179 line 1770, p0180 line 1779). Here the projection is applied: where one path is a prefix of another the shorter one decides, so `c` is included whole ([ADR-214](decisions.md)). The other order and an exclusion pair are not recorded; the same reading holds for them here. A `find` is: `{c: 1, "c.d": 1}`, its other order and an exclusion pair over four documents are refused with 31249 or 31250 (`q7s3d.out` q7s3d0027 line 236, d0028 line 245, d0029 line 254), and here the shorter path decides.
 
 **To close:** a refusal of an ancestor and its descendant in the projection parse, which is small. Not planned until the reference's answer is wanted.
+
+---
+
+## 🟡 A projection value that is a `$slice` or an expression (a string, a `"$field"`) is a `400`, where the reference applies it
+
+**Raised 2026-11-14, from the probes q7s2p (`findAndModify`) and q7s3d (`find`).** The projection of a `find` and of a `find_and_modify` takes `0`, `1` or a boolean for a path. The reference also takes two other values, and answers them; here each is a `400`.
+
+**`{path: {$slice: n}}` and `{path: {$slice: [skip, n]}}`** (the refdiff's group of 22 cases: 18 finds of `q7s3d`, 4 `findAndModify` of `q7s2p`). The reference keeps the document whole and cuts the array at `path`: `{arr: {$slice: 2}}` over `[5, 6, 7, 8]` answers `[5, 6]` (`q7s3d0052`), `{$slice: [1, 2]}` answers `[6, 7]` (`q7s3d0056`), `{$slice: [-2, 1]}` answers `[7]` (`q7s3d0057`), `{$slice: 0}` answers `[]` (`q7s3d0054`), a Double count reads as its whole part (`q7s3d0061`, `q7s3d0062`: `2.5` answers two elements), a path through a document works (`{"c.e": {$slice: 2}}`, `q7s3d0066`), and a value that is not an array is left as it is (`{a: {$slice: 1}}`, `q7s3d0070`). It refuses `[1, 0]`, `[1, -1]` and a list of three (code 28724, `q7s3d0058`, `q7s3d0060`, `q7s3d0065`), and a string count or a list of one (code 28667, `q7s3d0063`, `q7s3d0064`); those refusals are also `400` here, with other words. A `findAndModify` that carries one applies its update (`q7s2p` p0185 to p0188: `fields: {"c.e": {$slice: 1}}` and `{a: {$slice: 1}}`, with `new` true and false); the recording holds the effect on the stored documents and `lastErrorObject` only. **`q7s2z`** records the three forms of `$slice` (`2`, `[1, 2]`, `-1`) over `a = [1, 2, 3, 4]` through `findAndModify` with `new` true, `new` false and `remove` (z0031 to z0033, z0035 to z0037, z0039 to z0041) and through `find` (z0034 answers `a: [1, 2]`, z0038 `[2, 3]`, z0042 `[4]`, the other fields whole), a `$slice` beside an inclusion (`{b: 1, a: {$slice: 2}}` answers `{_id, a: [1, 2], b}`, z0043 to z0046), and a path (`{"c.d": {$slice: 1}}` answers `c: {d: [5]}`, z0067 to z0070). The three `findAndModify` rows of each form apply (`lastErrorObject.n` 1, the update stored with `z` added), and the returned document is the top-level `value` of each record, the same shape as the `find` row: with `new` true the projection of the updated document (z0031 returns `{_id: 1, a: [1, 2], b: "x", c: {d: [5, 6]}, z: 1}`), with `new` false and with `remove` the projection of the document as it was (z0032, z0033: the same without `z`; z0036, z0037 `a: [2, 3]`; z0040, z0041 `a: [4]`), and `{b: 1, a: {$slice: 2}}` returns `{_id, a: [1, 2], b}` in all three (z0044, z0045; z0043). `{"c.d": {$slice: 1}}` returns the whole document with `c.d` cut to `[5]` (z0067 to z0069).
+
+**A literal or an expression as the value** (10 cases: 8 finds of `q7s3d`, 2 `findAndModify` of `q7s2p`). `{a: "x"}` answers `a: "x"` for every document (`q7s3d0021`), and `{a: "$b"}` answers `a` as the value of `b`, with no `a` where the document has no `b` (`q7s3d0087`). A `findAndModify` with `fields: {a: "$b"}` applies its update (`q7s2p` p0191, p0192); the document it returns is in `q7s2z` (below). **`q7s2z` (`find`, and its `findAndModify` twins, whose returned `value` has the shape of the `find` row, in `new` true, `new` false and `remove`):** `{a: "x"}` answers `a: "x"` (z0050; z0047 to z0049), `{a: "$b"}` answers `a: "x"`, the value of `b` (z0054; z0051 to z0053), `{a: {$add: [1, 2]}}` answers `a: 3` (z0058; z0055 to z0057), `{a: {$literal: 5}}` answers `a: 5` (z0062; z0059 to z0061), and `{a: 1, b: "$b"}` answers `a` whole with `b: "x"` (z0066; z0063 to z0065). A projection that mixes inclusion and exclusion (`{a: true, b: false}`) is refused with code 31254 in `find` and in the three `findAndModify` forms (z0071 to z0074), as an `$elemMatch` projection is answered (`{a: {$elemMatch: {$gt: 2}}}` answers `a: [3]`, z0078, and the `value` of z0075 to z0077 is `{_id: 1, a: [3]}`) and the positional `{"a.$": 1}` is refused: code 51246 on `find` and on `findAndModify` with `new` false and `remove` (z0080 to z0082), and code 2 ("cannot use a positional projection and return the new document") with `new` true (z0079). These are the cases of the same entry; every other expression the projection takes is not recorded.
+
+Here a `find_and_modify` that carries either value is the `400` as a whole, where the reference applies the update.
+
+**To close:** the `$slice` cut over the projected array is small and the forms above are recorded; the expression value is the aggregation `$project` engine over a single document and is larger. Not planned until the reference's answer is wanted.
 
 ---
 
@@ -419,6 +433,9 @@ Also recorded here, so they are not read as bugs:
 **Recorded 2026-11-01.** Only an ObjectId, string, integer, `Decimal128` and binary value can be a document `_id`; an embedded document, an array, a double, a boolean, a date or `null` is refused at insert (`400 invalid document id`), where the reference stores any type but an array. A pipeline update that sets `_id` to a double is refused for the same reason (see the pipeline-update entry). An existing design decision on the key type; not changed by the query-language work.
 
 **Recorded 2026-11-14 (`q7s2o`), the routes the reference accepts and this refuses.** An upsert whose replacement names `_id: 5.0` (`q7s2o.out` o0592 line 3473, 6 cases; with a filter `_id` that equals it, o0599 line 3514, 4 cases) is stored under `5` there and is `400 invalid _id type` here; an upsert whose filter pins `_id` to `5.0` or to a document (`{_id: {k: 1}}`, `{"_id.k": 1}`) inserts there (o0723 line 4240, o0767 line 4487, 4 cases) and is `400` here. A pipeline update that makes `_id` a double (`$toDouble`, a double literal, a `$replaceWith` naming one) stores it there (`q7s2s.jsonl` cases 3-4, 13-14, 47-48) and is refused here; the same number in a long or a decimal is accepted on both.
+
+**The cases the refdiff counts as eleven (`q7s2o`, the update operators, an upsert that inserts, refused here as `invalid _id type`).** A `Double` `_id`: o0722 (`$rename y -> _id`, filter `{_id: 5.0}`) and o0723 (`$set z`, the same filter); the reference stores `_id: 5.0`, and `{_id: 5.0, z: 1}` for o0723. A document `_id`, six cases: o0765 (`$max _id 9`), o0766 (`$rename y -> _id`) and o0767 (`$set z 1`) over the filter `{_id: {k: 1}}`, and o0776, o0777, o0778 (the same three operators) over the filter `{"_id.k": 1}`; the reference stores `_id: {k: 1}` in all six, with `z: 1` for o0767 and o0778. **A `null` `_id`, three cases:** o0786 (`$min _id 1`), o0788 (`$rename y -> _id`) and o0789 (`$set z 1`), over the filter `{_id: null}`; the reference stores `_id: null` for the first two and `{_id: null, z: 1}` for o0789, where this is `400 invalid _id type "Null"`.
+**`$set "_id.x"` on an upsert that inserts** (the refdiff's three cases, `q7s2o`: o0746 over the filter `{}`, o0757 over `{a: 5}`, o0801 over `{_id: /x/}`). The reference inserts `{_id: {x: 1}}` (`{_id: {x: 1}, a: 5}` for o0757): the path creates an `_id` that is a document. Here the update is refused as a change of the immutable `_id` (`400`). That route is the same refusal as the document `_id` above, and is closed with it.
 
 **To close:** none planned.
 
@@ -1142,27 +1159,81 @@ under [Positional updates](query-language.md#positional-updates) and
   under `{a: 1}` returns `a: 1` for a scalar and `[1]` for `[1, 2]`, and `{"c.d.$": 1}`
   returns `c: {d: 1}` and `c: [{d: 1}]` (`q7s3d.out` d0110 line 983, d0108 line 965); here
   that request is the `400`.
+  **The update recorded for it (15 cases by the refdiff).** Where the filter
+  holds a condition that records no position, the reference still takes a `$`
+  and writes an element: `{arr: {$exists: true}}` over `[1, 2, 3, 2]` writes
+  index 0 (`q7s2l` l0034 to l0036: `$set` gives `[9, 2, 3, 2]`, `$unset` leaves
+  `null` at 0, `$inc` gives `[2, 2, 3, 2]`); `{arr: {$all: [2, 3]}}` writes
+  index 2 (l0052 to l0054), and `{arr: {$all: [6, 1]}}` over `[5, 1, 6, 2, 7]`
+  writes index 1 (`q7s2q` q0015): in both, the position of the last value
+  listed.
+  **The rows of the update table that keep this are `q7s2q0015`, `q7s2q0079`,
+  `q7s2q0080`, `q7s2l0052`, `q7s2l0053`, `q7s2l0054` and, below, `q7s2l0138`.** A condition on an element of an array that is itself an array,
+  `{"arr.0": {$elemMatch: {$gt: 1}}}` over `[[1, 2], [3, 4], [3, 5]]`, writes
+  index 1 (q0079, and `arr.$.0` gives `[X, 4]` at index 1, q0080); and
+  `{"items.c": {$exists: true}, "items.d": {$exists: true}}` and its
+  `$exists: false` pair apply with a `$` too (`q7s3i` 182 and 184). A `$` over `g = [[1, 2], [3, 4]]` under
+  `{"g.1": 4}`, which matches no document, is `n: 0` and no refusal there
+  (l0131, l0136, l0141, l0151); here it is the `400` above, because the filter
+  is not on an array that the path goes through. All of these are the `400`
+  here. Where the filter names no array at all (`{_id: 1}`, l0046 to l0048), or
+  holds `$size` or an index (`{"arr.0": 1}`, l0055 to l0063), the reference
+  refuses too, as here.
+- **`$` after an index, under a filter that matched an element of the array
+  before it, is applied there and refused here** (l0137 and l0138, `q7s2l`).
+  `{$set: {"g.0.$": 9}}` under `{g: [3, 4]}` over `g = [[1, 2], [3, 4]]`
+  writes `[[1, 9], [3, 4]]`: the matched element of `g` is index 1, and the
+  reference reads that 1 as the `$` inside `g.0`. Under `{g: {$elemMatch: {$gt:
+  3}}}` the same update matches nothing (`n: 0`). Here both are `400` (the `$` follows `g.0`
+  but the filter matched an element of `g`). Which index the reference takes for
+  `$` after other paths than these two is unrecorded.
 - **Several conditions on one array path** leave the first element satisfying
   the *last* condition evaluated. `$nor`, `$not`, `$ne`, `$nin`, `$exists`,
   `$size`, `$all` and `$expr` record no position; an explicit index in the
   filter (`items.0.sku`) records none either. The clauses of a filter are
   ordered as written for "the last array"; the conditions inside one field
   are in the filter's evaluation order, which puts one holding a `$expr` last.
-- **`$` under `$or` works here and is refused by the reference.** `$or` records
-  from the first branch, in the order written, that held, **passing over a branch
+- **`$` under `$or`: equal for equalities on one array, applied here and refused there for
+  the rest.** What is **equal** (recorded in `q7s2ab`, 102 rows, and the update table's
+  `q7s2q0001`, `q7s2q0003`, `q7s2l0040`, `q7s2l0041` and `q7s2l0042`): an `$or` whose
+  branches are all one equality on the same array path is one `$in` of their values, so `$`
+  takes the **smallest index** of an element equal to any of them, in whatever order the
+  branches are written, and a branch that matches nothing is ignored (`q7s2ab0001` to
+  `q7s2ab0036`); `{arr: {$in: [...]}}` takes the first element that matches any of the values
+  (`q7s2ab0037` to `q7s2ab0042`); an `$or` of that shape beside another condition on the same
+  array decides the position, whichever is written first (`{arr: 2, $or: [{arr: 7}, {arr: 1}]}`
+  and its swap, `q7s2ab0049` to `q7s2ab0054`; any other shape of that kind is UNRECORDED); an
+  explicit `$and` of conditions on the array takes the last one written (`q7s2ab0055` to
+  `q7s2ab0060`). The find projection `items.$` chooses its element by the same code
+  (`filter::position`); the reference's refusal of the projection under `$or` is the **kept**
+  difference below. **Kept:** every other `$or` records from the first branch, in the order
+  written, that held, **passing over a branch
   that draws a random number** (`$sampleRate`, `$rand`), which cannot be asked
   again after the match: the position can then come from a later branch, and a
   document that matched only through a random branch gives none, so the
   positional `$` is a `400` for it (`{$or: [{a: 2, $sampleRate: 0.9}, {b: 1}]}`
   over `{a: [1, 2, 3]}` with no `b`). That is not recorded against the
-  reference either (`q8-probes/q8d-m3.js`, not run). The reference's `$or` does
-  not pass match details to its branches, so an update that uses `$` under
-  `$or` fails there (*the positional operator did not find the match needed
-  from the query*). A filter written for this engine that relies on it does not
-  port. **The find projection is the same:** `{"items.$": 1}` under
+  reference either (`q8-probes/q8d-m3.js`, not run). For every shape but the
+  equalities above, an update that uses `$` under `$or` fails in the reference
+  (*the positional operator did not find the match needed from the query*, code
+  2). A filter written for this engine that relies on it does not port. **The find projection is the same:** `{"items.$": 1}` under
   `{$or: [{"items.c": 2}, {"items.d": 1}]}` is refused by the reference (code 51246, the
   positional operator could not find a matching element; q7s3i0173, q7s3i0175) and answered
   here.
+  **Recorded in `q7s2ab` (30 rows of the table, kept; refused by the reference with
+  code 2 and applied here, each `$set`, `$inc` and `$unset` of `arr.$`):** an `$or` with a
+  range branch (`{$gt: 6}` and `{$lt: 2}`, in either order: `q7s2ab0043` to `q7s2ab0048`), an
+  `$or` with a branch on another field (`q7s2ab0061` to `q7s2ab0072`), a nested `$or`
+  (`q7s2ab0073` to `q7s2ab0078`) and `$or` branches of `$elemMatch` (`q7s2ab0088` to
+  `q7s2ab0093`): `q7s2ab0043`, `q7s2ab0044`, `q7s2ab0045`, `q7s2ab0046`, `q7s2ab0047`, `q7s2ab0048`, `q7s2ab0061`, `q7s2ab0062`, `q7s2ab0063`, `q7s2ab0064`, `q7s2ab0065`, `q7s2ab0066`, `q7s2ab0067`, `q7s2ab0068`, `q7s2ab0069`, `q7s2ab0070`, `q7s2ab0071`, `q7s2ab0072`, `q7s2ab0073`, `q7s2ab0074`, `q7s2ab0075`, `q7s2ab0076`, `q7s2ab0077`, `q7s2ab0078`, `q7s2ab0088`, `q7s2ab0089`, `q7s2ab0090`, `q7s2ab0091`, `q7s2ab0092`, `q7s2ab0093`.
+  **Recorded (11 cases by the refdiff, still applying):** `q7s2q` q0010,
+  q0014, q0021, q0022, q0029 and q0030 (six), among them `$set arr.$` under
+  `{$or: [{arr: {$gt: 5}}, {arr: {$lt: 2}}]}` (q0010) and
+  `{$or: [{arr: {$gt: 6}}, {x: 1}]}` (q0014) over `arr = [5, 1, 6, 2, 7]`, and
+  `$set arr.$.z` under `{$or: [{"arr.a": 2}, {"arr.b": 5}]}` over an array of
+  documents (q0021), refused by the reference with code 2 and applied here; the
+  other five are `q7s3g` (3 cases) and `q7s3i` (2 cases), which this entry
+  does not list (the two projection rows of `q7s3i` above are not among them).
 - **An upsert that inserts is a `400`** for a `$` path: there was no existing
   document to match, so no element. An upsert whose filter finds a document
   updates it and the `$` reads that document.
@@ -1533,9 +1604,19 @@ as MongoDB does, and the concrete paths they reach are checked again in each
 document, where MongoDB reports *"Update created a conflict at 'items.1.qty'"*
 and this reports the same message as at parse, ending `in this document`;
 every positional path is expanded against the document before the update, so
-array filters select the same elements in any key order. An index segment is
-compared by its value (`a.01` is `a.1`).
+array filters select the same elements in any key order. A digit segment is
+compared as written at parse and, in each document, by its value where it
+steps into an array (`a.01` is `a.1` there) and as a field name where it steps
+into a document or into nothing (the entry on `a.01` and `a.1`, below).
 `$setOnInsert` is checked as before. Breaking for callers, in a `0.MINOR`.
+
+---
+
+## 🟡 Two `$push` to one array element under two spellings of its index are refused, where the reference applies both
+
+**Raised 2026-11-14, from the probe q7s2y (reference 6.0.5).** `{$push: {"a.01": 5, "a.1": 6}}` over `a = [[1], [2, 3], [4]]` appends both to the element at index 1 and leaves `[[1], [2, 3, 5, 6], [4]]`, in either order of the two keys (`q7s2y` y0060, y0061); each alone appends one (y0062, y0063). Here the pair is refused as a path conflict (`in this document`: where `a` is an array, `01` and `1` are one index, and two writes to one element are refused whatever the operator). The same two spellings under `$set` or `$inc` over an array abort the reference's server (`q7s2y` y0001 to y0016, y0025 to y0033, recorded with `serverAborted`), and are refused here too; a `$set` of one spelling with a `$push` of the other aborts it as well (y0064). Where the container is a document or is missing the two are two fields and both apply, as there (see the `update_table` test).
+
+**To close:** none planned; it is a kept difference, on the side of refusing a pair that names one element twice.
 
 ---
 
@@ -3944,7 +4025,17 @@ update does not (q7s3i 162-172, 186: for some orders it takes the first; the row
 rule for both. UNRECORDED beyond those cases. To close it: record more cases and give the
 update its own rule.
 
----
+## 🟡 With full or explicit bounds the order of the output of `$densify` is not a promise of the reference; ours is one order, and a `$sort` fixes it
+
+**Recorded 2026-11-15 (`q7s4t0015`, `q7s4t0017`, `q7s4v`, `q7s4v2`).** With bounds `"partition"` the reference's order is stable and this build keeps it: the partitions come in the order of their keys (the order of a sort on the key, document order for document keys), and inside one the documents with no numeric value for the field (absent or null) come first in stored order, then the values ascending with the generated rows between them (`q7s4t0016`, `q7s4t0018`, `q7s4v0001`, `q7s4v0007`). With bounds `"full"` and with explicit bounds `[lo, hi]`, with or without `partitionByFields`, the reference's own order is NOT reliable: the two full-bounds rows of `q7s4t` came out in a different order in two containers running the same script, and the rows of `q7s4v` that agree between its two containers (3 to 6 and 9 to 12) agreed by chance, so the tables compare those rows as a set (`q7s4t0015` and `q7s4t0017` are in the tester's `unstable.tsv`; the rest of `q7s4v` is not, and the generator marks them by rule). What this build does there: the documents with no value come first, all of them, as they arrived. With `"full"` the documents with a value follow in the order of the field across all partitions, the generated rows between them, and then the tail of each partition's grid, partition by partition in key order. With explicit bounds the partitions follow in key order, each with its values ascending and the generated rows between them, then the rest of its grid to the upper bound. How the reference places the tail of a partition (at the end of the stage, or before the next partition that has a value) is unexplained, which is why no order is built. **What to do:** add a `$sort` after the stage. **To close:** a recording that settles the order of the tails.
+
+## 🟡 A query hinted to a partial index that cannot answer it answers only what that index holds in the reference; this engine has no `hint` and answers the whole collection
+
+**Recorded 2026-11-15 (`q7s3k`, lines 67 to 74).** Over `{v: {$lt: 3}}`, `{v: {$lte: 1.0}}`, `{v: {$gte: NaN}}` and `{v: {$gt: -Infinity}}` as partial indexes, a query the filter does not contain (`{v: {$exists: true}}`, a bound outside it, a sort) answers from the index alone when it is hinted to it: 7 documents against the 15 an unhinted query returns in q7s3k0067. Here the planner uses a partial index only for a query it contains, and there is no `hint`, so the answer is the collection scan's, which the unhinted answer of the reference is too. The membership of those indexes is asserted by `nan_inf_index.rs`; the hinted answers are not compared. **To close:** a `hint` that names a partial index and answers from it.
+
+## 🟡 Ties in a sort with no unique key: ours keeps stored order in both directions; the reference reverses the ties when a descending sort is served by a backward index scan
+
+**Recorded 2026-11-15 (`q7s3n`, three containers; `q7s3k0001` and `q7s3k0008`).** A sort with no unique last key leaves the order of tied documents to the engine. Ours keeps the stored order, ascending and descending alike, for `find` and for a `$sort` stage. The reference does the same when it sorts in memory: with no index on `v`, `{v: -1}` answers `[1, 2, 13, 14, 3, 4, 5, 6, 7, 8, 11, 12, 9, 10]` and `{v: 1}` answers `[9, 10, 11, 12, 7, 8, 5, 6, 3, 4, 13, 14, 1, 2]`, the same lists as with `_id: 1` added. With an index on `v`, `{v: 1}` gives that same ascending list, and a sort that ends in `_id` gives the in-memory lists whatever the index. The reference reverses ties only when a descending sort without a unique key is served by a backward index scan: `{v: -1}` then answers `[2, 1, 14, 13, 4, 3, 6, 5, 8, 7, 12, 11, 10, 9]`, the exact reverse of the ascending list, ties included. Unhinted and hinted answers agree. `sort_ties.rs` compares the no-index rows and every row that ends in `_id` exactly, and the index-served `{v: -1}` rows (find and `$sort` stage) group by group: the sequence of distinct key values equal, each group of equal keys the same ids as a set. `nan_inf_index.rs` does the same for a sorted row of q7s3k whose sort has no unique last key. A kept difference: no engine change, since the order of ties is unspecified. **To close:** none planned; a descending read of an index would have to reverse its ties.
 
 ## How to use this document
 

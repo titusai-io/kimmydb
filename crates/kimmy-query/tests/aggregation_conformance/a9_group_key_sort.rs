@@ -282,7 +282,9 @@ fn the_bounded_sort_reads_the_whole_id_too() {
     assert!(failures.is_empty(), "{} rows differ:\n{}", failures.len(), failures.join("\n"));
 }
 
-// The recorded data, generated from q7s4j.jsonl.
+// The recorded data: hand-written, no generator. The documents and commands are copied from the
+// cases of q7s4f 31 to 48, q7s4a 65, 277, 303 and the 147 cases of q7s4j named at the top of this
+// file, whose records read `beforeOrdered` and `reply.docs`.
 
 fn shapes20() -> Vec<Document> {
     let rows = json(

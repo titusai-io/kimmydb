@@ -81,6 +81,9 @@ fn docs_607d1c18() -> Vec<Document> {
     ]
 }
 
+/// The number of cases `cases_bounds` holds, written by the generator.
+pub const CASES_BOUNDS_COUNT: usize = 22;
+
 pub fn cases_bounds() -> Vec<Bound> {
     vec![
         Bound {
@@ -283,6 +286,9 @@ pub fn cases_bounds() -> Vec<Bound> {
         },
     ]
 }
+
+/// The number of cases `cases_whole` holds, written by the generator.
+pub const CASES_WHOLE_COUNT: usize = 68;
 
 pub fn cases_whole() -> Vec<Rec> {
     vec![

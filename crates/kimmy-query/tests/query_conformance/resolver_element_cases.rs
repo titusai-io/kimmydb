@@ -1,3 +1,4 @@
+//! Rebuilt by `tests/data/resolver_element_cases_gen.py`; its docstring has the command.
 //! Generated from the recordings q7s3b, q7s3g and q7s3i (reference 6.0.5): `$elemMatch`,
 //! `arrayFilters` and the positional `$` of a projection and of an update. The label is the
 //! case's, the line its place in the set's `.out`.
@@ -57,6 +58,9 @@ fn docs_afa18611() -> Vec<Document> {
         doc! { "_id": Bson::Int32(6), "items": Bson::Array(vec![Bson::Document(doc! { "d": Bson::Int32(1) }), Bson::Document(doc! { "d": Bson::Int32(1) })]) },
     ]
 }
+
+/// The number of cases `cases_elements` holds, written by the generator.
+pub const CASES_ELEMENTS_COUNT: usize = 92;
 
 pub fn cases_elements() -> Vec<Rec> {
     vec![

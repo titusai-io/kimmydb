@@ -9,6 +9,8 @@ refused it (code 2), or the `_id`s it answered in order (`OK` for a findAndModif
 """
 import json, sys
 
+ROWS = 0  # the rows written: the test asserts this count
+
 def plain(v):
     if isinstance(v, dict):
         if list(v) == ["$ordered"]:
@@ -40,5 +42,7 @@ for n, line in enumerate(open(base + "q7s4l.jsonl"), 1):
         else:
             docs = reply.get("ids") if "ids" in reply else [d["_id"] for d in plain(reply["docs"])]
             answer = json.dumps(plain(docs))
+    ROWS += 1
     print("\t".join([f"{n:04d}", r["kind"], json.dumps(plain(r["beforeOrdered"]), ensure_ascii=False),
                      json.dumps(cmd, ensure_ascii=False), answer]))
+print(f"sort_exempt: {ROWS} cases", file=sys.stderr)

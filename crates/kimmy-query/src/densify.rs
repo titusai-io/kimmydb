@@ -373,6 +373,8 @@ impl Span {
 /// Where the walk puts what it finds: the count pass counts, the second pass builds.
 trait Sink {
     fn doc(&mut self, row: &Row) -> Result<()>;
+    /// A document with no value, leading its partition (bounds "partition").
+    fn pass(&mut self, at: usize) -> Result<()>;
     fn generated(&mut self, part: usize, value: Bson) -> Result<()>;
 }
 
@@ -414,6 +416,25 @@ fn pass(grid: &Grid<'_>, cursor: &mut Cursor, value: &Bson) -> Result<()> {
     Ok(())
 }
 
+/// The partition a document is in, made when it is the first of it.
+fn part_of(
+    spec: &DensifySpec,
+    doc: &Document,
+    index: &mut std::collections::HashMap<Vec<u8>, usize>,
+    parts: &mut Vec<Part>,
+) -> usize {
+    let held = fields_of(doc, &spec.partition_fields);
+    *index.entry(group_key(&Bson::Document(held.clone()))).or_insert_with(|| {
+        let rep = spec
+            .partition_fields
+            .iter()
+            .map(|f| path::resolve(&held, f).into_iter().next().cloned())
+            .collect();
+        parts.push(Part { fields: held, rep });
+        parts.len() - 1
+    })
+}
+
 /// Run a parsed `$densify`.
 pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Result<Vec<Document>> {
     let mut lease = limits.buffer.lease(buffer_name("$densify"));
@@ -421,7 +442,8 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
 
     // Read every document: its value of the field, its partition.
     let mut docs: Vec<Option<Document>> = Vec::with_capacity(input_len);
-    let mut passthrough: Vec<usize> = Vec::new();
+    // The documents with no numeric value, and, with bounds "partition", the partition each is in.
+    let mut passthrough: Vec<(usize, Option<usize>)> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut parts: Vec<Part> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
@@ -433,7 +455,9 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
         let value = match crate::aggregate::name_value(&doc, &spec.field) {
             // A document without the field is not part of the series.
             Some(Bson::Null) | None => {
-                passthrough.push(at);
+                let part = matches!(spec.bounds, Bounds::Partition)
+                    .then(|| part_of(spec, &doc, &mut index, &mut parts));
+                passthrough.push((at, part));
                 docs.push(Some(doc));
                 continue;
             }
@@ -465,16 +489,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
             ));
         }
         dates = Some(is_date);
-        let held = fields_of(&doc, &spec.partition_fields);
-        let part = *index.entry(group_key(&Bson::Document(held.clone()))).or_insert_with(|| {
-            let rep = spec
-                .partition_fields
-                .iter()
-                .map(|f| path::resolve(&held, f).into_iter().next().cloned())
-                .collect();
-            parts.push(Part { fields: held, rep });
-            parts.len() - 1
-        });
+        let part = part_of(spec, &doc, &mut index, &mut parts);
         rows.push(Row { value, doc: at, part });
         docs.push(Some(doc));
     }
@@ -503,10 +518,19 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
 
     let grid = Grid { step: &spec.step, unit: spec.unit.as_deref() };
     let spans = spans(spec, &rows, &parts);
+    // With bounds "partition" the documents with no value lead inside their own partition, in the
+    // order they arrived (q7s4v0001, q7s4v0007, q7s4t0016, q7s4t0018). With full or explicit bounds
+    // they lead the output, all of them, as they arrived: the reference promises no order there.
+    let mut passed: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
+    for &(at, part) in &passthrough {
+        if let Some(part) = part {
+            passed[part].push(at);
+        }
+    }
 
     // First pass: how many documents the range makes, before any is made.
     let mut count = Count { total: input_len, limits };
-    walk(spec, &grid, &rows, &order, &spans, &mut count)?;
+    walk(spec, &grid, &rows, &order, &spans, &passed, &mut count)?;
     deadline::check()?;
 
     // Second pass: the documents.
@@ -517,14 +541,17 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
         out: Vec::with_capacity(count.total),
         lease: &mut lease,
     };
-    // Documents without a value lead, as they arrived.
-    for &at in &passthrough {
+    // Documents without a value lead, as they arrived (all of them, but with bounds "partition",
+    // where each leads its own partition).
+    for &(at, part) in &passthrough {
         deadline::tick()?;
-        if let Some(doc) = made.docs[at].take() {
+        if part.is_none()
+            && let Some(doc) = made.docs[at].take()
+        {
             made.out.push(doc);
         }
     }
-    walk(spec, &grid, &rows, &order, &spans, &mut made)?;
+    walk(spec, &grid, &rows, &order, &spans, &passed, &mut made)?;
     Ok(made.out)
 }
 
@@ -599,6 +626,7 @@ fn walk(
     rows: &[Row],
     order: &[usize],
     spans: &[Option<Span>],
+    passed: &[Vec<usize>],
     sink: &mut dyn Sink,
 ) -> Result<()> {
     let mut cursors: Vec<Option<Cursor>> = spans
@@ -624,6 +652,10 @@ fn walk(
                 by_part[r.part].push(i);
             }
             for &p in order {
+                for &at in &passed[p] {
+                    deadline::tick()?;
+                    sink.pass(at)?;
+                }
                 for &i in &by_part[p] {
                     deadline::tick()?;
                     take(grid, spans, &mut cursors, &rows[i], sink)?;
@@ -642,6 +674,10 @@ struct Count<'a> {
 
 impl Sink for Count<'_> {
     fn doc(&mut self, _: &Row) -> Result<()> {
+        Ok(())
+    }
+
+    fn pass(&mut self, _: usize) -> Result<()> {
         Ok(())
     }
 
@@ -668,6 +704,13 @@ struct Build<'a> {
 }
 
 impl Sink for Build<'_> {
+    fn pass(&mut self, at: usize) -> Result<()> {
+        if let Some(doc) = self.docs[at].take() {
+            self.out.push(doc);
+        }
+        Ok(())
+    }
+
     fn doc(&mut self, row: &Row) -> Result<()> {
         if let Some(doc) = self.docs[row.doc].take() {
             self.out.push(doc);

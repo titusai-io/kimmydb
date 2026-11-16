@@ -1178,8 +1178,10 @@ pub struct ArrayPosition {
 /// position, and several conditions on one array path (kept in the order the
 /// filter evaluates them) leave the first element
 /// that satisfies the last of them. An element is tested as [`matches`] tests
-/// it, one level into the array. An `$or` records from the first branch, in
-/// the order written, that holds and does not draw a random number (a branch
+/// it, one level into the array. An `$or` of equalities on one array path is one `$in` of their
+/// values and records the smallest index of an element equal to any (q7s2ab); beside another
+/// condition on that array it decides the position. Any other `$or` records from the first
+/// branch, in the order written, that holds and does not draw a random number (a branch
 /// that does cannot be asked again after the match, and is passed over, so a
 /// document that matched only through it gives no position); the reference
 /// passes no match details to the branches of an `$or`, so this is an
@@ -1214,11 +1216,31 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
         | Filter::JsonSchema(_)
         | Filter::SampleRate(_) => {}
         Filter::And(branches) => {
+            // An `$or` beside another condition on the same array decides the position, whatever
+            // the order they are written in (q7s2ab 49 to 54); on another array the later
+            // clause is the last array matched on, as written.
+            let mut from_or = None;
             for branch in branches.in_written_order() {
+                let before = at.clone();
                 record_position(branch, doc, at)?;
+                if matches!(branch, Filter::Or(_)) && *at != before {
+                    from_or = at.clone();
+                }
+            }
+            if let (Some(chosen), Some(now)) = (from_or, at.as_ref())
+                && chosen.path == now.path
+            {
+                *at = Some(chosen);
             }
         }
         Filter::Or(branches) => {
+            // An `$or` whose branches are all one equality on the same array path is one `$in`
+            // of their values: the position is the smallest index of an element equal to any of
+            // them, whatever the order the branches are written in (q7s2ab 1 to 36).
+            if let Some(smallest) = smallest_equal_element(branches.in_written_order(), doc)? {
+                *at = Some(smallest);
+                return Ok(());
+            }
             // The first branch, in the order written, that holds. A branch that cannot be
             // evaluated for this document (an `$expr` that fails on it) did not decide the
             // match, as `matches` itself defers it, and the next is tried; an error that is
@@ -1246,6 +1268,31 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
         }
     }
     Ok(())
+}
+
+/// The smallest index, over the branches of an `$or`, of the first element each equality names,
+/// when every branch is one equality on the same path: `None` for any other shape of branch, which
+/// records as the first branch that holds does.
+fn smallest_equal_element<'a>(
+    branches: impl Iterator<Item = &'a Filter>,
+    doc: &Document,
+) -> Result<Option<ArrayPosition>> {
+    let mut path_of: Option<&str> = None;
+    let mut smallest: Option<ArrayPosition> = None;
+    for branch in branches {
+        let Filter::Field { path, conditions } = branch else { return Ok(None) };
+        let [condition @ Condition::Eq(_)] = conditions.as_slice() else { return Ok(None) };
+        if path_of.is_some_and(|first| first != path.as_str()) {
+            return Ok(None);
+        }
+        path_of = Some(path.as_str());
+        if let Some(found) = condition_position(condition, doc, path)?
+            && smallest.as_ref().is_none_or(|best| found.index < best.index)
+        {
+            smallest = Some(found);
+        }
+    }
+    Ok(smallest)
 }
 
 /// The first element of the outermost array on `path` that satisfies
@@ -1611,32 +1658,8 @@ fn condition_matches(
         }
 
         Condition::ElemMatch(inner) => {
-            // The body is either operators on the element itself (`{$gt: 5}`: the value form,
-            // parsed to a condition on the empty path) or a filter on its fields (the document
-            // form).
-            let value_form = matches!(&**inner, Filter::Field { path, .. } if path.is_empty());
             any_of(values.values.iter().map(|(v, _)| *v), |v| match v {
-                Bson::Array(items) => any_of(items, |item| match item {
-                    // The value form takes each element as one value, a document too, with no
-                    // traversal into it (q7s3b 169-171, q7s3g 148, q7s3f 301-341).
-                    Bson::Document(_) if value_form => {
-                        matches_scalar_against(inner, item, vars, true)
-                    }
-                    Bson::Document(d) => evaluate(inner, d, vars),
-                    // An element that is an array is one value: the conditions are made on it
-                    // whole and do not look into it (q7s2r.out r0040, r0052, r0057, r0058).
-                    Bson::Array(_) if value_form => matches_scalar_against(inner, item, vars, true),
-                    // The document form reads an array element as the document of its
-                    // positions, `{"0": first, "1": second, ...}` (q7s3f 18, 19, 332, 334, 335;
-                    // q7s3g 143, 147), and the empty body holds for it as for a document.
-                    Bson::Array(members) => evaluate(inner, &position_document(members), vars),
-                    // The empty body holds for a document or an array element and for no
-                    // other (r0059).
-                    _ if matches!(**inner, Filter::AlwaysTrue) => Ok(false),
-                    // A scalar element is tested by wrapping it so that
-                    // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
-                    scalar => matches_scalar_against(inner, scalar, vars, false),
-                }),
+                Bson::Array(items) => any_of(items, |item| elem_match_member(inner, item, vars)),
                 _ => Ok(false),
             })?
         }
@@ -1756,14 +1779,49 @@ pub fn parse_pull_query(doc: &Document) -> Result<Filter> {
 
 /// Whether one array element satisfies a query parsed by [`parse_pull_query`]:
 /// a document element is matched as a stored document is, any other element
-/// (a scalar, an array, `null`) does not match. UNRECORDED: an array element
-/// that holds documents (q7s2j.out j1255 records arrays of scalars only).
+/// (a scalar, an array, `null`) does not match; so does an array element that holds documents
+/// (q7s2y y0075, y0083, y0091: `$pull` of `{k: 2}` leaves `[{k: 2}]`; q7s2j.out j1255 records
+/// arrays of scalars).
 pub fn matches_pull_query(filter: &Filter, element: &Bson) -> Result<bool> {
     match element {
         Bson::Document(d) => {
             matches(filter, d).map_err(|e| unevaluable(e, None, "an array element of "))
         }
         _ => Ok(false),
+    }
+}
+
+/// Whether one member of an array satisfies the body of an `$elemMatch`. **`find` and `$pull` read
+/// a member the same way, through this function** (q7s3g0243: `{$elemMatch: {$gt: 1}}` over
+/// `[[1, [2, 3]], [4]]` pulls `[4]` only, as `find` matches `[4]` only).
+///
+/// The body is either operators on the member itself (`{$gt: 5}`: the value form, parsed to a
+/// condition on the empty path) or a filter on its fields (the document form).
+///
+/// **One code path for `find` and `$pull`:** both call this function, so an `$all` inside a value
+/// form body reaches the one `Condition::All` arm of `element_condition` for a document or an array
+/// member (each listed value must equal the member as one whole value: q7s3f0322, q7s3f0323,
+/// q7s3l0001 to 0020 for `find`; q7s2aa 1 to 10 for `$pull`), and a scalar member reads it through
+/// `condition_matches`, where a one-value walk gives the same whole-value equality.
+fn elem_match_member(inner: &Filter, item: &Bson, vars: &[expr::Binding<'_>]) -> Result<bool> {
+    let value_form = matches!(inner, Filter::Field { path, .. } if path.is_empty());
+    match item {
+        // The value form takes each member as one value, a document too, with no traversal into
+        // it (q7s3b 169-171, q7s3g 148, q7s3f 301-341).
+        Bson::Document(_) if value_form => matches_scalar_against(inner, item, vars, true),
+        Bson::Document(d) => evaluate(inner, d, vars),
+        // A member that is an array is one value: the conditions are made on it whole and do
+        // not look into it (q7s2r.out r0040, r0052, r0057, r0058).
+        Bson::Array(_) if value_form => matches_scalar_against(inner, item, vars, true),
+        // The document form reads an array member as the document of its positions,
+        // `{"0": first, "1": second, ...}` (q7s3f 18, 19, 332, 334, 335; q7s3g 143, 147), and
+        // the empty body holds for it as for a document.
+        Bson::Array(members) => evaluate(inner, &position_document(members), vars),
+        // The empty body holds for a document or an array member and for no other (r0059).
+        _ if matches!(inner, Filter::AlwaysTrue) => Ok(false),
+        // A scalar member is tested by wrapping it so that `{$elemMatch: {$gt: 5}}` works on an
+        // array of numbers.
+        scalar => matches_scalar_against(inner, scalar, vars, false),
     }
 }
 
@@ -1788,19 +1846,7 @@ fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
             // (q7s2j.out lines 7774-7779, 7792-7797, q7s2q.out q0221 line 1479).
             Condition::ElemMatch(inner) => match element {
                 Bson::Array(members) => {
-                    for member in members {
-                        let hit = match member {
-                            Bson::Document(d) => evaluate(inner, d, &[])?,
-                            // An empty body asks for a document member: a scalar is not one
-                            // (q7s3i.jsonl 132, 145).
-                            _ if matches!(**inner, Filter::AlwaysTrue) => false,
-                            scalar => matches_scalar_against(inner, scalar, &[], false)?,
-                        };
-                        if hit {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
+                    any_of(members, |member| elem_match_member(inner, member, &[]))
                 }
                 _ => Ok(false),
             },

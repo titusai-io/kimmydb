@@ -962,14 +962,14 @@ invalid update: $set on "a" conflicts with $inc on "a.b": updating the path "a.b
 ```
 
 A `$rename` counts as writing both its source and its destination. A
-`$setOnInsert` counts as a write whether or not the request inserts. **An
-index is compared by its value**: an update here reads `a.01` and `a.+1` as
-`a.1`, so `{"$set": {"a.1": 5}, "$inc": {"a.01": 1}}` writes one path twice
-and is refused as a path conflict (a `400`), with the conflict named at
-`"a.1"`. A path spelled that way
-alone is not refused. Over a field holding an object rather than an array,
-`01` and `1` are two keys, but such a pair is still refused rather than told
-apart.
+`$setOnInsert` counts as a write whether or not the request inserts. **A
+digit segment is read by its value where it steps into an array**: over an
+array an update reads `a.01` as `a.1`, so `{"$set": {"a.1": 5}, "$inc":
+{"a.01": 1}}` writes one element twice and is refused as a path conflict (a
+`400`, `in this document`), with the conflict named at `"a.1"`. A path spelled
+that way alone is not refused. Over a field holding a document, or where the
+field is missing, `01` and `1` are two fields and both writes apply (q7s2y,
+q7s2u, q7s2v). `a.+1` is a field name always.
 
 **Positional paths are checked twice.** As written, a path with a `$[]` or
 `$[<identifier>]` segment is compared segment by segment like any other, so

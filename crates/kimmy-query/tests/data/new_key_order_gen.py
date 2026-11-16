@@ -11,6 +11,8 @@ upsert), the update, and the document the reference stored, each as JSON in the 
 """
 import json, sys
 
+ROWS = 0  # the rows written: the test asserts this count
+
 def plain(v):
     if isinstance(v, dict):
         if list(v) == ["$ordered"]:
@@ -58,5 +60,7 @@ for letter, name in (("u", "q7s2u"), ("v", "q7s2v"), ("w", "q7s2w"), ("k", "q7s4
             seed = before[0]
         if not (simple(seed) and simple(update) and simple(after[0])):
             continue
+        ROWS += 1
         print("\t".join([f"{letter}{n:04d}", "1" if upsert else "0", json.dumps(seed, ensure_ascii=False),
                          json.dumps(update, ensure_ascii=False), json.dumps(after[0], ensure_ascii=False)]))
+print(f"new_key_order: {ROWS} cases", file=sys.stderr)

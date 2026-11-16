@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use bson::{Bson, Document};
-use kimmy_query::{aggregate, filter, shape};
+use kimmy_query::{aggregate, filter, shape, update};
 
 /// The value a JSON text holds: objects, arrays, strings without escapes, whole numbers, `null`
 /// and booleans, which is all the recorded data uses (the `bson!` macro runs out of recursion on
@@ -35,7 +35,7 @@ fn parse_json(b: &[u8], at: &mut usize) -> bson::Bson {
                 match b[*at] {
                     b'}' => {
                         *at += 1;
-                        return Bson::Document(out);
+                        return extended(out);
                     }
                     b',' => *at += 1,
                     _ => {
@@ -65,10 +65,34 @@ fn parse_json(b: &[u8], at: &mut usize) -> bson::Bson {
             }
         }
         b'"' => {
-            let start = *at + 1;
-            let end = start + b[start..].iter().position(|c| *c == b'"').expect("a closing quote");
-            *at = end + 1;
-            Bson::String(String::from_utf8(b[start..end].to_vec()).expect("utf-8"))
+            let mut out: Vec<u8> = Vec::new();
+            *at += 1;
+            loop {
+                match b[*at] {
+                    b'"' => break,
+                    b'\\' => {
+                        *at += 1;
+                        match b[*at] {
+                            b'n' => out.push(b'\n'),
+                            b't' => out.push(b'\t'),
+                            b'r' => out.push(b'\r'),
+                            b'u' => {
+                                let hex = std::str::from_utf8(&b[*at + 1..*at + 5]).unwrap();
+                                let ch = char::from_u32(u32::from_str_radix(hex, 16).unwrap())
+                                    .expect("a scalar value");
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                *at += 4;
+                            }
+                            other => out.push(other),
+                        }
+                    }
+                    other => out.push(other),
+                }
+                *at += 1;
+            }
+            *at += 1;
+            Bson::String(String::from_utf8(out).expect("utf-8"))
         }
         _ => {
             let start = *at;
@@ -84,10 +108,53 @@ fn parse_json(b: &[u8], at: &mut usize) -> bson::Bson {
                 b"false" => Bson::Boolean(false),
                 number => {
                     let text = std::str::from_utf8(number).unwrap();
-                    Bson::Int32(text.parse().unwrap_or_else(|_| panic!("a number: {text}")))
+                    match text.parse::<i32>() {
+                        Ok(n) => Bson::Int32(n),
+                        Err(_) => Bson::Double(
+                            text.parse().unwrap_or_else(|_| panic!("a number: {text}")),
+                        ),
+                    }
                 }
             }
         }
+    }
+}
+
+/// A document that is one canonical extended JSON value (`{"$numberLong": "5"}`, `$date`, `$oid`,
+/// `$numberDouble`, `$numberDecimal`, `$numberInt`, `$binary`, `$minKey`, `$maxKey`,
+/// `$regularExpression`) is that value; any other is a document.
+fn extended(doc: Document) -> Bson {
+    use bson::Bson;
+    if doc.len() != 1 {
+        return Bson::Document(doc);
+    }
+    let (key, value) = doc.iter().next().unwrap();
+    match (key.as_str(), value) {
+        ("$numberInt", Bson::String(t)) => Bson::Int32(t.parse().unwrap()),
+        ("$numberLong", Bson::String(t)) => Bson::Int64(t.parse().unwrap()),
+        ("$numberDouble", Bson::String(t)) => Bson::Double(match t.as_str() {
+            "NaN" => f64::NAN,
+            "Infinity" => f64::INFINITY,
+            "-Infinity" => f64::NEG_INFINITY,
+            other => other.parse().unwrap(),
+        }),
+        ("$numberDecimal", Bson::String(t)) => Bson::Decimal128(t.parse().unwrap()),
+        ("$oid", Bson::String(t)) => Bson::ObjectId(bson::oid::ObjectId::parse_str(t).unwrap()),
+        ("$date", Bson::Int64(ms)) => Bson::DateTime(bson::DateTime::from_millis(*ms)),
+        ("$minKey", _) => Bson::MinKey,
+        ("$maxKey", _) => Bson::MaxKey,
+        ("$binary", Bson::Document(d)) => {
+            let subtype = u8::from_str_radix(d.get_str("subType").unwrap(), 16).unwrap();
+            Bson::Binary(
+                bson::Binary::from_base64(d.get_str("base64").unwrap(), Some(subtype.into()))
+                    .unwrap(),
+            )
+        }
+        ("$regularExpression", Bson::Document(d)) => Bson::RegularExpression(bson::Regex {
+            pattern: d.get_str("pattern").unwrap().to_string().try_into().unwrap(),
+            options: d.get_str("options").unwrap().to_string().try_into().unwrap(),
+        }),
+        _ => Bson::Document(doc),
     }
 }
 
@@ -100,7 +167,7 @@ pub fn ids(docs: &[Document]) -> Vec<Bson> {
 }
 
 /// The matches of `query` among `docs` and the sort of a command, as `find` and `findAndModify`
-/// read them: a query that is exactly `{_id: <number>}` ([`shape::is_one_by_id`]) sorts nothing.
+/// read them: a query that is exactly one key `_id` with a literal value ([`shape::is_one_by_id`]) sorts nothing.
 fn matched_and_sort<'a>(
     docs: &'a [Document],
     query: &Document,
@@ -157,6 +224,30 @@ pub fn find_and_modify_answers(docs: &[Document], command: &Document) -> Result<
         shape::sort_keys(&sort, doc).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// A `findAndModify` of the first match in the order of the command's sort, as the returned document:
+/// the document after the update (`new: true`) or before it, `None` where nothing matched (the
+/// reference answers `value: null`). The refusal of a sort over parallel arrays is checked on every
+/// match first, as in [`find_and_modify_answers`].
+pub fn find_and_modify_value(
+    docs: &[Document],
+    command: &Document,
+) -> Result<Option<Document>, String> {
+    const NOW: i64 = 1_700_000_000_000;
+    let query = command.get_document("query").unwrap();
+    let (matched, sort) = matched_and_sort(docs, query, command.get_document("sort").unwrap())?;
+    for doc in &matched {
+        shape::sort_keys(&sort, doc).map_err(|e| e.to_string())?;
+    }
+    let mut chosen: Vec<Document> = matched.into_iter().cloned().collect();
+    shape::sort(&sort, &mut chosen);
+    let Some(before) = chosen.into_iter().next() else { return Ok(None) };
+    let mut after = before.clone();
+    let parsed =
+        update::parse(command.get_document("update").unwrap()).map_err(|e| e.to_string())?;
+    update::apply(&parsed, &mut after, NOW).map_err(|e| e.to_string())?;
+    Ok(Some(if command.get_bool("new").unwrap_or(false) { after } else { before }))
 }
 
 pub fn pipeline_ids(docs: &[Document], command: &Document) -> Result<Vec<Bson>, String> {

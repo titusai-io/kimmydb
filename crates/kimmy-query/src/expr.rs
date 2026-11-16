@@ -3365,9 +3365,45 @@ fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
 /// end" (q7s4g:674, 678).
 fn substr_cp(args: &[Bson]) -> Result<Bson> {
     let s = as_string_lossy(&args[0], Op::SubstrCp)?;
-    let start = as_index(&args[1], "$substrCP start")?;
-    let len = as_index(&args[2], "$substrCP length")?;
+    let start =
+        cp_index(&args[1], "starting index", "$substrCP starting index must be nonnegative")?;
+    let len = cp_index(&args[2], "length", "$substrCP length must be a nonnegative integer")?;
     Ok(Bson::String(s.chars().skip(start).take(len).collect()))
+}
+
+/// A `$substrCP` start or length: a number that is a 32-bit integer in value. A Double or a
+/// Decimal128 that is whole is accepted (2.0, `Decimal128("2")`, q7s4s0042, 0044, 0047), one with a
+/// fraction (1.5) or past 32 bits (4294967296, as an Int64 or a Double) is refused (34451 for a
+/// start, 34453 for a length: q7s4r0027, q7s4s0041, 0045, 0046, 0055 to 0058), a value that is no
+/// number is refused (34450, 34452: q7s4s0049 to 0054), and a negative one is refused (34455,
+/// 34454: q7s4r0025, q7s4r0026). `$substr` and `$substrBytes` accept every number: they do not
+/// come here.
+fn cp_index(value: &Bson, what: &str, negative: &str) -> Result<usize> {
+    let unrepresentable = |shown: String| {
+        Error::InvalidQuery(format!(
+            "$substrCP: {what} cannot be represented as a 32-bit integral value: {shown}"
+        ))
+    };
+    let whole: i64 = match value {
+        Bson::Int32(n) => i64::from(*n),
+        Bson::Int64(n) => *n,
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        Bson::Double(d) => return Err(unrepresentable(d.to_string())),
+        Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+            Some(n) => n,
+            None => return Err(unrepresentable(d.to_string())),
+        },
+        other => {
+            return Err(Error::InvalidQuery(format!(
+                "$substrCP: {what} must be a numeric type (is BSON type {})",
+                type_name(other)
+            )));
+        }
+    };
+    if i32::try_from(whole).is_err() {
+        return Err(unrepresentable(whole.to_string()));
+    }
+    usize::try_from(whole).map_err(|_| Error::InvalidQuery(format!("{negative}, found {whole}")))
 }
 
 fn as_index(value: &Bson, what: &str) -> Result<usize> {
@@ -4909,6 +4945,18 @@ mod tests {
         assert_eq!(
             on(doc! {"$substrCP": ["$s", 1, 2]}.into(), doc! {"s": "héllo"}),
             Bson::String("él".into())
+        );
+        // A length that is not an integer is refused by `$substrCP` (q7s4r0027: 34453), and
+        // accepted by `$substr` and `$substrBytes` (q7s4r0009, q7s4r0018). A fractional start is
+        // UNRECORDED for all three.
+        assert!(ev(doc! {"$substrCP": ["abc", 1, 1.5]}.into(), &Document::new()).is_err());
+        assert_eq!(
+            ev(doc! {"$substr": ["abc", 1, 1.5]}.into(), &Document::new()).unwrap(),
+            Bson::String("b".into())
+        );
+        assert_eq!(
+            ev(doc! {"$substrBytes": ["abc", 1, 1.5]}.into(), &Document::new()).unwrap(),
+            Bson::String("b".into())
         );
     }
 
@@ -6873,16 +6921,19 @@ mod decimal128 {
                 bson!({ "$indexOfArray": ["$xs", 30, 1.0, 3.0] }),
             ),
             (bson!({ "$substr": ["$s", b("1"), b("2")] }), bson!({ "$substr": ["$s", 1.0, 2.0] })),
-            // `$substr` truncates a fraction, the double's and the decimal's alike.
-            (
-                bson!({ "$substr": ["$s", b("1.9"), b("2.5")] }),
-                bson!({ "$substr": ["$s", 1.9, 2.5] }),
-            ),
         ] {
             let (got, want) = (at(decimal.clone()), at(double));
             assert_eq!(got.as_ref().ok(), want.as_ref().ok(), "{decimal}");
             assert!(got.is_ok(), "{decimal}: {got:?}");
         }
+        // `$substr` truncates a Double's fraction and ROUNDS a Decimal128 to the nearest whole
+        // number, halves to the even one (q7s4u): over "hello", a start of 1.9 and a length of 2.5 are
+        // 1 and 2 as doubles ("el") and 2 and 2 as decimals ("ll").
+        assert_eq!(at(bson!({ "$substr": ["$s", 1.9, 2.5] })).unwrap(), Bson::String("el".into()));
+        assert_eq!(
+            at(bson!({ "$substr": ["$s", b("1.9"), b("2.5")] })).unwrap(),
+            Bson::String("ll".into())
+        );
         assert_eq!(at(bson!({ "$arrayElemAt": ["$xs", b("2")] })).unwrap(), Bson::Int32(30));
         // A fraction, a NaN and an infinity are refused, as the double ones are.
         for (decimal, double) in [

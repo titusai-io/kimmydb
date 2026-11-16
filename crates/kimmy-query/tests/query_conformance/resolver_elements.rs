@@ -5,8 +5,8 @@
 //! (the set and the case number, the line of the set's `.jsonl`) and its line in the set's `.out`.
 
 use super::common::assert_recorded;
-use super::resolver_cases::cases_elem_match;
-use super::resolver_element_cases::cases_elements;
+use super::resolver_cases::{CASES_ELEM_MATCH_COUNT, cases_elem_match};
+use super::resolver_element_cases::{CASES_ELEMENTS_COUNT, cases_elements};
 use bson::{Bson, Document};
 use kimmy_query::{filter, shape, update};
 use std::collections::HashMap;
@@ -111,7 +111,12 @@ fn exceptions() -> HashMap<&'static str, &'static str> {
 #[test]
 fn every_recorded_element_condition_answers_as_recorded() {
     let cases = cases_elements();
-    assert!(cases.len() > 60, "premise: {}", cases.len());
+    assert_eq!(
+        cases.len(),
+        CASES_ELEMENTS_COUNT,
+        "element cases: the generator wrote CASES_ELEMENTS_COUNT cases"
+    );
+    println!("element cases: {} cases", cases.len());
     let exceptions = exceptions();
     // The heading each exception cites is checked against docs/deviations.md by
     // `kimmy-api/tests/exception_headings.rs`: only kimmy-api tests read a documentation file.
@@ -153,6 +158,11 @@ fn every_recorded_element_condition_answers_as_recorded() {
 #[test]
 fn every_recorded_elem_match_filter_answers_as_recorded() {
     let cases = cases_elem_match();
-    assert!(cases.len() > 40, "premise: {}", cases.len());
+    assert_eq!(
+        cases.len(),
+        CASES_ELEM_MATCH_COUNT,
+        "elem-match cases: the generator wrote CASES_ELEM_MATCH_COUNT cases"
+    );
+    println!("elem-match cases: {} cases", cases.len());
     assert_recorded("$elemMatch", cases);
 }

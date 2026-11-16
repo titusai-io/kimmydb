@@ -81,7 +81,8 @@ fn every_recorded_update_stores_the_recorded_order() {
             "an exception for a row that is not in the table: {case}"
         );
     }
-    assert!(rows > 450, "{rows} rows");
+    assert_eq!(rows, 495, "the generator wrote 495 cases");
+    println!("new_key_order: {rows} cases");
     assert!(
         failures.is_empty(),
         "{} of {rows} rows differ:\n{}",

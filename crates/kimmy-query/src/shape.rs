@@ -161,20 +161,29 @@ fn sort_vector(
     }
 }
 
-/// Whether a filter is exactly `{_id: <number>}`: the one document it names is read by its key and
-/// **sorted by nothing**, so a document whose sort keys are parallel arrays is returned and not
-/// refused (q7s4k 103, 104; q7s4l: `find`, `findAndModify` and a `$match` that stands first in a
-/// pipeline, with `$sort` right after it or only a `$skip` between). Any other filter that selects
-/// the document is refused: `{_id: {$eq: v}}`, `{_id: {$in: [v]}}`, `{_id: v, a: ...}`,
-/// `{$and: [{_id: v}]}` and `{_id: {$gte: v, $lte: v}}`.
+/// Whether a filter is exactly one key `_id` with a literal value: the one document it names is
+/// read by its key and **sorted by nothing**, so a document whose sort keys are parallel arrays is
+/// returned and not refused (q7s4k 103, 104; q7s4l: `find`, `findAndModify` and a `$match` that
+/// stands first in a pipeline, with `$sort` right after it or only a `$skip` between). Any other
+/// filter that selects the document is refused: `{_id: {$eq: v}}`, `{_id: {$in: [v]}}`,
+/// `{_id: v, a: ...}`, `{$and: [{_id: v}]}` and `{_id: {$gte: v, $lte: v}}`.
 ///
-/// Only a **number** is recorded. A string, an ObjectId, a Long, a Double, a Decimal128, a
-/// boolean, a `null`, a date and a document as the value are UNRECORDED, and are not exempt here;
-/// the one place that says so is this function, which the `find` and `findAndModify` handlers and
-/// the pipeline parser all call.
+/// The value is exempt of **every type but `null`** (q7s4m, 72 cases through the three routes): a
+/// string, an ObjectId, an Int64, a Double (`2.5`, and `2.0` against a stored Int32 `2`), a
+/// Decimal128, a boolean, a date, a document literal, a binary, a UUID, a `MinKey` and the empty
+/// string answer the one document. Refused: `{_id: null}`, a regular expression in either
+/// spelling (`/^s/`, `{$regex: ...}`) and an operator document (`{$eq: v}`, `{$in: [v]}`). An array
+/// as the value (`[1, 2]`, `[]`, `[2]`) is read as a literal: it selects nothing and raises
+/// nothing in the three routes, and `{_id: {}}` is exempt where `{_id: {$eq: {}}}` is refused
+/// (q7s2z 13 to 27). The `find` and `findAndModify` handlers and the pipeline parser all call this
+/// one function.
 pub fn is_one_by_id(filter: &Document) -> bool {
     filter.len() == 1
-        && matches!(filter.get(ID_FIELD), Some(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)))
+        && match filter.get(ID_FIELD) {
+            None | Some(Bson::Null | Bson::RegularExpression(_)) => false,
+            Some(Bson::Document(value)) => !value.keys().any(|key| key.starts_with('$')),
+            Some(_) => true,
+        }
 }
 
 /// Where one key's path is in the document: not there, the value there, or the empty array a

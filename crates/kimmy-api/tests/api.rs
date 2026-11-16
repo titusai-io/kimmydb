@@ -22658,7 +22658,7 @@ async fn a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_
     // (code 2, "cannot sort with keys that are parallel arrays"), and a filter that is exactly
     // `{_id: <number>}` reads the one document by its key and sorts nothing. Every other filter
     // that selects the document is refused, in `find`, `find_and_modify` and `aggregate` alike.
-    // Only a number is recorded; the other types of `_id` are unrecorded.
+    // The other types of `_id` are in `a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_null`.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pairs" })).await;
@@ -22798,4 +22798,155 @@ async fn a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_
     assert_eq!(res.body["documents"][0]["z"], 2, "{:?}", res.body);
     let res = modify(json!({ "filter": { "_id": 2 }, "sort": sort, "remove": true })).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn an_int64_is_written_as_a_plain_number_and_read_back_by_its_size() {
+    // docs/http-api.md "The JSON boundary". OUTPUT: an Int32 and an Int64 are both a plain JSON
+    // number, whatever their size, with all the digits of an Int64 past 2^53 (`json.rs`
+    // `bson_to_json`). INPUT: a plain integer that fits 32 bits is an Int32, a larger one an
+    // Int64, and `{"$numberLong": ...}` an Int64 of any size (`number_to_bson`). So a document
+    // read and sent back unchanged stores an Int64 that fits 32 bits as an Int32, and the Int64
+    // past 2^53 stays an Int64. `$type` is the way to read a stored width.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "widths" })).await;
+    let coll = "/v1/db/shop/coll/widths";
+    let res = server
+        .post(
+            &format!("{coll}/docs"),
+            Some(&token),
+            json!({
+                "_id": 1,
+                "small": { "$numberLong": "5" },
+                "big": { "$numberLong": "9007199254740993" },
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let ids_of_type = |field: &'static str, name: &'static str| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    &format!("{coll}/find"),
+                    Some(token),
+                    json!({ "filter": { field: { "$type": name } } }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body["documents"].as_array().unwrap().len()
+        }
+    };
+    // Before: both are stored as an Int64.
+    assert_eq!(ids_of_type("small", "long").await, 1);
+    assert_eq!(ids_of_type("big", "long").await, 1);
+    // Read back: a plain number, with every digit.
+    let read = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    let doc = read.body["documents"][0].clone();
+    assert_eq!(doc["small"], json!(5), "{doc}");
+    assert_eq!(doc["big"].as_i64(), Some(9_007_199_254_740_993), "{doc}");
+    assert!(doc["big"].is_i64() && doc["small"].is_i64(), "{doc}");
+    // Sent back unchanged: the 5 is now an Int32, and the large one is still an Int64.
+    let put = server.put(&format!("{coll}/docs/1"), Some(&token), doc).await;
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    assert_eq!(ids_of_type("small", "int").await, 1);
+    assert_eq!(ids_of_type("small", "long").await, 0);
+    assert_eq!(ids_of_type("big", "long").await, 1);
+    assert_eq!(ids_of_type("big", "int").await, 0);
+}
+
+#[tokio::test]
+async fn a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_null() {
+    // q7s4m (72 cases): the exemption of a filter that is exactly `{_id: <number>}` (q7s4l, see
+    // `a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_id_number`) holds
+    // for every literal `_id` but `null`: a string, an ObjectId, an Int64, a Decimal128 and a
+    // binary here (the types a document may have as an `_id`; the rest are in the `kimmy-query`
+    // table `sort_exempt_types`). Refused: a regular expression in either spelling, `$eq`, `$in`,
+    // and an extra key beside `_id`. Through `find`, `aggregate` and `find_and_modify`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "idtypes" })).await;
+    let coll = "/v1/db/shop/coll/idtypes";
+    let held = [
+        json!("s2"),
+        json!({ "$oid": "000000000000000000000002" }),
+        json!({ "$numberLong": "2" }),
+        json!({ "$binary": { "base64": "AQID", "subType": "00" } }),
+    ];
+    // The same id as the Int64 2 in other numeric types (one id, as the product reads ids: 2,
+    // 2.0 and the decimal 2 are one `_id`), so they are filtered against the stored document and
+    // not stored beside it (q7s4m0013 to 0021: a Double 2.0 against a stored Int32 2).
+    let equal_to_the_long = [json!({ "$numberDecimal": "2" }), json!(2.0), json!(2)];
+    let mut batch = vec![json!({ "_id": 101, "a": 1, "b": 2, "k": "x" })];
+    for id in &held {
+        batch.push(json!({ "_id": id, "a": [1, 2], "b": [3, 4], "k": "only" }));
+    }
+    let res = server.post(&format!("{coll}/bulk"), Some(&token), json!(batch)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let sort = json!({ "a": 1, "b": 1, "_id": 1 });
+    let refused = |res: &Res| {
+        res.status == 400
+            && res.body["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with("cannot sort with keys that are parallel arrays"))
+    };
+    let find = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            server
+                .post(
+                    &format!("{coll}/find"),
+                    Some(token),
+                    json!({ "filter": filter, "sort": sort }),
+                )
+                .await
+        }
+    };
+    let aggregate = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            let stages =
+                json!([{ "$match": filter }, { "$sort": sort }, { "$project": { "_id": 1 } }]);
+            server
+                .post(&format!("{coll}/aggregate"), Some(token), json!({ "pipeline": stages }))
+                .await
+        }
+    };
+    let modify = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            let body = json!({ "filter": filter, "sort": sort, "update": { "$set": { "z": 1 } } });
+            server.post(&format!("{coll}/find_and_modify"), Some(token), body).await
+        }
+    };
+    for id in held.iter().chain(&equal_to_the_long) {
+        let filter = json!({ "_id": id });
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "find {filter}: {:?}", res.body);
+        assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{filter}");
+        let res = aggregate(filter.clone()).await;
+        assert_eq!(res.status, 200, "aggregate {filter}: {:?}", res.body);
+        assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{filter}");
+        let res = modify(filter.clone()).await;
+        assert_eq!(res.status, 200, "find_and_modify {filter}: {:?}", res.body);
+    }
+    // The string `s2` matched in each of these, and the document it names has parallel arrays.
+    for filter in [
+        json!({ "_id": { "$regularExpression": { "pattern": "^s", "options": "" } } }),
+        json!({ "_id": { "$regex": "^s" } }),
+        json!({ "_id": { "$in": ["s2"] } }),
+        json!({ "_id": { "$eq": "s2" } }),
+        json!({ "_id": "s2", "k": "only" }),
+        json!({ "k": "only", "_id": "s2" }),
+    ] {
+        for (what, res) in [
+            ("find", find(filter.clone()).await),
+            ("aggregate", aggregate(filter.clone()).await),
+            ("find_and_modify", modify(filter.clone()).await),
+        ] {
+            assert!(refused(&res), "{what} {filter}: {:?}", res.body);
+        }
+    }
 }

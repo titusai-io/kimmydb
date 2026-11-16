@@ -1,3 +1,4 @@
+//! Rebuilt by `tests/data/resolver_order_cases_gen.py`; its docstring has the command.
 //! Generated from the recordings q7s3g, q7s3h and q7s3j (reference 6.0.5): documents compared with
 //! documents, by the sort, `$cmp`, `$max`, `$min`, `$group` and the update operators. The label is
 //! the case's, the line its place in the set's `.out`.
@@ -278,6 +279,9 @@ fn docs_ca63c1b9() -> Vec<Document> {
 fn docs_b54803e8() -> Vec<Document> {
     vec![doc! { "_id": Bson::Int32(1), "v": Bson::Array(vec![Bson::String("a".to_string())]) }]
 }
+
+/// The number of cases `cases_document_order` holds, written by the generator.
+pub const CASES_DOCUMENT_ORDER_COUNT: usize = 168;
 
 pub fn cases_document_order() -> Vec<Rec> {
     vec![
