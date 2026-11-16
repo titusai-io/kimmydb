@@ -23032,3 +23032,72 @@ async fn the_merge_policy_is_chosen_at_creation_and_described_with_its_guidance(
         "the measured figure is in the text: {steering}"
     );
 }
+
+/// A `field` collection's writes answer an `etag` beside the `stamp`, and `if_stamp` takes the etag: a
+/// stamp is refused there, an etag is refused on a `document` collection, and a stale etag is the
+/// `409` it always was.
+#[tokio::test]
+async fn a_field_collections_writes_carry_an_etag_and_if_stamp_takes_it() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let made = server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"f","mergePolicy":"field"}))
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"d"})).await;
+
+    let ins = server.post("/v1/db/shop/coll/f/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    assert_eq!(ins.status, 200, "{:?}", ins.body);
+    let (stamp, etag) = (stamp_of(&ins.body), ins.body["etag"].as_str().unwrap().to_string());
+    assert_ne!(stamp, etag, "an etag is not the stamp");
+    // a document collection answers no etag
+    let dins = server.post("/v1/db/shop/coll/d/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    assert!(dins.body.get("etag").is_none(), "{:?}", dins.body);
+
+    // the wrong kind of token is a 400, on either policy
+    let res = server
+        .put(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={stamp}"), Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = server
+        .put(&format!("/v1/db/shop/coll/d/docs/1?if_stamp={etag}"), Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+
+    // the etag is current: the write goes through and the answer carries the next etag
+    let res = server
+        .put(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={etag}"), Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let next = res.body["etag"].as_str().unwrap().to_string();
+    assert_ne!(next, etag);
+    // the old etag is stale for every conditional route
+    let res = server
+        .put(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={etag}"), Some(&token), json!({"n": 2}))
+        .await;
+    assert_eq!((res.status, &res.body["error"]), (409, &json!("stale")), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/f/update",
+            Some(&token),
+            json!({"filter": {"_id": 1}, "update": {"$inc": {"n": 5}}, "if_stamp": etag}),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    // and the current one works for an update, which answers the next etag
+    let res = server
+        .post(
+            "/v1/db/shop/coll/f/update",
+            Some(&token),
+            json!({"filter": {"_id": 1}, "update": {"$inc": {"n": 5}}, "if_stamp": next}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let after = res.body["etag"].as_str().unwrap().to_string();
+    let res =
+        server.delete(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={next}"), Some(&token)).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let res =
+        server.delete(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={after}"), Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
