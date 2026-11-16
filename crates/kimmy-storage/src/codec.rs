@@ -246,6 +246,28 @@ fn decode_doc_record_inner(mut input: &[u8], keep_meta: bool) -> Result<DocRecor
     Ok(DocRecord { stamp, deleted, body: input.to_vec(), meta })
 }
 
+/// The hash of the merged state an encoded document record carries, read from the stored bytes
+/// without copying or decoding the state: `None` for a version 1 record (no state) or bytes
+/// that are not a record.
+pub fn doc_record_state_hash(mut input: &[u8]) -> Option<[u8; 16]> {
+    if !check_version_meta(&mut input).ok()? {
+        return None;
+    }
+    take(&mut input, STAMP_LEN + 1).ok()?;
+    let len = take_varint(&mut input).ok()?;
+    let meta = take(&mut input, len).ok()?;
+    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
+}
+
+/// The version identity of a record read from `raw`: its stamp, and the hash of the merged state
+/// its bytes carry when they carry one (an etag), else the stamp alone.
+pub fn doc_record_version(record: &DocRecord, raw: &[u8]) -> kimmy_core::DocVersion {
+    match doc_record_state_hash(raw) {
+        Some(hash) => kimmy_core::DocVersion::Etag(record.stamp, hash),
+        None => kimmy_core::DocVersion::Stamp(record.stamp),
+    }
+}
+
 /// Whether an encoded document record is live, read from its fixed-width header
 /// without touching the body.
 ///

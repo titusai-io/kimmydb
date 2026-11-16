@@ -23101,3 +23101,52 @@ async fn a_field_collections_writes_carry_an_etag_and_if_stamp_takes_it() {
         server.delete(&format!("/v1/db/shop/coll/f/docs/1?if_stamp={after}"), Some(&token)).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
 }
+
+/// Every way a `field` document's version is read answers the same etag as the write that made it: the
+/// read by id (`ETag`), `find` with `stamps` (indexed, scanned, sorted and by `_id`), and a bulk insert.
+#[tokio::test]
+async fn a_field_documents_etag_is_the_same_whichever_way_it_is_read() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"f","mergePolicy":"field"}))
+        .await;
+    let bulk = server
+        .post("/v1/db/shop/coll/f/bulk", Some(&token), json!([{"_id":1,"n":2},{"_id":2,"n":1}]))
+        .await;
+    assert_eq!(bulk.status, 200, "{:?}", bulk.body);
+    let etags: Vec<String> = bulk.body["etags"]
+        .as_array()
+        .expect("a bulk insert into a field collection answers etags")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(etags.len(), 2);
+    assert_ne!(bulk.body["stamps"][0], bulk.body["etags"][0]);
+
+    let by_id = server.get("/v1/db/shop/coll/f/docs/1", Some(&token)).await;
+    assert_eq!(by_id.header("etag").as_deref(), Some(format!("\"{}\"", etags[0]).as_str()));
+
+    server.post("/v1/db/shop/coll/f/indexes", Some(&token), json!({"fields":[{"path":"n"}]})).await;
+    for filter in [json!({}), json!({"_id": 1}), json!({"n": {"$gte": 0}})] {
+        for sort in [None, Some(json!({"n": 1}))] {
+            let mut body = json!({"filter": filter, "stamps": true});
+            if let Some(sort) = &sort {
+                body["sort"] = sort.clone();
+            }
+            let found = server.post("/v1/db/shop/coll/f/find", Some(&token), body).await;
+            assert_eq!(found.status, 200, "{filter} {sort:?}: {:?}", found.body);
+            let docs = found.body["documents"].as_array().unwrap();
+            let stamps = found.body["stamps"].as_array().unwrap();
+            assert_eq!(docs.len(), stamps.len());
+            for (doc, token) in docs.iter().zip(stamps) {
+                let which = doc["_id"].as_i64().unwrap() as usize - 1;
+                assert_eq!(token, &json!(etags[which]), "{filter} {sort:?}");
+            }
+        }
+    }
+    // a document collection is as before: stamps are stamp tokens and there are no etags
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"d"})).await;
+    let bulk = server.post("/v1/db/shop/coll/d/bulk", Some(&token), json!([{"_id":1}])).await;
+    assert!(bulk.body.get("etags").is_none(), "{:?}", bulk.body);
+}

@@ -402,7 +402,7 @@ pub fn find(
     // document is visited, so the vector below never holds a stored document
     // (ADR-150). How many documents each path shapes to fill it differs, and
     // each branch says which.
-    let (page_stamps, page_docs, stats): (Vec<kimmy_core::Stamp>, Vec<bson::Document>, _) =
+    let (page_stamps, page_docs, stats): (Vec<kimmy_core::DocVersion>, Vec<bson::Document>, _) =
         if sorted {
             // A sort has to see every match before it can page, but it need
             // not *hold* every match: the `skip + limit` least are all it can
@@ -425,11 +425,17 @@ pub fn find(
             let mut top = TopK::new(window, &order, projection.as_ref(), &filter);
             // A sort key that reads a position beside a field of that name is refused, with the
             // keys of every match taken before any is compared (the reference's 16746).
-            let stats =
-                visit_matching_until(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                    top.offer(stamp, doc)?;
+            let stats = visit_matching_versions_until(
+                state,
+                &meta,
+                &filter,
+                Order::Any,
+                None,
+                |version, doc| {
+                    top.offer(version, doc)?;
                     Ok(true)
-                })?;
+                },
+            )?;
             // The window shaped `skip + limit` documents and `skip` of them
             // are dropped here, with any refusal they hold. Nothing cheaper
             // is available: which matches the offset steps over is not known
@@ -462,7 +468,7 @@ pub fn find(
                 &filter,
                 Order::ById { after: cursor.as_ref().map(|c| c.key()) },
                 bounds,
-                |stamp, doc| {
+                |version, doc| {
                     seen += 1;
                     if seen > skip {
                         if continuable {
@@ -478,7 +484,7 @@ pub fn find(
                         };
                         match shaped {
                             Ok(shaped) => {
-                                stamps.push(stamp);
+                                stamps.push(version);
                                 docs.push(shaped);
                             }
                             Err(e) => {
@@ -504,7 +510,7 @@ pub fn find(
     if params.stamps {
         // Parallel to `documents` rather than a field inside each one: the
         // document is the caller's data and comes back exactly as stored.
-        let stamps: Vec<String> = page_stamps.iter().map(kimmy_core::Stamp::encode).collect();
+        let stamps: Vec<String> = page_stamps.iter().map(kimmy_core::DocVersion::encode).collect();
         body["stamps"] = json!(stamps);
     }
     if let Some(next) = next {
@@ -615,7 +621,7 @@ struct TopK<'a> {
 /// One held match: what ranks it, and what it will return.
 struct Ranked<'a> {
     order: &'a [shape::SortKey],
-    stamp: kimmy_core::Stamp,
+    stamp: kimmy_core::DocVersion,
     keys: Vec<bson::Bson>,
     /// The shaped document, or why it cannot be shaped. A refusal is held with
     /// the match it belongs to and raised only if that match is on the page
@@ -660,7 +666,12 @@ impl<'a> TopK<'a> {
         }
     }
 
-    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> kimmy_core::Result<()> {
+    fn offer(
+        &mut self,
+        stamp: impl Into<kimmy_core::DocVersion>,
+        doc: bson::Document,
+    ) -> kimmy_core::Result<()> {
+        let stamp = stamp.into();
         if self.n == 0 {
             return Ok(());
         }
@@ -693,7 +704,7 @@ impl<'a> TopK<'a> {
     fn into_sorted(
         self,
         skip: usize,
-    ) -> Result<Vec<(kimmy_core::Stamp, bson::Document)>, ApiError> {
+    ) -> Result<Vec<(kimmy_core::DocVersion, bson::Document)>, ApiError> {
         self.heap
             .into_sorted_vec()
             .into_iter()
@@ -751,8 +762,8 @@ pub fn get_doc_stamped(
     let _span = op_span("get_doc", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let doc_id = parse_id(id)?;
-    match state.engine.get_stamped(&meta, &doc_id)? {
-        Some((stamp, doc)) => Ok((stamp.encode(), document_to_json(&doc))),
+    match state.engine.get_versioned(&meta, &doc_id)? {
+        Some((version, doc)) => Ok((version.encode(), document_to_json(&doc))),
         None => Err(ApiError::not_found(format!("no document with _id {id}"))),
     }
 }
@@ -887,7 +898,7 @@ struct Recheck<'a, F> {
     visit: F,
 }
 
-impl<F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>> Recheck<'_, F> {
+impl<F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>> Recheck<'_, F> {
     /// Examine one candidate; whether the scan should go on.
     ///
     /// The bound is checked **before** a candidate is considered, not after
@@ -899,7 +910,11 @@ impl<F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>> Re
     ///
     /// `Err` when the filter's `$expr` cannot be evaluated against the
     /// candidate, which ends the scan and fails the read (ADR-206).
-    fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> kimmy_core::Result<bool> {
+    fn take(
+        &mut self,
+        version: kimmy_core::DocVersion,
+        doc: bson::Document,
+    ) -> kimmy_core::Result<bool> {
         if self.stop_after == Some(self.matched) {
             return Ok(false);
         }
@@ -908,7 +923,7 @@ impl<F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>> Re
             self.matched += 1;
             // The visitor may end the scan, or fail it (the memory an aggregation's source
             // read holds, ADR-269): the document that passes the limit is the last read.
-            if !(self.visit)(stamp, doc)? {
+            if !(self.visit)(version, doc)? {
                 return Ok(false);
             }
         }
@@ -1036,6 +1051,25 @@ pub(crate) fn visit_matching_until<F>(
 where
     F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
 {
+    let mut visit = visit;
+    visit_matching_versions_until(state, meta, filter, order, stop_after, |version, doc| {
+        visit(version.stamp(), doc)
+    })
+}
+
+/// [`visit_matching_until`] handing the visitor each document's version identity (its stamp, and
+/// under `field` the state hash), read from the same record as the document.
+pub(crate) fn visit_matching_versions_until<F>(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    order: Order<'_>,
+    stop_after: Option<usize>,
+    visit: F,
+) -> Result<QueryStats, ApiError>
+where
+    F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>,
+{
     let bounds = ScanBounds { stop_after, want: stop_after, hold: None };
     visit_matching_bounded(state, meta, filter, order, bounds, visit)
 }
@@ -1065,7 +1099,7 @@ pub(crate) fn visit_matching_bounded<F>(
     visit: F,
 ) -> Result<QueryStats, ApiError>
 where
-    F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
+    F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>,
 {
     let ScanBounds { stop_after, want, hold } = bounds;
     // Every read of documents goes through here (find, count, an aggregate's source,
@@ -1093,10 +1127,10 @@ where
             }
             // A key naming no document is an ordinary miss, not an error: the
             // filter asked for an `_id` nothing was stored under.
-            let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, key)? else {
+            let Some((version, doc)) = state.engine.get_version_by_encoded_key(meta, key)? else {
                 continue;
             };
-            if !recheck.take(stamp, doc)? {
+            if !recheck.take(version, doc)? {
                 break;
             }
         }
@@ -1150,13 +1184,13 @@ where
             Order::Any => kimmy_storage::CandidateOrder::Any,
         };
         let outcome = kimmy_storage::blocking(|| {
-            state.engine.visit_index_candidates_held(
+            state.engine.visit_index_candidates_versioned_held(
                 meta,
                 &scan,
                 delivery,
                 kimmy_storage::WalkScope::Request,
                 hold,
-                |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
+                |_, version, doc| Ok(recheck.take(version, doc)?),
             )
         })?;
         match outcome {
@@ -1169,11 +1203,11 @@ where
     }
     if plan.is_none() {
         kimmy_storage::blocking(|| {
-            state.engine.for_each_record_after(
+            state.engine.for_each_version_after(
                 meta,
                 after,
                 kimmy_storage::WalkScope::Request,
-                |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
+                |_, version, doc| Ok(recheck.take(version, doc)?),
             )
         })?;
     }
@@ -1250,7 +1284,7 @@ pub fn insert_many(
         .collect::<Result<Vec<_>, _>>()?;
     let sent: Vec<_> = docs.iter().map(|doc| doc.get(kimmy_storage::ID_FIELD).cloned()).collect();
 
-    let stamped = state.engine.insert_many_stamped(&meta, docs).map_err(|e| match e.index {
+    let stamped = state.engine.insert_many_versioned(&meta, docs).map_err(|e| match e.index {
         Some(i) => at_index(i, e.source.into()),
         None => e.source.into(),
     })?;
@@ -1258,15 +1292,20 @@ pub fn insert_many(
     // Positionally parallel to `insertedIds`: every document gets its own
     // stamp, and a caller following one up with a conditional write needs
     // the version it landed at, exactly as `insert` reports.
-    Ok(json!({
+    let mut body = json!({
         "inserted": stamped.len(),
         "insertedIds": stamped
             .iter()
             .zip(sent)
             .map(|((id, _), sent)| crate::json::bson_to_json(&inserted_id(sent, id)))
             .collect::<Vec<_>>(),
-        "stamps": stamped.iter().map(|(_, stamp)| stamp.encode()).collect::<Vec<_>>(),
-    }))
+        "stamps": stamped.iter().map(|(_, v)| v.stamp().encode()).collect::<Vec<_>>(),
+    });
+    // Under `field`, the identity a conditional write names, parallel to `stamps`.
+    if stamped.iter().any(|(_, v)| matches!(v, kimmy_core::DocVersion::Etag(..))) {
+        body["etags"] = json!(stamped.iter().map(|(_, v)| v.encode()).collect::<Vec<_>>());
+    }
+    Ok(body)
 }
 
 /// Name the offending document's position without changing the error envelope.

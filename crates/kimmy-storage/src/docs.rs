@@ -402,6 +402,21 @@ impl Engine {
     where
         F: FnMut(DocId, Stamp, Document) -> Result<bool>,
     {
+        self.for_each_version_after(coll, after, scope, |id, v, doc| f(id, v.stamp(), doc))
+    }
+
+    /// [`Engine::for_each_record_after`] handing `f` each document's version identity, taken from
+    /// the same record bytes as the document.
+    pub fn for_each_version_after<F>(
+        &self,
+        coll: &CollectionMeta,
+        after: Option<&[u8]>,
+        scope: WalkScope,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DocId, kimmy_core::DocVersion, Document) -> Result<bool>,
+    {
         let txn = self.db().begin_read()?;
         let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
         for entry in docs.range(doc_range_after(coll.id, after))? {
@@ -412,7 +427,7 @@ impl Engine {
             }
             let doc: Document = bson::deserialize_from_slice(&record.body)?;
             let id = extract_id(&doc)?;
-            if !f(id, record.stamp, doc)? {
+            if !f(id, codec::doc_record_version(&record, value.value()), doc)? {
                 break;
             }
         }
@@ -610,6 +625,20 @@ impl Engine {
         coll: &CollectionMeta,
         docs: Vec<Document>,
     ) -> std::result::Result<Vec<(DocId, Stamp)>, BulkInsertError> {
+        Ok(self
+            .insert_many_versioned(coll, docs)?
+            .into_iter()
+            .map(|(id, version)| (id, version.stamp()))
+            .collect())
+    }
+
+    /// [`Engine::insert_many_stamped`] answering each document's version identity: its stamp, and
+    /// under `field` the etag.
+    pub fn insert_many_versioned(
+        &self,
+        coll: &CollectionMeta,
+        docs: Vec<Document>,
+    ) -> std::result::Result<Vec<(DocId, kimmy_core::DocVersion)>, BulkInsertError> {
         // Nothing to do, and nothing to log: an empty batch must not open a
         // transaction, or it would append an oplog entry for a write that
         // never happened.
@@ -647,7 +676,7 @@ impl Engine {
         for (index, checked) in pending.into_iter().enumerate() {
             match self.write_insert(&txn, coll, checked, None) {
                 Ok((id, entry)) => {
-                    ids.push((id, entry.stamp));
+                    ids.push((id, version_of_entry(&entry)));
                     entries.push(entry);
                 }
                 Err(source) => {

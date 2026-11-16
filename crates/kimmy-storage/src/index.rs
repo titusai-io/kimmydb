@@ -2368,12 +2368,24 @@ impl crate::Engine {
         coll: &crate::CollectionMeta,
         key: &[u8],
     ) -> Result<Option<(kimmy_core::Stamp, Document)>> {
+        Ok(self.get_version_by_encoded_key(coll, key)?.map(|(v, doc)| (v.stamp(), doc)))
+    }
+
+    /// [`Engine::get_record_by_encoded_key`] with the document's version identity, taken from the
+    /// same record bytes as the document.
+    pub fn get_version_by_encoded_key(
+        &self,
+        coll: &crate::CollectionMeta,
+        key: &[u8],
+    ) -> Result<Option<(kimmy_core::DocVersion, Document)>> {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         match docs.get((coll.id.0, key))? {
             Some(raw) => {
                 let record = crate::codec::decode_doc_record(raw.value())?;
-                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+                Ok(record
+                    .document()?
+                    .map(|doc| (crate::codec::doc_record_version(&record, raw.value()), doc)))
             }
             None => Ok(None),
         }
@@ -2486,18 +2498,21 @@ struct Walk<'t, F> {
 
 impl<F> Walk<'_, F>
 where
-    F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+    F: FnMut(&[u8], kimmy_core::DocVersion, Document) -> Result<bool>,
 {
     /// The live document under a key, or `None` for a tombstone or a gap.
     ///
     /// A gap is an ordinary miss, not an error: index entries are removed
     /// lazily after a drop, and a candidate whose document is gone is simply
     /// not a candidate.
-    fn load(&self, key: &[u8]) -> Result<Option<(kimmy_core::Stamp, Document)>> {
+    fn load(&self, key: &[u8]) -> Result<Option<(kimmy_core::DocVersion, Document)>> {
         match self.docs.get((self.coll.0, key))? {
             Some(raw) => {
                 let record = crate::codec::decode_doc_record(raw.value())?;
-                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+                // The identity comes from the same bytes the document was decoded from.
+                Ok(record
+                    .document()?
+                    .map(|doc| (crate::codec::doc_record_version(&record, raw.value()), doc)))
             }
             None => Ok(None),
         }
@@ -2804,10 +2819,30 @@ impl crate::Engine {
         order: CandidateOrder<'_>,
         scope: WalkScope,
         hold: Option<&dyn KeyHold>,
-        visit: F,
+        mut visit: F,
     ) -> Result<Option<IndexScanOutcome>>
     where
         F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+    {
+        self.visit_index_candidates_versioned_held(coll, scan, order, scope, hold, |k, v, d| {
+            visit(k, v.stamp(), d)
+        })
+    }
+
+    /// [`Engine::visit_index_candidates_held`] handing the visitor each document's version
+    /// identity (its stamp, and under `field` the state hash too), taken from the same record
+    /// bytes the document was decoded from.
+    pub fn visit_index_candidates_versioned_held<F>(
+        &self,
+        coll: &crate::CollectionMeta,
+        scan: &IndexScan<'_>,
+        order: CandidateOrder<'_>,
+        scope: WalkScope,
+        hold: Option<&dyn KeyHold>,
+        visit: F,
+    ) -> Result<Option<IndexScanOutcome>>
+    where
+        F: FnMut(&[u8], kimmy_core::DocVersion, Document) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
         let index = {
