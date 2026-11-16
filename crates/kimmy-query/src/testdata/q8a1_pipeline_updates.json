@@ -1,0 +1,894 @@
+[
+{
+"label": "set+unset many",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"total": {
+"$add": [
+"$a",
+"$b"
+]
+}
+}
+},
+{
+"$unset": "scratch"
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+],
+"total": {
+"$numberInt": "5"
+}
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": [],
+"total": {
+"$numberInt": "30"
+}
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+]
+},
+{
+"label": "no-op pipeline",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"flag": true,
+"n": {
+"$numberInt": "1"
+}
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"n": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"flag": true
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"flag": true,
+"n": {
+"$numberInt": "1"
+}
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"n": {
+"$numberInt": "2"
+},
+"flag": true
+}
+]
+},
+{
+"label": "no-op replaceWith ROOT",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$replaceWith": "$$ROOT"
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+]
+},
+{
+"label": "no-op set then unset",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"zz": {
+"$numberInt": "1"
+}
+}
+},
+{
+"$unset": "zz"
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+]
+},
+{
+"label": "key reorder is a change",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$replaceWith": {
+"b": "$b",
+"a": "$a"
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "1"
+}
+}
+]
+},
+{
+"label": "add int int type",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"s": {
+"$add": [
+"$a",
+"$b"
+]
+},
+"m": {
+"$multiply": [
+"$a",
+{
+"$numberInt": "2"
+}
+]
+},
+"sub": {
+"$subtract": [
+"$b",
+"$a"
+]
+}
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"s": {
+"$numberInt": "2"
+},
+"m": {
+"$numberInt": "2"
+},
+"sub": {
+"$numberInt": "0"
+}
+}
+]
+},
+{
+"label": "_id: multi unset",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [
+{
+"$unset": "_id"
+},
+{
+"$set": {
+"u": {
+"$numberInt": "1"
+}
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+],
+"u": {
+"$numberInt": "1"
+}
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": [],
+"u": {
+"$numberInt": "1"
+}
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+},
+"u": {
+"$numberInt": "1"
+}
+}
+]
+},
+{
+"label": "multi: empty array",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+],
+"pipeline": [],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "2"
+},
+"b": {
+"$numberInt": "3"
+},
+"scratch": true,
+"items": [
+{
+"sku": "x",
+"q": {
+"$numberInt": "1"
+}
+},
+{
+"sku": "y",
+"q": {
+"$numberInt": "4"
+}
+}
+]
+},
+{
+"_id": {
+"$numberInt": "2"
+},
+"a": {
+"$numberInt": "10"
+},
+"b": {
+"$numberInt": "20"
+},
+"items": []
+},
+{
+"_id": {
+"$numberInt": "3"
+},
+"a": {
+"$numberInt": "1"
+},
+"b": {
+"$numberInt": "1"
+},
+"total": {
+"$numberInt": "2"
+}
+}
+]
+},
+{
+"label": "set missing path over existing field",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"p": {
+"$numberInt": "5"
+},
+"q": {
+"$numberInt": "1"
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"p": "$nope"
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"q": {
+"$numberInt": "1"
+}
+}
+]
+},
+{
+"label": "set missing path, nested",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"o": {
+"p": {
+"$numberInt": "5"
+}
+}
+}
+],
+"pipeline": [
+{
+"$set": {
+"o.p": "$nope",
+"o.r": "$nope2"
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"o": {}
+}
+]
+},
+{
+"label": "project computed missing",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+}
+}
+],
+"pipeline": [
+{
+"$project": {
+"a": {
+"$numberInt": "1"
+},
+"p": "$nope"
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+}
+}
+]
+},
+{
+"label": "replaceWith with missing field",
+"before": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+}
+}
+],
+"pipeline": [
+{
+"$replaceWith": {
+"a": "$a",
+"p": "$nope"
+}
+}
+],
+"after": [
+{
+"_id": {
+"$numberInt": "1"
+},
+"a": {
+"$numberInt": "1"
+}
+}
+]
+}
+]
