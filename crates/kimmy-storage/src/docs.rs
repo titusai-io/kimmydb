@@ -40,6 +40,10 @@ pub struct WriteOutcome {
     /// What a caller hands back as `if_stamp` to make its next write
     /// conditional on nothing having happened in between.
     pub stamp: Option<Stamp>,
+    /// The version identity the write produced: [`Self::stamp`] under the `document` policy, the
+    /// stamp and the hash of the merged state (an etag) under `field`. `None` when nothing was
+    /// written.
+    pub version: Option<kimmy_core::DocVersion>,
 }
 
 /// A bulk insert's failure, and which document caused it.
@@ -549,6 +553,26 @@ impl Engine {
         Ok((id, stamp))
     }
 
+    /// [`Engine::insert_stamped`] answering with the version identity the insert produced.
+    pub fn insert_versioned(
+        &self,
+        coll: &CollectionMeta,
+        doc: Document,
+    ) -> Result<(DocId, kimmy_core::DocVersion)> {
+        let txn = self.begin_write(WriterHolder::Write)?;
+        let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
+            Ok(pair) => pair,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        txn.commit()?;
+        let version = version_of_entry(&entry);
+        self.publish(vec![entry]);
+        Ok((id, version))
+    }
+
     /// Insert many documents in a single transaction, or none of them.
     ///
     /// The whole point is the commit: one durable commit for the batch instead
@@ -957,15 +981,25 @@ impl Engine {
                 return Err(StorageError::Stale { current });
             }
             if !existed && !upsert {
-                let unmatched =
-                    WriteOutcome { matched: false, modified: false, upserted: false, stamp: None };
+                let unmatched = WriteOutcome {
+                    matched: false,
+                    modified: false,
+                    upserted: false,
+                    stamp: None,
+                    version: None,
+                };
                 return Ok((unmatched, None));
             }
             if unchanged {
                 // Byte for byte what is stored: no stamp, no record, no
                 // index maintenance, no oplog entry (ADR-208).
-                let unchanged =
-                    WriteOutcome { matched: true, modified: false, upserted: false, stamp: None };
+                let unchanged = WriteOutcome {
+                    matched: true,
+                    modified: false,
+                    upserted: false,
+                    stamp: None,
+                    version: None,
+                };
                 return Ok((unchanged, None));
             }
             // Only a write that will be made is held to the cap, so sending a stored
@@ -1041,6 +1075,7 @@ impl Engine {
             modified: existed,
             upserted: !existed,
             stamp: Some(stamp),
+            version: Some(version_of_entry(&entry)),
         };
         Ok((outcome, Some(entry)))
     }
@@ -1070,7 +1105,7 @@ impl Engine {
         id: &DocId,
         expected: Option<Stamp>,
     ) -> Result<Option<Stamp>> {
-        self.delete_if_state(coll, id, expected, None)
+        Ok(self.delete_if_state(coll, id, expected, None)?.map(|v| v.stamp()))
     }
 
     /// [`Engine::delete_if`] with the version of a `field` document: a stamp and the hash of the
@@ -1081,7 +1116,7 @@ impl Engine {
         id: &DocId,
         expected: Option<Stamp>,
         expected_state: Option<kimmy_core::StateHash>,
-    ) -> Result<Option<Stamp>> {
+    ) -> Result<Option<kimmy_core::DocVersion>> {
         let Some(expected) = expected else {
             return self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true));
         };
@@ -1094,7 +1129,7 @@ impl Engine {
                 Err(StorageError::Stale { current: Some(current) })
             }
         })? {
-            Some(stamp) => Ok(Some(stamp)),
+            Some(version) => Ok(Some(version)),
             None => Err(StorageError::Stale { current: None }),
         }
     }
@@ -1145,14 +1180,14 @@ impl Engine {
         id: &DocId,
         expected_state: Option<kimmy_core::StateHash>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
-    ) -> Result<Option<Stamp>> {
+    ) -> Result<Option<kimmy_core::DocVersion>> {
         let txn = self.begin_write(holder)?;
         match self.delete_in_txn(&txn, coll, id, expected_state, guard) {
             Ok(Some(entry)) => {
                 txn.commit()?;
-                let stamp = entry.stamp;
+                let version = version_of_entry(&entry);
                 self.publish(vec![entry]);
-                Ok(Some(stamp))
+                Ok(Some(version))
             }
             // Nothing to remove, or the guard declined: nothing was written,
             // so nothing is committed — a refused expiry must not cost an
@@ -2730,7 +2765,13 @@ mod tests {
         let outcome = engine.replace(&coll, &id, doc! { "a": 1 }, false).unwrap();
         assert_eq!(
             outcome,
-            WriteOutcome { matched: false, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: false,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         assert!(engine.get(&coll, &id).unwrap().is_none());
     }
@@ -3065,7 +3106,13 @@ mod tests {
         let out = engine.replace(&coll, &local, doc! { "email": "clash@x" }, false).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         let out = engine.modify_where(&coll, &crate::Candidates::Scan, &SetEmail, None).unwrap();
         assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0));
@@ -3612,13 +3659,25 @@ mod tests {
         let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, false).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         // Upsert changes nothing about an existing document.
         let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, true).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         // At the current stamp it is the same no-op, and the stamp stays
         // valid for the next conditional write.
@@ -3843,4 +3902,13 @@ mod tests {
 pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
     let meta = record?.meta.as_deref()?;
     kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
+}
+
+/// The version identity an oplog entry's write produced: the stamp, and for a `field` entry the
+/// hash of the merged state it carries.
+pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
+    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::compact_hash_of) {
+        Some(Ok(hash)) => kimmy_core::DocVersion::Etag(entry.stamp, hash),
+        _ => kimmy_core::DocVersion::Stamp(entry.stamp),
+    }
 }

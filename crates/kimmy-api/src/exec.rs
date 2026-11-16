@@ -516,9 +516,41 @@ pub fn find(
     Ok(body)
 }
 
-/// A caller's `if_stamp`, decoded — `None` when the write is unconditional.
-fn parse_if_stamp(raw: Option<&str>) -> Result<Option<kimmy_core::Stamp>, ApiError> {
-    raw.map(|s| kimmy_core::Stamp::decode(s).map_err(|_| ApiError::malformed_stamp(s))).transpose()
+/// A caller's `if_stamp`, decoded against the collection it is for: a stamp token for a `document`
+/// collection, an etag token for a `field` one. The other kind is refused, so a caller is never
+/// held to a weaker condition than it asked for (a stamp does not name a merged state).
+/// `None` when the write is unconditional.
+fn parse_if_version(
+    meta: &CollectionMeta,
+    raw: Option<&str>,
+) -> Result<Option<kimmy_core::DocVersion>, ApiError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let version =
+        kimmy_core::DocVersion::decode(raw).map_err(|_| ApiError::malformed_stamp(raw))?;
+    match (meta.merge_policy, &version) {
+        (kimmy_core::MergePolicy::Field, kimmy_core::DocVersion::Stamp(_)) => {
+            Err(ApiError::bad_request(
+                "`if_stamp` is a stamp, and a collection with merge policy `field` takes an etag: \
+                 use the `etag` a read or write of it answered",
+            ))
+        }
+        (kimmy_core::MergePolicy::Document, kimmy_core::DocVersion::Etag(..)) => {
+            Err(ApiError::bad_request(
+                "`if_stamp` is an etag, which names a document of a collection with merge policy \
+                 `field`; this collection's versions are stamps",
+            ))
+        }
+        _ => Ok(Some(version)),
+    }
+}
+
+/// A write's answer carries the version it produced: its `stamp`, and under `field` the `etag`
+/// that a conditional write names.
+fn put_version(body: &mut Value, version: kimmy_core::DocVersion) {
+    body["stamp"] = json!(version.stamp().encode());
+    if let kimmy_core::DocVersion::Etag(..) = version {
+        body["etag"] = json!(version.encode());
+    }
 }
 
 /// Whether a sort specification is exactly `_id` ascending.
@@ -1173,11 +1205,10 @@ pub fn insert(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc = json_to_document(document)?;
     let sent = doc.get(kimmy_storage::ID_FIELD).cloned();
-    let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
-    Ok(json!({
-        "insertedId": crate::json::bson_to_json(&inserted_id(sent, &id)),
-        "stamp": stamp.encode(),
-    }))
+    let (id, version) = state.engine.insert_versioned(&meta, doc)?;
+    let mut body = json!({ "insertedId": crate::json::bson_to_json(&inserted_id(sent, &id)) });
+    put_version(&mut body, version);
+    Ok(body)
 }
 
 /// The `_id` an insert reports: the one the client sent, which the engine
@@ -1268,8 +1299,15 @@ pub fn replace(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let doc = json_to_document(document)?;
-    let expected = parse_if_stamp(params.if_stamp.as_deref())?;
-    let outcome = state.engine.replace_if(&meta, &doc_id, doc, params.upsert, expected)?;
+    let expected = parse_if_version(&meta, params.if_stamp.as_deref())?;
+    let outcome = state.engine.replace_if_state(
+        &meta,
+        &doc_id,
+        doc,
+        params.upsert,
+        expected.map(|v| v.stamp()),
+        expected.and_then(|v| v.state_hash()),
+    )?;
     // `modified` is 0 for a body identical to the stored one, which writes
     // nothing and reports no `stamp` (ADR-208).
     //
@@ -1286,8 +1324,8 @@ pub fn replace(
         "modified": u8::from(outcome.modified),
         "upserted": outcome.upserted,
     });
-    if let Some(stamp) = outcome.stamp {
-        body["stamp"] = json!(stamp.encode());
+    if let Some(version) = outcome.version {
+        put_version(&mut body, version);
     }
     Ok(body)
 }
@@ -1303,15 +1341,20 @@ pub fn delete_by_id(
     let _span = op_span("delete_by_id", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
-    let expected = parse_if_stamp(if_stamp)?;
+    let expected = parse_if_version(&meta, if_stamp)?;
     // The tombstone's stamp, reported as every other write reports the
     // version it produced (ADR-084): `POST .../delete` of one document
     // already did, and a by-id delete that said only `{"deleted": 1}` was the
     // one write a client could not follow with the version it made.
-    let stamp = state.engine.delete_if(&meta, &doc_id, expected)?;
-    let mut body = json!({ "deleted": u8::from(stamp.is_some()) });
-    if let Some(stamp) = stamp {
-        body["stamp"] = json!(stamp.encode());
+    let version = state.engine.delete_if_state(
+        &meta,
+        &doc_id,
+        expected.map(|v| v.stamp()),
+        expected.and_then(|v| v.state_hash()),
+    )?;
+    let mut body = json!({ "deleted": u8::from(version.is_some()) });
+    if let Some(version) = version {
+        put_version(&mut body, version);
     }
     Ok(body)
 }
@@ -1342,7 +1385,7 @@ impl WriteParams {
     /// because one stamp cannot describe several documents, and alongside
     /// `explain`, because a plan cannot honestly answer "would this write
     /// happen" without checking a version it never reads (ADR-131).
-    fn expected(&self) -> Result<Option<kimmy_core::Stamp>, ApiError> {
+    fn expected(&self, meta: &CollectionMeta) -> Result<Option<kimmy_core::DocVersion>, ApiError> {
         if self.multi && self.if_stamp.is_some() {
             return Err(ApiError::bad_request(
                 "`if_stamp` names one document's version, so it cannot be combined with \
@@ -1355,7 +1398,7 @@ impl WriteParams {
                  so it cannot be combined with `explain: true`",
             ));
         }
-        parse_if_stamp(self.if_stamp.as_deref())
+        parse_if_version(meta, self.if_stamp.as_deref())
     }
 }
 
@@ -1376,7 +1419,7 @@ pub fn update(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
     let update = parse_update(update_json, &params.array_filters)?;
-    let expected = params.expected()?;
+    let expected = params.expected(&meta)?;
     let stop_after = if multi { None } else { Some(1) };
 
     // `explain: true` plans the write and reports it, exactly as `find`
@@ -1430,8 +1473,8 @@ pub fn update(
         "modified": outcome.modified,
         "commits": outcome.commits,
     });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    if let Some(version) = single_version(multi, &outcome) {
+        put_version(&mut body, version);
     }
     Ok(body)
 }
@@ -1475,11 +1518,11 @@ fn refuse_positional_without_filter(
 /// `if_stamp` alongside it for the same reason), so it reports none rather
 /// than the last chunk's last document, which would look like the answer
 /// and not be it.
-fn single_stamp(
+fn single_version(
     multi: bool,
     outcome: &kimmy_storage::ModifyManyOutcome,
-) -> Option<kimmy_core::Stamp> {
-    (!multi && outcome.modified == 1).then_some(outcome.stamp).flatten()
+) -> Option<kimmy_core::DocVersion> {
+    (!multi && outcome.modified == 1).then_some(outcome.version).flatten()
 }
 
 /// Where a filtered write looks, in the engine's terms.
@@ -1556,7 +1599,7 @@ struct Modify<'a> {
     upsert: Option<std::result::Result<Document, String>>,
     now: i64,
     /// The version the write is conditional on, if any.
-    expected: Option<kimmy_core::Stamp>,
+    expected: Option<kimmy_core::DocVersion>,
     /// A `findAndModify`'s positional projection and the image it answers
     /// with. Checked in `apply`, where a refusal writes nothing.
     answer: Option<(&'a shape::FindProjection, ReturnDocument)>,
@@ -1621,7 +1664,11 @@ impl Modify<'_> {
 
 impl kimmy_storage::ModifySpec for Modify<'_> {
     fn expected_stamp(&self) -> Option<kimmy_core::Stamp> {
-        self.expected
+        self.expected.map(|v| v.stamp())
+    }
+
+    fn expected_state(&self) -> Option<kimmy_core::StateHash> {
+        self.expected.and_then(|v| v.state_hash())
     }
 
     fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
@@ -1851,7 +1898,7 @@ pub fn find_and_modify(
     // writer, because only the index planner ran here.
     let candidates = candidates_for(&filter, &meta);
 
-    let expected = parse_if_stamp(spec.if_stamp.as_deref())?;
+    let expected = parse_if_version(&meta, spec.if_stamp.as_deref())?;
     if expected.is_some() && spec.upsert {
         // An upsert says "create it if it is not there"; a stamp says "it
         // must be there, at this version". Both at once has no reading.
@@ -1924,13 +1971,13 @@ pub fn find_and_modify(
         body["upsertedId"] =
             crate::json::bson_to_json(&stored.map_or_else(|| id.to_bson(), Clone::clone));
     }
-    if let Some(stamp) = outcome.stamp {
+    if let Some(version) = outcome.version {
         // The version the write produced — what the next conditional write
         // names. A removal produces a tombstone's stamp, which nothing can
         // be conditional on, so it is reported only for a document that
         // still exists.
         if outcome.after.is_some() {
-            body["stamp"] = json!(stamp.encode());
+            put_version(&mut body, version);
         }
     }
     Ok(body)
@@ -1949,7 +1996,7 @@ pub fn delete(
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
-    let expected = params.expected()?;
+    let expected = params.expected(&meta)?;
     let stop_after = if multi { None } else { Some(1) };
 
     // Plans without deleting, exactly as `update` does above (ADR-131).
@@ -1983,8 +2030,8 @@ pub fn delete(
     let _written = deadline::Deadline::suspend();
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    if let Some(version) = single_version(multi, &outcome) {
+        put_version(&mut body, version);
     }
     Ok(body)
 }

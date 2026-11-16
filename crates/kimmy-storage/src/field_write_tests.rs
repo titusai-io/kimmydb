@@ -494,3 +494,20 @@ fn a_write_conditional_on_an_etag_needs_the_stamp_and_the_state_to_match() {
         true
     );
 }
+
+#[test]
+fn every_write_answers_the_version_it_produced() {
+    use kimmy_core::DocVersion;
+    let (e, _d) = open();
+    let (f, dc) = pair(&e);
+    let id = DocId::Int64(1);
+    let (_, v) = e.insert_versioned(&f, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    assert!(matches!(v, DocVersion::Etag(..)));
+    assert_eq!(e.get_versioned(&f, &id).unwrap().unwrap().0, v);
+    let out = e.replace(&f, &id, doc! { "_id": 1_i64, "a": 2 }, false).unwrap();
+    assert_eq!(e.get_versioned(&f, &id).unwrap().unwrap().0, out.version.unwrap());
+    let tombstone = e.delete_if_state(&f, &id, None, None).unwrap();
+    assert!(tombstone.is_some());
+    let (_, dv) = e.insert_versioned(&dc, doc! { "_id": 1_i64 }).unwrap();
+    assert!(matches!(dv, DocVersion::Stamp(_)), "{dv:?}");
+}
