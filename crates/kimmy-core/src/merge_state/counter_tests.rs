@@ -700,3 +700,34 @@ fn the_cap_mutants_are_caught() {
         assert!(scenario(&o).is_err(), "not caught: {what}");
     }
 }
+
+/// A counter with NO base reads its first part as it is, with no implicit zero to add it to: a field
+/// an `$inc` created holds the operand exactly, sign and exponent (the reference, q7s5a.out I2-I5:
+/// `-0`, `0E+3`, `-0.00`, `1.50`). `0 + -0` is `+0` and `0 + 0E+3` is `0`, and a non-zero operand with
+/// a positive exponent lost it the same way: `0 + 5E+3` read `5000` where the reference stores `5E+3`.
+#[test]
+fn a_counter_with_no_base_reads_its_operand_exactly() {
+    let o = opts();
+    for t in ["-0", "0E+3", "-0E-2", "5E+3", "-5E+3", "1.50"] {
+        let mut w = Writer::new(wid('A', 0), o.clone());
+        w.insert(&fl(&[("k", Value::Int32(1))]), 0).unwrap();
+        w.write_inc_value(&p("x"), &dec(t), 0).expect("the $inc was refused");
+        let got = w.visible().unwrap()[&p("x")].clone();
+        assert_eq!(got, dec(t), "{t} read as {}", text(&got));
+    }
+}
+
+/// Two writers that each added to a field with no base: the sum starts from the first part in the
+/// canonical order, so `5E+3` and `2E+3` read `7E+3` (the exponent of both), in every delivery order
+/// of the two entries and with one state hash (what the reference's serial answer gives).
+#[test]
+fn two_writers_with_no_base_sum_from_the_first_part_in_every_delivery_order() {
+    let o = opts();
+    let v = concurrent_n(
+        &o,
+        &[("k", Value::Int32(1))],
+        "x",
+        &[('A', &dec("5E+3"), 0), ('B', &dec("2E+3"), 0)],
+    );
+    assert_eq!(v, dec("7E+3"), "read as {}", text(&v));
+}
