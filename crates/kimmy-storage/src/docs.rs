@@ -583,7 +583,7 @@ impl Engine {
         let mut ids = Vec::with_capacity(pending.len());
         let mut entries = Vec::with_capacity(pending.len());
         for (index, checked) in pending.into_iter().enumerate() {
-            match self.write_insert(&txn, coll, checked) {
+            match self.write_insert(&txn, coll, checked, None) {
                 Ok((id, entry)) => {
                     ids.push((id, entry.stamp));
                     entries.push(entry);
@@ -613,7 +613,21 @@ impl Engine {
         doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
         let checked = self.check_insert(txn, coll, doc, None)?;
-        self.write_insert(txn, coll, checked)
+        self.write_insert(txn, coll, checked, None)
+    }
+
+    /// [`Self::insert_in_txn`] for the document an upsert creates: for a field collection the
+    /// creation is written through the writer's typed creation entry (`creation`), so its
+    /// increments are counters; a document collection ignores it.
+    pub(crate) fn insert_created_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        doc: Document,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
+    ) -> Result<(DocId, OplogEntry)> {
+        let checked = self.check_insert(txn, coll, doc, None)?;
+        self.write_insert(txn, coll, checked, creation)
     }
 
     /// The half of an insert that can refuse it: the id, the stored state, the
@@ -683,6 +697,7 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         checked: CheckedInsert,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
     ) -> Result<(DocId, OplogEntry)> {
         let CheckedInsert { id, key, body } = checked;
         // A field collection keeps the document's merge state with it: the writer renders the
@@ -698,11 +713,17 @@ impl Engine {
                 }
             };
             let doc: Document = bson::deserialize_from_slice(&body)?;
-            let image =
-                field_write::insert(self.field_writer(), prior, &doc, &mut || self.next_stamp())?
-                    .ok_or_else(|| {
-                    StorageError::Corrupt("an insert over a live field document".into())
-                })?;
+            let image = match creation {
+                Some(creation) => {
+                    field_write::upsert(self.field_writer(), prior, creation, &doc, &mut || {
+                        self.next_stamp()
+                    })?
+                }
+                None => field_write::insert(self.field_writer(), prior, &doc, &mut || {
+                    self.next_stamp()
+                })?,
+            }
+            .ok_or_else(|| StorageError::Corrupt("an insert over a live field document".into()))?;
             Some(image)
         } else {
             None
@@ -1360,6 +1381,12 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(RemoteApplied::Superseded { released: false });
         };
+        // Merging a remote write into a field document is the apply of Step 3; until it
+        // lands an entry for one is refused by name, not stored as a document that has no
+        // state.
+        if coll.merge_policy == MergePolicy::Field {
+            return Err(refuse_field_replication());
+        }
 
         let key = doc_key(&id)?;
         let incoming = match &entry.body {
@@ -2118,6 +2145,16 @@ pub(crate) fn record_stamp(
         Some(raw) => Ok(Some(codec::decode_doc_record(raw.value())?.stamp)),
         None => Ok(None),
     }
+}
+
+/// The refusal of a remote write or snapshot document for a `field` collection, until the apply of
+/// Step 3 exists. Answered as the unbuilt capability it is (`501`).
+pub(crate) fn refuse_field_replication() -> StorageError {
+    StorageError::Core(CoreError::Unsupported(
+        "replicating a collection with merge policy `field` is not built yet: a remote write or \
+         snapshot document for it is refused (use mergePolicy `document` for a replicated collection)"
+            .into(),
+    ))
 }
 
 #[cfg(test)]

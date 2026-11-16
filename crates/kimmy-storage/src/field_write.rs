@@ -18,10 +18,11 @@
 //!   and entries as they were (version 1, no meta); the one `if` is at each call site.
 
 use bson::Document;
-use kimmy_core::effects::{Effects, Outcome};
-use kimmy_core::merge_state::bridge::{document_to_fields, ordered_to_document};
+use kimmy_core::effects::{CellTag, CreationCell, Effects, Outcome, UpsertEffects};
+use kimmy_core::merge_state::bridge::{bson_to_value, document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
-    JoinOptions, MStamp, MergeState, StampError, UpdateError, Writer, WriterId, Written,
+    JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, UpdateRefused, Writer,
+    WriterId, Written,
 };
 use kimmy_core::{Error as CoreError, Hlc, Stamp};
 
@@ -65,8 +66,15 @@ fn refused(what: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Core(CoreError::Unsupported(format!("{what}: {e}")))
 }
 
+/// The writer's refusal of an update or a creation, with its own text, as the request's error
+/// (a 400, like any invalid update).
+fn update_refused(r: UpdateRefused) -> StorageError {
+    StorageError::Core(CoreError::InvalidUpdate(r.to_string()))
+}
+
+/// A stamp the writer refused is a defect of the caller, not of the request.
 fn stamp_error(e: StampError) -> StorageError {
-    refused("the write's stamp", e)
+    StorageError::Corrupt(format!("the write's stamp was refused: {e}"))
 }
 
 /// Run one write against `prior` (the stored state, or `None` for a document never stored) and
@@ -89,7 +97,14 @@ fn write(
         m_stamp(s)
     })
     .map_err(stamp_error)?;
-    let Some(_written) = written else { return Ok(None) };
+    let Some(_written) = written else {
+        // `None` is a write that changes nothing, or one the writer refused for the cap.
+        return if w.would_hit_writer_cap() {
+            Err(update_refused(UpdateRefused::WriterCap))
+        } else {
+            Ok(None)
+        };
+    };
     let rendered = w.state.ordered_document(&opts);
     let alive = rendered.is_some();
     let body = match rendered {
@@ -155,7 +170,64 @@ pub(crate) fn update(
             Err(UpdateError::Stamp(e)) => Err(e),
         })?;
     match refusal {
-        Some(r) => Err(refused("the update", r)),
+        Some(r) => Err(update_refused(r)),
+        None => Ok(image),
+    }
+}
+
+/// The path of every field of `doc`, in its order, a document-valued field before its members:
+/// the order `UpsertEffects::creation_list` asks for.
+fn post_image_order(doc: &Document) -> Vec<Path> {
+    fn walk(d: &Document, at: &mut Vec<String>, out: &mut Vec<Path>) {
+        for (name, value) in d {
+            at.push(name.clone());
+            if let Ok(p) = Path::new(at.iter().cloned()) {
+                out.push(p);
+            }
+            if let bson::Bson::Document(inner) = value {
+                walk(inner, at, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The creation of an upsert that matched nothing, as the writer's typed creation entry: the
+/// filter's equalities, `$setOnInsert`, `$set` and the increments (typed, as counters) in the
+/// order of `doc`, the document the engine would insert, which names the `_id`. One record, one
+/// entry: the stamp is the later of the two the writer takes (the creation and, beside creation
+/// cells, the increment write).
+pub(crate) fn upsert(
+    writer: WriterId,
+    prior: Option<MergeState>,
+    fx: &UpsertEffects,
+    doc: &Document,
+    mint: &mut dyn FnMut() -> Stamp,
+) -> Result<Option<Image>> {
+    let order = post_image_order(doc);
+    // The effects never name `_id` (it is the upsert's key, the engine's); the document's own
+    // `_id` is the first cell of the creation, as it is the first field of an insert.
+    let mut cells = fx.creation_list(&order).map_err(update_refused)?;
+    if let Some(id) = doc.get("_id") {
+        let value = bson_to_value(id).map_err(|e| refused("the _id", e))?;
+        let path = Path::flat("_id").map_err(|e| refused("the _id", e))?;
+        cells.insert(0, CreationCell { path, value, tag: CellTag::Plain });
+    }
+    let mut refusal = None;
+    let image =
+        write(writer, prior, mint, |w, stamp| match w.upsert_create_stamped(&cells, stamp) {
+            Ok((created, _)) => Ok(Some(created)),
+            Err(UpdateError::Refused(r)) => {
+                refusal = Some(r);
+                Ok(None)
+            }
+            Err(UpdateError::Stamp(e)) => Err(e),
+        })?;
+    match refusal {
+        Some(r) => Err(update_refused(r)),
         None => Ok(image),
     }
 }

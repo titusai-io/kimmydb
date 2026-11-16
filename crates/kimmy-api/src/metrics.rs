@@ -129,6 +129,9 @@ pub struct StorageReadings {
     /// holds only as the state a snapshot gave it (`Engine::state_held_refusals`,
     /// ADR-224). A reading, for the reason `sync_ddl_relogged` is.
     pub sync_horizon_state_held: u64,
+    /// Remote writes and snapshot documents refused for a `field` collection, whose apply is not
+    /// built yet (`Engine::field_replication_refusals`). A reading, for the reason `sync_ddl_relogged` is.
+    pub sync_field_refused: u64,
     /// How long writes waited for the single writer, the writes that gave
     /// up waiting inside their budget, and the longest any one transaction
     /// held it (ADR-151). The wait is the part of a write's latency that
@@ -500,6 +503,8 @@ pub struct MetricsSnapshot {
     pub sync_ddl_relogged: u64,
     /// Windows refused a peer for a hole (ADR-224). One of the engine's readings.
     pub sync_horizon_state_held: u64,
+    /// Remote writes and snapshot documents refused for a `field` collection. One of the engine's readings.
+    pub sync_field_refused: u64,
     /// Collections the cross-member divergence check currently has confirmed
     /// (ADR-133): held by a peer and not here, or held by both with
     /// disagreeing document counts, seen on two ticks running. Moves for a
@@ -1524,6 +1529,7 @@ impl Metrics {
             }),
             sync_ddl_relogged: readings.sync_ddl_relogged,
             sync_horizon_state_held: readings.sync_horizon_state_held,
+            sync_field_refused: readings.sync_field_refused,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
@@ -1943,6 +1949,9 @@ impl Metrics {
              # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.\n\
              # TYPE kimmy_sync_horizon_state_held_total counter\n\
              kimmy_sync_horizon_state_held_total {sync_horizon_state_held}\n\
+             # HELP kimmy_sync_field_refused_total Remote writes and snapshot documents this node refused because their collection has merge policy field, whose replication is not built yet. The rest of the batch is applied and the position moves past the refused entries; a rising value names a field collection in a cluster that replicates it.\n\
+             # TYPE kimmy_sync_field_refused_total counter\n\
+             kimmy_sync_field_refused_total {sync_field_refused}\n\
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes, or (0.49.0) held by both with different index or vector definitions, which kimmy_sync_definition_divergent_collections attributes; nothing repairs either - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
@@ -2137,6 +2146,7 @@ impl Metrics {
             ddl_confirm_pushes = self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged = readings.sync_ddl_relogged,
             sync_horizon_state_held = readings.sync_horizon_state_held,
+            sync_field_refused = readings.sync_field_refused,
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
             sync_div_skipped = self.get(&self.sync_divergence_skips),
@@ -3225,6 +3235,7 @@ mod tests {
             index_unkeyed_refusals: 27,
             sync_ddl_relogged: 91,
             sync_horizon_state_held: 92,
+            sync_field_refused: 93,
             webhook_active: 15,
             webhook_invalidated: 16,
             webhook_unreadable: 38,
@@ -3881,6 +3892,9 @@ kimmy_sync_ddl_relogged_total 91
 # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.
 # TYPE kimmy_sync_horizon_state_held_total counter
 kimmy_sync_horizon_state_held_total 92
+# HELP kimmy_sync_field_refused_total Remote writes and snapshot documents this node refused because their collection has merge policy field, whose replication is not built yet. The rest of the batch is applied and the position moves past the refused entries; a rising value names a field collection in a cluster that replicates it.
+# TYPE kimmy_sync_field_refused_total counter
+kimmy_sync_field_refused_total 93
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes, or (0.49.0) held by both with different index or vector definitions, which kimmy_sync_definition_divergent_collections attributes; nothing repairs either - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
@@ -4563,6 +4577,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         }
         expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
         expect(&format!("kimmy_sync_horizon_state_held_total {}\n", s.sync_horizon_state_held));
+        expect(&format!("kimmy_sync_field_refused_total {}\n", s.sync_field_refused));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
             "kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {}\n",
@@ -5082,6 +5097,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // (ADR-220).
                 + 2
                 // Pulls refused for a hole a snapshot left (ADR-224).
+                + 1
+                // Entries of field collections refused until the field apply exists (Q7 S2c).
                 + 1
                 // The definition digest (B3 half 2): its gauge, three outcomes
                 // and one line per deferral reason.

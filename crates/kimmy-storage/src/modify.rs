@@ -135,6 +135,15 @@ pub trait ModifySpec {
         None
     }
 
+    /// The creation of an upsert as effects, for a `field` collection: what makes `doc`, the
+    /// document `upsert` answered. `None` (the default): `doc` is inserted as it is.
+    fn upsert_effects(
+        &self,
+        _doc: &Document,
+    ) -> Option<std::result::Result<kimmy_core::effects::UpsertEffects, String>> {
+        None
+    }
+
     /// The document to insert when nothing matched, if this is an upsert.
     fn upsert(&self) -> Option<std::result::Result<Document, String>>;
 
@@ -494,7 +503,21 @@ impl Engine {
                     ));
                 }
             };
-            let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
+            let creation = if coll.merge_policy == MergePolicy::Field {
+                match spec.upsert_effects(&doc) {
+                    Some(Ok(fx)) => Some(fx),
+                    Some(Err(e)) => {
+                        txn.abort()?;
+                        return Err(StorageError::Core(
+                            spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
+                        ));
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let (id, entry) = match self.insert_created_in_txn(&txn, coll, doc, creation.as_ref()) {
                 Ok(pair) => pair,
                 Err(e) => {
                     txn.abort()?;

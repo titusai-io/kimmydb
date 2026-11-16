@@ -1676,6 +1676,20 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         }
     }
 
+    fn upsert_effects(
+        &self,
+        _doc: &Document,
+    ) -> Option<std::result::Result<kimmy_core::effects::UpsertEffects, String>> {
+        let update = self.update?;
+        match kimmy_query::update_effects::plan_upsert(update, self.filter, self.now) {
+            Ok(kimmy_query::update_effects::UpsertPlan::Effects { effects, .. }) => {
+                Some(Ok(effects))
+            }
+            Ok(kimmy_query::update_effects::UpsertPlan::Replace { .. }) => None,
+            Err(e) => Some(Err(Self::reported(&self.failures, e))),
+        }
+    }
+
     fn upsert(&self) -> Option<std::result::Result<Document, String>> {
         self.upsert.clone()
     }
