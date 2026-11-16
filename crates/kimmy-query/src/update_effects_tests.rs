@@ -1181,3 +1181,54 @@ fn an_inc_of_a_zero_integer_on_an_absent_field_keeps_its_type() {
     absent_inc_stores_the_operand("q7s5a0009", Bson::Int32(0));
     absent_inc_stores_the_operand("q7s5a0010", Bson::Int64(0));
 }
+
+/// D1 and D2, q7s5b0001 and q7s5b0002: a Decimal128 with a positive exponent and a non-zero
+/// coefficient on an absent field is stored as written, `5E+3` and `-5E+3` (not `5000`).
+#[test]
+fn an_inc_of_a_decimal_with_a_positive_exponent_on_an_absent_field_keeps_the_exponent() {
+    absent_inc_stores_the_operand("q7s5b0001", decimal("5E+3"));
+    absent_inc_stores_the_operand("q7s5b0002", decimal("-5E+3"));
+}
+
+/// The stored `x` after `$inc first` and then `$inc second` on `{_id: 1}`: the effects of each
+/// step through the writer render the engine's post-image (`parity_doc`), and the second step
+/// finds the first one's result as the document.
+fn two_decimal_incs(label: &str, first: &str, second: &str, want: &str) {
+    let d = doc! { "_id": 1 };
+    let u1 = doc! {"$inc": {"x": decimal(first)}};
+    let after1 = plan_of(&parse(u1.clone()), None, &d).1;
+    parity_doc(u1, &d);
+    let u2 = doc! {"$inc": {"x": decimal(second)}};
+    let after2 = plan_of(&parse(u2.clone()), None, &after1).1;
+    parity_doc(u2, &after1);
+    assert_eq!(after2.get("x"), Some(&decimal(want)), "{label}: {after2}");
+}
+
+/// D3 and D4, q7s5b0003 and q7s5b0004: `5E+3` and `2E+3` added one after the other, in either
+/// order, store `7E+3` (the exponent of both).
+#[test]
+fn two_decimal_incs_with_a_positive_exponent_add_up_in_either_order() {
+    two_decimal_incs("q7s5b0003", "5E+3", "2E+3", "7E+3");
+    two_decimal_incs("q7s5b0004", "2E+3", "5E+3", "7E+3");
+}
+
+/// D5, q7s5b0005: `$inc -0` creates `-0`, and `$inc 0E+3` after it is no write (nModified 0, the
+/// stored `-0` stays): the engine finds the result equal to what is stored.
+#[test]
+fn an_inc_that_leaves_a_stored_decimal_zero_equal_is_no_write() {
+    let d = doc! { "_id": 1, "x": decimal("-0") };
+    let (effects, outcome) = parity_doc(doc! {"$inc": {"x": decimal("0E+3")}}, &d);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(outcome, Outcome::Unchanged);
+}
+
+/// D6, q7s5b0006: over a PRESENT Decimal128 `0`, `$inc 5E+3` stores `5000` (the sum with a base
+/// takes the smaller exponent, as it does for any base): the base is the only part that is
+/// added to.
+#[test]
+fn an_inc_over_a_present_decimal_zero_is_a_sum_with_a_base() {
+    let d = doc! { "_id": 1, "x": decimal("0") };
+    let (_, post) = plan_of(&parse(doc! {"$inc": {"x": decimal("5E+3")}}), None, &d);
+    assert_eq!(post.get("x"), Some(&decimal("5000")));
+    parity_doc(doc! {"$inc": {"x": decimal("5E+3")}}, &d);
+}

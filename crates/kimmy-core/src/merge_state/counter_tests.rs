@@ -708,7 +708,8 @@ fn the_cap_mutants_are_caught() {
 #[test]
 fn a_counter_with_no_base_reads_its_operand_exactly() {
     let o = opts();
-    for t in ["-0", "0E+3", "-0E-2", "5E+3", "-5E+3", "1.50"] {
+    // q7s5a0005-0008, q7s5b0001 and q7s5b0002
+    for t in ["-0", "0E+3", "-0E-2", "1.50", "5E+3", "-5E+3"] {
         let mut w = Writer::new(wid('A', 0), o.clone());
         w.insert(&fl(&[("k", Value::Int32(1))]), 0).unwrap();
         w.write_inc_value(&p("x"), &dec(t), 0).expect("the $inc was refused");
@@ -719,7 +720,8 @@ fn a_counter_with_no_base_reads_its_operand_exactly() {
 
 /// Two writers that each added to a field with no base: the sum starts from the first part in the
 /// canonical order, so `5E+3` and `2E+3` read `7E+3` (the exponent of both), in every delivery order
-/// of the two entries and with one state hash (what the reference's serial answer gives).
+/// of the two entries and with one state hash: the reference's serial answer in either order
+/// (q7s5b0003, q7s5b0004).
 #[test]
 fn two_writers_with_no_base_sum_from_the_first_part_in_every_delivery_order() {
     let o = opts();
@@ -730,4 +732,16 @@ fn two_writers_with_no_base_sum_from_the_first_part_in_every_delivery_order() {
         &[('A', &dec("5E+3"), 0), ('B', &dec("2E+3"), 0)],
     );
     assert_eq!(v, dec("7E+3"), "read as {}", text(&v));
+}
+
+/// With a base the first part is the base and the sum takes the smaller exponent, as for any
+/// base (q7s5b0006: over a present `0`, `$inc 5E+3` stores `5000`): only a counter with NO base
+/// reads its operand as it is.
+#[test]
+fn a_counter_with_a_base_zero_adds_to_it() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", dec("0"))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &dec("5E+3"), 0).expect("the $inc was refused");
+    let got = w.visible().unwrap()[&p("x")].clone();
+    assert_eq!(got, dec("5000"), "read as {}", text(&got));
 }
