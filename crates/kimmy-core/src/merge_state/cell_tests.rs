@@ -1511,7 +1511,10 @@ fn a_decimal_inc_reads_as_the_products_stored_decimal() {
     }
     // an absent field: the product creates it from the operand as it is, its cohort member kept (the
     // canonical encoding of the operand): `5E+3` stays `5E+3`, `-0` stays `-0`, `0E2015` stays `0E+2015`
-    // `5E+3` and `-0`: recorded (q7s5b0001, q7s5a0005); the others follow the same rule
+    // Recorded: `5E+3` (q7s5b0001), `-0` (q7s5a0005) and `NaN` (q7s2k.out k0016, a Decimal128 NaN
+    // over an absent field). `Infinity` is recorded as POSITIVE only (k0017): `-Infinity` is the
+    // implementation's rule, not a recorded answer; so are `1E+40`, `0E2015` and `1E+2`: they test
+    // that the operand's canonical encoding is the value.
     for op in ["5E+3", "-0", "1E+40", "NaN", "-Infinity", "0E2015", "1E+2"] {
         let mut w = Writer::new(wid('A', 0), opts());
         w.insert(&fl(&[("y", i(1))]), 0).unwrap();
