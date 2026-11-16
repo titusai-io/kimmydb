@@ -295,8 +295,9 @@ fn timed_routes() -> Router<SharedState> {
 /// `docs/openapi.yaml` gives a query parameter, so a parameter documented on a
 /// route this table does not open, or opened here and documented nowhere, is
 /// a failing test rather than a route that quietly behaves otherwise.
-pub const QUERY_STRING_ROUTES: [(&str, &str); 9] = [
+pub const QUERY_STRING_ROUTES: [(&str, &str); 10] = [
     ("GET", "/v1/db/{db}/coll/{coll}/docs"),
+    ("GET", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("PUT", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("DELETE", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("GET", "/v1/db/{db}/coll/{coll}/describe"),
