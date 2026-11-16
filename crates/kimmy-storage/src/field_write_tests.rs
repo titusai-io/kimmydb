@@ -442,3 +442,69 @@ fn a_snapshot_page_with_a_field_document_applies_the_rest_and_the_cursor_moves_o
     assert!(raw(&b, &db_, 2).is_some());
     assert_eq!(b.field_replication_refusals(), 1);
 }
+
+#[test]
+fn the_version_of_a_field_document_is_its_stamp_and_the_hash_of_its_state() {
+    use kimmy_core::DocVersion;
+    let (e, _d) = open();
+    let (f, dc) = pair(&e);
+    for c in [&f, &dc] {
+        e.insert(c, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    }
+    let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
+    let hash = MergeState::compact_hash_of(rec.meta.as_deref().unwrap()).unwrap();
+    let (v, d) = e.get_versioned(&f, &DocId::Int64(1)).unwrap().unwrap();
+    assert_eq!(v, DocVersion::Etag(rec.stamp, hash));
+    assert_eq!(d, doc! { "_id": 1_i64, "a": 1 });
+    let (v, _) = e.get_versioned(&dc, &DocId::Int64(1)).unwrap().unwrap();
+    assert!(matches!(v, DocVersion::Stamp(_)), "{v:?}");
+    assert!(e.get_versioned(&f, &DocId::Int64(9)).unwrap().is_none());
+}
+
+#[test]
+fn a_write_conditional_on_an_etag_needs_the_stamp_and_the_state_to_match() {
+    use crate::StorageError;
+    let (e, _d) = open();
+    let (f, _) = pair(&e);
+    let id = DocId::Int64(1);
+    e.insert(&f, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    let (v, _) = e.get_versioned(&f, &id).unwrap().unwrap();
+    let (stamp, hash) = (v.stamp(), v.state_hash().unwrap());
+    let other = [hash[0] ^ 1; 16];
+    // the right stamp with another state is stale, and writes nothing
+    let last = e.clock_last();
+    let r =
+        e.replace_if_state(&f, &id, doc! { "_id": 1_i64, "a": 2 }, false, Some(stamp), Some(other));
+    assert!(matches!(r, Err(StorageError::Stale { current: Some(c) }) if c == stamp), "{r:?}");
+    let r = e.delete_if_state(&f, &id, Some(stamp), Some(other));
+    assert!(matches!(r, Err(StorageError::Stale { .. })), "{r:?}");
+    assert_eq!(e.clock_last(), last);
+    assert_eq!(e.get(&f, &id).unwrap().unwrap(), doc! { "_id": 1_i64, "a": 1 });
+    // the right etag writes, and the old etag is stale afterwards
+    let out = e
+        .replace_if_state(&f, &id, doc! { "_id": 1_i64, "a": 2 }, false, Some(stamp), Some(hash))
+        .unwrap();
+    assert!(out.modified);
+    let r = e.delete_if_state(&f, &id, Some(stamp), Some(hash));
+    assert!(matches!(r, Err(StorageError::Stale { .. })), "{r:?}");
+    let (v2, _) = e.get_versioned(&f, &id).unwrap().unwrap();
+    assert_ne!(v2, v);
+    assert!(e.delete_if_state(&f, &id, Some(v2.stamp()), v2.state_hash()).unwrap().is_some());
+}
+
+#[test]
+fn every_write_answers_the_version_it_produced() {
+    use kimmy_core::DocVersion;
+    let (e, _d) = open();
+    let (f, dc) = pair(&e);
+    let id = DocId::Int64(1);
+    let (_, v) = e.insert_versioned(&f, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    assert!(matches!(v, DocVersion::Etag(..)));
+    assert_eq!(e.get_versioned(&f, &id).unwrap().unwrap().0, v);
+    let out = e.replace(&f, &id, doc! { "_id": 1_i64, "a": 2 }, false).unwrap();
+    assert_eq!(e.get_versioned(&f, &id).unwrap().unwrap().0, out.version.unwrap());
+    let tombstone = e.delete_if_state(&f, &id, None, None).unwrap();
+    assert!(tombstone.is_some());
+    let (_, dv) = e.insert_versioned(&dc, doc! { "_id": 1_i64 }).unwrap();
+    assert!(matches!(dv, DocVersion::Stamp(_)), "{dv:?}");
+}

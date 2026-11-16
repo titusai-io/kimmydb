@@ -166,6 +166,13 @@ pub trait ModifySpec {
         None
     }
 
+    /// With [`Self::expected_stamp`], for a `field` document: the hash of the merged state the
+    /// caller read (the second half of an etag). A match at the stamp with another state is
+    /// [`StorageError::Stale`] too.
+    fn expected_state(&self) -> Option<kimmy_core::StateHash> {
+        None
+    }
+
     /// Where the document keys an index range gathers are charged, if the caller budgets
     /// them (ADR-270's second addendum).
     ///
@@ -218,6 +225,8 @@ pub struct ModifyOutcome {
     pub upserted: Option<DocId>,
     /// The stamp the write produced, when it wrote anything.
     pub stamp: Option<Stamp>,
+    /// The version identity the write produced (an etag under `field`), when it wrote anything.
+    pub version: Option<kimmy_core::DocVersion>,
 }
 
 /// What a filtered write did, counted inside the transaction that did it.
@@ -245,6 +254,8 @@ pub struct ModifyManyOutcome {
     /// (ADR-084). A multi write reports it too, but it describes the last
     /// document of the last chunk and nothing else.
     pub stamp: Option<Stamp>,
+    /// The version identity of the last document written (an etag under `field`).
+    pub version: Option<kimmy_core::DocVersion>,
 }
 
 impl Engine {
@@ -337,6 +348,7 @@ impl Engine {
                         outcome.commits += 1;
                         outcome.modified += entries.len() as u64;
                         outcome.stamp = Some(last.stamp);
+                        outcome.version = Some(crate::docs::version_of_entry(last));
                         // Published per chunk, after its commit: a
                         // subscriber sees a chunk whole before the next one
                         // begins.
@@ -529,6 +541,7 @@ impl Engine {
             )?;
             txn.commit()?;
             let stamp = entry.stamp;
+            let version = crate::docs::version_of_entry(&entry);
             self.publish(vec![entry]);
             return Ok(ModifyOutcome {
                 before: None,
@@ -539,6 +552,7 @@ impl Engine {
                 modified: false,
                 upserted: Some(id),
                 stamp: Some(stamp),
+                version: Some(version),
             });
         };
 
@@ -552,16 +566,17 @@ impl Engine {
 
         // Unchanged: nothing was written, so nothing is committed, minted or
         // published, and the document keeps the stamp it had (ADR-208).
-        let stamp = match entry {
+        let (stamp, version) = match entry {
             Some(entry) => {
                 txn.commit()?;
                 let stamp = entry.stamp;
+                let version = crate::docs::version_of_entry(&entry);
                 self.publish(vec![entry]);
-                Some(stamp)
+                (Some(stamp), Some(version))
             }
             None => {
                 txn.abort()?;
-                None
+                (None, None)
             }
         };
 
@@ -572,6 +587,7 @@ impl Engine {
             modified: stamp.is_some(),
             upserted: None,
             stamp,
+            version,
         })
     }
 
@@ -596,6 +612,17 @@ impl Engine {
             && expected != found.stamp
         {
             return Err(StorageError::Stale { current: Some(found.stamp) });
+        }
+        if let Some(want) = spec.expected_state() {
+            let key = crate::docs::doc_key(&extract_id(&found.doc)?)?;
+            let docs = txn.open_table(tables::DOCS)?;
+            let have = docs
+                .get((coll.id.0, key.as_slice()))?
+                .map(|raw| codec::decode_doc_record_with_meta(raw.value()))
+                .transpose()?;
+            if crate::docs::state_hash_of(have.as_ref()) != Some(want) {
+                return Err(StorageError::Stale { current: Some(found.stamp) });
+            }
         }
         let id = extract_id(&found.doc)?;
         let next = spec.apply(&found.doc).map_err(|e| match kimmy_core::deadline::check() {
@@ -2837,7 +2864,14 @@ mod tests {
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
         assert_eq!(
             out,
-            ModifyManyOutcome { examined: 2, matched: 2, modified: 0, commits: 0, stamp: None }
+            ModifyManyOutcome {
+                examined: 2,
+                matched: 2,
+                modified: 0,
+                commits: 0,
+                stamp: None,
+                version: None
+            }
         );
         assert_eq!(footprint(&engine, &coll, &[1, 2]), before, "nothing reached the store");
         assert!(drain(&mut rx).is_empty(), "nothing was published");

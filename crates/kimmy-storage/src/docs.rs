@@ -40,6 +40,10 @@ pub struct WriteOutcome {
     /// What a caller hands back as `if_stamp` to make its next write
     /// conditional on nothing having happened in between.
     pub stamp: Option<Stamp>,
+    /// The version identity the write produced: [`Self::stamp`] under the `document` policy, the
+    /// stamp and the hash of the merged state (an etag) under `field`. `None` when nothing was
+    /// written.
+    pub version: Option<kimmy_core::DocVersion>,
 }
 
 /// A bulk insert's failure, and which document caused it.
@@ -134,7 +138,7 @@ impl WriteScope<'_> {
         self.refuse_if_poisoned()?;
         let (outcome, entry) = self
             .engine
-            .replace_in_txn(&self.txn, coll, id, doc, upsert, None)
+            .replace_in_txn(&self.txn, coll, id, doc, upsert, Condition::default())
             .map_err(|e| self.poison(e))?;
         self.wrote |= entry.is_some();
         self.entries.extend(entry);
@@ -205,7 +209,7 @@ impl WriteScope<'_> {
         self.refuse_if_poisoned()?;
         let entry = self
             .engine
-            .delete_in_txn(&self.txn, coll, id, |_, _| Ok(true))
+            .delete_in_txn(&self.txn, coll, id, None, |_, _| Ok(true))
             .map_err(|e| self.poison(e))?;
         let removed = entry.is_some();
         self.wrote |= removed;
@@ -272,6 +276,14 @@ impl WriteScope<'_> {
             "a write inside this scope failed and the scope cannot commit: {first}"
         ))
     }
+}
+
+/// The version a conditional write is held to: the stamp of the live document and, for a `field`
+/// document, the hash of its merged state. The default is no condition.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Condition {
+    pub stamp: Option<Stamp>,
+    pub state: Option<kimmy_core::StateHash>,
 }
 
 /// An insert that has passed every check and is not yet written: its id, its
@@ -460,6 +472,36 @@ impl Engine {
         self.get_record_by_encoded_key(coll, &doc_key(id)?)
     }
 
+    /// One live document with its version identity: its stamp under the `document` policy, its
+    /// stamp and the hash of its merged state (an etag) under `field`. `None` if it is absent or
+    /// tombstoned.
+    pub fn get_versioned(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+    ) -> Result<Option<(kimmy_core::DocVersion, Document)>> {
+        let key = doc_key(id)?;
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+            return Ok(None);
+        };
+        let record = codec::decode_doc_record_with_meta(raw.value())?;
+        let Some(doc) = record.document()? else {
+            return Ok(None);
+        };
+        let version = match (coll.merge_policy, state_hash_of(Some(&record))) {
+            (MergePolicy::Field, Some(hash)) => kimmy_core::DocVersion::Etag(record.stamp, hash),
+            (MergePolicy::Field, None) => {
+                return Err(StorageError::Corrupt(
+                    "a record of a field collection carries no merge state".into(),
+                ));
+            }
+            (MergePolicy::Document, _) => kimmy_core::DocVersion::Stamp(record.stamp),
+        };
+        Ok(Some((version, doc)))
+    }
+
     /// The stamp of a live document, or `None` if it is absent or tombstoned.
     ///
     /// Exposed so that derived data can be tagged with the version of the
@@ -517,6 +559,26 @@ impl Engine {
         self.publish(vec![entry]);
 
         Ok((id, stamp))
+    }
+
+    /// [`Engine::insert_stamped`] answering with the version identity the insert produced.
+    pub fn insert_versioned(
+        &self,
+        coll: &CollectionMeta,
+        doc: Document,
+    ) -> Result<(DocId, kimmy_core::DocVersion)> {
+        let txn = self.begin_write(WriterHolder::Write)?;
+        let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
+            Ok(pair) => pair,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        txn.commit()?;
+        let version = version_of_entry(&entry);
+        self.publish(vec![entry]);
+        Ok((id, version))
     }
 
     /// Insert many documents in a single transaction, or none of them.
@@ -794,12 +856,34 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
+        self.replace_if_state(coll, id, doc, upsert, expected, None)
+    }
+
+    /// [`Engine::replace_if`] with the version of a `field` document, which is a stamp and the
+    /// hash of the merged state (an etag): the write happens only if both match what is stored.
+    /// A state hash against a `document` collection never matches.
+    pub fn replace_if_state(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        doc: Document,
+        upsert: bool,
+        expected: Option<Stamp>,
+        expected_state: Option<kimmy_core::StateHash>,
+    ) -> Result<WriteOutcome> {
         // The client's admission point for a replace and an upsert (ADR-250).
         if self.caps_apply() {
             kimmy_core::limits::check_id(id)?;
         }
         let txn = self.begin_write(WriterHolder::Write)?;
-        match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
+        match self.replace_in_txn(
+            &txn,
+            coll,
+            id,
+            doc,
+            upsert,
+            Condition { stamp: expected, state: expected_state },
+        ) {
             Ok((outcome, Some(entry))) => {
                 txn.commit()?;
                 self.publish(vec![entry]);
@@ -844,8 +928,9 @@ impl Engine {
         id: &DocId,
         doc: Document,
         upsert: bool,
-        expected: Option<Stamp>,
+        condition: Condition,
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
+        let Condition { stamp: expected, state: expected_state } = condition;
         let key = doc_key(id)?;
 
         let field = coll.merge_policy == MergePolicy::Field;
@@ -905,16 +990,31 @@ impl Engine {
             if expected.is_some() && current != expected {
                 return Err(StorageError::Stale { current });
             }
+            if let Some(want) = expected_state
+                && state_hash_of(existing.as_ref()) != Some(want)
+            {
+                return Err(StorageError::Stale { current });
+            }
             if !existed && !upsert {
-                let unmatched =
-                    WriteOutcome { matched: false, modified: false, upserted: false, stamp: None };
+                let unmatched = WriteOutcome {
+                    matched: false,
+                    modified: false,
+                    upserted: false,
+                    stamp: None,
+                    version: None,
+                };
                 return Ok((unmatched, None));
             }
             if unchanged {
                 // Byte for byte what is stored: no stamp, no record, no
                 // index maintenance, no oplog entry (ADR-208).
-                let unchanged =
-                    WriteOutcome { matched: true, modified: false, upserted: false, stamp: None };
+                let unchanged = WriteOutcome {
+                    matched: true,
+                    modified: false,
+                    upserted: false,
+                    stamp: None,
+                    version: None,
+                };
                 return Ok((unchanged, None));
             }
             // Only a write that will be made is held to the cap, so sending a stored
@@ -990,6 +1090,7 @@ impl Engine {
             modified: existed,
             upserted: !existed,
             stamp: Some(stamp),
+            version: Some(version_of_entry(&entry)),
         };
         Ok((outcome, Some(entry)))
     }
@@ -1000,7 +1101,7 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        Ok(self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true))?.is_some())
+        Ok(self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true))?.is_some())
     }
 
     /// [`Engine::delete`], conditional on the document's current version,
@@ -1019,19 +1120,31 @@ impl Engine {
         id: &DocId,
         expected: Option<Stamp>,
     ) -> Result<Option<Stamp>> {
+        Ok(self.delete_if_state(coll, id, expected, None)?.map(|v| v.stamp()))
+    }
+
+    /// [`Engine::delete_if`] with the version of a `field` document: a stamp and the hash of the
+    /// merged state, both of which must match what is stored.
+    pub fn delete_if_state(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        expected: Option<Stamp>,
+        expected_state: Option<kimmy_core::StateHash>,
+    ) -> Result<Option<kimmy_core::DocVersion>> {
         let Some(expected) = expected else {
-            return self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true));
+            return self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true));
         };
         // The absent case is decided here rather than in the guard, which
         // only ever sees a live document.
-        match self.delete_where(WriterHolder::Write, coll, id, |current, _| {
+        match self.delete_where(WriterHolder::Write, coll, id, expected_state, |current, _| {
             if current == expected {
                 Ok(true)
             } else {
                 Err(StorageError::Stale { current: Some(current) })
             }
         })? {
-            Some(stamp) => Ok(Some(stamp)),
+            Some(version) => Ok(Some(version)),
             None => Err(StorageError::Stale { current: None }),
         }
     }
@@ -1055,7 +1168,9 @@ impl Engine {
         // The expiry pass's own hold, not a client's: a TTL delete costs the
         // same transaction as a client's delete, and an operator asking what
         // held the writer needs the two apart (ADR-159).
-        Ok(self.delete_where(WriterHolder::Expiry, coll, id, |_, doc| Ok(guard(doc)))?.is_some())
+        Ok(self
+            .delete_where(WriterHolder::Expiry, coll, id, None, |_, doc| Ok(guard(doc)))?
+            .is_some())
     }
 
     /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
@@ -1078,15 +1193,16 @@ impl Engine {
         holder: WriterHolder,
         coll: &CollectionMeta,
         id: &DocId,
+        expected_state: Option<kimmy_core::StateHash>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
-    ) -> Result<Option<Stamp>> {
+    ) -> Result<Option<kimmy_core::DocVersion>> {
         let txn = self.begin_write(holder)?;
-        match self.delete_in_txn(&txn, coll, id, guard) {
+        match self.delete_in_txn(&txn, coll, id, expected_state, guard) {
             Ok(Some(entry)) => {
                 txn.commit()?;
-                let stamp = entry.stamp;
+                let version = version_of_entry(&entry);
                 self.publish(vec![entry]);
-                Ok(Some(stamp))
+                Ok(Some(version))
             }
             // Nothing to remove, or the guard declined: nothing was written,
             // so nothing is committed — a refused expiry must not cost an
@@ -1118,6 +1234,7 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         id: &DocId,
+        expected_state: Option<kimmy_core::StateHash>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<OplogEntry>> {
         let key = doc_key(id)?;
@@ -1132,6 +1249,12 @@ impl Engine {
                     } else {
                         codec::decode_doc_record(raw.value())?
                     };
+                    if record.is_live()
+                        && let Some(want) = expected_state
+                        && state_hash_of(Some(&record)) != Some(want)
+                    {
+                        return Err(StorageError::Stale { current: Some(record.stamp) });
+                    }
                     let state = if field && record.is_live() {
                         Some(field_write::load(record.meta.as_deref())?)
                     } else {
@@ -2157,6 +2280,22 @@ pub(crate) fn refuse_field_replication() -> StorageError {
     ))
 }
 
+/// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read
+/// from the stored bytes without decoding the state. `None` for a record with no meta.
+pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
+    let meta = record?.meta.as_deref()?;
+    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
+}
+
+/// The version identity an oplog entry's write produced: the stamp, and for a `field` entry the
+/// hash of the merged state it carries.
+pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
+    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::compact_hash_of) {
+        Some(Ok(hash)) => kimmy_core::DocVersion::Etag(entry.stamp, hash),
+        _ => kimmy_core::DocVersion::Stamp(entry.stamp),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bson::doc;
@@ -2657,7 +2796,13 @@ mod tests {
         let outcome = engine.replace(&coll, &id, doc! { "a": 1 }, false).unwrap();
         assert_eq!(
             outcome,
-            WriteOutcome { matched: false, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: false,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         assert!(engine.get(&coll, &id).unwrap().is_none());
     }
@@ -2992,7 +3137,13 @@ mod tests {
         let out = engine.replace(&coll, &local, doc! { "email": "clash@x" }, false).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         let out = engine.modify_where(&coll, &crate::Candidates::Scan, &SetEmail, None).unwrap();
         assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0));
@@ -3539,13 +3690,25 @@ mod tests {
         let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, false).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         // Upsert changes nothing about an existing document.
         let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, true).unwrap();
         assert_eq!(
             out,
-            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+            WriteOutcome {
+                matched: true,
+                modified: false,
+                upserted: false,
+                stamp: None,
+                version: None
+            }
         );
         // At the current stamp it is the same no-op, and the stamp stays
         // valid for the next conditional write.
