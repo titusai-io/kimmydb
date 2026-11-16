@@ -60,6 +60,10 @@ pub enum Probe {
     /// `probes::q3_whole_vector`: an entry whose stamp the receiver covers and whose state it does not
     /// is applied by the design and skipped by the stamp-only mutant.
     Q3Stamp,
+    /// `probes::omitted_lower_stamp_entry` (Step 3, ruling 9): an entry joined below the receiver's newest
+    /// stamp is appended by the design; the mutant joins it and does not append it, so the next puller of the
+    /// receiver reads a state without it.
+    OmittedLower,
     /// `probes::v3m1_order_independent`: two members that apply the same entries in different orders, after
     /// a partition longer than retention, must hold the same state. The default protocol, skip on.
     HorizonOrder,
@@ -260,6 +264,12 @@ pub fn mutants() -> Vec<Mutant> {
             apply: |c| c.flags.covered_skip_by_stamp = true,
             grader: Bounded { nested: false },
             probe: Q3Stamp,
+        },
+        Mutant {
+            name: "an entry joined below the receiver's newest stamp is not appended  [Step 3, ruling 9]",
+            apply: |c| c.flags.append_only_newest = true,
+            grader: Bounded { nested: false },
+            probe: OmittedLower,
         },
         Mutant {
             name: "no start-HLC rule: a new origin is pulled from 0  [Q3]",
@@ -489,6 +499,23 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
             (
                 Some(format!(
                     "Q3 whole vector: the receiver learns the write the entry carries: design {d}, mutant {m}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
+        }
+        Probe::OmittedLower => {
+            let (d, m) = (
+                probes::omitted_lower_stamp_entry(&design),
+                probes::omitted_lower_stamp_entry(&cfg),
+            );
+            let design_ok =
+                d.p_reads_a_and_b && d.same_state && d.snapshots == 0 && !d.follow_up_moved;
+            let k = design_ok && !m.p_reads_a_and_b;
+            (
+                Some(format!(
+                    "omitted lower stamp: P reads a and b with no snapshot: design {design_ok}, mutant {}: {}",
+                    m.p_reads_a_and_b,
                     if k { "killed" } else { "NOT killed" }
                 )),
                 k,

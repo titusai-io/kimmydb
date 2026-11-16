@@ -637,3 +637,46 @@ pub fn v3m1_order_independent(cfg: &Cfg) -> bool {
     }
     w.canon() == v.canon()
 }
+
+/// Step 3, ruling 9: the required case (two documents, three members; a single-document run cannot show it).
+/// A sets `X.a` at s1; M, not having it, sets `X.b` at s2 > s1; M pulls A (the entry is joined and must be
+/// APPENDED although M's newest stamp out-stamps it); A writes another document Y at s3 and M pulls it, which
+/// raises M's servable[A] past s1; P, empty, pulls only M. P must read `X = {a, b}` with M's state, with no
+/// snapshot and nothing left to move on a following P-to-A round. Returns what P read, whether P and M hold
+/// the same state, and the snapshots taken anywhere.
+pub struct OmittedOut {
+    pub p_reads_a_and_b: bool,
+    pub same_state: bool,
+    pub snapshots: u32,
+    pub follow_up_moved: bool,
+}
+
+pub fn omitted_lower_stamp_entry(cfg: &Cfg) -> OmittedOut {
+    let mut log = Log::new();
+    // indices: I0 A1 M2 P3; I inserts the document, A and M hold it, P is empty
+    let mut ms: Vec<Node> = "IAMP".chars().map(|c| Node::new(c, cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(0))], &mut log, 0).expect("I inserts X");
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[1].set("a", Value::Int64(1), &mut log, 0).expect("A writes X.a at s1");
+    ms[2].w.clock = Hlc::new(5, 0);
+    ms[2].set("b", Value::Int64(2), &mut log, 0).expect("M writes X.b at s2 above s1");
+    pull(&mut ms, 2, 1, None);
+    ms[1].other_document_write();
+    pull(&mut ms, 2, 1, None);
+    pull(&mut ms, 3, 2, None);
+    let read = ms[3].visible();
+    let p_reads_a_and_b = read.is_some_and(|d| {
+        d.get(&p("a")) == Some(&Value::Int64(1)) && d.get(&p("b")) == Some(&Value::Int64(2))
+    });
+    let same_state = ms[3].canon() == ms[2].canon();
+    let before = fix_key(&ms[3..]);
+    pull(&mut ms, 3, 1, None);
+    let follow_up_moved = fix_key(&ms[3..]) != before;
+    OmittedOut {
+        p_reads_a_and_b,
+        same_state,
+        snapshots: ms.iter().map(|n| n.snaps).sum(),
+        follow_up_moved,
+    }
+}
