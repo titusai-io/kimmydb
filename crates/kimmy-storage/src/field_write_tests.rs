@@ -373,7 +373,7 @@ fn the_writers_refusal_of_an_update_reaches_the_request_with_its_own_text_and_wr
 }
 
 #[test]
-fn a_remote_entry_for_a_field_collection_is_refused_by_name_and_a_document_collection_still_applies_it()
+fn a_remote_entry_for_a_field_collection_is_applied_as_a_joined_state_and_a_document_collection_still_applies_it()
  {
     let (a, _da) = open();
     let (b, _db) = open();
@@ -381,12 +381,13 @@ fn a_remote_entry_for_a_field_collection_is_refused_by_name_and_a_document_colle
     let (fb, db_) = pair(&b);
     a.insert(&fa, doc! { "_id": 1_i64, "a": 1 }).unwrap();
     let entry = entries(&a, &fa).remove(0);
-    let err = b.apply_remote(&fb, &entry).unwrap_err();
-    assert!(
-        matches!(&err, crate::StorageError::Core(kimmy_core::Error::Unsupported(t)) if t.contains("`field`")),
-        "{err:?}"
+    assert!(b.apply_remote(&fb, &entry).unwrap(), "the entry is applied");
+    assert_eq!(
+        b.get(&fb, &kimmy_core::DocId::Int64(1)).unwrap(),
+        Some(doc! { "_id": 1_i64, "a": 1 })
     );
-    assert!(raw(&b, &fb, 1).is_none(), "nothing was stored");
+    assert_eq!(raw(&b, &fb, 1), raw(&a, &fa, 1), "the same record, merge state included");
+    assert!(!b.apply_remote(&fb, &entry).unwrap(), "the same entry again moves nothing");
     // the same write, as a document collection's entry, applies
     let (c, _dc) = open();
     let (_, dc) = pair(&c);
@@ -396,24 +397,20 @@ fn a_remote_entry_for_a_field_collection_is_refused_by_name_and_a_document_colle
 }
 
 #[test]
-fn a_batch_with_a_field_entry_applies_the_rest_counts_the_refusal_and_moves_the_position() {
+fn a_batch_with_a_field_entry_applies_both_and_counts_no_refusal() {
     let (a, _da) = open();
     let (b, _db) = open();
     let (fa, da) = pair(&a);
-    // the field entry comes first in stamp order, the document entry after it
     a.insert(&fa, doc! { "_id": 1_i64, "a": 1 }).unwrap();
     a.insert(&da, doc! { "_id": 2_i64, "b": 2 }).unwrap();
     let all = a.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).unwrap().entries;
     let out = b.apply_batch(&all).unwrap();
-    assert_eq!(out.field_refused, 1, "{out:?}");
-    assert_eq!(out.field_refused_in, vec!["app.f".to_string()]);
-    assert_eq!(out.applied, 1, "the document collection's entry after the refused one is applied");
-    assert_eq!(b.field_replication_refusals(), 1);
+    assert_eq!(out.applied, 2, "the field entry and the document entry");
+    assert_eq!(b.field_replication_refusals(), 0);
     let fb = b.get_collection("app", "f").unwrap();
     let db_ = b.get_collection("app", "d").unwrap();
-    assert!(raw(&b, &fb, 1).is_none(), "the field document is not stored");
-    assert!(raw(&b, &db_, 2).is_some(), "the document collection's is");
-    // the position moved past the refused entry: nothing of it is asked for again
+    assert!(raw(&b, &fb, 1).is_some(), "the field document is stored");
+    assert!(raw(&b, &db_, 2).is_some(), "and the document collection's");
     let again = b.apply_batch(&all).unwrap();
     assert_eq!(again.applied, 0);
 }

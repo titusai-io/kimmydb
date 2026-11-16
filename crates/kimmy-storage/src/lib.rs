@@ -95,6 +95,9 @@ mod converge_tests;
 mod definition_repair_tests;
 
 #[cfg(test)]
+mod field_apply_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]

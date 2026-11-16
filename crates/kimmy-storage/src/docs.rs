@@ -1607,11 +1607,13 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(RemoteApplied::Superseded { released: false });
         };
-        // Merging a remote write into a field document is the apply of Step 3; until it
-        // lands an entry for one is refused by name, not stored as a document that has no
-        // state.
         if coll.merge_policy == MergePolicy::Field {
-            return Err(refuse_field_replication());
+            // A snapshot document of a field collection is state without an entry: its apply is
+            // the snapshot work of Step 3 (item 3), and until then it is refused by name.
+            if position == Position::Hold {
+                return Err(refuse_field_replication());
+            }
+            return self.apply_field_in_txn(txn, coll, entry, id, position);
         }
 
         let key = doc_key(&id)?;
@@ -1748,6 +1750,103 @@ impl Engine {
         let unkeyed = self.append_unkeyed(txn, unkeyed_details(coll.id, &id, &filings))?;
 
         Ok(RemoteApplied::Applied { id, violations, unkeyed, released })
+    }
+
+    /// The apply of one entry of a `field` collection (Step 3): the state the entry carries is
+    /// JOINED into the stored one, not decided by the stamp. An entry below the member's newest
+    /// stamp can carry a field the member lacks, so a stamp test would lose it.
+    ///
+    /// * The join changed the document: the record, the indexes and the counts move and the
+    ///   entry is appended and published.
+    /// * The join changed only the state behind the document (the version vector, a dead life):
+    ///   the record is rewritten and the entry appended, and nothing is published (a meta-only
+    ///   join is not an event).
+    /// * The join changed nothing (the entry is covered): nothing is rewritten.
+    ///
+    /// **Always keep.** In every case the entry joins this member's oplog when it is not there and
+    /// not below retention's horizon for its origin, so a member that took it serves it onward
+    /// whatever else it holds: a member that pulls only from this one reads the same state, and
+    /// the members of a cluster hold the same set of entries (the rewind folds over it).
+    fn apply_field_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+        id: DocId,
+        position: Position,
+    ) -> Result<RemoteApplied> {
+        let key = doc_key(&id)?;
+        let other = field_write::load(entry.meta.as_deref())?;
+        let (joined, previous) = {
+            let mut docs = txn.open_table(tables::DOCS)?;
+            let existing = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => Some(codec::decode_doc_record_with_meta(raw.value())?),
+                None => None,
+            };
+            let prior = match &existing {
+                Some(record) => Some(field_write::load(record.meta.as_deref())?),
+                None => None,
+            };
+            let joined = field_write::join(self.field_writer(), prior, &other)?;
+            if !joined.changed && existing.is_some() {
+                drop(docs);
+                return self.field_entry_kept(txn, entry, position);
+            }
+            // The record carries the newest write merged in.
+            let record_stamp = match &existing {
+                Some(current) if !entry.stamp.wins_over(&current.stamp) => current.stamp,
+                _ => entry.stamp,
+            };
+            let previous = match &existing {
+                Some(record) => record.document()?,
+                None => None,
+            };
+            let mut record = if joined.alive {
+                DocRecord::live(record_stamp, joined.body.clone())
+            } else {
+                DocRecord::tombstone(record_stamp)
+            };
+            record.meta = Some(joined.meta.clone());
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )?;
+            (joined, previous)
+        };
+        let next: Option<Document> =
+            if joined.alive { Some(bson::deserialize_from_slice(&joined.body)?) } else { None };
+        if previous == next {
+            // The merged state moved and the document did not.
+            return self.field_entry_kept(txn, entry, position);
+        }
+        let (violations, newly_multikey, filings) =
+            index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
+        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+        let released = crate::engine::append_oplog_at(txn, entry, position)?;
+        self.witness(&entry.stamp);
+        let unkeyed = self.append_unkeyed(txn, unkeyed_details(coll.id, &id, &filings))?;
+        Ok(RemoteApplied::Applied { id, violations, unkeyed, released })
+    }
+
+    /// An entry of a `field` collection that moved no document: appended when it is owed (always
+    /// keep), its held mark released when it arrives in position, witnessed, and not published.
+    fn field_entry_kept(
+        &self,
+        txn: &WriteTxn<'_>,
+        entry: &OplogEntry,
+        position: Position,
+    ) -> Result<RemoteApplied> {
+        let released = if crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
+            crate::engine::append_oplog_at(txn, entry, position)?
+        } else {
+            position == Position::InWindow
+                && crate::engine::release_held_in_position(txn, &entry.stamp)?
+        };
+        self.witness(&entry.stamp);
+        Ok(RemoteApplied::Superseded { released })
     }
 
     /// The part of a replicated write that must follow its commit: count and

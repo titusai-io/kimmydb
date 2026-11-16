@@ -6082,6 +6082,13 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
             let Some(id) = entry.doc_id.as_ref() else {
                 continue;
             };
+            // An entry of a `field` collection carries a merge state: the stamp of the record
+            // that stands says nothing about whether the entry's own writes are in it, so its
+            // mark is never dropped by the stamp test (Step 3: the entry is asked for until
+            // the vectors cover it, and kept when it arrives).
+            if entry.meta.is_some() {
+                continue;
+            }
             let doc_key = crate::docs::doc_key(id)?;
             let superseded = match docs.get((entry.collection.0, doc_key.as_slice()))? {
                 Some(current) => codec::decode_doc_record(current.value())?.stamp.wins_over(&stamp),
