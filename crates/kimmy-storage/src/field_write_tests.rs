@@ -394,3 +394,51 @@ fn a_remote_entry_for_a_field_collection_is_refused_by_name_and_a_document_colle
     let e2 = entries(&c, &dc).remove(0);
     assert!(b.apply_remote(&db_, &e2).unwrap());
 }
+
+#[test]
+fn a_batch_with_a_field_entry_applies_the_rest_counts_the_refusal_and_moves_the_position() {
+    let (a, _da) = open();
+    let (b, _db) = open();
+    let (fa, da) = pair(&a);
+    // the field entry comes first in stamp order, the document entry after it
+    a.insert(&fa, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    a.insert(&da, doc! { "_id": 2_i64, "b": 2 }).unwrap();
+    let all = a.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).unwrap().entries;
+    let out = b.apply_batch(&all).unwrap();
+    assert_eq!(out.field_refused, 1, "{out:?}");
+    assert_eq!(out.field_refused_in, vec!["app.f".to_string()]);
+    assert_eq!(out.applied, 1, "the document collection's entry after the refused one is applied");
+    assert_eq!(b.field_replication_refusals(), 1);
+    let fb = b.get_collection("app", "f").unwrap();
+    let db_ = b.get_collection("app", "d").unwrap();
+    assert!(raw(&b, &fb, 1).is_none(), "the field document is not stored");
+    assert!(raw(&b, &db_, 2).is_some(), "the document collection's is");
+    // the position moved past the refused entry: nothing of it is asked for again
+    let again = b.apply_batch(&all).unwrap();
+    assert_eq!(again.applied, 0);
+}
+
+#[test]
+fn a_snapshot_page_with_a_field_document_applies_the_rest_and_the_cursor_moves_on() {
+    let (a, _da) = open();
+    let (b, _db) = open();
+    let (fa, da) = pair(&a);
+    a.insert(&fa, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    a.insert(&da, doc! { "_id": 2_i64, "b": 2 }).unwrap();
+    let mut progress = crate::SnapshotProgress::whole_database();
+    let mut after = None;
+    for _ in 0..20 {
+        let page = a.snapshot_page(after.take(), None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        after = page.next.clone();
+        if after.is_none() {
+            break;
+        }
+    }
+    assert!(after.is_none(), "the snapshot ended");
+    let fb = b.get_collection("app", "f").unwrap();
+    let db_ = b.get_collection("app", "d").unwrap();
+    assert!(raw(&b, &fb, 1).is_none());
+    assert!(raw(&b, &db_, 2).is_some());
+    assert_eq!(b.field_replication_refusals(), 1);
+}

@@ -1256,6 +1256,47 @@ impl Engine {
         Ok(waits)
     }
 
+    /// `page` without the documents of collections with merge policy `field`, which cannot be
+    /// applied yet (Step 3). Counted, and named in one log line for the page.
+    fn without_field_documents(&self, page: &SnapshotPage) -> Result<SnapshotPage> {
+        let announced: std::collections::BTreeSet<CollectionId> = page
+            .collections
+            .iter()
+            .filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
+            .map(|c| CollectionId::derive(&c.db, &c.name))
+            .collect();
+        let mut kept = Vec::with_capacity(page.documents.len());
+        let mut refused = 0u64;
+        let mut named: Vec<String> = Vec::new();
+        for doc in &page.documents {
+            let local = self.collection_by_id(doc.collection)?;
+            let field = announced.contains(&doc.collection)
+                || local.as_ref().is_some_and(|c| c.merge_policy == kimmy_core::MergePolicy::Field);
+            if !field {
+                kept.push(doc.clone());
+                continue;
+            }
+            refused += 1;
+            let name = local.map_or_else(
+                || format!("collection {}", doc.collection.0),
+                |c| format!("{}.{}", c.db, c.name),
+            );
+            if !named.contains(&name) {
+                named.push(name);
+            }
+        }
+        if refused == 0 {
+            return Ok(page.clone());
+        }
+        self.count_field_replication_refused(refused);
+        tracing::warn!(
+            entries = refused,
+            collections = %named.join(", "),
+            "refused snapshot documents for collections with merge policy `field`: their replication is not built yet; the rest of the page was applied"
+        );
+        Ok(SnapshotPage { documents: kept, ..page.clone() })
+    }
+
     /// Apply one page of a peer's snapshot, and move `progress` past it.
     ///
     /// The page's documents are one transaction: every one that wins
@@ -1282,24 +1323,10 @@ impl Engine {
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
         // A document of a `field` collection is a merge state the receiver cannot apply until
-        // Step 3: the page is refused by name before anything of it is written.
-        {
-            let announced: std::collections::BTreeSet<CollectionId> = page
-                .collections
-                .iter()
-                .filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
-                .map(|c| CollectionId::derive(&c.db, &c.name))
-                .collect();
-            for doc in &page.documents {
-                let field = announced.contains(&doc.collection)
-                    || self
-                        .collection_by_id(doc.collection)?
-                        .is_some_and(|c| c.merge_policy == kimmy_core::MergePolicy::Field);
-                if field {
-                    return Err(crate::docs::refuse_field_replication());
-                }
-            }
-        }
+        // Step 3: those documents are left out of the page and counted, once per page in the log,
+        // and the rest of the page is applied and the cursor moves on. Failing the page would
+        // hold the whole snapshot at this page and stall every other collection behind it.
+        let page = &self.without_field_documents(page)?;
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
