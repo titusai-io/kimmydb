@@ -30,6 +30,9 @@ pub mod expiry;
 pub mod faults;
 pub mod format;
 pub mod gc;
+// The field path of a write (insert, replace, delete) over a record's merge state.
+#[allow(dead_code)] // the write hooks of the next commit call it
+mod field_write;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
