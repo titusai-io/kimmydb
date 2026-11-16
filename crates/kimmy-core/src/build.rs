@@ -32,6 +32,20 @@ pub const SCHEMA_7_RELEASE: &str = "0.58.0";
 /// refused, by this name.
 pub const SCHEMA_8_RELEASE: &str = "0.61.0";
 
+/// The release that introduced storage schema 10, and with it the refusal of a
+/// store or backup an older build wrote. Schema 10 changes how an index keys a
+/// path through arrays (a missing field, a scalar element and an empty array
+/// key `null`; a position inside the array keys that element only), so an older
+/// store holds entries the new rule would not write. The one place the storage
+/// refusals name it.
+pub const SCHEMA_10_RELEASE: &str = "0.61.0";
+
+/// The release that introduced storage schema 11, the key of a document value (the order of a
+/// document by the type of its fields' values, then their names, then the values). Both schemas
+/// belong to one release, so a store of schema 10 written by a build between them is refused
+/// too. The one place the storage refusals name it.
+pub const SCHEMA_11_RELEASE: &str = "0.61.0";
+
 /// Short commit hash, with no decoration; `unknown` without git.
 pub const COMMIT: &str = env!("KIMMY_BUILD_COMMIT");
 

@@ -298,6 +298,51 @@ static NOOP_RENAMES: AtomicUsize = AtomicUsize::new(0);
 /// Steps whose update holds a `$rename` and is refused for another reason (printed, not floored).
 static OTHER_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// The steps of THIS thread's run whose only mismatch with the engine was the documented width
+    /// difference of `counter-type-q7` (see [`only_the_documented_width_difference`]).
+    static WIDTH_DIFFERENCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `counter-type-q7` (docs/deviations.md; recorded directly in q7s5d.out R1-R3): once an `Int32`
+/// overflow made a stored number an `Int64`, the reference keeps it an `Int64` whatever the later
+/// increments do, where a counter's type is a function of the merged state (R1), so a sequence that
+/// leaves the 32-bit range and comes back reads an `Int32`. The ONLY mismatch accepted between the
+/// engine's post-image and the writer's render: at a leaf an `$inc` of the step names, the engine has
+/// an `Int64` and the writer an `Int32` of the SAME value. The documents must be equal everywhere
+/// else (the same fields in the same order, every other value bit for bit).
+fn only_the_documented_width_difference(
+    engine: &Document,
+    writer: &Document,
+    inc_paths: &[String],
+) -> bool {
+    fn walk(path: &str, engine: &Bson, writer: &Bson, inc_paths: &[String]) -> bool {
+        let join =
+            |name: &str| if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
+        match (engine, writer) {
+            (Bson::Document(e), Bson::Document(w)) => {
+                e.len() == w.len()
+                    && e.iter()
+                        .zip(w.iter())
+                        .all(|((ke, ve), (kw, vw))| ke == kw && walk(&join(ke), ve, vw, inc_paths))
+            }
+            (Bson::Array(e), Bson::Array(w)) => {
+                e.len() == w.len()
+                    && e.iter()
+                        .zip(w.iter())
+                        .enumerate()
+                        .all(|(i, (ve, vw))| walk(&join(&i.to_string()), ve, vw, inc_paths))
+            }
+            (Bson::Int64(v), Bson::Int32(n)) => {
+                i64::from(*n) == *v && inc_paths.iter().any(|p| p == path)
+            }
+            // every other leaf: the same type and the same bits (`Debug` shows `-0.0` and a NaN)
+            (e, w) => format!("{e:?}") == format!("{w:?}"),
+        }
+    }
+    walk("", &Bson::Document(engine.clone()), &Bson::Document(writer.clone()), inc_paths)
+}
+
 /// Whether a refusal text names a `$rename` of `operations`: it says `$rename` (the source and
 /// array-element cases, q7s2f.out), or it is the recorded "cannot create field '<x>' in element
 /// {...}" (q7s2d.out 4e) and `<x>` is a segment of the DESTINATION of one of the renames.
@@ -412,13 +457,27 @@ fn run(start: Document, steps: Vec<Step>) -> Result<(), TestCaseError> {
                         effects
                     );
                 } else {
-                    prop_assert_eq!(
-                        bytes(&rendered),
-                        bytes(&post_image),
-                        "{:?} over {}",
-                        step,
-                        doc
-                    );
+                    let inc_paths: Vec<String> = match &update {
+                        Update::Operators(operations) => operations
+                            .iter()
+                            .filter(|op| matches!(op.kind, OpKind::Inc(_)))
+                            .map(|op| op.path.clone())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if bytes(&rendered) != bytes(&post_image)
+                        && only_the_documented_width_difference(&post_image, &rendered, &inc_paths)
+                    {
+                        WIDTH_DIFFERENCES.with(|n| n.set(n.get() + 1));
+                    } else {
+                        prop_assert_eq!(
+                            bytes(&rendered),
+                            bytes(&post_image),
+                            "{:?} over {}",
+                            step,
+                            doc
+                        );
+                    }
                     prop_assert_eq!(
                         outcome.modified(),
                         bytes(&post_image) != bytes(&doc),
@@ -450,6 +509,11 @@ fn effects_through_the_writer_render_the_engines_post_image() {
             runner
                 .run(&strategy, |(start, steps)| run(start, steps))
                 .unwrap_or_else(|e| panic!("{e}"));
+            eprintln!(
+                "width differences of counter-type-q7 accepted (an Int64 of the engine, an Int32 of \
+                 the writer, the same value at an $inc-ed leaf): {}",
+                WIDTH_DIFFERENCES.with(std::cell::Cell::get)
+            );
         })
         .unwrap()
         .join()
@@ -464,4 +528,61 @@ fn effects_through_the_writer_render_the_engines_post_image() {
     // the floor was `> 0` (r1 and r2); the hold prints the count, to be pinned from the run
     assert!(refused > 0, "no generated step hit a refused rename");
     assert!(noop > 0, "no generated step renamed a missing source");
+}
+
+/// The exception is not vacuous: the sequence of q7s5d.out R1 (`x: Int32 MIN`, `$inc -1`, `$inc
+/// 2147483647`, the one the property test found) through the same `run` is accepted AND counted.
+#[test]
+fn the_documented_width_difference_fires_for_the_recorded_sequence() {
+    let before = WIDTH_DIFFERENCES.with(std::cell::Cell::get);
+    let start = doc! { "_id": 1, "sub": { "k": i32::MIN } };
+    let steps = vec![
+        Step::Ops {
+            update: doc! {"$inc": {"sub.k": -1}},
+            array_filters: Vec::new(),
+            matched: Document::new(),
+        },
+        Step::Ops {
+            update: doc! {"$inc": {"sub.k": i32::MAX}},
+            array_filters: Vec::new(),
+            matched: Document::new(),
+        },
+    ];
+    run(start, steps).expect("the documented difference is accepted");
+    assert_eq!(WIDTH_DIFFERENCES.with(std::cell::Cell::get), before + 1);
+}
+
+/// And it accepts nothing else: another path, another value, the other direction, another leaf
+/// type, another field order are all mismatches.
+#[test]
+fn the_documented_width_difference_accepts_nothing_else() {
+    let inc = vec!["sub.k".to_string()];
+    let engine = doc! { "_id": 1, "sub": { "k": -2_i64 }, "z": 1 };
+    let ok = doc! { "_id": 1, "sub": { "k": -2_i32 }, "z": 1 };
+    assert!(only_the_documented_width_difference(&engine, &ok, &inc));
+    // a leaf the update did not `$inc`
+    assert!(!only_the_documented_width_difference(&engine, &ok, &["other".to_string()]));
+    assert!(!only_the_documented_width_difference(&engine, &ok, &[]));
+    // another value
+    assert!(!only_the_documented_width_difference(
+        &engine,
+        &doc! { "_id": 1, "sub": { "k": -3_i32 }, "z": 1 },
+        &inc
+    ));
+    // the other direction: the engine has the Int32
+    assert!(!only_the_documented_width_difference(&ok, &engine, &inc));
+    // another difference beside it
+    assert!(!only_the_documented_width_difference(
+        &engine,
+        &doc! { "_id": 1, "sub": { "k": -2_i32 }, "z": 2 },
+        &inc
+    ));
+    // another field order
+    assert!(!only_the_documented_width_difference(
+        &engine,
+        &doc! { "_id": 1, "z": 1, "sub": { "k": -2_i32 } },
+        &inc
+    ));
+    // a negative zero is not a zero
+    assert!(!only_the_documented_width_difference(&doc! { "d": 0.0 }, &doc! { "d": -0.0 }, &[]));
 }

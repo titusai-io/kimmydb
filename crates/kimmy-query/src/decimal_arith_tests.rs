@@ -484,9 +484,10 @@ fn field(doc: &Document, key: &str) -> Bson {
 
 #[test]
 fn inc_and_mul_take_a_decimal_operand() {
-    // An absent field starts as the integer 0.
+    // `$inc` over an absent field stores the operand as given (q7s4h.jsonl 1-6), `$mul` takes the
+    // field as the integer 0.
     same(field(&after(doc! { "$inc": { "n": dec("1.50") } }, doc! {}), "n"), "1.50");
-    same(field(&after(doc! { "$inc": { "n": dec("1E+3") } }, doc! {}), "n"), "1000");
+    same(field(&after(doc! { "$inc": { "n": dec("1E+3") } }, doc! {}), "n"), "1E+3");
     same(field(&after(doc! { "$mul": { "n": dec("1.50") } }, doc! {}), "n"), "0.00");
     // A double operand with no decimal in sight stays a double.
     assert_eq!(field(&after(doc! { "$inc": { "n": 0.5 } }, doc! {}), "n"), Bson::Double(0.5));
@@ -518,6 +519,128 @@ fn inc_and_mul_take_a_decimal_operand() {
         field(&after(doc! { "$inc": { "v": dec("1") } }, doc! { "v": 0.1 }), "v"),
         "1.100000000000000005551115123125783",
     );
+}
+
+/// `$inc` and `$mul` of a decimal over an absent field, over `Int32` 0 and over `Decimal128("0")`
+/// and over an upserted seed, one row per recorded case (q7s4h.jsonl lines 1-6, 13-18, 25-30,
+/// 97-102, 109-114, 121-126 and 193-226): the stored text, which keeps its cohort member.
+/// `$inc` over an absent field stores the operand as given (1-6, 193).
+///
+/// Nine rows give the same number in another cohort member than the reference prints (the
+/// exponent the `Decimal128` is stored with: "0" against "0E+3", "2" against "2.00"). A
+/// representation difference, not a value difference, and kept (docs/deviations.md). Each is
+/// asserted both ways: ours as it is, in `OURS`, and the reference's recorded text, which must
+/// differ from it, so the test fails the day either changes.
+#[test]
+fn inc_and_mul_over_zero_and_absent_as_recorded_in_q7s4h() {
+    // (case, the text this arithmetic stores); the reference's is in the row.
+    const OURS: [(u32, &str); 9] = [
+        (29, "0.00"),
+        (121, "0E+3"),
+        (122, "0.00"),
+        (123, "0.0"),
+        (124, "0E+3"),
+        (125, "-0.00"),
+        (126, "0.000"),
+        (206, "2.00"),
+        (221, "2.00"),
+    ];
+    #[rustfmt::skip]
+    let rows: Vec<(u32, bool, &str, Bson, Document, &str)> = vec![
+        (1, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "1E+3"),
+        (2, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "1.00"),
+        (3, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "15.0"),
+        (4, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (5, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (6, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "1.000"),
+        (13, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1000"),
+        (14, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1.00"),
+        (15, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "15.0"),
+        (16, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0"),
+        (17, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.00"),
+        (18, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "1.000"),
+        (25, false, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1000"),
+        (26, false, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1.00"),
+        (27, false, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "15.0"),
+        (28, false, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (29, false, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (30, false, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "1.000"),
+        (97, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (98, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "0.00"),
+        (99, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "0.0"),
+        (100, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (101, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (102, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "0.000"),
+        (109, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0E+3"),
+        (110, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.00"),
+        (111, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.0"),
+        (112, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0E+3"),
+        (113, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "-0.00"),
+        (114, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(0) }, "0.000"),
+        (121, false, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (122, false, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (123, false, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (124, false, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (125, false, "$mul", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (126, false, "$mul", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("0") }, "0"),
+        (193, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "1E+3"),
+        (194, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "1002"),
+        (195, true, "$inc", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "1002"),
+        (196, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "1.00"),
+        (197, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "3.00"),
+        (198, true, "$inc", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "3.00"),
+        (199, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "15.0"),
+        (200, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "17.0"),
+        (201, true, "$inc", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "17.0"),
+        (202, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (203, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (204, true, "$inc", dec("0E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2"),
+        (205, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1) }, "-0.00"),
+        (206, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (207, true, "$inc", dec("-0.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2.00"),
+        (208, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1) }, "1.000"),
+        (209, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "3.000"),
+        (210, true, "$inc", dec("1.000"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "3.000"),
+        (211, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1) }, "5"),
+        (212, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "7"),
+        (213, true, "$inc", dec("5"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "7"),
+        (214, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1) }, "0"),
+        (215, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (216, true, "$inc", dec("0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2"),
+        (217, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+        (218, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2E+3"),
+        (219, true, "$mul", dec("1E+3"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2E+3"),
+        (220, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1) }, "0.00"),
+        (221, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "2"),
+        (222, true, "$mul", dec("1.00"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "2.00"),
+        (223, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1) }, "0.0"),
+        (224, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": dec("2") }, "30.0"),
+        (225, true, "$mul", dec("15.0"), doc! { "_id": Bson::Int32(1), "n": Bson::Int32(2) }, "30.0"),
+        (226, true, "$mul", dec("0E+3"), doc! { "_id": Bson::Int32(1) }, "0E+3"),
+    ];
+    let mut wrong = Vec::new();
+    for (case, upsert, op, operand, base, want) in rows {
+        let mut stored = base.clone();
+        let update = update::parse(&doc! { op: { "n": operand.clone() } }).unwrap();
+        let outcome = if upsert {
+            update::apply_on_insert(&update, &mut stored, 0)
+        } else {
+            update::apply(&update, &mut stored, 0)
+        };
+        let got = outcome.map(|()| text(stored.get("n").expect("n is stored")));
+        let ours = OURS.iter().find(|(c, _)| *c == case).map_or(want, |(_, text)| *text);
+        assert_eq!(
+            OURS.iter().any(|(c, _)| *c == case),
+            ours != want,
+            "case {case}: ours is listed in OURS exactly when it differs from the recorded {want}"
+        );
+        if !matches!(got.as_deref(), Ok(text) if text == ours) {
+            wrong.push(format!(
+                "case {case}: {op} {operand:?} over {base:?}: {got:?}, expected {ours} (recorded {want})"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]

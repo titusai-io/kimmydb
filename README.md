@@ -162,9 +162,11 @@ websocat "ws://localhost:7878/v1/db/shop/coll/orders/watch?full_document=true" \
 | `GET` | `/healthz` `/readyz` `/metrics` | Unauthenticated |
 
 Documents cross the boundary as JSON, using Extended JSON v2 (`{"$oid":…}`,
-`{"$date":…}`, `{"$numberLong":…}`) for types JSON cannot express. Whole numbers
-stay integers rather than widening to double, so `$type` queries keep working
-and values above 2^53 survive exactly.
+`{"$date":…}`, `{"$numberLong":…}`) for types JSON cannot express; the
+[JSON boundary](docs/http-api.md#the-json-boundary) lists what is read and what is
+written for each type. Whole numbers stay integers rather than widening to double,
+so `$type` queries keep working and an Int64 past 2^53 is stored exactly (an integer
+too large for 64 bits is read as a double).
 
 Check what a given configuration resolves to without starting the server:
 

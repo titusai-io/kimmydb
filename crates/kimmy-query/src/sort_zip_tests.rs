@@ -237,16 +237,20 @@ fn a_missing_key_sorts_as_null_and_a_non_document_ties_with_it() {
 }
 
 #[test]
-fn a_descending_key_through_an_array_takes_the_largest_element() {
-    // `[0, 5]` sorts by 0 ascending and by 5 descending; `[1, 2]` by 1 and by 2.
-    let docs = bson!([{ "a": [0, 5] }, { "a": 3 }, { "a": [1, 2] }]);
+fn a_sort_array_key_through_an_array_is_compared_as_a_whole_value() {
+    // q7s3m0045 and q7s3m0046 (read from `reply.docs`): `$sortArray` of `[{s: 3}, {s: [0, 5]},
+    // {s: [1, 2]}]` by `{s: 1}` answers `[{s: 3}, {s: [0, 5]}, {s: [1, 2]}]`, and by `{s: -1}`
+    // the exact reverse: the key is compared as a whole value, a number before any array and
+    // arrays element by element. (A `find` and a `$sort` stage take the smallest element
+    // ascending and the largest descending instead: q7s4o 11 to 20.)
+    let docs = bson!([{ "s": [0, 5] }, { "s": 3 }, { "s": [1, 2] }]);
     assert_eq!(
-        sorted(docs.clone(), bson!({ "a": 1 })),
-        bson!([{ "a": [0, 5] }, { "a": [1, 2] }, { "a": 3 }])
+        sorted(docs.clone(), bson!({ "s": 1 })),
+        bson!([{ "s": 3 }, { "s": [0, 5] }, { "s": [1, 2] }])
     );
     assert_eq!(
-        sorted(docs, bson!({ "a": -1 })),
-        bson!([{ "a": [0, 5] }, { "a": 3 }, { "a": [1, 2] }])
+        sorted(docs, bson!({ "s": -1 })),
+        bson!([{ "s": [1, 2] }, { "s": [0, 5] }, { "s": 3 }])
     );
     // Through an array of documents.
     let items = bson!([{ "i": [{ "q": 9 }, { "q": 1 }] }, { "i": [{ "q": 5 }] }]);

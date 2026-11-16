@@ -972,3 +972,121 @@ fn write_documents_refuses_nested_parallel_arrays_before_its_first_chunk() {
     assert!(message.ends_with("output document 1"), "{message}");
     assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 0, "nothing was written");
 }
+
+// ---- a position beside a field of that name (the reference's 16746), and the null keys ----
+
+/// CL 1 of the q7s3 fixtures: the position `0` and a field named `0`.
+fn ambiguous() -> Document {
+    doc! { "a": [{ "0": 9 }] }
+}
+
+fn positioned(e: &Engine, path: &str, unique: bool) -> CollectionMeta {
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&[path]), unique, Some("ap".into())).unwrap();
+    e.get_collection("shop", "c").unwrap()
+}
+
+fn filed(e: &Engine, c: &CollectionMeta) -> u64 {
+    e.unkeyed_count(c, c.index("ap").unwrap().id).unwrap()
+}
+
+#[test]
+fn every_local_write_path_refuses_an_ambiguous_position_and_counts_it() {
+    // q7s3g 133, 136; q7s3j 151, 152: refused at insert, in an index that is not unique and in
+    // one that is, with the reference's wording, and counted as every unkeyed refusal is.
+    for unique in [false, true] {
+        let (e, _d) = open();
+        let c = positioned(&e, "a.0", unique);
+        let message = refusal(e.insert(&c, with_id(1, ambiguous())).unwrap_err());
+        assert!(message.contains("Ambiguous field name found in array"), "{message}");
+        assert!(message.contains("\"ap\""), "{message}");
+        assert!(unique || message.contains("_id 1"), "{message}");
+        assert_eq!(e.unkeyed_refusals(), 1, "unique: {unique}");
+
+        let err = e
+            .insert_many(&c, vec![with_id(2, doc! { "a": [{ "b": 1 }] }), with_id(3, ambiguous())])
+            .unwrap_err();
+        assert_eq!(err.index, Some(1));
+        refusal(err.source);
+        // A document that keys, then a replace that makes it ambiguous.
+        e.insert(&c, with_id(4, doc! { "a": [{ "b": 1 }] })).unwrap();
+        refusal(e.replace(&c, &DocId::Int64(4), ambiguous(), false).unwrap_err());
+    }
+    let (e, _d) = open();
+    let c = positioned(&e, "a.1", false);
+    // PE 2: the position is inside the array and an element holds the field "1" (j:151).
+    refusal(e.insert(&c, with_id(1, doc! { "a": [{ "1": 5 }, { "b": 1 }] })).unwrap_err());
+    // PE 1, 3 and 6: keyed, never refused.
+    for (id, a) in
+        [(2, bson::bson!([{ "1": 5 }])), (3, bson::bson!([5, 6])), (4, bson::bson!([{ "b": 1 }]))]
+    {
+        e.insert(&c, doc! { "_id": id as i64, "a": a }).unwrap();
+    }
+}
+
+#[test]
+fn a_local_create_over_an_ambiguous_position_refuses_and_creates_nothing() {
+    // q7s3g 69-76, 133, 134; q7s3j 179-182: the build over a clash is refused, unique or not.
+    for unique in [false, true] {
+        let (e, _d) = open();
+        e.create_collection("shop", "c").unwrap();
+        let c = e.get_collection("shop", "c").unwrap();
+        e.insert(&c, with_id(1, ambiguous())).unwrap();
+        let message = refusal(
+            e.create_index("shop", "c", fields(&["a.0"]), unique, Some("ap".into())).unwrap_err(),
+        );
+        assert!(message.contains("Ambiguous field name found in array"), "{message}");
+        assert!(e.get_collection("shop", "c").unwrap().index("ap").is_none());
+        // The same documents build under a non-digit path (g:135, 138).
+        e.create_index("shop", "c", fields(&["a.b"]), unique, Some("ab".into())).unwrap();
+    }
+}
+
+#[test]
+fn a_replicated_ambiguous_position_is_filed_unkeyed_and_announced() {
+    let (e, _d) = open();
+    let c = positioned(&e, "a.0", false);
+    assert!(e.apply_remote(&c, &remote(&c, 5, now_ms(), ambiguous())).unwrap());
+    assert_eq!(filed(&e, &c), 1);
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(named, vec![(DocId::Int64(5), "ambiguous_position".to_string())]);
+    // A unique index does not check an unkeyed document: a second one is filed as well.
+    let (e, _d) = open();
+    let c = positioned(&e, "a.0", true);
+    assert!(e.apply_remote(&c, &remote(&c, 5, now_ms(), ambiguous())).unwrap());
+    assert!(e.apply_remote(&c, &remote(&c, 6, now_ms() + 1, ambiguous())).unwrap());
+    assert_eq!(filed(&e, &c), 2);
+    // A local replace that leaves it ambiguous is refused, one that reshapes it is accepted
+    // (the parallel-arrays consequence, indexes.md).
+    refusal(e.replace(&c, &DocId::Int64(5), ambiguous(), false).unwrap_err());
+    e.replace(&c, &DocId::Int64(5), doc! { "a": [{ "b": 1 }] }, false).unwrap();
+    assert_eq!(filed(&e, &c), 1);
+}
+
+#[test]
+fn a_unique_index_on_a_path_through_arrays_collides_on_the_null_keys() {
+    // q7s3g 1-17: an element lacking the field, a scalar element, a nested element, an empty
+    // array and a missing parent all key null and collide.
+    let others = [
+        ("a missing parent", doc! { "b": 1 }),
+        ("a scalar element", doc! { "a": [5] }),
+        ("a nested array", doc! { "a": [[{ "c": 1 }]] }),
+        ("an empty array", doc! { "a": [] }),
+        ("an element lacking the field", doc! { "a": [{ "d": 1 }] }),
+    ];
+    for (what, other) in others {
+        let (e, _d) = open();
+        let c = positioned(&e, "a.c", true);
+        e.insert(&c, with_id(1, doc! { "a": [{ "c": 5 }, { "d": 1 }] })).unwrap();
+        let err = e.insert(&c, with_id(2, other)).unwrap_err();
+        assert!(matches!(err, StorageError::Core(CoreError::UniqueViolation { .. })), "{what}");
+    }
+    // A leaf `[]` is its own key: it collides with another `[]` and with nothing else (i:1-4).
+    let (e, _d) = open();
+    let c = positioned(&e, "a.c", true);
+    e.insert(&c, with_id(1, doc! { "a": [{ "c": [] }] })).unwrap();
+    e.insert(&c, with_id(2, doc! { "b": 1 })).unwrap();
+    e.insert(&c, with_id(3, doc! { "a": [{ "c": [1] }] })).unwrap();
+    let err = e.insert(&c, with_id(4, doc! { "a": [{ "c": [] }] })).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::UniqueViolation { .. })));
+}
