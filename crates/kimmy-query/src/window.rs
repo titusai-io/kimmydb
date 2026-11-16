@@ -873,7 +873,7 @@ fn run_partition(
         let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
         for doc in docs {
             deadline::tick()?;
-            let keys = shape::sort_keys(&spec.sort, &doc);
+            let keys = shape::sort_keys(&spec.sort, &doc)?;
             lease.charge(keys.iter().map(crate::budget::held_bytes_bson).sum())?;
             keyed.push((keys, doc));
         }

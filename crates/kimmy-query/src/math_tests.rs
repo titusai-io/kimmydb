@@ -701,33 +701,25 @@ fn try_run(pipeline: &[Document], input: Document) -> kimmy_core::Result<Vec<Doc
 }
 
 #[test]
-fn remove_at_a_path_a_value_could_not_be_written_to_is_refused_with_the_same_error() {
-    // Through an array by a name: `$addFields` of a value there is refused, so is leaving it out.
-    let value = try_run(&[doc! {"$addFields": {"a.b": 1}}], doc! {"a": [{"b": 1}]})
-        .expect_err("a value cannot be written through an array by a name")
-        .to_string();
-    let removed = try_run(&[doc! {"$addFields": {"a.b": "$$REMOVE"}}], doc! {"a": [{"b": 1}]})
-        .expect_err("nor can it be left out")
-        .to_string();
-    assert_eq!(removed, value);
-    assert!(removed.contains("cannot set \"a.b\""), "{removed}");
-    // A position in the array leaves a null hole, as `$unset` does; a position that is not
-    // there, a field that is not, and a path through a scalar are nothing to remove.
+fn remove_at_a_path_walks_it_as_a_write_does() {
+    // q7s4g 9, 71, 72: `$$REMOVE` takes the leaf out and makes a document of each parent it
+    // passes, a scalar element of an array and a missing, null or scalar parent included.
+    let run =
+        |spec: Document, input: Document| try_run(&[doc! {"$addFields": spec}], input).unwrap();
+    assert_eq!(run(doc! {"a.b": "$$REMOVE"}, doc! {"a": [{"b": 1}]}), vec![doc! {"a": [{}]}]);
     assert_eq!(
-        try_run(&[doc! {"$addFields": {"a.0": "$$REMOVE"}}], doc! {"a": [1, 2]}).unwrap(),
-        vec![doc! {"a": [Bson::Null, 2]}]
+        run(doc! {"a.b": "$$REMOVE"}, doc! {"a": [{"b": 1, "c": 2}, 5, [{"b": 3}]]}),
+        vec![doc! {"a": [{"c": 2}, {}, [{}]]}]
     );
+    assert_eq!(run(doc! {"a.0": "$$REMOVE"}, doc! {"a": [1, 2]}), vec![doc! {"a": [{}, {}]}]);
     assert_eq!(
-        try_run(&[doc! {"$addFields": {"a.0.b": "$$REMOVE"}}], doc! {"a": [{"b": 1, "c": 2}]})
-            .unwrap(),
+        run(doc! {"a.0": "$$REMOVE"}, doc! {"a": [{"0": 1, "c": 2}]}),
         vec![doc! {"a": [{"c": 2}]}]
     );
-    for input in [doc! {"a": [1, 2]}, doc! {"a": 5}, doc! {}, doc! {"a": {"c": 1}}] {
-        let path =
-            if input.get("a").is_some_and(|a| a.as_array().is_some()) { "a.7" } else { "a.b.c" };
-        assert_eq!(
-            try_run(&[doc! {"$addFields": {path: "$$REMOVE"}}], input.clone()).unwrap(),
-            vec![input]
-        );
+    for input in [doc! {"a": 5}, doc! {"a": Bson::Null}, doc! {}] {
+        assert_eq!(run(doc! {"a.b": "$$REMOVE"}, input), vec![doc! {"a": {}}]);
     }
+    // An empty array stays empty, and a document without the leaf is as it was.
+    assert_eq!(run(doc! {"a.b": "$$REMOVE"}, doc! {"a": []}), vec![doc! {"a": []}]);
+    assert_eq!(run(doc! {"a.b": "$$REMOVE"}, doc! {"a": {"c": 1}}), vec![doc! {"a": {"c": 1}}]);
 }

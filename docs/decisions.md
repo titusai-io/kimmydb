@@ -30639,6 +30639,23 @@ decimal `_id` and a decimal-bound definition.
 
 **Why `$pull` has three readings.** The aim was to add conditions without changing one `$pull` that worked. Reading a plain document as a query, which is the other reading in use, would have made `{"$pull": {"results": {"score": 8}}}` remove `{score: 8, item: "B"}` as well, a change to the result of every existing partial-document pull, with a `200`. Keyed on the document's keys, the only operands whose meaning changed are the ones that were operator documents, which as values matched nothing and so removed nothing: the rule leaves every existing pull unchanged and only adds conditions. The mixed document is refused rather than assigned a side because either reading would be a guess about a caller who wrote both, and the message names the spelling (`$elemMatch`) that says which they meant. Whether an operand is a condition is decided in one small function (`pull_is_condition`), so the rule is one edit away from a change.
 
+> **Amended 2026-11-14: item 14 is superseded for a document operand.** A document with
+> no `$` key is a query on each element, not a value removed by whole-element equality;
+> the empty document is a query every document element satisfies; a regular expression
+> operand is a pattern; `$and`, `$or` and `$nor` are queries on document elements only;
+> a top-level `$elemMatch` searches an element that is an array and removes no document
+> or scalar; and a `$not` at the top of the operand is refused. The reference does all of
+> this on the recorded cases: `q7s2j.out` j0709 (line 4250), j1251 (7521), j1254 (7539),
+> j1266 (7613), j1270 (7638), j1292-j1297 (7774-7810), j1312 (7897), and `q7s2q.out`
+> q0177 (line 1215), q0191 (1299), q0204 (1377), q0221 (1479), q0240 (1593), q0326
+> (2109), q0330 (2133). Item 14's reason, that no existing `$pull` changes, gave way to
+> 43 recorded cases that answered differently with a `200`. This is a breaking change,
+> recorded in the CHANGELOG, and the deviations entry that kept the whole-element reading
+> is closed. Whole-element removal is `$pullAll` (j1344 line 8094, j1350 line 8131).
+> Unchanged from item 14: a scalar or array operand matches by canonical equality, a
+> document with `$` keys and plain keys is refused, and a condition is parsed once with
+> the update.
+
 **Cost.** The decimal functions at 34 digits take microseconds (measured by the cost test in `kimmy-core`, with a loose ceiling); the exact power of a short base and a small power is a few multiplications. A `$$NOW` is one clock read per pipeline, not per document, and folds into a constant. `$round` of a double formats its exact expansion (at most as many digits as it has fractional bits), which is cheap for the values a database holds and bounded at about 1,100 digits for the smallest subnormal.
 
 **Alternatives rejected.** Doing the decimal functions in double (the way a convenience library would): it narrows a decimal field to 53 bits on the first `$exp` and is exactly what ADR-252 refused for arithmetic. An external decimal library (decNumber, `dfp-number-sys`): C, `unsafe`, a licence and conversions, for functions of a few hundred lines in the context that already exists; the `dec` crate stays a dev-dependency, as the oracle the tests compare against. Correctly rounding every transcendental result with a Ziv loop: an unbounded loop on the request thread to cover an input that does not occur. A `NaN` or an infinity for a domain error: a typo and a request for one would be indistinguishable in the output, the reason arithmetic refuses a zero divisor. Rounding a double through its shortest text, so `2.675` rounds to `2.68`: it makes `$round` of a double disagree with `$toDecimal` of the same double and with the comparator that orders `2.675` below the decimal `2.675`. `$$NOW` evaluated per document, or carried through the scope: it needs the clock threaded through every caller that builds a scope, and gives each document its own time. A shared database clock for `$$NOW`: members' clocks are not agreed, and nothing else in the read path asks for one. A sentinel BSON value for `$$REMOVE`: a stored `undefined` is a legal document value and would be mistaken for it. A double `$bit` operand accepted when whole (a bit pattern is not a number, and JSON has one number type). A BinData `$bits*` mask read as little- or big-endian bytes (a guess that is wrong for the other half of callers). A plain `$pull` document read as a query (it changes the result of existing pulls). A mixed `$pull` document read as a condition with the plain keys ignored (a typo would remove elements it was not meant to).

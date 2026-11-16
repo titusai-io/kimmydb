@@ -1,0 +1,2 @@
+# Rows this build refuses until a later commit of the series: the case, a tab, and the stack-fixes commit whose subject removes the row from this list (a row lives where it is true).
+# Empty: the rows of q7s2u and q7s2v that refused two spellings of one index (u0016 ... v0144, 46 rows) pass since 'Judge two spellings of one index by the container each lands in'.
