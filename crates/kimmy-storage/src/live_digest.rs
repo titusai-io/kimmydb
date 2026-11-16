@@ -32,13 +32,14 @@ use std::collections::BTreeMap;
 use kimmy_core::{Hlc, Origin, Stamp};
 use redb::{ReadableTable, WriteTransaction};
 
+use crate::codec::RecordView;
 use crate::error::{Result, StorageError};
 use crate::tables;
 
 /// The digest format: what is hashed, and how a row is laid out. A build that
 /// changes either changes this, which moves the mark, so rows written under
 /// the old format are rebuilt rather than trusted.
-pub const FORMAT: u8 = 2;
+pub const FORMAT: u8 = 3;
 
 /// The key of the digest mark in [`tables::LIVE_DIGESTS_THROUGH`].
 pub(crate) const THROUGH: &str = "arrival";
@@ -70,6 +71,15 @@ impl DigestRow {
     /// Raise `maxw` to `stamp`, never lowering it.
     pub fn raise_maxw(&mut self, stamp: &Stamp) {
         raise(&mut self.maxw, stamp);
+    }
+
+    /// Raise `maxw` to everything a record vouches for: its newest stamp and, for a record that
+    /// carries a merged state, the newest write of every origin the state has seen.
+    pub fn raise_view(&mut self, view: &RecordView) {
+        self.raise_maxw(&view.stamp);
+        for (origin, hlc) in &view.origins {
+            self.raise_maxw(&Stamp::new(*hlc, origin.node, origin.epoch));
+        }
     }
 
     /// Raise `bare_max` to `stamp`, never lowering it.
@@ -154,6 +164,22 @@ pub fn term(key: &[u8], stamp: &Stamp) -> u128 {
     hasher.digest128()
 }
 
+/// The term of a live record as the digest folds it. A record of a `document` collection folds its
+/// stamp ([`term`]); a record that carries a merged state folds `xxh3_128(key || state_hash)`, so two
+/// members whose records stand at the same newest stamp over different states do not compare equal,
+/// and members holding the same state compare equal however it arrived.
+pub fn term_of(key: &[u8], view: &RecordView) -> u128 {
+    match &view.state {
+        None => term(key, &view.stamp),
+        Some(hash) => {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            hasher.update(key);
+            hasher.update(hash);
+            hasher.digest128()
+        }
+    }
+}
+
 /// What one transaction owes one collection's row, gathered as it writes and
 /// applied once by [`flush`].
 #[derive(Default)]
@@ -173,17 +199,19 @@ impl Delta {
     pub(crate) fn wrote(
         &mut self,
         key: &[u8],
-        before: Option<(Stamp, bool)>,
-        after: Option<(Stamp, bool)>,
+        before: Option<&RecordView>,
+        after: Option<&RecordView>,
     ) {
-        if let Some((stamp, true)) = before {
-            self.xor ^= term(key, &stamp);
+        if let Some(view) = before
+            && view.live
+        {
+            self.xor ^= term_of(key, view);
         }
-        if let Some((stamp, live)) = after {
-            if live {
-                self.xor ^= term(key, &stamp);
+        if let Some(view) = after {
+            if view.live {
+                self.xor ^= term_of(key, view);
             }
-            self.raised.raise_maxw(&stamp);
+            self.raised.raise_view(view);
         }
     }
 
@@ -309,16 +337,15 @@ pub(crate) fn fold_walked(
     rows: &mut BTreeMap<u64, DigestRow>,
     collection: u64,
     key: &[u8],
-    stamp: &Stamp,
-    live: bool,
+    view: &RecordView,
 ) {
     let row = rows.entry(collection).or_default();
-    if live {
-        row.flip(key, stamp);
+    if view.live {
+        row.digest ^= term_of(key, view);
     } else {
-        row.raise_bare(stamp);
+        row.raise_bare(&view.stamp);
     }
-    row.raise_maxw(stamp);
+    row.raise_view(view);
 }
 
 #[cfg(test)]
@@ -424,7 +451,7 @@ mod tests {
     /// hold origins, so a store of the earlier format is rebuilt, not trusted.
     #[test]
     fn the_format_and_the_row_version_moved_with_the_stamp() {
-        assert_eq!(FORMAT, 2);
+        assert_eq!(FORMAT, 3);
         assert_eq!(ROW_VERSION, 2);
         let mut old = DigestRow::default().encode();
         old[0] = 1;
@@ -434,13 +461,13 @@ mod tests {
     #[test]
     fn a_delta_that_nets_to_nothing_moves_no_row() {
         let mut delta = Delta::default();
-        delta.wrote(&k(b"k"), None, Some((stamp(1, 1), true)));
+        delta.wrote(&k(b"k"), None, Some(&RecordView::plain(stamp(1, 1), true)));
         assert!(!delta.moves_nothing());
         let mut delta = Delta::default();
         // Written live and removed again inside one transaction: the digest
         // nets to nothing, but the stamp was still seen.
-        delta.wrote(&k(b"k"), None, Some((stamp(1, 1), true)));
-        delta.wrote(&k(b"k"), Some((stamp(1, 1), true)), None);
+        delta.wrote(&k(b"k"), None, Some(&RecordView::plain(stamp(1, 1), true)));
+        delta.wrote(&k(b"k"), Some(&RecordView::plain(stamp(1, 1), true)), None);
         assert_eq!(delta.xor, 0);
         assert!(!delta.moves_nothing(), "maxw rose");
     }

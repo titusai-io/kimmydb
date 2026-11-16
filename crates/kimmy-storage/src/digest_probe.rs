@@ -651,9 +651,9 @@ impl Engine {
                 return Ok(Excluded::OverBudget);
             }
             if let Some(record) = docs.get((collection.0, key.as_slice()))? {
-                let (stamp, live) = codec::doc_record_header(record.value())?;
-                if live {
-                    digest ^= live_digest::term(key, &stamp);
+                let view = codec::doc_record_view(record.value())?;
+                if view.live {
+                    digest ^= live_digest::term_of(key, &view);
                 }
             }
         }
@@ -922,8 +922,8 @@ impl Engine {
                 return Ok(None);
             }
             // not a row: a record header that does not decode, left out as the rebuild does
-            if let Ok((stamp, live)) = codec::doc_record_header(value) {
-                live_digest::fold_walked(&mut walked, collection.0, doc_key, &stamp, live);
+            if let Ok(view) = codec::doc_record_view(value) {
+                live_digest::fold_walked(&mut walked, collection.0, doc_key, &view);
             }
         }
         // not a row: the walk's own map, read after the walk
@@ -2040,5 +2040,149 @@ mod tests {
             a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).is_err()
         );
         assert!(a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).is_ok());
+    }
+
+    /// A `field` collection on `a`, with document 1 written in two steps (`a`, then `b`) so that the
+    /// record stands at the stamp of the second write over `{a, b}`, and the entries of the three writes.
+    fn field_document()
+    -> (Engine, crate::CollectionMeta, Vec<kimmy_core::OplogEntry>, tempfile::TempDir) {
+        let (a, da) = engine();
+        let coll = a
+            .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+            .unwrap();
+        let id = a.insert(&coll, doc! { "_id": 1 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        a.replace(&coll, &id, doc! { "_id": 1, "a": 1 }, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        a.replace(&coll, &id, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
+        let entries = a
+            .entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        (a, coll, entries, da)
+    }
+
+    /// Step 3 (S3b): two members at the same newest stamp over different merged states are FOUND
+    /// divergent. B holds the record of A's last write, stamped as A's is, over a state that lacks a field:
+    /// the old term (key and stamp) was the same on both and the probe called them equal.
+    #[test]
+    fn two_field_records_at_one_stamp_over_different_states_are_found_divergent() {
+        let (a, coll, _entries, _da) = field_document();
+        let (b, _db) = engine();
+        sync(&a, &b);
+        let id = DocId::Int64(1);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let (version, _) = b.get_versioned(&cb, &id).unwrap().expect("B holds the document");
+        let kimmy_core::DocVersion::Etag(stamp, _) = version else {
+            panic!("an etag: {version:?}")
+        };
+        let verdicts = exchange(&a, &b, None);
+        assert_eq!(compared(&verdicts, coll.id), Some(true), "premise: converged: {verdicts:?}");
+
+        // B's record: the same newest stamp, a state that holds only the field `b`
+        let image = crate::field_write::insert(
+            a.field_writer(),
+            None,
+            &doc! { "_id": 1, "b": 2 },
+            &mut || stamp,
+        )
+        .unwrap()
+        .expect("a state");
+        let mut record = kimmy_core::DocRecord::live(stamp, image.body);
+        record.meta = Some(image.meta);
+        let key = crate::docs::doc_key(&id).unwrap();
+        {
+            let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let verdicts = exchange(x, y, None);
+            assert_eq!(
+                compared(&verdicts, coll.id),
+                Some(false),
+                "the probe finds the difference of the states: {verdicts:?}"
+            );
+        }
+    }
+
+    /// The same entries applied in either order reach one state, and the probe finds nothing to repair.
+    #[test]
+    fn one_field_state_reached_in_either_order_is_not_found_divergent() {
+        let (_a, coll, entries, _da) = field_document();
+        assert_eq!(entries.len(), 3, "premise: insert and two replaces");
+        let (_c, _dc) = (0, 0);
+        let (q, _dq) = engine();
+        let (r, _dr) = engine();
+        let creation = _a
+            .entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_ddl())
+            .collect::<Vec<_>>();
+        q.apply_batch(&creation).unwrap();
+        r.apply_batch(&creation).unwrap();
+        q.apply_batch(&[entries[0].clone(), entries[1].clone(), entries[2].clone()]).unwrap();
+        r.apply_batch(&[entries[0].clone(), entries[2].clone(), entries[1].clone()]).unwrap();
+        for (x, y) in [(&q, &r), (&r, &q)] {
+            let verdicts = exchange(x, y, None);
+            assert_eq!(compared(&verdicts, coll.id), Some(true), "{verdicts:?}");
+        }
+    }
+
+    /// An in-flight write is not reported as divergence. B writes `b` at s0 (its clock behind), A writes
+    /// `a` at s1 above it concurrently, B pulls A: B holds `{a, b}` at s1 and A holds `{a}` at s1, and A
+    /// has not witnessed s0. The key is stamped above the cut, so it is excluded from both digests: the
+    /// probe says nothing (B does not answer for a collection that is not quiet at the cut) or finds the
+    /// two equal, in both directions and whether or not the busy collection is named. Never a mismatch.
+    #[test]
+    fn members_whose_states_differ_only_because_a_write_has_not_arrived_are_not_found_divergent() {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let coll = a
+            .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+            .unwrap();
+        let id = a.insert(&coll, doc! { "_id": 1 }).unwrap();
+        sync(&a, &b);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.replace(&cb, &id, doc! { "_id": 1, "b": 2 }, false).unwrap();
+        let s0 = b
+            .entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background)
+            .unwrap()
+            .entries
+            .last()
+            .unwrap()
+            .stamp;
+        a.advance_clock_past(&Stamp::new(Hlc::new(s0.hlc.wall_ms + 50, 0), a.node_id(), a.epoch()));
+        a.replace(&coll, &id, doc! { "_id": 1, "a": 1 }, false).unwrap();
+        pull(&b, &a);
+        assert_eq!(b.get(&cb, &id).unwrap(), Some(doc! { "_id": 1, "a": 1, "b": 2 }), "premise");
+        assert_eq!(a.get(&coll, &id).unwrap(), Some(doc! { "_id": 1, "a": 1 }), "premise");
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            for busy in [None, Some(coll.id)] {
+                let verdicts = exchange(x, y, busy);
+                assert_ne!(
+                    compared(&verdicts, coll.id),
+                    Some(false),
+                    "an in-flight write is not a divergence (busy named: {}): {verdicts:?}",
+                    busy.is_some()
+                );
+            }
+        }
+        drop((da, db));
     }
 }

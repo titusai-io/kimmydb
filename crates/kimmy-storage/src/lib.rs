@@ -98,6 +98,9 @@ mod definition_repair_tests;
 mod field_apply_tests;
 
 #[cfg(test)]
+mod field_digest_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]
