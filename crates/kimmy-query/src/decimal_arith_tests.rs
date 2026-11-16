@@ -796,3 +796,64 @@ fn add_over_a_list_is_sum_over_the_same_values() {
         assert_eq!(added, group("$sum", values.clone()), "{values:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `$inc` into a stored value: a result that is the stored value is not written (q7s5c.out)
+// ---------------------------------------------------------------------------
+
+/// `x` after `$inc x by` over `{_id: 1, x: stored}`.
+fn inc_over(stored: Bson, by: Bson) -> Bson {
+    let out = upd(doc! {"$inc": {"x": by}}, doc! {"_id": 1, "x": stored}).expect("applied");
+    out.get("x").cloned().expect("x")
+}
+
+/// The stored decimal stays as stored (the bytes, not only the number), as nModified 0 says.
+fn inc_keeps(label: &str, stored: Bson, by: Bson) {
+    assert_eq!(inc_over(stored.clone(), by), stored, "{label}");
+}
+
+#[test]
+fn an_inc_of_a_zero_with_a_finer_exponent_keeps_the_stored_decimal() {
+    inc_keeps("q7s5c0001 E1", dec("5000"), dec("0E-2"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_with_a_trailing_zero_as_it_is() {
+    inc_keeps("q7s5c0002 E2", dec("1.0"), dec("0.00"));
+    inc_keeps("q7s5c0003 E3", dec("1.50"), dec("0"));
+}
+
+#[test]
+fn an_inc_of_a_zero_keeps_a_stored_decimal_zero_as_it_is() {
+    inc_keeps("q7s5c0004 E4", dec("0E+3"), dec("-0"));
+    inc_keeps("q7s5c0005 E5", dec("-0"), dec("0"));
+    // q7s5b0005 (D5): `-0` stays `-0` after an `$inc` of `0E+3`
+    inc_keeps("q7s5b0005 D5", dec("-0"), dec("0E+3"));
+}
+
+#[test]
+fn an_inc_of_an_integer_zero_keeps_a_stored_decimal() {
+    inc_keeps("q7s5c0008 E8", dec("5"), Bson::Int32(0));
+}
+
+/// E6, q7s5c0006: an `Int32` plus a decimal zero is a decimal, so it is written.
+#[test]
+fn an_inc_of_a_decimal_zero_over_an_int32_writes_the_decimal() {
+    same(inc_over(Bson::Int32(5), dec("0")), "5");
+}
+
+/// E7, q7s5c0007: a double plus a decimal zero is a decimal, so it is written, at the digits the
+/// double converts to.
+#[test]
+fn an_inc_of_a_decimal_zero_over_a_double_writes_the_decimal() {
+    same(inc_over(Bson::Double(5.0), dec("0E+3")), "5.00000000000000");
+}
+
+/// E9, q7s5c0009: a double that the `$inc` leaves equal stays as it is, with its sign.
+#[test]
+fn an_inc_of_a_zero_double_keeps_a_stored_negative_zero() {
+    match inc_over(Bson::Double(-0.0), Bson::Double(0.0)) {
+        Bson::Double(x) => assert_eq!(x.to_bits(), (-0.0_f64).to_bits()),
+        other => panic!("{other:?}"),
+    }
+}
