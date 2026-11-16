@@ -138,7 +138,7 @@ impl WriteScope<'_> {
         self.refuse_if_poisoned()?;
         let (outcome, entry) = self
             .engine
-            .replace_in_txn(&self.txn, coll, id, doc, upsert, None, None)
+            .replace_in_txn(&self.txn, coll, id, doc, upsert, Condition::default())
             .map_err(|e| self.poison(e))?;
         self.wrote |= entry.is_some();
         self.entries.extend(entry);
@@ -276,6 +276,14 @@ impl WriteScope<'_> {
             "a write inside this scope failed and the scope cannot commit: {first}"
         ))
     }
+}
+
+/// The version a conditional write is held to: the stamp of the live document and, for a `field`
+/// document, the hash of its merged state. The default is no condition.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Condition {
+    pub stamp: Option<Stamp>,
+    pub state: Option<kimmy_core::StateHash>,
 }
 
 /// An insert that has passed every check and is not yet written: its id, its
@@ -868,7 +876,14 @@ impl Engine {
             kimmy_core::limits::check_id(id)?;
         }
         let txn = self.begin_write(WriterHolder::Write)?;
-        match self.replace_in_txn(&txn, coll, id, doc, upsert, expected, expected_state) {
+        match self.replace_in_txn(
+            &txn,
+            coll,
+            id,
+            doc,
+            upsert,
+            Condition { stamp: expected, state: expected_state },
+        ) {
             Ok((outcome, Some(entry))) => {
                 txn.commit()?;
                 self.publish(vec![entry]);
@@ -913,9 +928,9 @@ impl Engine {
         id: &DocId,
         doc: Document,
         upsert: bool,
-        expected: Option<Stamp>,
-        expected_state: Option<kimmy_core::StateHash>,
+        condition: Condition,
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
+        let Condition { stamp: expected, state: expected_state } = condition;
         let key = doc_key(id)?;
 
         let field = coll.merge_policy == MergePolicy::Field;

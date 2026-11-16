@@ -401,7 +401,8 @@ impl Engine {
                 next
             }
         };
-        let (_, entry) = self.replace_in_txn(txn, coll, &id, next, false, None, None)?;
+        let (_, entry) =
+            self.replace_in_txn(txn, coll, &id, next, false, crate::docs::Condition::default())?;
         entries.extend(entry);
         Ok(())
     }
