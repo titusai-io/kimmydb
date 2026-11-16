@@ -2139,6 +2139,7 @@ mod tests {
             collection: shadow.id,
             doc_id: Some(chunk_id),
             body: Some(bson::serialize_to_vec(&body).unwrap()),
+            meta: None,
         };
         assert!(engine.apply_remote(&shadow, &entry).unwrap(), "the chunk must have applied");
         assert_eq!(count_vectors(&engine, &shadow).unwrap(), 61);

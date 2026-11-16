@@ -575,6 +575,7 @@ fn violations_is_cut_at_a_passed_deadline_and_runs_with_time_left() {
         collection: meta.id,
         doc_id: Some(DocId::String("remote".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap()),
+        meta: None,
     };
     state.engine.apply_remote(&meta, &remote).unwrap();
 

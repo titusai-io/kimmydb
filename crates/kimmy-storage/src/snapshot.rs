@@ -1256,6 +1256,47 @@ impl Engine {
         Ok(waits)
     }
 
+    /// `page` without the documents of collections with merge policy `field`, which cannot be
+    /// applied yet (Step 3). Counted, and named in one log line for the page.
+    fn without_field_documents(&self, page: &SnapshotPage) -> Result<SnapshotPage> {
+        let announced: std::collections::BTreeSet<CollectionId> = page
+            .collections
+            .iter()
+            .filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
+            .map(|c| CollectionId::derive(&c.db, &c.name))
+            .collect();
+        let mut kept = Vec::with_capacity(page.documents.len());
+        let mut refused = 0u64;
+        let mut named: Vec<String> = Vec::new();
+        for doc in &page.documents {
+            let local = self.collection_by_id(doc.collection)?;
+            let field = announced.contains(&doc.collection)
+                || local.as_ref().is_some_and(|c| c.merge_policy == kimmy_core::MergePolicy::Field);
+            if !field {
+                kept.push(doc.clone());
+                continue;
+            }
+            refused += 1;
+            let name = local.map_or_else(
+                || format!("collection {}", doc.collection.0),
+                |c| format!("{}.{}", c.db, c.name),
+            );
+            if !named.contains(&name) {
+                named.push(name);
+            }
+        }
+        if refused == 0 {
+            return Ok(page.clone());
+        }
+        self.count_field_replication_refused(refused);
+        tracing::warn!(
+            entries = refused,
+            collections = %named.join(", "),
+            "refused snapshot documents for collections with merge policy `field`: their replication is not built yet; the rest of the page was applied"
+        );
+        Ok(SnapshotPage { documents: kept, ..page.clone() })
+    }
+
     /// Apply one page of a peer's snapshot, and move `progress` past it.
     ///
     /// The page's documents are one transaction: every one that wins
@@ -1281,6 +1322,11 @@ impl Engine {
         // every carried delete's key in the stored form, which is all any path
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
+        // A document of a `field` collection is a merge state the receiver cannot apply until
+        // Step 3: those documents are left out of the page and counted, once per page in the log,
+        // and the rest of the page is applied and the cursor moves on. Failing the page would
+        // hold the whole snapshot at this page and stall every other collection behind it.
+        let page = &self.without_field_documents(page)?;
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
@@ -1481,6 +1527,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
+                    meta: None,
                 };
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
@@ -1732,6 +1779,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
+                    meta: None,
                 };
                 if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
@@ -2021,6 +2069,7 @@ impl Engine {
                 collection: collection.id,
                 doc_id: Some(id),
                 body: None,
+                meta: None,
             };
             if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                 self.apply_remote_in_txn(txn, &collection, &entry, Position::Hold)?
@@ -7444,6 +7493,7 @@ mod tests {
             collection: cb.id,
             doc_id: Some(DocId::Int64(2)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            meta: None,
         };
 
         b.apply_batch(std::slice::from_ref(&forged)).unwrap();
@@ -7541,7 +7591,14 @@ mod tests {
         coll: &CollectionMeta,
         body: Option<Vec<u8>>,
     ) -> OplogEntry {
-        OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(DocId::Int64(2)), body }
+        OplogEntry {
+            stamp,
+            kind,
+            collection: coll.id,
+            doc_id: Some(DocId::Int64(2)),
+            body,
+            meta: None,
+        }
     }
 
     fn entries_at(engine: &Engine, stamp: Stamp) -> usize {
@@ -7660,6 +7717,7 @@ mod tests {
             collection: cb.id,
             doc_id: Some(DocId::Int64(2)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            meta: None,
         };
 
         // By entries, against the bare tombstone and then against the appended one.

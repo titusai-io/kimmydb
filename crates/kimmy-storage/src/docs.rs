@@ -11,8 +11,8 @@
 
 use bson::{Bson, Document};
 use kimmy_core::{
-    CollectionId, DocId, DocRecord, Error as CoreError, OpKind, OplogEntry, ResumeToken, Stamp,
-    keyenc,
+    CollectionId, DocId, DocRecord, Error as CoreError, MergePolicy, OpKind, OplogEntry,
+    ResumeToken, Stamp, keyenc,
 };
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
@@ -20,6 +20,7 @@ use tracing::warn;
 use crate::codec;
 use crate::engine::{Engine, Position, WriteTxn, WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
+use crate::field_write;
 use crate::index;
 use crate::meta::CollectionMeta;
 use crate::tables;
@@ -282,6 +283,12 @@ struct CheckedInsert {
 }
 
 impl Engine {
+    /// This member's writer identity in a field document's merge state: its node and the epoch
+    /// it opened with, the same pair its stamps carry.
+    pub(crate) fn field_writer(&self) -> kimmy_core::merge_state::WriterId {
+        kimmy_core::merge_state::WriterId { node: self.node_id(), epoch: self.epoch() }
+    }
+
     // -----------------------------------------------------------------------
     // Reads
     // -----------------------------------------------------------------------
@@ -576,7 +583,7 @@ impl Engine {
         let mut ids = Vec::with_capacity(pending.len());
         let mut entries = Vec::with_capacity(pending.len());
         for (index, checked) in pending.into_iter().enumerate() {
-            match self.write_insert(&txn, coll, checked) {
+            match self.write_insert(&txn, coll, checked, None) {
                 Ok((id, entry)) => {
                     ids.push((id, entry.stamp));
                     entries.push(entry);
@@ -606,7 +613,21 @@ impl Engine {
         doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
         let checked = self.check_insert(txn, coll, doc, None)?;
-        self.write_insert(txn, coll, checked)
+        self.write_insert(txn, coll, checked, None)
+    }
+
+    /// [`Self::insert_in_txn`] for the document an upsert creates: for a field collection the
+    /// creation is written through the writer's typed creation entry (`creation`), so its
+    /// increments are counters; a document collection ignores it.
+    pub(crate) fn insert_created_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        doc: Document,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
+    ) -> Result<(DocId, OplogEntry)> {
+        let checked = self.check_insert(txn, coll, doc, None)?;
+        self.write_insert(txn, coll, checked, creation)
     }
 
     /// The half of an insert that can refuse it: the id, the stored state, the
@@ -676,15 +697,52 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         checked: CheckedInsert,
+        creation: Option<&kimmy_core::effects::UpsertEffects>,
     ) -> Result<(DocId, OplogEntry)> {
         let CheckedInsert { id, key, body } = checked;
+        // A field collection keeps the document's merge state with it: the writer renders the
+        // body and the state, from what a tombstone at the key still holds.
+        let field = if coll.merge_policy == MergePolicy::Field {
+            let prior = {
+                let docs = txn.open_table(tables::DOCS)?;
+                match docs.get((coll.id.0, key.as_slice()))? {
+                    Some(raw) => Some(field_write::load(
+                        codec::decode_doc_record_with_meta(raw.value())?.meta.as_deref(),
+                    )?),
+                    None => None,
+                }
+            };
+            let doc: Document = bson::deserialize_from_slice(&body)?;
+            let image = match creation {
+                Some(creation) => {
+                    field_write::upsert(self.field_writer(), prior, creation, &doc, &mut || {
+                        self.next_stamp()
+                    })?
+                }
+                None => field_write::insert(self.field_writer(), prior, &doc, &mut || {
+                    self.next_stamp()
+                })?,
+            }
+            .ok_or_else(|| StorageError::Corrupt("an insert over a live field document".into()))?;
+            Some(image)
+        } else {
+            None
+        };
         // Minted once the write is certain to be made, under the writer
         // (ADR-148): a refused insert is not an event, so it does not tick
         // the clock.
-        let stamp = self.next_stamp();
+        let stamp = match &field {
+            Some(image) => image.stamp.expect("an insert mints a stamp"),
+            None => self.next_stamp(),
+        };
+        let (body, meta) = match field {
+            Some(image) => (image.body, Some(image.meta)),
+            None => (body, None),
+        };
         {
             let mut docs = txn.open_table(tables::DOCS)?;
-            let record = DocRecord::live(stamp, body.clone());
+            let mut record = DocRecord::live(stamp, body.clone());
+            record.meta = meta.clone();
             crate::live_count::put_record(
                 txn,
                 &mut docs,
@@ -700,6 +758,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: Some(body),
+            meta,
         };
         append_oplog(txn, &entry)?;
 
@@ -789,13 +848,17 @@ impl Engine {
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
         let key = doc_key(id)?;
 
-        let (existed, stamp, body) = {
+        let field = coll.merge_policy == MergePolicy::Field;
+        let (existed, stamp, body, meta) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The id is part of the document's identity, not its content: a
             // replace must not be able to move a document to a different
             // key. Its stored type is kept (see `replace_id_value`), so the
             // key is the same and `$type` does not change under the caller.
+            // A field collection's record is read with its merge state: the write goes through
+            // the state, and a body-only read here would lose it.
             let existing = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) if field => Some(codec::decode_doc_record_with_meta(raw.value())?),
                 Some(raw) => Some(codec::decode_doc_record(raw.value())?),
                 None => None,
             };
@@ -806,17 +869,38 @@ impl Engine {
             let stored_id = stored_doc.as_ref().and_then(|d| d.get(ID_FIELD));
             let id_value = replace_id_value(id, stored_id, doc.get(ID_FIELD));
             let doc = with_id_first(doc, id_value);
-            let body = bson::serialize_to_vec(&doc)?;
+            let mut body = bson::serialize_to_vec(&doc)?;
+            let mut doc = doc;
             // The previous image is needed to remove the index entries it
             // contributed — they are derived from the old value, not the new.
-            let (current, previous, unchanged) = match &existing {
+            let (current, previous, mut unchanged) = match &existing {
                 Some(record) => {
-                    let unchanged = record.is_live() && record.body == body;
+                    let unchanged = !field && record.is_live() && record.body == body;
                     (record.is_live().then_some(record.stamp), stored_doc, unchanged)
                 }
                 None => (None, None, false),
             };
             let existed = previous.is_some();
+            // The state the write starts from: the live document's, or what a tombstone still
+            // holds. A dry run says what the write would store before anything is minted: the
+            // stored image of a field document is what its merge state renders, which is not
+            // always the document sent (a replace keeps the order of the fields that stay).
+            let prior = match (&existing, field) {
+                (Some(record), true) => Some(field_write::load(record.meta.as_deref())?),
+                _ => None,
+            };
+            if field && existed && expected.is_none_or(|e| current == Some(e)) {
+                let state = prior.clone().expect("a field record has a state");
+                let writer = self.field_writer();
+                let probe = field_write::provisional(writer, &state);
+                match field_write::replace(writer, state, &doc, &mut || probe)? {
+                    None => unchanged = true,
+                    Some(image) => {
+                        body = image.body;
+                        doc = bson::deserialize_from_slice(&body)?;
+                    }
+                }
+            }
 
             if expected.is_some() && current != expected {
                 return Err(StorageError::Stale { current });
@@ -854,8 +938,30 @@ impl Engine {
 
             // Minted only once there is something to write, and still under
             // the writer (ADR-148).
-            let stamp = self.next_stamp();
-            let record = DocRecord::live(stamp, body.clone());
+            let (stamp, meta) = if field {
+                let writer = self.field_writer();
+                let image = match (existed, prior) {
+                    (true, Some(state)) => {
+                        field_write::replace(writer, state, &doc, &mut || self.next_stamp())?
+                    }
+                    (_, prior) => {
+                        field_write::insert(writer, prior, &doc, &mut || self.next_stamp())?
+                    }
+                }
+                .ok_or_else(|| {
+                    StorageError::Corrupt("a write the dry run made was refused".into())
+                })?;
+                if image.body != body {
+                    return Err(StorageError::Corrupt(
+                        "the stored image differs from the image of the dry run".into(),
+                    ));
+                }
+                (image.stamp.expect("a write that changes mints a stamp"), Some(image.meta))
+            } else {
+                (self.next_stamp(), None)
+            };
+            let mut record = DocRecord::live(stamp, body.clone());
+            record.meta = meta.clone();
             crate::live_count::put_record(
                 txn,
                 &mut docs,
@@ -864,7 +970,7 @@ impl Engine {
                 &codec::encode_doc_record(&record),
             )?;
             drop(docs);
-            (existed, stamp, body)
+            (existed, stamp, body, meta)
         };
 
         let entry = OplogEntry {
@@ -875,6 +981,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: Some(body),
+            meta,
         };
         append_oplog(txn, &entry)?;
 
@@ -1015,14 +1122,24 @@ impl Engine {
     ) -> Result<Option<OplogEntry>> {
         let key = doc_key(id)?;
 
-        let (previous, stamp) = {
+        let field = coll.merge_policy == MergePolicy::Field;
+        let (previous, stamp, meta) = {
             let mut docs = txn.open_table(tables::DOCS)?;
-            let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
+            let (current, previous, state) = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => {
-                    let record = codec::decode_doc_record(raw.value())?;
-                    (Some(record.stamp), record.document()?)
+                    let record = if field {
+                        codec::decode_doc_record_with_meta(raw.value())?
+                    } else {
+                        codec::decode_doc_record(raw.value())?
+                    };
+                    let state = if field && record.is_live() {
+                        Some(field_write::load(record.meta.as_deref())?)
+                    } else {
+                        None
+                    };
+                    (Some(record.stamp), record.document()?, state)
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
             let (Some(current), Some(image)) = (current, previous.as_ref()) else {
                 return Ok(None);
@@ -1033,15 +1150,29 @@ impl Engine {
             // Minted once the delete is certain to be made, under the writer
             // (ADR-148): a delete that finds nothing, or that the guard
             // declines, is not an event and does not tick the clock.
-            let stamp = self.next_stamp();
+            let (stamp, meta) = match state {
+                Some(state) => {
+                    let image =
+                        field_write::delete(self.field_writer(), state, &mut || self.next_stamp())?
+                            .ok_or_else(|| {
+                                StorageError::Corrupt(
+                                    "a live field document has no life to delete".into(),
+                                )
+                            })?;
+                    (image.stamp.expect("a delete mints a stamp"), Some(image.meta))
+                }
+                None => (self.next_stamp(), None),
+            };
+            let mut tombstone = DocRecord::tombstone(stamp);
+            tombstone.meta = meta.clone();
             crate::live_count::put_record(
                 txn,
                 &mut docs,
                 coll.id.0,
                 &key,
-                &codec::encode_doc_record(&DocRecord::tombstone(stamp)),
+                &codec::encode_doc_record(&tombstone),
             )?;
-            (previous, stamp)
+            (previous, stamp, meta)
         };
 
         // A tombstoned document must leave no index entries behind, or a scan
@@ -1055,6 +1186,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: None,
+            meta,
         };
         append_oplog(txn, &entry)?;
 
@@ -1249,6 +1381,12 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(RemoteApplied::Superseded { released: false });
         };
+        // Merging a remote write into a field document is the apply of Step 3; until it
+        // lands an entry for one is refused by name, not stored as a document that has no
+        // state.
+        if coll.merge_policy == MergePolicy::Field {
+            return Err(refuse_field_replication());
+        }
 
         let key = doc_key(&id)?;
         let incoming = match &entry.body {
@@ -1879,6 +2017,7 @@ impl Engine {
             collection: coll.id,
             doc_id: None,
             body: Some(bson::serialize_to_vec(&detail)?),
+            meta: None,
         };
         append_oplog(&txn, &entry)?;
         txn.commit()?;
@@ -1909,6 +2048,7 @@ impl Engine {
                 collection,
                 doc_id: None,
                 body: Some(bson::serialize_to_vec(&detail)?),
+                meta: None,
             };
             append_oplog(txn, &entry)?;
             entries.push(entry);
@@ -2005,6 +2145,16 @@ pub(crate) fn record_stamp(
         Some(raw) => Ok(Some(codec::decode_doc_record(raw.value())?.stamp)),
         None => Ok(None),
     }
+}
+
+/// The refusal of a remote write or snapshot document for a `field` collection, until the apply of
+/// Step 3 exists. Answered as the unbuilt capability it is (`501`).
+pub(crate) fn refuse_field_replication() -> StorageError {
+    StorageError::Core(CoreError::Unsupported(
+        "replicating a collection with merge policy `field` is not built yet: a remote write or \
+         snapshot document for it is refused (use mergePolicy `document` for a replicated collection)"
+            .into(),
+    ))
 }
 
 #[cfg(test)]
@@ -2670,6 +2820,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: body.map(|d| bson::serialize_to_vec(&d).unwrap()),
+            meta: None,
         }
     }
 
@@ -2798,6 +2949,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&doc).unwrap()),
+            meta: None,
         }
     }
 
@@ -3499,6 +3651,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "x", "pad": "y".repeat(64) }).unwrap(),
             ),
+            meta: None,
         };
         let mut bytes = codec::encode_oplog_entry(&entry);
         bytes.truncate(bytes.len() - 8);

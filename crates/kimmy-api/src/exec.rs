@@ -174,7 +174,14 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
-    create_collection_validated(state, auth, db, name, None, kimmy_core::MergePolicy::DEFAULT)
+    create_collection_validated(
+        state,
+        auth,
+        db,
+        name,
+        None,
+        kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
+    )
 }
 
 /// [`create_collection`] with a validator set at creation (ADR-257).
@@ -1655,6 +1662,39 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         };
         self.check_answer(doc, answered)?;
         Ok(Some(next))
+    }
+
+    /// The update as effects, for a document of a `field` collection. A replacement document (and
+    /// so every spec that is a removal) has none and is written as a replace.
+    fn effects(
+        &self,
+        doc: &Document,
+    ) -> Option<std::result::Result<kimmy_core::effects::Effects, String>> {
+        let update = self.update?;
+        match kimmy_query::update_effects::apply_with_effects(
+            update,
+            Some(self.filter),
+            doc,
+            self.now,
+        ) {
+            Ok(kimmy_query::update_effects::Plan::Effects { effects, .. }) => Some(Ok(effects)),
+            Ok(kimmy_query::update_effects::Plan::Replace { .. }) => None,
+            Err(e) => Some(Err(Self::reported(&self.failures, e))),
+        }
+    }
+
+    fn upsert_effects(
+        &self,
+        _doc: &Document,
+    ) -> Option<std::result::Result<kimmy_core::effects::UpsertEffects, String>> {
+        let update = self.update?;
+        match kimmy_query::update_effects::plan_upsert(update, self.filter, self.now) {
+            Ok(kimmy_query::update_effects::UpsertPlan::Effects { effects, .. }) => {
+                Some(Ok(effects))
+            }
+            Ok(kimmy_query::update_effects::UpsertPlan::Replace { .. }) => None,
+            Err(e) => Some(Err(Self::reported(&self.failures, e))),
+        }
     }
 
     fn upsert(&self) -> Option<std::result::Result<Document, String>> {
@@ -3329,12 +3369,12 @@ fn write_sink(
     let meta = match existing {
         Some(meta) => meta,
         // An implicit target is a collection like any created without a `mergePolicy`: the
-        // collection default, as over HTTP.
+        // create default, as over HTTP.
         None => match kimmy_storage::blocking(|| {
             state.engine.create_collection_with_policy(
                 &db,
                 &coll,
-                kimmy_core::MergePolicy::DEFAULT,
+                kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
                 None,
             )
         }) {

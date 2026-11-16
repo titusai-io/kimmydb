@@ -245,6 +245,7 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                     collection: coll.id,
                     doc_id: Some(kimmy_core::DocId::Int64((docs + extra) as i64)),
                     body: Some(bson::serialize_to_vec(&body).unwrap()),
+                    meta: None,
                 };
                 assert!(engine.apply_remote(&coll, &entry).unwrap());
             }

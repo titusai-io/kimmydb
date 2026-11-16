@@ -362,6 +362,13 @@ impl Writer {
         ws.len() >= MAX_WRITERS && !ws.contains(&self.id)
     }
 
+    /// Whether a write by this writer would be refused for the document's writer cap
+    /// ([`UpdateRefused::WriterCap`]). A refused write answers `None` like one that changes
+    /// nothing; a caller that must tell them apart asks this.
+    pub fn would_hit_writer_cap(&self) -> bool {
+        self.at_writer_cap()
+    }
+
     /// Mint the stamp of one write from `m`. A refused stamp is kept in `m` and reported as
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {

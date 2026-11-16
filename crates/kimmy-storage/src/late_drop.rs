@@ -1529,6 +1529,7 @@ mod tests {
             collection: id,
             doc_id: Some(DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 1i64, "x": 5 }).unwrap()),
+            meta: None,
         };
         assert!(b.apply_remote(&coll, &entry).unwrap());
         let entries = |e: &Engine| {

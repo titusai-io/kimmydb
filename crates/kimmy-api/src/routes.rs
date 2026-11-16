@@ -1032,7 +1032,7 @@ struct CreateCollectionRequest {
     /// `strict` (the default) or `moderate`.
     #[serde(default, rename = "validationLevel")]
     validation_level: Option<String>,
-    /// `field` (the default) or `document`. Fixed for the collection's life.
+    /// `document` (the default for now) or `field`. Fixed for the collection's life.
     #[serde(default, rename = "mergePolicy")]
     merge_policy: Option<String>,
 }
@@ -1050,7 +1050,7 @@ async fn create_collection(
     }
     .into_spec()?;
     let policy = match body.merge_policy.as_deref() {
-        None => kimmy_core::MergePolicy::DEFAULT,
+        None => kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
         Some(text) => kimmy_core::MergePolicy::parse(text).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "`mergePolicy` must be `field` or `document`, not `{text}`"

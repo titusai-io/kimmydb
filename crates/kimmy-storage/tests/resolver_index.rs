@@ -110,6 +110,7 @@ fn remote(coll: &CollectionMeta, doc: &Document, wall: u64) -> OplogEntry {
         collection: coll.id,
         doc_id: Some(DocId::try_from_bson(doc.get("_id").unwrap()).unwrap()),
         body: Some(bson::serialize_to_vec(doc).unwrap()),
+        meta: None,
     }
 }
 

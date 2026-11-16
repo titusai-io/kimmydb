@@ -249,6 +249,7 @@ mod tests {
             collection: kimmy_core::ids::CollectionId(1),
             doc_id: Some(id),
             body,
+            meta: None,
         }
     }
 

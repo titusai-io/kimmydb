@@ -52,9 +52,38 @@ pub enum MergePolicy {
     Document,
 }
 
+/// Chris's 2026-11-04 ruling, as the steering text states it: the merge state a `field` document
+/// carries costs about this many bytes of value per field at [`FIELD_POLICY_STEERING_FIELDS`]
+/// fields (L34-B measurement B0). B1 and B2 revise it; the constant is the one place the number
+/// lives, and `describe`, the OpenAPI document and the HTTP reference all read it from here.
+pub const FIELD_POLICY_BYTES_PER_FIELD: u32 = 45;
+
+/// The document width [`FIELD_POLICY_BYTES_PER_FIELD`] was measured at.
+pub const FIELD_POLICY_STEERING_FIELDS: u32 = 20;
+
+/// When to choose which merge policy: shown by `describe` and written in the documentation.
+pub fn merge_policy_steering() -> String {
+    format!(
+        "`field` merges concurrent writes to different fields of one document and keeps every \
+         concurrent `$inc`; it stores a merge state with each document, about \
+         {FIELD_POLICY_BYTES_PER_FIELD} bytes per field at {FIELD_POLICY_STEERING_FIELDS} fields, \
+         so it costs most on documents of many small fields. `document` stores nothing extra and \
+         the later write of a whole document wins: choose it for documents that are written whole, \
+         for large values and for write-once data. The policy is chosen when the collection is \
+         created and cannot be changed."
+    )
+}
+
 impl MergePolicy {
-    /// What a create request that names no policy gets.
+    /// What a create request that names no policy gets: the ruled default, `field`. Not yet what
+    /// the create paths use: see [`MergePolicy::INTERIM_CREATE_DEFAULT`].
     pub const DEFAULT: MergePolicy = MergePolicy::Field;
+
+    /// What the create paths (the HTTP route, the implicit `$out` and `$merge` targets) use while a
+    /// remote write for a `field` collection is refused, which is until Step 3's apply commit.
+    /// That commit deletes this constant, points the three uses back at [`MergePolicy::DEFAULT`] and
+    /// flips the text of `describe`, the OpenAPI document and the HTTP reference together.
+    pub const INTERIM_CREATE_DEFAULT: MergePolicy = MergePolicy::Document;
 
     pub fn as_str(self) -> &'static str {
         match self {

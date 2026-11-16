@@ -37,6 +37,19 @@ fn round_trip(st: &MergeState) -> Vec<u8> {
 }
 
 #[test]
+fn the_hash_of_the_bytes_is_the_hash_of_the_decoded_state() {
+    for st in [golden_empty(), golden_170(), golden_mixed(), golden_delete(), golden_obs()] {
+        let enc = st.encode_compact();
+        let decoded = MergeState::decode_compact(&enc).unwrap();
+        assert_eq!(MergeState::compact_hash_of(&enc).unwrap(), decoded.compact_hash());
+        assert_eq!(MergeState::compact_hash_of(&enc).unwrap(), st.compact_hash());
+    }
+    for bad in [&b""[..], b"QMS", b"QMS\x01rest", b"XMS\x02rest"] {
+        assert!(MergeState::compact_hash_of(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
 fn the_golden_states_round_trip_and_are_much_smaller() {
     for (name, st) in [
         ("empty", golden_empty()),
