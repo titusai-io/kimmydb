@@ -4439,6 +4439,17 @@ impl Engine {
     pub fn create_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
+        // The informational run of the whole suite with the helper creating `field` collections
+        // (Q7 S2c, W10): `KIMMY_TEST_HELPER_POLICY=field`. Test builds only; never gating.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if std::env::var("KIMMY_TEST_HELPER_POLICY").is_ok_and(|v| v == "field") {
+            return self.create_collection_with_policy(
+                db,
+                name,
+                kimmy_core::MergePolicy::Field,
+                None,
+            );
+        }
         self.create_collection_unchecked(db, name)
     }
 
