@@ -444,8 +444,8 @@ pub(crate) mod test_support {
         for row in txn.open_table(tables::DOCS).unwrap().iter().unwrap() {
             let (key, value) = row.unwrap();
             let (collection, doc_key) = key.value();
-            let (stamp, live) = codec::doc_record_header(value.value()).unwrap();
-            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &stamp, live);
+            let view = codec::doc_record_view(value.value()).unwrap();
+            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &view);
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
         let mut kept: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();

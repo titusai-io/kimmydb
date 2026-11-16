@@ -53,14 +53,14 @@ fn trio() -> Trio {
     p.apply_batch(&insert).unwrap();
     later();
     a.replace(&ca, &x, doc! { "_id": 1, "a": 1 }, false).unwrap();
-    let s1 = everything(&a).into_iter().filter(|e| e.stamp > cut).last().unwrap();
+    let s1 = everything(&a).into_iter().rfind(|e| e.stamp > cut).unwrap();
     later();
     m.replace(&cm, &x, doc! { "_id": 1, "b": 2 }, false).unwrap();
-    let s2 = everything(&m).into_iter().filter(|e| e.stamp > cut).last().unwrap();
+    let s2 = everything(&m).into_iter().rfind(|e| e.stamp > cut).unwrap();
     m.apply_batch(std::slice::from_ref(&s1)).unwrap();
     later();
     m.replace(&cm, &x, doc! { "_id": 1, "a": 1, "b": 2, "c": 3 }, false).unwrap();
-    let s3 = everything(&m).into_iter().filter(|e| e.stamp > cut).last().unwrap();
+    let s3 = everything(&m).into_iter().rfind(|e| e.stamp > cut).unwrap();
     assert!(s1.stamp < s2.stamp && s2.stamp < s3.stamp, "premise: the writes are stamped in order");
     Trio { a, m, p, _dirs: vec![da, dm, dp], coll: ca.id, s1, s2, s3 }
 }
