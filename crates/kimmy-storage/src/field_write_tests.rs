@@ -161,3 +161,66 @@ fn a_refused_field_write_does_not_move_the_clock() {
     assert!(same.stamp.is_none());
     assert_eq!(e.clock_last(), last, "a replace that changes nothing mints nothing");
 }
+
+/// A spec that matches every document and answers `to(doc)`.
+struct Spec<F: Fn(&Document) -> Option<Document>>(F);
+
+impl<F: Fn(&Document) -> Option<Document>> crate::ModifySpec for Spec<F> {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(true)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> Result<Option<Document>, String> {
+        Ok((self.0)(doc))
+    }
+    fn upsert(&self) -> Option<Result<Document, String>> {
+        None
+    }
+}
+
+#[test]
+fn an_update_of_a_field_collection_writes_the_state_and_a_removal_leaves_a_tombstone_with_it() {
+    use crate::Candidates;
+    let (e, _d) = open();
+    let (f, dc) = pair(&e);
+    for c in [&f, &dc] {
+        e.insert(c, doc! { "_id": 1_i64, "n": 1, "k": "x" }).unwrap();
+    }
+    // a change: the record, and the entry, carry the state; the stamp is max(vv)
+    let bump = Spec(|d: &Document| {
+        let mut d = d.clone();
+        d.insert("n", 2);
+        Some(d)
+    });
+    let out = e.modify_where(&f, &Candidates::Scan, &bump, None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 1));
+    let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
+    assert_eq!(rec.body, bytes(&doc! { "_id": 1_i64, "n": 2, "k": "x" }));
+    let state = MergeState::decode_compact(rec.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(state.vv.values().copied().max(), Some(rec.stamp.hlc));
+    let es = entries(&e, &f);
+    assert_eq!(
+        (es.len(), es[1].kind, es[1].meta.as_deref()),
+        (2, OpKind::Replace, rec.meta.as_deref())
+    );
+    // the same result again is no write
+    let commits = e.commits();
+    let same = Spec(|d: &Document| Some(d.clone()));
+    let out = e.modify_where(&f, &Candidates::Scan, &same, None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 0));
+    assert_eq!(e.commits(), commits);
+    // a removal
+    let gone = Spec(|_: &Document| None);
+    let out = e.modify_where(&f, &Candidates::Scan, &gone, None).unwrap();
+    assert_eq!(out.modified, 1);
+    let t = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
+    assert!(t.deleted && t.meta.is_some());
+    let es = entries(&e, &f);
+    assert_eq!((es[2].kind, es[2].meta.as_deref()), (OpKind::Delete, t.meta.as_deref()));
+    // the document collection is as it was
+    e.modify_where(&dc, &Candidates::Scan, &bump, None).unwrap();
+    assert_eq!(raw(&e, &dc, 1).unwrap()[0], 1);
+    assert!(entries(&e, &dc).iter().all(|x| x.meta.is_none()));
+}

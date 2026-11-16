@@ -285,7 +285,7 @@ struct CheckedInsert {
 impl Engine {
     /// This member's writer identity in a field document's merge state: its node and the epoch
     /// it opened with, the same pair its stamps carry.
-    fn field_writer(&self) -> kimmy_core::merge_state::WriterId {
+    pub(crate) fn field_writer(&self) -> kimmy_core::merge_state::WriterId {
         kimmy_core::merge_state::WriterId { node: self.node_id(), epoch: self.epoch() }
     }
 
