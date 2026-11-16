@@ -90,6 +90,42 @@ fn check_version(input: &mut &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The format version of a record that carries the merge state of a `field` collection's
+/// document: `version ‖ stamp ‖ deleted ‖ varint meta_len ‖ meta ‖ body` for a document
+/// record, and the same flag for an oplog entry. A `document` collection never writes it.
+pub const META_FORMAT_VERSION: u8 = 2;
+
+/// The version byte of a document record or an oplog entry: 1, or 2 when it carries `meta`.
+/// Returns whether `meta` follows the header.
+fn check_version_meta(input: &mut &[u8]) -> Result<bool> {
+    let version = take(input, 1)?[0];
+    match version {
+        FORMAT_VERSION => Ok(false),
+        META_FORMAT_VERSION => Ok(true),
+        found => Err(StorageError::UnsupportedFormat { found, expected: META_FORMAT_VERSION }),
+    }
+}
+
+fn put_varint(mut n: usize, out: &mut Vec<u8>) {
+    while n >= 0x80 {
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+fn take_varint(input: &mut &[u8]) -> Result<usize> {
+    let mut n = 0usize;
+    for shift in (0..35).step_by(7) {
+        let b = take(input, 1)?[0];
+        n |= usize::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+    Err(corrupt("a length is longer than five bytes"))
+}
+
 // ---------------------------------------------------------------------------
 // DocId
 // ---------------------------------------------------------------------------
@@ -169,20 +205,45 @@ pub fn decode_doc_id(input: &mut &[u8]) -> Result<DocId> {
 // ---------------------------------------------------------------------------
 
 pub fn encode_doc_record(record: &DocRecord) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + STAMP_LEN + 1 + record.body.len());
-    out.push(FORMAT_VERSION);
+    let meta_len = record.meta.as_ref().map_or(0, Vec::len);
+    let mut out = Vec::with_capacity(1 + STAMP_LEN + 1 + 5 + meta_len + record.body.len());
+    out.push(if record.meta.is_some() { META_FORMAT_VERSION } else { FORMAT_VERSION });
     put_stamp(&record.stamp, &mut out);
     out.push(u8::from(record.deleted));
+    if let Some(meta) = &record.meta {
+        put_varint(meta.len(), &mut out);
+        out.extend_from_slice(meta);
+    }
     out.extend_from_slice(&record.body);
     out
 }
 
-pub fn decode_doc_record(mut input: &[u8]) -> Result<DocRecord> {
-    check_version(&mut input)?;
+/// The record without its merge state: the body-only reader, for every site that reads and
+/// does not write the record back. `meta` is skipped, not copied, and is `None` in the result.
+pub fn decode_doc_record(input: &[u8]) -> Result<DocRecord> {
+    decode_doc_record_inner(input, false)
+}
+
+/// The record with its merge state, for a site that reads a record and writes it back (a
+/// body-only read there would drop the state without a sound).
+pub fn decode_doc_record_with_meta(input: &[u8]) -> Result<DocRecord> {
+    decode_doc_record_inner(input, true)
+}
+
+fn decode_doc_record_inner(mut input: &[u8], keep_meta: bool) -> Result<DocRecord> {
+    let has_meta = check_version_meta(&mut input)?;
     let stamp = take_stamp(&mut input)?;
     let deleted = take(&mut input, 1)?[0] != 0;
+    let mut meta = None;
+    if has_meta {
+        let len = take_varint(&mut input)?;
+        let bytes = take(&mut input, len)?;
+        if keep_meta {
+            meta = Some(bytes.to_vec());
+        }
+    }
     // The body is the remainder; no length prefix needed since it is last.
-    Ok(DocRecord { stamp, deleted, body: input.to_vec() })
+    Ok(DocRecord { stamp, deleted, body: input.to_vec(), meta })
 }
 
 /// Whether an encoded document record is live, read from its fixed-width header
@@ -194,7 +255,7 @@ pub fn decode_doc_record(mut input: &[u8]) -> Result<DocRecord> {
 /// key — but the copy [`decode_doc_record`] makes of every body, and the BSON
 /// parse a document read adds to it, are not (ADR-133's addendum).
 pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     take(&mut input, STAMP_LEN)?;
     Ok(take(&mut input, 1)?[0] == 0)
 }
@@ -205,7 +266,7 @@ pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
 /// For a walk that asks only whether any record was written after a point, as
 /// [`doc_record_is_live`] is for one that only counts.
 pub fn doc_record_header(mut input: &[u8]) -> Result<(Stamp, bool)> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     let stamp = take_stamp(&mut input)?;
     Ok((stamp, take(&mut input, 1)?[0] == 0))
 }
@@ -342,6 +403,81 @@ mod tests {
 
     fn stamp(ms: u64, n: u8) -> Stamp {
         Stamp::new(Hlc::new(ms, 3), NodeId::from_bytes([n; 16]), Epoch::ZERO)
+    }
+
+    fn meta_of(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_record_without_meta_is_the_version_1_bytes_it_always_was() {
+        let r = DocRecord::live(stamp(100, 1), b"body".to_vec());
+        let bytes = encode_doc_record(&r);
+        let mut want = vec![FORMAT_VERSION];
+        put_stamp(&r.stamp, &mut want);
+        want.push(0);
+        want.extend_from_slice(b"body");
+        assert_eq!(bytes, want, "a document record's bytes do not change");
+        assert_eq!(bytes.len(), 1 + STAMP_LEN + 1 + 4);
+        let t = encode_doc_record(&DocRecord::tombstone(stamp(5, 2)));
+        assert_eq!((t[0], t[1 + STAMP_LEN], t.len()), (1, 1, 1 + STAMP_LEN + 1));
+    }
+
+    #[test]
+    fn a_record_with_meta_round_trips_live_tombstone_empty_and_large() {
+        for meta in [meta_of(0), meta_of(1), meta_of(127), meta_of(128), meta_of(65_536)] {
+            for base in [
+                DocRecord::live(stamp(100, 1), b"body-bytes".to_vec()),
+                DocRecord::live(stamp(0, 0), Vec::new()),
+                DocRecord::tombstone(stamp(200, 2)),
+            ] {
+                let record = base.with_meta(meta.clone());
+                let bytes = encode_doc_record(&record);
+                assert_eq!(bytes[0], META_FORMAT_VERSION);
+                assert_eq!(decode_doc_record_with_meta(&bytes).unwrap(), record);
+                // the body-only reader: the same stamp, flag and body, and no meta
+                let body_only = decode_doc_record(&bytes).unwrap();
+                assert_eq!(body_only.meta, None);
+                assert_eq!(
+                    (body_only.stamp, body_only.deleted, &body_only.body),
+                    (record.stamp, record.deleted, &record.body)
+                );
+                // the headers read the same two facts from either version
+                assert_eq!(doc_record_header(&bytes).unwrap(), (record.stamp, record.is_live()));
+                assert_eq!(doc_record_is_live(&bytes).unwrap(), record.is_live());
+            }
+        }
+    }
+
+    #[test]
+    fn the_with_meta_reader_reads_a_version_1_record_as_no_meta() {
+        let r = DocRecord::live(stamp(9, 9), b"x".to_vec());
+        assert_eq!(decode_doc_record_with_meta(&encode_doc_record(&r)).unwrap(), r);
+    }
+
+    #[test]
+    fn a_meta_length_past_the_end_is_corrupt_and_version_3_is_unsupported() {
+        let good =
+            encode_doc_record(&DocRecord::live(stamp(1, 1), Vec::new()).with_meta(meta_of(10)));
+        // cut inside the meta
+        let cut = &good[..good.len() - 3];
+        for f in [decode_doc_record, decode_doc_record_with_meta] {
+            assert!(matches!(f(cut), Err(StorageError::Corrupt(_))), "{:?}", f(cut));
+        }
+        // a length of 2^31 and a length that never ends
+        let at = 1 + STAMP_LEN + 1;
+        let mut big = good[..at].to_vec();
+        big.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x08]);
+        assert!(decode_doc_record(&big).is_err());
+        let mut endless = good[..at].to_vec();
+        endless.extend_from_slice(&[0xff; 8]);
+        assert!(decode_doc_record(&endless).is_err());
+        let mut v3 = good.clone();
+        v3[0] = 3;
+        for r in [decode_doc_record(&v3), decode_doc_record_with_meta(&v3)] {
+            assert!(matches!(r, Err(StorageError::UnsupportedFormat { found: 3, .. })));
+        }
+        assert!(doc_record_header(&v3).is_err() && doc_record_is_live(&v3).is_err());
     }
 
     #[test]
