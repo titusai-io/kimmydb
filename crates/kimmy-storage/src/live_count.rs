@@ -160,8 +160,8 @@ impl Pending {
         &mut self,
         collection: u64,
         key: &[u8],
-        before: Option<(kimmy_core::Stamp, bool)>,
-        after: Option<(kimmy_core::Stamp, bool)>,
+        before: Option<&codec::RecordView>,
+        after: Option<&codec::RecordView>,
     ) {
         self.digests.entry(collection).or_default().wrote(key, before, after);
     }
@@ -172,8 +172,8 @@ impl Pending {
         &mut self,
         _collection: u64,
         _key: &[u8],
-        _before: Option<(kimmy_core::Stamp, bool)>,
-        _after: Option<(kimmy_core::Stamp, bool)>,
+        _before: Option<&codec::RecordView>,
+        _after: Option<&codec::RecordView>,
     ) {
     }
 
@@ -215,13 +215,13 @@ pub(crate) fn put_record(
     record: &[u8],
 ) -> Result<()> {
     let before = match docs.insert((collection, key), record)? {
-        Some(previous) => Some(codec::doc_record_header(previous.value())?),
+        Some(previous) => Some(codec::doc_record_view(previous.value())?),
         None => None,
     };
-    let after = codec::doc_record_header(record)?;
+    let after = codec::doc_record_view(record)?;
     let mut pending = txn.live_counts().lock();
-    pending.moved(collection, before.is_some_and(|(_, live)| live), after.1);
-    pending.wrote(collection, key, before, Some(after));
+    pending.moved(collection, before.as_ref().is_some_and(|v| v.live), after.live);
+    pending.wrote(collection, key, before.as_ref(), Some(&after));
     Ok(())
 }
 
@@ -249,12 +249,12 @@ pub(crate) fn remove_record(
     key: &[u8],
 ) -> Result<bool> {
     let before = match docs.remove((collection, key))? {
-        Some(previous) => codec::doc_record_header(previous.value())?,
+        Some(previous) => codec::doc_record_view(previous.value())?,
         None => return Ok(false),
     };
     let mut pending = txn.live_counts().lock();
-    pending.moved(collection, before.1, false);
-    pending.wrote(collection, key, Some(before), None);
+    pending.moved(collection, before.live, false);
+    pending.wrote(collection, key, Some(&before), None);
     Ok(true)
 }
 

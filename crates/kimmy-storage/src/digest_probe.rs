@@ -651,9 +651,9 @@ impl Engine {
                 return Ok(Excluded::OverBudget);
             }
             if let Some(record) = docs.get((collection.0, key.as_slice()))? {
-                let (stamp, live) = codec::doc_record_header(record.value())?;
-                if live {
-                    digest ^= live_digest::term(key, &stamp);
+                let view = codec::doc_record_view(record.value())?;
+                if view.live {
+                    digest ^= live_digest::term_of(key, &view);
                 }
             }
         }
@@ -922,8 +922,8 @@ impl Engine {
                 return Ok(None);
             }
             // not a row: a record header that does not decode, left out as the rebuild does
-            if let Ok((stamp, live)) = codec::doc_record_header(value) {
-                live_digest::fold_walked(&mut walked, collection.0, doc_key, &stamp, live);
+            if let Ok(view) = codec::doc_record_view(value) {
+                live_digest::fold_walked(&mut walked, collection.0, doc_key, &view);
             }
         }
         // not a row: the walk's own map, read after the walk
