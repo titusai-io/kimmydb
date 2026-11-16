@@ -1126,6 +1126,10 @@ struct FindRequest {
     cursor: Option<String>,
     /// Return each document's stamp in a parallel `stamps` array.
     stamps: bool,
+    /// With `stamps`: write stamps, comma separated; a parallel `covers` array says, per
+    /// document and stamp, whether this member's copy has seen the write.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
+    covers: Option<String>,
 }
 
 impl From<FindRequest> for exec::FindParams {
@@ -1139,6 +1143,7 @@ impl From<FindRequest> for exec::FindParams {
             explain: r.explain,
             cursor: r.cursor,
             stamps: r.stamps,
+            covers: r.covers,
         }
     }
 }

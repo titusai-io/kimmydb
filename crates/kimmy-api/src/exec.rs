@@ -316,6 +316,9 @@ pub struct FindParams {
     /// Return each document's stamp alongside it, for a conditional write
     /// that follows (ADR-084).
     pub stamps: bool,
+    /// Write stamps, comma separated: with `stamps`, a parallel `covers` array answers for each
+    /// document, per stamp asked, whether this member's copy has seen that write.
+    pub covers: Option<String>,
 }
 
 pub fn find(
@@ -340,6 +343,16 @@ pub fn find(
     refuse_positional_without_filter(projection.as_ref(), &filter)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let skip = params.skip.unwrap_or(0);
+    // `covers` is answered beside `stamps`, one list per document.
+    let asked = match params.covers.as_deref() {
+        None => Vec::new(),
+        Some(_) if !params.stamps => {
+            return Err(ApiError::bad_request(
+                "`covers` is answered beside `stamps`: set `stamps: true`",
+            ));
+        }
+        Some(raw) => parse_covers(raw)?,
+    };
 
     // A cursor pages in `_id` order, which is the order both access paths
     // already produce. Combining it with anything that reorders or re-offsets
@@ -402,7 +415,7 @@ pub fn find(
     // document is visited, so the vector below never holds a stored document
     // (ADR-150). How many documents each path shapes to fill it differs, and
     // each branch says which.
-    let (page_stamps, page_docs, stats): (Vec<kimmy_core::DocVersion>, Vec<bson::Document>, _) =
+    let (page_stamps, page_docs, stats): (Vec<kimmy_storage::Seen>, Vec<bson::Document>, _) =
         if sorted {
             // A sort has to see every match before it can page, but it need
             // not *hold* every match: the `skip + limit` least are all it can
@@ -431,8 +444,9 @@ pub fn find(
                 &filter,
                 Order::Any,
                 None,
-                |version, doc| {
-                    top.offer(version, doc)?;
+                &asked,
+                |seen, doc| {
+                    top.offer(seen, doc)?;
                     Ok(true)
                 },
             )?;
@@ -460,15 +474,19 @@ pub fn find(
             // accepts what it reads never asks the pool; the first pass that goes past it
             // makes the lease, and a read that takes another path never does.
             let keys = IndexKeys::of_a_find(state.aggregate_memory(), window);
-            let bounds =
-                ScanBounds { stop_after: Some(window), want: Some(window), hold: Some(&keys) };
+            let bounds = ScanBounds {
+                stop_after: Some(window),
+                want: Some(window),
+                hold: Some(&keys),
+                asked: &asked,
+            };
             let stats = visit_matching_bounded(
                 state,
                 &meta,
                 &filter,
                 Order::ById { after: cursor.as_ref().map(|c| c.key()) },
                 bounds,
-                |version, doc| {
+                |found, doc| {
                     seen += 1;
                     if seen > skip {
                         if continuable {
@@ -484,7 +502,7 @@ pub fn find(
                         };
                         match shaped {
                             Ok(shaped) => {
-                                stamps.push(version);
+                                stamps.push(found);
                                 docs.push(shaped);
                             }
                             Err(e) => {
@@ -510,8 +528,13 @@ pub fn find(
     if params.stamps {
         // Parallel to `documents` rather than a field inside each one: the
         // document is the caller's data and comes back exactly as stored.
-        let stamps: Vec<String> = page_stamps.iter().map(kimmy_core::DocVersion::encode).collect();
+        let stamps: Vec<String> = page_stamps.iter().map(|s| s.version.encode()).collect();
         body["stamps"] = json!(stamps);
+        // For each document, per write asked, whether this member's copy has seen it: read from
+        // the record the document came from.
+        if !asked.is_empty() {
+            body["covers"] = json!(page_stamps.iter().map(|s| &s.covers).collect::<Vec<_>>());
+        }
     }
     if let Some(next) = next {
         body["nextCursor"] = json!(next.encode());
@@ -621,7 +644,7 @@ struct TopK<'a> {
 /// One held match: what ranks it, and what it will return.
 struct Ranked<'a> {
     order: &'a [shape::SortKey],
-    stamp: kimmy_core::DocVersion,
+    stamp: kimmy_storage::Seen,
     keys: Vec<bson::Bson>,
     /// The shaped document, or why it cannot be shaped. A refusal is held with
     /// the match it belongs to and raised only if that match is on the page
@@ -668,7 +691,7 @@ impl<'a> TopK<'a> {
 
     fn offer(
         &mut self,
-        stamp: impl Into<kimmy_core::DocVersion>,
+        stamp: impl Into<kimmy_storage::Seen>,
         doc: bson::Document,
     ) -> kimmy_core::Result<()> {
         let stamp = stamp.into();
@@ -704,7 +727,7 @@ impl<'a> TopK<'a> {
     fn into_sorted(
         self,
         skip: usize,
-    ) -> Result<Vec<(kimmy_core::DocVersion, bson::Document)>, ApiError> {
+    ) -> Result<Vec<(kimmy_storage::Seen, bson::Document)>, ApiError> {
         self.heap
             .into_sorted_vec()
             .into_iter()
@@ -924,7 +947,7 @@ struct Recheck<'a, F> {
     visit: F,
 }
 
-impl<F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>> Recheck<'_, F> {
+impl<F: FnMut(kimmy_storage::Seen, bson::Document) -> kimmy_core::Result<bool>> Recheck<'_, F> {
     /// Examine one candidate; whether the scan should go on.
     ///
     /// The bound is checked **before** a candidate is considered, not after
@@ -938,7 +961,7 @@ impl<F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool
     /// candidate, which ends the scan and fails the read (ADR-206).
     fn take(
         &mut self,
-        version: kimmy_core::DocVersion,
+        version: kimmy_storage::Seen,
         doc: bson::Document,
     ) -> kimmy_core::Result<bool> {
         if self.stop_after == Some(self.matched) {
@@ -1078,8 +1101,8 @@ where
     F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
 {
     let mut visit = visit;
-    visit_matching_versions_until(state, meta, filter, order, stop_after, |version, doc| {
-        visit(version.stamp(), doc)
+    visit_matching_versions_until(state, meta, filter, order, stop_after, &[], |seen, doc| {
+        visit(seen.version.stamp(), doc)
     })
 }
 
@@ -1091,12 +1114,13 @@ pub(crate) fn visit_matching_versions_until<F>(
     filter: &filter::Filter,
     order: Order<'_>,
     stop_after: Option<usize>,
+    asked: &[kimmy_core::Stamp],
     visit: F,
 ) -> Result<QueryStats, ApiError>
 where
-    F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>,
+    F: FnMut(kimmy_storage::Seen, bson::Document) -> kimmy_core::Result<bool>,
 {
-    let bounds = ScanBounds { stop_after, want: stop_after, hold: None };
+    let bounds = ScanBounds { stop_after, want: stop_after, hold: None, asked };
     visit_matching_bounded(state, meta, filter, order, bounds, visit)
 }
 
@@ -1112,6 +1136,8 @@ pub(crate) struct ScanBounds<'a> {
     /// Where the keys an inexact index range holds are charged when `want` does not bound
     /// them (ADR-269).
     pub(crate) hold: Option<&'a dyn kimmy_storage::KeyHold>,
+    /// Write stamps a `find` asked whether the copy has seen (`covers`); empty otherwise.
+    pub(crate) asked: &'a [kimmy_core::Stamp],
 }
 
 /// [`visit_matching_until`], with the bounds of the read given apart: `stop_after` ends the
@@ -1125,9 +1151,9 @@ pub(crate) fn visit_matching_bounded<F>(
     visit: F,
 ) -> Result<QueryStats, ApiError>
 where
-    F: FnMut(kimmy_core::DocVersion, bson::Document) -> kimmy_core::Result<bool>,
+    F: FnMut(kimmy_storage::Seen, bson::Document) -> kimmy_core::Result<bool>,
 {
-    let ScanBounds { stop_after, want, hold } = bounds;
+    let ScanBounds { stop_after, want, hold, asked } = bounds;
     // Every read of documents goes through here (find, count, an aggregate's source,
     // the vector filter), so the request's deadline is set once for all of
     // them; the walks below tick it per row (ADR-266).
@@ -1153,7 +1179,8 @@ where
             }
             // A key naming no document is an ordinary miss, not an error: the
             // filter asked for an `_id` nothing was stored under.
-            let Some((version, doc)) = state.engine.get_version_by_encoded_key(meta, key)? else {
+            let Some((version, doc)) = state.engine.get_version_by_encoded_key(meta, key, asked)?
+            else {
                 continue;
             };
             if !recheck.take(version, doc)? {
@@ -1215,7 +1242,7 @@ where
                 &scan,
                 delivery,
                 kimmy_storage::WalkScope::Request,
-                hold,
+                kimmy_storage::ScanExtras { hold, asked },
                 |_, version, doc| Ok(recheck.take(version, doc)?),
             )
         })?;
@@ -1233,6 +1260,7 @@ where
                 meta,
                 after,
                 kimmy_storage::WalkScope::Request,
+                asked,
                 |_, version, doc| Ok(recheck.take(version, doc)?),
             )
         })?;
@@ -3020,6 +3048,7 @@ fn scan_pipeline(
             stop_after: None,
             want: pipeline::source_bound(stages),
             hold: Some(&keys),
+            asked: &[],
         };
         // Under `blocking` as a whole: the walks below are, but an `_id` lookup is read inline
         // there, and what the chain and the lease charge there can wait for the pool.
@@ -3060,7 +3089,8 @@ fn scan_pipeline(
         // that rejects most candidates goes on to passes that double, up to the range.
         let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
         let ceiling = Some(limits.max_documents + 1);
-        let bounds = ScanBounds { stop_after: ceiling, want: ceiling, hold: Some(&keys) };
+        let bounds =
+            ScanBounds { stop_after: ceiling, want: ceiling, hold: Some(&keys), asked: &[] };
         // Under `blocking`, as the streaming read above is: `read` can wait for the pool.
         let stats = kimmy_storage::blocking(|| {
             visit_matching_bounded(

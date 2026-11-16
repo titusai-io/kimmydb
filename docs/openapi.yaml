@@ -4293,6 +4293,16 @@ components:
             Return each document's stamp in a parallel `stamps` array, for a
             conditional write that follows. Off by default: a version is not
             one of the document's fields, and most reads do not want one.
+        covers:
+          type: string
+          description: |
+            Write stamps, comma separated, asked beside `stamps: true` (a
+            `400` without it). The response's `covers` array has, for each
+            document in order, one `true` or `false` per stamp asked: whether
+            this member's copy of that document has seen the write, read from
+            the record the document came from (`field`: the document's
+            version vector holds the write's origin at or above its clock;
+            `document`: the stored stamp is at or above it).
 
     FindResponse:
       type: object
@@ -4313,6 +4323,15 @@ components:
             collection with merge policy `field` each entry is the document's
             etag (its stamp and the hash of its merged state), read from the
             same record as the document.
+        covers:
+          type: array
+          items:
+            type: array
+            items: { type: boolean }
+          description: |
+            Present when the request set `covers`: parallel to `documents`,
+            each entry the answer per stamp asked, as `Kimmy-Covers` is on a
+            read by id.
         nextCursor:
           type: string
           description: |

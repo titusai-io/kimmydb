@@ -23194,3 +23194,73 @@ async fn a_read_by_id_answers_which_writes_the_copy_has_seen() {
         assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
     }
 }
+
+/// `covers` on `find` with `stamps` answers, per document, what a read by id answers for the same
+/// document: the same record, the same rule (a `field` document's version vector, a `document`'s stamp).
+#[tokio::test]
+async fn covers_on_find_and_on_a_read_by_id_agree_for_the_same_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for (name, policy) in [("f", "field"), ("d", "document")] {
+        server
+            .post(
+                "/v1/db/shop/collections",
+                Some(&token),
+                json!({"name": name, "mergePolicy": policy}),
+            )
+            .await;
+        let first = server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":1,"n":0}))
+            .await;
+        let s1 = stamp_of(&first.body);
+        let second = server
+            .put(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token), json!({"n": 1}))
+            .await;
+        let s2 = stamp_of(&second.body);
+        server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":2,"n":9}))
+            .await;
+        let future = {
+            let mut st = kimmy_core::Stamp::decode(&s2).unwrap();
+            st.hlc = kimmy_core::Hlc::new(st.hlc.wall_ms + 86_400_000, 0);
+            st.encode()
+        };
+        let asked = format!("{s1},{s2},{future}");
+        let by_id = server
+            .get(&format!("/v1/db/shop/coll/{name}/docs/1?covers={asked}"), Some(&token))
+            .await;
+        let want = by_id.header("kimmy-covers").unwrap();
+        assert_eq!(want, "true,true,false", "{name}");
+        for sort in [None, Some(json!({"n": 1}))] {
+            let mut body = json!({"filter": {"_id": 1}, "stamps": true, "covers": asked});
+            if let Some(sort) = sort {
+                body["sort"] = sort;
+            }
+            let found =
+                server.post(&format!("/v1/db/shop/coll/{name}/find"), Some(&token), body).await;
+            assert_eq!(found.status, 200, "{name}: {:?}", found.body);
+            assert_eq!(found.body["covers"], json!([[true, true, false]]), "{name}");
+        }
+        // the whole collection: one list per document, the second document has seen neither of the
+        // first one's writes
+        let all = server
+            .post(
+                &format!("/v1/db/shop/coll/{name}/find"),
+                Some(&token),
+                json!({"filter": {}, "stamps": true, "covers": s1}),
+            )
+            .await;
+        let covers = all.body["covers"].as_array().unwrap();
+        assert_eq!(covers.len(), 2, "{name}: {:?}", all.body);
+        assert_eq!(covers[0], json!([true]), "{name}");
+        // `covers` without `stamps` is refused
+        let bad = server
+            .post(
+                &format!("/v1/db/shop/coll/{name}/find"),
+                Some(&token),
+                json!({"filter": {}, "covers": s1}),
+            )
+            .await;
+        assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
+    }
+}

@@ -637,7 +637,7 @@ the `ETag`, a bulk insert answers `etags`, and `if_stamp` takes it (a stamp is
 state, so a write conditional on it is `409 stale` when the stamp or any part of
 the state differs. `GET .../docs/{id}?covers=<stamp>[,<stamp>...]` answers a
 `Kimmy-Covers` header with `true` or `false` per stamp: whether this member's
-copy of the document has seen that write. The create answer and `describe` both carry the policy, and `describe`
+copy of the document has seen that write. `find` with `stamps: true` takes the same stamps as `covers` in its body and answers a `covers` array, one list per document, from the record each document was read from. The create answer and `describe` both carry the policy, and `describe`
 the guidance above as `mergePolicyGuidance`.
 
 Databases are created implicitly by their first collection and removed

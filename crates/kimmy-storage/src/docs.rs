@@ -278,6 +278,27 @@ impl WriteScope<'_> {
     }
 }
 
+/// What a read walk hands its visitor besides the document: the document's version identity and,
+/// when the read asked which writes the copy has seen (`covers`), the answer per write asked, in
+/// order. Both are computed from the record bytes the document was decoded from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub version: kimmy_core::DocVersion,
+    pub covers: Vec<bool>,
+}
+
+impl From<kimmy_core::DocVersion> for Seen {
+    fn from(version: kimmy_core::DocVersion) -> Self {
+        Self { version, covers: Vec::new() }
+    }
+}
+
+impl From<Stamp> for Seen {
+    fn from(stamp: Stamp) -> Self {
+        Self::from(kimmy_core::DocVersion::Stamp(stamp))
+    }
+}
+
 /// The version a conditional write is held to: the stamp of the live document and, for a `field`
 /// document, the hash of its merged state. The default is no condition.
 #[derive(Clone, Copy, Debug, Default)]
@@ -402,20 +423,24 @@ impl Engine {
     where
         F: FnMut(DocId, Stamp, Document) -> Result<bool>,
     {
-        self.for_each_version_after(coll, after, scope, |id, v, doc| f(id, v.stamp(), doc))
+        self.for_each_version_after(coll, after, scope, &[], |id, seen, doc| {
+            f(id, seen.version.stamp(), doc)
+        })
     }
 
-    /// [`Engine::for_each_record_after`] handing `f` each document's version identity, taken from
-    /// the same record bytes as the document.
+    /// [`Engine::for_each_record_after`] handing `f` each document's version identity and, for the
+    /// writes in `asked`, whether the copy has seen each, taken from the same record bytes as the
+    /// document.
     pub fn for_each_version_after<F>(
         &self,
         coll: &CollectionMeta,
         after: Option<&[u8]>,
         scope: WalkScope,
+        asked: &[Stamp],
         mut f: F,
     ) -> Result<()>
     where
-        F: FnMut(DocId, kimmy_core::DocVersion, Document) -> Result<bool>,
+        F: FnMut(DocId, Seen, Document) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
         let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
@@ -427,7 +452,7 @@ impl Engine {
             }
             let doc: Document = bson::deserialize_from_slice(&record.body)?;
             let id = extract_id(&doc)?;
-            if !f(id, codec::doc_record_version(&record, value.value()), doc)? {
+            if !f(id, codec::doc_record_seen(&record, value.value(), asked)?, doc)? {
                 break;
             }
         }
