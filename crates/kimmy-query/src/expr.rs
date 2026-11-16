@@ -147,6 +147,7 @@ pub enum Op {
     ToUpper,
     ToLower,
     Substr,
+    SubstrCp,
     Split,
     StrLenCp,
     IndexOfCp,
@@ -251,7 +252,8 @@ impl Op {
             "$concat" => Op::Concat,
             "$toUpper" => Op::ToUpper,
             "$toLower" => Op::ToLower,
-            "$substr" | "$substrCP" => Op::Substr,
+            "$substr" => Op::Substr,
+            "$substrCP" => Op::SubstrCp,
             "$split" => Op::Split,
             "$strLenCP" => Op::StrLenCp,
             "$indexOfCP" => Op::IndexOfCp,
@@ -341,6 +343,7 @@ impl Op {
             Op::ToUpper => "$toUpper",
             Op::ToLower => "$toLower",
             Op::Substr => "$substr",
+            Op::SubstrCp => "$substrCP",
             Op::Split => "$split",
             Op::StrLenCp => "$strLenCP",
             Op::IndexOfCp => "$indexOfCP",
@@ -402,14 +405,13 @@ impl Op {
             | Op::SetUnion
             | Op::SetIntersection => Arity::AtLeast(1),
             Op::MergeObjects => Arity::AtLeast(0),
-            Op::SetEquals => Arity::AtLeast(2),
+            Op::SetEquals | Op::IfNull => Arity::AtLeast(2),
             Op::Subtract
             | Op::Divide
             | Op::Mod
             | Op::Pow
             | Op::Split
             | Op::Strcasecmp
-            | Op::IfNull
             | Op::Eq
             | Op::Ne
             | Op::Gt
@@ -423,7 +425,7 @@ impl Op {
             | Op::In
             | Op::SetDifference
             | Op::SetIsSubset => Arity::Exact(2),
-            Op::Substr | Op::SubstrBytes => Arity::Exact(3),
+            Op::Substr | Op::SubstrCp | Op::SubstrBytes => Arity::Exact(3),
             Op::IndexOfCp | Op::IndexOfBytes => Arity::Between(2, 4),
             Op::Cond => Arity::Exact(3),
             Op::Slice | Op::Range => Arity::Between(2, 3),
@@ -1313,7 +1315,20 @@ impl Expr {
         match value {
             Bson::String(s) => Ok(match s.strip_prefix('$') {
                 Some(rest) if rest.starts_with('$') => Self::parse_variable(&rest[1..], declared)?,
-                Some(field) if !field.is_empty() => Expr::Field(field.to_string()),
+                // A path that is no path is refused, as the reference refuses it wherever an
+                // expression is read (q7s4d0028, d0030, d0031: `"$"`, `"$a."`, `"$.a"`; codes
+                // 16872, 40353, 15998). An empty segment or one that starts with `$` after
+                // the first (`"$a..b"`, `"$a.$b"`) is the same refusal; UNRECORDED in an
+                // expression, recorded for a projection name (q7s3i 187 to 228).
+                Some(field) => {
+                    if field.is_empty() {
+                        return Err(Error::InvalidQuery(
+                            "'$' by itself is not a valid FieldPath".into(),
+                        ));
+                    }
+                    crate::shape::check_field_path("field path", field)?;
+                    Expr::Field(field.to_string())
+                }
                 // A bare string without `$` is a literal, which is what
                 // MongoDB does: `{$sum: "total"}` sums the constant.
                 _ => Expr::Literal(value.clone()),
@@ -1706,7 +1721,7 @@ impl Expr {
                             "$sortArray sortBy for {path:?} must be 1 or -1"
                         )));
                     };
-                    parsed.push(SortKey { path: path.clone(), descending });
+                    parsed.push(SortKey::new(path.clone(), descending));
                 }
                 ArrayOrder::Keys(parsed)
             }
@@ -2173,14 +2188,18 @@ fn eval_lazy(op: Op, args: &[Expr], scope: &Scope<'_>) -> Result<Bson> {
             }
             _ => unreachable!("arity checked at parse"),
         },
+        // `[e1, ..., en, replacement]`: the first `ei` that is neither null nor missing, and the
+        // replacement when there is none (q7s4b3657, b3658, b3661). The arguments are read in
+        // order and no more than is needed, so a later one that would fail is not read.
         Op::IfNull => match args {
-            [value, fallback] => {
-                let v = value.eval_in(scope)?;
-                if matches!(v, Bson::Null | Bson::Undefined) {
-                    fallback.eval_in(scope)
-                } else {
-                    Ok(v)
+            [candidates @ .., fallback] if !candidates.is_empty() => {
+                for candidate in candidates {
+                    let v = candidate.eval_in(scope)?;
+                    if !matches!(v, Bson::Null | Bson::Undefined) {
+                        return Ok(v);
+                    }
                 }
+                fallback.eval_in(scope)
             }
             _ => unreachable!("arity checked at parse"),
         },
@@ -2365,7 +2384,9 @@ fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> 
 /// input order, in either direction.
 ///
 /// The comparison is the `$sort` stage's own ([`shape::compare_keys`]) over the
-/// keys read once per element. A sort document reads an element that is not a
+/// keys read once per element by [`shape::element_sort_keys`], which are not a sort key's: a
+/// digit is a position, a name is not looked up through an array, the value is compared whole,
+/// and nothing is refused (q7s3j 187-205). A sort document reads an element that is not a
 /// document as an empty one, so every key is null and it ties with a document
 /// holding none of them. With `sortBy: 1` or `-1` whole elements are compared,
 /// documents included, by [`canonical_cmp`].
@@ -2385,7 +2406,7 @@ fn sort_array(items: Vec<Bson>, order: &ArrayOrder) -> Vec<Bson> {
                 .into_iter()
                 .map(|item| {
                     let doc = if let Bson::Document(d) = &item { d } else { &none };
-                    (shape::sort_keys(keys, doc), item)
+                    (shape::element_sort_keys(keys, doc), item)
                 })
                 .collect();
             keyed.sort_by(|a, b| shape::compare_keys(keys, &a.0, &b.0));
@@ -2629,7 +2650,9 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::Concat => concat(args),
         Op::ToUpper => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_uppercase())),
         Op::ToLower => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_lowercase())),
-        Op::Substr => substr(args),
+        // The legacy `$substr` counts bytes, as `$substrBytes` does (q7s4g:674, 678).
+        Op::Substr => strings::substr_bytes(args),
+        Op::SubstrCp => substr_cp(args),
         Op::Split => split(&args[0], &args[1]),
         Op::StrLenCp => Ok(count_bson(as_string_strict(&args[0], op)?.chars().count())),
         Op::IndexOfCp | Op::IndexOfBytes => strings::index_of(op, args),
@@ -3080,7 +3103,16 @@ fn fold_numeric(op: Op, args: &[Bson], f: fn(Num, Num) -> Num) -> Result<Bson> {
     }
     let mut it = nums.into_iter();
     let first = it.next().expect("arity checked at parse");
-    Ok(it.fold(first, f).to_bson())
+    let folded = it.fold(first, f);
+    // The reference's sum starts at `+0.0`: `$add` of negative zeros is `0.0` (q7s4g:670, 671),
+    // where `$multiply [-0.0, 1]` keeps its sign (672).
+    if op == Op::Add
+        && let Num::Dbl(d) = folded
+        && d == 0.0
+    {
+        return Ok(Bson::Double(0.0));
+    }
+    Ok(folded.to_bson())
 }
 
 /// `$add` is arithmetic *or* date shifting, decided by its operands.
@@ -3105,7 +3137,9 @@ fn arithmetic_add(args: &[Bson]) -> Result<Bson> {
             Bson::DateTime(dt) => base = dt.timestamp_millis(),
             Bson::Null | Bson::Undefined => return Ok(Bson::Null),
             other => match Num::from_bson(other) {
-                Some(n) => millis = millis.saturating_add(n.as_f64() as i64),
+                Some(n) => {
+                    millis = millis.checked_add(date_shift(n, true)?).ok_or_else(date_overflow)?;
+                }
                 None => {
                     return Err(Error::InvalidQuery(format!(
                         "$add needs numbers or one date, found {}",
@@ -3115,8 +3149,36 @@ fn arithmetic_add(args: &[Bson]) -> Result<Bson> {
             },
         }
     }
-    Ok(Bson::DateTime(bson::DateTime::from_millis(base.saturating_add(millis))))
+    let shifted = base.checked_add(millis).ok_or_else(date_overflow)?;
+    Ok(Bson::DateTime(bson::DateTime::from_millis(shifted)))
 }
+
+/// The refusal of a date shifted past what a date holds, in the reference's words (code 15).
+fn date_overflow() -> Error {
+    Error::InvalidQuery("date overflow in $add".into())
+}
+
+/// The milliseconds a number shifts a date by, exactly: an integer as it is, and a double cut
+/// toward zero (`Date(0) + 1.5` is `Date(1)`, `Date(0) - 1.5` is `Date(-1)`: q7s4b0389, b0789).
+/// A NaN, an infinity and a double past what a long holds are refused (q7s4b0220, b0240, b0260,
+/// b0391 to b0393 for `$add`, code 15 "date overflow in $add"; b0791 to b0793 for `$subtract`,
+/// code 31109 "Can't coerce out of range value nan to long"). A finite double past the long
+/// range is UNRECORDED and is refused the same way.
+fn date_shift(n: Num, add: bool) -> Result<i64> {
+    match n {
+        Num::Int32(n) => Ok(i64::from(n)),
+        Num::Int64(n) => Ok(n),
+        Num::Dbl(d) if d.is_finite() && (-TWO_POW_63..TWO_POW_63).contains(&d) => Ok(d as i64),
+        Num::Dbl(_) if add => Err(date_overflow()),
+        Num::Dbl(d) => Err(Error::InvalidQuery(format!(
+            "Can't coerce out of range value {} to long",
+            if d.is_nan() { "nan".to_string() } else { d.to_string() }
+        ))),
+    }
+}
+
+/// 2^63 as a double: the first value a long cannot hold.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// `$subtract` on two dates is an interval in milliseconds; on a date and a
 /// number it shifts the date. Both are MongoDB's behaviour and both are what
@@ -3128,9 +3190,17 @@ fn arithmetic_subtract(a: &Bson, b: &Bson) -> Result<Bson> {
             Ok(Bson::Int64(x.timestamp_millis().saturating_sub(y.timestamp_millis())))
         }
         (Bson::DateTime(x), other) => match Num::from_bson(other) {
-            Some(n) => Ok(Bson::DateTime(bson::DateTime::from_millis(
-                x.timestamp_millis().saturating_sub(n.as_f64() as i64),
-            ))),
+            // Long.MIN cannot be negated (q7s4b0788: code 159).
+            Some(Num::Int64(i64::MIN)) => {
+                Err(Error::InvalidQuery("Cannot negate the minimum duration".into()))
+            }
+            Some(n) => {
+                let shifted = x.timestamp_millis().checked_sub(date_shift(n, false)?);
+                // A shift past what a date holds is UNRECORDED; refused as `$add` is.
+                let shifted = shifted
+                    .ok_or_else(|| Error::InvalidQuery("date overflow in $subtract".into()))?;
+                Ok(Bson::DateTime(bson::DateTime::from_millis(shifted)))
+            }
             None => Err(Error::InvalidQuery(format!(
                 "$subtract needs a date or a number, found {}",
                 type_name(other)
@@ -3156,6 +3226,12 @@ fn arithmetic_subtract(a: &Bson, b: &Bson) -> Result<Bson> {
 }
 
 fn divide(a: &Bson, b: &Bson) -> Result<Bson> {
+    // A null or missing operand in either position answers null before the other operand's type
+    // is looked at, as `$subtract` does (q7s4b1556, b1557, b1576, b1577, b1596, b1597 for
+    // `$divide`; b1956, b1957, b1976, b1977, b1996, b1997 for `$mod`).
+    if matches!(a, Bson::Null | Bson::Undefined) || matches!(b, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
     let Some(operands) = operands(Op::Divide, &[a.clone(), b.clone()])? else {
         return Ok(Bson::Null);
     };
@@ -3180,6 +3256,12 @@ fn divide(a: &Bson, b: &Bson) -> Result<Bson> {
 }
 
 fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
+    // A null or missing operand in either position answers null before the other operand's type
+    // is looked at, as `$subtract` does (q7s4b1556, b1557, b1576, b1577, b1596, b1597 for
+    // `$divide`; b1956, b1957, b1976, b1977, b1996, b1997 for `$mod`).
+    if matches!(a, Bson::Null | Bson::Undefined) || matches!(b, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
     let Some(operands) = operands(Op::Mod, &[a.clone(), b.clone()])? else {
         return Ok(Bson::Null);
     };
@@ -3277,27 +3359,51 @@ fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
     Ok(Bson::String(out))
 }
 
-/// Counted in **code points**, not bytes.
-///
-/// The byte-oriented `$substrBytes` can split a multi-byte character and
-/// produce invalid UTF-8; there is no reason to offer that here, so `$substr`
-/// and `$substrCP` are the same operator.
-fn substr(args: &[Bson]) -> Result<Bson> {
-    let s = as_string_lossy(&args[0], Op::Substr)?;
-    let start = as_index(&args[1], "$substr start")?;
-    let len = match &args[2] {
-        // MongoDB's convention: a negative length means "to the end".
-        Bson::Int32(n) if *n < 0 => None,
-        Bson::Int64(n) if *n < 0 => None,
-        Bson::Double(d) if *d < 0.0 => None,
-        other => Some(as_index(other, "$substr length")?),
-    };
+/// `$substrCP`: counted in **code points**, not bytes. A negative length is refused, as the
+/// reference refuses it (q7s4d0137: code 34454, "length must be a nonnegative integer"). The
+/// legacy `$substr` counts bytes, as `$substrBytes` does, and reads a negative length as "to the
+/// end" (q7s4g:674, 678).
+fn substr_cp(args: &[Bson]) -> Result<Bson> {
+    let s = as_string_lossy(&args[0], Op::SubstrCp)?;
+    let start =
+        cp_index(&args[1], "starting index", "$substrCP starting index must be nonnegative")?;
+    let len = cp_index(&args[2], "length", "$substrCP length must be a nonnegative integer")?;
+    Ok(Bson::String(s.chars().skip(start).take(len).collect()))
+}
 
-    let taken: String = match len {
-        Some(n) => s.chars().skip(start).take(n).collect(),
-        None => s.chars().skip(start).collect(),
+/// A `$substrCP` start or length: a number that is a 32-bit integer in value. A Double or a
+/// Decimal128 that is whole is accepted (2.0, `Decimal128("2")`, q7s4s0042, 0044, 0047), one with a
+/// fraction (1.5) or past 32 bits (4294967296, as an Int64 or a Double) is refused (34451 for a
+/// start, 34453 for a length: q7s4r0027, q7s4s0041, 0045, 0046, 0055 to 0058), a value that is no
+/// number is refused (34450, 34452: q7s4s0049 to 0054), and a negative one is refused (34455,
+/// 34454: q7s4r0025, q7s4r0026). `$substr` and `$substrBytes` accept every number: they do not
+/// come here.
+fn cp_index(value: &Bson, what: &str, negative: &str) -> Result<usize> {
+    let unrepresentable = |shown: String| {
+        Error::InvalidQuery(format!(
+            "$substrCP: {what} cannot be represented as a 32-bit integral value: {shown}"
+        ))
     };
-    Ok(Bson::String(taken))
+    let whole: i64 = match value {
+        Bson::Int32(n) => i64::from(*n),
+        Bson::Int64(n) => *n,
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        Bson::Double(d) => return Err(unrepresentable(d.to_string())),
+        Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+            Some(n) => n,
+            None => return Err(unrepresentable(d.to_string())),
+        },
+        other => {
+            return Err(Error::InvalidQuery(format!(
+                "$substrCP: {what} must be a numeric type (is BSON type {})",
+                type_name(other)
+            )));
+        }
+    };
+    if i32::try_from(whole).is_err() {
+        return Err(unrepresentable(whole.to_string()));
+    }
+    usize::try_from(whole).map_err(|_| Error::InvalidQuery(format!("{negative}, found {whole}")))
 }
 
 fn as_index(value: &Bson, what: &str) -> Result<usize> {
@@ -3429,6 +3535,13 @@ fn array_elem_at(array: &Bson, index: &Bson) -> Result<Bson> {
     let Some(i) = integer_or_null(index, "$arrayElemAt index")? else {
         return Ok(Bson::Null);
     };
+    // The reference's 28691 (q7s4c0136: Int64 2147483648). Whether the null array or the index
+    // is judged first is UNRECORDED.
+    if i32::try_from(i).is_err() {
+        return Err(Error::InvalidQuery(format!(
+            "$arrayElemAt's second argument must be representable as a 32-bit integer: {i}"
+        )));
+    }
     Ok(position(items.len(), i).and_then(|p| items.get(p)).cloned().unwrap_or(Bson::Null))
 }
 
@@ -4812,16 +4925,38 @@ mod tests {
     }
 
     #[test]
-    fn substr_counts_code_points_not_bytes() {
-        // A byte offset here would split the multi-byte character and produce
-        // something that is not valid UTF-8.
+    fn substr_counts_bytes_and_substr_cp_code_points() {
+        // The legacy `$substr` counts bytes, as `$substrBytes` does (q7s4g:674: `"aéb"` from 1 for
+        // 2 is `"é"`), and refuses a range that splits a character.
         assert_eq!(
             on(doc! {"$substr": ["$s", 0, 3]}.into(), doc! {"s": "héllo"}),
-            Bson::String("hél".into())
+            Bson::String("hé".into())
         );
         assert_eq!(
             on(doc! {"$substr": ["$s", 1, 2]}.into(), doc! {"s": "héllo"}),
+            Bson::String("é".into())
+        );
+        assert!(ev(doc! {"$substr": ["héllo", 2, 1]}.into(), &Document::new()).is_err());
+        // `$substrCP` counts code points (q7s4g:676).
+        assert_eq!(
+            on(doc! {"$substrCP": ["$s", 0, 3]}.into(), doc! {"s": "héllo"}),
+            Bson::String("hél".into())
+        );
+        assert_eq!(
+            on(doc! {"$substrCP": ["$s", 1, 2]}.into(), doc! {"s": "héllo"}),
             Bson::String("él".into())
+        );
+        // A length that is not an integer is refused by `$substrCP` (q7s4r0027: 34453), and
+        // accepted by `$substr` and `$substrBytes` (q7s4r0009, q7s4r0018). A fractional start is
+        // UNRECORDED for all three.
+        assert!(ev(doc! {"$substrCP": ["abc", 1, 1.5]}.into(), &Document::new()).is_err());
+        assert_eq!(
+            ev(doc! {"$substr": ["abc", 1, 1.5]}.into(), &Document::new()).unwrap(),
+            Bson::String("b".into())
+        );
+        assert_eq!(
+            ev(doc! {"$substrBytes": ["abc", 1, 1.5]}.into(), &Document::new()).unwrap(),
+            Bson::String("b".into())
         );
     }
 
@@ -6786,16 +6921,19 @@ mod decimal128 {
                 bson!({ "$indexOfArray": ["$xs", 30, 1.0, 3.0] }),
             ),
             (bson!({ "$substr": ["$s", b("1"), b("2")] }), bson!({ "$substr": ["$s", 1.0, 2.0] })),
-            // `$substr` truncates a fraction, the double's and the decimal's alike.
-            (
-                bson!({ "$substr": ["$s", b("1.9"), b("2.5")] }),
-                bson!({ "$substr": ["$s", 1.9, 2.5] }),
-            ),
         ] {
             let (got, want) = (at(decimal.clone()), at(double));
             assert_eq!(got.as_ref().ok(), want.as_ref().ok(), "{decimal}");
             assert!(got.is_ok(), "{decimal}: {got:?}");
         }
+        // `$substr` truncates a Double's fraction and ROUNDS a Decimal128 to the nearest whole
+        // number, halves to the even one (q7s4u): over "hello", a start of 1.9 and a length of 2.5 are
+        // 1 and 2 as doubles ("el") and 2 and 2 as decimals ("ll").
+        assert_eq!(at(bson!({ "$substr": ["$s", 1.9, 2.5] })).unwrap(), Bson::String("el".into()));
+        assert_eq!(
+            at(bson!({ "$substr": ["$s", b("1.9"), b("2.5")] })).unwrap(),
+            Bson::String("ll".into())
+        );
         assert_eq!(at(bson!({ "$arrayElemAt": ["$xs", b("2")] })).unwrap(), Bson::Int32(30));
         // A fraction, a NaN and an infinity are refused, as the double ones are.
         for (decimal, double) in [

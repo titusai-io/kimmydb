@@ -3135,7 +3135,8 @@ async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
 }
 
 /// A descending sort orders a document with an array at the sort path by its largest
-/// element, an ascending one by its smallest, in a full sort and in a bounded one (ADR-264).
+/// element, an ascending one by its smallest, in a full sort, in a bounded one and in the `$sort`
+/// stage (ADR-264; q7s4o 11 to 20). `$sortArray` is not this rule: see the test below.
 #[tokio::test]
 async fn a_descending_sort_orders_an_array_by_its_largest_element() {
     let server = Server::start().await;
@@ -3165,7 +3166,7 @@ async fn a_descending_sort_orders_an_array_by_its_largest_element() {
         order(&server, &token, json!({"sort": {"a": -1}, "skip": 1, "limit": 2})).await,
         vec![2, 3]
     );
-    // The pipeline's `$sort` and a `$push` followed by `$sortArray` agree.
+    // The pipeline's `$sort` takes the same elements.
     let res = server
         .post(
             "/v1/db/shop/coll/c/aggregate",
@@ -3179,13 +3180,38 @@ async fn a_descending_sort_orders_an_array_by_its_largest_element() {
         "{:?}",
         res.body
     );
-    let res = server
-        .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
-            {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
-            {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": -1}}}, "as": "d", "in": "$$d.id"}}}}
-        ]}))
-        .await;
-    assert_eq!(res.body["documents"], json!([{"ids": [1, 2, 3]}]), "{:?}", res.body);
+}
+
+/// `$sortArray` compares an array key as a whole value (q7s3m0045 and q7s3m0046: a number before
+/// any array, arrays element by element, descending the exact reverse of ascending), where a find
+/// or a `$sort` stage takes its smallest element ascending and its largest descending (the test
+/// above): over `a: [0, 5]` (id 1), `3` (id 2) and `[1, 2]` (id 3), ascending is `[2, 1, 3]` and
+/// descending `[3, 1, 2]`. These two vectors are derived from that rule over these three
+/// documents; q7s3m0045 and q7s3m0046 record it over `[{s: 3}, {s: [0, 5]}, {s: [1, 2]}]`.
+#[tokio::test]
+async fn sort_array_compares_an_array_key_as_a_whole_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, a) in [(1, json!([0, 5])), (2, json!(3)), (3, json!([1, 2]))] {
+        let res =
+            server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "a": a})).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    for (dir, want) in [(1, json!([2, 1, 3])), (-1, json!([3, 1, 2]))] {
+        let res = server
+            .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
+                {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
+                {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": dir}}}, "as": "d", "in": "$$d.id"}}}}
+            ]}))
+            .await;
+        assert_eq!(
+            res.body["documents"],
+            json!([{"ids": want}]),
+            "direction {dir}: {:?}",
+            res.body
+        );
+    }
 }
 
 /// A stored document's fields come back in the order they were written, as
@@ -4628,24 +4654,22 @@ async fn pull_with_a_condition_removes_the_matching_elements() {
     assert_eq!(res.body["modified"], 1);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
     assert_eq!(doc["scores"], json!([1]), "{doc}");
+    // A top-level `$elemMatch` removes no document element (q7s2q.out q0221).
     let res = update(1, json!({"$pull": {"results": {"$elemMatch": {"score": 8}}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
-    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
+    assert_eq!(doc["results"], results, "{doc}");
 
-    // A plain document matches the whole element, so the supersets stay.
+    // A plain document is a query on each element (q7s2j.out j1254), so the
+    // supersets go too.
     let res = update(2, json!({"$pull": {"results": {"score": 8}}})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let doc = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
-    assert_eq!(
-        doc["results"],
-        json!([{"score": 8, "item": "A"}, {"score": 8, "item": "B"}, {"score": 7, "item": "C"}]),
-        "{doc}"
-    );
+    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
 
     // A mixed document and a bad condition are 400s, and write nothing.
     for (spec, needle) in [
-        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "$elemMatch"),
+        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "cannot mix operators"),
         (json!({"$pull": {"scores": {"$nope": 1}}}), "unsupported operator"),
         (json!({"$pull": {"scores": {"$in": 3}}}), "$in requires an array"),
     ] {
@@ -11022,12 +11046,11 @@ async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
 }
 
 #[tokio::test]
-async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
-    // Finding 10's own reproduction, over the route rather than the parse
-    // layer: `items` is an array, so `$unwind: "$items.sku"` has no single
-    // place to write an element back to, whatever any particular document's
-    // `sku` holds — refused uniformly, `400`, naming the stage (ADR-130).
-    // Before this fix the server answered `200` with the document unchanged.
+async fn unwind_reads_a_path_that_crosses_an_array_as_missing_over_http() {
+    // Finding 10's reproduction, over the route: `items` is an array, so `$unwind:
+    // "$items.sku"` meets it before the last segment and the path is missing, as in the
+    // reference (q7s4i 316, 317): the document is dropped, and kept with
+    // `preserveNullAndEmptyArrays`. It is not refused.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
@@ -11046,14 +11069,17 @@ async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
             json!({"pipeline": [{"$unwind": "$items.sku"}]}),
         )
         .await;
-    assert_eq!(res.status, 400, "{:?}", res.body);
-    assert_eq!(res.body["error"], "bad_request");
-    let body = format!("{:?}", res.body);
-    assert!(body.contains("$unwind"), "{body}");
-    // The refusal names the concrete fix, not just the problem: the caller
-    // who wrote `$items.sku` is told to unwind `$items` first.
-    assert!(body.contains("$items"), "{body}");
-    assert!(body.contains("sku"), "{body}");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(0), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$unwind": {"path": "$items.sku", "preserveNullAndEmptyArrays": true}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -14092,19 +14118,22 @@ async fn type_number_finds_every_numeric_type_and_an_unknown_alias_or_flag_is_a_
 }
 
 #[tokio::test]
-async fn a_regex_in_in_nin_or_all_is_refused_and_a_dollar_keyed_document_is_not() {
-    // `$in` compares values, and over HTTP a regex arrives as a document:
-    // `{$in: [{$regex: "abc"}]}` matched nothing and `$nin` everything, with a
-    // 200. Refused now, while a stored document with `$`-prefixed keys stays
-    // reachable by `$eq` and by `$in` of any other shape.
+async fn a_regex_in_in_nin_and_all_matches_as_a_pattern_over_http() {
+    // A regex arrives as `{$regex: ..}` or as `{$regularExpression: ..}`, and among the members
+    // of `$in` and `$all` it is a pattern, as the reference reads it (q7s2r.out r0006 to r0032).
+    // `$nin` is the complement of `$in`. A stored document shaped `{$regex: ..}` is found by
+    // `$eq`, no longer by `$in`; `$ne` of a regex stays refused (r0033).
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "names" })).await;
     let docs = "/v1/db/shop/coll/names/docs";
     for doc in [
-        json!({ "_id": 1, "s": "xabcx" }),
-        json!({ "_id": 2, "s": { "$regex": "abc" } }),
-        json!({ "_id": 3, "s": { "$regex": "abc", "kind": "note" } }),
+        json!({ "_id": 1, "s": "apple" }),
+        json!({ "_id": 2, "s": "banana" }),
+        json!({ "_id": 3, "s": ["apple", "cherry"] }),
+        json!({ "_id": 4, "s": 5 }),
+        json!({ "_id": 5 }),
+        json!({ "_id": 6, "s": { "$regex": "^a" } }),
     ] {
         let stored = server.post(docs, Some(&token), doc).await;
         assert_eq!(stored.status, 200, "a document may hold a $-prefixed key: {:?}", stored.body);
@@ -14122,41 +14151,149 @@ async fn a_regex_in_in_nin_or_all_is_refused_and_a_dollar_keyed_document_is_not(
         ids.sort_unstable();
         ids
     };
-
-    for op in ["$in", "$nin", "$all"] {
-        for value in [
-            json!({ "$regex": "abc" }),
-            json!({ "$regex": "abc", "$options": "i" }),
-            json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
-        ] {
-            let res = find(json!({ "s": { op: ["plain", value.clone()] } })).await;
-            assert_eq!(res.status, 400, "{op} with {value}: {:?}", res.body);
-            let message = res.body["message"].as_str().unwrap();
-            assert!(
-                message.contains(&format!("{op} cannot hold a regular expression"))
-                    && message.contains("$or of $regex clauses"),
-                "{message}"
-            );
-        }
+    let ext = json!({ "$regularExpression": { "pattern": "^a", "options": "" } });
+    for (filter, want) in [
+        (json!({ "s": { "$in": [{ "$regex": "^a" }] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [ext.clone()] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [ext.clone(), "banana"] } }), vec![1, 2, 3]),
+        (json!({ "s": { "$in": [{ "$regex": "^A", "$options": "i" }] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [{ "$regex": "^A" }] } }), vec![]),
+        (json!({ "s": { "$nin": [{ "$regex": "^a" }] } }), vec![2, 4, 5, 6]),
+        (json!({ "s": { "$nin": [ext.clone(), "banana"] } }), vec![4, 5, 6]),
+        (json!({ "s": { "$not": { "$in": [ext.clone()] } } }), vec![2, 4, 5, 6]),
+        (json!({ "s": { "$all": [{ "$regex": "^a" }] } }), vec![1, 3]),
+        (json!({ "s": { "$all": [ext.clone(), "cherry"] } }), vec![3]),
+        (json!({ "s": { "$all": [ext.clone(), { "$regex": "^c" }] } }), vec![3]),
+        // The stored `{$regex: "^a"}` is a value to `$eq`, which still finds it.
+        (json!({ "s": { "$eq": { "$regex": "^a" } } }), vec![6]),
+    ] {
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{filter}");
     }
-    // What the refusal points to answers the question.
-    let either =
-        find(json!({ "$or": [{ "s": { "$regex": "abc" } }, { "s": { "$regex": "^q" } }] }));
-    assert_eq!(ids(&either.await.body), [1]);
-    // The stored `{$regex: "abc"}` is a value like any other to `$eq`, and
-    // a document of another shape is still compared by `$in`.
-    let eq = find(json!({ "s": { "$eq": { "$regex": "abc" } } })).await;
-    assert_eq!(ids(&eq.body), [2], "{:?}", eq.body);
-    let other =
-        find(json!({ "s": { "$in": [{ "$regex": "abc", "kind": "note" }, "xabcx"] } })).await;
-    assert_eq!(ids(&other.body), [1, 3], "{:?}", other.body);
+    for value in [
+        json!({ "$regex": "abc" }),
+        json!({ "$regex": "abc", "$options": "i" }),
+        json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
+    ] {
+        let res = find(json!({ "s": { "$ne": value.clone() } })).await;
+        assert_eq!(res.status, 400, "$ne with {value}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("$ne cannot take a regular expression"), "{message}");
+    }
+    // An invalid pattern is a 400, not an empty answer (r0048).
+    let bad = find(
+        json!({ "s": { "$in": [{ "$regularExpression": { "pattern": "(", "options": "" } }] } }),
+    )
+    .await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+
+    // As the filter of a multi-update (r0075: `n` 3 of 16 there) and of an upsert (r0076: it
+    // seeds nothing).
+    let update = server
+        .post(
+            "/v1/db/shop/coll/names/update",
+            Some(&token),
+            json!({ "filter": { "s": { "$in": [ext.clone()] } }, "update": { "$set": { "z": 1 } },
+                    "multi": true }),
+        )
+        .await;
+    assert_eq!(update.status, 200, "{:?}", update.body);
+    assert_eq!(update.body["matched"], 2, "{:?}", update.body);
+    let upsert = server
+        .post(
+            "/v1/db/shop/coll/names/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "s": { "$in": [{ "$regex": "^zz" }] } },
+                    "update": { "$set": { "w": 9 } }, "upsert": true, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `w` are seeded: {made}");
 }
 
 #[tokio::test]
-async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
-    // `$ne` compares values, so `{$ne: {$regex: "abc"}}` held for every
-    // string; `$all` compares values, so `[{$elemMatch: ...}]` matched
-    // nothing. Both answered 200.
+async fn a_pattern_in_an_in_or_nin_list_is_never_answered_from_an_index() {
+    // A plain `$in` of values is answered by probing an index on the field; with a pattern among
+    // the members the filter gets a collection scan, because a probe would read the pattern as
+    // a value and drop what it matches. The answer is the same with and without the index.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "fruit" })).await;
+    for doc in [
+        json!({ "_id": 1, "s": "apple" }),
+        json!({ "_id": 2, "s": "banana" }),
+        json!({ "_id": 3, "s": "cherry" }),
+        json!({ "_id": 4, "s": "avocado" }),
+        json!({ "_id": 5 }),
+    ] {
+        let res = server.post("/v1/db/shop/coll/fruit/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let pattern = json!({ "$regularExpression": { "pattern": "^a", "options": "" } });
+    let filters = [
+        (
+            "in, value and pattern",
+            json!({ "s": { "$in": ["banana", pattern.clone()] } }),
+            vec![1, 2, 4],
+        ),
+        ("in, pattern alone", json!({ "s": { "$in": [pattern.clone()] } }), vec![1, 4]),
+        (
+            "nin, value and pattern",
+            json!({ "s": { "$nin": ["banana", pattern.clone()] } }),
+            vec![3, 5],
+        ),
+        ("not in", json!({ "s": { "$not": { "$in": [pattern.clone()] } } }), vec![2, 3, 5]),
+    ];
+    async fn run_find(server: &Server, token: &str, filter: Value) -> (Vec<i64>, String) {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/fruit/find",
+                Some(token),
+                json!({ "filter": filter, "explain": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let mut ids: Vec<i64> = res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        (ids, res.body["explain"]["strategy"].as_str().unwrap().to_string())
+    }
+    let run = |filter: Value| run_find(&server, &token, filter);
+    for (label, filter, want) in &filters {
+        let (ids, strategy) = run(filter.clone()).await;
+        assert_eq!((&ids, strategy.as_str()), (want, "collectionScan"), "{label}, no index");
+    }
+    let made = server
+        .post(
+            "/v1/db/shop/coll/fruit/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "s" }] }),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    // The contrast: the same field with values only is answered from the index.
+    let (ids, strategy) = run(json!({ "s": { "$in": ["banana", "cherry"] } })).await;
+    assert_eq!((ids, strategy.as_str()), (vec![2, 3], "indexUnion"));
+    for (label, filter, want) in &filters {
+        let (ids, strategy) = run(filter.clone()).await;
+        assert_eq!(strategy, "collectionScan", "{label}: a pattern member is not an index probe");
+        assert_eq!(&ids, want, "{label}: the answer is the one without the index");
+    }
+}
+
+#[tokio::test]
+async fn a_regex_under_ne_is_refused_and_an_elem_match_under_all_is_read_per_member() {
+    // `$ne` of a regex is a 400 as in the reference (q7s2r.out r0033); `$all` of `$elemMatch`
+    // documents holds when the field has an element for each (r0049 to r0066), as a find, a
+    // multi-update filter and an upsert filter (r0117 to r0134); a list that mixes an
+    // `$elemMatch` with anything else is refused as the reference refuses it (r0054 to r0056).
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "carts" })).await;
@@ -14164,6 +14301,7 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
     for doc in [
         json!({ "_id": 1, "s": "xabcx", "items": [{ "qty": 5, "sku": "b" }, { "qty": 1, "sku": "a" }] }),
         json!({ "_id": 2, "s": "q", "items": ["q"] }),
+        json!({ "_id": 3, "s": "r", "items": [[1, 2], [3]] }),
     ] {
         let stored = server.post(docs, Some(&token), doc).await;
         assert_eq!(stored.status, 200, "{:?}", stored.body);
@@ -14193,23 +14331,66 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
         assert!(message.contains("$ne cannot take a regular expression"), "{message}");
     }
     let not = find(json!({ "s": { "$not": { "$regex": "abc" } } })).await;
-    assert_eq!(ids(&not.body), [2], "{:?}", not.body);
+    assert_eq!(ids(&not.body), [2, 3], "{:?}", not.body);
 
-    for filter in [
-        json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }] } }),
-        json!({ "items": { "$all": [{ "$elemMatch": { "$eq": "q" } }] } }),
+    for (filter, want) in [
+        (json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }] } }), vec![1]),
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "a" } }] } }),
+            vec![1],
+        ),
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "z" } }] } }),
+            vec![],
+        ),
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$eq": "q" } }] } }), vec![2]),
+        // An element that is an array is one value: `$gt` does not look into it (r0052).
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$gt": 2 } }] } }), vec![]),
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$size": 2 } }] } }), vec![3]),
+        (json!({ "items": { "$not": { "$all": [{ "$elemMatch": { "qty": 5 } }] } } }), vec![2, 3]),
+    ] {
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{filter}");
+    }
+    for (filter, message) in [
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, 2] } }),
+            "$all/$elemMatch has to be consistent",
+        ),
+        (
+            json!({ "items": { "$all": [1, { "$elemMatch": { "qty": 5 } }] } }),
+            "no $ expressions in $all",
+        ),
     ] {
         let res = find(filter.clone()).await;
         assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
-        let message = res.body["message"].as_str().unwrap();
-        assert!(message.contains("$all cannot hold an $elemMatch"), "{message}");
+        assert!(res.body["message"].as_str().unwrap().contains(message), "{:?}", res.body);
     }
-    let both = find(json!({ "$and": [
-        { "items": { "$elemMatch": { "qty": 5 } } },
-        { "items": { "$elemMatch": { "sku": "a" } } },
-    ] }))
-    .await;
-    assert_eq!(ids(&both.body), [1], "{:?}", both.body);
+
+    // The same form as the filter of a multi update, and of an upsert that seeds nothing from it.
+    let update = server
+        .post(
+            "/v1/db/shop/coll/carts/update",
+            Some(&token),
+            json!({ "filter": { "items": { "$all": [{ "$elemMatch": { "sku": "a" } }] } },
+                    "update": { "$set": { "z": 1 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(update.status, 200, "{:?}", update.body);
+    assert_eq!(update.body["matched"], 1, "{:?}", update.body);
+    let upsert = server
+        .post(
+            "/v1/db/shop/coll/carts/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "items": { "$all": [{ "$elemMatch": { "sku": "zz" } }] } },
+                    "update": { "$set": { "w": 9 } }, "upsert": true, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `w` are seeded: {made}");
 }
 
 #[tokio::test]
@@ -14270,10 +14451,10 @@ async fn a_regex_written_as_a_fields_value_matches_as_a_pattern_over_http() {
 }
 
 #[tokio::test]
-async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
-    // `{tags: {$all: []}}` held for every document whose `tags` is an array,
-    // so a list a client emptied by mistake reached all of them, on a `multi`
-    // delete or update too, with a 200.
+async fn an_empty_all_matches_no_document_on_every_route() {
+    // `{tags: {$all: []}}` matches no document (q7s2r.out r0067, r0135, r0136): not every
+    // document whose `tags` is an array. A `multi` update or delete by it touches nothing, and an
+    // upsert by it inserts a document seeded with nothing.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
@@ -14281,16 +14462,12 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
         (0..5i64).map(|i| json!({ "_id": i, "tags": ["a", format!("t{i}")] })).collect();
     server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
     let empty = json!({ "tags": { "$all": [] } });
-    let refused = |res: &Res, route: &str| {
-        assert_eq!(res.status, 400, "{route}: {:?}", res.body);
-        let message = res.body["message"].as_str().unwrap();
-        assert!(message.contains(r#"$all on "tags" has an empty list"#), "{route}: {message}");
-    };
     let coll = "/v1/db/shop/coll/posts";
     let res = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": empty })).await;
-    refused(&res, "find");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([]), "find");
     let res = server.post(&format!("{coll}/count"), Some(&token), json!({ "filter": empty })).await;
-    refused(&res, "count");
+    assert_eq!((res.status, &res.body["count"]), (200, &json!(0)), "{:?}", res.body);
     let res = server
         .post(
             &format!("{coll}/update"),
@@ -14298,11 +14475,20 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
             json!({ "filter": empty, "update": { "$set": { "hit": true } }, "multi": true }),
         )
         .await;
-    refused(&res, "update");
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(0)), "{:?}", res.body);
     let res = server
         .post(&format!("{coll}/delete"), Some(&token), json!({ "filter": empty, "multi": true }))
         .await;
-    refused(&res, "delete");
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(0)), "{:?}", res.body);
+    // Under `$not` it is every document.
+    let res = server
+        .post(
+            &format!("{coll}/count"),
+            Some(&token),
+            json!({ "filter": { "tags": { "$not": { "$all": [] } } } }),
+        )
+        .await;
+    assert_eq!(res.body["count"], 5, "{:?}", res.body);
 
     // Nothing was written or removed, and one value still selects.
     let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
@@ -14317,6 +14503,20 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
         )
         .await;
     assert_eq!(one.body["count"], 1, "{:?}", one.body);
+
+    // As the filter of an upsert it matches nothing and seeds nothing.
+    let upsert = server
+        .post(
+            &format!("{coll}/find_and_modify"),
+            Some(&token),
+            json!({ "filter": empty, "update": { "$set": { "hit": true } }, "upsert": true,
+                    "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `hit` are seeded: {made}");
 }
 
 #[tokio::test]
@@ -19308,8 +19508,14 @@ async fn a_change_stream_sees_the_writes_of_a_merge() {
     assert_eq!(seen, vec![(json!("replace"), json!(1)), (json!("insert"), json!(3))]);
 }
 
+/// Over the eight values of `k` (ids 1 `[1, 5]`, 2 `3`, 3 `[2, 4]`, 4 missing, 5 the decimal 2.5,
+/// 6 `"s"`, 7 `{x: 1}`, 8 `null`), the recordings of q7s4o: as the eight documents of a collection,
+/// the `$sort` stage takes the smallest element of an array ascending and the largest descending
+/// (q7s4o0016 `[4, 8, 1, 3, 5, 2, 6, 7]`, q7s4o0018 `[7, 6, 1, 3, 2, 5, 4, 8]`); as the elements of
+/// one array, `$sortArray` compares the key whole, arrays after the documents, descending the
+/// reverse (q7s4o0005 `[4, 8, 5, 2, 6, 7, 1, 3]`, q7s4o0007 `[3, 1, 7, 6, 2, 5, 4, 8]`).
 #[tokio::test]
-async fn sort_array_orders_documents_as_the_sort_stage_does() {
+async fn the_sort_stage_takes_an_element_of_an_array_key_and_sort_array_compares_it_whole() {
     let server = Server::start().await;
     let token = server.root().await;
     let docs = vec![
@@ -19323,11 +19529,11 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         json!({"_id": 8, "k": null}),
     ];
     sink_seed(&server, &token, "src", docs).await;
-    // Ascending takes the smallest element of an array (1 for id 1, 2 for id 3), descending the
-    // largest (5 and 4): so id 1 comes before id 3 and id 2 (a 3) both ways round, and after
-    // `{x: 1}` and "s", which sort above every number.
-    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]))];
-    for (dir, expected) in expected {
+    let expected = [
+        (1, json!([4, 8, 1, 3, 5, 2, 6, 7]), json!([4, 8, 5, 2, 6, 7, 1, 3])),
+        (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]), json!([3, 1, 7, 6, 2, 5, 4, 8])),
+    ];
+    for (dir, stage_ids, array_ids) in expected {
         let stage = sink_run(
             &server,
             &token,
@@ -19351,8 +19557,8 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         )
         .await;
         assert_eq!(array.status, 200, "{:?}", array.body);
-        assert_eq!(json!(ids), expected, "$sort, direction {dir}");
-        assert_eq!(array.body["documents"][0]["ids"], expected, "$sortArray, direction {dir}");
+        assert_eq!(json!(ids), stage_ids, "$sort, direction {dir}");
+        assert_eq!(array.body["documents"][0]["ids"], array_ids, "$sortArray, direction {dir}");
     }
 }
 
@@ -21055,7 +21261,7 @@ async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipe
     assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 2, "u": 1 }));
     let res = update(json!([{ "$set": { "_id": 2 } }]), json!({})).await;
     assert_eq!(res.status, 400, "{:?}", res.body);
-    // The same `_id` as a long is the same `_id`.
+    // The same `_id` as a long is the same `_id` (UNRECORDED for a pipeline).
     let res = update(json!([{ "$set": { "_id": { "$toLong": "$_id" } } }]), json!({})).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     // A stage after `$replaceWith` reads no `_id`; it is back at the end.
@@ -22077,4 +22283,701 @@ async fn an_upsert_seeds_the_filter_fields_in_name_order_for_every_kind_of_updat
     // 2e and 2f: a replacement keeps none of the filter's fields.
     let (id, got) = upsert(filter(), json!({ "v": 1 })).await;
     assert_eq!(got, want(id, json!({ "v": 1 })));
+}
+
+/// An upsert whose operators name `_id` inserts as any insert does (q7s2o.out o0692-o0799):
+/// the id it ends with is judged as an insert's, a duplicate is a conflict that overwrites
+/// nothing, and a document that matched is never given another `_id`.
+#[tokio::test]
+async fn an_upsert_that_names_its_id_is_inserted_as_any_insert_is() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 7, "k": "a" })]).await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    // The operators' id is the one inserted.
+    let res = fam(json!({ "filter": { "k": "new" }, "update": { "$set": { "_id": 8 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 8, "k": "new" }));
+    // The same id as the filter's is no change to the id the filter gave.
+    let res = fam(json!({ "filter": { "_id": 9 }, "update": { "$set": { "_id": 9 } },
+                          "upsert": true, "returnDocument": "after" }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 9 }));
+    // Another id than the filter's is refused, and nothing is inserted.
+    let res = fam(json!({ "filter": { "_id": 10 }, "update": { "$set": { "_id": 11 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/10", Some(&token)).await.status, 404);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/11", Some(&token)).await.status, 404);
+    // An id that exists is a duplicate, as an insert of it is, and the document stays.
+    let res = fam(json!({ "filter": { "k": "other" }, "update": { "$set": { "_id": 7 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+    // An id that is no document id (a double, a document) is refused as an insert's is.
+    for update in [json!({ "$set": { "_id": 5.5 } }), json!({ "$set": { "_id.x": 1 } })] {
+        let res = fam(json!({ "filter": { "k": "bad" }, "update": update, "upsert": true })).await;
+        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
+    }
+    // A document that matched keeps its `_id`: the same id is no change, another is refused.
+    let res = fam(json!({ "filter": { "_id": 7 }, "update": { "$set": { "_id": 7 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = fam(json!({ "filter": { "_id": 7 }, "update": { "$set": { "_id": 12 } },
+                          "upsert": true }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("_id is immutable"),
+        "{:?}",
+        res.body
+    );
+    assert_eq!(pu_doc(&server, &token, 7).await, json!({ "_id": 7, "k": "a" }));
+}
+
+/// A matched document's `_id` is judged by the result, on every route that writes a
+/// post-image: `update` (one document and `multi`), `find_and_modify`, with an operator
+/// update and with a pipeline update. They all end in `update::apply_matched`, whose
+/// `settle_matched_id` is the one judge (q7s2r.out r0137-r0196).
+#[tokio::test]
+async fn a_matched_documents_id_is_judged_by_the_result_on_every_route() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 1 }), json!({ "_id": 2, "a": 1 })])
+        .await;
+    let route = |name: &'static str, body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post(&format!("/v1/db/shop/coll/pu/{name}"), Some(token), body).await }
+    };
+    let same_ops = [
+        json!({ "$set": { "_id": 1 } }),
+        json!({ "$inc": { "_id": 0 } }),
+        json!({ "$mul": { "_id": 1 } }),
+        json!({ "$setOnInsert": { "_id": 9 } }),
+        json!([{ "$set": { "_id": 1 } }]),
+        json!([{ "$unset": "_id" }]),
+    ];
+    let changing = [
+        json!({ "$set": { "_id": 2 } }),
+        json!({ "$set": { "_id": { "$numberLong": "1" } } }),
+        json!({ "$inc": { "_id": 1 } }),
+        json!({ "$unset": { "_id": "" } }),
+        json!({ "$rename": { "_id": "y" } }),
+        json!([{ "$set": { "_id": 2 } }]),
+    ];
+    for name in ["update", "find_and_modify"] {
+        for update in &same_ops {
+            let res = route(name, json!({ "filter": { "_id": 1 }, "update": update })).await;
+            assert_eq!(res.status, 200, "{name} {update}: {:?}", res.body);
+            assert_eq!(res.body["modified"], 0, "{name} {update}: {:?}", res.body);
+        }
+        for update in &changing {
+            let res = route(name, json!({ "filter": { "_id": 1 }, "update": update })).await;
+            assert_eq!(res.status, 400, "{name} {update}: {:?}", res.body);
+            assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 1 }));
+        }
+    }
+    // `multi`: one document that would change refuses the request and writes nothing.
+    let res =
+        route("update", json!({ "filter": {}, "multi": true, "update": { "$set": { "_id": 1 } } }))
+            .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "a": 1 }));
+    let res = route(
+        "update",
+        json!({ "filter": {}, "multi": true, "update": { "$inc": { "_id": 0, "a": 1 } } }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "a": 2 }));
+}
+
+#[tokio::test]
+async fn an_options_with_no_regex_is_refused_and_a_delete_by_it_removes_nothing() {
+    // `{a: {$options: "i"}}` is a `400`, `$options needs a $regex` (q7s3b0216, q7s3b.out:6240),
+    // on every route that takes a filter. It matched every document, so a multi delete by it,
+    // what a client is left with when `JSON.stringify` drops an `undefined` `$regex`, emptied
+    // the collection.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> =
+        (0..3i64).map(|i| json!({ "_id": i, "name": format!("n{i}") })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let coll = "/v1/db/shop/coll/posts";
+    let lone = json!({ "name": { "$options": "i" } });
+    for (route, body) in [
+        ("find", json!({ "filter": lone })),
+        ("count", json!({ "filter": lone })),
+        ("delete", json!({ "filter": lone, "multi": true })),
+        ("update", json!({ "filter": lone, "update": { "$set": { "hit": true } }, "multi": true })),
+    ] {
+        let res = server.post(&format!("{coll}/{route}"), Some(&token), body).await;
+        assert_eq!(res.status, 400, "{route}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap().contains("$options needs a $regex"),
+            "{route}: {:?}",
+            res.body
+        );
+    }
+    let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    let docs = all.body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 3, "{:?}", all.body);
+    assert!(docs.iter().all(|d| d.get("hit").is_none()), "{:?}", all.body);
+    // Beside a `$regex` it is the flags of the pattern.
+    let ok = server
+        .post(
+            &format!("{coll}/count"),
+            Some(&token),
+            json!({ "filter": { "name": { "$regex": "N1", "$options": "i" } } }),
+        )
+        .await;
+    assert_eq!(ok.body["count"], 1, "{:?}", ok.body);
+}
+
+#[tokio::test]
+async fn a_limit_or_skip_written_as_a_double_is_truncated_and_a_negative_one_is_refused() {
+    // q7s3f0165 to f0199 (q7s3f.jsonl lines 165 to 199), over eight documents in `_id` order:
+    // `limit` and `skip` of `2.0`, `2.5`, `2.7` and `2.99` are the count `2`, and a negative one
+    // of any type (`-1`, `-2.0`, `-2.5`) is refused, where a double was a `4xx` for its type.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> = (1..=8i64).map(|i| json!({ "_id": i })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let ids = |res: &Value| -> Vec<i64> {
+        res["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()).collect()
+    };
+    let find = |extra: Value| {
+        let mut body = json!({ "filter": {}, "sort": { "_id": 1 } });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let server = &server;
+        let token = &token;
+        async move { server.post("/v1/db/shop/coll/posts/find", Some(token), body).await }
+    };
+    let all: Vec<i64> = (1..=8).collect();
+    for (label, extra, want) in [
+        ("f0165 limit 2", json!({ "limit": 2 }), vec![1, 2]),
+        ("f0166 skip 2", json!({ "skip": 2 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0167 skip 2 limit 2", json!({ "skip": 2, "limit": 2 }), vec![3, 4]),
+        ("f0168 limit 2.0", json!({ "limit": 2.0 }), vec![1, 2]),
+        ("f0169 skip 2.0", json!({ "skip": 2.0 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0170 both 2.0", json!({ "skip": 2.0, "limit": 2.0 }), vec![3, 4]),
+        ("f0171 limit 2.5", json!({ "limit": 2.5 }), vec![1, 2]),
+        ("f0172 skip 2.5", json!({ "skip": 2.5 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0173 both 2.5", json!({ "skip": 2.5, "limit": 2.5 }), vec![3, 4]),
+        ("f0174 limit 2.7", json!({ "limit": 2.7 }), vec![1, 2]),
+        ("f0175 skip 2.7", json!({ "skip": 2.7 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0176 both 2.7", json!({ "skip": 2.7, "limit": 2.7 }), vec![3, 4]),
+        ("f0177 limit 2.99", json!({ "limit": 2.99 }), vec![1, 2]),
+        ("f0178 skip 2.99", json!({ "skip": 2.99 }), vec![3, 4, 5, 6, 7, 8]),
+        ("f0179 both 2.99", json!({ "skip": 2.99, "limit": 2.99 }), vec![3, 4]),
+        ("f0193 skip 0", json!({ "skip": 0 }), all.clone()),
+        ("f0196 skip 0.0", json!({ "skip": 0.0 }), all.clone()),
+        ("f0199 skip 0.5", json!({ "skip": 0.5 }), all.clone()),
+        // Kept apart from the reference: `limit` 0 is an empty page here, and a double that
+        // truncates to 0 (`0.0`, `0.5`) is the same count (f0192, f0195 and f0198, which are
+        // every document there; see docs/deviations.md, "`limit: 0`").
+        ("f0192 limit 0", json!({ "limit": 0 }), vec![]),
+        ("f0195 limit 0.0", json!({ "limit": 0.0 }), vec![]),
+        ("f0198 limit 0.5", json!({ "limit": 0.5 }), vec![]),
+    ] {
+        let res = find(extra.clone()).await;
+        assert_eq!(res.status, 200, "{label} {extra}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{label} {extra}: {:?}", res.body);
+    }
+    for (label, extra) in [
+        ("f0180 limit -1", json!({ "limit": -1 })),
+        ("f0181 skip -1", json!({ "skip": -1 })),
+        ("f0182 both -1", json!({ "skip": -1, "limit": -1 })),
+        ("f0183 limit -2.0", json!({ "limit": -2.0 })),
+        ("f0184 skip -2.0", json!({ "skip": -2.0 })),
+        ("f0185 both -2.0", json!({ "skip": -2.0, "limit": -2.0 })),
+        ("f0186 limit -2 (long)", json!({ "limit": -9_000_000_000i64 })),
+        ("f0189 limit -2.5", json!({ "limit": -2.5 })),
+        ("f0190 skip -2.5", json!({ "skip": -2.5 })),
+        ("f0191 both -2.5", json!({ "skip": -2.5, "limit": -2.5 })),
+        ("q7s3c0053 limit \"2\"", json!({ "limit": "2" })),
+        ("null", json!({ "limit": null })),
+    ] {
+        let res = find(extra.clone()).await;
+        assert!((400..500).contains(&res.status), "{label} {extra}: {} {:?}", res.status, res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_limit_or_skip_in_a_query_string_reads_as_the_body_does() {
+    // `GET .../docs?limit=2.5` is the one parameter of the find body: a double that is not
+    // negative is truncated, a negative one, a NaN and text are refused.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> = (1..=8i64).map(|i| json!({ "_id": i })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let ids = |res: &Value| -> Vec<i64> {
+        res["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()).collect()
+    };
+    for (query, want) in [
+        ("limit=2", vec![1, 2]),
+        ("limit=2.0", vec![1, 2]),
+        ("limit=2.5", vec![1, 2]),
+        ("limit=2.99", vec![1, 2]),
+        ("skip=2.7&limit=2.7", vec![3, 4]),
+        ("skip=6.5", vec![7, 8]),
+        ("limit=0.5", vec![]),
+        ("skip=0.0", (1..=8).collect()),
+    ] {
+        let res = server.get(&format!("/v1/db/shop/coll/posts/docs?{query}"), Some(&token)).await;
+        assert_eq!(res.status, 200, "{query}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{query}: {:?}", res.body);
+    }
+    for query in
+        ["limit=-1", "skip=-2.5", "limit=-0.5e1", "limit=NaN", "limit=inf", "limit=abc", "limit="]
+    {
+        let res = server.get(&format!("/v1/db/shop/coll/posts/docs?{query}"), Some(&token)).await;
+        assert!((400..500).contains(&res.status), "{query}: {} {:?}", res.status, res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_sort_on_a_position_beside_a_field_of_that_name_is_refused_on_find_and_find_and_modify() {
+    // The reference's 16746, "Ambiguous field name found in array (do not use numeric field
+    // names in embedded elements in an array)" (q7s3g 105, 106, 131; q7s3j 151, 152): a sort key
+    // `a.0` over an array that holds a document with a field named `0`. Raised at sort time, by
+    // the documents the sort reads, whatever the window; a filter that removes the clash first
+    // does not raise it (g:131); a position past the end never does (q7s3j 157-186).
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch = json!([
+        { "_id": 1, "a": [{ "0": 9 }] },
+        { "_id": 2, "a": [5, 6] },
+        { "_id": 3, "a": [{ "b": 1 }] },
+    ]);
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), batch).await;
+    let coll = "/v1/db/shop/coll/posts";
+    let ids = |res: &Res| -> Vec<i64> {
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    };
+    for body in [
+        json!({ "sort": { "a.0": 1, "_id": 1 } }),
+        json!({ "sort": { "a.0": -1, "_id": 1 } }),
+        json!({ "sort": { "a.0": 1, "_id": 1 }, "limit": 1 }),
+        json!({ "sort": { "a.0": 1, "_id": 1 }, "limit": 1, "skip": 2 }),
+        json!({ "sort": { "_id": 1, "a.0": 1 } }),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 400, "{body}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap().contains("Ambiguous field name found in array"),
+            "{body}: {:?}",
+            res.body
+        );
+    }
+    // Filtered out first (g:131), a field name, and a position past the end: answered.
+    for (body, want) in [
+        (
+            json!({ "filter": { "_id": { "$in": [2, 3] } }, "sort": { "a.0": 1, "_id": 1 } }),
+            vec![2, 3],
+        ),
+        (json!({ "sort": { "a.00": 1, "_id": 1 } }), vec![1, 2, 3]),
+        (json!({ "sort": { "a.1": 1, "_id": 1 } }), vec![1, 3, 2]),
+        (json!({ "sort": { "a.0": 1, "_id": 1 }, "filter": { "a.0": 5 } }), vec![2]),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(ids(&res), want, "{body}");
+    }
+    // `find_and_modify` takes the keys of every match before it picks one, and writes nothing.
+    let res = server
+        .post(
+            &format!("{coll}/find_and_modify"),
+            Some(&token),
+            json!({ "filter": {}, "sort": { "a.0": 1 }, "update": { "$set": { "hit": true } } }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("Ambiguous field name found in array"));
+    let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    assert!(
+        all.body["documents"].as_array().unwrap().iter().all(|d| d.get("hit").is_none()),
+        "{:?}",
+        all.body
+    );
+}
+
+#[tokio::test]
+async fn a_graph_lookup_follows_a_position_written_with_a_leading_zero() {
+    // q7s4i 343: `connectFromField: "a.00"` reads `00` as the position 0, the array it reaches
+    // is expanded, and the document `_id: 7` (`a: [[1]]`) links on to `_id: 1`. UNRECORDED beyond
+    // that case: every other reader of a path takes `00` for a field name.
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["base", "foreign"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let base = json!([
+        { "_id": 1, "a": [10, 20] },
+        { "_id": 2, "a": [[1], [2]] },
+        { "_id": 3, "a": [{ "01": 5 }, 9] },
+        { "_id": 4, "a": { "0": 6, "1": 8, "01": 7 } },
+        { "_id": 5, "a": [{ "x": 1 }, { "x": 2 }] },
+        { "_id": 6, "a": { "00": 1 } },
+        { "_id": 7, "a": [[1, 2], [3]] },
+        { "_id": 8 },
+    ]);
+    let foreign = json!([
+        { "_id": 1, "k": 10, "a": [10, 20] },
+        { "_id": 2, "k": 5, "a": [{ "01": 5 }, 9] },
+        { "_id": 3, "k": 7, "a": { "01": 7 } },
+        { "_id": 4, "k": 1 },
+        { "_id": 5, "k": [5, 20] },
+        { "_id": 6, "a": [9] },
+        { "_id": 7, "k": 20, "a": [[1]] },
+    ]);
+    server.post("/v1/db/shop/coll/base/bulk", Some(&token), base).await;
+    server.post("/v1/db/shop/coll/foreign/bulk", Some(&token), foreign).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/base/aggregate",
+            Some(&token),
+            json!({ "pipeline": [
+                { "$graphLookup": { "from": "foreign", "startWith": "$_id",
+                    "connectFromField": "a.00", "connectToField": "_id", "as": "g",
+                    "maxDepth": 1 } },
+                { "$project": { "g._id": 1 } },
+                { "$sort": { "_id": 1 } },
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got: Vec<Vec<i64>> = res.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let mut ids: Vec<i64> =
+                d["g"].as_array().unwrap().iter().map(|g| g["_id"].as_i64().unwrap()).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    let want: Vec<Vec<i64>> =
+        vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![1, 7], vec![]];
+    assert_eq!(got, want, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_id_number() {
+    // q7s4k 103, 104 and q7s4l: two sort keys that meet different arrays of a document are refused
+    // (code 2, "cannot sort with keys that are parallel arrays"), and a filter that is exactly
+    // `{_id: <number>}` reads the one document by its key and sorts nothing. Every other filter
+    // that selects the document is refused, in `find`, `find_and_modify` and `aggregate` alike.
+    // The other types of `_id` are in `a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_null`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pairs" })).await;
+    let batch = json!([
+        { "_id": 1, "a": 1, "b": 2 },
+        { "_id": 2, "a": [1, 2], "b": [3, 4] },
+        { "_id": 3, "a": 5, "b": [1, 2] },
+        { "_id": 4, "a": 0, "b": 0 },
+        { "_id": 5, "a": [7, 8], "b": 1 },
+    ]);
+    server.post("/v1/db/shop/coll/pairs/bulk", Some(&token), batch).await;
+    let coll = "/v1/db/shop/coll/pairs";
+    let sort = json!({ "a": 1, "b": 1, "_id": 1 });
+    let refused = |res: &Res| {
+        res.status == 400
+            && res.body["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with("cannot sort with keys that are parallel arrays"))
+    };
+    let ids = |res: &Res| -> Vec<i64> {
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    };
+
+    // `find`: the exempt shapes answer the one document (q7s4k 103; q7s4l 1, 23, 25, 26, 27).
+    for body in [
+        json!({ "filter": { "_id": 2 }, "sort": sort }),
+        json!({ "filter": { "_id": 2 }, "sort": { "a": 1, "b": 1 } }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "limit": 1 }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "skip": 0 }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "projection": { "a": 1 } }),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(ids(&res), vec![2], "{body}");
+    }
+    // A filter that matches nothing, and one that leaves the document out (q7s4l 15, 19).
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": 99 }, "sort": sort }),
+        )
+        .await;
+    assert_eq!((res.status, ids(&res)), (200, vec![]), "{:?}", res.body);
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": { "$gt": 2 } }, "sort": sort }),
+        )
+        .await;
+    assert_eq!((res.status, ids(&res)), (200, vec![4, 3, 5]), "{:?}", res.body);
+    // `find`: every other filter that selects the document, and no filter (q7s4l 3, 5, 7, 9, 11,
+    // 17, 21; q7s4k 100, 105).
+    for filter in [
+        json!({ "_id": { "$eq": 2 } }),
+        json!({ "_id": { "$in": [2] } }),
+        json!({ "_id": 2, "a": { "$exists": true } }),
+        json!({ "$and": [{ "_id": 2 }] }),
+        json!({ "_id": { "$gte": 2, "$lte": 2 } }),
+        json!({ "_id": { "$in": [2, 3] } }),
+        json!({}),
+    ] {
+        let body = json!({ "filter": filter, "sort": sort });
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert!(refused(&res), "{body}: {:?}", res.body);
+    }
+
+    // `aggregate`: the `$match` first and the `$sort` after it or after a `$skip` (q7s4l 2, 29,
+    // 32); a `$limit`, `$addFields` or `$project` between keeps the refusal (28, 30, 31).
+    let aggregate = |stages: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(&format!("{coll}/aggregate"), Some(token), json!({ "pipeline": stages }))
+                .await
+        }
+    };
+    let sorted = json!({ "$sort": sort });
+    for stages in [
+        json!([{ "$match": { "_id": 2 } }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$skip": 0 }, sorted]),
+        json!([sorted, { "$match": { "_id": 2 } }]),
+    ] {
+        let res = aggregate(stages.clone()).await;
+        assert_eq!(res.status, 200, "{stages}: {:?}", res.body);
+        assert_eq!(ids(&res), vec![2], "{stages}");
+    }
+    for stages in [
+        json!([{ "$match": { "_id": 2 } }, { "$limit": 1 }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$addFields": { "z": 1 } }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$project": { "a": 1, "b": 1 } }, sorted]),
+        json!([{ "$match": { "_id": { "$in": [2] } } }, sorted]),
+        json!([{ "$match": {} }, sorted]),
+    ] {
+        let res = aggregate(stages.clone()).await;
+        assert!(refused(&res), "{stages}: {:?}", res.body);
+    }
+
+    // `find_and_modify`: the exempt shapes update, upsert and remove the one document
+    // (q7s4l 36, 37, 47, 52); the others are refused and write nothing (38, 39, 44, 45).
+    let modify = |body: Value| {
+        let server = &server;
+        let token = &token;
+        async move { server.post(&format!("{coll}/find_and_modify"), Some(token), body).await }
+    };
+    for body in [
+        json!({ "filter": { "_id": 2 }, "sort": sort, "update": { "$set": { "z": 1 } } }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "update": { "$set": { "z": 2 } }, "upsert": true }),
+        json!({ "filter": { "_id": 99 }, "sort": sort, "update": { "$set": { "z": 1 } }, "upsert": true }),
+    ] {
+        let res = modify(body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+    }
+    for body in [
+        json!({ "filter": { "_id": { "$in": [2] } }, "sort": sort, "update": { "$set": { "z": 3 } } }),
+        json!({ "filter": { "_id": { "$in": [2] } }, "sort": sort, "update": { "$set": { "z": 3 } }, "upsert": true }),
+        json!({ "filter": {}, "sort": sort, "update": { "$set": { "z": 3 } } }),
+        json!({ "filter": {}, "sort": sort, "remove": true }),
+    ] {
+        let res = modify(body.clone()).await;
+        assert!(refused(&res), "{body}: {:?}", res.body);
+    }
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": 2 }, "sort": sort }),
+        )
+        .await;
+    assert_eq!(res.body["documents"][0]["z"], 2, "{:?}", res.body);
+    let res = modify(json!({ "filter": { "_id": 2 }, "sort": sort, "remove": true })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn an_int64_is_written_as_a_plain_number_and_read_back_by_its_size() {
+    // docs/http-api.md "The JSON boundary". OUTPUT: an Int32 and an Int64 are both a plain JSON
+    // number, whatever their size, with all the digits of an Int64 past 2^53 (`json.rs`
+    // `bson_to_json`). INPUT: a plain integer that fits 32 bits is an Int32, a larger one an
+    // Int64, and `{"$numberLong": ...}` an Int64 of any size (`number_to_bson`). So a document
+    // read and sent back unchanged stores an Int64 that fits 32 bits as an Int32, and the Int64
+    // past 2^53 stays an Int64. `$type` is the way to read a stored width.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "widths" })).await;
+    let coll = "/v1/db/shop/coll/widths";
+    let res = server
+        .post(
+            &format!("{coll}/docs"),
+            Some(&token),
+            json!({
+                "_id": 1,
+                "small": { "$numberLong": "5" },
+                "big": { "$numberLong": "9007199254740993" },
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let ids_of_type = |field: &'static str, name: &'static str| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    &format!("{coll}/find"),
+                    Some(token),
+                    json!({ "filter": { field: { "$type": name } } }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body["documents"].as_array().unwrap().len()
+        }
+    };
+    // Before: both are stored as an Int64.
+    assert_eq!(ids_of_type("small", "long").await, 1);
+    assert_eq!(ids_of_type("big", "long").await, 1);
+    // Read back: a plain number, with every digit.
+    let read = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    let doc = read.body["documents"][0].clone();
+    assert_eq!(doc["small"], json!(5), "{doc}");
+    assert_eq!(doc["big"].as_i64(), Some(9_007_199_254_740_993), "{doc}");
+    assert!(doc["big"].is_i64() && doc["small"].is_i64(), "{doc}");
+    // Sent back unchanged: the 5 is now an Int32, and the large one is still an Int64.
+    let put = server.put(&format!("{coll}/docs/1"), Some(&token), doc).await;
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    assert_eq!(ids_of_type("small", "int").await, 1);
+    assert_eq!(ids_of_type("small", "long").await, 0);
+    assert_eq!(ids_of_type("big", "long").await, 1);
+    assert_eq!(ids_of_type("big", "int").await, 0);
+}
+
+#[tokio::test]
+async fn a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_null() {
+    // q7s4m (72 cases): the exemption of a filter that is exactly `{_id: <number>}` (q7s4l, see
+    // `a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_id_number`) holds
+    // for every literal `_id` but `null`: a string, an ObjectId, an Int64, a Decimal128 and a
+    // binary here (the types a document may have as an `_id`; the rest are in the `kimmy-query`
+    // table `sort_exempt_types`). Refused: a regular expression in either spelling, `$eq`, `$in`,
+    // and an extra key beside `_id`. Through `find`, `aggregate` and `find_and_modify`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "idtypes" })).await;
+    let coll = "/v1/db/shop/coll/idtypes";
+    let held = [
+        json!("s2"),
+        json!({ "$oid": "000000000000000000000002" }),
+        json!({ "$numberLong": "2" }),
+        json!({ "$binary": { "base64": "AQID", "subType": "00" } }),
+    ];
+    // The same id as the Int64 2 in other numeric types (one id, as the product reads ids: 2,
+    // 2.0 and the decimal 2 are one `_id`), so they are filtered against the stored document and
+    // not stored beside it (q7s4m0013 to 0021: a Double 2.0 against a stored Int32 2).
+    let equal_to_the_long = [json!({ "$numberDecimal": "2" }), json!(2.0), json!(2)];
+    let mut batch = vec![json!({ "_id": 101, "a": 1, "b": 2, "k": "x" })];
+    for id in &held {
+        batch.push(json!({ "_id": id, "a": [1, 2], "b": [3, 4], "k": "only" }));
+    }
+    let res = server.post(&format!("{coll}/bulk"), Some(&token), json!(batch)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let sort = json!({ "a": 1, "b": 1, "_id": 1 });
+    let refused = |res: &Res| {
+        res.status == 400
+            && res.body["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with("cannot sort with keys that are parallel arrays"))
+    };
+    let find = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            server
+                .post(
+                    &format!("{coll}/find"),
+                    Some(token),
+                    json!({ "filter": filter, "sort": sort }),
+                )
+                .await
+        }
+    };
+    let aggregate = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            let stages =
+                json!([{ "$match": filter }, { "$sort": sort }, { "$project": { "_id": 1 } }]);
+            server
+                .post(&format!("{coll}/aggregate"), Some(token), json!({ "pipeline": stages }))
+                .await
+        }
+    };
+    let modify = |filter: Value| {
+        let (server, token, sort) = (&server, &token, &sort);
+        async move {
+            let body = json!({ "filter": filter, "sort": sort, "update": { "$set": { "z": 1 } } });
+            server.post(&format!("{coll}/find_and_modify"), Some(token), body).await
+        }
+    };
+    for id in held.iter().chain(&equal_to_the_long) {
+        let filter = json!({ "_id": id });
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "find {filter}: {:?}", res.body);
+        assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{filter}");
+        let res = aggregate(filter.clone()).await;
+        assert_eq!(res.status, 200, "aggregate {filter}: {:?}", res.body);
+        assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{filter}");
+        let res = modify(filter.clone()).await;
+        assert_eq!(res.status, 200, "find_and_modify {filter}: {:?}", res.body);
+    }
+    // The string `s2` matched in each of these, and the document it names has parallel arrays.
+    for filter in [
+        json!({ "_id": { "$regularExpression": { "pattern": "^s", "options": "" } } }),
+        json!({ "_id": { "$regex": "^s" } }),
+        json!({ "_id": { "$in": ["s2"] } }),
+        json!({ "_id": { "$eq": "s2" } }),
+        json!({ "_id": "s2", "k": "only" }),
+        json!({ "k": "only", "_id": "s2" }),
+    ] {
+        for (what, res) in [
+            ("find", find(filter.clone()).await),
+            ("aggregate", aggregate(filter.clone()).await),
+            ("find_and_modify", modify(filter.clone()).await),
+        ] {
+            assert!(refused(&res), "{what} {filter}: {:?}", res.body);
+        }
+    }
 }

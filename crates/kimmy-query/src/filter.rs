@@ -6,8 +6,8 @@
 //! optimisation — it is the shared representation.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::matching::{self, any_element};
+use kimmy_core::path::Walk;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
@@ -91,10 +91,12 @@ fn condition_draws_random(condition: &Condition) -> bool {
         | Condition::Lte(_)
         | Condition::In(_)
         | Condition::Nin(_)
+        | Condition::InPatterns(_)
         | Condition::Exists(_)
         | Condition::Type(_)
         | Condition::Regex(_)
         | Condition::All(_)
+        | Condition::AllPatterns(_)
         | Condition::Size(_)
         | Condition::Mod { .. }
         | Condition::Bits { .. } => false,
@@ -164,7 +166,8 @@ impl<'a> IntoIterator for &'a Branches {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Condition {
-    /// Imposes no constraint. Produced by a bare `$options`.
+    /// Imposes no constraint. Produced by the `$options` that sits beside a `$regex`, which the
+    /// pattern has already read; a `$options` with no `$regex` is refused.
     AlwaysTrue,
     /// Both must hold. Only produced when negating a multi-operator `$not`.
     Both(Box<Condition>, Box<Condition>),
@@ -176,12 +179,22 @@ pub enum Condition {
     Lte(Bson),
     In(Vec<Bson>),
     Nin(Vec<Bson>),
+    /// An `$in` that holds at least one regular expression: the field, or an element of it,
+    /// equals one of the values or matches one of the patterns. A `$nin` of such a list is
+    /// this under `Not`. Never answered from an index: the planner reads only `In`.
+    InPatterns(Members),
     Exists(bool),
     Type(Vec<String>),
     /// `$regex`, compiled when the filter was parsed.
     Regex(RegexPattern),
-    /// Every listed value must be present in the field's array.
+    /// `$all` of values: the `$and` of an equality on the path for each, so each is held by
+    /// the field as `$eq` reads it (the field, or an element of it, equals it; a missing field
+    /// equals `null`), and the members may be held by different values of the path.
     All(Vec<Bson>),
+    /// An `$all` that holds at least one regular expression: every value is present, as for
+    /// [`Condition::All`], and every pattern matches a string the field holds (or an element
+    /// of it), each as a clause of its own. Never answered from an index.
+    AllPatterns(Members),
     /// At least one array element must match the inner filter.
     ElemMatch(Box<Filter>),
     Size(i64),
@@ -199,6 +212,14 @@ pub enum Condition {
         mask: u64,
     },
     Not(Box<Condition>),
+}
+
+/// The members of an `$in` or `$all` list, the regular expressions taken apart from the
+/// values: a value is compared, a pattern is matched against strings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Members {
+    pub values: Vec<Bson>,
+    pub patterns: Vec<RegexPattern>,
 }
 
 /// Which way a [`Condition::Bits`] reads the bits its mask names.
@@ -450,7 +471,13 @@ fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Co
     }
 
     // `$options` is a modifier on a sibling `$regex`, not an operator of its
-    // own, so it has to be read before the operators are parsed independently.
+    // own: with no `$regex` beside it there is nothing to modify, and it is refused
+    // (q7s3b0216, q7s3b.out:6240), where it once matched every document and so
+    // selected the whole collection for a multi update or a delete.
+    if doc.contains_key("$options") && !doc.contains_key("$regex") {
+        return Err(Error::InvalidQuery("$options needs a $regex".into()));
+    }
+    // It has to be read before the operators are parsed independently.
     let sibling_options = match doc.get("$options") {
         Some(Bson::String(s)) => s.clone(),
         Some(_) => return Err(Error::InvalidQuery("$options requires a string of flags".into())),
@@ -510,30 +537,80 @@ fn parse_condition(
     Ok(match op {
         "eq" => Condition::Eq(arg.clone()),
         "ne" => Condition::Ne(not_regex(arg)?.clone()),
-        "gt" => Condition::Gt(arg.clone()),
-        "gte" => Condition::Gte(arg.clone()),
-        "lt" => Condition::Lt(arg.clone()),
-        "lte" => Condition::Lte(arg.clone()),
-        "in" => Condition::In(without_regex(op, array_arg(arg)?)?),
-        "nin" => Condition::Nin(without_regex(op, array_arg(arg)?)?),
-        "all" => Condition::All(non_empty_all(
-            path,
-            without_elem_match(without_regex(op, array_arg(arg)?)?)?,
-        )?),
+        "gt" => Condition::Gt(range_operand(path, arg)?.clone()),
+        "gte" => Condition::Gte(range_operand(path, arg)?.clone()),
+        "lt" => Condition::Lt(range_operand(path, arg)?.clone()),
+        "lte" => Condition::Lte(range_operand(path, arg)?.clone()),
+        "in" => {
+            let list = array_arg(arg)?;
+            refuse_nested_operators("in", &list)?;
+            let (values, patterns) = split_members(list)?;
+            if patterns.is_empty() {
+                Condition::In(values)
+            } else {
+                Condition::InPatterns(Members { values, patterns })
+            }
+        }
+        // The exact complement of `$in`: a field that is missing or null is in it, unless
+        // `null` is listed (q7s2r.out r0023 to r0027).
+        "nin" => {
+            let list = array_arg(arg)?;
+            refuse_nested_operators("nin", &list)?;
+            let (values, patterns) = split_members(list)?;
+            if patterns.is_empty() {
+                Condition::Nin(values)
+            } else {
+                Condition::Not(Box::new(Condition::InPatterns(Members { values, patterns })))
+            }
+        }
+        "all" => {
+            let list = array_arg(arg)?;
+            if list.iter().any(is_elem_match_member) {
+                return all_elem_matches(path, &list, sibling_options, scope);
+            }
+            // An empty list matches no document, not every one that holds an array
+            // (q7s2r.out r0067): an `$in` of nothing, which is the same condition.
+            if list.is_empty() {
+                return Ok(Condition::In(Vec::new()));
+            }
+            // `$all` is a list of values to be equal to, never of operators: `{$eq: 1}` there
+            // is no condition on the field, and the reference refuses it (q7s3a0021,
+            // q7s3a.out:302, code 2, "no $ expressions in $all"), as it refuses an operator
+            // among `$elemMatch` members (q7s2r.out r0055).
+            if list.iter().any(is_operator_document) {
+                return Err(Error::InvalidQuery("no $ expressions in $all".into()));
+            }
+            let (values, patterns) = split_members(list)?;
+            if patterns.is_empty() {
+                Condition::All(values)
+            } else {
+                Condition::AllPatterns(Members { values, patterns })
+            }
+        }
         // `$exists` reads its argument the way an expression reads a
         // condition, so `Decimal128("0")` asks for absence as `0` does.
         "exists" => Condition::Exists(expr::truthy(arg)),
-        "size" => match arg {
-            Bson::Int32(n) => Condition::Size(i64::from(*n)),
-            Bson::Int64(n) => Condition::Size(*n),
-            Bson::Double(n) if n.fract() == 0.0 => Condition::Size(*n as i64),
-            // A decimal by its value, as the double of that value is.
-            Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
-                Some(n) => Condition::Size(n),
-                None => return Err(Error::InvalidQuery("$size requires an integer".into())),
-            },
-            _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
-        },
+        "size" => {
+            let length = match arg {
+                Bson::Int32(n) => i64::from(*n),
+                Bson::Int64(n) => *n,
+                Bson::Double(n) if n.fract() == 0.0 => *n as i64,
+                // A decimal by its value, as the double of that value is.
+                Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+                    Some(n) => n,
+                    None => return Err(Error::InvalidQuery("$size requires an integer".into())),
+                },
+                _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
+            };
+            // A length below zero is no length: refused, where it matched nothing
+            // (q7s3b0132, q7s3b.out:3802, code 2, "Expected a non-negative number").
+            if length < 0 {
+                return Err(Error::InvalidQuery(format!(
+                    "Failed to parse $size. Expected a non-negative number in: $size: {length}"
+                )));
+            }
+            Condition::Size(length)
+        }
         "mod" => parse_mod(arg)?,
         "bitsAllSet" => parse_bits(BitTest::AllSet, arg)?,
         "bitsAnySet" => parse_bits(BitTest::AnySet, arg)?,
@@ -553,9 +630,10 @@ fn parse_condition(
             }
             _ => return Err(Error::InvalidQuery("$regex requires a string or regex".into())),
         },
-        // Already folded into the sibling `$regex` above. On its own it
-        // constrains nothing, but its flags are still checked: a flag this
-        // database does not implement is refused wherever it is written.
+        // Already folded into the sibling `$regex` above (`parse_conditions` refuses
+        // one with no `$regex` beside it). It constrains nothing itself, but its flags
+        // are still checked: a flag this database does not implement is refused
+        // wherever it is written.
         "options" => {
             check_regex_options(sibling_options)?;
             Condition::AlwaysTrue
@@ -628,28 +706,74 @@ fn is_regex_shaped(value: &Bson) -> bool {
     }
 }
 
-/// Refuse a regular expression among the values of `$in`, `$nin` or `$all`.
+/// The members of an `$in`, `$nin` or `$all` list, the regular expressions among them
+/// compiled and taken apart from the values.
 ///
-/// These operators compare values, so a regex among them was compared as a
-/// value: `{s: {$in: [/abc/]}}` matched only a stored regex `/abc/` and never
-/// the string `"xabcx"`, and `$nin` matched every string. Over HTTP a regex
-/// cannot even be written as one, so `{$regex: "abc"}` or the Extended JSON
-/// `{$regularExpression: ...}` arrived as a document and was compared as
-/// that. Each answered a result that looks right and is not.
+/// A regular expression is a pattern there: the field, or an element of it, matches it as
+/// `$regex` matches, and it also matches a stored regex of the same pattern and flags
+/// (q7s2r.out r0006 to r0022). It is one when written as a regex literal, as a document of
+/// `$regex` and optionally `$options`, or as the document `$regularExpression`, which are
+/// the shapes a client can send it in. A regex inside an array member is not a pattern: the
+/// array is a value (r0022).
 ///
-/// Only those shapes are refused ([`is_regex_shaped`]). A stored document
-/// may hold a key beginning with `$`, and `$in` still compares against any
-/// other document, a `{$regex: ..., other: ...}` among them.
-fn without_regex(op: &str, values: Vec<Bson>) -> Result<Vec<Bson>> {
-    match values.iter().find(|v| is_regex_shaped(v)) {
-        Some(regex) => Err(Error::InvalidQuery(format!(
-            "${op} cannot hold a regular expression, and {regex} is one: ${op} compares \
-             values, so it would match a stored value of that shape and never a string the \
-             pattern matches; to match any of several patterns, write an $or of $regex \
-             clauses, as in {{\"$or\": [{{\"name\": {{\"$regex\": \"^a\"}}}}, {{\"name\": \
-             {{\"$regex\": \"^b\"}}}}]}}, or one pattern, as in {{\"$regex\": \"^(a|b)\"}}"
-        ))),
-        None => Ok(values),
+/// What that costs: a stored document shaped exactly `{$regex: ...}` cannot be found through
+/// `$in` or `$all`; `$eq` still finds it.
+fn split_members(list: Vec<Bson>) -> Result<(Vec<Bson>, Vec<RegexPattern>)> {
+    let mut values = Vec::new();
+    let mut patterns = Vec::new();
+    for member in list {
+        match pattern_member(&member)? {
+            Some(pattern) => patterns.push(pattern),
+            None => values.push(member),
+        }
+    }
+    Ok((values, patterns))
+}
+
+/// The pattern a list member is, or `None` for a member that is a value.
+fn pattern_member(member: &Bson) -> Result<Option<RegexPattern>> {
+    if !is_regex_shaped(member) {
+        return Ok(None);
+    }
+    match member {
+        Bson::RegularExpression(re) => {
+            Ok(Some(RegexPattern::new(re.pattern.as_str(), re.options.as_str())?))
+        }
+        Bson::Document(d) if d.contains_key("$regularExpression") => {
+            match d.get("$regularExpression") {
+                Some(Bson::Document(inner)) => match (inner.get("pattern"), inner.get("options")) {
+                    (Some(Bson::String(pattern)), Some(Bson::String(options))) => {
+                        Ok(Some(RegexPattern::new(pattern, options)?))
+                    }
+                    _ => Err(Error::InvalidQuery(
+                        "$regularExpression requires a string pattern and a string options".into(),
+                    )),
+                },
+                _ => Err(Error::InvalidQuery(
+                    "$regularExpression requires a document of pattern and options".into(),
+                )),
+            }
+        }
+        Bson::Document(d) => {
+            let sibling = match d.get("$options") {
+                Some(Bson::String(s)) => s.as_str(),
+                Some(_) => {
+                    return Err(Error::InvalidQuery("$options requires a string of flags".into()));
+                }
+                None => "",
+            };
+            match d.get("$regex") {
+                Some(Bson::String(pattern)) => Ok(Some(RegexPattern::new(pattern, sibling)?)),
+                Some(Bson::RegularExpression(re)) => {
+                    // Flags written on the literal win over a sibling `$options`.
+                    let options =
+                        if re.options.as_str().is_empty() { sibling } else { re.options.as_str() };
+                    Ok(Some(RegexPattern::new(re.pattern.as_str(), options)?))
+                }
+                _ => Err(Error::InvalidQuery("$regex requires a string or regex".into())),
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -671,45 +795,90 @@ fn not_regex(operand: &Bson) -> Result<&Bson> {
     Ok(operand)
 }
 
-/// Refuse an `$elemMatch` among the values of `$all`.
+/// Refuse a regular expression as the operand of `$gt`, `$gte`, `$lt` or `$lte`.
 ///
-/// `$all` compares values, so `{items: {$all: [{$elemMatch: {qty: 5}}]}}`
-/// compared every element with the document `{$elemMatch: {qty: 5}}` and
-/// matched nothing, even when an element has `qty: 5`. Only a document whose
-/// only key is `$elemMatch` is refused; any other document is still a value.
-fn without_elem_match(values: Vec<Bson>) -> Result<Vec<Bson>> {
-    let is_elem_match =
-        |v: &Bson| matches!(v, Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch"));
-    match values.iter().find(|v| is_elem_match(v)) {
-        Some(elem_match) => Err(Error::InvalidQuery(format!(
-            "$all cannot hold an $elemMatch, and {elem_match} is one: $all compares values, so \
-             it would match only a stored document of that shape; to require an element \
-             matching each condition, write an $and of $elemMatch clauses, as in \
-             {{\"$and\": [{{\"items\": {{\"$elemMatch\": {{\"qty\": 5}}}}}}, {{\"items\": \
-             {{\"$elemMatch\": {{\"sku\": \"a\"}}}}}}]}}"
-        ))),
-        None => Ok(values),
-    }
-}
-
-/// Refuse an empty `$all`.
-///
-/// "Every one of no values" holds for any array, so `{tags: {$all: []}}`
-/// matched every document whose field holds an array, and under `$not` every
-/// document whose field does not. A list that arrives empty is far more
-/// likely a client's bug than a question, and on a `multi` update or delete
-/// it reached every such document with a `200`.
-fn non_empty_all(path: &str, values: Vec<Bson>) -> Result<Vec<Bson>> {
-    if values.is_empty() {
-        let field =
-            if path.is_empty() { "an array element".to_string() } else { format!("{path:?}") };
+/// A regex has no order a range could ask about: the reference refuses it (q7s3a0137, a0172, a0207
+/// and a0242, q7s3a.out:5527, 7452, 9377, 11302, code 2, "Can't have RegEx as arg to predicate
+/// over field 'v'"), where it was compared with the other regular expressions, `MinKey` and
+/// `MaxKey` as one group. `$eq` still compares a regex as a value.
+fn range_operand<'a>(path: &str, operand: &'a Bson) -> Result<&'a Bson> {
+    if matches!(operand, Bson::RegularExpression(_)) {
         return Err(Error::InvalidQuery(format!(
-            "$all on {field} has an empty list, which would match every document whose field \
-             holds an array, so a list emptied by mistake would reach all of them; send at least \
-             one value, or leave the condition out"
+            "Can't have RegEx as arg to predicate over field '{path}'."
         )));
     }
-    Ok(values)
+    Ok(operand)
+}
+
+/// Refuse a member of an `$in` or `$nin` list that is a document with a `$`-led key: the
+/// reference reads it as an operator nested under `$in` and refuses it, code 2, "cannot nest $
+/// under $in" (q7s3f0299, q7s3f.out:5247, with `{$options: "i"}`). The refusal is generalised to
+/// any `$`-led key, which is UNRECORDED. A regular expression in one of its shapes is a pattern
+/// and is not refused. `$eq` of the whole document is not touched: a stored document with a
+/// `$`-led key is still found by `{$eq: <that document>}`.
+fn refuse_nested_operators(op: &str, list: &[Bson]) -> Result<()> {
+    let nested = |member: &Bson| {
+        matches!(member, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')))
+            && !is_regex_shaped(member)
+    };
+    if list.iter().any(nested) {
+        return Err(Error::InvalidQuery(format!("cannot nest $ under ${op}")));
+    }
+    Ok(())
+}
+
+/// Whether an `$all` member is an operator document: one whose first key is an operator, and
+/// that is not a regular expression in one of its shapes or a document holding an `$elemMatch`
+/// (that one is read by [`is_elem_match_member`], and is a value when it has other keys).
+fn is_operator_document(member: &Bson) -> bool {
+    matches!(member, Bson::Document(d)
+        if d.keys().next().is_some_and(|k| k.starts_with('$'))
+            && !d.contains_key("$elemMatch")
+            && !is_regex_shaped(member))
+}
+
+/// Whether an `$all` member is an `$elemMatch`: a document whose only key is `$elemMatch`.
+/// Any other document, one with another key beside `$elemMatch` included, is a value.
+fn is_elem_match_member(member: &Bson) -> bool {
+    matches!(member, Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch"))
+}
+
+/// An `$all` whose members are `$elemMatch` documents: each is the `$elemMatch` condition on
+/// the same path, and the field must satisfy every one, each by an element of its own
+/// (q7s2r.out r0049 to r0066).
+///
+/// The list is all `$elemMatch` or none: a first member that is not one, with one later, is
+/// refused as "no $ expressions in $all" (r0055), and a first that is one with a member that is
+/// not (a value, a document, a regex) as "$all/$elemMatch has to be consistent" (r0054, r0056,
+/// r0063), the reference's own refusals.
+fn all_elem_matches(
+    path: &str,
+    list: &[Bson],
+    sibling_options: &str,
+    scope: Scope<'_>,
+) -> Result<Condition> {
+    let starts_with_elem_match = list.first().is_some_and(is_elem_match_member);
+    if !starts_with_elem_match {
+        return Err(Error::InvalidQuery("no $ expressions in $all".into()));
+    }
+    if !list.iter().all(is_elem_match_member) {
+        return Err(Error::InvalidQuery("$all/$elemMatch has to be consistent".into()));
+    }
+    let mut conditions = Vec::with_capacity(list.len());
+    for member in list {
+        let body = match member {
+            Bson::Document(d) => d.get("$elemMatch"),
+            _ => None,
+        };
+        let Some(body) = body else {
+            return Err(Error::InvalidQuery("$elemMatch requires a document".into()));
+        };
+        conditions.push(parse_condition(path, "elemMatch", body, sibling_options, scope)?);
+    }
+    Ok(conditions
+        .into_iter()
+        .reduce(|a, b| Condition::Both(Box::new(a), Box::new(b)))
+        .expect("the list is not empty: its first member is an $elemMatch"))
 }
 
 /// `{$mod: [divisor, remainder]}`, exactly two numbers.
@@ -863,19 +1032,32 @@ fn truncate_to_i64(d: f64) -> Option<i64> {
 /// parsed and the evaluator only ever sees concrete names.
 const NUMBER_TYPES: [&str; 4] = ["double", "int", "long", "decimal"];
 
+/// The argument of `$type`: an alias, a code, or an array of them.
+///
+/// A code is a whole number, of any numeric type: a double or a decimal that is whole is the
+/// code it equals, as an integer is (`{$type: 2.0}` is `{$type: 2}`, q7s3f0253 to f0262,
+/// q7s3b0123 and b0097); a fractional or non-finite one is no code and is refused.
 fn parse_type_arg(arg: &Bson) -> Result<Vec<String>> {
     let one = |value: &Bson| -> Result<Vec<String>> {
         match value {
             Bson::String(s) if s == "number" => {
                 Ok(NUMBER_TYPES.iter().map(|n| (*n).to_string()).collect())
             }
-            Bson::String(s) if TYPE_NAMES.contains(&s.as_str()) => Ok(vec![s.clone()]),
+            Bson::String(s) if TYPE_NAMES.contains(&s.as_str()) || s == WITH_SCOPE => {
+                Ok(vec![s.clone()])
+            }
             Bson::String(s) => Err(Error::InvalidQuery(format!(
-                "unknown $type alias {s:?}; the aliases are number and {}",
+                "unknown $type alias {s:?}; the aliases are number, {WITH_SCOPE} and {}",
                 TYPE_NAMES.join(", ")
             ))),
-            Bson::Int32(n) => type_name_for_code(i64::from(*n)).map(|name| vec![name]),
-            Bson::Int64(n) => type_name_for_code(*n).map(|name| vec![name]),
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                match whole_i64(value) {
+                    Some(code) => type_name_for_code(code).map(|name| vec![name]),
+                    None => {
+                        Err(Error::InvalidQuery(format!("Invalid numerical type code: {value}")))
+                    }
+                }
+            }
             _ => Err(Error::InvalidQuery("$type requires a string alias or type code".into())),
         }
     };
@@ -895,6 +1077,15 @@ fn regex_condition(pattern: &str, options: &str) -> Result<Condition> {
     Ok(Condition::Regex(RegexPattern::new(pattern, options)?))
 }
 
+/// The name `$type` code 15 stands for: a value that is code with a scope, and no other. Also the
+/// alias `javascriptWithScope`.
+const WITH_SCOPE: &str = "javascriptWithScope";
+
+/// The type a code stands for. Code 13 (`javascript`) is code and code 15 is code with a scope,
+/// each only itself (q7s3f0240, f0242, f0264 and f0265: the one matches the code value and not
+/// the one with a scope, the other the reverse); 12 (`dbPointer`) and 14 (`symbol`) are the
+/// legacy types, a symbol held by a document (f0241) and a pointer that no client can store
+/// (f0239).
 fn type_name_for_code(code: i64) -> Result<String> {
     Ok(match code {
         1 => "double",
@@ -908,14 +1099,19 @@ fn type_name_for_code(code: i64) -> Result<String> {
         9 => "date",
         10 => "null",
         11 => "regex",
+        12 => "dbPointer",
         13 => "javascript",
+        14 => "symbol",
+        15 => WITH_SCOPE,
         16 => "int",
         17 => "timestamp",
         18 => "long",
         19 => "decimal",
         -1 => "minKey",
         127 => "maxKey",
-        other => return Err(Error::InvalidQuery(format!("unknown $type code {other}"))),
+        other => {
+            return Err(Error::InvalidQuery(format!("Invalid numerical type code: {other}")));
+        }
     }
     .to_string())
 }
@@ -982,8 +1178,10 @@ pub struct ArrayPosition {
 /// position, and several conditions on one array path (kept in the order the
 /// filter evaluates them) leave the first element
 /// that satisfies the last of them. An element is tested as [`matches`] tests
-/// it, one level into the array. An `$or` records from the first branch, in
-/// the order written, that holds and does not draw a random number (a branch
+/// it, one level into the array. An `$or` of equalities on one array path is one `$in` of their
+/// values and records the smallest index of an element equal to any (q7s2ab); beside another
+/// condition on that array it decides the position. Any other `$or` records from the first
+/// branch, in the order written, that holds and does not draw a random number (a branch
 /// that does cannot be asked again after the match, and is passed over, so a
 /// document that matched only through it gives no position); the reference
 /// passes no match details to the branches of an `$or`, so this is an
@@ -1018,11 +1216,31 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
         | Filter::JsonSchema(_)
         | Filter::SampleRate(_) => {}
         Filter::And(branches) => {
+            // An `$or` beside another condition on the same array decides the position, whatever
+            // the order they are written in (q7s2ab 49 to 54); on another array the later
+            // clause is the last array matched on, as written.
+            let mut from_or = None;
             for branch in branches.in_written_order() {
+                let before = at.clone();
                 record_position(branch, doc, at)?;
+                if matches!(branch, Filter::Or(_)) && *at != before {
+                    from_or = at.clone();
+                }
+            }
+            if let (Some(chosen), Some(now)) = (from_or, at.as_ref())
+                && chosen.path == now.path
+            {
+                *at = Some(chosen);
             }
         }
         Filter::Or(branches) => {
+            // An `$or` whose branches are all one equality on the same array path is one `$in`
+            // of their values: the position is the smallest index of an element equal to any of
+            // them, whatever the order the branches are written in (q7s2ab 1 to 36).
+            if let Some(smallest) = smallest_equal_element(branches.in_written_order(), doc)? {
+                *at = Some(smallest);
+                return Ok(());
+            }
             // The first branch, in the order written, that holds. A branch that cannot be
             // evaluated for this document (an `$expr` that fails on it) did not decide the
             // match, as `matches` itself defers it, and the next is tried; an error that is
@@ -1052,6 +1270,31 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
     Ok(())
 }
 
+/// The smallest index, over the branches of an `$or`, of the first element each equality names,
+/// when every branch is one equality on the same path: `None` for any other shape of branch, which
+/// records as the first branch that holds does.
+fn smallest_equal_element<'a>(
+    branches: impl Iterator<Item = &'a Filter>,
+    doc: &Document,
+) -> Result<Option<ArrayPosition>> {
+    let mut path_of: Option<&str> = None;
+    let mut smallest: Option<ArrayPosition> = None;
+    for branch in branches {
+        let Filter::Field { path, conditions } = branch else { return Ok(None) };
+        let [condition @ Condition::Eq(_)] = conditions.as_slice() else { return Ok(None) };
+        if path_of.is_some_and(|first| first != path.as_str()) {
+            return Ok(None);
+        }
+        path_of = Some(path.as_str());
+        if let Some(found) = condition_position(condition, doc, path)?
+            && smallest.as_ref().is_none_or(|best| found.index < best.index)
+        {
+            smallest = Some(found);
+        }
+    }
+    Ok(smallest)
+}
+
 /// The first element of the outermost array on `path` that satisfies
 /// `condition`, for a condition that is about elements. An error that is about the request and
 /// not the element (the deadline, the node's stop, a size refusal) goes up, as `$or`'s does.
@@ -1068,11 +1311,15 @@ fn condition_position(
             | Condition::Lt(_)
             | Condition::Lte(_)
             | Condition::In(_)
+            | Condition::InPatterns(_)
             | Condition::Type(_)
             | Condition::Regex(_)
             | Condition::ElemMatch(_)
             | Condition::Mod { .. }
             | Condition::Bits { .. }
+            // `$exists: true` records the first element where the rest of the path yields a
+            // value (q7s3i 181-184).
+            | Condition::Exists(true)
     ) {
         return Ok(None);
     }
@@ -1104,7 +1351,7 @@ fn condition_position(
 /// array is one value, and its members are not tried. [`item_holds`] is that
 /// per-element step, from the predicates [`condition_matches`] applies. With a
 /// path below the element, the values under it are the matcher's own
-/// ([`path::resolve`]) and the condition is evaluated over them whole.
+/// ([`path::read_document`]) and the condition is evaluated over them whole.
 ///
 /// An element that cannot be evaluated (an `$expr` in an `$elemMatch` body that fails on it) did
 /// not satisfy the condition, as `matches` defers it; any other error goes up.
@@ -1113,7 +1360,9 @@ fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> Result<b
         item_holds(condition, item)
     } else {
         match item {
-            Bson::Document(inner) => condition_matches(condition, &path::resolve(inner, rest), &[]),
+            Bson::Document(inner) => {
+                condition_matches(condition, &path::read_document(inner, rest), &[])
+            }
             _ => return Ok(false),
         }
     };
@@ -1138,14 +1387,21 @@ fn item_holds(condition: &Condition, item: &Bson) -> Result<bool> {
             matching::value_compares(item, bound, &[Ordering::Less, Ordering::Equal])
         }
         Condition::In(options) => options.iter().any(|o| matching::value_equals(item, o)),
+        Condition::InPatterns(members) => {
+            members.values.iter().any(|o| matching::value_equals(item, o))
+                || members.patterns.iter().any(|re| regex_holds(re, item))
+        }
         Condition::Type(names) => type_holds(names, item),
         Condition::Regex(re) => regex_holds(re, item),
         Condition::Mod { divisor, remainder } => mod_holds(*divisor, *remainder, item),
         Condition::Bits { test, mask } => bits_holds(*test, *mask, item),
+        // An element is a value: with nothing of the path below it, it is there.
+        Condition::Exists(true) => true,
         // `$elemMatch` reads the elements of the array it is given; the
         // element alone is wrapped so that it is the one it tests.
         Condition::ElemMatch(_) => {
-            condition_matches(condition, &[&Bson::Array(vec![item.clone()])], &[])?
+            let wrapped = Bson::Array(vec![item.clone()]);
+            condition_matches(condition, &Walk::single(&wrapped), &[])?
         }
         // Not about elements: `condition_position` does not ask.
         _ => false,
@@ -1190,10 +1446,12 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
             | Condition::Lte(_)
             | Condition::In(_)
             | Condition::Nin(_)
+            | Condition::InPatterns(_)
             | Condition::Exists(_)
             | Condition::Type(_)
             | Condition::Regex(_)
             | Condition::All(_)
+            | Condition::AllPatterns(_)
             | Condition::Size(_)
             | Condition::Bits { .. }
             | Condition::Mod { .. } => false,
@@ -1212,7 +1470,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
 }
 
 /// Whether a filter holds a `$expr` anywhere it is evaluated from.
-fn filter_has_expr(filter: &Filter) -> bool {
+pub(crate) fn filter_has_expr(filter: &Filter) -> bool {
     match filter {
         Filter::AlwaysTrue => false,
         Filter::And(branches) | Filter::Or(branches) => branches.iter().any(filter_has_expr),
@@ -1245,7 +1503,7 @@ fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Resu
         Filter::Or(branches) => any_of(branches, |f| evaluate(f, doc, vars)),
         Filter::Nor(branches) => Ok(!any_of(branches, |f| evaluate(f, doc, vars))?),
         Filter::Field { path, conditions } => {
-            let values = path::resolve(doc, path);
+            let values = path::read_document(doc, path);
             all_of(conditions, |c| condition_matches(c, &values, vars))
         }
         Filter::Expr(e) => expr_matches(e, doc, vars),
@@ -1293,7 +1551,13 @@ pub(crate) fn expr_evaluations() -> usize {
 
 /// `$type` on one value.
 fn type_holds(names: &[String], value: &Bson) -> bool {
-    names.iter().any(|n| n == type_name_of(value))
+    names.iter().any(|n| match n.as_str() {
+        // Each of the two is only itself, whether written as the alias or as the code
+        // (q7s3f0240, f0242, f0264, f0265); `type_name_of` calls both "javascript".
+        "javascript" => matches!(value, Bson::JavaScriptCode(_)),
+        WITH_SCOPE => matches!(value, Bson::JavaScriptCodeWithScope(_)),
+        name => name == type_name_of(value),
+    })
 }
 
 /// `$regex` on one value (and a regex written as a field's value, which is the same
@@ -1347,7 +1611,7 @@ fn bits_holds(test: BitTest, mask: u64, value: &Bson) -> bool {
 /// specially. Only `$elemMatch` can fail, through a `$expr` in its body.
 fn condition_matches(
     condition: &Condition,
-    values: &[&Bson],
+    values: &Walk<'_>,
     vars: &[expr::Binding<'_>],
 ) -> Result<bool> {
     Ok(match condition {
@@ -1368,6 +1632,10 @@ fn condition_matches(
 
         Condition::In(options) => options.iter().any(|option| matching::equals(values, option)),
         Condition::Nin(options) => !options.iter().any(|option| matching::equals(values, option)),
+        Condition::InPatterns(members) => {
+            members.values.iter().any(|option| matching::equals(values, option))
+                || members.patterns.iter().any(|re| any_element(values, |v| regex_holds(re, v)))
+        }
 
         Condition::Type(names) => any_element(values, |v| type_holds(names, v)),
 
@@ -1375,28 +1643,26 @@ fn condition_matches(
 
         // Array-shaped operators inspect the array itself rather than its
         // elements, so they must not go through `any_element`.
-        Condition::Size(want) => values.iter().any(|v| match v {
+        Condition::Size(want) => values.values.iter().any(|(v, _)| match v {
             Bson::Array(items) => items.len() as i64 == *want,
             _ => false,
         }),
 
-        Condition::All(required) => values.iter().any(|v| match v {
-            Bson::Array(items) => required.iter().all(|needle| {
-                items.iter().any(|item| canonical_cmp(item, needle) == Ordering::Equal)
-            }),
-            // A non-array matches `$all` only for a single-element list.
-            other => required.len() == 1 && canonical_cmp(other, &required[0]) == Ordering::Equal,
-        }),
+        // `$all` is the `$and` of one equality per member, each as `$eq` reads it on the path
+        // (q7s3a0001 to a0035, q7s3b0140 to b0154): the members may be held by different
+        // values, `arr.a` over `[{a: 1}, {a: 2}]`, and a missing field holds `null`.
+        Condition::All(required) => required.iter().all(|needle| matching::equals(values, needle)),
+        Condition::AllPatterns(members) => {
+            members.values.iter().all(|needle| matching::equals(values, needle))
+                && members.patterns.iter().all(|re| any_element(values, |v| regex_holds(re, v)))
+        }
 
-        Condition::ElemMatch(inner) => any_of(values, |v| match v {
-            Bson::Array(items) => any_of(items, |item| match item {
-                Bson::Document(d) => evaluate(inner, d, vars),
-                // A scalar element is tested by wrapping it so that
-                // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
-                scalar => matches_scalar_against(inner, scalar, vars),
-            }),
-            _ => Ok(false),
-        })?,
+        Condition::ElemMatch(inner) => {
+            any_of(values.values.iter().map(|(v, _)| *v), |v| match v {
+                Bson::Array(items) => any_of(items, |item| elem_match_member(inner, item, vars)),
+                _ => Ok(false),
+            })?
+        }
 
         // Element-wise like the comparisons, and numeric only: a string never
         // has a remainder (`mod_holds`).
@@ -1414,6 +1680,12 @@ fn condition_matches(
             all_of(&[a.as_ref(), b.as_ref()], |c| condition_matches(c, values, vars))?
         }
     })
+}
+
+/// An array read as a document: `[a, b]` is `{"0": a, "1": b}`, what an `$elemMatch` on fields
+/// tests an array element by.
+fn position_document(members: &[Bson]) -> Document {
+    members.iter().enumerate().map(|(at, member)| (at.to_string(), member.clone())).collect()
 }
 
 /// Test one array element against a filter, for the update language's
@@ -1456,12 +1728,12 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
         }
         Filter::Field { path, conditions } => {
             if path.is_empty() {
-                return all_of(conditions, |c| condition_matches(c, &[element], &[]));
+                return all_of(conditions, |c| condition_matches(c, &Walk::single(element), &[]));
             }
-            let values = match element {
-                Bson::Document(doc) => path::resolve(doc, path),
-                _ => Vec::new(),
-            };
+            // The element is the identifier's value, read as a field value is: an array element
+            // is traversed and a position read (`{"x.0": {$gt: 0}}` selects `[1, 2]` and `[3]`:
+            // q7s3g 175, 229, 256), and a scalar has no fields, so the path is absent.
+            let values = path::read_value(element, path::Root::Field, path);
             all_of(conditions, |c| condition_matches(c, &values, &[]))
         }
         Filter::Expr(e) => {
@@ -1485,18 +1757,81 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
 /// `{$in: [1, 2]}`, `{$elemMatch: {score: 8}}`). Parsed once per update, so an
 /// unknown operator or a bad argument is refused before any element is tested.
 pub fn parse_condition_document(doc: &Document) -> Result<Filter> {
+    // The reference refuses a `$not` at the top of the operand, whatever it holds
+    // (q7s2q.out q0177 line 1215, code 2).
+    if doc.contains_key("$not") {
+        return Err(Error::InvalidQuery(
+            "unknown top level operator: $not. If you are trying to negate an entire \
+             expression, use $nor"
+                .into(),
+        ));
+    }
     let _budget = RegexBudget::open();
     parse_elem_match(doc, Scope::NONE)
+}
+
+/// Parse the document operand of an update's `$pull` that names fields (no key
+/// starts with `$`): a query, as a filter is, tested against each element that
+/// is a document.
+pub fn parse_pull_query(doc: &Document) -> Result<Filter> {
+    parse(doc)
+}
+
+/// Whether one array element satisfies a query parsed by [`parse_pull_query`]:
+/// a document element is matched as a stored document is, any other element
+/// (a scalar, an array, `null`) does not match; so does an array element that holds documents
+/// (q7s2y y0075, y0083, y0091: `$pull` of `{k: 2}` leaves `[{k: 2}]`; q7s2j.out j1255 records
+/// arrays of scalars).
+pub fn matches_pull_query(filter: &Filter, element: &Bson) -> Result<bool> {
+    match element {
+        Bson::Document(d) => {
+            matches(filter, d).map_err(|e| unevaluable(e, None, "an array element of "))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether one member of an array satisfies the body of an `$elemMatch`. **`find` and `$pull` read
+/// a member the same way, through this function** (q7s3g0243: `{$elemMatch: {$gt: 1}}` over
+/// `[[1, [2, 3]], [4]]` pulls `[4]` only, as `find` matches `[4]` only).
+///
+/// The body is either operators on the member itself (`{$gt: 5}`: the value form, parsed to a
+/// condition on the empty path) or a filter on its fields (the document form).
+///
+/// **One code path for `find` and `$pull`:** both call this function, so an `$all` inside a value
+/// form body reaches the one `Condition::All` arm of `element_condition` for a document or an array
+/// member (each listed value must equal the member as one whole value: q7s3f0322, q7s3f0323,
+/// q7s3l0001 to 0020 for `find`; q7s2aa 1 to 10 for `$pull`), and a scalar member reads it through
+/// `condition_matches`, where a one-value walk gives the same whole-value equality.
+fn elem_match_member(inner: &Filter, item: &Bson, vars: &[expr::Binding<'_>]) -> Result<bool> {
+    let value_form = matches!(inner, Filter::Field { path, .. } if path.is_empty());
+    match item {
+        // The value form takes each member as one value, a document too, with no traversal into
+        // it (q7s3b 169-171, q7s3g 148, q7s3f 301-341).
+        Bson::Document(_) if value_form => matches_scalar_against(inner, item, vars, true),
+        Bson::Document(d) => evaluate(inner, d, vars),
+        // A member that is an array is one value: the conditions are made on it whole and do
+        // not look into it (q7s2r.out r0040, r0052, r0057, r0058).
+        Bson::Array(_) if value_form => matches_scalar_against(inner, item, vars, true),
+        // The document form reads an array member as the document of its positions,
+        // `{"0": first, "1": second, ...}` (q7s3f 18, 19, 332, 334, 335; q7s3g 143, 147), and
+        // the empty body holds for it as for a document.
+        Bson::Array(members) => evaluate(inner, &position_document(members), vars),
+        // The empty body holds for a document or an array member and for no other (r0059).
+        _ if matches!(inner, Filter::AlwaysTrue) => Ok(false),
+        // A scalar member is tested by wrapping it so that `{$elemMatch: {$gt: 5}}` works on an
+        // array of numbers.
+        scalar => matches_scalar_against(inner, scalar, vars, false),
+    }
 }
 
 /// Whether one array element satisfies a condition parsed by
 /// [`parse_condition_document`], as `$pull` asks of each element.
 ///
 /// The conditions are tested against the element itself, as an `$elemMatch`
-/// over scalars tests them. A top-level `$elemMatch` (or one under `$not`)
-/// reads the element as the thing to match, not as an array to search: a
-/// document element is matched against its body by field, a scalar element
-/// as `$elemMatch: {$gt: 5}` matches one. A document-level clause (`$and`,
+/// over scalars tests them. A top-level `$elemMatch` searches an array element
+/// for a member that satisfies its body; a document or a scalar element holds
+/// nothing to search and does not match. A document-level clause (`$and`,
 /// `$or`, `$nor`, `$expr`) is matched against a document element and holds for
 /// no scalar. `Err` only when a `$expr` cannot be evaluated against the element.
 pub fn matches_pull_element(filter: &Filter, element: &Bson) -> Result<bool> {
@@ -1506,22 +1841,30 @@ pub fn matches_pull_element(filter: &Filter, element: &Bson) -> Result<bool> {
 fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
     fn condition(c: &Condition, element: &Bson) -> Result<bool> {
         match c {
+            // An array element is searched for a member that satisfies the body. A
+            // document or a scalar is not searched: it holds nothing to find
+            // (q7s2j.out lines 7774-7779, 7792-7797, q7s2q.out q0221 line 1479).
             Condition::ElemMatch(inner) => match element {
-                Bson::Document(d) => evaluate(inner, d, &[]),
-                scalar => matches_scalar_against(inner, scalar, &[]),
+                Bson::Array(members) => {
+                    any_of(members, |member| elem_match_member(inner, member, &[]))
+                }
+                _ => Ok(false),
             },
             Condition::Not(inner) => Ok(!condition(inner, element)?),
             Condition::Both(a, b) => all_of(&[a.as_ref(), b.as_ref()], |c| condition(c, element)),
-            other => condition_matches(other, &[element], &[]),
+            other => condition_matches(other, &Walk::single(element), &[]),
         }
     }
     match filter {
         Filter::Field { path, conditions } if path.is_empty() => {
             all_of(conditions, |c| condition(c, element))
         }
+        // A clause on a document (`$and`, `$or`, `$nor`, `$expr`, `$jsonSchema`) is tested
+        // on a document element, and no other element satisfies it, a `$nor` included
+        // (q7s2q.out q0191 line 1299, q0326 line 2109).
         other => match element {
             Bson::Document(d) => evaluate(other, d, &[]),
-            scalar => matches_scalar_against(other, scalar, &[]),
+            _ => Ok(false),
         },
     }
 }
@@ -1532,20 +1875,28 @@ fn matches_scalar_against(
     filter: &Filter,
     scalar: &Bson,
     vars: &[expr::Binding<'_>],
+    opaque: bool,
 ) -> Result<bool> {
     match filter {
         Filter::AlwaysTrue => Ok(true),
-        Filter::And(branches) => all_of(branches, |f| matches_scalar_against(f, scalar, vars)),
-        Filter::Or(branches) => any_of(branches, |f| matches_scalar_against(f, scalar, vars)),
+        Filter::And(branches) => {
+            all_of(branches, |f| matches_scalar_against(f, scalar, vars, opaque))
+        }
+        Filter::Or(branches) => {
+            any_of(branches, |f| matches_scalar_against(f, scalar, vars, opaque))
+        }
         Filter::Nor(branches) => {
-            Ok(!any_of(branches, |f| matches_scalar_against(f, scalar, vars))?)
+            Ok(!any_of(branches, |f| matches_scalar_against(f, scalar, vars, opaque))?)
         }
         Filter::Field { path, conditions } => {
             // A scalar element has no fields, so only an empty path applies.
             if !path.is_empty() {
                 return Ok(false);
             }
-            all_of(conditions, |c| condition_matches(c, &[scalar], vars))
+            if opaque {
+                return all_of(conditions, |c| element_condition(c, scalar, vars));
+            }
+            all_of(conditions, |c| condition_matches(c, &Walk::single(scalar), vars))
         }
         // An expression reads fields, and a scalar has none to read: nothing
         // is evaluated, so there is nothing to fail.
@@ -1555,6 +1906,44 @@ fn matches_scalar_against(
         // Refused inside an `$elemMatch` when the filter is parsed, so never reached.
         Filter::SampleRate(_) => Ok(false),
     }
+}
+
+/// One condition of an `$elemMatch` body on an element that is an array, which is one value:
+/// the comparisons, `$in`, `$type`, `$regex`, `$mod` and the bit tests are made on the array as
+/// it is and not on its members, which is what makes `{$elemMatch: {$gt: 1}}` hold for `[2, 3]`
+/// and for no `[[2, 3]]`; the conditions about an array (`$size`, `$elemMatch`, `$exists`) read
+/// it as they read a field. An `$all` is asked of the member as one whole value: each listed
+/// value must **equal** the member, so `{$all: [1]}` holds for a member `1` and not for a member
+/// `[1, 2]`, `{$all: [[1, 2]]}` holds for a member equal to `[1, 2]`, and `{$all: [1, 2]}` holds
+/// for none (q7s3f0322, q7s3f0323, q7s3l0001 to 0020).
+fn element_condition(
+    condition: &Condition,
+    element: &Bson,
+    vars: &[expr::Binding<'_>],
+) -> Result<bool> {
+    Ok(match condition {
+        Condition::Eq(_)
+        | Condition::Gt(_)
+        | Condition::Gte(_)
+        | Condition::Lt(_)
+        | Condition::Lte(_)
+        | Condition::In(_)
+        | Condition::InPatterns(_)
+        | Condition::Type(_)
+        | Condition::Regex(_)
+        | Condition::Mod { .. }
+        | Condition::Bits { .. } => item_holds(condition, element)?,
+        Condition::Ne(expected) => !matching::value_equals(element, expected),
+        Condition::Nin(options) => !options.iter().any(|o| matching::value_equals(element, o)),
+        Condition::All(required) => {
+            required.iter().all(|needle| matching::value_equals(element, needle))
+        }
+        Condition::Not(inner) => !element_condition(inner, element, vars)?,
+        Condition::Both(a, b) => {
+            all_of(&[a.as_ref(), b.as_ref()], |c| element_condition(c, element, vars))?
+        }
+        _ => condition_matches(condition, &Walk::single(element), vars)?,
+    })
 }
 
 #[cfg(test)]
@@ -1847,8 +2236,8 @@ mod tests {
     fn a_regex_against_a_stored_regex_gives_the_references_recorded_answers() {
         // The reference's (6.0.5) answers, recorded over this collection (`q8p-ref.rec`, P2).
         // Id 11 was written `/ab/s` and the reference's shell stored it as `/ab/`, so that is
-        // what it is here; `$in`, `$nin` and `$ne` with a regex are refused here and are not
-        // in the table (a recorded deviation).
+        // what it is here; `$in`, `$nin` and `$all` with a regex are in `tests/patterns_in_lists.rs`,
+        // and `$ne` with a regex is refused here, as in the reference.
         let docs = vec![
             doc! { "_id": 1, "s": "aaab" },
             doc! { "_id": 2, "s": literal("ab", "") },
@@ -1915,25 +2304,28 @@ mod tests {
         assert!(message.contains("nosuch"), "{message}");
         // The numeric spelling was already refused, and stays refused.
         assert!(refused(doc! { "a": { "$type": 999 } }).contains("999"));
+        assert!(refused(doc! { "a": { "$type": 2.5 } }).contains("2.5"));
     }
 
     #[test]
-    fn an_empty_all_is_refused_naming_the_field() {
-        for (q, field) in [
-            (doc! { "tags": { "$all": [] } }, r#""tags""#),
-            (doc! { "a.b": { "$all": [] } }, r#""a.b""#),
-            (doc! { "tags": { "$not": { "$all": [] } } }, r#""tags""#),
-            (doc! { "$or": [ { "x": 1 }, { "tags": { "$all": [] } } ] }, r#""tags""#),
-            (doc! { "items": { "$elemMatch": { "tags": { "$all": [] } } } }, r#""tags""#),
-            (doc! { "grid": { "$elemMatch": { "$all": [] } } }, "an array element"),
+    fn an_empty_all_matches_no_document() {
+        // r0067 (q7s2r.out line 1298): not every document whose field is an array.
+        let arrays = [doc! { "tags": ["a", "b"] }, doc! { "tags": [] }];
+        for q in [
+            doc! { "tags": { "$all": [] } },
+            doc! { "a.b": { "$all": [] } },
+            doc! { "$or": [ { "x": 1 }, { "tags": { "$all": [] } } ] },
+            doc! { "items": { "$elemMatch": { "tags": { "$all": [] } } } },
+            doc! { "grid": { "$elemMatch": { "$all": [] } } },
         ] {
-            let message = refused(q.clone());
-            assert!(
-                message.starts_with(&format!("$all on {field} has an empty list"))
-                    && message.contains("send at least one value"),
-                "{q}: {message}"
-            );
+            parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
         }
+        for d in &arrays {
+            assert!(!hits(doc! { "tags": { "$all": [] } }, d.clone()));
+            assert!(hits(doc! { "tags": { "$not": { "$all": [] } } }, d.clone()));
+        }
+        assert!(!hits(doc! { "tags": { "$all": [] } }, doc! { "tags": "a" }));
+        assert!(!hits(doc! { "tags": { "$all": [] } }, doc! {}));
         // One value or more is unchanged.
         assert!(hits(doc! { "tags": { "$all": ["a"] } }, doc! { "tags": ["a", "b"] }));
         assert!(!hits(doc! { "tags": { "$all": ["a", "c"] } }, doc! { "tags": ["a", "b"] }));
@@ -1978,8 +2370,15 @@ mod tests {
         ];
         let mut seen = std::collections::BTreeSet::new();
         for value in &samples {
+            // Code with a scope is the alias `javascriptWithScope`, which `type_name_of` does
+            // not report: it calls both forms of code "javascript", which holds for code alone.
             let name = type_name_of(value);
             seen.insert(name);
+            let name = if matches!(value, Bson::JavaScriptCodeWithScope(_)) {
+                "javascriptWithScope"
+            } else {
+                name
+            };
             let filter = parse(&doc! { "a": { "$type": name } })
                 .unwrap_or_else(|e| panic!("{name} must parse: {e}"));
             assert!(
@@ -1994,7 +2393,7 @@ mod tests {
         let table: std::collections::BTreeSet<&str> = TYPE_NAMES.iter().copied().collect();
         assert_eq!(seen, table, "the alias table and the names values report must be one set");
         // And every name a code spells is in it.
-        for code in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, -1, 127] {
+        for code in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, -1, 127] {
             let name = type_name_for_code(code).unwrap();
             assert!(table.contains(name.as_str()), "{name}");
         }
@@ -2065,9 +2464,9 @@ mod tests {
             assert!(message.contains("flag"), "{message}");
         }
         assert!(refused(doc! { "s": { "$regex": "s", "$options": "iI" } }).contains("'I'"));
-        // The literal's own flags, and a lone `$options`, are checked too.
+        // The literal's own flags, and a `$options` beside a `$regex`, are checked too.
         refused(doc! { "s": { "$regex": literal("s", "g") } });
-        refused(doc! { "s": { "$options": "I" } });
+        refused(doc! { "s": { "$regex": "s", "$options": "I" } });
         refused(doc! { "s": { "$not": literal("s", "g") } });
     }
 
@@ -2168,8 +2567,8 @@ mod tests {
             refused(implicit(literal(pattern, "")));
             refused(doc! { "$or": [{ "t": 1 }, { "s": literal(pattern, "") }] });
         }
-        // `$in` keeps its documented refusal of a regex.
-        refused(doc! { "s": { "$in": [literal("a", "")] } });
+        // `$in` reads it as a pattern too (`tests/patterns_in_lists.rs`).
+        assert!(hits(doc! { "s": { "$in": [literal("a", "")] } }, doc! { "s": "aaab" }));
     }
 
     #[test]
@@ -2198,37 +2597,6 @@ mod tests {
         assert!(message.contains("unclosed group") && !message.contains('\n'), "{message}");
         // A pattern that compiles is untouched.
         assert!(hits(doc! { "s": { "$regex": "^a(b|c)+$" } }, doc! { "s": "abcb" }));
-    }
-
-    #[test]
-    fn a_regex_among_the_values_of_in_nin_or_all_is_refused() {
-        let shapes: Vec<Bson> = vec![
-            literal("abc", ""),
-            literal("^a", "i"),
-            Bson::Document(doc! { "$regex": "abc" }),
-            Bson::Document(doc! { "$regex": "abc", "$options": "i" }),
-            Bson::Document(doc! { "$options": "i", "$regex": literal("abc", "") }),
-            Bson::Document(doc! { "$regularExpression": { "pattern": "abc", "options": "" } }),
-        ];
-        for op in ["$in", "$nin", "$all"] {
-            for shape in &shapes {
-                // Alone, beside an ordinary value, under `$not` and inside an
-                // `$elemMatch`: every place the operator can be written.
-                for q in [
-                    doc! { "s": { op: [shape.clone()] } },
-                    doc! { "s": { op: ["plain", shape.clone()] } },
-                    doc! { "s": { "$not": { op: [shape.clone()] } } },
-                    doc! { "s": { "$elemMatch": { op: [shape.clone()] } } },
-                ] {
-                    let message = refused(q.clone());
-                    assert!(
-                        message.starts_with(&format!("{op} cannot hold a regular expression"))
-                            && message.contains("write an $or of $regex clauses"),
-                        "{q}: {message}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -2262,47 +2630,59 @@ mod tests {
     }
 
     #[test]
-    fn an_elem_match_among_the_values_of_all_is_refused() {
-        for q in [
-            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } } ] } },
-            doc! { "items": { "$all": [ { "$elemMatch": { "$eq": "q" } } ] } },
-            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "a" } } ] } },
-            doc! { "items": { "$all": [ "plain", { "$elemMatch": { "qty": 5 } } ] } },
-            doc! { "items": { "$not": { "$all": [ { "$elemMatch": { "qty": 5 } } ] } } },
-        ] {
-            let message = refused(q.clone());
-            assert!(
-                message.starts_with("$all cannot hold an $elemMatch")
-                    && message.contains("write an $and of $elemMatch clauses"),
-                "{q}: {message}"
-            );
-        }
-        // What the message points to answers it; a document with another key
-        // beside `$elemMatch` is still a value.
+    fn an_all_of_elem_matches_needs_an_element_for_each() {
+        // Every member is an `$elemMatch`: the field holds an element for each (the
+        // recording is in `tests/patterns_in_lists.rs`).
         let d = doc! { "items": [ { "qty": 5, "sku": "b" }, { "qty": 1, "sku": "a" } ] };
         assert!(hits(
-            doc! { "$and": [
-                { "items": { "$elemMatch": { "qty": 5 } } },
-                { "items": { "$elemMatch": { "sku": "a" } } },
-            ] },
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "a" } } ] } },
             d.clone()
         ));
+        assert!(!hits(
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "z" } } ] } },
+            d.clone()
+        ));
+        // A document with another key beside `$elemMatch` is a value.
         let odd = doc! { "items": [ { "$elemMatch": { "qty": 5 }, "x": 1 } ] };
         assert!(hits(
             doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 }, "x": 1 } ] } },
             odd
         ));
+        // A list of `$elemMatch` and anything else is refused, as the reference refuses it.
+        for q in [
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, 2 ] } },
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, { "qty": 5 } ] } },
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, literal("x", "") ] } },
+            doc! { "items": { "$not": { "$all": [ { "$elemMatch": { "qty": 5 } }, "plain" ] } } },
+        ] {
+            assert_eq!(refused(q.clone()), "$all/$elemMatch has to be consistent", "{q}");
+        }
+        for q in [
+            doc! { "items": { "$all": [ "plain", { "$elemMatch": { "qty": 5 } } ] } },
+            doc! { "items": { "$all": [ 1, { "$elemMatch": { "qty": 5 } } ] } },
+        ] {
+            assert_eq!(refused(q.clone()), "no $ expressions in $all", "{q}");
+        }
     }
 
     #[test]
     fn in_still_compares_documents_that_are_not_regex_shaped() {
-        // A stored document may hold a key beginning with `$`; only the exact
-        // regex shapes are refused.
+        // A stored document may hold a key beginning with `$`: `$eq` of the whole document finds
+        // it, and an `$in` or `$nin` member with a `$`-led key is refused (q7s3f0299), a regex
+        // in one of its shapes excepted.
         let d =
             doc! { "s": { "$regex": "x", "other": 1 }, "t": { "$options": "i" }, "u": { "a": 1 } };
         for q in [
             doc! { "s": { "$in": [ { "$regex": "x", "other": 1 } ] } },
-            doc! { "t": { "$in": [ { "$options": "i" } ] } },
+            doc! { "t": { "$nin": [ { "$options": "i" } ] } },
+            doc! { "t": { "$in": [ 1, { "$gt": 1 } ] } },
+        ] {
+            let message = refused(q.clone());
+            assert!(message.contains("cannot nest $ under"), "{message}");
+        }
+        for q in [
+            doc! { "s": { "$eq": { "$regex": "x", "other": 1 } } },
+            doc! { "t": { "$eq": { "$options": "i" } } },
             doc! { "u": { "$in": [ { "a": 1 }, "abc" ] } },
             doc! { "u": { "$all": [ { "a": 1 } ] } },
         ] {
@@ -3334,8 +3714,6 @@ mod tests {
         assert!(pulls(doc! { "$gt": 1, "$lt": 5 }, 3));
         assert!(!pulls(doc! { "$gt": 1, "$lt": 5 }, 5));
         assert!(pulls(doc! { "$in": [1, 2] }, 2));
-        assert!(pulls(doc! { "$not": { "$gt": 5 } }, 5));
-        assert!(!pulls(doc! { "$not": { "$gt": 5 } }, 6));
         assert!(pulls(doc! { "$regex": "^a" }, "abc"));
         assert!(!pulls(doc! { "$regex": "^a" }, 5));
         assert!(pulls(doc! { "$bitsAllSet": 4 }, 6));
@@ -3345,23 +3723,40 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_elem_match_reads_the_element_as_the_thing_to_match() {
+    fn a_pull_elem_match_searches_an_array_element_and_no_other() {
+        // q7s2q.out q0221 (line 1479), q0175 (1233), q0266 (1749), q0265 (1743), q7s2j.out
+        // j1292-j1297: a document or a scalar element is not searched, an array element is.
         let c = || doc! { "$elemMatch": { "score": 8 } };
-        assert!(pulls(c(), doc! { "score": 8, "item": "B" }));
-        assert!(!pulls(c(), doc! { "score": 7, "item": "B" }));
+        assert!(!pulls(c(), doc! { "score": 8, "item": "B" }));
         assert!(!pulls(c(), 8));
-        // Over scalars it is the scalar form of an `$elemMatch`.
-        assert!(pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 7));
-        assert!(!pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 8));
-        // Under `$not`.
-        assert!(pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, 8));
-        assert!(!pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, doc! { "score": 8 }));
+        let body = || doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } };
+        assert!(!pulls(body(), 7));
+        assert!(pulls(body(), bson::bson!([1, 7])));
+        assert!(!pulls(body(), bson::bson!([1, 8])));
+        assert!(!pulls(doc! { "$elemMatch": { "a": 1 } }, bson::bson!([1, 2])));
+        // q7s3i.jsonl cases 127, 130 and 143: an array element is pulled when a member
+        // satisfies the body, and 141, 133, 131: not when none does or the body names fields.
+        assert!(pulls(doc! { "$elemMatch": { "$gt": 1 } }, bson::bson!([1, 2])));
+        assert!(pulls(doc! { "$elemMatch": { "$exists": true } }, bson::bson!([6])));
+        assert!(!pulls(doc! { "$elemMatch": { "$gt": 1, "$lt": 3 } }, bson::bson!([6])));
+        assert!(!pulls(
+            doc! { "$elemMatch": { "$or": [{ "b": 1 }, { "b": 3 }] } },
+            bson::bson!([1, 2])
+        ));
+        assert!(!pulls(doc! { "$elemMatch": { "b": Bson::Null } }, bson::bson!([1, 2])));
+        // Cases 132 and 145: an empty body asks for a document member, and a scalar is none.
+        assert!(!pulls(doc! { "$elemMatch": {} }, bson::bson!([1, 2])));
+        assert!(!pulls(doc! { "$elemMatch": {} }, bson::bson!([6])));
     }
 
     #[test]
     fn a_pull_condition_is_refused_at_parse_time() {
         let err = |d: Document| parse_condition_document(&d).unwrap_err();
         assert!(matches!(err(doc! { "$nope": 1 }), Error::UnsupportedOperator { .. }));
+        // q7s2q.out q0177 (line 1215): code 2, `unknown top level operator: $not`.
+        assert!(
+            matches!(err(doc! { "$not": { "$gt": 1 } }), Error::InvalidQuery(m) if m.contains("unknown top level operator: $not"))
+        );
         assert!(matches!(err(doc! { "$in": 1 }), Error::InvalidQuery(_)));
         assert!(matches!(err(doc! { "$bitsAllSet": -1 }), Error::InvalidQuery(_)));
         assert!(matches!(err(doc! { "$regex": "(" }), Error::InvalidQuery(_)));

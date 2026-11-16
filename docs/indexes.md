@@ -193,6 +193,23 @@ the index exactly as it was.
 **A missing field indexes as `null`.** That is what keeps `{a: null}` —
 which matches missing fields — answerable from the index.
 
+**So does an element that lacks the field, on a path through an array.** An index on
+`a.c` keys `{a: [{c: 5}, {d: 1}]}` under `5` **and** `null`, and keys a scalar element
+(`a: [5]`), a nested array element (`a: [[{c: 1}]]`), an empty array (`a: []`) and a
+missing `a` all under `null` alone, where the filter reads the same documents as
+null or as holding nothing ([Query language](query-language.md#1-null-matches-missing-fields)).
+A leaf `[]` is its **own key**, not `null` (`{a: [{c: []}]}` is keyed under `[]`),
+so it collides with another `[]` and with nothing else. A position inside the array
+keys that element only, with no `null` for an element that lacks the field named by
+the digits (an index on `a.0` keys `{a: [{b: 1}]}` under the document `{b: 1}`, and a
+missing `a` under `null`); a position past the end of the array keys the field of
+that name in each document element, and `null` for an element lacking it, and never
+refuses. A position is `0` or a digit 1-9 and digits; `a.00` and `a.01` are field
+names. An index on a path whose segment is a position is **not used by the planner for
+a predicate a `null` satisfies** (`{"a.0": null}`, `$in` with a `null`, `$gte` and
+`$lte` of `null`), because the filter reads a `null` there that the index does not
+key: it scans, and the answer is the filter's.
+
 **An array indexes its elements *and* itself.** Mongo indexes only the elements;
 that would leave `{tags: ["a","b"]}` (whole-array equality) with no entry, so an
 index-backed query would return an *incomplete* result. Storing both costs a
@@ -204,12 +221,17 @@ encode identically, so a lookup for `5` finds a document that stored `5.0`. See
 
 ### Documents an index cannot key
 
-Two shapes give an index no finite, exact set of keys for a document:
+Three shapes give an index no finite, exact set of keys for a document:
 
 - **arrays at two of a compound index's paths** — the keys would be the
   cartesian product, `|a| × |b|` entries for one document;
 - **more than 1,000 keys for one document** — the backstop behind that rule,
-  and the ceiling for a single-field index over one very large array.
+  and the ceiling for a single-field index over one very large array;
+- **a position beside a field of that name** (`ambiguous_position`) — an index path
+  with a position (`a.0`) over an array that is that long or longer, one of whose
+  direct elements is a document holding a field of that name (`{a: [{"0": 9}]}`): the
+  reference's 16746, "Ambiguous field name found in array". The document has no
+  single key, because the same path would name two things.
 
 Through 0.50.x there was a third, **a `Decimal128` at an indexed path**, which
 had no exact key encoding. Since 0.51.0 a `Decimal128` is keyed by its exact
@@ -277,7 +299,7 @@ database, collection, index and document id, and counted in
 `kimmy_index_unkeyed_total`, which counts every filing a member makes without being asked: a replicated write, the backfill of a replicated, restored or repaired definition, and a rewind that puts a document back. It is announced on the collection's change stream
 as an [`unkeyedDocument` event](change-streams.md) on each member that files it,
 and `GET /v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed` lists the documents an
-index holds unkeyed, with `reason` `parallel_arrays` or `too_many_keys` (the OpenAPI enum also lists `unencodable`, a reason kept for a key the encoder refuses; no current build files a document under it), paged
+index holds unkeyed, with `reason` `parallel_arrays`, `too_many_keys` or `ambiguous_position` (the OpenAPI enum also lists `unencodable`, a reason kept for a key the encoder refuses; no current build files a document under it), paged
 like the violations reports (`limit`, `cursor`; `404` for an index the
 collection does not have). The event is sent on the move **into** the unkeyed run
 — a replicated write that arrives unkeyed, a replicated definition's backfill, an
@@ -606,6 +628,13 @@ ranked a `Decimal128` equal to every other number. Since 0.53.0 such an index is
 `{field: {$exists: true}}`, which is where MongoDB has been steering people for
 years, so there is one mechanism rather than two overlapping ones.
 
+**A limit against the reference, stated.** The reference's sparse unique index accepts
+two documents whose arrays hold an element lacking the field (`[{c: 1}, {d: 1}]` and
+`[{c: 2}, {d: 2}]`), because a sparse index skips the missing element's `null`. Here a
+sparse unique index is the partial `{$exists: true}`, which keeps the `null` key of the
+other element of a document that has a value, so it refuses the second one. See
+[Deviations](deviations.md).
+
 ### The filter language is deliberately small
 
 | Allowed | |
@@ -901,7 +930,13 @@ collection it holds.
 { "fields": [{ "path": "email" }], "unique": true }
 ```
 
-A duplicate write is rejected with **409 `unique_violation`**. A document's own
+A duplicate write is rejected with **409 `unique_violation`**. **On a path through an
+array, an element lacking the field, a scalar element, an empty parent array and a
+missing parent all key `null` and collide with each other**, and a document whose
+array holds one such element beside a value collides with a document with no value at
+all (`[{c: 5}, {d: 1}]` and `{}`). A leaf `[]` is its own key and collides only with
+another `[]`. A unique index on a path with a position is refused a document with a
+position beside a field of that name, as above. A document's own
 existing entry never counts against it, so updating in place works. Creating a
 unique index over data that *already* violates it is refused — building it
 anyway would advertise a constraint that does not hold. For the same reason a

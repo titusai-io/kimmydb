@@ -1,0 +1,9 @@
+q7s3g0328	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3g0329	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3g0330	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3i0164	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3i0168	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3i0172	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3i0186	A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+q7s3i0173	The `$` positional operator, in updates and in a find projection, is built (ADR-256)
+q7s3i0175	The `$` positional operator, in updates and in a find projection, is built (ADR-256)

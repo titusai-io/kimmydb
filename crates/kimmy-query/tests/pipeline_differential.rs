@@ -489,7 +489,8 @@ proptest! {
 /// are written and applied until none applies, which shares nothing with the rewrite at the
 /// parse but the rules themselves (ADR-270): a window moves ahead of a stage that neither
 /// filters nor changes the count; two `$skip`s are one, two `$limit`s are one, and a `$limit`
-/// then a `$skip` is a `$skip` then a `$limit`; a `$skip` of nothing is not a stage.
+/// then a `$skip` is a `$skip` then a `$limit`; a `$skip` of nothing is not a stage. Before
+/// those, a `$match` that follows a `$sort` is applied before it (q7s4l 32).
 fn model_reorder(mut specs: Vec<Document>) -> Vec<(String, i64)> {
     fn name(spec: &Document) -> &str {
         spec.keys().next().map(String::as_str).unwrap()
@@ -518,6 +519,18 @@ fn model_reorder(mut specs: Vec<Document>) -> Vec<(String, i64)> {
             && before.iter().any(|spec| name(spec) != "$match"))
     }
     let window = |n: &str, v: i64| doc! { n: v };
+    // A `$match` that follows a `$sort` is applied before it, whatever it holds (q7s4l 32), and
+    // each moves past every `$sort` it follows. The parse does this before it moves a window, so
+    // the model does too.
+    let mut at = 1;
+    while at < specs.len() {
+        if name(&specs[at]) == "$match" && name(&specs[at - 1]) == "$sort" {
+            specs.swap(at - 1, at);
+            at = (at - 1).max(1);
+        } else {
+            at += 1;
+        }
+    }
     'again: loop {
         for at in 0..specs.len() {
             if name(&specs[at]) == "$skip" && count(&specs[at]) == 0 {
@@ -650,7 +663,7 @@ proptest! {
 
 /// Keys that tie a lot, over documents that share most of their values.
 fn tie_keys() -> impl Strategy<Value = Vec<SortKey>> {
-    let key = |path: &str, descending: bool| SortKey { path: path.to_string(), descending };
+    let key = |path: &str, descending: bool| SortKey::new(path, descending);
     prop_oneof![
         Just(vec![key("a", false)]),
         Just(vec![key("a", true)]),
