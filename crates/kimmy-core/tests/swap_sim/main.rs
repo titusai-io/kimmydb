@@ -183,6 +183,7 @@ mod tests {
     /// condition (a held entry released without its predecessors). And R4's grant gate: `m-snap-register-late` is equivalent to the
     /// base under rule B (the review), so its kill is REQUIRED in combination with rule B off.
     #[test]
+    #[ignore = "gate size: 583 s on the 4-core CI runner against a 600 s per-test limit; the harness gate runs it with `cargo test -p kimmy-core --test swap_sim -- --ignored`"]
     fn the_product_route_mutants_and_the_grant_gate_with_rule_b_off_are_killed() {
         let seeds = env_u64("Q6_MUTROUTE_RUNS", 250);
         let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
@@ -1878,6 +1879,7 @@ mod tests {
     /// only on a route; `seed_1434_shape...` kills it), `m-dead-page-dropped` (0 in 28,800 in-order runs in
     /// the model; `seed_885_shape...` kills it), `m-loss-outside-prefix` (the model: fails nothing).
     #[test]
+    #[ignore = "gate size: over 600 s on the 4-core CI runner against a 600 s per-test limit; the harness gate runs it with `cargo test -p kimmy-core --test swap_sim -- --ignored`"]
     fn the_mutants_on_the_snapshot_grid() {
         let seeds = env_u64("Q6_MUTANT_RUNS", 40);
         let cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
