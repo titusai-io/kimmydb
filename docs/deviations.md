@@ -1103,7 +1103,9 @@ operator; the entry below records how the conversion differs from MongoDB's.
 - **`decimal` converts a double by its exact binary value, rounded once to 34
   digits (ADR-252); MongoDB rounds it to 15 significant digits.** `{$toDecimal:
   0.1}` is `0.1000000000000000055511151231257827` here and `Decimal128("0.100000000000000")`
-  there, and `{$toDecimal: 2.5}` is `2.5` here and `2.50000000000000` there. The
+  there (`q7s5h.out` 0004), `{$toDecimal: 5.0}` is `5` here and `5.00000000000000`
+  there (0005), and `{$toDecimal: 1234567890123465.0}` is `1234567890123465` here and
+  `1.23456789012346E+15` there (0006). The
   15-digit rule reverses orders the comparator gives (`0.3` against
   `0.29999999999999999`), merges distinct doubles (`0.1 + 0.2` with `0.3`) and
   pads. This conversion is IEEE 754 `convertFormat`, never reverses an order,
@@ -1146,14 +1148,23 @@ and [query-language.md](query-language.md#decimal128-arithmetic-in-updates).
 It differs from MongoDB's in four places (verified against its source and manual
 on 2026-10-16, except the n-ary `$add`, which is by reading):
 
-- **A double converts exactly, not at 15 digits.** MongoDB converts a double to a
-  decimal at 15 significant digits, with trailing zeros kept, in `$add`,
-  `$subtract`, `$multiply` and `$divide` (`Value::coerceToDecimal`, the
-  `kRoundTo15Digits` default), in `$toDecimal`, and in `$inc` and `$mul`
-  (`SafeNum::getDecimal`). Here it is the double's exact binary value rounded
-  once to 34 digits, half to even, everywhere. `0.1 + Decimal128("0.2")` is
-  `0.3000000000000000055511151231257827` here and `0.300000000000000` there.
-  Only MongoDB's own `$sum` converts the double part at 34 digits.
+- **A double converts exactly, where the reference rounds it at 15 digits in six places.**
+  The reference converts a double that meets a `Decimal128` to a decimal rounded to 15 significant
+  digits, half to even, in the update operators `$inc` and `$mul`, in `$subtract`, `$multiply` and
+  `$divide`, and in `$toDecimal`: `{$subtract: [0.1, Decimal128("0")]}`, `{$multiply: [0.1,
+  Decimal128("1")]}`, `{$divide: [0.1, Decimal128("1")]}` and `{$toDecimal: 0.1}` are
+  `0.100000000000000` there (`q7s5h.out` 0001-0004), `{$toDecimal: 5.0}` is `5.00000000000000`
+  (0005), and `$inc` of `Decimal128("0")` over a stored `5.0` or `0.1` stores `5.00000000000000` or
+  `0.100000000000000` (`q7s5e.out` 0001-0006, `q7s5f.out` 0001-0005, 0007 and 0009). The update
+  operators fold a positive exponent into the coefficient (exponent 0) and make a negative zero
+  positive: a stored `1234567890123465.0`, a tie at the 15th digit, becomes `1234567890123460`
+  (`q7s5g.out` 0001 and 0003), where `{$toDecimal: 1234567890123465.0}` keeps the exponent,
+  `1.23456789012346E+15` (`q7s5h.out` 0006). Here a double converts by its exact binary value
+  rounded once to 34 digits, half to even (ADR-252, Chris's ruling, which rejects the 15-digit
+  convention: it can reverse an ordering and merges distinct doubles), so the same operations give
+  `0.1000000000000000055511151231257827`, `5`, and `1234567890123465`. In `$add` and `$sum` the
+  reference keeps the exact value as well, so there is no difference there (`q7s5e.out` 0007-0011:
+  `$add` of a double and a decimal, also inside a pipeline update, and `$sum`).
 - **`$sum` and `$avg` are exact and independent of order.** MongoDB's `$sum`
   rounds decimals at each document (`decimalTotal.add`), so the total depends on
   document order: over `1E+34`, `0.5`, `0.5`, `-1E+34` one order gives `0E+1`
@@ -1183,9 +1194,10 @@ and 18 `$mul` cases such as k0493 (line 2957); here each is the `400`.
 reference's.** The same number is stored as another member of its cohort: `$mul` of
 `Decimal128("1E+3")`, `100E-2`, `1.50E+1`, `0E+3`, `-0E-2` or `1.000` over a stored
 `Decimal128("0")` is `0E+3`, `0.00`, `0.0`, `0E+3`, `-0.00` or `0.000` here and `0` there
-(`q7s4h.jsonl` 121-126); `$inc` of `-0E-2` over a stored `Decimal128("0")` is `0.00` here and `0`
-there (29); and an upsert that seeds a `Decimal128("2")` and applies `$inc` of `-0E-2` or `$mul`
-of `100E-2` stores `2.00` here and `2` there (206, 221). A representation difference, not a value
+(`q7s4h.jsonl` 121-126); and an upsert that seeds a `Decimal128("2")` and applies `$mul` of
+`100E-2` stores `2.00` here and `2` there (221). An `$inc` of a decimal zero that leaves the stored
+decimal equal leaves it as it is, as the reference does (29 and 206 matched since `q7s5c.out`
+E1-E5). A representation difference, not a value
 difference: the values are equal and compare equal. The rows are pinned both ways in
 `decimal_arith_tests.rs` (ours and the recorded text), so a change on either side fails the test.
 `$inc` over an absent field stores the operand as given, as the reference does (1-6, 193-208).
