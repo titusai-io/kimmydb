@@ -18,7 +18,7 @@
 //!   and entries as they were (version 1, no meta); the one `if` is at each call site.
 
 use bson::Document;
-use kimmy_core::effects::{Effects, Outcome, UpsertEffects};
+use kimmy_core::effects::{CellTag, CreationCell, Effects, Outcome, UpsertEffects};
 use kimmy_core::merge_state::bridge::{bson_to_value, document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
     JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, UpdateRefused, Writer,
@@ -207,21 +207,25 @@ pub(crate) fn upsert(
     doc: &Document,
     mint: &mut dyn FnMut() -> Stamp,
 ) -> Result<Option<Image>> {
-    let mut fx = fx.clone();
+    let order = post_image_order(doc);
+    // The effects never name `_id` (it is the upsert's key, the engine's); the document's own
+    // `_id` is the first cell of the creation, as it is the first field of an insert.
+    let mut cells = fx.creation_list(&order).map_err(update_refused)?;
     if let Some(id) = doc.get("_id") {
         let value = bson_to_value(id).map_err(|e| refused("the _id", e))?;
-        fx.set.insert(0, (Path::flat("_id").map_err(|e| refused("the _id", e))?, value));
+        let path = Path::flat("_id").map_err(|e| refused("the _id", e))?;
+        cells.insert(0, CreationCell { path, value, tag: CellTag::Plain });
     }
-    let order = post_image_order(doc);
     let mut refusal = None;
-    let image = write(writer, prior, mint, |w, stamp| match fx.apply_stamped(w, &order, stamp) {
-        Ok(written) => Ok(Some(written.created)),
-        Err(UpdateError::Refused(r)) => {
-            refusal = Some(r);
-            Ok(None)
-        }
-        Err(UpdateError::Stamp(e)) => Err(e),
-    })?;
+    let image =
+        write(writer, prior, mint, |w, stamp| match w.upsert_create_stamped(&cells, stamp) {
+            Ok((created, _)) => Ok(Some(created)),
+            Err(UpdateError::Refused(r)) => {
+                refusal = Some(r);
+                Ok(None)
+            }
+            Err(UpdateError::Stamp(e)) => Err(e),
+        })?;
     match refusal {
         Some(r) => Err(update_refused(r)),
         None => Ok(image),
