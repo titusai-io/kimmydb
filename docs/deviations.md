@@ -21,7 +21,7 @@ Status meanings:
 
 ## 🟡 Under the `field` merge policy four kinds of update are refused with a 400 where the reference applies them (Q7 step 2)
 
-**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: (1) a 65th contributing writer to a counter; (2) a double increment of an integer or decimal counter, which the reference accepts (an `Int32` or `Int64` field becomes a `Double`, `5` + `1.5` gives `6.5`, recorded in `q7s2-probes/reference-6.0.5/q7s2.out` lines 230-247; a `Decimal128` field stays a `Decimal128`, at 15 digits, line 252); (3) an increment whose `Decimal128` total cannot be represented exactly: the reference ROUNDS the total to 34 digits (34 nines + 0.5 gives `1.000000000000000000000000000000000E+34`, lines 331-335, where the true sum is 10^34 - 0.5) or STORES `Infinity` on overflow (lines 341-345), where ours is refused with `IncOutOfRange`, because a counter must stay exact to merge (Chris's ruling, item 9: a deviation); the rule is that **a sum that would round is refused, for the visible value and for the writer's own running total** (a sum whose exact value is a `Decimal128` at some exponent is accepted: 34 nines + 1 is exactly 10^34, lines 326-330 and 336-340, and is stored as `1.000000000000000000000000000000000E+34`, as there) (see `counter-gain-after-absorb-q7`); this is the design's D5, "exact or 400", and the first implementation refused only the overflow; and (4) a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has neither the 65-contributor nor the 256-writer limit. Not listed: an `$inc` past the Int64 range is refused by the reference too (line 277), so it is not a deviation. The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
+**Raised with the Q7 step 2 effects interface; to be built by S2a.** The writer refuses the whole update, changing nothing, for: (1) a 65th contributing writer to a counter; (2) a double increment of an integer or decimal counter that is MATCHED (an upsert that creates the document from a filter naming the field makes a Double register instead, with no deviation), which the reference accepts (an `Int32` or `Int64` field becomes a `Double`, `5` + `1.5` gives `6.5`, recorded in `q7s2-probes/reference-6.0.5/q7s2.out` lines 230-247; a `Decimal128` field stays a `Decimal128`, at 15 digits, line 252); (3) an increment of a MATCHED counter whose `Decimal128` total cannot be represented exactly: the reference ROUNDS the total to 34 digits (34 nines + 0.5 gives `1.000000000000000000000000000000000E+34`, lines 331-335, where the true sum is 10^34 - 0.5) or STORES `Infinity` on overflow (lines 341-345), where ours is refused with `IncOutOfRange`, because a counter must stay exact to merge (Chris's ruling, item 9: a deviation); the rule is that **a sum that would round is refused, for the visible value and for the writer's own running total** (a sum whose exact value is a `Decimal128` at some exponent is accepted: 34 nines + 1 is exactly 10^34, lines 326-330 and 336-340, and is stored as `1.000000000000000000000000000000000E+34`, as there) (see `counter-gain-after-absorb-q7`); this is the design's D5, "exact or 400", and the first implementation refused only the overflow; and (4) a document that already has 256 writers when a 257th writes (`WriterCap`). The reference has neither the 65-contributor nor the 256-writer limit. Not listed: an `$inc` past the Int64 range is refused by the reference too (line 277), so it is not a deviation. The no-match case (`NoLife`) is not a 400: it is "matched 0" and takes the upsert path.
 
 **To close:** none planned; the limits are the design's (D5, Q11).
 
@@ -51,18 +51,6 @@ Status meanings:
 
 **To close:** keep the exact decimal gain with the slot (a second `Decimal128` per slot and pair), a change of the compact form; not planned.
 
-<a id="upsert-filter-field-incremented-q7"></a>
-
-## 🟡 Under the `field` merge policy an upsert that creates a document and increments a field its own filter names is refused with a 400
-
-**Raised with the Q7 step 2 effects interface; recorded in `q7s2-probes/reference-6.0.5/q7s2.out` and `q7s2b.out`.** `update` with `upsert: true` that matches nothing. The deviations are EXACTLY: the `$inc` on the EQUAL path of a filter field, filter `{a: 5}` with `{$inc: {a: 1}}` (the reference creates `{a: 6}`, `q7s2.out` line 435) and filter `{"a.b": 1}` with `{$inc: {"a.b": 1}}` (the reference creates `{a: {b: 2}}`, `q7s2b.out` line 204); and an `$inc` BELOW a Document filter value, filter `{a: {b: 1}}` with `{$inc: {"a.c": 1}}` (the reference creates `{a: {b: 1, c: 1}}`, `q7s2.out` line 440). The reference accepts all three; here the creation path refuses them (`Overlap`): the filter's field is written by the creation, as a register or as one Document cell, and a counter slot at or below a creation register belongs to no generation of it (the design's overlap refusal). The spelling matters: filter `{"a.b": 1}` with `$inc a.c` is accepted here (a leaf cell beside the increment) and gives the same document as the reference (`q7s2.out` line 445). An `$inc` ABOVE a filter cell is NOT a deviation, the reference refuses it too (code 14, "non-numeric type object": filter `{"a.b": 1}` with `$inc a`, `q7s2b.out` line 163; filter `{"a.b.c": 1}` with `$inc a.b`, line 208; filter `{a: {b: 1}}` with `$inc a`, `q7s2.out` line 454), and neither is an `$inc` below a scalar filter value (`q7s2.out` line 449). A `$setOnInsert` or `$set` Document with an `$inc` below it is refused by the reference at parse time (code 40, `q7s2b.out` lines 5 to 45), so it is not part of this entry. An upsert that MATCHES a document is an ordinary update and is not refused (`updateOne({v: 3}, {$inc: {v: 1}}, {upsert: true})` increments). Giving a creation register a slot of its own write is a merge-model change, not in scope.
-
-**Workaround:** increment a field the filter does not name, or `$set` the computed value.
-
-**To close:** let the creation write a counter base and a slot together for a filter field (merge model, Q7 design).
-
----
-
 <a id="rename-of-a-counter-q7"></a>
 
 ## 🟡 Under the `field` merge policy `$rename` of a number that has been incremented, or of a sub-document holding one, is refused with a 400
@@ -88,6 +76,30 @@ Status meanings:
 **Workaround:** store the value as a string or a number, or keep the collection under the `document` policy.
 
 **To close:** give the merge state a variant for each of the six (a codec change, so a format decision).
+
+---
+
+<a id="pipeline-reorder-only-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that only reorders the fields of a document is not written, and a new field goes after the fields the document had
+
+**Raised with the Q7 step 2 pipeline-update effects.** A pipeline update (ADR-265) is diffed against the stored document, field by field: a changed or new top-level field is one write, a removed one an unset, and the order of the fields that stay is the writer's (the order they were first written in), not the order the pipeline's result lists them in. So over `{_id: 1, a: 1, b: 2}`, `[{$replaceWith: {_id: "$_id", b: "$b", a: "$a"}}]` changes nothing (`modified: false`), where the reference answers `modified: true` and stores `{_id, b, a}`; and `[{$replaceWith: {n: 9, b: "$b", _id: "$_id"}}]` stores `{_id, b, n}` (the kept field `b` first, then the new `n`), where the reference stores `{_id, n, b}`. A `document` collection stores the pipeline's result as it is. A reorder INSIDE a sub-document is a write (the writer counts an order-only change of a sub-document as a change), under both policies.
+
+**Workaround:** `replaceOne` with the document in the wanted order sets the order.
+
+**To close:** none planned; a pipeline update is a diff, not a replace (the 2026-11-04 ruling).
+
+---
+
+<a id="pipeline-id-type-q7"></a>
+
+## 🟡 Under the `field` merge policy a pipeline update that restates `_id` as another numeric type of the same id keeps the stored `_id`
+
+**Raised with the Q7 step 2 pipeline-update effects.** ADR-265 stores a pipeline result whose `_id` is the same id of another type (`Int32 1` and `Int64 1` are one id) as the result gives it. On a `field` collection `_id` is never an effect: the document's identity is the one it was created with, so `[{$set: {_id: NumberLong(1)}}]` over `{_id: 1}` leaves `_id: 1` (an `Int32`) and answers `modified: false`, where a `document` collection stores the `Int64` and answers `modified: true`. A result with another document's id is refused under both policies.
+
+**Workaround:** none needed; the id is the same id.
+
+**To close:** none planned.
 
 ---
 

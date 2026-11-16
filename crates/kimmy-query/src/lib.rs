@@ -30,6 +30,7 @@ pub mod seed;
 pub mod shape;
 pub mod stages;
 pub mod update;
+pub mod update_effects;
 pub mod update_pipeline;
 pub mod window;
 pub mod window_acc;
@@ -77,7 +78,19 @@ mod stage_tests;
 mod trig_tests;
 
 #[cfg(test)]
+mod update_effects_id_tests;
+#[cfg(test)]
+mod update_effects_prop_tests;
+#[cfg(test)]
+mod update_effects_rename_tests;
+#[cfg(test)]
+mod update_effects_tests;
+#[cfg(test)]
+mod update_pipeline_effects_tests;
+#[cfg(test)]
 mod update_pipeline_tests;
+#[cfg(test)]
+mod update_upsert_effects_tests;
 #[cfg(test)]
 mod window_deadline_tests;
 #[cfg(test)]
