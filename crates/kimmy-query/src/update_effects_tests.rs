@@ -1124,3 +1124,60 @@ fn a_noop_through_an_array_has_no_effects() {
         assert_eq!(outcome, Outcome::Unchanged);
     }
 }
+
+/// The reference creates an absent field from an `$inc` as the operand EXACTLY, sign and exponent
+/// kept (q7s5a.out I1-I7, with q7s2k.out k0010): the writer must render the engine's post-image
+/// byte for byte, and the effect is the increment of the operand as written.
+fn absent_inc_stores_the_operand(label: &str, operand: Bson) {
+    let d = doc! { "_id": 1 };
+    let (effects, outcome) = parity_doc(doc! {"$inc": {"x": operand.clone()}}, &d);
+    same_effects(
+        &effects,
+        &fx(|e| {
+            e.inc(p("x"), v(operand.clone()));
+        }),
+        label,
+    );
+    assert!(outcome.modified(), "{label}: {outcome:?}");
+}
+
+fn decimal(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
+}
+
+/// I1, q7s5a0004: `$inc x Double -0.0` over `{_id: 1}` stores `-0.0`.
+#[test]
+fn an_inc_of_a_negative_double_zero_on_an_absent_field_stores_it_as_it_is() {
+    absent_inc_stores_the_operand("q7s5a0004", Bson::Double(-0.0));
+}
+
+/// I2, q7s5a0005: Decimal128 `-0`.
+#[test]
+fn an_inc_of_a_negative_decimal_zero_on_an_absent_field_keeps_its_sign() {
+    absent_inc_stores_the_operand("q7s5a0005", decimal("-0"));
+}
+
+/// I3, q7s5a0006: Decimal128 `0E+3`.
+#[test]
+fn an_inc_of_a_decimal_zero_with_a_positive_exponent_on_an_absent_field_keeps_the_exponent() {
+    absent_inc_stores_the_operand("q7s5a0006", decimal("0E+3"));
+}
+
+/// I4, q7s5a0007: Decimal128 `-0E-2` (the shell prints `-0.00`).
+#[test]
+fn an_inc_of_a_negative_decimal_zero_with_a_negative_exponent_on_an_absent_field_keeps_both() {
+    absent_inc_stores_the_operand("q7s5a0007", decimal("-0E-2"));
+}
+
+/// I5, q7s5a0008: Decimal128 `1.50`.
+#[test]
+fn an_inc_of_a_decimal_with_a_trailing_zero_on_an_absent_field_keeps_it() {
+    absent_inc_stores_the_operand("q7s5a0008", decimal("1.50"));
+}
+
+/// I6 and I7, q7s5a0009 and q7s5a0010: an Int32 zero and an Int64 zero keep their types.
+#[test]
+fn an_inc_of_a_zero_integer_on_an_absent_field_keeps_its_type() {
+    absent_inc_stores_the_operand("q7s5a0009", Bson::Int32(0));
+    absent_inc_stores_the_operand("q7s5a0010", Bson::Int64(0));
+}
