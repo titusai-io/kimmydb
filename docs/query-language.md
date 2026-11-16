@@ -544,6 +544,20 @@ Use `$exists` when you need the distinction:
 `$ne` inherits this: `{ "a": { "$ne": 1 } }` matches documents with no `a` at
 all.
 
+Through an array of documents, **an element that lacks the field reads as `null`**:
+`{"a.c": null}` matches `{a: [{c: 5}, {d: 1}]}`, because the second element has no
+`c`. A parent that is missing, a scalar, or itself `null` lacks the field the same
+way. What contributes nothing, and so is neither a value nor a `null`, is an empty
+array and an array element that is not a document (a number, a string, a `null`, a
+nested array): `{a: []}` and `{a: [1, 2]}` do not match `{"a.c": null}`, and `{a:
+[{c: []}]}` does not either (its `c` is an empty array, not a missing one).
+`$exists: true` asks whether any value was reached, so it is the complement of
+`$exists: false` and of none of the null forms. `$gte: null` and `$lte: null` read
+a lacking field as `null` as an equality does; `$gt: null` and `$lt: null` match
+nothing. See [Sort and projection](#sort-and-projection) and
+[Indexes](indexes.md#what-gets-indexed) for what a sort and an index make of the same
+path.
+
 ### 2. Paths traverse into arrays
 
 ```javascript
@@ -573,14 +587,35 @@ Which leads directly to the `$elemMatch` distinction:
 // ✗ [1, 20]     — they straddle it, but neither is inside
 ```
 
-A numeric segment is read both ways: `{"items.0.sku": "a"}` matches when the
-first element's `sku` is `"a"` *or* when any element has a field named `0`
-whose `sku` is. A [sort](#sort-and-projection) key reads it the same two
-ways, and an [update](#update-operators) path writes by position. That is not
-every path's rule: a [projection](#sort-and-projection) path and an
-aggregation expression read a numeric segment as a field name only, never a
-position — `{"items.0": 1}` and `$items.0.sku` both name a field called `0`
-in each element; see [aggregation.md](aggregation.md#arrays).
+**A position is `0`, or a digit from 1 to 9 followed by digits, in every read.** `00`,
+`01`, `+0` and `-1` are field names, not positions (`{"a.01": 5}` reads the field
+named `01`); a run of digits too long for a number is a position past every end,
+never an error. An [update](#update-operators) path writes by position and reads
+`00` and `01` as positions, so the two rules differ there by design. Then:
+
+- **A filter reads a position both ways**: `{"items.0.sku": "a"}` matches when the
+  first element's `sku` is `"a"` *or* when any element has a field named `0` whose
+  `sku` is, whether the position is inside the array or past its end. A leaf array
+  reached by a position is compared **whole** (`{"a.0": 1}` does not match
+  `{a: [[1, 2]]}`), where one reached by a name is searched by its elements.
+- **A [sort](#sort-and-projection) key reads a position inside the array as that
+  element only**, and past the end as the field of that name in each element. A
+  position inside an array beside a document element that holds a field of that name
+  is refused: see [Sort and projection](#sort-and-projection).
+- **An index key** reads a position as a sort key does ([Indexes](indexes.md#what-gets-indexed)).
+- **Every other reader of a field path now reads a position by the same rule**, a behaviour
+  change that no recording covers (UNRECORDED for each): the `path` of `$unwind`, the
+  `localField` and `foreignField` of `$lookup` and the `connectToField` of `$graphLookup`, the `field` of `$densify`
+  and `$fill`, the `partitionBy`, `sortBy` and `output` fields of `$setWindowFields`, the array
+  of a positional projection (`items.$`), the vector index's source field, and the date field of
+  a TTL index when it re-checks a document before deleting it, so that its recheck reads what
+  its keys were taken from. `{"$unwind": "$a.01"}` reads a field named `01` where it read the
+  second element. **`$graphLookup`'s `connectFromField` is the exception: it keeps `00` and `01` as positions** (`a.00` over `[[1]]` links to 1: q7s4i 343; UNRECORDED beyond that case). An update path is not one of them: it reads and writes `00` and `01` as
+  positions.
+- A [projection](#sort-and-projection) path and an aggregation expression read a
+  numeric segment as a field name only, never a position — `{"items.0": 1}` and
+  `$items.0.sku` both name a field called `0` in each element; see
+  [aggregation.md](aggregation.md#arrays).
 
 ### 3. Comparisons do not cross type groups
 
@@ -1480,6 +1515,39 @@ identically. ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill)
 changed the descending rule from the smallest element.) It is not the rule `$lookup` follows for a join key, which reads the *first*
 element of a path that crosses an array rather than the least
 ([Aggregation](aggregation.md#lookup)).
+
+**What a sort key reaches, exactly.** The candidates are every value the path
+reaches; a `null` for a document that lacks the next field and for each element of an
+array on the path that is not a document (a number, a `null`, a nested array); and a
+`null` if there is nothing else. `{"a.c": 1}` over `a: [5, {c: 9}]` sorts by the
+`null` of the scalar element ascending, and by `9` descending. A leaf array is expanded one level, unless a position
+reached it, which keeps it whole (`{"a.0": 1}` over `a: [[1, 2]]` sorts by `[1, 2]`);
+an empty leaf array sorts as described above.
+
+**A position beside a field of that name is refused at sort time**, with `400` and
+the reference's wording: `Ambiguous field name found in array (do not use numeric
+field names in embedded elements in an array)`. It is raised when a sort key has a
+position that is inside the array (`{"a.0": 1}` over `a: [{"0": 9}]`, and over `a:
+[[5], {"0": 9}]`, where the element at the position is not even a document) and
+some direct element of that array is a document holding that field, in either
+direction and in any place of a compound key. It is judged on the documents the sort
+reads: a filter that removes them first, or a `$match` before a `$sort`, raises
+nothing, and a `limit` or `skip` does not hide a document the sort read. A position
+past the end of the array is a field name and never refuses (`{"a.1": 1}` over `a:
+[{"1": 5}]`), and neither does `{"a.00": 1}`, which is a field name. `find`,
+`find_and_modify`, `$sort`, the bounded sort and `$setWindowFields` and `$fill`
+`sortBy` refuse it; `$top`, `$bottom`, `$topN`, `$bucketAuto`, `$sortByCount`, an
+index build, a change stream and TTL do not.
+
+**`$sortArray` and `$push`'s `$sort` read an element by a path into it and never
+refuse.** A segment of digits is a position and nothing else, a name is not looked
+up through an array, and the value the path ends at is compared **whole** (an array
+as an array), where a sort key takes the least of an array's elements.
+
+**A positional projection of a document that has no value at the array's path
+returns the document without the field** (`{"items.$": 1}` with a filter that
+matched through another field); one that has the array and for which the filter
+recorded no element is still `400`.
 
 **A `Decimal128` at a sort path takes its place among the numbers**, by its
 exact value: `Decimal128("1.5")` sorts between `1` and `2`, and

@@ -3411,6 +3411,20 @@ pub fn join_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
     out
 }
 
+/// [`join_values`] for the links of a `$graphLookup`: a position is a run of digits, leading
+/// zeros included, as the reference reads `connectFromField` (`a.00` over `[[1]]` links to 1:
+/// q7s4i 343). UNRECORDED beyond that case: the other readings of a path are [`join_values`]'s.
+pub fn link_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
+    let mut out = Vec::new();
+    for value in path::resolve_with_written_positions(doc, field) {
+        out.push(value);
+        if let Bson::Array(items) = value {
+            out.extend(items.iter());
+        }
+    }
+    out
+}
+
 /// The distinct values a `$lookup` needs from its input: every value of
 /// [`join_values`] of every input document, once each.
 ///

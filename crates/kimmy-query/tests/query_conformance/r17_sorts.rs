@@ -284,7 +284,8 @@ fn the_keys_taken_once_order_as_the_documents_do() {
     for case in cases_sorts() {
         let keys = shape::parse_sort(&case.sort).unwrap();
         let docs = (case.docs)();
-        let keyed: Vec<Vec<Bson>> = docs.iter().map(|d| shape::sort_keys(&keys, d)).collect();
+        let keyed: Vec<Vec<Bson>> =
+            docs.iter().map(|d| shape::sort_keys(&keys, d).unwrap()).collect();
         for (i, a) in docs.iter().enumerate() {
             for (j, b) in docs.iter().enumerate() {
                 assert_eq!(

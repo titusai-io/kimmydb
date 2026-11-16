@@ -36,6 +36,14 @@ mod r2_end_keys;
 mod r4_null_bounds;
 mod r8_all;
 mod ranges_a;
+mod resolver;
+mod resolver_bound_cases;
+mod resolver_cases;
+mod resolver_element_cases;
+mod resolver_elements;
+mod resolver_order_cases;
+mod resolver_sort_cases;
+mod resolver_sorts;
 
 // ---------------------------------------------------------------------------
 // R15: `$options` with no `$regex`

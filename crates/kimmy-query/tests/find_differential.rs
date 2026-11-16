@@ -127,6 +127,26 @@ fn docs() -> Vec<Document> {
         out.push(doc! {"_id": 0, "k": {"a": v.clone()}});
         out.push(doc! {"_id": 0, "k": [{"a": v}]});
     }
+    // The shapes of the recorded fixtures AD, CL and PE (q7s3 resolver rule): elements that lack
+    // the field, scalar, null and nested-array elements, an empty array, and a position beside a
+    // field of that name.
+    for k in [
+        bson::bson!([{"b": null}, {"a": 1}]),
+        bson::bson!([{"a": 5}, {"b": 1}]),
+        bson::bson!([1, 2]),
+        bson::bson!([]),
+        bson::bson!([{"a": null}]),
+        bson::bson!([{"a": []}]),
+        bson::bson!([null, {"a": 9}]),
+        bson::bson!([[{"a": 1}]]),
+        bson::bson!([{"0": 9}]),
+        bson::bson!([{"b": 1}, {"0": 2}]),
+        bson::bson!([[5], {"0": 9}]),
+        bson::bson!([{"1": 5}, {"b": 1}]),
+        bson::bson!({"0": "x", "01": "z"}),
+    ] {
+        out.push(doc! {"_id": 0, "k": k});
+    }
     out
 }
 
@@ -134,7 +154,7 @@ fn docs() -> Vec<Document> {
 /// `k.a`, plus the operand-free and compound forms.
 fn filters() -> Vec<Document> {
     let mut out = Vec::new();
-    for path in ["k", "k.a"] {
+    for path in ["k", "k.a", "k.0", "k.1", "k.01"] {
         out.push(doc! {path: {"$exists": true}});
         out.push(doc! {path: {"$exists": false}});
         for v in values() {
@@ -185,7 +205,7 @@ fn write_the_table() {
 /// as its operand.
 fn partial_filters() -> Vec<Document> {
     let mut out = Vec::new();
-    for path in ["k", "k.a"] {
+    for path in ["k", "k.a", "k.0", "k.1", "k.01"] {
         out.push(doc! {path: {"$exists": true}});
         for v in values() {
             if kimmy_core::holds_decimal128(&v) {

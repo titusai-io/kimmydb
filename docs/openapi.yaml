@@ -2778,7 +2778,7 @@ paths:
                             Why the index cannot key the document. `unencodable`
                             is kept for a key the encoder refuses; no current
                             build files a document under it.
-                          enum: [parallel_arrays, too_many_keys, unencodable]
+                          enum: [parallel_arrays, too_many_keys, ambiguous_position, unencodable]
                   count: { type: integer }
                   nextCursor:
                     type: string
@@ -4838,7 +4838,7 @@ components:
                 Why the index cannot key the document. `unencodable` is kept
                 for a key the encoder refuses; no current build files a
                 document under it.
-              enum: [parallel_arrays, too_many_keys, unencodable]
+              enum: [parallel_arrays, too_many_keys, ambiguous_position, unencodable]
         - type: object
           title: invalidate
           description: |

@@ -2365,7 +2365,9 @@ fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> 
 /// input order, in either direction.
 ///
 /// The comparison is the `$sort` stage's own ([`shape::compare_keys`]) over the
-/// keys read once per element. A sort document reads an element that is not a
+/// keys read once per element by [`shape::element_sort_keys`], which are not a sort key's: a
+/// digit is a position, a name is not looked up through an array, the value is compared whole,
+/// and nothing is refused (q7s3j 187-205). A sort document reads an element that is not a
 /// document as an empty one, so every key is null and it ties with a document
 /// holding none of them. With `sortBy: 1` or `-1` whole elements are compared,
 /// documents included, by [`canonical_cmp`].
@@ -2385,7 +2387,7 @@ fn sort_array(items: Vec<Bson>, order: &ArrayOrder) -> Vec<Bson> {
                 .into_iter()
                 .map(|item| {
                     let doc = if let Bson::Document(d) = &item { d } else { &none };
-                    (shape::sort_keys(keys, doc), item)
+                    (shape::element_sort_keys(keys, doc), item)
                 })
                 .collect();
             keyed.sort_by(|a, b| shape::compare_keys(keys, &a.0, &b.0));

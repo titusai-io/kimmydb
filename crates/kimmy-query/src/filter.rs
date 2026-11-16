@@ -7,6 +7,7 @@
 
 use bson::{Bson, Document};
 use kimmy_core::matching::{self, any_element};
+use kimmy_core::path::Walk;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
@@ -1269,6 +1270,9 @@ fn condition_position(
             | Condition::ElemMatch(_)
             | Condition::Mod { .. }
             | Condition::Bits { .. }
+            // `$exists: true` records the first element where the rest of the path yields a
+            // value (q7s3i 181-184).
+            | Condition::Exists(true)
     ) {
         return Ok(None);
     }
@@ -1300,7 +1304,7 @@ fn condition_position(
 /// array is one value, and its members are not tried. [`item_holds`] is that
 /// per-element step, from the predicates [`condition_matches`] applies. With a
 /// path below the element, the values under it are the matcher's own
-/// ([`path::resolve`]) and the condition is evaluated over them whole.
+/// ([`path::read_document`]) and the condition is evaluated over them whole.
 ///
 /// An element that cannot be evaluated (an `$expr` in an `$elemMatch` body that fails on it) did
 /// not satisfy the condition, as `matches` defers it; any other error goes up.
@@ -1309,7 +1313,9 @@ fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> Result<b
         item_holds(condition, item)
     } else {
         match item {
-            Bson::Document(inner) => condition_matches(condition, &path::resolve(inner, rest), &[]),
+            Bson::Document(inner) => {
+                condition_matches(condition, &path::read_document(inner, rest), &[])
+            }
             _ => return Ok(false),
         }
     };
@@ -1342,10 +1348,13 @@ fn item_holds(condition: &Condition, item: &Bson) -> Result<bool> {
         Condition::Regex(re) => regex_holds(re, item),
         Condition::Mod { divisor, remainder } => mod_holds(*divisor, *remainder, item),
         Condition::Bits { test, mask } => bits_holds(*test, *mask, item),
+        // An element is a value: with nothing of the path below it, it is there.
+        Condition::Exists(true) => true,
         // `$elemMatch` reads the elements of the array it is given; the
         // element alone is wrapped so that it is the one it tests.
         Condition::ElemMatch(_) => {
-            condition_matches(condition, &[&Bson::Array(vec![item.clone()])], &[])?
+            let wrapped = Bson::Array(vec![item.clone()]);
+            condition_matches(condition, &Walk::single(&wrapped), &[])?
         }
         // Not about elements: `condition_position` does not ask.
         _ => false,
@@ -1447,7 +1456,7 @@ fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Resu
         Filter::Or(branches) => any_of(branches, |f| evaluate(f, doc, vars)),
         Filter::Nor(branches) => Ok(!any_of(branches, |f| evaluate(f, doc, vars))?),
         Filter::Field { path, conditions } => {
-            let values = path::resolve(doc, path);
+            let values = path::read_document(doc, path);
             all_of(conditions, |c| condition_matches(c, &values, vars))
         }
         Filter::Expr(e) => expr_matches(e, doc, vars),
@@ -1555,7 +1564,7 @@ fn bits_holds(test: BitTest, mask: u64, value: &Bson) -> bool {
 /// specially. Only `$elemMatch` can fail, through a `$expr` in its body.
 fn condition_matches(
     condition: &Condition,
-    values: &[&Bson],
+    values: &Walk<'_>,
     vars: &[expr::Binding<'_>],
 ) -> Result<bool> {
     Ok(match condition {
@@ -1587,7 +1596,7 @@ fn condition_matches(
 
         // Array-shaped operators inspect the array itself rather than its
         // elements, so they must not go through `any_element`.
-        Condition::Size(want) => values.iter().any(|v| match v {
+        Condition::Size(want) => values.values.iter().any(|(v, _)| match v {
             Bson::Array(items) => items.len() as i64 == *want,
             _ => false,
         }),
@@ -1601,21 +1610,36 @@ fn condition_matches(
                 && members.patterns.iter().all(|re| any_element(values, |v| regex_holds(re, v)))
         }
 
-        Condition::ElemMatch(inner) => any_of(values, |v| match v {
-            Bson::Array(items) => any_of(items, |item| match item {
-                Bson::Document(d) => evaluate(inner, d, vars),
-                // An element that is an array is one value: the conditions are made on it
-                // whole and do not look into it (q7s2r.out r0040, r0052, r0057, r0058).
-                Bson::Array(_) => matches_scalar_against(inner, item, vars, true),
-                // The empty body holds for a document or an array element and for no
-                // other (r0059).
-                _ if matches!(**inner, Filter::AlwaysTrue) => Ok(false),
-                // A scalar element is tested by wrapping it so that
-                // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
-                scalar => matches_scalar_against(inner, scalar, vars, false),
-            }),
-            _ => Ok(false),
-        })?,
+        Condition::ElemMatch(inner) => {
+            // The body is either operators on the element itself (`{$gt: 5}`: the value form,
+            // parsed to a condition on the empty path) or a filter on its fields (the document
+            // form).
+            let value_form = matches!(&**inner, Filter::Field { path, .. } if path.is_empty());
+            any_of(values.values.iter().map(|(v, _)| *v), |v| match v {
+                Bson::Array(items) => any_of(items, |item| match item {
+                    // The value form takes each element as one value, a document too, with no
+                    // traversal into it (q7s3b 169-171, q7s3g 148, q7s3f 301-341).
+                    Bson::Document(_) if value_form => {
+                        matches_scalar_against(inner, item, vars, true)
+                    }
+                    Bson::Document(d) => evaluate(inner, d, vars),
+                    // An element that is an array is one value: the conditions are made on it
+                    // whole and do not look into it (q7s2r.out r0040, r0052, r0057, r0058).
+                    Bson::Array(_) if value_form => matches_scalar_against(inner, item, vars, true),
+                    // The document form reads an array element as the document of its
+                    // positions, `{"0": first, "1": second, ...}` (q7s3f 18, 19, 332, 334, 335;
+                    // q7s3g 143, 147), and the empty body holds for it as for a document.
+                    Bson::Array(members) => evaluate(inner, &position_document(members), vars),
+                    // The empty body holds for a document or an array element and for no
+                    // other (r0059).
+                    _ if matches!(**inner, Filter::AlwaysTrue) => Ok(false),
+                    // A scalar element is tested by wrapping it so that
+                    // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
+                    scalar => matches_scalar_against(inner, scalar, vars, false),
+                }),
+                _ => Ok(false),
+            })?
+        }
 
         // Element-wise like the comparisons, and numeric only: a string never
         // has a remainder (`mod_holds`).
@@ -1633,6 +1657,12 @@ fn condition_matches(
             all_of(&[a.as_ref(), b.as_ref()], |c| condition_matches(c, values, vars))?
         }
     })
+}
+
+/// An array read as a document: `[a, b]` is `{"0": a, "1": b}`, what an `$elemMatch` on fields
+/// tests an array element by.
+fn position_document(members: &[Bson]) -> Document {
+    members.iter().enumerate().map(|(at, member)| (at.to_string(), member.clone())).collect()
 }
 
 /// Test one array element against a filter, for the update language's
@@ -1675,12 +1705,12 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
         }
         Filter::Field { path, conditions } => {
             if path.is_empty() {
-                return all_of(conditions, |c| condition_matches(c, &[element], &[]));
+                return all_of(conditions, |c| condition_matches(c, &Walk::single(element), &[]));
             }
-            let values = match element {
-                Bson::Document(doc) => path::resolve(doc, path),
-                _ => Vec::new(),
-            };
+            // The element is the identifier's value, read as a field value is: an array element
+            // is traversed and a position read (`{"x.0": {$gt: 0}}` selects `[1, 2]` and `[3]`:
+            // q7s3g 175, 229, 256), and a scalar has no fields, so the path is absent.
+            let values = path::read_value(element, path::Root::Field, path);
             all_of(conditions, |c| condition_matches(c, &values, &[]))
         }
         Filter::Expr(e) => {
@@ -1776,7 +1806,7 @@ fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
             },
             Condition::Not(inner) => Ok(!condition(inner, element)?),
             Condition::Both(a, b) => all_of(&[a.as_ref(), b.as_ref()], |c| condition(c, element)),
-            other => condition_matches(other, &[element], &[]),
+            other => condition_matches(other, &Walk::single(element), &[]),
         }
     }
     match filter {
@@ -1820,7 +1850,7 @@ fn matches_scalar_against(
             if opaque {
                 return all_of(conditions, |c| element_condition(c, scalar, vars));
             }
-            all_of(conditions, |c| condition_matches(c, &[scalar], vars))
+            all_of(conditions, |c| condition_matches(c, &Walk::single(scalar), vars))
         }
         // An expression reads fields, and a scalar has none to read: nothing
         // is evaluated, so there is nothing to fail.
@@ -1866,7 +1896,7 @@ fn element_condition(
         Condition::Both(a, b) => {
             all_of(&[a.as_ref(), b.as_ref()], |c| element_condition(c, element, vars))?
         }
-        _ => condition_matches(condition, &[element], vars)?,
+        _ => condition_matches(condition, &Walk::single(element), vars)?,
     })
 }
 

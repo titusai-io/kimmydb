@@ -1190,3 +1190,27 @@ fn n_a_rename_to_the_id_of_a_field_that_is_missing_is_no_change() {
     // UNRECORDED: a source that is there is still refused.
     refused(upserted_id(doc! { "$rename": { "a": "_id" } }, doc! { "a": 5 }), "_id is immutable");
 }
+
+#[test]
+fn l_every_operator_reads_where_it_writes_by_position_under_the_read_rule() {
+    // A read takes `00` and `01` for field names (the resolver rule), an update path takes them
+    // for positions (q7s2g2.jsonl 34, 37). No operator computes its value from a read that
+    // follows the read rule: each reads the element it writes, `a.01` being the second. This is a
+    // guard and not a failing-first test: it passes on the code before the read-position switch
+    // too, and fails if an operator's read moves off its write when the switch is made.
+    let ten_twenty = || doc! { "_id": 1, "a": [10, 20] };
+    let nested = || doc! { "_id": 1, "a": [[1], [2]] };
+    let two_three = || doc! { "_id": 1, "a": [[1], [2, 3]] };
+    same(updated(doc! { "$inc": { "a.01": 1 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 21] });
+    same(updated(doc! { "$mul": { "a.01": 2 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 40] });
+    same(
+        updated(doc! { "$bit": { "a.01": { "or": 1 } } }, ten_twenty()),
+        doc! { "_id": 1, "a": [10, 21] },
+    );
+    same(updated(doc! { "$min": { "a.01": 5 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 5] });
+    same(updated(doc! { "$max": { "a.01": 50 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 50] });
+    same(updated(doc! { "$push": { "a.01": 3 } }, nested()), two_three());
+    same(updated(doc! { "$addToSet": { "a.01": 3 } }, nested()), two_three());
+    same(updated(doc! { "$pull": { "a.01": 2 } }, two_three()), doc! { "_id": 1, "a": [[1], [3]] });
+    same(updated(doc! { "$pop": { "a.01": 1 } }, two_three()), doc! { "_id": 1, "a": [[1], [2]] });
+}

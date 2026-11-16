@@ -163,9 +163,21 @@ impl ArraySort {
                         _ => empty,
                     }
                 }
-                items.sort_by(|a, b| {
-                    shape::compare(keys, as_document(a, &empty), as_document(b, &empty))
+                // The keys are read once per element, as a path into the element that is
+                // never refused and compares what it ends at whole (q7s3j 194-209).
+                let element_keys: Vec<Vec<Bson>> = items
+                    .iter()
+                    .map(|item| shape::element_sort_keys(keys, as_document(item, &empty)))
+                    .collect();
+                let mut order: Vec<usize> = (0..items.len()).collect();
+                order.sort_by(|a, b| {
+                    shape::compare_keys(keys, &element_keys[*a], &element_keys[*b])
                 });
+                let mut taken: Vec<Bson> =
+                    items.iter_mut().map(|slot| std::mem::replace(slot, Bson::Null)).collect();
+                for (slot, at) in items.iter_mut().zip(order) {
+                    *slot = std::mem::replace(&mut taken[at], Bson::Null);
+                }
             }
         }
     }
@@ -1610,7 +1622,7 @@ fn apply_one(
                     Way::Scalar { prefix } => {
                         let part = prefix.rsplit('.').next().unwrap_or(&prefix);
                         let below = target[prefix.len() + 1..].split('.').next().unwrap_or("");
-                        let held = path::resolve(doc, &prefix).first().map(|v| v.to_string());
+                        let held = path::get_checked(doc, &prefix).map(ToString::to_string);
                         return Err(invalid(format!(
                             "cannot create field '{below}' in element {{{part}: {}}}",
                             held.unwrap_or_default()
@@ -2168,20 +2180,23 @@ mod tests {
     }
 
     #[test]
-    fn push_sort_by_a_field_through_an_array_takes_the_smallest_ascending_and_the_largest_descending()
-     {
+    fn push_sort_by_a_field_through_an_array_compares_the_value_whole_and_descending_reverses_it() {
+        // q7s3m0035 and q7s3m0036 (an empty `$each` and a `$sort` only), over
+        // `[{s: 3}, {s: [0, 5]}, {s: [1, 2]}]`: the key is compared as a whole value, a number
+        // before any array and arrays element by element, and descending is the reverse of
+        // ascending. (A find or an aggregation `$sort` reduces the array to its least or
+        // greatest element instead; that rule is not this one.)
         let a = doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] };
-        // Ascending by 0, 1, 3; descending by 5, 3, 2.
         let asc =
             applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": 1 } } } }, a.clone());
         assert_eq!(
             asc,
-            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": [1, 2] }, doc! { "s": 3 }] }
+            doc! { "a": [doc! { "s": 3 }, doc! { "s": [0, 5] }, doc! { "s": [1, 2] }] }
         );
         let desc = applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": -1 } } } }, a);
         assert_eq!(
             desc,
-            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] }
+            doc! { "a": [doc! { "s": [1, 2] }, doc! { "s": [0, 5] }, doc! { "s": 3 }] }
         );
     }
 

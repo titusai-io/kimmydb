@@ -16,6 +16,11 @@
 //! Encodings are *self-delimiting*: a compound index key is the concatenation
 //! of its parts, with no separators needed.
 //!
+//! **A document** is `40`, then for each field `01`, the value's type tag, the escaped name and
+//! the value's encoding without its tag, then `00`: documents compare by the type of a field's
+//! value, then its name, then the value (storage schema 9; before it the name came first). An
+//! array is `50`, then `01` and the element's encoding for each element, then `00`.
+//!
 //! **Numbers** (`Int32`, `Int64`, `Double`, `Decimal128`) share one form, so
 //! equal values have equal keys whatever their types (storage schema 5):
 //!
@@ -129,9 +134,14 @@ pub fn encode_into(value: &Bson, out: &mut Vec<u8>) -> Result<()> {
         Bson::Document(d) => {
             out.push(TAG_DOCUMENT);
             for (key, val) in d {
+                // The type of the value, then the name, then the value without its tag: the
+                // order of [`crate::cmp::canonical_cmp`] on documents (storage schema 9).
+                let mut value = Vec::new();
+                encode_into(val, &mut value)?;
                 out.push(ELEMENT_PRESENT);
+                out.push(value[0]);
                 encode_bytes(key.as_bytes(), out);
-                encode_into(val, out)?;
+                out.extend_from_slice(&value[1..]);
             }
             out.push(ELEMENT_END);
         }
@@ -590,6 +600,21 @@ mod tests {
     }
 
     #[test]
+    fn a_document_field_is_its_type_then_its_name_then_its_value() {
+        // `{c: "z"}` against `{d: 1}`: the string is above the number, so the first is above,
+        // whatever the names; and `{c: [8, 2]}` is above `{c: "z"}`, the same name, by type.
+        lt(Bson::Document(doc! { "d": 1 }), Bson::Document(doc! { "c": "z" }));
+        lt(Bson::Document(doc! { "c": "z" }), Bson::Document(doc! { "c": [8, 2] }));
+        lt(Bson::Document(doc! { "c": "z" }), Bson::Document(doc! { "b": [8, 2] }));
+        // The bytes: 40, 01, the string tag, the name, the string, 00.
+        let bytes = enc(&Bson::Document(doc! { "a": "x" }));
+        assert_eq!(bytes[..3], [TAG_DOCUMENT, ELEMENT_PRESENT, TAG_STRING]);
+        assert_eq!(*bytes.last().unwrap(), ELEMENT_END);
+        // A number keeps one form whatever its type, so one key for `1`, `1.0` and `1i64`.
+        eq_bytes(Bson::Document(doc! { "a": 1 }), Bson::Document(doc! { "a": 1.0 }));
+    }
+
+    #[test]
     fn arrays_and_documents_nest() {
         lt(Bson::Array(vec![Bson::Int32(1)]), Bson::Array(vec![Bson::Int32(2)]));
         lt(Bson::Array(vec![Bson::Int32(1)]), Bson::Array(vec![Bson::Int32(1), Bson::Int32(0)]));
@@ -726,13 +751,15 @@ mod tests {
             leaf.prop_recursive(3, 12, 3, |inner| {
                 prop_oneof![
                     prop::collection::vec(inner.clone(), 0..3).prop_map(Bson::Array),
-                    prop::collection::vec(("[a-b]{1,2}", inner), 0..3).prop_map(|pairs| {
-                        let mut doc = bson::Document::new();
-                        for (k, v) in pairs {
-                            doc.insert(k, v);
+                    prop::collection::vec(("[a-b\u{0}\u{1}]{0,2}", inner), 0..3).prop_map(
+                        |pairs| {
+                            let mut doc = bson::Document::new();
+                            for (k, v) in pairs {
+                                doc.insert(k, v);
+                            }
+                            Bson::Document(doc)
                         }
-                        Bson::Document(doc)
-                    }),
+                    ),
                 ]
             })
         }

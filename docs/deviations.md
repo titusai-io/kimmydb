@@ -27,7 +27,7 @@ Status meanings:
 
 ## 🟡 An `$inc` or `$mul` that leaves a NaN, and a `$push` whose `$slice` leaves the array as it was, count as modified in the reference and not here
 
-**Raised 2026-11-14, from the update probes q7s2j and q7s2k on the reference (6.0.5).** A write that leaves the stored bytes as they were is not written and is not counted in `modified` ([ADR-208](decisions.md)). The reference counts two kinds of such write as modified (`nModified` 1), and answers the same document. **A stored NaN**: `$inc` and `$mul` of a number over a stored double or decimal `NaN` give `NaN` again, which the reference compares as unequal to itself, so it counts and writes it (`q7s2k.out` k0277 line 1661, k0376 line 2255, k0726 line 4355, k0826 line 4955: 64 cases over the integer, long, double and decimal operands). **A `$push` whose `$slice` leaves the array unchanged**: `{$each: [8, 9], $slice: 0}` over `[]` (`q7s2j.out` j1017 line 6098), `$slice: 2.0` over `[1, 2]`, `[{a: 1}, {a: 2}]` and `[[1, 2], [3]]` (j1039 line 6230 to j1041), and `$slice: 0` with `$sort: 1` over `[]` (j1115 line 6686): the reference does not compare the array it built with the one it held. Here nothing is written and `modified` is 0 for all five forms and all 64 NaN cases; the document, the stamp and the oplog are as they were.
+**Raised 2026-11-14, from the update probes q7s2j and q7s2k on the reference (6.0.5).** A write that leaves the stored bytes as they were is not written and is not counted in `modified` ([ADR-208](decisions.md)). The reference counts two kinds of such write as modified (`nModified` 1), and answers the same document. **A stored NaN**: `$inc` and `$mul` of a number over a stored double or decimal `NaN` give `NaN` again, which the reference compares as unequal to itself, so it counts and writes it (`q7s2k.out` k0277 line 1661, k0376 line 2255, k0726 line 4355, k0826 line 4955: 64 cases over the integer, long, double and decimal operands). **A `$push` whose `$slice` leaves the array unchanged**: `{$each: [8, 9], $slice: 0}` over `[]` (`q7s2j.out` j1017 line 6098), `$slice: 2.0` over `[1, 2]`, `[{a: 1}, {a: 2}]` and `[[1, 2], [3]]` (j1039 line 6230 to j1041), and `$slice: 0` with `$sort: 1` over `[]` (j1115 line 6686), and an empty `$each` with a `$sort` that leaves the array in the order it had (q7s3j0201, q7s3m0031, q7s3m0032 and q7s3m0035, each `nModified` 1): the reference does not compare the array it built with the one it held. Here nothing is written and `modified` is 0 for all those forms and all 64 NaN cases; the document, the stamp and the oplog are as they were.
 
 **Why.** The count and the write are one decision here, made on the stored bytes. Counting a write that changes no byte would mean writing it, minting a stamp and replicating it, which is the cost [ADR-208](decisions.md) removed, for a number that says "something happened" about nothing.
 
@@ -1114,7 +1114,10 @@ under [Positional updates](query-language.md#positional-updates) and
   not pass match details to its branches, so an update that uses `$` under
   `$or` fails there (*the positional operator did not find the match needed
   from the query*). A filter written for this engine that relies on it does not
-  port.
+  port. **The find projection is the same:** `{"items.$": 1}` under
+  `{$or: [{"items.c": 2}, {"items.d": 1}]}` is refused by the reference (code 51246, the
+  positional operator could not find a matching element; q7s3i0173, q7s3i0175) and answered
+  here.
 - **An upsert that inserts is a `400`** for a `$` path: there was no existing
   document to match, so no element. An upsert whose filter finds a document
   updates it and the `$` reads that document.
@@ -3836,6 +3839,64 @@ keys per chunk and is unchanged here.
 
 **The behaviour change** is the sort window, recorded in
 [ADR-098](decisions.md) and in [Compatibility](compatibility.md).
+
+## 🟡 A sparse unique index is the partial `{$exists: true}`, which keeps the null key of an array's other elements, so it refuses what the reference's sparse unique index accepts
+
+**Raised with the path resolver rule (0.61.0).** On a path through an array, an element
+that lacks the field keys `null` beside the values the other elements hold, here and in
+the reference. The reference's sparse unique index leaves that `null` out and accepts
+`[{c: 1}, {d: 1}]` beside `[{c: 2}, {d: 2}]` (q7s3g 18-34, 77-84); here a sparse index is
+the partial `{c: {$exists: true}}`, whose documents keep every key they have, the `null`
+of the lacking element included, so the second is refused as the reference's own unique
+partial index refuses it (q7s3g 35-51, 85-92). There is no `sparse` flag to close this
+with. To close it: key a partial index's documents by the values its filter selected
+only, which is a different index.
+
+## 🟡 An index whose path has a digit position is not used for a predicate a `null` satisfies
+
+**Raised with the path resolver rule (0.61.0).** `{"a.0": null}` matches `{a: [{b: 1}]}`:
+the element at `0` is a document that lacks the field `0`, which a filter reads as `null`.
+The index on `a.0` keys that document under the element, not under `null`, so an index
+answer would miss it. The reference answers such a query from its index and returns less
+than a collection scan does (q7s3g 133: it returns `[6]` alone); KimmyDB's planner scans
+for an equality with `null`, a `$in` holding `null`, and a `$gte` or `$lte` of `null` on
+such a path, and answers what the filter says. Performance, not correctness: the query is
+a scan. To close it: key the lacked `null` of an in-range position in the index.
+
+## 🟡 A positional update over a matched document without the array is atomic per chunk, where the reference applies the earlier documents of the batch
+
+**Raised with the path resolver rule (0.61.0).** `{$set: {"items.$.z": 1}}` with `multi`
+over documents of which one has no `items` fails at that document in both. The reference
+had applied documents 1, 2, 4 and 5 (q7s3g 293); here the chunk holding the failing
+document is aborted whole, earlier chunks stay committed, and the reply is `500
+partially_applied` with their counts (or `400` with nothing written when no chunk
+committed): the chunk rule of [`multi` writes](http-api.md). The projection of a document
+with no array is not refused, as the reference's is not (q7s3g 291).
+
+## 🟡 A TTL index on a path with a position never expires a replicated document that is ambiguous there
+
+**Raised with the path resolver rule (0.61.0).** A document with a position beside a field of
+that name (`{a: [{"0": d}]}` under a TTL index on `a.0`) is refused by the member that takes
+the write, so it can only arrive replicated, where it is filed unkeyed. The TTL pass reads the
+index's keys and excludes the unkeyed run, so that document is never expired, on any member.
+To close it: have the TTL pass read the unkeyed run and decide by the filter.
+
+## 🟡 `{c: [[]]}` collides with `{c: []}` in a unique index, where the reference keeps them apart
+
+**Raised with the path resolver rule (0.61.0).** An array indexes its elements and itself,
+so `{c: [[]]}` is keyed under its element `[]` and under `[[]]`, and collides with a
+document holding `[]`. The reference does not (q7s3i 5). To close it: key an empty array
+element as a nested array only.
+
+---
+
+## 🟡 A positional update with two conditions on one array follows the last written; the reference's update chooses otherwise
+
+**Raised with the path resolver rule (0.61.0).** A find projection `items.$` follows the
+last condition as written (q7s3i 161-185), and so does ADR-256's update. The reference's
+update does not (q7s3i 162-172, 186: for some orders it takes the first; the rows of the resolver table that differ are q7s3g0328 to q7s3g0330 and q7s3i0164, q7s3i0168, q7s3i0172, q7s3i0186). KimmyDB keeps one
+rule for both. UNRECORDED beyond those cases. To close it: record more cases and give the
+update its own rule.
 
 ---
 

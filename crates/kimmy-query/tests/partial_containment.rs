@@ -314,3 +314,96 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
     assert_eq!(partials.len(), 562, "the partial filters that parse");
     assert_eq!(queries.len(), 1_820, "the queries that parse");
 }
+
+/// The shapes of the recorded fixtures AD, CL, PE and POS (q7s3 resolver rule) at `k`: elements
+/// that lack the field, scalar, null and nested-array elements, an empty array, a position
+/// beside a field of that name, and a position past the end.
+fn array_fixture_docs() -> Vec<Document> {
+    let ks = [
+        bson::bson!([{"a": null}, {"b": 1}]),
+        bson::bson!([{"a": 5}, {"b": 1}]),
+        bson::bson!([1, 2]),
+        bson::bson!([]),
+        bson::bson!([{"a": null}]),
+        bson::bson!([{"a": []}]),
+        bson::bson!([{"a": [5, 1]}, {"a": 4}]),
+        bson::bson!([null, {"a": 9}]),
+        bson::bson!([[{"a": 1}]]),
+        bson::bson!({"a": 1}),
+        bson::bson!({"a": null}),
+        bson::bson!([[1, 2], [3, 4]]),
+        bson::bson!([{"0": 9}]),
+        bson::bson!([{"b": 1}, {"0": 2}]),
+        bson::bson!([[5], {"0": 9}]),
+        bson::bson!([{"1": 5}]),
+        bson::bson!([{"1": 5}, {"b": 1}]),
+        bson::bson!({"0": "x", "1": "y", "01": "z", "00": "w"}),
+        bson::bson!("str"),
+    ];
+    let mut out = vec![doc! {"z": 1}];
+    out.extend(ks.into_iter().map(|k| doc! {"k": k, "z": 1}));
+    out
+}
+
+/// The superset invariant for membership: a partial index the planner chooses holds every
+/// document `find` returns, over the array fixtures and the paths `k.a`, `k.0` and `k.1`,
+/// which a position reads, with the null forms that a lacking field satisfies.
+#[test]
+fn a_chosen_partial_index_holds_every_document_find_returns_over_the_array_fixtures() {
+    let docs = array_fixture_docs();
+    let operands = [
+        Bson::Null,
+        Bson::Int32(1),
+        Bson::Int32(5),
+        Bson::String("x".into()),
+        Bson::MinKey,
+        Bson::MaxKey,
+        Bson::Array(vec![]),
+        Bson::Array(vec![1.into(), 2.into()]),
+    ];
+    let mut partials = Vec::new();
+    let mut queries = Vec::new();
+    for path in ["k", "k.a", "k.0", "k.1"] {
+        partials.push(doc! {path: {"$exists": true}});
+        queries.push(doc! {path: {"$exists": true}});
+        queries.push(doc! {path: {"$exists": false}});
+        for v in &operands {
+            partials.push(doc! {path: v.clone()});
+            queries.push(doc! {path: v.clone()});
+            queries.push(doc! {path: {"$in": [v.clone(), Bson::Null]}});
+            queries.push(doc! {path: {"$gte": v.clone(), "$lte": Bson::Null}});
+            for op in ["$gt", "$gte", "$lt", "$lte"] {
+                partials.push(doc! {path: {op: v.clone()}});
+                queries.push(doc! {path: {op: v.clone()}});
+            }
+        }
+    }
+    let (mut used, mut lost) = (0usize, Vec::<String>::new());
+    for pdoc in &partials {
+        let Ok(partial) = PartialFilter::parse(pdoc) else { continue };
+        let path = pdoc.keys().next().unwrap().clone();
+        for qdoc in &queries {
+            let Ok(bare) = filter::parse(qdoc) else { continue };
+            let mut with_z = qdoc.clone();
+            with_z.insert("z", 1);
+            let z = filter::parse(&with_z).unwrap();
+            for (on, q) in [("z", &z), (path.as_str(), &bare)] {
+                let Some(chosen) = plan::choose(q, &[index(on, pdoc)]) else { continue };
+                assert_eq!(chosen.index_name, "p");
+                used += 1;
+                for d in &docs {
+                    if filter::matches(q, d).unwrap() && !holds(&partial, d) {
+                        lost.push(format!("index {pdoc} used for {qdoc} (on {on}) misses {d:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(used > 500, "premise: the planner chose the index, {used} times");
+    assert!(
+        lost.is_empty(),
+        "a partial index was used for a query whose matches it does not hold: {} pairs:\n  {}",
+        lost.len(),
+        lost.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ")
+    );
+}

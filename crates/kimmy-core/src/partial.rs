@@ -92,9 +92,9 @@ impl PartialOp {
         }
     }
 
-    /// Whether the values a path resolves to satisfy this, as `find`
-    /// evaluates the same operator: `values` is empty when the path is absent.
-    pub fn selects(&self, values: &[&Bson]) -> bool {
+    /// Whether what a path reaches satisfies this, as `find` evaluates the same operator:
+    /// [`path::Walk::missing`] when the path is absent.
+    pub fn selects(&self, values: &path::Walk<'_>) -> bool {
         match self {
             PartialOp::Exists => crate::matching::exists(values, true),
             PartialOp::Eq(want) => crate::matching::equals(values, want),
@@ -160,7 +160,7 @@ impl PartialOp {
             (PartialOp::Eq(Bson::Null), o) => matches!(o, PartialOp::Eq(Bson::Null)),
             // Anything else that holds at all implies presence, except a bound that a missing
             // field satisfies: `{$gt: MinKey}` holds for a document without the field.
-            (_, PartialOp::Exists) => !self.selects(&[]),
+            (_, PartialOp::Exists) => !self.selects(&path::Walk::missing()),
             // A known value implies whatever that value satisfies.
             (PartialOp::Eq(v), o) => o.holds_on_value(v),
             (PartialOp::Exists, _) => false,
@@ -258,7 +258,7 @@ impl PartialFilter {
     /// array, and read a missing field as matching nothing; containment was
     /// judged against the one while `find` answered by the other.
     pub fn selects(&self, doc: &Document) -> bool {
-        self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
+        self.predicates.iter().all(|(field, op)| op.selects(&path::read_document(doc, field)))
     }
 
     /// Whether a query carrying `query` is provably contained by this filter.
@@ -477,8 +477,10 @@ mod tests {
 
     #[test]
     fn a_missing_field_satisfies_no_comparison() {
-        // If absence were treated as null it would sort below everything and
-        // pull every incomplete document into a `$lt` index.
+        // A missing field reads as null only for the comparisons that say so (an equality with
+        // null, a `MinKey` or `MaxKey` bound, `$gte` and `$lte` of null: `matching::compares`).
+        // A `$lt: 5` is none of them: were absence null here it would sort below everything
+        // and pull every incomplete document into a `$lt` index.
         let f = parse(doc! {"qty": {"$lt": 5}}).unwrap();
         assert!(f.selects(&doc! {"qty": 1}));
         assert!(!f.selects(&doc! {"other": 1}));
@@ -730,7 +732,7 @@ mod tests {
                 implied += 1;
                 both_decimal += usize::from(decimal(&qop) && decimal(&iop));
                 for d in &docs {
-                    let values = path::resolve(d, "k");
+                    let values = path::read_document(d, "k");
                     let matched = qop.selects(&values);
                     assert!(
                         !matched || iop.selects(&values),

@@ -3134,7 +3134,8 @@ async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
 }
 
 /// A descending sort orders a document with an array at the sort path by its largest
-/// element, an ascending one by its smallest, in a full sort and in a bounded one (ADR-264).
+/// element, an ascending one by its smallest, in a full sort, in a bounded one and in the `$sort`
+/// stage (ADR-264; q7s4o 11 to 20). `$sortArray` is not this rule: see the test below.
 #[tokio::test]
 async fn a_descending_sort_orders_an_array_by_its_largest_element() {
     let server = Server::start().await;
@@ -3164,7 +3165,7 @@ async fn a_descending_sort_orders_an_array_by_its_largest_element() {
         order(&server, &token, json!({"sort": {"a": -1}, "skip": 1, "limit": 2})).await,
         vec![2, 3]
     );
-    // The pipeline's `$sort` and a `$push` followed by `$sortArray` agree.
+    // The pipeline's `$sort` takes the same elements.
     let res = server
         .post(
             "/v1/db/shop/coll/c/aggregate",
@@ -3178,13 +3179,38 @@ async fn a_descending_sort_orders_an_array_by_its_largest_element() {
         "{:?}",
         res.body
     );
-    let res = server
-        .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
-            {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
-            {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": -1}}}, "as": "d", "in": "$$d.id"}}}}
-        ]}))
-        .await;
-    assert_eq!(res.body["documents"], json!([{"ids": [1, 2, 3]}]), "{:?}", res.body);
+}
+
+/// `$sortArray` compares an array key as a whole value (q7s3m0045 and q7s3m0046: a number before
+/// any array, arrays element by element, descending the exact reverse of ascending), where a find
+/// or a `$sort` stage takes its smallest element ascending and its largest descending (the test
+/// above): over `a: [0, 5]` (id 1), `3` (id 2) and `[1, 2]` (id 3), ascending is `[2, 1, 3]` and
+/// descending `[3, 1, 2]`. These two vectors are derived from that rule over these three
+/// documents; q7s3m0045 and q7s3m0046 record it over `[{s: 3}, {s: [0, 5]}, {s: [1, 2]}]`.
+#[tokio::test]
+async fn sort_array_compares_an_array_key_as_a_whole_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, a) in [(1, json!([0, 5])), (2, json!(3)), (3, json!([1, 2]))] {
+        let res =
+            server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "a": a})).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    for (dir, want) in [(1, json!([2, 1, 3])), (-1, json!([3, 1, 2]))] {
+        let res = server
+            .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
+                {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
+                {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": dir}}}, "as": "d", "in": "$$d.id"}}}}
+            ]}))
+            .await;
+        assert_eq!(
+            res.body["documents"],
+            json!([{"ids": want}]),
+            "direction {dir}: {:?}",
+            res.body
+        );
+    }
 }
 
 /// A stored document's fields come back in the order they were written, as
@@ -19449,8 +19475,14 @@ async fn a_change_stream_sees_the_writes_of_a_merge() {
     assert_eq!(seen, vec![(json!("replace"), json!(1)), (json!("insert"), json!(3))]);
 }
 
+/// Over the eight values of `k` (ids 1 `[1, 5]`, 2 `3`, 3 `[2, 4]`, 4 missing, 5 the decimal 2.5,
+/// 6 `"s"`, 7 `{x: 1}`, 8 `null`), the recordings of q7s4o: as the eight documents of a collection,
+/// the `$sort` stage takes the smallest element of an array ascending and the largest descending
+/// (q7s4o0016 `[4, 8, 1, 3, 5, 2, 6, 7]`, q7s4o0018 `[7, 6, 1, 3, 2, 5, 4, 8]`); as the elements of
+/// one array, `$sortArray` compares the key whole, arrays after the documents, descending the
+/// reverse (q7s4o0005 `[4, 8, 5, 2, 6, 7, 1, 3]`, q7s4o0007 `[3, 1, 7, 6, 2, 5, 4, 8]`).
 #[tokio::test]
-async fn sort_array_orders_documents_as_the_sort_stage_does() {
+async fn the_sort_stage_takes_an_element_of_an_array_key_and_sort_array_compares_it_whole() {
     let server = Server::start().await;
     let token = server.root().await;
     let docs = vec![
@@ -19464,11 +19496,11 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         json!({"_id": 8, "k": null}),
     ];
     sink_seed(&server, &token, "src", docs).await;
-    // Ascending takes the smallest element of an array (1 for id 1, 2 for id 3), descending the
-    // largest (5 and 4): so id 1 comes before id 3 and id 2 (a 3) both ways round, and after
-    // `{x: 1}` and "s", which sort above every number.
-    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]))];
-    for (dir, expected) in expected {
+    let expected = [
+        (1, json!([4, 8, 1, 3, 5, 2, 6, 7]), json!([4, 8, 5, 2, 6, 7, 1, 3])),
+        (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]), json!([3, 1, 7, 6, 2, 5, 4, 8])),
+    ];
+    for (dir, stage_ids, array_ids) in expected {
         let stage = sink_run(
             &server,
             &token,
@@ -19492,8 +19524,8 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         )
         .await;
         assert_eq!(array.status, 200, "{:?}", array.body);
-        assert_eq!(json!(ids), expected, "$sort, direction {dir}");
-        assert_eq!(array.body["documents"][0]["ids"], expected, "$sortArray, direction {dir}");
+        assert_eq!(json!(ids), stage_ids, "$sort, direction {dir}");
+        assert_eq!(array.body["documents"][0]["ids"], array_ids, "$sortArray, direction {dir}");
     }
 }
 
@@ -22483,4 +22515,137 @@ async fn a_limit_or_skip_in_a_query_string_reads_as_the_body_does() {
         let res = server.get(&format!("/v1/db/shop/coll/posts/docs?{query}"), Some(&token)).await;
         assert!((400..500).contains(&res.status), "{query}: {} {:?}", res.status, res.body);
     }
+}
+
+#[tokio::test]
+async fn a_sort_on_a_position_beside_a_field_of_that_name_is_refused_on_find_and_find_and_modify() {
+    // The reference's 16746, "Ambiguous field name found in array (do not use numeric field
+    // names in embedded elements in an array)" (q7s3g 105, 106, 131; q7s3j 151, 152): a sort key
+    // `a.0` over an array that holds a document with a field named `0`. Raised at sort time, by
+    // the documents the sort reads, whatever the window; a filter that removes the clash first
+    // does not raise it (g:131); a position past the end never does (q7s3j 157-186).
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch = json!([
+        { "_id": 1, "a": [{ "0": 9 }] },
+        { "_id": 2, "a": [5, 6] },
+        { "_id": 3, "a": [{ "b": 1 }] },
+    ]);
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), batch).await;
+    let coll = "/v1/db/shop/coll/posts";
+    let ids = |res: &Res| -> Vec<i64> {
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    };
+    for body in [
+        json!({ "sort": { "a.0": 1, "_id": 1 } }),
+        json!({ "sort": { "a.0": -1, "_id": 1 } }),
+        json!({ "sort": { "a.0": 1, "_id": 1 }, "limit": 1 }),
+        json!({ "sort": { "a.0": 1, "_id": 1 }, "limit": 1, "skip": 2 }),
+        json!({ "sort": { "_id": 1, "a.0": 1 } }),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 400, "{body}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap().contains("Ambiguous field name found in array"),
+            "{body}: {:?}",
+            res.body
+        );
+    }
+    // Filtered out first (g:131), a field name, and a position past the end: answered.
+    for (body, want) in [
+        (
+            json!({ "filter": { "_id": { "$in": [2, 3] } }, "sort": { "a.0": 1, "_id": 1 } }),
+            vec![2, 3],
+        ),
+        (json!({ "sort": { "a.00": 1, "_id": 1 } }), vec![1, 2, 3]),
+        (json!({ "sort": { "a.1": 1, "_id": 1 } }), vec![1, 3, 2]),
+        (json!({ "sort": { "a.0": 1, "_id": 1 }, "filter": { "a.0": 5 } }), vec![2]),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(ids(&res), want, "{body}");
+    }
+    // `find_and_modify` takes the keys of every match before it picks one, and writes nothing.
+    let res = server
+        .post(
+            &format!("{coll}/find_and_modify"),
+            Some(&token),
+            json!({ "filter": {}, "sort": { "a.0": 1 }, "update": { "$set": { "hit": true } } }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("Ambiguous field name found in array"));
+    let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    assert!(
+        all.body["documents"].as_array().unwrap().iter().all(|d| d.get("hit").is_none()),
+        "{:?}",
+        all.body
+    );
+}
+
+#[tokio::test]
+async fn a_graph_lookup_follows_a_position_written_with_a_leading_zero() {
+    // q7s4i 343: `connectFromField: "a.00"` reads `00` as the position 0, the array it reaches
+    // is expanded, and the document `_id: 7` (`a: [[1]]`) links on to `_id: 1`. UNRECORDED beyond
+    // that case: every other reader of a path takes `00` for a field name.
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["base", "foreign"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let base = json!([
+        { "_id": 1, "a": [10, 20] },
+        { "_id": 2, "a": [[1], [2]] },
+        { "_id": 3, "a": [{ "01": 5 }, 9] },
+        { "_id": 4, "a": { "0": 6, "1": 8, "01": 7 } },
+        { "_id": 5, "a": [{ "x": 1 }, { "x": 2 }] },
+        { "_id": 6, "a": { "00": 1 } },
+        { "_id": 7, "a": [[1, 2], [3]] },
+        { "_id": 8 },
+    ]);
+    let foreign = json!([
+        { "_id": 1, "k": 10, "a": [10, 20] },
+        { "_id": 2, "k": 5, "a": [{ "01": 5 }, 9] },
+        { "_id": 3, "k": 7, "a": { "01": 7 } },
+        { "_id": 4, "k": 1 },
+        { "_id": 5, "k": [5, 20] },
+        { "_id": 6, "a": [9] },
+        { "_id": 7, "k": 20, "a": [[1]] },
+    ]);
+    server.post("/v1/db/shop/coll/base/bulk", Some(&token), base).await;
+    server.post("/v1/db/shop/coll/foreign/bulk", Some(&token), foreign).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/base/aggregate",
+            Some(&token),
+            json!({ "pipeline": [
+                { "$graphLookup": { "from": "foreign", "startWith": "$_id",
+                    "connectFromField": "a.00", "connectToField": "_id", "as": "g",
+                    "maxDepth": 1 } },
+                { "$project": { "g._id": 1 } },
+                { "$sort": { "_id": 1 } },
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got: Vec<Vec<i64>> = res.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let mut ids: Vec<i64> =
+                d["g"].as_array().unwrap().iter().map(|g| g["_id"].as_i64().unwrap()).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    let want: Vec<Vec<i64>> =
+        vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![1, 7], vec![]];
+    assert_eq!(got, want, "{:?}", res.body);
 }

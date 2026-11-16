@@ -58,10 +58,15 @@ pub fn direction_of(direction: &Bson) -> Option<bool> {
 ///
 /// A document missing the sort field sorts as though it held `null`, which is
 /// what puts absent values at one end rather than in arbitrary positions.
+///
+/// **Never refuses.** A position inside an array beside a document element holding a field of
+/// that name (16746, below) is read as the position here. The callers that refuse it take their
+/// keys eagerly with [`sort_keys`], and this is for the ones that do not (and for the tests'
+/// oracle).
 pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
     for key in keys {
-        let va = sort_value(a, &key.path, key.descending);
-        let vb = sort_value(b, &key.path, key.descending);
+        let va = sort_value_lenient(a, &key.path, key.descending);
+        let vb = sort_value_lenient(b, &key.path, key.descending);
         let ordering = sort_cmp(&va, &vb);
         if ordering != Ordering::Equal {
             return if key.descending { ordering.reverse() } else { ordering };
@@ -77,8 +82,51 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
 /// (ADR-150). A missing path yields `Null` here exactly as it does there, so
 /// the vector is always as long as `keys` and the two comparisons line up
 /// position for position.
-pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Vec<Bson> {
-    keys.iter().map(|key| sort_value(doc, &key.path, key.descending)).collect()
+///
+/// **Refuses with the reference's 16746** ("Ambiguous field name found in array (do not use
+/// numeric field names in embedded elements in an array)") when a key's path has a position
+/// inside an array one of whose direct elements is a document holding a field of that name
+/// (q7s3g 133; q7s3j 151, 152, 155, 191, 192). The check is made on the documents the sort reads,
+/// each in full before any comparison, so a caller that takes the keys of every candidate first
+/// refuses whenever the reference does. A position past the end of the array never refuses
+/// (q7s3j 157-186).
+pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Result<Vec<Bson>> {
+    keys.iter()
+        .map(|key| sort_value(doc, &key.path, key.descending, path::OnAmbiguous::Error))
+        .collect()
+}
+
+/// The keys of one element of the array `$sortArray` and `$push`'s `$sort` order, which are
+/// not a sort key's: **never refused** (q7s3j 187-209), and read from the element as a path
+/// into it. A segment of digits is a position and only a position; a name is not looked up
+/// through an array; and the value the path ends at is compared whole, an array as an array,
+/// where a sort key takes the least of its elements. A path that reaches nothing is `null`. An
+/// empty array is an array like another, compared whole: after every number and before the other
+/// arrays ascending, the exact reverse descending (`$push` with `$sort`: q7s3m0041, q7s3m0042).
+/// The place below the numbers that [`empty_array_key`] gives it is a `find` sort's and a `$sort`
+/// stage's only. One function serves `$sortArray` and `$push`, and both are recorded: q7s4p 1 to
+/// 16 (an empty array, `null` and a missing key, and nested empties, both directions; the ties
+/// keep their input order, as the stable sorts with a reversed comparison do).
+pub fn element_sort_keys(keys: &[SortKey], doc: &Document) -> Vec<Bson> {
+    keys.iter().map(|key| element_sort_value(doc, &key.path)).collect()
+}
+
+fn element_sort_value(doc: &Document, field_path: &str) -> Bson {
+    let mut segments = field_path.split('.');
+    let mut current: Option<&Bson> = segments.next().and_then(|first| doc.get(first));
+    for segment in segments {
+        current = match current {
+            Some(Bson::Document(inner)) => inner.get(segment),
+            Some(Bson::Array(items)) => {
+                path::read_position(segment).and_then(|position| items.get(position))
+            }
+            _ => None,
+        };
+    }
+    match current {
+        None => Bson::Null,
+        Some(value) => value.clone(),
+    }
 }
 
 /// [`compare`], over values already taken by [`sort_keys`].
@@ -113,21 +161,37 @@ pub fn compare_keys(keys: &[SortKey], a: &[Bson], b: &[Bson]) -> Ordering {
 /// (`a` over `a: [[]]` or `[[1], []]`), and sorts at the rank arrays hold, by the arrays' own
 /// order, where `[]` is the least. `canonical_cmp` and the order of an index are not changed:
 /// the key of an empty array is [`empty_array_key`], which [`sort_cmp`] places.
-fn sort_value(doc: &Document, path: &str, descending: bool) -> Bson {
-    let values = path::resolve(doc, path);
-    if values.is_empty() {
-        return Bson::Null;
-    }
+///
+/// **The candidates** (the resolver rule, q7s3-resolver-rule.md 2(b)): every value the path
+/// reaches; a `null` for a document lacking the next field and for every element of an array on
+/// the path that is not a document (a scalar, a `null` or a nested array: q7s3f 27, 31, q7s3g
+/// 93-96); a `null` if there is nothing else. A leaf array is expanded one level, unless a
+/// position reached it, which keeps it whole (q7s3f 282, q7s3g 107). A position inside the array
+/// is that element only and never a field of that name, and refuses when one is held (see
+/// [`sort_keys`]); past the end it names a field of each element (q7s3j 157-186).
+fn sort_value(
+    doc: &Document,
+    field_path: &str,
+    descending: bool,
+    on_ambiguous: path::OnAmbiguous,
+) -> Result<Bson> {
+    let rule = path::Rule { mode: path::Mode::Key, on_ambiguous, positions: path::Positions::Read };
+    let walked = path::walk_document(doc, field_path, rule)
+        .map_err(|clash| Error::InvalidQuery(clash.to_string()))?;
     let empty = empty_array_key();
+    let null = Bson::Null;
     // Flatten a terminal array so that sorting by an array field orders by its
     // elements rather than by the array as a whole.
     let mut candidates: Vec<&Bson> = Vec::new();
-    for value in &values {
+    for (value, by_position) in &walked.values {
         match value {
             Bson::Array(items) if items.is_empty() => candidates.push(&empty),
-            Bson::Array(items) => candidates.extend(items.iter()),
+            Bson::Array(items) if !by_position => candidates.extend(items.iter()),
             other => candidates.push(other),
         }
+    }
+    if walked.lacked || candidates.is_empty() {
+        candidates.push(&null);
     }
     let pick = |a: &&Bson, b: &&Bson| sort_cmp(a, b);
     let best = if descending {
@@ -135,7 +199,12 @@ fn sort_value(doc: &Document, path: &str, descending: bool) -> Bson {
     } else {
         candidates.into_iter().min_by(pick)
     };
-    best.cloned().unwrap_or(Bson::Null)
+    Ok(best.cloned().unwrap_or(Bson::Null))
+}
+
+/// [`sort_value`] for the callers that never refuse.
+fn sort_value_lenient(doc: &Document, field_path: &str, descending: bool) -> Bson {
+    sort_value(doc, field_path, descending, path::OnAmbiguous::Ignore).unwrap_or(Bson::Null)
 }
 
 /// What a sort holds for an empty array that a path reaches: an array no value is, so that it
@@ -200,8 +269,11 @@ pub(crate) const SORT_RUN: usize = 4096;
 /// takes milliseconds, so the deadline is seen within that.
 ///
 /// Takes and returns the documents, because a stop leaves nothing worth keeping.
+///
+/// **Never refuses** a position beside a field of that name (16746): `$sortByCount` sorts by
+/// its own `count`. The stages that refuse it use [`sort_charging_keys`].
 pub fn sort_until_deadline(keys: &[SortKey], docs: Vec<Document>) -> Result<Vec<Document>> {
-    sort_keyed(keys, docs, None)
+    sort_keyed(keys, docs, None, path::OnAmbiguous::Ignore)
 }
 
 /// [`sort_until_deadline`] that charges the sort keys it holds to `held` (ADR-269) as it reads
@@ -209,18 +281,22 @@ pub fn sort_until_deadline(keys: &[SortKey], docs: Vec<Document>) -> Result<Vec<
 /// them, so a `$sort` that keeps everything and one that keeps the first documents agree on
 /// what a key costs. The documents are not charged here; the stage that holds them has
 /// charged them. A refusal ends the sort at the document whose keys pass the limit.
+///
+/// The `$sort` stage's own, which **refuses** a position beside a field of that name with the
+/// reference's 16746 ([`sort_keys`]), the keys of every document taken before any is compared.
 pub fn sort_charging_keys(
     keys: &[SortKey],
     docs: Vec<Document>,
     held: &mut Lease,
 ) -> Result<Vec<Document>> {
-    sort_keyed(keys, docs, Some(held))
+    sort_keyed(keys, docs, Some(held), path::OnAmbiguous::Error)
 }
 
 fn sort_keyed(
     keys: &[SortKey],
     docs: Vec<Document>,
     mut held: Option<&mut Lease>,
+    on_ambiguous: path::OnAmbiguous,
 ) -> Result<Vec<Document>> {
     if keys.is_empty() {
         return Ok(docs);
@@ -229,7 +305,10 @@ fn sort_keyed(
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for doc in docs {
         ticker.tick()?;
-        let sort = sort_keys(keys, &doc);
+        let sort = keys
+            .iter()
+            .map(|key| sort_value(&doc, &key.path, key.descending, on_ambiguous))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(held) = held.as_deref_mut() {
             held.charge(keys_bytes(&sort))?;
         }
@@ -374,7 +453,8 @@ impl<'k> TopK<'k> {
         if self.keep == 0 {
             return Ok(());
         }
-        let sort = sort_keys(self.keys, &doc);
+        // Taken before anything is compared, and refused as a `$sort` stage refuses.
+        let sort = sort_keys(self.keys, &doc)?;
         let full = self.heap.len() == self.keep;
         if full {
             let last = self.heap.peek().expect("a heap that is full holds a document");
@@ -613,6 +693,12 @@ impl FindProjection {
         doc: &Document,
         array: &str,
     ) -> Result<Document> {
+        // A document with no value at the array's path is returned without the field, as the
+        // reference does (q7s3g 291, id 7). One that has the array and no element recorded is
+        // still refused below (q7s3g 296, 306).
+        if at.is_none() && path::resolve(doc, array).is_empty() {
+            return Ok(project(Some(&self.projection), doc));
+        }
         let at = self.check_position(at, array)?;
         let kept = match path::resolve(doc, array).first() {
             Some(Bson::Array(items)) => items.get(at.index),
@@ -1147,7 +1233,8 @@ mod tests {
             doc! { "missing": 1, "_id": -1 },
         ] {
             let order = parse_sort(&spec).unwrap();
-            let taken: Vec<Vec<Bson>> = docs.iter().map(|d| sort_keys(&order, d)).collect();
+            let taken: Vec<Vec<Bson>> =
+                docs.iter().map(|d| sort_keys(&order, d).unwrap()).collect();
             for (i, a) in docs.iter().enumerate() {
                 for (j, b) in docs.iter().enumerate() {
                     assert_eq!(
@@ -1162,7 +1249,7 @@ mod tests {
             let mut by_doc = docs.clone();
             by_doc.sort_by(|a, b| compare(&order, a, b));
             let mut by_key: Vec<(Vec<Bson>, &Document)> =
-                docs.iter().map(|d| (sort_keys(&order, d), d)).collect();
+                docs.iter().map(|d| (sort_keys(&order, d).unwrap(), d)).collect();
             by_key.sort_by(|(a, _), (b, _)| compare_keys(&order, a, b));
             assert_eq!(
                 by_doc.iter().collect::<Vec<_>>(),

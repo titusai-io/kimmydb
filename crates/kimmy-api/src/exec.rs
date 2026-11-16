@@ -408,9 +408,13 @@ pub fn find(
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
             let mut top = TopK::new(window, &order, projection.as_ref(), &filter);
-            let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                top.offer(stamp, doc);
-            })?;
+            // A sort key that reads a position beside a field of that name is refused, with the
+            // keys of every match taken before any is compared (the reference's 16746).
+            let stats =
+                visit_matching_until(state, &meta, &filter, Order::Any, None, |stamp, doc| {
+                    top.offer(stamp, doc)?;
+                    Ok(true)
+                })?;
             // The window shaped `skip + limit` documents and `skip` of them
             // are dropped here, with any refusal they hold. Nothing cheaper
             // is available: which matches the offset steps over is not known
@@ -609,11 +613,11 @@ impl<'a> TopK<'a> {
         }
     }
 
-    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) {
+    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> kimmy_core::Result<()> {
         if self.n == 0 {
-            return;
+            return Ok(());
         }
-        let keys = shape::sort_keys(self.order, &doc);
+        let keys = shape::sort_keys(self.order, &doc)?;
         if self.heap.len() == self.n {
             // Would not displace the largest held, so it is dropped where it
             // stands — unprojected, and never a document this window holds.
@@ -621,7 +625,7 @@ impl<'a> TopK<'a> {
                 shape::compare_keys(self.order, &keys, &largest.keys).is_lt()
             });
             if !displaces {
-                return;
+                return Ok(());
             }
             self.heap.pop();
         }
@@ -633,6 +637,7 @@ impl<'a> TopK<'a> {
             Some(projection) => projection.project(self.filter, &doc),
         };
         self.heap.push(Ranked { order: self.order, stamp, keys, doc });
+        Ok(())
     }
 
     /// The page: everything held, least first, after `skip`. A projection
@@ -1610,6 +1615,12 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn compare(&self, a: &Document, b: &Document) -> std::cmp::Ordering {
         shape::compare(self.sort, a, b)
+    }
+
+    /// The keys of a match, taken before any two are compared: refused with the reference's
+    /// 16746 when the sort reads a position beside a field of that name.
+    fn check_sortable(&self, doc: &Document) -> kimmy_core::Result<()> {
+        shape::sort_keys(self.sort, doc).map(|_| ())
     }
 
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
@@ -3827,7 +3838,7 @@ fn graph_lookup(
                 ticker.tick()?;
                 visited.insert(at);
                 reached.push((at, depth));
-                for key in link_keys(&foreign[at], &spec.connect_from) {
+                for key in follow_keys(&foreign[at], &spec.connect_from) {
                     if searched.insert(key.clone()) {
                         next.push(key);
                     }
@@ -3912,6 +3923,19 @@ fn read_foreign(
 /// undefined ones: a `null` link follows nothing, and nothing is filed under it.
 fn link_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = aggregate::join_values(doc, field)
+        .into_iter()
+        .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
+        .filter_map(encode_key)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// [`link_keys`] for the field a `$graphLookup` follows (`connectFromField`), where a position
+/// is a run of digits, leading zeros included (q7s4i 343; UNRECORDED beyond that case).
+fn follow_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = aggregate::link_values(doc, field)
         .into_iter()
         .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
         .filter_map(encode_key)
@@ -4522,7 +4546,7 @@ mod tests {
                 let all = filter::Filter::AlwaysTrue;
                 let mut top = TopK::new(skip + limit, &order, None, &all);
                 for (stamp, doc) in scrambled.iter().cloned() {
-                    top.offer(stamp, doc);
+                    top.offer(stamp, doc).unwrap();
                 }
                 let got: Vec<i64> = top
                     .into_sorted(skip)
@@ -5317,7 +5341,7 @@ mod tests {
         let order = with_id_tiebreak(&[]);
         let mut top = TopK::new(0, &order, None, &filter);
         for (stamp, doc) in all {
-            top.offer(stamp, doc);
+            top.offer(stamp, doc).unwrap();
         }
         assert!(top.into_sorted(0).unwrap().is_empty());
     }

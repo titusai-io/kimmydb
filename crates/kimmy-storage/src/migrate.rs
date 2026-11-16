@@ -27,14 +27,28 @@ use crate::tables;
 /// through.** A schema-6 store holds index entries for documents the new rule
 /// files unkeyed, and a later write to one would leave them behind. Nothing
 /// rewrites them: this build refuses a schema-6 store and backup by name.
-pub const SCHEMA_VERSION: u8 = 7;
+///
+/// **8 changes the keys an index derives from a path through arrays, and, with the
+/// document order of the same series, the key a document value encodes to.** An
+/// element lacking the field, a scalar element and an empty array on the path key
+/// `null`; a position inside the array keys that element only; `00` and `01` are
+/// field names; and a document value orders by value type, then name, then value. A
+/// schema-7 store holds entries the new rule would not write, and nothing rewrites
+/// them: this build refuses a schema-7 store and backup by name.
+///
+/// **9 changes the key of a document value**: a field is its type tag, its name, then its value
+/// without the tag, so documents order by the type of their values first. An index over documents
+/// (and a key that holds one, an array of them included, and a JavaScript value with a scope)
+/// written under schema 8 orders otherwise; this build refuses a schema-8 store and backup by
+/// name. The commits of the series between schema 8 and 9 are not deployable.
+pub const SCHEMA_VERSION: u8 = 9;
 
 /// What a refusal of a store or backup of an older schema tells the operator.
 pub(crate) fn no_upgrade() -> String {
     format!(
         "{} does not upgrade stores; stop every member, wipe this data directory, start on an \
          empty one and reseed.",
-        kimmy_core::build::SCHEMA_7_RELEASE
+        kimmy_core::build::SCHEMA_9_RELEASE
     )
 }
 
@@ -289,7 +303,7 @@ mod tests {
     }
 
     /// The store 0.57.0 wrote (schema 6) holds index entries derived under the
-    /// old array rule (ADR-259): 0.58.0 refuses it by name and writes nothing.
+    /// old array rule (ADR-259): this build refuses it by name and writes nothing.
     #[test]
     fn a_schema_6_store_is_refused_by_name_and_nothing_is_written() {
         let (_dir, path) = a_schema_5_store();
@@ -306,10 +320,62 @@ mod tests {
             Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                 assert!(why.contains("0.57.0"), "{why}");
                 assert!(why.contains("storage schema 6"), "{why}");
-                assert!(why.contains("0.58.0 does not upgrade stores"), "{why}");
+                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a schema 6 store"),
+        }
+        assert!(snapshot(&path) == before, "the store or its sidecar changed");
+    }
+
+    /// The store 0.60.0 wrote (schema 7) holds index entries keyed under the old path rule
+    /// and document order: this build refuses it by name and writes nothing.
+    #[test]
+    fn a_schema_7_store_is_refused_by_name_and_nothing_is_written() {
+        let (_dir, path) = a_schema_5_store();
+        {
+            let db = Database::create(&path).unwrap();
+            write_version(&db, 7).unwrap();
+        }
+        let mut sidecar = read_sidecar(&path).expect("a sidecar");
+        sidecar.schema = 7;
+        sidecar.written_by = "0.60.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let before = snapshot(&path);
+        match Engine::open(&path) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(why.contains("0.60.0"), "{why}");
+                assert!(why.contains("storage schema 7"), "{why}");
+                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
+            }
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a schema 7 store"),
+        }
+        assert!(snapshot(&path) == before, "the store or its sidecar changed");
+    }
+
+    /// The store a build between the two schemas of this release wrote (schema 8) holds document keys of
+    /// the old order: this build refuses it by name and writes nothing.
+    #[test]
+    fn a_schema_8_store_is_refused_by_name_and_nothing_is_written() {
+        let (_dir, path) = a_schema_5_store();
+        {
+            let db = Database::create(&path).unwrap();
+            write_version(&db, 8).unwrap();
+        }
+        let mut sidecar = read_sidecar(&path).expect("a sidecar");
+        sidecar.schema = 8;
+        sidecar.written_by = "0.61.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let before = snapshot(&path);
+        match Engine::open(&path) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(why.contains("0.61.0"), "{why}");
+                assert!(why.contains("storage schema 8"), "{why}");
+                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
+            }
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a schema 8 store"),
         }
         assert!(snapshot(&path) == before, "the store or its sidecar changed");
     }
@@ -357,7 +423,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         drop(Engine::open(&path).unwrap());
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 9);
         let db = Database::create(&path).unwrap();
         assert_eq!(stored_version(&db).unwrap(), Some(SCHEMA_VERSION));
     }

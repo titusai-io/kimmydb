@@ -106,6 +106,10 @@ pub(crate) enum UnkeyedCause {
     /// The key encoder refused a value. Unreachable since schema 5, kept as a
     /// filing rather than a panic.
     Unencodable,
+    /// A position of an index path (`a.0`) is inside an array one of whose direct
+    /// elements is a document holding a field of that name: the reference's 16746,
+    /// "Ambiguous field name found in array" (q7s3g 133, q7s3j 151-186).
+    AmbiguousPosition,
 }
 
 impl UnkeyedCause {
@@ -116,6 +120,7 @@ impl UnkeyedCause {
             Self::ParallelArrays => "parallel_arrays",
             Self::TooManyKeys => "too_many_keys",
             Self::Unencodable => "unencodable",
+            Self::AmbiguousPosition => "ambiguous_position",
         }
     }
 }
@@ -137,6 +142,11 @@ pub(crate) enum DocumentKeys {
     // filter's "no" is an answer, and such a document is outside the index
     // like any other the filter does not select: `Keyed` with no keys.
 }
+
+/// How an index key reads a path segment as a position: as a read does (`0`, or a digit 1-9 and
+/// digits; `00` and `01` are field names, q7s3f 48-82). The key walk and [`parallel_arrays`]
+/// both read it here, so that they cannot disagree, and the filter reads the same.
+const INDEX_POSITIONS: path::Positions = path::Positions::Read;
 
 /// Compute every index key a document contributes, refusing a document the
 /// index cannot key.
@@ -198,34 +208,50 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
         }
     }
 
-    // Per field, the set of values this document offers.
+    // Per field, the set of values this document offers: every value the path reaches, the
+    // items of every array among them and the array itself, and a null for an element that
+    // lacks the field, a scalar or nested-array element, or no value at all (q7s3 resolver
+    // rule, section 2(e)). A position inside an array keys that element only; a clash with a
+    // field of that name files the document unkeyed (`ambiguous_position`), never keyed.
+    let rule = path::Rule {
+        mode: path::Mode::Key,
+        on_ambiguous: path::OnAmbiguous::Unkeyed,
+        positions: INDEX_POSITIONS,
+    };
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(index.fields.len());
     let mut multikey = false;
+    let mut ambiguous = false;
 
     for field in &index.fields {
-        let resolved = path::resolve(doc, &field.path);
         let mut values: Vec<Bson> = Vec::new();
-
-        // A path that resolves to several values has fanned out through an
-        // array of documents — multikey even though no value is itself an
-        // array.
-        multikey |= resolved.len() > 1;
-
-        if resolved.is_empty() {
-            // A missing field indexes as null, so `{a: null}` and
-            // `{a: {$exists: false}}` remain answerable.
-            values.push(Bson::Null);
-        } else {
-            for value in resolved {
-                if let Bson::Array(items) = value {
-                    multikey = true;
-                    values.extend(items.iter().cloned());
-                    // ...and the array itself, for whole-array equality.
-                    values.push(value.clone());
-                } else {
-                    values.push(value.clone());
-                }
+        let walked = match path::walk_document(doc, &field.path, rule) {
+            Ok(walked) => walked,
+            // Not reachable with `Unkeyed`; filed as the same cause rather than a panic.
+            Err(path::Ambiguous16746) => {
+                ambiguous = true;
+                per_field.push(vec![Bson::Null]);
+                continue;
             }
+        };
+        ambiguous |= walked.ambiguous;
+
+        for (value, _by_position) in &walked.values {
+            if let Bson::Array(items) = value {
+                multikey = true;
+                values.extend(items.iter().cloned());
+                // ...and the array itself, for whole-array equality.
+                values.push((*value).clone());
+            } else {
+                values.push((*value).clone());
+            }
+        }
+        // A path that reaches several values, or a value and a null, has fanned out through an
+        // array of documents: multikey even though no value is itself an array.
+        multikey |= walked.values.len() + usize::from(walked.lacked) > 1;
+        // A missing field indexes as null, so `{a: null}` and `{a: {$exists: false}}` remain
+        // answerable, and so does an element lacking the field beside one that has it.
+        if walked.lacked || values.is_empty() {
+            values.push(Bson::Null);
         }
 
         // Duplicate elements would produce identical keys; drop them early.
@@ -240,6 +266,10 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
             multikey,
         })
     };
+
+    if ambiguous {
+        return unkeyed(UnkeyedCause::AmbiguousPosition, path::Ambiguous16746.to_string());
+    }
 
     if index.fields.len() > 1 && parallel_arrays(index, doc).is_some() {
         return unkeyed(
@@ -380,6 +410,9 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
             index.name
         ),
         UnkeyedCause::Unencodable => format!("{reason} (_id {id})"),
+        UnkeyedCause::AmbiguousPosition => {
+            format!("{} (index {:?}, _id {id})", path::Ambiguous16746, index.name)
+        }
     }
 }
 
@@ -408,7 +441,7 @@ fn on_one_path(a: &str, b: &str) -> bool {
 fn parallel_arrays(index: &IndexMeta, doc: &Document) -> Option<(String, String)> {
     let mut met: Vec<String> = Vec::new();
     for field in &index.fields {
-        for prefix in path::array_prefixes(doc, &field.path) {
+        for prefix in path::array_prefixes(doc, &field.path, INDEX_POSITIONS) {
             if !met.contains(&prefix) {
                 met.push(prefix);
             }
@@ -5717,6 +5750,230 @@ mod tests {
                 let scan = by_scan(&engine, &coll, &query);
                 let indexed = by_index(&engine, &coll, &query).expect("the index should apply");
                 assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
+            }
+        }
+    }
+
+    // ---- the keys of a path through arrays (the resolver rule, q7s3 recordings) ----
+
+    fn key_of(value: &Bson) -> Vec<u8> {
+        keyenc::encode_compound_ordered(&[(value.clone(), false)]).unwrap()
+    }
+
+    fn null_key() -> Vec<u8> {
+        key_of(&Bson::Null)
+    }
+
+    /// The sorted keys and the multikey flag of a keyed document.
+    fn keyed(idx: &IndexMeta, d: &Document) -> (Vec<Vec<u8>>, bool) {
+        match document_keys(idx, d).unwrap() {
+            DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
+            other => panic!("not keyed: {other:?}"),
+        }
+    }
+
+    fn sorted(mut keys: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        keys.sort();
+        keys
+    }
+
+    fn on(path: &str) -> IndexMeta {
+        index(vec![IndexField::ascending(path)], false)
+    }
+
+    #[test]
+    fn an_element_lacking_the_field_keys_null_beside_the_values_that_have_it() {
+        // q7s3g 1, 2, 10: `[{c:5},{d:1}]` keys 5 and null, so a unique index on `a.c`
+        // refuses it beside a document with no `a`.
+        let idx = on("a.c");
+        let (keys, multikey) = keyed(&idx, &doc! { "a": [{ "c": 5 }, { "d": 1 }] });
+        assert_eq!(keys, sorted(vec![key_of(&Bson::Int32(5)), null_key()]));
+        assert!(multikey, "one field contributed a value and a null: the index is multikey");
+        let (missing, _) = keyed(&idx, &doc! { "b": 1 });
+        assert!(keys.contains(&missing[0]), "and collides with a missing `a` on the null key");
+    }
+
+    #[test]
+    fn a_scalar_element_a_nested_array_an_empty_array_and_a_missing_parent_key_one_null() {
+        // q7s3g 3, 4 (scalar element), 17 (nested array), 5, 6 (empty array), 8, 15 (missing
+        // parent), 9 (null).
+        let idx = on("a.c");
+        for (what, d) in [
+            ("a scalar element", doc! { "a": [5] }),
+            ("a nested array", doc! { "a": [[{ "c": 1 }]] }),
+            ("an empty array", doc! { "a": [] }),
+            ("a missing parent", doc! { "b": 1 }),
+            ("a null", doc! { "a": Bson::Null }),
+            ("a null field", doc! { "a": { "c": Bson::Null } }),
+        ] {
+            assert_eq!(keyed(&idx, &d).0, vec![null_key()], "{what}");
+        }
+    }
+
+    #[test]
+    fn a_leaf_empty_array_is_its_own_key_and_not_null() {
+        // q7s3i 1-4, 6-10, 31-33.
+        let idx = on("a.c");
+        let (keys, _) = keyed(&idx, &doc! { "a": [{ "c": [] }] });
+        assert_eq!(keys, vec![key_of(&Bson::Array(vec![]))]);
+        assert!(!keys.contains(&null_key()), "it does not collide with missing or null");
+        let (one, _) = keyed(&idx, &doc! { "a": [{ "c": [1] }] });
+        assert!(!one.contains(&key_of(&Bson::Array(vec![]))), "nor with `[1]`");
+        // D6: `{c:[[]]}` collides with `{c:[]}` here, where the reference does not (i:5).
+        let (nested, _) = keyed(&idx, &doc! { "a": [{ "c": [[]] }] });
+        assert!(nested.contains(&key_of(&Bson::Array(vec![]))));
+    }
+
+    #[test]
+    fn a_position_inside_the_array_keys_that_element_only() {
+        // q7s3g 136: under `a.0`, `[{b:1}]` and a missing `a` do not collide.
+        let idx = on("a.0");
+        let (held, _) = keyed(&idx, &doc! { "a": [{ "b": 1 }] });
+        assert_eq!(held, vec![key_of(&Bson::Document(doc! { "b": 1 }))]);
+        assert_eq!(keyed(&idx, &doc! { "b": 1 }).0, vec![null_key()]);
+        // A leaf array reached by a position keys its items and itself (F6; f:282, g:152).
+        let (leaf, multikey) = keyed(&idx, &doc! { "a": [[1, 2]] });
+        assert_eq!(
+            leaf,
+            sorted(vec![
+                key_of(&Bson::Int32(1)),
+                key_of(&Bson::Int32(2)),
+                key_of(&bson::bson!([1, 2]))
+            ])
+        );
+        assert!(multikey);
+    }
+
+    #[test]
+    fn a_position_past_the_end_keys_field_names_and_null_for_the_elements_lacking_them() {
+        // q7s3j 175-178, 183-186.
+        let idx = on("a.1");
+        let (pe1, _) = keyed(&idx, &doc! { "a": [{ "1": 5 }] });
+        assert_eq!(pe1, vec![key_of(&Bson::Int32(5))]);
+        let (pe3, _) = keyed(&idx, &doc! { "a": [5] });
+        assert_eq!(pe3, vec![null_key()], "a scalar element lacks the field");
+        let (over_long, _) = keyed(&on("a.99999999999"), &doc! { "a": [{ "99999999999": 1 }] });
+        assert_eq!(over_long, vec![key_of(&Bson::Int32(1))], "PE 5: j:157-158");
+    }
+
+    #[test]
+    fn a_clash_between_a_position_and_a_field_of_that_name_is_unkeyed_as_ambiguous_position() {
+        // q7s3g 133, 134, 136, 137; q7s3j 151, 152.
+        for (path, d) in [
+            ("a.0", doc! { "a": [{ "0": 9 }] }),
+            ("a.0", doc! { "a": [{ "b": 1 }, { "0": 2 }] }),
+            ("a.0", doc! { "a": [[5], { "0": 9 }] }),
+            ("a.1", doc! { "a": [{ "1": 5 }, { "b": 1 }] }),
+        ] {
+            match document_keys(&on(path), &d).unwrap() {
+                DocumentKeys::Unkeyed { cause, reason, .. } => {
+                    assert_eq!(cause, UnkeyedCause::AmbiguousPosition, "{path} {d}");
+                    assert_eq!(cause.as_str(), "ambiguous_position");
+                    assert!(reason.contains("Ambiguous field name found in array"), "{reason}");
+                }
+                other => panic!("{path} {d}: keyed: {other:?}"),
+            }
+        }
+        // The same documents under a non-digit index are keyed (g:135, 138), and the ones
+        // without a clash are keyed under `a.0` (CL 4-8; PE 1, 3-6).
+        assert!(matches!(
+            document_keys(&on("a.b"), &doc! { "a": [{ "0": 9 }] }).unwrap(),
+            DocumentKeys::Keyed { .. }
+        ));
+        for d in [
+            doc! { "a": [5, 6] },
+            doc! { "a": [{ "b": 1 }] },
+            doc! { "b": 1 },
+            doc! { "a": { "0": 3 } },
+            doc! { "a": [[{ "0": 1 }]] },
+        ] {
+            assert!(matches!(document_keys(&on("a.0"), &d).unwrap(), DocumentKeys::Keyed { .. }));
+        }
+    }
+
+    /// The documents of q7s3's fixtures AD, POS, SD, CL, PE and EP, one value of `a` each.
+    fn resolver_corpus() -> Vec<Document> {
+        let values: Vec<Bson> = vec![
+            bson::bson!([{ "b": null }, { "c": 1 }]),
+            bson::bson!([{ "c": 5 }, { "d": 1 }]),
+            bson::bson!([1, 2]),
+            bson::bson!([]),
+            bson::bson!([{ "c": null }]),
+            bson::bson!([{ "c": 1 }, { "c": null }]),
+            bson::bson!([{ "c": [] }]),
+            bson::bson!({ "c": 1 }),
+            bson::bson!([{ "c": 3 }, { "c": 1 }]),
+            bson::bson!([{ "c": [5, 1] }, { "c": 4 }]),
+            bson::bson!([null, { "c": 9 }]),
+            bson::bson!([[{ "c": 1 }]]),
+            bson::bson!({ "c": null }),
+            bson::bson!([5, 6, 7]),
+            bson::bson!([[1, 2], [3, 4]]),
+            bson::bson!([{ "x": 1 }, { "x": 2 }]),
+            bson::bson!({ "0": "x", "1": "y", "01": "z", "00": "w" }),
+            bson::bson!([{ "0": 9 }]),
+            bson::bson!({ "b": [5, 6] }),
+            bson::bson!([[5]]),
+            bson::bson!({ "0": [1, 2] }),
+            bson::bson!("str"),
+            bson::bson!([[1], { "c": 9 }]),
+            bson::bson!([{ "b": 1 }, { "0": 2 }]),
+            bson::bson!([[5], { "0": 9 }]),
+            bson::bson!([{ "1": 5 }]),
+            bson::bson!([{ "1": 5 }, { "b": 1 }]),
+            bson::bson!([{ "99999999999": 1 }]),
+            bson::bson!([[[3]]]),
+            bson::bson!([[{ "b": 2 }]]),
+            bson::bson!([[[1, 2]], [3]]),
+        ];
+        let mut docs: Vec<Document> = values.into_iter().map(|v| doc! { "a": v }).collect();
+        docs.push(doc! { "z": 1 });
+        docs
+    }
+
+    const RESOLVER_PATHS: [&str; 15] = [
+        "a",
+        "a.c",
+        "a.b",
+        "a.x",
+        "a.0",
+        "a.1",
+        "a.2",
+        "a.0.c",
+        "a.1.c",
+        "a.0.0",
+        "a.0.b",
+        "a.00",
+        "a.01",
+        "a.99999999999",
+        "a.b.0",
+    ];
+
+    /// The superset invariant of the key change, in the form a unit test can state: every
+    /// value the filter reads at a path *as it reads it until the read-position switch*
+    /// (`path::resolve`), and every item of such an array, has its key, and a document the
+    /// filter reads as null (no value) has the null key. An index never offers fewer
+    /// candidates than the scan's answer. A clash document is unkeyed, never keyed short.
+    #[test]
+    fn every_value_the_filter_reaches_is_keyed_and_so_is_the_null_it_reads() {
+        for path in RESOLVER_PATHS {
+            let idx = on(path);
+            for d in resolver_corpus() {
+                let DocumentKeys::Keyed { keys, .. } = document_keys(&idx, &d).unwrap() else {
+                    continue;
+                };
+                let reached = path::resolve(&d, path);
+                for value in &reached {
+                    assert!(keys.contains(&key_of(value)), "{path} over {d}: {value}");
+                    if let Bson::Array(items) = value {
+                        for item in items {
+                            assert!(keys.contains(&key_of(item)), "{path} over {d}: item {item}");
+                        }
+                    }
+                }
+                if reached.is_empty() {
+                    assert!(keys.contains(&null_key()), "{path} over {d}: no value reads null");
+                }
             }
         }
     }

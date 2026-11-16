@@ -880,7 +880,7 @@ and listed by `GET …/indexes/{name}/unkeyed`
 `GET …/indexes/{name}/unkeyed?limit=&cursor=` answers
 `{"index": "tags_1_sizes_1", "unkeyed": [{"_id": 1, "reason": "parallel_arrays"}],
 "count": 1, "nextCursor": "…"}`, `nextCursor` present while the run holds more;
-`reason` is `parallel_arrays` or `too_many_keys`. An index the collection does not
+`reason` is `parallel_arrays`, `too_many_keys` or `ambiguous_position`. An index the collection does not
 have is `404`.
 
 Creating an index under a name the collection already has is **idempotent

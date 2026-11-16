@@ -12,6 +12,35 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Read before upgrading: this release does not open a data directory or a backup written by 0.60.0 or older (storage schema 9); 0.61.0 does not open a store written by an older version at all. Stop every member, wipe the data, start on empty directories and reseed.**
+
+The cluster protocol is unchanged by this part of the release, and members of different schemas never join. A path through arrays now has one rule for a filter, a sort and an index, and a document value has one order, so the keys of an old index are not the keys of a new one.
+
+**Changed (breaking): a path through an array of documents reads an element that lacks the field as `null`, in a filter, a partial index, and the keys of an index.** `{"a.c": null}` matches `{a: [{c: 5}, {d: 1}]}` and no longer matches `{a: []}`, and `{a: [1, 2]}` (an empty array and an element that is not a document contribute nothing). `$gte: null` and `$lte: null` follow an equality. A position is `0` or a digit 1-9 and digits in every read: `a.00` and `a.01` are field names in a filter, a sort, an index and a projection (an update path still writes `00` and `01` as positions), and a leaf array reached by a position is compared whole, not by its elements. `$elemMatch` takes each element as one value in its operator form, a document element included, and reads an array element as `{"0": ..}` in its field form; `arrayFilters` traverse the element; `$exists: true` records a position for the positional `$`, and a positional projection of a document without the array returns it without the field.
+
+**Changed (breaking): an index keys an element that lacks the field, a scalar element, a nested array element, an empty array on the path and a missing parent as `null`, so a unique index collides on them.** `[{c: 5}, {d: 1}]` and a document with no `a` now collide under a unique index on `a.c`, and so do `[5]`, `[]` and `[[{c: 1}]]` with each other. A leaf `[]` is its own key and collides with another `[]` only. A position inside the array keys that element only. A sparse unique index is the partial `{$exists: true}` and keeps these `null` keys, so it refuses what the reference's sparse index accepts (a stated difference, deviations register).
+
+**Changed: every reader of a field path takes a position by the one read rule** (`$unwind`, `$lookup` field paths and `$graphLookup`'s `connectToField`, `$densify`, `$fill`, `$setWindowFields`, the positional projection, a vector index's source field, and TTL's recheck of a document): `a.00` and `a.01` name fields there, as in a filter. An update path is unchanged, and so is `$graphLookup`'s `connectFromField`, which keeps `00` and `01` as positions. A TTL index on a path with a position never expires a replicated document that is ambiguous there (it is filed unkeyed).
+
+**Changed (breaking): a position beside a field of that name is refused (`ambiguous_position`; the reference's 16746, "Ambiguous field name found in array").** A local write, a local `createIndex` and a build over documents refuse a document on which an index path with a position (`a.0`) is inside an array one of whose direct elements is a document holding the field `0`; a replicated arrival is filed unkeyed and announced, as for parallel arrays. A sort refuses the same shape at sort time (`find`, `find_and_modify`, `$sort`, `$setWindowFields`, `$fill`), judged on the documents the sort reads. `$sortArray` and `$push`'s `$sort` never refuse; they compare the value a path ends at whole.
+
+**Changed (breaking): documents are ordered by the type of their values, then their names, then the values, recursively, where they were ordered by name first.** `{c: "z"}` is after `{d: 1}` now. A sort, a comparison, `$cmp`, `$min` and `$max` of every kind, a `$group` `$min` and `$max`, an update `$min` and `$max`, and the key order of an index over documents follow it.
+
+**Before the wipe, find what 0.60.0 accepted that this release refuses.** Run on 0.60.0, per collection. (1) For each unique index on a path `arr.f` through one array, the documents with an element that is not a document or lacks `f`, plus the documents `{"arr.f": null}` matches today; more than one in total is a reseed refused at the second. Deeper paths need one `$map` per array level.
+
+```
+{$expr: {$anyElementTrue: [{$map: {input: {$cond: [{$isArray: "$arr"}, "$arr", []]},
+  as: "e", in: {$or: [{$ne: [{$type: "$$e"}, "object"]}, {$eq: [{$type: "$$e.f"}, "missing"]}]}}}]}}
+```
+
+(2) For each index on a path `arr.N...`, the documents whose `arr` has more than `N` elements and a document element holding the field named `N` (`"$$e.N"` reads that field in an expression); each is refused on reseed.
+
+```
+{$expr: {$and: [{$isArray: "$arr"}, {$gt: [{$size: "$arr"}, N]},
+  {$anyElementTrue: [{$map: {input: "$arr", as: "e", in: {$and: [{$eq: [{$type: "$$e"}, "object"]},
+  {$ne: [{$type: "$$e.N"}, "missing"]}]}}}]}]}}
+```
+
 **Changed (breaking):** a member of `$in` or `$nin` that is a document with a `$`-led key is now a `400` (`cannot nest $ under $in`), where it was compared as a document and answered `200`: `{"a": {"$in": [{"$options": "i"}]}}`, `{"$nin": [{"$gt": 1}]}`. A regular expression in one of its shapes is still a pattern, a member document of plain keys is a value, and `$eq` of the whole document is unchanged: a stored document with a `$`-led key is still found by `$eq` of that document. See [Comparison](docs/query-language.md#comparison).
 
 **Changed:** an empty array as the value a sort reaches now sorts below `null`, as the reference orders it: first ascending, after a `MinKey` only, and second to last descending, where it sorted among the arrays, after the documents (`{"tags": 1}` over a `tags: []` came after every document, and now comes before a missing `tags` and a `null`). The same holds at any depth (`items.sku` over `items: [{sku: []}]`); an empty array that is an element of the array reached (`tags: [[]]`) still ranks as an array among the arrays. `find`, `find_and_modify`, the `$sort` stage, `$sortArray` with a key document, `$push`'s `$sort` and `$setWindowFields` order alike; the order of an index and the comparison operators are unchanged. See [Sort and projection](docs/query-language.md#sort-and-projection).

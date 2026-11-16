@@ -88,7 +88,7 @@ the document and why:
 }
 ```
 
-`reason` is `parallel_arrays` or `too_many_keys`. The event is **per member and
+`reason` is `parallel_arrays`, `too_many_keys` or `ambiguous_position`. The event is **per member and
 not replicated**, like `uniqueViolation`: each member that files the document
 reports it under its own stamp, so a watcher on any member sees one event per
 index per document on that member. It is sent on the **move into the unkeyed

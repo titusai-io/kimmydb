@@ -113,6 +113,14 @@ pub trait ModifySpec {
     /// which is `_id` order for an index scan and storage order otherwise.
     fn compare(&self, a: &Document, b: &Document) -> Ordering;
 
+    /// Whether a match can be ordered, asked of **every** match before any two are compared. An
+    /// `Err` is the caller's refusal of the sort for this document, which fails the write before
+    /// anything is written (the reference's 16746, for a sort that reads a position beside a
+    /// field of that name). The default orders everything.
+    fn check_sortable(&self, _doc: &Document) -> kimmy_core::Result<()> {
+        Ok(())
+    }
+
     /// The new document, or `None` to remove it.
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String>;
 
@@ -601,6 +609,11 @@ impl Engine {
 
         if matches.is_empty() {
             return Ok(None);
+        }
+        // The keys of every match are taken before any two are compared, so a document the sort
+        // cannot read refuses it whether or not it would have been compared.
+        for found in &matches {
+            spec.check_sortable(&found.doc).map_err(StorageError::Core)?;
         }
         // `sort_by` rather than picking a minimum: the comparator is the
         // caller's whole sort specification, and a stable sort keeps the

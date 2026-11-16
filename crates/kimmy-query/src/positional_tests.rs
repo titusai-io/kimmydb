@@ -364,20 +364,29 @@ fn each_element_condition_skips_an_array_element_holding_its_value() {
 }
 
 /// Conditions that are not about one element record nothing, whatever the
-/// array holds.
+/// array holds: `$nin`, `$ne`, `$size`, `$all` and `$not`. (`$exists: true` is not one of them:
+/// it records a position, see the test below.)
 #[test]
-fn conditions_that_are_not_about_an_element_record_nothing() {
+fn conditions_that_are_not_about_an_element_record_nothing_but_exists_true_does() {
     let d = doc! { "_id": 1, "a": [[1, 2], 1, 5] };
     for f in [
         doc! { "a": { "$nin": [9] } },
         doc! { "a": { "$ne": 9 } },
         doc! { "a": { "$size": 3 } },
-        doc! { "a": { "$exists": true } },
         doc! { "a": { "$all": [1, 5] } },
         doc! { "a": { "$not": { "$gt": 99 } } },
     ] {
         assert_eq!(at(f.clone(), &d), None, "{f}");
     }
+}
+
+/// `$exists: true` records a position, the first element: `{arr: {$exists: true}}` over
+/// `[1, 2, 3, 2]` writes index 0 through `arr.$` (q7s2l0034 to q7s2l0036), and the filters of
+/// q7s3i0181 to q7s3i0184 apply with a `$` over `$exists` conditions.
+#[test]
+fn exists_true_records_the_first_element_as_a_position() {
+    let d = doc! { "_id": 1, "a": [[1, 2], 1, 5] };
+    assert_eq!(at(doc! { "a": { "$exists": true } }, &d), Some(("a".to_string(), 0)));
 }
 
 #[test]

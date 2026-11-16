@@ -377,12 +377,28 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
     }
 }
 
+/// Whether a path has a segment a read takes for an array position (`a.0`, `a.b.1.c`).
+///
+/// An index on such a path does not hold the null a filter reads from the field-name reading of
+/// a position inside the array: `{"a.0": null}` matches `{a: [{b: 1}]}` (the element at `0` lacks
+/// the field `0`), whose key under `a.0` is the element, not null. The reference answers such a
+/// query from its index and returns less than a scan does (q7s3g 133; deviation D3); this plan
+/// never offers fewer candidates than the scan, so it does not use the index for a predicate a
+/// null satisfies.
+fn reads_a_position(path: &str) -> bool {
+    kimmy_core::path::segments(path)
+        .into_iter()
+        .any(|s| kimmy_core::path::read_position(s).is_some())
+}
+
 /// Build a plan for one index, if the predicates cover its leading fields.
 fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<IndexPlan> {
-    // How many leading fields have an equality predicate.
+    // How many leading fields have an equality predicate. An equality with null on a field whose
+    // path reads a position ends the prefix before it (see `reads_a_position`).
     let mut prefix: Vec<(Bson, bool)> = Vec::new();
     for field in &index.fields {
         match predicates.get(&field.path).and_then(|b| b.eq.clone()) {
+            Some(Bson::Null) if reads_a_position(&field.path) => break,
             Some(value) => prefix.push((value, field.descending)),
             None => break,
         }
@@ -395,7 +411,10 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
     // are sound on a multikey index, which a two-sided range is not.
     if let Some(field) = index.fields.get(prefix.len())
         && let Some(bounds) = predicates.get(&field.path)
-        && let Some(values) = &bounds.in_values
+        // A `$in` holding null on a field that reads a position is dropped whole.
+        && let Some(values) = bounds.in_values.as_ref().filter(|values| {
+            !(reads_a_position(&field.path) && values.iter().any(|v| matches!(v, Bson::Null)))
+        })
     {
         // One probe per distinct value. Deduplicated on the *encoded* key, so
         // `[5, 5.0]` — one value in two numeric spellings — probes once, the
@@ -434,10 +453,17 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
     let mut both_bounds = false;
     let mut ranged = false;
 
-    if let Some(field) = index.fields.get(prefix.len())
-        && let Some(bounds) = predicates.get(&field.path)
-        && (bounds.lower.is_some() || bounds.upper.is_some())
-    {
+    // A bound of null on a field that reads a position is not used: `$gte` and `$lte` of null
+    // hold for a lacking field (see `reads_a_position`). A dropped bound only widens the range.
+    let ranged_field = index.fields.get(prefix.len()).and_then(|field| {
+        let bounds = predicates.get(&field.path)?;
+        let positioned = reads_a_position(&field.path);
+        let usable =
+            |b: &Option<Bson>| b.clone().filter(|v| !(positioned && matches!(v, Bson::Null)));
+        let (low, high) = (usable(&bounds.lower), usable(&bounds.upper));
+        (low.is_some() || high.is_some()).then_some((field, low, high))
+    });
+    if let Some((field, low_bound, high_bound)) = ranged_field {
         // Whether BOTH ends of the range may be used hangs on one fact
         // about the data, not the query: does any document contribute more
         // than one key?
@@ -463,7 +489,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         // a range that is too narrow — which is why, until it had its own
         // property test, the range was dropped here rather than risked.
         let desc = field.descending;
-        match (&bounds.lower, &bounds.upper) {
+        match (&low_bound, &high_bound) {
             (Some(lo), Some(hi)) if !index.multikey => {
                 let (key_low, key_high) = if desc { (hi, lo) } else { (lo, hi) };
                 lower.push((key_low.clone(), desc));
