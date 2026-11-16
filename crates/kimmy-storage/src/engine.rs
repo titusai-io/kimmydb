@@ -5648,6 +5648,7 @@ pub(crate) fn ddl_entry<T: serde::Serialize>(
         collection,
         doc_id: None,
         body: Some(bson::serialize_to_vec(payload)?),
+        meta: None,
     })
 }
 

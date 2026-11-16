@@ -455,6 +455,7 @@ fn entry(origin: NodeId, wall: u64, collection: kimmy_core::CollectionId, id: i6
         collection,
         doc_id: Some(DocId::Int64(id)),
         body: Some(bson::serialize_to_vec(&document(id)).unwrap()),
+        meta: None,
     }
 }
 

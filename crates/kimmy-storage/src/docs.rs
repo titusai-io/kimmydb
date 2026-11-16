@@ -700,6 +700,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: Some(body),
+            meta: None,
         };
         append_oplog(txn, &entry)?;
 
@@ -875,6 +876,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: Some(body),
+            meta: None,
         };
         append_oplog(txn, &entry)?;
 
@@ -1055,6 +1057,7 @@ impl Engine {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: None,
+            meta: None,
         };
         append_oplog(txn, &entry)?;
 
@@ -1879,6 +1882,7 @@ impl Engine {
             collection: coll.id,
             doc_id: None,
             body: Some(bson::serialize_to_vec(&detail)?),
+            meta: None,
         };
         append_oplog(&txn, &entry)?;
         txn.commit()?;
@@ -1909,6 +1913,7 @@ impl Engine {
                 collection,
                 doc_id: None,
                 body: Some(bson::serialize_to_vec(&detail)?),
+                meta: None,
             };
             append_oplog(txn, &entry)?;
             entries.push(entry);
@@ -2670,6 +2675,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(id.clone()),
             body: body.map(|d| bson::serialize_to_vec(&d).unwrap()),
+            meta: None,
         }
     }
 
@@ -2798,6 +2804,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&doc).unwrap()),
+            meta: None,
         }
     }
 
@@ -3499,6 +3506,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "x", "pad": "y".repeat(64) }).unwrap(),
             ),
+            meta: None,
         };
         let mut bytes = codec::encode_oplog_entry(&entry);
         bytes.truncate(bytes.len() - 8);

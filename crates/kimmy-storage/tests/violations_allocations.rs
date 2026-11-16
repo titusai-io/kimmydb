@@ -114,6 +114,7 @@ fn build(path: &std::path::Path, documents: usize, violations: usize) {
                     )
                     .unwrap(),
                 ),
+                meta: None,
             };
             assert!(engine.apply_remote(&coll, &entry).unwrap());
             made += 1;

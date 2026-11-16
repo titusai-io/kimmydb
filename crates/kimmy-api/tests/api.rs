@@ -4783,6 +4783,7 @@ async fn standing_unique_violations_are_reported_until_resolved() {
         body: Some(
             bson::serialize_to_vec(&bson::doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
         ),
+        meta: None,
     };
     server.state.engine.apply_remote(&meta, &remote).unwrap();
 
@@ -4858,6 +4859,7 @@ async fn a_violation_names_a_uuid_holder_with_its_subtype() {
         body: Some(
             bson::serialize_to_vec(&bson::doc! { "_id": remote_id, "email": "clash@x" }).unwrap(),
         ),
+        meta: None,
     };
     server.state.engine.apply_remote(&meta, &remote_entry).unwrap();
 
@@ -4917,6 +4919,7 @@ async fn a_rewritten_member_leaves_its_violation_group() {
             body: Some(
                 bson::serialize_to_vec(&bson::doc! { "_id": id, "email": "clash@x" }).unwrap(),
             ),
+            meta: None,
         };
         server.state.engine.apply_remote(&meta, &remote).unwrap();
     }
@@ -5045,6 +5048,7 @@ async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_stand
             collection: meta.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id, "email": email }).unwrap()),
+            meta: None,
         };
     server
         .state
@@ -13675,6 +13679,7 @@ fn replicated_into(
         collection: meta.id,
         doc_id: Some(id),
         body: Some(bson::serialize_to_vec(&body).unwrap()),
+        meta: None,
     };
     server.state.engine.apply_remote(&meta, &entry).unwrap();
 }

@@ -319,7 +319,7 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
 /// stamp back. The entry on the wire (serde) keeps its stamp.
 pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
-    out.push(FORMAT_VERSION);
+    out.push(if entry.meta.is_some() { META_FORMAT_VERSION } else { FORMAT_VERSION });
     out.push(op_kind_tag(entry.kind));
     out.extend_from_slice(&entry.collection.0.to_be_bytes());
 
@@ -333,6 +333,10 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     }
 
     put_opt_bytes(entry.body.as_deref(), &mut out);
+    // version 2 only: the merge state follows the body
+    if let Some(meta) = &entry.meta {
+        put_bytes(meta, &mut out);
+    }
     out
 }
 
@@ -343,7 +347,7 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
 /// entry is judged on these nine bytes, and only a match pays for
 /// [`decode_oplog_entry`] and the copy of its body.
 pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, CollectionId)> {
-    check_version(&mut input)?;
+    check_version_meta(&mut input)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
@@ -354,7 +358,7 @@ pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, Col
 /// ([`decode_oplog_key`]), the rest is the value ([`encode_oplog_entry`]).
 pub fn decode_oplog_entry(key: &[u8], mut input: &[u8]) -> Result<OplogEntry> {
     let stamp = decode_oplog_key(key)?;
-    check_version(&mut input)?;
+    let has_meta = check_version_meta(&mut input)?;
     let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
     let collection =
         CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
@@ -364,8 +368,9 @@ pub fn decode_oplog_entry(key: &[u8], mut input: &[u8]) -> Result<OplogEntry> {
         None => None,
     };
     let body = take_opt_bytes(&mut input)?.map(<[u8]>::to_vec);
+    let meta = if has_meta { Some(take_bytes(&mut input)?.to_vec()) } else { None };
 
-    Ok(OplogEntry { stamp, kind, collection, doc_id, body })
+    Ok(OplogEntry { stamp, kind, collection, doc_id, body, meta })
 }
 
 /// An entry encoded for the `OPLOG` table and read back under its own key: the round trip a
@@ -542,6 +547,63 @@ mod tests {
     }
 
     #[test]
+    fn an_oplog_entry_without_meta_is_the_version_1_bytes_and_one_with_meta_round_trips() {
+        let base = OplogEntry {
+            stamp: stamp(100, 1),
+            kind: OpKind::Insert,
+            collection: CollectionId(7),
+            doc_id: Some(DocId::String("k".into())),
+            body: Some(b"doc".to_vec()),
+            meta: None,
+        };
+        let v1 = encode_oplog_entry(&base);
+        assert_eq!(v1[0], FORMAT_VERSION);
+        // version 1: kind, collection, id (length-prefixed), body (length-prefixed), nothing after
+        let id_len = 1 + 4 + 1; // tag, length, "k"
+        assert_eq!(v1.len(), 1 + 1 + 8 + 4 + id_len + 4 + 3);
+        for meta in [Vec::new(), vec![1, 2, 3], vec![9; 70_000]] {
+            let with = OplogEntry { meta: Some(meta), ..base.clone() };
+            let bytes = encode_oplog_entry(&with);
+            assert_eq!(bytes[0], META_FORMAT_VERSION);
+            assert_eq!(
+                &bytes[1..v1.len()],
+                &v1[1..],
+                "the rest of the entry is the version 1 layout"
+            );
+            assert_eq!(oplog_round_trip(&with).unwrap(), with);
+            assert_eq!(
+                decode_oplog_kind_and_collection(&bytes).unwrap(),
+                (OpKind::Insert, CollectionId(7))
+            );
+            let mut cut = bytes.clone();
+            cut.truncate(bytes.len() - 1);
+            assert!(decode_oplog_entry(&oplog_key(&with.stamp), &cut).is_err());
+        }
+        assert_eq!(oplog_round_trip(&base).unwrap(), base);
+    }
+
+    #[test]
+    fn the_wire_form_of_an_entry_without_meta_has_no_meta_key_and_one_with_meta_is_binary() {
+        let base = OplogEntry {
+            stamp: stamp(100, 1),
+            kind: OpKind::Insert,
+            collection: CollectionId(7),
+            doc_id: Some(DocId::String("k".into())),
+            body: Some(b"doc".to_vec()),
+            meta: None,
+        };
+        let plain = bson::serialize_to_vec(&base).unwrap();
+        assert!(!plain.windows(5).any(|w| w == b"meta\0"), "no meta key without meta");
+        let with = OplogEntry { meta: Some(vec![7; 1000]), ..base.clone() };
+        let wire = bson::serialize_to_vec(&with).unwrap();
+        assert!(wire.len() < plain.len() + 1100, "binary, not an int32 per byte: {}", wire.len());
+        let back: OplogEntry = bson::deserialize_from_slice(&wire).unwrap();
+        assert_eq!(back, with);
+        let back: OplogEntry = bson::deserialize_from_slice(&plain).unwrap();
+        assert_eq!(back, base);
+    }
+
+    #[test]
     fn oplog_entry_round_trips() {
         let entries = [
             OplogEntry {
@@ -550,6 +612,7 @@ mod tests {
                 collection: CollectionId(7),
                 doc_id: Some(DocId::String("k".into())),
                 body: Some(b"doc".to_vec()),
+                meta: None,
             },
             // A delete carries no body.
             OplogEntry {
@@ -558,6 +621,7 @@ mod tests {
                 collection: CollectionId(7),
                 doc_id: Some(DocId::Int64(42)),
                 body: None,
+                meta: None,
             },
             // A collection-level op carries neither id nor body.
             OplogEntry {
@@ -566,6 +630,7 @@ mod tests {
                 collection: CollectionId(u64::MAX),
                 doc_id: None,
                 body: None,
+                meta: None,
             },
         ];
         for entry in entries {
@@ -584,6 +649,7 @@ mod tests {
             collection: CollectionId(1),
             doc_id: Some(DocId::Int64(1)),
             body: Some(Vec::new()),
+            meta: None,
         };
         let none = OplogEntry { body: None, ..base.clone() };
         assert_ne!(encode_oplog_entry(&base), encode_oplog_entry(&none));
@@ -631,6 +697,7 @@ mod tests {
             collection: CollectionId(1),
             doc_id: Some(DocId::String("abc".into())),
             body: Some(b"xyz".to_vec()),
+            meta: None,
         };
         let key = oplog_key(&entry.stamp);
         let full = encode_oplog_entry(&entry);

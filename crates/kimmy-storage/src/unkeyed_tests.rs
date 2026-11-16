@@ -107,6 +107,7 @@ fn remote(c: &CollectionMeta, id: i64, wall: u64, body: Document) -> OplogEntry 
         collection: c.id,
         doc_id: Some(DocId::Int64(id)),
         body: Some(bson::serialize_to_vec(&with_id(id, body)).unwrap()),
+        meta: None,
     }
 }
 
@@ -763,6 +764,7 @@ fn remote_id(
         collection: c.id,
         doc_id: Some(id.clone()),
         body: Some(bson::serialize_to_vec(&body).unwrap()),
+        meta: None,
     }
 }
 

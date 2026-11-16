@@ -2482,6 +2482,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+            meta: None,
         }
     }
 
@@ -3118,6 +3119,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
             body: None,
+            meta: None,
         };
         engine.apply_batch(std::slice::from_ref(&old)).unwrap();
         assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
@@ -3153,6 +3155,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
             body: None,
+            meta: None,
         };
         engine.apply_batch(std::slice::from_ref(&old)).unwrap();
         assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
@@ -3350,6 +3353,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
             body: None,
+            meta: None,
         };
         engine.apply_batch(std::slice::from_ref(&late)).unwrap();
         assert!(engine.arrival_of(&late.stamp).unwrap().is_some(), "premise: held");
@@ -3411,6 +3415,7 @@ mod tests {
             collection: coll.id,
             doc_id: Some(kimmy_core::DocId::Int64(99)),
             body: None,
+            meta: None,
         };
         engine.apply_batch(std::slice::from_ref(&late)).unwrap();
         let horizon = engine.oplog_collected().unwrap().get(engine.origin());
@@ -4295,6 +4300,7 @@ mod tests {
             collection: late.id,
             doc_id: Some(kimmy_core::DocId::Int64(2)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap()),
+            meta: None,
         };
         let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
         crate::engine::append_oplog(&txn, &drop).unwrap();
@@ -4570,6 +4576,7 @@ mod tests {
                     collection: self.coll.id,
                     doc_id: Some(kimmy_core::DocId::String(id.clone())),
                     body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+                    meta: None,
                 };
                 self.apply(&entry, position);
                 self.applied.push(entry);
@@ -4878,6 +4885,7 @@ mod tests {
                 collection: store.coll.id,
                 doc_id: Some(kimmy_core::DocId::String("stray".into())),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": "stray" }).unwrap()),
+                meta: None,
             };
             store.apply(&entry, Position::Hold);
             let db = store.engine().db();

@@ -1263,6 +1263,7 @@ mod tests {
                 collection: orders.id,
                 doc_id: Some(DocId::Int64(7_000)),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 7000i64 }).unwrap()),
+                meta: None,
             };
             e.apply_remote(&orders, &entry).unwrap();
         }
@@ -1512,6 +1513,7 @@ mod tests {
                 collection: items.id,
                 doc_id: Some(DocId::Int64(8_000)),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+                meta: None,
             };
             node.apply_remote(&items, &entry).unwrap();
         }
@@ -1589,6 +1591,7 @@ mod tests {
                 collection: items.id,
                 doc_id: Some(DocId::Int64(8_000)),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+                meta: None,
             };
             node.apply_remote(&items, &entry).unwrap();
         }

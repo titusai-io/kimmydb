@@ -835,7 +835,14 @@ impl Engine {
             )?;
         }
 
-        let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };
+        let entry = OplogEntry {
+            stamp,
+            kind,
+            collection: coll.id,
+            doc_id: Some(id.clone()),
+            body,
+            meta: None,
+        };
         append_oplog(txn, &entry)?;
         Ok(Some(entry))
     }
@@ -2444,6 +2451,7 @@ mod tests {
                 collection: coll.id,
                 doc_id: Some(DocId::Int64(-1 - i)),
                 body: Some(bson::serialize_to_vec(&body).unwrap()),
+                meta: None,
             };
             assert!(engine.apply_remote(&coll, &entry).unwrap());
         }

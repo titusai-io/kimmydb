@@ -1271,6 +1271,7 @@ fn entry_stamped(collection: kimmy_core::CollectionId, wall_ms: u64) -> kimmy_co
         collection,
         doc_id: Some(DocId::String("clock".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "clock" }).unwrap()),
+        meta: None,
     }
 }
 
@@ -1890,6 +1891,7 @@ async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stam
         collection: ca.id,
         doc_id: Some(DocId::String(id.clone())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+        meta: None,
     };
     let h = base + 1_024;
     let mut history: Vec<kimmy_core::OplogEntry> =
@@ -1969,6 +1971,7 @@ async fn a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_
             collection: ca.id,
             doc_id: Some(DocId::String(format!("x{i}"))),
             body: Some(bson::serialize_to_vec(&doc! { "_id": format!("x{i}") }).unwrap()),
+            meta: None,
         }
     };
     let history: Vec<kimmy_core::OplogEntry> = (0..3_000).map(entry).collect();
@@ -3515,6 +3518,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
         body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+        meta: None,
     };
     if !fresh {
         b.engine.apply_remote(&coll, &entry(0)).unwrap();
@@ -7449,6 +7453,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
         collection,
         doc_id: Some(DocId::String("d0".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+        meta: None,
     };
     b.engine.apply_remote(&coll, &entry).unwrap();
     let mut theirs = kimmy_core::VersionVector::new();
@@ -7569,6 +7574,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
         collection,
         doc_id: Some(DocId::String("d0".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+        meta: None,
     };
     let mut theirs = kimmy_core::VersionVector::new();
     theirs.insert(origin, Hlc::new(1_000_000, 0));
@@ -7709,6 +7715,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
         collection,
         doc_id: Some(DocId::String("d0".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+        meta: None,
     };
     b.engine.apply_remote(&coll, &entry).unwrap();
     let mut theirs = kimmy_core::VersionVector::new();
@@ -8111,6 +8118,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
         body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+        meta: None,
     };
     let mut theirs = kimmy_core::VersionVector::new();
     theirs.insert(origin, Hlc::new(1_000_000, 0));
@@ -8277,6 +8285,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
         collection,
         doc_id: Some(DocId::String(format!("d{n}"))),
         body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+        meta: None,
     };
     let mut theirs = kimmy_core::VersionVector::new();
     theirs.insert(origin, Hlc::new(1_000_000, 0));
@@ -9014,6 +9023,7 @@ async fn the_replay_moves_the_clock_past_the_lost_writes() {
         collection: meta.id,
         doc_id: Some(DocId::String("99".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "99" }).unwrap()),
+        meta: None,
     };
     peer.engine.apply_batch(std::slice::from_ref(&lost)).unwrap();
 
@@ -9606,6 +9616,7 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
         collection: peer_only.id,
         doc_id: Some(DocId::String("lost".into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": "lost" }).unwrap()),
+        meta: None,
     };
     scenario.peer.engine.apply_batch(std::slice::from_ref(&lost)).unwrap();
 

@@ -1252,6 +1252,7 @@ fn foreign(
         collection,
         doc_id: Some(kimmy_core::DocId::Int64(n)),
         body: Some(bson::serialize_to_vec(&doc! { "_id": n }).unwrap()),
+        meta: None,
     }
 }
 

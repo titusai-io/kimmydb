@@ -3082,6 +3082,7 @@ async fn a_start_serves_a_store_that_holds_the_stragglers_of_a_late_drop_without
             collection: on_b.id,
             doc_id: Some(kimmy_core::DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1i64, "from": "a" }).unwrap()),
+            meta: None,
         };
         assert!(engine.apply_remote(&on_b, &straggler).unwrap());
         // The drop this member holds, below its life: recorded as a member

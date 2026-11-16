@@ -3753,6 +3753,7 @@ mod tests {
             collection: kimmy_core::CollectionId::derive("db", "c"),
             doc_id: Some(DocId::String("x".into())),
             body: None,
+            meta: None,
         }
     }
 
@@ -3817,6 +3818,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
             ),
+            meta: None,
         };
         a.apply_remote(&ca, &clash).unwrap();
         assert_eq!(a.unique_violations(), 1);
@@ -3887,6 +3889,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
             ),
+            meta: None,
         };
         a.apply_remote(&ca, &clash).unwrap();
         assert_eq!(a.unique_violations(), 1, "the collision must have been recorded");
@@ -4050,6 +4053,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
             ),
+            meta: None,
         };
         a.apply_remote(&ca, &clash).unwrap();
         assert_eq!(a.unique_violations(), 1);
@@ -4324,6 +4328,7 @@ mod tests {
                                 )
                                 .unwrap(),
                             ),
+                            meta: None,
                         };
                         a.apply_batch(&[entry]).unwrap();
                     } else {
@@ -4702,6 +4707,7 @@ mod tests {
                 collection: ca_new.id,
                 doc_id: Some(DocId::String("ghost".into())),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": "ghost" }).unwrap()),
+                meta: None,
             };
             let outcome = a.apply_batch(&[entry]).unwrap();
             assert_eq!(
@@ -4726,6 +4732,7 @@ mod tests {
                 body: Some(
                     bson::serialize_to_vec(&doc! { "_id": format!("live-{offset}") }).unwrap(),
                 ),
+                meta: None,
             };
             let outcome = a.apply_batch(&[entry]).unwrap();
             assert_eq!(outcome.applied, 1, "post-recreation writes must apply (offset {offset})");
@@ -4756,6 +4763,7 @@ mod tests {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
             ),
+            meta: None,
         };
         a.apply_remote(&ca, &entry).unwrap();
         assert_eq!(a.unique_violations(), 1, "the collision must have been recorded");
@@ -5297,6 +5305,7 @@ mod tests {
             collection: cb.id,
             doc_id: Some(DocId::String(id.into())),
             body: Some(bson::serialize_to_vec(&doc! { "_id": id, "email": email }).unwrap()),
+            meta: None,
         };
         let entries = vec![
             remote(9_000, "before", "a@x"),
@@ -5340,6 +5349,7 @@ mod tests {
             collection: kimmy_core::CollectionId::derive("shop", "never-heard-of"),
             doc_id: Some(DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 1 }).unwrap()),
+            meta: None,
         };
 
         let outcome = b.apply_batch(&[orphan]).unwrap();
@@ -10532,6 +10542,7 @@ mod budget_tests {
             collection,
             doc_id: Some(DocId::String(id.clone())),
             body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+            meta: None,
         }
     }
 

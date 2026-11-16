@@ -7273,6 +7273,7 @@ mod tests {
             collection: CollectionId(1),
             doc_id: None,
             body: None,
+            meta: None,
         };
         let start = Hlc::new(10, 0);
         let p = at(20, 5);
@@ -8219,6 +8220,7 @@ mod tests {
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
+            meta: None,
         };
         let window = vec![entry(4_000, 1), entry(7_000, 2), entry(8_000, 3)];
 
@@ -8334,6 +8336,7 @@ mod tests {
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
+            meta: None,
         };
         let create = OplogEntry {
             stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), origin, Epoch::ZERO),
@@ -8349,6 +8352,7 @@ mod tests {
                 })
                 .unwrap(),
             ),
+            meta: None,
         };
         let window = vec![insert(base + 2_000, 1), create, insert(base + 4_000, 2)];
 
@@ -8590,6 +8594,7 @@ mod tests {
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(id.into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
+            meta: None,
         };
 
         /// One round of the peer's side: answer the vectors, expect
@@ -11120,6 +11125,7 @@ mod tests {
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+            meta: None,
         };
         let refused = kimmy_core::IndexCreate {
             db: "shop".into(),
@@ -11142,6 +11148,7 @@ mod tests {
             collection: orders.id,
             doc_id: None,
             body: Some(bson::serialize_to_vec(&refused).unwrap()),
+            meta: None,
         };
         let mut theirs = VersionVector::new();
         theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(5_000, 0));
@@ -11254,6 +11261,7 @@ mod tests {
             collection: orders.id,
             doc_id: Some(kimmy_core::DocId::Int64(1)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+            meta: None,
         };
         let mut theirs = VersionVector::new();
         theirs.insert(kimmy_core::Origin::new(origin, kimmy_core::Epoch::ZERO), Hlc::new(4_000, 0));
@@ -13028,6 +13036,7 @@ mod tests {
                 })
                 .unwrap(),
             ),
+            meta: None,
         };
         let insert = OplogEntry {
             stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_000, 0), me.node, me.epoch),
@@ -13035,6 +13044,7 @@ mod tests {
             collection: CollectionId::derive("shop", "gone"),
             doc_id: Some(kimmy_core::DocId::Int64(7)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 7_i64 }).unwrap()),
+            meta: None,
         };
         let served = std::cell::RefCell::new(vec![create, insert]);
         // This member's own startup write, above the lost ones.
@@ -13160,6 +13170,7 @@ mod tests {
             collection: CollectionId::derive("shop", "gone"),
             doc_id: Some(kimmy_core::DocId::Int64(8)),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 8_i64 }).unwrap()),
+            meta: None,
         });
         let woken = |changes: &mut tokio::sync::watch::Receiver<u64>| *changes.borrow_and_update();
         let before = woken(&mut changes);
@@ -13304,6 +13315,7 @@ mod tests {
             collection: elsewhere.id,
             doc_id: Some(kimmy_core::DocId::String("lost".into())),
             body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "lost" }).unwrap()),
+            meta: None,
         };
         peer.apply_batch(std::slice::from_ref(&lost)).unwrap();
 
@@ -13363,6 +13375,7 @@ mod tests {
             collection: kimmy_core::CollectionId(1),
             doc_id: Some(kimmy_core::DocId::Int64(1)),
             body: None,
+            meta: None,
         };
         for count in [1usize, 2, 100, MAX_BATCH] {
             let entries: Vec<OplogEntry> = (0..count as u64).map(|i| entry(1 + i)).collect();
@@ -13529,6 +13542,7 @@ mod partial_windows_never_skip {
                 collection: coll.id,
                 doc_id: Some(DocId::String(id.clone())),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": id, "u": u }).unwrap()),
+                meta: None,
             }
         }
 
@@ -14226,6 +14240,7 @@ mod partial_windows_never_skip {
                     collection: orders.id,
                     doc_id: Some(kimmy_core::DocId::Int64(1)),
                     body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+                    meta: None,
                 }]
             } else {
                 Vec::new()

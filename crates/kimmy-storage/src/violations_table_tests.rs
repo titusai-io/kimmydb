@@ -43,6 +43,7 @@ fn violate(engine: &Engine, coll: &CollectionMeta, tag: &str, n: usize) {
                 bson::serialize_to_vec(&doc! { "_id": format!("{tag}r{i}"), "email": email })
                     .unwrap(),
             ),
+            meta: None,
         };
         assert!(engine.apply_remote(coll, &entry).unwrap());
     }
@@ -934,6 +935,7 @@ fn groups_of_same_length_binary_holders_are_reported_apart() {
             body: Some(
                 bson::serialize_to_vec(&doc! { "_id": binary(theirs), "email": email }).unwrap(),
             ),
+            meta: None,
         };
         assert!(engine.apply_remote(&coll, &entry).unwrap());
     }
