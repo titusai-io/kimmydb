@@ -325,9 +325,8 @@ fn an_upsert_into_a_field_collection_is_created_through_the_typed_entry_with_one
             ..Default::default()
         },
     };
-    let out = e.modify_where(&f, &Candidates::Scan, &spec, Some(1)).unwrap();
-    assert_eq!(out.matched, 0);
-    let _ = out;
+    let out = e.find_and_modify(&f, &Candidates::Scan, &spec).unwrap();
+    assert!(!out.matched && out.upserted.is_some(), "{out:?}");
     let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 7).unwrap()).unwrap();
     assert_eq!(rec.body, bytes(&doc! { "_id": 7_i64, "k": 5, "a": 1, "n": 3 }));
     let state = MergeState::decode_compact(rec.meta.as_deref().unwrap()).unwrap();
