@@ -22,7 +22,7 @@ use kimmy_core::merge_state::bridge::{document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
     JoinOptions, MStamp, MergeState, StampError, Writer, WriterId, Written,
 };
-use kimmy_core::{Error as CoreError, Stamp};
+use kimmy_core::{Error as CoreError, Hlc, Stamp};
 
 use crate::error::{Result, StorageError};
 
@@ -98,6 +98,15 @@ fn write(
         None => Vec::new(),
     };
     Ok(Some(Image { meta: w.state.encode_compact(), body, alive, stamp: minted }))
+}
+
+/// A stamp for a dry run: strictly above everything `prior` has seen, so the writer accepts it,
+/// and never minted by the engine. A replace is run once with it to learn what it would store
+/// (the validator and the indexes need the post-image before the engine mints the real stamp,
+/// ADR-148), and once more with the real one.
+pub(crate) fn provisional(writer: WriterId, prior: &MergeState) -> Stamp {
+    let top = prior.vv.values().copied().max().unwrap_or(Hlc::ZERO);
+    Stamp::new(Hlc::new(top.wall_ms.saturating_add(1), 0), writer.node, writer.epoch)
 }
 
 /// An insert: a new life, over `prior` when the key holds a tombstone. `None` when a life is
