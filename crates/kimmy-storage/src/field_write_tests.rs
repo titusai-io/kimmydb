@@ -108,8 +108,9 @@ fn an_identical_replace_writes_nothing_a_reorder_replace_stores_the_new_order_an
     let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
     assert_eq!(
         rec.body,
-        bytes(&doc! { "_id": 1_i64, "b": 9, "c": 3 }),
-        "b stays, a goes, c is new"
+        bytes(&doc! { "_id": 1_i64, "c": 3, "b": 9 }),
+        "a is removed, c is new, and the order is the one sent (pipeline-reorder-only-q7: a \
+         replaceOne sets the order)"
     );
     let state = MergeState::decode_compact(rec.meta.as_deref().unwrap()).unwrap();
     assert_eq!(state.vv.values().copied().max(), Some(rec.stamp.hlc));
