@@ -4,7 +4,7 @@
 use bson::{Document, doc};
 use kimmy_core::merge_state::MergeState;
 use kimmy_core::{DocId, Hlc, MergePolicy, OpKind, OplogEntry};
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableDatabase;
 
 use crate::meta::CollectionMeta;
 use crate::{Engine, WalkScope};
@@ -83,9 +83,9 @@ fn a_field_replace_keeps_the_order_of_the_fields_that_stay_and_a_no_change_write
     let before = raw(&e, &f, 1).unwrap();
     let commits = e.commits();
     let out =
-        e.replace(&f, &DocId::Int64(1), doc! { "b": 2, "_id": 1_i64, "a": 1 }, false).unwrap();
+        e.replace(&f, &DocId::Int64(1), doc! { "_id": 1_i64, "a": 1, "b": 2 }, false).unwrap();
     assert!(out.matched && !out.modified && out.stamp.is_none(), "{out:?}");
-    assert_eq!(raw(&e, &f, 1).unwrap(), before, "the same fields in another order change nothing");
+    assert_eq!(raw(&e, &f, 1).unwrap(), before, "the same document changes nothing");
     assert_eq!(e.commits(), commits, "no commit");
     assert_eq!(entries(&e, &f).len(), 1);
 

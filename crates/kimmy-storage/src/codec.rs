@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn a_future_format_version_is_rejected() {
         let mut bytes = encode_doc_record(&DocRecord::tombstone(stamp(1, 1)));
-        bytes[0] = FORMAT_VERSION + 1;
+        bytes[0] = META_FORMAT_VERSION + 1;
         assert!(matches!(decode_doc_record(&bytes), Err(StorageError::UnsupportedFormat { .. })));
     }
 
