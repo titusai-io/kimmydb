@@ -112,9 +112,17 @@ pub fn canonical_cmp(a: &Bson, b: &Bson) -> Ordering {
     }
 }
 
-/// Documents compare field by field, key before value, then by field count.
+/// Documents compare field by field, and for each field by **the type of the two values**, then
+/// **the name**, then **the value**, recursively; the shorter document comes first when one is a
+/// prefix of the other (q7s3h 29-42 and 57-70, q7s3g 98-99, q7s3j 210-369). Numbers are one
+/// type, so equal numbers of different types tie. It was name first, then value, which ordered
+/// `{d: 1}` before `{c: "z"}`; the reference orders the string first.
 fn cmp_documents(x: &bson::Document, y: &bson::Document) -> Ordering {
     for ((kx, vx), (ky, vy)) in x.iter().zip(y.iter()) {
+        match type_rank(vx).cmp(&type_rank(vy)) {
+            Ordering::Equal => {}
+            other => return other,
+        }
         match kx.cmp(ky) {
             Ordering::Equal => {}
             other => return other,
@@ -542,8 +550,124 @@ mod tests {
 
     #[test]
     fn documents_compare_key_before_value() {
+        // Same type of value: the name decides, then the value.
         lt(Bson::Document(doc! { "a": 99 }), Bson::Document(doc! { "b": 1 }));
         lt(Bson::Document(doc! { "a": 1 }), Bson::Document(doc! { "a": 2 }));
+    }
+
+    /// The type of the value decides before the name does (q7s3h 29-42, 57-70; q7s3g 98, 99).
+    #[test]
+    fn documents_compare_the_type_of_a_value_before_its_name() {
+        // A number is below a string whatever the names: `d` after `c` is not what decides.
+        lt(Bson::Document(doc! { "d": 1 }), Bson::Document(doc! { "c": "z" }));
+        // An array above a string, and above a number.
+        lt(Bson::Document(doc! { "c": "z" }), Bson::Document(doc! { "b": [8, 2] }));
+        // Nested: the same rule inside a value.
+        lt(
+            Bson::Document(doc! { "k": doc! { "d": 1 } }),
+            Bson::Document(doc! { "k": doc! { "c": "z" } }),
+        );
+        // The same type: the name, then the value, then a prefix first.
+        lt(Bson::Document(doc! { "a": 1 }), Bson::Document(doc! { "a": 1, "b": 1 }));
+        lt(Bson::Document(doc! { "a": "z" }), Bson::Document(doc! { "b": "a" }));
+        // Numbers are one type: an `Int32`, a `Double` and a `Decimal128` of one value tie.
+        let tie = |a: Bson, b: Bson| {
+            assert_eq!(
+                canonical_cmp(&Bson::Document(doc! { "a": a }), &Bson::Document(doc! { "a": b })),
+                Ordering::Equal
+            );
+        };
+        tie(Bson::Int32(1), Bson::Double(1.0));
+        tie(Bson::Int64(1), Bson::Decimal128("1.0".parse().unwrap()));
+        // A null and an undefined are one type, and an empty document is below any other.
+        tie(Bson::Null, Bson::Undefined);
+        lt(Bson::Document(doc! {}), Bson::Document(doc! { "a": 1 }));
+    }
+
+    /// An oracle for the order of documents that shares no code with [`cmp_documents`] or
+    /// [`type_rank`]: the rule as the recordings state it, written over its own list of types.
+    fn document_oracle(x: &bson::Document, y: &bson::Document) -> Ordering {
+        fn class(v: &Bson) -> u32 {
+            match v {
+                Bson::MinKey => 0,
+                Bson::Null | Bson::Undefined => 1,
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => 2,
+                Bson::String(_) | Bson::Symbol(_) => 3,
+                Bson::Document(_) => 4,
+                Bson::Array(_) => 5,
+                Bson::Binary(_) => 6,
+                Bson::ObjectId(_) => 7,
+                Bson::Boolean(_) => 8,
+                Bson::DateTime(_) => 9,
+                Bson::Timestamp(_) => 10,
+                Bson::RegularExpression(_) => 11,
+                Bson::DbPointer(_) => 12,
+                Bson::JavaScriptCode(_) => 13,
+                Bson::JavaScriptCodeWithScope(_) => 14,
+                Bson::MaxKey => 15,
+            }
+        }
+        let (mut a, mut b) = (x.iter(), y.iter());
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some((ka, va)), Some((kb, vb))) => {
+                    let by_type = class(va).cmp(&class(vb));
+                    if by_type != Ordering::Equal {
+                        return by_type;
+                    }
+                    let by_name = ka.cmp(kb);
+                    if by_name != Ordering::Equal {
+                        return by_name;
+                    }
+                    let by_value = match (va, vb) {
+                        (Bson::Document(p), Bson::Document(q)) => document_oracle(p, q),
+                        _ => canonical_cmp(va, vb),
+                    };
+                    if by_value != Ordering::Equal {
+                        return by_value;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `canonical_cmp` of two documents is the oracle's, over values of every type, nested.
+    #[test]
+    fn canonical_order_of_documents_is_the_oracle_s() {
+        let values = [
+            Bson::MinKey,
+            Bson::Null,
+            Bson::Int32(1),
+            Bson::Double(1.5),
+            Bson::Decimal128("2".parse().unwrap()),
+            Bson::String("z".into()),
+            Bson::Document(doc! { "d": 1 }),
+            Bson::Document(doc! { "c": "z" }),
+            Bson::Array(vec![Bson::Int32(8), Bson::Int32(2)]),
+            Bson::Boolean(true),
+            Bson::MaxKey,
+        ];
+        let mut docs: Vec<bson::Document> = vec![doc! {}];
+        for name in ["a", "b"] {
+            for v in &values {
+                docs.push(doc! { name: v.clone() });
+                for w in &values {
+                    docs.push(doc! { name: v.clone(), "z": w.clone() });
+                }
+            }
+        }
+        for x in &docs {
+            for y in &docs {
+                assert_eq!(
+                    canonical_cmp(&Bson::Document(x.clone()), &Bson::Document(y.clone())),
+                    document_oracle(x, y),
+                    "{x:?} against {y:?}"
+                );
+            }
+        }
     }
 
     /// An oracle for numeric comparison that shares no code with

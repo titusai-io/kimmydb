@@ -1,0 +1,147 @@
+q7s4r0001	$substr	["éa", {"$numberInt": "1"}, {"$numberInt": "1"}]	{"error": 28656}
+q7s4r0002	$substr	["éa", {"$numberInt": "0"}, {"$numberInt": "1"}]	{"error": 28657}
+q7s4r0003	$substr	["🙂", {"$numberInt": "0"}, {"$numberInt": "3"}]	{"error": 28657}
+q7s4r0004	$substr	["éa", {"$numberInt": "0"}, {"$numberInt": "2"}]	{"r": "é"}
+q7s4r0005	$substr	["éa", {"$numberInt": "2"}, {"$numberInt": "1"}]	{"r": "a"}
+q7s4r0006	$substr	["é", {"$numberInt": "5"}, {"$numberInt": "1"}]	{"r": ""}
+q7s4r0007	$substr	["éa", {"$numberInt": "2"}, {"$numberInt": "-1"}]	{"r": "a"}
+q7s4r0008	$substr	["abc", {"$numberInt": "-1"}, {"$numberInt": "1"}]	{"error": 50752}
+q7s4r0009	$substr	["abc", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4r0010	$substrBytes	["éa", {"$numberInt": "1"}, {"$numberInt": "1"}]	{"error": 28656}
+q7s4r0011	$substrBytes	["éa", {"$numberInt": "0"}, {"$numberInt": "1"}]	{"error": 28657}
+q7s4r0012	$substrBytes	["🙂", {"$numberInt": "0"}, {"$numberInt": "3"}]	{"error": 28657}
+q7s4r0013	$substrBytes	["éa", {"$numberInt": "0"}, {"$numberInt": "2"}]	{"r": "é"}
+q7s4r0014	$substrBytes	["éa", {"$numberInt": "2"}, {"$numberInt": "1"}]	{"r": "a"}
+q7s4r0015	$substrBytes	["é", {"$numberInt": "5"}, {"$numberInt": "1"}]	{"r": ""}
+q7s4r0016	$substrBytes	["éa", {"$numberInt": "2"}, {"$numberInt": "-1"}]	{"r": "a"}
+q7s4r0017	$substrBytes	["abc", {"$numberInt": "-1"}, {"$numberInt": "1"}]	{"error": 50752}
+q7s4r0018	$substrBytes	["abc", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4r0019	$substrCP	["éa", {"$numberInt": "1"}, {"$numberInt": "1"}]	{"r": "a"}
+q7s4r0020	$substrCP	["éa", {"$numberInt": "0"}, {"$numberInt": "1"}]	{"r": "é"}
+q7s4r0021	$substrCP	["🙂", {"$numberInt": "0"}, {"$numberInt": "3"}]	{"r": "🙂"}
+q7s4r0022	$substrCP	["éa", {"$numberInt": "0"}, {"$numberInt": "2"}]	{"r": "éa"}
+q7s4r0023	$substrCP	["éa", {"$numberInt": "2"}, {"$numberInt": "1"}]	{"r": ""}
+q7s4r0024	$substrCP	["é", {"$numberInt": "5"}, {"$numberInt": "1"}]	{"r": ""}
+q7s4r0025	$substrCP	["éa", {"$numberInt": "2"}, {"$numberInt": "-1"}]	{"error": 34454}
+q7s4r0026	$substrCP	["abc", {"$numberInt": "-1"}, {"$numberInt": "1"}]	{"error": 34455}
+q7s4r0027	$substrCP	["abc", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"error": 34453}
+q7s4s0001	$substr	["abcdef", {"$numberDouble": "1.5"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0002	$substr	["abcdef", {"$numberDouble": "1.0"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0003	$substr	["abcdef", {"$numberLong": "1"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0004	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "2.0"}]	{"r": "bc"}
+q7s4s0005	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4s0006	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.5"}]	{"r": "bc"}
+q7s4s0007	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2"}]	{"r": "bc"}
+q7s4s0008	$substr	["abcdef", {"$numberInt": "1"}, {"$numberLong": "2"}]	{"r": "bc"}
+q7s4s0009	$substr	["abcdef", "1", {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0010	$substr	["abcdef", null, {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0011	$substr	["abcdef", "$nosuch", {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0012	$substr	["abcdef", {"$numberInt": "1"}, "2"]	{"error": 16035}
+q7s4s0013	$substr	["abcdef", {"$numberInt": "1"}, null]	{"error": 16035}
+q7s4s0014	$substr	["abcdef", {"$numberInt": "1"}, "$nosuch"]	{"error": 16035}
+q7s4s0015	$substr	["abcdef", {"$numberInt": "1"}, {"$numberLong": "4294967296"}]	{"r": "bcdef"}
+q7s4s0016	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "4294967296.0"}]	{"r": "bcdef"}
+q7s4s0017	$substr	["abcdef", {"$numberLong": "4294967296"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0018	$substr	["abcdef", {"$numberDouble": "4294967296.0"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0019	$substr	["abcdef", {"$numberInt": "10"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0020	$substr	["abcdef", {"$numberInt": "6"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0021	$substrBytes	["abcdef", {"$numberDouble": "1.5"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0022	$substrBytes	["abcdef", {"$numberDouble": "1.0"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0023	$substrBytes	["abcdef", {"$numberLong": "1"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0024	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "2.0"}]	{"r": "bc"}
+q7s4s0025	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4s0026	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.5"}]	{"r": "bc"}
+q7s4s0027	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2"}]	{"r": "bc"}
+q7s4s0028	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberLong": "2"}]	{"r": "bc"}
+q7s4s0029	$substrBytes	["abcdef", "1", {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0030	$substrBytes	["abcdef", null, {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0031	$substrBytes	["abcdef", "$nosuch", {"$numberInt": "2"}]	{"error": 16034}
+q7s4s0032	$substrBytes	["abcdef", {"$numberInt": "1"}, "2"]	{"error": 16035}
+q7s4s0033	$substrBytes	["abcdef", {"$numberInt": "1"}, null]	{"error": 16035}
+q7s4s0034	$substrBytes	["abcdef", {"$numberInt": "1"}, "$nosuch"]	{"error": 16035}
+q7s4s0035	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberLong": "4294967296"}]	{"r": "bcdef"}
+q7s4s0036	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "4294967296.0"}]	{"r": "bcdef"}
+q7s4s0037	$substrBytes	["abcdef", {"$numberLong": "4294967296"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0038	$substrBytes	["abcdef", {"$numberDouble": "4294967296.0"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0039	$substrBytes	["abcdef", {"$numberInt": "10"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0040	$substrBytes	["abcdef", {"$numberInt": "6"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0041	$substrCP	["abcdef", {"$numberDouble": "1.5"}, {"$numberInt": "2"}]	{"error": 34451}
+q7s4s0042	$substrCP	["abcdef", {"$numberDouble": "1.0"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0043	$substrCP	["abcdef", {"$numberLong": "1"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4s0044	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "2.0"}]	{"r": "bc"}
+q7s4s0045	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"error": 34453}
+q7s4s0046	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.5"}]	{"error": 34453}
+q7s4s0047	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2"}]	{"r": "bc"}
+q7s4s0048	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberLong": "2"}]	{"r": "bc"}
+q7s4s0049	$substrCP	["abcdef", "1", {"$numberInt": "2"}]	{"error": 34450}
+q7s4s0050	$substrCP	["abcdef", null, {"$numberInt": "2"}]	{"error": 34450}
+q7s4s0051	$substrCP	["abcdef", "$nosuch", {"$numberInt": "2"}]	{"error": 34450}
+q7s4s0052	$substrCP	["abcdef", {"$numberInt": "1"}, "2"]	{"error": 34452}
+q7s4s0053	$substrCP	["abcdef", {"$numberInt": "1"}, null]	{"error": 34452}
+q7s4s0054	$substrCP	["abcdef", {"$numberInt": "1"}, "$nosuch"]	{"error": 34452}
+q7s4s0055	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberLong": "4294967296"}]	{"error": 34453}
+q7s4s0056	$substrCP	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "4294967296.0"}]	{"error": 34453}
+q7s4s0057	$substrCP	["abcdef", {"$numberLong": "4294967296"}, {"$numberInt": "2"}]	{"error": 34451}
+q7s4s0058	$substrCP	["abcdef", {"$numberDouble": "4294967296.0"}, {"$numberInt": "2"}]	{"error": 34451}
+q7s4s0059	$substrCP	["abcdef", {"$numberInt": "10"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4s0060	$substrCP	["abcdef", {"$numberInt": "6"}, {"$numberInt": "2"}]	{"r": ""}
+q7s4u0001	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "0.5"}]	{"r": ""}
+q7s4u0002	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.4"}]	{"r": "b"}
+q7s4u0003	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.5"}]	{"r": "bc"}
+q7s4u0004	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.6"}]	{"r": "bc"}
+q7s4u0005	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2.5"}]	{"r": "bc"}
+q7s4u0006	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "3.5"}]	{"r": "bcde"}
+q7s4u0007	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2.0"}]	{"r": "bc"}
+q7s4u0008	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "-0.5"}]	{"r": ""}
+q7s4u0009	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "-1"}]	{"r": "bcdef"}
+q7s4u0010	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "0.5"}]	{"r": ""}
+q7s4u0011	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.4"}]	{"r": "b"}
+q7s4u0012	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4u0013	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.6"}]	{"r": "b"}
+q7s4u0014	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "2.5"}]	{"r": "bc"}
+q7s4u0015	$substr	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "3.5"}]	{"r": "bcd"}
+q7s4u0016	$substr	["abcdef", {"$numberDecimal": "0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0017	$substr	["abcdef", {"$numberDecimal": "1.4"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0018	$substr	["abcdef", {"$numberDecimal": "1.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0019	$substr	["abcdef", {"$numberDecimal": "1.6"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0020	$substr	["abcdef", {"$numberDecimal": "2.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0021	$substr	["abcdef", {"$numberDecimal": "3.5"}, {"$numberInt": "2"}]	{"r": "ef"}
+q7s4u0022	$substr	["abcdef", {"$numberDecimal": "2.0"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0023	$substr	["abcdef", {"$numberDecimal": "-0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0024	$substr	["abcdef", {"$numberDecimal": "-1"}, {"$numberInt": "2"}]	{"error": 50752}
+q7s4u0025	$substr	["abcdef", {"$numberDouble": "0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0026	$substr	["abcdef", {"$numberDouble": "1.4"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0027	$substr	["abcdef", {"$numberDouble": "1.5"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0028	$substr	["abcdef", {"$numberDouble": "1.6"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0029	$substr	["abcdef", {"$numberDouble": "2.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0030	$substr	["abcdef", {"$numberDouble": "3.5"}, {"$numberInt": "2"}]	{"r": "de"}
+q7s4u0031	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "0.5"}]	{"r": ""}
+q7s4u0032	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.4"}]	{"r": "b"}
+q7s4u0033	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.5"}]	{"r": "bc"}
+q7s4u0034	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "1.6"}]	{"r": "bc"}
+q7s4u0035	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2.5"}]	{"r": "bc"}
+q7s4u0036	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "3.5"}]	{"r": "bcde"}
+q7s4u0037	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "2.0"}]	{"r": "bc"}
+q7s4u0038	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "-0.5"}]	{"r": ""}
+q7s4u0039	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDecimal": "-1"}]	{"r": "bcdef"}
+q7s4u0040	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "0.5"}]	{"r": ""}
+q7s4u0041	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.4"}]	{"r": "b"}
+q7s4u0042	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.5"}]	{"r": "b"}
+q7s4u0043	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "1.6"}]	{"r": "b"}
+q7s4u0044	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "2.5"}]	{"r": "bc"}
+q7s4u0045	$substrBytes	["abcdef", {"$numberInt": "1"}, {"$numberDouble": "3.5"}]	{"r": "bcd"}
+q7s4u0046	$substrBytes	["abcdef", {"$numberDecimal": "0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0047	$substrBytes	["abcdef", {"$numberDecimal": "1.4"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0048	$substrBytes	["abcdef", {"$numberDecimal": "1.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0049	$substrBytes	["abcdef", {"$numberDecimal": "1.6"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0050	$substrBytes	["abcdef", {"$numberDecimal": "2.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0051	$substrBytes	["abcdef", {"$numberDecimal": "3.5"}, {"$numberInt": "2"}]	{"r": "ef"}
+q7s4u0052	$substrBytes	["abcdef", {"$numberDecimal": "2.0"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0053	$substrBytes	["abcdef", {"$numberDecimal": "-0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0054	$substrBytes	["abcdef", {"$numberDecimal": "-1"}, {"$numberInt": "2"}]	{"error": 50752}
+q7s4u0055	$substrBytes	["abcdef", {"$numberDouble": "0.5"}, {"$numberInt": "2"}]	{"r": "ab"}
+q7s4u0056	$substrBytes	["abcdef", {"$numberDouble": "1.4"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0057	$substrBytes	["abcdef", {"$numberDouble": "1.5"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0058	$substrBytes	["abcdef", {"$numberDouble": "1.6"}, {"$numberInt": "2"}]	{"r": "bc"}
+q7s4u0059	$substrBytes	["abcdef", {"$numberDouble": "2.5"}, {"$numberInt": "2"}]	{"r": "cd"}
+q7s4u0060	$substrBytes	["abcdef", {"$numberDouble": "3.5"}, {"$numberInt": "2"}]	{"r": "de"}

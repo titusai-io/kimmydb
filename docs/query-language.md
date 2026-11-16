@@ -42,17 +42,26 @@ graph LR
 { "seq": { "$mod": [4, 0] } }           // every fourth
 ```
 
-**`$in`, `$nin`, `$all` and `$ne` compare values, so a regular expression
-among their operands is refused.** A regex literal, `{"$regex": ...}` with or
-without `$options`, or the Extended JSON `{"$regularExpression": ...}` in the
-list, or as the operand of `$ne`, is a **`400`** before any document is read.
-They used to be compared as values, so `{"s": {"$in": [{"$regex": "abc"}]}}`
-matched no string, and `$nin` and `$ne` matched every one, with a `200`. To
-match any of several patterns, write an `$or` of `$regex` clauses, or one
-pattern: `{"s": {"$regex": "^(abc|def)"}}`; to exclude what a pattern matches,
-`{"s": {"$not": {"$regex": "abc"}}}`. Any other document, one with
-`$`-prefixed keys included, is still compared as a value, and `$eq` compares a
-regex as a value too. See [Deviations](deviations.md).
+**A regular expression among the members of `$in`, `$nin` and `$all` is a pattern.**
+A regex literal, `{"$regex": ...}` with or without `$options`, or the Extended
+JSON `{"$regularExpression": ...}` in the list matches the strings the field
+holds (or the elements of an array field) that match it, united with the field
+equalling any of the other members; it also matches a stored regex of the same
+pattern and flags, compared as written. `{"s": {"$in": [/^a/, "banana"]}}` matches
+`"apple"`, `["apple", "cherry"]` and `"banana"`. `$nin` is the exact complement:
+a document whose field is missing or null is in it, unless `null` is listed. In
+`$all` every pattern is a clause of its own, beside the values: `{"$all": [/^a/,
+/^c/]}` matches `["apple", "cherry"]`. A regex inside an array member
+(`{"$in": [[/^a/]]}`) is part of that value and matches nothing. An invalid
+pattern is a `400`. A filter that holds one is never answered from an index
+(`explain` shows a collection scan), and as the filter of an upsert it seeds
+nothing from a pattern. A stored document shaped exactly `{"$regex": ...}`
+cannot be found through these operators; `$eq` finds it.
+
+**`$ne` takes no regular expression.** As the operand of `$ne` it is a **`400`**
+before any document is read, as it is in the reference; to exclude what a pattern
+matches, write `{"s": {"$not": {"$regex": "abc"}}}`. `$eq` compares a regex as a
+value. See [Deviations](deviations.md).
 
 **A regular expression written as a field's value is a pattern.** `{"s": /ab/i}`,
 which over HTTP is `{"s": {"$regularExpression": {"pattern": "ab", "options":
@@ -93,25 +102,54 @@ Top-level fields are implicitly `$and`-ed.
 
 | Operator | Meaning |
 |---|---|
-| `$all` | Array contains every listed value |
+| `$all` | Every listed value is equal to the field, or to an element of it: the `$and` of one equality per value |
 | `$size` | Array has exactly this length |
 | `$elemMatch` | **One** element satisfies all the conditions |
 
-**`$all` compares values, so an `$elemMatch` among them is refused.**
-`{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` is a **`400`**: it used to
-compare each element with the document `{"$elemMatch": {"qty": 5}}` and match
-nothing, with a `200`. To require an element matching each of several
-conditions, write an `$and` of `$elemMatch` clauses:
-`{"$and": [{"items": {"$elemMatch": {"qty": 5}}}, {"items": {"$elemMatch": {"sku": "a"}}}]}`.
-A document with any other key beside `$elemMatch` is still a value. See
-[Deviations](deviations.md).
+**`$all` is an `$and` of plain equalities.** `{"v": {"$all": [x1, x2]}}` selects what
+`{"$and": [{"v": x1}, {"v": x2}]}` selects, each member read as `{"v": x}` is: a scalar
+field equal to every member matches (`{"$all": [1, 1]}` matches `v: 1`), a member that
+is an array is compared as the whole array (`{"$all": [[1, 2]]}` matches `v: [1, 2]`
+and `v: [[1, 2], [3]]`), `null` matches a missing field, and through an array of
+documents each member may be held by a different element
+(`{"items.sku": {"$all": ["a", "b"]}}` matches `items: [{sku: "a"}, {sku: "b"}]`). It
+used to ask that every member be an element of one array value, which matched
+nothing for a scalar field, a whole-array member and the documents above.
 
-**An empty `$all` is refused.** `{"tags": {"$all": []}}` is a **`400`** naming
-the field, before any document is read. "Every one of no values" holds for any
-array, so it used to match every document whose field holds an array (and under
-`$not`, every document whose field does not), with a `200`; a list a client
-emptied by mistake reached all of them, on a `multi` update or delete too. Send
-at least one value, or leave the condition out. See
+**`$all` of `$elemMatch` documents holds when the field has an element for each.**
+`{"items": {"$all": [{"$elemMatch": {"qty": 5}}, {"$elemMatch": {"sku": "a"}}]}}`
+needs an element with `qty: 5` and an element with `sku: "a"`, which may be
+different elements; it is the `$and` of the two `$elemMatch` clauses. Every
+member has to be an `$elemMatch`: a list that starts with one and holds a value,
+a document or a regex is a **`400`** ("$all/$elemMatch has to be consistent"),
+and one that holds a value before an `$elemMatch` is a `400` ("no $ expressions
+in $all"). A document with another key beside `$elemMatch` is still a value. An
+`$elemMatch` reads an element that is itself an array as one value, so
+`{"$elemMatch": {"$gt": 1}}` does not look into `[[2, 3]]`, and
+`{"$elemMatch": {}}` holds for a document or an array element and for no scalar.
+See [Deviations](deviations.md).
+
+**A member document of `$in` or `$nin` with a `$`-led key is a `400`.**
+`{"a": {"$in": [{"$options": "i"}]}}` is refused, `cannot nest $ under $in`, as the
+reference refuses it; the refusal covers any `$`-led key in a member document
+(UNRECORDED beyond `$options`). A regex in one of its shapes is still a pattern. `$eq` of
+the whole document is unchanged, and finds a stored document with a `$`-led key.
+
+**An operator document inside `$all` is a `400`.** `{"v": {"$all": [{"$eq": 1}]}}`
+(or `$gt`, `$in`, any operator, alone or beside values) is refused, `no $ expressions
+in $all`, as the reference refuses it; `$all` lists values to be equal to, and it
+used to compare `{$eq: 1}` as a literal document and match nothing. A regex in one
+of its shapes is a pattern, an `$elemMatch` member is read as above, and a
+document that starts with a plain field is a value.
+
+**A negative `$size` is a `400`.** `{"a": {"$size": -1}}` is refused (`Failed to parse
+$size. Expected a non-negative number`), as the reference refuses it; it used to match
+nothing. A whole double (`2.0`) is a length, a fractional one is still refused.
+
+**An empty `$all` matches no document.** `{"tags": {"$all": []}}` selects
+nothing, as the reference answers it, where "every one of no values" would hold
+for any array; a `multi` update or delete by it touches nothing, an upsert by it
+seeds nothing, and under `$not` it matches every document. See
 [Deviations](deviations.md).
 
 ### `$expr` — comparing fields of the same document
@@ -419,8 +457,9 @@ It stands at the **top** of a filter, alone or beside other conditions, and insi
 The argument is an **alias, a numeric BSON code, or an array of them**. An
 array is a union: the document matches when the value is any one of the listed
 types, and aliases and codes may be mixed in it. An empty array is a `400`,
-because it lists no type. Anything else — a double, a bool, a nested array — is
-a `400` at parse.
+because it lists no type. A code is a whole number of any numeric type, so `2.0`
+and `Decimal128("2")` are the code `2`; anything else — a fractional or non-finite
+number, a bool, a nested array — is a `400` at parse.
 
 | Kind | Alias and code |
 |---|---|
@@ -428,10 +467,12 @@ a `400` at parse.
 | Text and bytes | `string` 2, `binData` 5 |
 | Structure | `object` 3, `array` 4 |
 | Identity and time | `objectId` 7, `date` 9, `timestamp` 17 |
-| Other | `bool` 8, `null` 10, `regex` 11, `javascript` 13, `undefined` 6, `minKey` −1, `maxKey` 127 |
+| Other | `bool` 8, `null` 10, `regex` 11, `javascript` 13, `javascriptWithScope` 15, `undefined` 6, `minKey` −1, `maxKey` 127 |
+| Legacy | `dbPointer` 12, `symbol` 14 |
 
-`javascript` covers both code forms; `symbol` and `dbPointer` are accepted as
-names for the two legacy types that have no code here. **`number` is an alias
+`javascript` (code 13) matches code with no scope, and `javascriptWithScope` (code 15)
+matches code with a scope, each only itself, as the reference answers them; `javascript`
+used to hold for both forms. Code 12 matches nothing a client can store. **`number` is an alias
 for the four numeric types at once**: it is expanded when the filter is
 parsed, so `{"$type": "number"}` and `{"$type": ["int", "long", "double",
 "decimal"]}` are the same filter, and it mixes with other aliases and codes in
@@ -503,6 +544,20 @@ Use `$exists` when you need the distinction:
 `$ne` inherits this: `{ "a": { "$ne": 1 } }` matches documents with no `a` at
 all.
 
+Through an array of documents, **an element that lacks the field reads as `null`**:
+`{"a.c": null}` matches `{a: [{c: 5}, {d: 1}]}`, because the second element has no
+`c`. A parent that is missing, a scalar, or itself `null` lacks the field the same
+way. What contributes nothing, and so is neither a value nor a `null`, is an empty
+array and an array element that is not a document (a number, a string, a `null`, a
+nested array): `{a: []}` and `{a: [1, 2]}` do not match `{"a.c": null}`, and `{a:
+[{c: []}]}` does not either (its `c` is an empty array, not a missing one).
+`$exists: true` asks whether any value was reached, so it is the complement of
+`$exists: false` and of none of the null forms. `$gte: null` and `$lte: null` read
+a lacking field as `null` as an equality does; `$gt: null` and `$lt: null` match
+nothing. See [Sort and projection](#sort-and-projection) and
+[Indexes](indexes.md#what-gets-indexed) for what a sort and an index make of the same
+path.
+
 ### 2. Paths traverse into arrays
 
 ```javascript
@@ -532,14 +587,35 @@ Which leads directly to the `$elemMatch` distinction:
 // ✗ [1, 20]     — they straddle it, but neither is inside
 ```
 
-A numeric segment is read both ways: `{"items.0.sku": "a"}` matches when the
-first element's `sku` is `"a"` *or* when any element has a field named `0`
-whose `sku` is. A [sort](#sort-and-projection) key reads it the same two
-ways, and an [update](#update-operators) path writes by position. That is not
-every path's rule: a [projection](#sort-and-projection) path and an
-aggregation expression read a numeric segment as a field name only, never a
-position — `{"items.0": 1}` and `$items.0.sku` both name a field called `0`
-in each element; see [aggregation.md](aggregation.md#arrays).
+**A position is `0`, or a digit from 1 to 9 followed by digits, in every read.** `00`,
+`01`, `+0` and `-1` are field names, not positions (`{"a.01": 5}` reads the field
+named `01`); a run of digits too long for a number is a position past every end,
+never an error. An [update](#update-operators) path writes by position and reads
+`00` and `01` as positions, so the two rules differ there by design. Then:
+
+- **A filter reads a position both ways**: `{"items.0.sku": "a"}` matches when the
+  first element's `sku` is `"a"` *or* when any element has a field named `0` whose
+  `sku` is, whether the position is inside the array or past its end. A leaf array
+  reached by a position is compared **whole** (`{"a.0": 1}` does not match
+  `{a: [[1, 2]]}`), where one reached by a name is searched by its elements.
+- **A [sort](#sort-and-projection) key reads a position inside the array as that
+  element only**, and past the end as the field of that name in each element. A
+  position inside an array beside a document element that holds a field of that name
+  is refused: see [Sort and projection](#sort-and-projection).
+- **An index key** reads a position as a sort key does ([Indexes](indexes.md#what-gets-indexed)).
+- **Every other reader of a field path now reads a position by the same rule**, a behaviour
+  change that no recording covers (UNRECORDED for each): the `path` of `$unwind`, the
+  `localField` and `foreignField` of `$lookup` and the `connectToField` of `$graphLookup`, the `field` of `$densify`
+  and `$fill`, the `partitionBy`, `sortBy` and `output` fields of `$setWindowFields`, the array
+  of a positional projection (`items.$`), the vector index's source field, and the date field of
+  a TTL index when it re-checks a document before deleting it, so that its recheck reads what
+  its keys were taken from. `{"$unwind": "$a.01"}` reads a field named `01` where it read the
+  second element. **`$graphLookup`'s `connectFromField` is the exception: it keeps `00` and `01` as positions** (`a.00` over `[[1]]` links to 1: q7s4i 343; UNRECORDED beyond that case). An update path is not one of them: it reads and writes `00` and `01` as
+  positions.
+- A [projection](#sort-and-projection) path and an aggregation expression read a
+  numeric segment as a field name only, never a position — `{"items.0": 1}` and
+  `$items.0.sku` both name a field called `0` in each element; see
+  [aggregation.md](aggregation.md#arrays).
 
 ### 3. Comparisons do not cross type groups
 
@@ -551,6 +627,36 @@ in each element; see [aggregation.md](aggregation.md#arrays).
 Strings sort after numbers in canonical order (used for *sorting*), but
 comparison operators are type-restricted. Equality, by contrast, *does* span
 numeric types — `5`, `5i64`, and `5.0` are all equal.
+
+**A NaN is ordered against no number.** `{"v": {"$lt": 5}}` and `{"v": {"$gt": -Infinity}}`
+do not match a document holding `NaN` (a double's or a decimal's), `{"v": {"$gt": NaN}}`
+matches nothing, and `$gte` and `$lte` of `NaN` match the NaNs and nothing else, as the
+reference answers them. A NaN used to sort below every number in a comparison as well, so
+every `$lt` and `$lte` returned the NaN documents. A **sort**, and the order of an
+index, still place a NaN below `-Infinity`: only the comparison operators changed, and a
+partial index's filter holds a NaN exactly where the same filter's `find` returns it.
+
+**`MinKey` and `MaxKey` are ordered against every type.** As the bound of `$gt`,
+`$gte`, `$lt` or `$lte` they compare with a number, a string, `null`, a regular
+expression, an array and a document alike, and a missing field reads as `null`:
+`{"v": {"$gt": MinKey}}` matches every document except one whose `v` is a `MinKey`
+(a document without `v` included), `{"v": {"$lte": MaxKey}}` matches every document, and
+`$lt` of `MinKey` and `$gt` of `MaxKey` match none. They used to share a type group with the
+regular expressions and the code types and so matched those and nothing else. A partial
+index's filter takes the same rule, and a bound of this kind no longer proves that
+the field is present.
+
+**`$gte` and `$lte` of `null` match a missing field.** `{"v": {"$gte": null}}` and
+`{"v": {"$lte": null}}` match a `null`, a `[null]` and a document without `v`, as
+equality with `null` does; `$gt` and `$lt` of `null` match nothing. A partial index's
+filter holds the same documents, and such a bound does not prove that the field is
+present.
+
+**A regular expression is not a range operand.** `{"v": {"$gt": /a/}}` (and `$gte`,
+`$lt`, `$lte`) is a `400`, `Can't have RegEx as arg to predicate over field 'v'.`, as
+the reference answers it. It was read as a value of its own group, ordered among the
+other regular expressions, `MinKey` and `MaxKey`, and a partial index's filter takes
+the same refusal. `$eq` and a regex written as a field's value are unchanged.
 
 **Numbers compare by their exact values, a `Decimal128` included.** Every
 number — `int`, `long`, `double` and `decimal` — denotes one exact value, and
@@ -605,12 +711,12 @@ see [Pipeline updates](#pipeline-updates).
 |---|---|
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
-| `$inc` `$mul` | Arithmetic; a missing field starts at `0`. A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
+| `$inc` `$mul` | Arithmetic; a missing field starts at `0` (`$inc` creates it as its operand, `-0.0` included). A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
 | `$bit` | Bitwise `and`, `or`, `xor` of an integer field: `{"$bit": {"flags": {"or": 4}}}`. See [`$bit`](#bit) |
-| `$pull` `$pop` | Remove matching elements / one end. A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition: `$pull: {scores: {$gte: 6}}`. See [`$pull`](#pull-a-value-or-a-condition) |
+| `$pull` `$pop` | Remove matching elements / one end (`$pop` takes `1` or `-1`, as an integer or as the double `1.0` or `-1.0`; any other number is a `400`). A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition, `$pull: {scores: {$gte: 6}}`, and a document of fields is a query on each element, `$pull: {results: {score: 8}}`. See [`$pull`](#pull-a-value-a-condition-or-a-query) |
 | `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
@@ -627,9 +733,13 @@ operator adds them and in whatever order the request writes them:
 `{"$set": {"b": 1, "a": 2}, "$inc": {"c": 1}}` over `{_id: 1}` gives `{_id, a,
 b, c}`, and `{"$set": {"b.y": 1, "b.x": 2}}` gives `b: {x, y}`. Fields already
 there keep their place, and a document given as a value keeps its own order.
-Sorted means the names made only of digits first, by numeric value, then the
-others in byte order: `{"$set": {"10": 1, "9": 1, "1": 1, "a": 1, "B": 1}}`
-gives `{_id, 1, 9, 10, B, a}`, and `s.10`, `s.9`, `s.b` give `s: {9, 10, b}`.
+Sorted means by bytes, except that two names that both begin with a digit from `1` to
+`9` are ordered by length first (the shorter first) and then by bytes; nothing else is
+read, no numeric value and no class of digit-only names (q7s2u, q7s2v, q7s2w). So
+`{"$set": {"10": 1, "9": 1, "1": 1, "a": 1, "B": 1}}` gives `{_id, 1, 9, 10, B, a}`,
+`s.10`, `s.9`, `s.b` give `s: {9, 10, b}`, `2`, `10`, `1a` give `2, 10, 1a`, `010` and `-a`
+are before every name led by `1` to `9` (`010, 2, 10, 1a`; `-a, 1`), `1a` is before `100`, and
+`01` is before `1`. The length counts bytes (`1é` is three: `99, 1é`, `100, 1é` and `1a, 1é` in q7s4k (h)). The order is the same whatever order the request lists the names in.
 An upsert stores `_id` first, then the fields its filter implies, sorted, then
 every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
 operators), sorted together. The nested fields a dotted filter key seeds are
@@ -702,44 +812,65 @@ incremented field, `$set` the new name and `$unset` the old one. Under the
 
 `$pull` of a value and `$pullAll` match by **canonical equality** — `2`
 removes `2.0`, and a document matches whole, field order included. `$pull`
-also takes a condition (below); `$pullAll` does not, and compares an operator
-document in its list as the plain document it is. `$pullAll` on a field that
+also takes a condition or a query (below); `$pullAll` does not, and compares an
+operator document in its list as the plain document it is. `$pullAll` on a field that
 is missing does nothing; on a field that is not an array it is a `400`,
 because the caller believes the field is an array and it is not. **So is `$pull`,
 of a value or a condition**: `cannot apply $pull to non-array field "v"`.
+**So is `$pop`**: a field that holds a string, a number, `null` or a document
+is a `400` (`cannot apply $pop to non-array field "v"`), and `$pop` of an empty
+array or of a missing field changes nothing.
 
-### `$pull`: a value or a condition
+**`$pull`, `$pullAll` and `$pop` do not look through a value they cannot
+enter.** A path that goes through a scalar or `null` by any segment (`f.a` or
+`f.0` over `f: 5`), or through an array by a field name (`f.a` over
+`f: [{a: [1, 2]}]`), is a `400` as a `$rename` source is
+(`cannot use the part (a of f.a) to traverse the element`), whether or not
+anything lies beyond it. A path that reaches nothing (`f.a` over a missing `f`,
+`f.0` over `f: []`) is no change, and an index into an array works
+(`f.0` over `f: [[1, 2], [3]]`). A `$min` or `$max` that would leave the field
+as it is refuses the same paths, as one that writes does.
 
-What `$pull` does with a **document** operand depends on its keys, and
-nothing else about it changes. A scalar or an array operand always removes the
-elements equal to it, as `$pull: {tags: "a"}` does.
+### `$pull`: a value, a condition or a query
+
+What `$pull` does with an operand depends on its shape. A scalar or an array
+operand always removes the elements equal to it, as `$pull: {tags: "a"}` does.
 
 | Operand | Reading | Example |
 |---|---|---|
-| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
-| A document with **no** key starting with `$` (the empty document too) | A **value**: removes the elements equal to the whole document, field order included | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}]` leaves `[{score: 8, item: "B"}]` |
-| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gte": 6, "score": 8 } } }` is a `400` |
+| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language: a comparison, `$in`, `$nin`, `$ne`, `$exists`, `$type`, `$size`, `$all`, `$mod`, `$regex` and the rest of the field operators, each as it reads a stored value (an element that is an array matches by its members: `{$gt: 1}` removes `[1, 2]`) | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
+| `$and`, `$or` or `$nor` of queries | A query, tested on the elements that are documents only: no scalar, array or `null` element is removed, a `$nor` included | `{ "$pull": { "r": { "$or": [{ "a": 1 }, { "a": 2 }] } } }` |
+| A document with **no** key starting with `$`, the empty document too | A **query** on each element: every element that is a document the query matches is removed, whatever else it holds and in whatever field order. A scalar, an array or a `null` element is never removed. The empty document is a query every document satisfies | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}, {score: 7}]` leaves `[{score: 7}]` |
+| A regular expression value (`{"$regularExpression": {...}}` in Extended JSON) | A pattern: the string elements it matches are removed | `{ "$pull": { "words": {"$regularExpression": {"pattern": "^tmp", "options": ""}} } }` |
+| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gt": 1, "score": 8 } } }` is a `400` |
 
 ```javascript
 { "$pull": { "scores": { "$gt": 1, "$lt": 5 } } }            // [1, 2, 4, 5] -> [1, 5]
 { "$pull": { "tags": { "$in": ["draft", "stale"] } } }
 { "$pull": { "words": { "$regex": "^tmp" } } }
 { "$pull": { "flags": { "$bitsAllSet": 4 } } }                // see the bit operators
-{ "$pull": { "scores": { "$not": { "$gt": 2 } } } }
-{ "$pull": { "results": { "$elemMatch": { "score": 8 } } } }  // removes {score: 8, item: "B"} too
+{ "$pull": { "results": { "score": { "$gte": 8 } } } }        // a query on each document element
+{ "$pull": { "grid": { "$elemMatch": { "$gt": 1 } } } }       // removes each array holding a member over 1
 ```
 
-A condition holds the operators of an `$elemMatch` over scalars, and an
-element is a scalar or a sub-document. To remove sub-documents by **some** of
-their fields, spell it `$elemMatch`: it matches the fields of a document
-element, where the plain `{ "score": 8 }` is a value and removes only a
-document equal to it. The condition is parsed once, with the update: an
-unknown operator or a bad argument (`{ "$in": 3 }`) is a `400` before any
-element is looked at. `$pull` from a field that is missing does nothing, and from
-one that is not an array is a `400`. A `$not` in a condition takes operators, as
-everywhere (`{ "$not": { "$gt": 2 } }`): `{ "$not": { "score": 8 } }` is a `400`
-naming `$ne` and `$elemMatch`, because a document with no operator in it would be
-read as the negation of an equality on a whole document.
+To remove the elements **equal to a whole document**, field order included, use
+`$pullAll` with that document in the list: `{ "$pullAll": { "results": [{ "score":
+8, "item": "A" }] } }` removes `{score: 8, item: "A"}` and neither `{score: 8}` nor an
+element with more fields. `$pull` of the same document is the query above, and
+removes by its fields.
+
+A top-level `$elemMatch` searches an element that is an **array** for a member
+that satisfies its body; a scalar element and a document element are not
+searched, so `{ "$pull": { "v": { "$elemMatch": { "$gt": 1 } } } }` over
+`[1, 2, 3]` removes nothing, and neither does `{ "$elemMatch": { "score": 8 } }`
+over an array of documents: write the fields as a query, `{ "score": 8 }`. A
+`$not` at the top of the operand is a `400` (`unknown top level operator:
+$not`), whatever it holds; an operator inside `$and`, `$or` or `$nor`
+(`{ "$or": [{ "$gt": 2 }] }`) is a `400` too, for the clauses are queries. The
+condition is parsed once, with the update: an unknown operator or a bad
+argument (`{ "$in": 3 }`) is a `400` before any element is looked at. `$pull`
+from a field that is missing does nothing, and from one that is not an array is
+a `400`.
 
 ### `$bit`
 
@@ -844,14 +975,14 @@ invalid update: $set on "a" conflicts with $inc on "a.b": updating the path "a.b
 ```
 
 A `$rename` counts as writing both its source and its destination. A
-`$setOnInsert` counts as a write whether or not the request inserts. **An
-index is compared by its value**: an update here reads `a.01` and `a.+1` as
-`a.1`, so `{"$set": {"a.1": 5}, "$inc": {"a.01": 1}}` writes one path twice
-and is refused as a path conflict (a `400`), with the conflict named at
-`"a.1"`. A path spelled that way
-alone is not refused. Over a field holding an object rather than an array,
-`01` and `1` are two keys, but such a pair is still refused rather than told
-apart.
+`$setOnInsert` counts as a write whether or not the request inserts. **A
+digit segment is read by its value where it steps into an array**: over an
+array an update reads `a.01` as `a.1`, so `{"$set": {"a.1": 5}, "$inc":
+{"a.01": 1}}` writes one element twice and is refused as a path conflict (a
+`400`, `in this document`), with the conflict named at `"a.1"`. A path spelled
+that way alone is not refused. Over a field holding a document, or where the
+field is missing, `01` and `1` are two fields and both writes apply (q7s2y,
+q7s2u, q7s2v). `a.+1` is a field name always.
 
 **Positional paths are checked twice.** As written, a path with a `$[]` or
 `$[<identifier>]` segment is compared segment by segment like any other, so
@@ -1167,19 +1298,54 @@ another numeric type it is stored as written, `NumberLong(1)` over the 32-bit
 as `1.0`, is refused, and a body with no `_id` keeps the stored one.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
-document:
+document, and a document that matched is **judged by the result**, in one place for
+every route (`update`, `multi`, `find_and_modify`, an operator update and a pipeline
+update):
 
 ```javascript
-// Rejected at parse time
-{ "$set": { "_id": 2 } }
-// Rejected when the result is known (a pipeline update)
+// Accepted, and no change (modified 0): the result is the stored _id, in value and type
+{ "$set": { "_id": 1 } }            // over _id: 1
+{ "$inc": { "_id": 0 } }  { "$mul": { "_id": 1 } }  { "$max": { "_id": 1 } }
+{ "$setOnInsert": { "_id": 2 } }    // skipped on a document that matched, whatever it holds
+{ "$rename": { "y": "_id" } }       // y is not there: nothing is moved
+[ { "$set": { "_id": 1 } } ]
+
+// Refused, 400: another value, another type of the same number (operators), a lost _id, a write below it
+{ "$set": { "_id": 2 } }  { "$set": { "_id": NumberLong(1) } }  { "$set": { "_id": 1.0 } }
+{ "$unset": { "_id": "" } }  { "$rename": { "_id": "y" } }  { "$rename": { "a": "_id" } }
+{ "$inc": { "_id": 1 } }  { "$max": { "_id": 5 } }  { "$set": { "_id.x": 1 } }
 [ { "$set": { "_id": 2 } } ]
 
+// A pipeline that leaves no _id has the stored one put back
+[ { "$unset": "_id" } ]
+
+// A replacement keeps the same _id as a document id, stored as the body wrote it
+{ "_id": 1, "item": "widget" }      // and {_id: NumberLong(1)} over _id: 1 stores the long
 // A replacement naming another _id is a 400 — the document is not relocated
 { "_id": 999, "item": "widget" }
-// Accepted: the same _id, or none (the stored one is kept)
-{ "_id": 7, "item": "widget" }
 ```
+
+The comparison of an operator result is of the value and its type as stored, so the
+same number of another type is a change of `_id` and is refused; a replacement and a
+pipeline update read `1` and `NumberLong(1)` as one id and store it as written (a result
+that is a double is refused, as a double `_id` is everywhere), and a pipeline that removes
+`_id` has the stored one put back.
+
+**An upsert's operators may name `_id`, so long as the id the filter gives
+holds.** With `upsert`, an operator update of `_id` is applied to the document
+that would be inserted, and judged by the result. Where the filter pins an `_id`
+(`{_id: 5}`, `{_id: {$in: [5]}}`), `{"$set": {"_id": 5}}` and `{"$setOnInsert":
+{"_id": 5}}` leave the document as it is, and any operator that would make it
+another id, or another type of the same number (`5` over a 64-bit `5`), is a
+`400` naming the immutable field: `{"$set": {"_id": 6}}`, `$inc`, `$unset`,
+`$min` or `$max` that moves it, and `{"$set": {"_id.x": 1}}` below a number. Where the filter pins none
+(`{}`, `{a: 5}`, `{_id: {$regex: "x"}}`), the operators' result is the id:
+`{"$set": {"_id": 6}}` inserts `{_id: 6, a: 5}`, `$inc` and `$min` create one,
+and `$unset` leaves a generated one. The id the document ends with is judged as an insert's (a double or a document is
+a `400`), and one that already exists is `409 duplicate_key`. A document that matched is never given an
+id this way: it is the same `400`. A `$rename` of a field that is not there onto
+`_id` changes nothing, as for any destination; of one that is there it is a
+`400`.
 
 ### `modified` counts changes
 
@@ -1211,6 +1377,7 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
 | `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
+| `$mul: {n: -1}` or `{n: -0.0}` | `n: -0.0` or `n: 0.0` (a double) | no: the result is a double equal to the one stored, so a stored zero keeps its sign. A `NaN` is never equal, so it is written |
 | `$bit: {n: {or: 0}}`, `{and: -1}`, `{xor: 0}`, or any operation that leaves the bits as they are | `n` a 32-bit integer, 32-bit operands | no |
 | `$bit: {n: {or: NumberLong(0)}}` | `n` a 32-bit integer | **yes**: a 64-bit operand makes the result a 64-bit integer |
 | `$pull` with a condition no element satisfies | | no |
@@ -1286,7 +1453,11 @@ queue never hands out the same job twice.
   equalities that overlap, the same path twice or one path inside another
   (`{a: 1, "a.b": 2}`, `{$and: [{a: 1}, {a: 2}]}`), name no one document to seed
   and are a `400` when the upsert would insert, through every one of those forms
-  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. `$setOnInsert` fields are added
+  (`{a: {$in: [5]}, "a.b": 1}`); `{"a.b": 1, "a.c": 2}` is fine. An `$all` of two or
+  more values is the same refusal (`path 'a' is matched twice`), where an `$all` of
+  one seeds. A filter with an `$expr` anywhere in it, beside other conditions or
+  under `$or`, is a `400` when the upsert would insert (`$expr is not allowed in
+  the query predicate for an upsert`). `$setOnInsert` fields are added
   to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that
@@ -1346,15 +1517,62 @@ greatest. The two ways of reaching several values behave alike: `{"tags": 1}`
 over `tags: ["c", "a"]` sorts by `"a"`, `{"tags": -1}` by `"c"`, and
 `{"items.qty": -1}` over `items: [{qty: 9}, {qty: 1}]` sorts by `9`. So
 `[0, 5]` sorts before `3` both ways (by its `0` ascending, by its `5`
-descending), and `[1, 100]` comes before `[2, 3]` descending. An empty array
-has no element to use and is compared as the array itself, at the rank arrays
-hold in the [type ordering](key-encoding.md#type-ordering) — not at either end
-of it. One comparison serves `find`, `find_and_modify`, `$sortArray` and the
+descending), and `[1, 100]` comes before `[2, 3]` descending. **An empty array
+that the path reaches has no element to use, and sorts below `null`**: after a `MinKey`
+and before a missing field, a `null` and a `[null]`, ascending, and, descending, just
+above a `MinKey` and so second to last, as the reference orders it. This is the path's own
+value at any depth (`tags` over `tags: []`, `items.sku` over `items: [{sku: []}]`); an empty
+array that is an *element* of the array reached (`tags: [[]]`, `[null, []]`) is an
+array like another, ranked among the arrays by their own order, where `[]` is the least.
+It used to be compared as the array itself, at the rank arrays hold in the [type
+ordering](key-encoding.md#type-ordering), after the documents. An index keeps its order,
+and nothing here reads one. One comparison serves `find`, `find_and_modify`, `$sortArray` and the
 pipeline's [`$sort`](aggregation.md#stages), so they order a collection
 identically. ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill)
 changed the descending rule from the smallest element.) It is not the rule `$lookup` follows for a join key, which reads the *first*
 element of a path that crosses an array rather than the least
 ([Aggregation](aggregation.md#lookup)).
+
+**Two keys through one array take one tuple per element.** When two sort keys reach values
+of the same array (`{"a.c": 1, "a.d": 1}` over `a: [{c: 5}, {d: 1}]`), each element gives
+one tuple of the keys, `(5, null)` and `(null, 1)` here, and the document's key is its
+least tuple ascending, compared key by key; it is not the
+least of each key taken apart, which would be `(null, null)` and would sort the document
+third. The recorded order of q7s3f0035 (`[7, 1, 3, 4, ...]`, document 2 after documents 1
+and 3) is this rule, and q7s4k (d) records it for the aggregation `$sort`.
+
+**What a sort key reaches, exactly.** The candidates are every value the path
+reaches; a `null` for a document that lacks the next field and for each element of an
+array on the path that is not a document (a number, a `null`, a nested array); and a
+`null` if there is nothing else. `{"a.c": 1}` over `a: [5, {c: 9}]` sorts by the
+`null` of the scalar element ascending, and by `9` descending. A leaf array is expanded one level, unless a position
+reached it, which keeps it whole (`{"a.0": 1}` over `a: [[1, 2]]` sorts by `[1, 2]`);
+an empty leaf array sorts as described above.
+
+**A position beside a field of that name is refused at sort time**, with `400` and
+the reference's wording: `Ambiguous field name found in array (do not use numeric
+field names in embedded elements in an array)`. It is raised when a sort key has a
+position that is inside the array (`{"a.0": 1}` over `a: [{"0": 9}]`, and over `a:
+[[5], {"0": 9}]`, where the element at the position is not even a document) and
+some direct element of that array is a document holding that field, in either
+direction and in any place of a compound key. It is judged on the documents the sort
+reads: a filter that removes them first, or a `$match` before a `$sort`, raises
+nothing, and a `limit` or `skip` does not hide a document the sort read. A position
+past the end of the array is a field name and never refuses (`{"a.1": 1}` over `a:
+[{"1": 5}]`), and neither does `{"a.00": 1}`, which is a field name. `find`,
+`find_and_modify`, `$sort`, the bounded sort and `$setWindowFields` and `$fill`
+`sortBy` refuse it; `$top`, `$bottom`, `$topN`, `$bucketAuto`, `$sortByCount`, an
+index build, a change stream and TTL do not.
+
+**`$sortArray` and `$push`'s `$sort` read an element by a path into it and never
+refuse.** A segment of digits is a position and nothing else, a name is not looked
+up through an array, and the value the path ends at is compared **whole** (an array
+as an array), where a sort key takes the least of an array's elements.
+
+**A positional projection of a document that has no value at the array's path
+returns the document without the field** (`{"items.$": 1}` with a filter that
+matched through another field); one that has the array and for which the filter
+recorded no element is still `400`.
 
 **A `Decimal128` at a sort path takes its place among the numbers**, by its
 exact value: `Decimal128("1.5")` sorts between `1` and `2`, and
@@ -1424,11 +1642,13 @@ else, and never answers part of one:
   takes only the field-name reading, which is also the one an [aggregation
   expression](aggregation.md#arrays) takes. No projection selects an element
   by position; `$slice` in a pipeline does that.
-- **Outside an array, an inclusion leaves out a sub-document that holds none
-  of the paths**: `{"a.b": 1}` over `{a: {c: 1}}` answers no `a` at all,
-  where an element of an array would be `{}`. A field the path cannot
-  continue through — a number where `a.b` needs a document — is left out
-  the same way.
+- **An included path keeps its parent whatever it finds inside**, in a
+  `find` projection and in a `$project` stage alike: `{"a.b": 1}` over
+  `{a: {c: 1}}` answers `a: {}`, an array keeps one projected document per
+  document element (empty ones included, scalar elements dropped, nested
+  arrays walked the same way), and an empty document stays `{}` and an empty
+  array `[]`. Only a parent that cannot be continued through — a scalar, a
+  `null` or a missing field, where `a.b` needs a document — is left out.
 
 A value is read as a flag, not as the literal `0` or `1`: any non-zero number
 or `true` includes, `0`, `0.0` and `false` exclude, and a string, `null`, an
@@ -1438,6 +1658,16 @@ array or a document is refused `400` — `projection value for "x" must be 0 or
 $slice is not supported for "items"; a projection value must be 0 or 1`. There
 are no projection operators besides the positional `$` below; reshape an array in an
 [aggregation](aggregation.md) pipeline, where `$slice` exists as an expression.
+
+**A projection field name has to be a path.** The empty name, a name that ends in a
+`.` (`"a."`), an empty segment (`".a"`, `"a..b"`) and a segment that starts with a `$`
+(`"$a"`, `"a.$b"`) are each a `400` (`projection field "a.": FieldPath must not end
+with a '.'.`), as the reference refuses them; they answered `_id` alone, or an empty
+array where the path met one. They are refused in an exclusion (`{"a.": 0}`) and in an
+exclusion beside another (`{"a.": 0, "d": 0}`) alike, as recorded. A `$` inside or at the end of a
+segment is a name, and so is the segment `$ref`: `{"a.$ref": 1}` and `{"a.b$": 0}` project. `a.$`
+with `1` is the positional projection below, and with `0` is refused. A `$project`
+stage is not a find projection and reads names as before.
 
 **`{"items.$": 1}` is the positional projection.** A `find` or
 `find_and_modify` projection with a path ending in `$` returns the document
@@ -1530,10 +1760,18 @@ string. Earlier releases let an invalid pattern match nothing, and ignored an
 `$options` that was not a string, so a bad pattern inside an `$or` returned a
 plausible result with one branch silently gone.
 
+**`$options` without a `$regex` is refused.** `{"a": {"$options": "i"}}` is a `400`
+(`$options needs a $regex`), as the reference answers it. It used to constrain nothing, so
+as the filter of a multi update or a delete it selected every document; a client that
+drops an `undefined` `$regex` while serialising (`JSON.stringify`) is left with exactly
+that filter. It is refused in every position it can stand in, as the reference
+refuses it: beside another operator, under `$not`, inside an `$elemMatch`, and inside
+`$and`, `$or` and `$nor`.
+
 **A flag other than `i`, `m`, `s`, `x` and `u` is refused.** `u` is accepted, as
 the reference accepts it, and changes nothing: a pattern is always matched as
 Unicode text. The five are the whole set, and any other character in `$options` —
-or in the flags of a regex literal, or in a lone `$options` — is a `400` naming
+or in the flags of a regex literal — is a `400` naming
 it, before any document is read: `{"$regex": "S", "$options": "I"}` fails on the
 `I`, because `$options` is case-sensitive. Earlier releases dropped an unknown flag and the pattern
 compiled without it, so `"I"` returned a case-sensitive result and `"iz"`
@@ -1612,6 +1850,13 @@ access path and every sort order.
 ```json
 { "filter": {}, "limit": 50, "skip": 100 }
 ```
+
+**`limit` and `skip` are numbers that are not negative, and a double is truncated.**
+`"limit": 2.0`, `2.5` and `2.99` are all `2`, and `"skip": 2.7` skips `2`, as the
+reference reads them; a double used to be refused with the error for a field of the wrong
+type. A negative one of any kind (`-1`, `-2.0`, `-2.5`), a `NaN`, a string and
+`null` are still refused, with a `4xx`. A double that truncates to `0` (`0.0`, `0.5`) is the
+count `0`: for `limit`, the window of nothing above.
 
 > **Sharp edge.** `skip` is O(n) even with an index: skipped documents are still
 > visited. Deep paging over a large collection is expensive — **use a cursor

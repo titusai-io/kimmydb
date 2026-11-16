@@ -1115,9 +1115,9 @@ struct FindRequest {
     sort: Option<Value>,
     #[serde(deserialize_with = "crate::json::non_null_field")]
     projection: Option<Value>,
-    #[serde(deserialize_with = "crate::json::non_null_field")]
+    #[serde(deserialize_with = "crate::json::count_field")]
     limit: Option<usize>,
-    #[serde(deserialize_with = "crate::json::non_null_field")]
+    #[serde(deserialize_with = "crate::json::count_field")]
     skip: Option<usize>,
     /// Report how the query was answered alongside the results.
     explain: bool,
@@ -1146,7 +1146,9 @@ impl From<FindRequest> for exec::FindParams {
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct FindQuery {
+    #[serde(deserialize_with = "crate::json::count_param")]
     limit: Option<usize>,
+    #[serde(deserialize_with = "crate::json::count_param")]
     skip: Option<usize>,
 }
 

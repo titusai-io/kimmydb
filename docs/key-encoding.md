@@ -298,14 +298,20 @@ Documents and arrays are encoded recursively with explicit framing:
 
 ```
 Array:     0x50  [0x01 <element>]*  0x00
-Document:  0x40  [0x01 <key> <value>]*  0x00
+Document:  0x40  [0x01 <tag> <key> <value without its tag>]*  0x00
 ```
 
 An element is introduced by `0x01`; the composite ends with `0x00`. Since
 `0x00 < 0x01`, a shorter sequence sorts before a longer one that shares its
 prefix — matching "compare elementwise, then by length".
 
-Documents compare key-then-value, pair by pair, which is Mongo's rule.
+Documents compare field by field, and for each field by the **type of the value**,
+then its **name**, then the **value**, recursively, which is the reference's rule
+(q7s3h; storage schema 11). Before schema 11 the name came first, so `{d: 1}` was below
+`{c: "z"}` and now it is the string that is above. The encoding writes the value's type
+tag before the name for that reason, and the value's own bytes after the name without
+the tag they began with; numbers are one type, so `1`, `1.0` and a decimal `1` share a
+key. A shorter document is first when it is a prefix of another.
 
 ---
 

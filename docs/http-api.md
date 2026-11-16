@@ -880,7 +880,7 @@ and listed by `GET …/indexes/{name}/unkeyed`
 `GET …/indexes/{name}/unkeyed?limit=&cursor=` answers
 `{"index": "tags_1_sizes_1", "unkeyed": [{"_id": 1, "reason": "parallel_arrays"}],
 "count": 1, "nextCursor": "…"}`, `nextCursor` present while the run holds more;
-`reason` is `parallel_arrays` or `too_many_keys`. An index the collection does not
+`reason` is `parallel_arrays`, `too_many_keys` or `ambiguous_position`. An index the collection does not
 have is `404`.
 
 Creating an index under a name the collection already has is **idempotent
@@ -1109,19 +1109,39 @@ back with the thing it is asking for.
 Documents are stored as BSON. JSON cannot express several BSON types, so the
 edge uses **Extended JSON v2**:
 
-| BSON type | JSON form |
-|---|---|
-| ObjectId | `{"$oid": "6745f2a1b3c4d5e6f7081920"}` |
-| DateTime | `{"$date": 1700000000000}` or RFC 3339 |
-| Int64 | `{"$numberLong": "9007199254740993"}` |
-| Decimal128 | `{"$numberDecimal": "1.25"}` |
-| Binary | `{"$binary": {"base64": "…", "subType": "00"}}` |
-| Regular expression | `{"$regularExpression": {"pattern": "ab+c", "options": "i"}}` |
-| Timestamp | `{"$timestamp": {"t": 1700000000, "i": 1}}` |
-| MinKey / MaxKey | `{"$minKey": 1}` / `{"$maxKey": 1}` |
+| BSON type | Read (what a request may carry) | Written (what a reply carries) |
+|---|---|---|
+| Int32 | a plain integer in the 32-bit range, or `{"$numberInt": "5"}` | a plain number |
+| Int64 | `{"$numberLong": "9007199254740993"}`, or a plain integer outside the 32-bit range that fits 64 bits | a plain number, with every digit ([below](#an-int64-is-a-plain-number-on-the-way-out)) |
+| Double | a plain number with a fraction or exponent, or `{"$numberDouble": "1.5"}` (also `"NaN"`, `"Infinity"`, `"-Infinity"`) | a plain number; NaN and the infinities as `{"$numberDouble": "NaN"}`, `"Infinity"`, `"-Infinity"` |
+| A whole number too large for 64 bits | read as a **Double**: its digits past 2^53 are not kept (send `{"$numberLong"}` for an Int64, or a `$numberDecimal`) | as a Double |
+| ObjectId | `{"$oid": "6745f2a1b3c4d5e6f7081920"}` | the same |
+| DateTime | `{"$date": 1700000000000}` (milliseconds), `{"$date": {"$numberLong": "1700000000000"}}`, or `{"$date": "2023-11-14T22:13:20Z"}` (RFC 3339) | **only** `{"$date": 1700000000000}`, in milliseconds; the RFC 3339 form is input only |
+| Decimal128 | `{"$numberDecimal": "1.25"}` | the same, the digits as sent |
+| Binary | `{"$binary": {"base64": "…", "subType": "00"}}` (`subType` absent means `00`) | the same, `subType` as two lower-case hex digits |
+| Regular expression | `{"$regularExpression": {"pattern": "ab+c", "options": "i"}}` | the same, `options` in alphabetical order |
+| Timestamp | `{"$timestamp": {"t": 1700000000, "i": 1}}` | the same |
+| MinKey / MaxKey | `{"$minKey": 1}` / `{"$maxKey": 1}` | the same |
+| Symbol | not read: a string | a plain string |
+| Undefined | not read: `null` | `null` |
+| DbPointer | not read | `null` |
+| Code, and code with scope | not read: `{"$code": "f()"}` arrives as a nested document | `{"$code": "f()"}`, and `{"$code": "f()", "$scope": {…}}` with a scope |
 
 Plain JSON keeps working for anything expressible in it — you only meet this
 when you need a type JSON lacks.
+
+<a id="an-int64-is-a-plain-number-on-the-way-out"></a>
+**An Int64 is a plain number on the way out, and its width is read back by its
+size.** On input a plain integer that fits 32 bits is an Int32 and a larger one
+an Int64; `{"$numberLong": "…"}` is an Int64 of any size, `5` included. On
+output an Int32 and an Int64 are both a plain JSON number, with all the digits
+of an Int64 past 2^53 (`9007199254740993` is written as that number, not as a
+string or a rounded double). So a document read and sent back unchanged stores
+an Int64 that fits 32 bits as an Int32, and an Int64 past 32 bits stays one;
+`$type` answers the stored width. A client that parses JSON numbers as doubles
+loses the digits past 2^53 on its side, which is not this edge's doing. Pinned by
+`an_int64_is_written_as_a_plain_number_and_read_back_by_its_size` in
+`crates/kimmy-api/tests/api.rs`.
 
 **A regular expression and a timestamp are read as well as written** (from
 0.59.0; before, they were written in these forms and arrived as nested

@@ -127,6 +127,26 @@ fn docs() -> Vec<Document> {
         out.push(doc! {"_id": 0, "k": {"a": v.clone()}});
         out.push(doc! {"_id": 0, "k": [{"a": v}]});
     }
+    // The shapes of the recorded fixtures AD, CL and PE (q7s3 resolver rule): elements that lack
+    // the field, scalar, null and nested-array elements, an empty array, and a position beside a
+    // field of that name.
+    for k in [
+        bson::bson!([{"b": null}, {"a": 1}]),
+        bson::bson!([{"a": 5}, {"b": 1}]),
+        bson::bson!([1, 2]),
+        bson::bson!([]),
+        bson::bson!([{"a": null}]),
+        bson::bson!([{"a": []}]),
+        bson::bson!([null, {"a": 9}]),
+        bson::bson!([[{"a": 1}]]),
+        bson::bson!([{"0": 9}]),
+        bson::bson!([{"b": 1}, {"0": 2}]),
+        bson::bson!([[5], {"0": 9}]),
+        bson::bson!([{"1": 5}, {"b": 1}]),
+        bson::bson!({"0": "x", "01": "z"}),
+    ] {
+        out.push(doc! {"_id": 0, "k": k});
+    }
     out
 }
 
@@ -134,7 +154,7 @@ fn docs() -> Vec<Document> {
 /// `k.a`, plus the operand-free and compound forms.
 fn filters() -> Vec<Document> {
     let mut out = Vec::new();
-    for path in ["k", "k.a"] {
+    for path in ["k", "k.a", "k.0", "k.1", "k.01"] {
         out.push(doc! {path: {"$exists": true}});
         out.push(doc! {path: {"$exists": false}});
         for v in values() {
@@ -185,7 +205,7 @@ fn write_the_table() {
 /// as its operand.
 fn partial_filters() -> Vec<Document> {
     let mut out = Vec::new();
-    for path in ["k", "k.a"] {
+    for path in ["k", "k.a", "k.0", "k.1", "k.01"] {
         out.push(doc! {path: {"$exists": true}});
         for v in values() {
             if kimmy_core::holds_decimal128(&v) {
@@ -338,6 +358,10 @@ fn numeric_classes() -> Vec<Vec<Bson>> {
 /// Every comparison operator, with every number of the corpus as the operand,
 /// against every number of the corpus stored, answers by the exact values
 /// alone: the hand-written order of [`numeric_classes`] says what each must be.
+/// Except for a NaN, which equals a NaN and is ordered against no number: `$gt`
+/// and `$lt` hold for no pair with a NaN in it, `$gte` and `$lte` for the pairs of
+/// two NaNs (q7s3a.out, the sweep over 50 values). The sort and the index order
+/// still place it first, and `canonical_cmp` is what says so.
 #[test]
 fn every_numeric_comparison_answers_by_exact_value() {
     let classes = numeric_classes();
@@ -353,19 +377,24 @@ fn every_numeric_comparison_answers_by_exact_value() {
         for s in stored {
             let d = doc! {"k": s.clone()};
             for (ro, operands) in classes.iter().enumerate() {
+                // Class 0 is the NaN class.
+                let ordered = rs != 0 && ro != 0;
+                let both_nan = rs == 0 && ro == 0;
+                let (gt, gte) = if ordered { (rs > ro, rs >= ro) } else { (false, both_nan) };
+                let (lt, lte) = if ordered { (rs < ro, rs <= ro) } else { (false, both_nan) };
                 for o in operands {
                     let want = [
                         (doc! {"k": o.clone()}, rs == ro),
                         (doc! {"k": {"$eq": o.clone()}}, rs == ro),
                         (doc! {"k": {"$ne": o.clone()}}, rs != ro),
-                        (doc! {"k": {"$gt": o.clone()}}, rs > ro),
-                        (doc! {"k": {"$gte": o.clone()}}, rs >= ro),
-                        (doc! {"k": {"$lt": o.clone()}}, rs < ro),
-                        (doc! {"k": {"$lte": o.clone()}}, rs <= ro),
+                        (doc! {"k": {"$gt": o.clone()}}, gt),
+                        (doc! {"k": {"$gte": o.clone()}}, gte),
+                        (doc! {"k": {"$lt": o.clone()}}, lt),
+                        (doc! {"k": {"$lte": o.clone()}}, lte),
                         (doc! {"k": {"$in": [o.clone()]}}, rs == ro),
                         (doc! {"k": {"$nin": [o.clone()]}}, rs != ro),
                         (doc! {"k": {"$all": [o.clone()]}}, rs == ro),
-                        (doc! {"k": {"$not": {"$lte": o.clone()}}}, rs > ro),
+                        (doc! {"k": {"$not": {"$lte": o.clone()}}}, !lte),
                     ];
                     for (f, expected) in want {
                         let got = answer(&f, &d);
