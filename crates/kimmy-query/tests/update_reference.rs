@@ -274,11 +274,12 @@ fn b_a_numeric_segment_reaches_three_levels_down() {
 
 #[test]
 fn b_a_numeric_segment_mixed_with_field_names_in_documents_and_arrays() {
-    // q7s2.out lines 56, 61, 71, 76, 81, 86. The last case differs from line
-    // 86 in the order of two fields: the recording lists the numeric-looking
-    // key "1" before "k", which says nothing a client can rely on (the
-    // reference orders integer-like keys by their own rules), so this pins the
-    // order the engine gives (the new field after the stored one).
+    // q7s2.out lines 56, 61, 71, 76, 81, 86. The last case differs from line 86 in the order
+    // of two fields: the recording lists the numeric-looking key "1" before "k". That order is
+    // an artifact of the first harness, which read the stored document through a JS object and
+    // so moved an integer-like name to the front; the reference appends the new field after the
+    // stored ones, and the expectation `a: [{k: 1, "1": 9}]` below is q7s2t t0003, t0013 and
+    // t0122 (`afterOrdered`, the order stored).
     let items = doc! { "_id": 1, "items": [{ "tags": ["a", "b"], "n": 1 }, { "tags": ["c"] }] };
     same(
         updated(doc! { "$set": { "items.0.tags.1": "z" } }, items.clone()),
@@ -365,16 +366,20 @@ fn b_an_upsert_writing_below_a_filter_scalar_is_refused() {
 }
 
 #[test]
-fn b_two_spellings_of_one_element_are_a_path_conflict() {
-    // No recorded answer. The product refuses the pair: `a.1` and `a.01` are
-    // one element, written twice.
+fn b_two_spellings_of_one_element_are_a_path_conflict_where_the_container_is_an_array() {
+    // q7s2y 1 to 16: the reference server aborts on `a.01` beside `a.1` over an array, which is
+    // read here as a refusal that writes nothing. Over a document, or where the container is
+    // missing, they are two fields and both apply (q7s2y 34 to 59; see `update_table`).
     for update in [
         doc! { "$set": { "a.1": 5 }, "$inc": { "a.01": 1 } },
         doc! { "$inc": { "a.01": 1 }, "$set": { "a.1": 5 } },
     ] {
-        let Err(err) = parsed(update) else { panic!("applied") };
-        assert!(err.contains("conflict"), "{err}");
+        refused(updated(update, doc! { "_id": 1, "a": [10, 20, 30] }), "conflict");
     }
+    same(
+        updated(doc! { "$set": { "o.01": 7, "o.1": 8 } }, doc! { "_id": 1, "o": { "k": 1 } }),
+        doc! { "_id": 1, "o": { "k": 1, "01": 7, "1": 8 } },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -599,14 +604,16 @@ fn decimal(text: &str) -> bson::Bson {
 fn h_a_body_id_that_is_no_document_id_is_refused() {
     // Not recorded: a double is equal to the stored 1 by value, but it is no
     // `DocId`, and a document stored under it could not be read back by key.
-    refused(updated(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1, "k": 1 }), "_id is immutable");
+    // The name is judged by the id types first (q7s2o0592, o0599, o0606), so the refusal is the
+    // id type's, not the immutable `_id`'s.
+    refused(updated(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1, "k": 1 }), "invalid _id type");
     refused(
         updated(doc! { "_id": decimal("7.5"), "v": 1 }, doc! { "_id": 7, "k": 1 }),
         "_id is immutable",
     );
     // A replacement upsert: the filter's `_id` against the body's, and a body
     // `_id` with no filter `_id`.
-    refused(upserted(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1 }), "_id is immutable");
+    refused(upserted(doc! { "_id": 1.0, "v": 1 }, doc! { "_id": 1 }), "invalid _id type");
     assert!(upserted(doc! { "_id": 1.0, "v": 1 }, doc! {}).is_err());
     // A non-integral Decimal128 is a document id, so it is a valid body `_id`
     // when the filter names none, and differs from a stored integer id.
@@ -967,13 +974,14 @@ fn l_a_field_name_that_is_not_an_index_on_an_array_is_the_same_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-// (M) New fields with all-digit names sort by value, ahead of the others
+// (M) The order of new fields: bytes, with the names led by 1 to 9 shorter first (q7s2u/v/w)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m_new_digit_names_come_first_by_value_then_the_rest_by_bytes() {
-    // q7s2h.out h1 and h2 (lines 2-12): `10, 9, 1, a, B` and `1, 9, 10, a, B`
-    // over `{_id: 1}` both store `_id, 1, 9, 10, B, a`.
+fn m_new_names_led_by_a_digit_come_shorter_first_and_the_rest_by_bytes() {
+    // q7s2h.out h1 and h2, stored key order (lines 6 and 12): `10, 9, 1, a, B` and `1, 9, 10,
+    // a, B` over `{_id: 1}` both store `_id, 1, 9, 10, B, a`. Over a document with fields,
+    // q7s2t t0108 and t0118 (`1, 10, 2` over `{m, k}` and over `{z, a, m}`): after them, `1, 2, 10`.
     let want = doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "B": 1, "a": 1 };
     same(
         updated(doc! { "$set": { "10": 1, "9": 1, "1": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
@@ -983,12 +991,12 @@ fn m_new_digit_names_come_first_by_value_then_the_rest_by_bytes() {
         updated(doc! { "$set": { "1": 1, "9": 1, "10": 1, "a": 1, "B": 1 } }, doc! { "_id": 1 }),
         want,
     );
-    // h8 (line 44): `$inc` of `10, 9, a, 1`.
+    // h8, stored key order (line 48): `$inc` of `10, 9, a, 1`.
     same(
         updated(doc! { "$inc": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
         doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
     );
-    // h15 (line 86): letters only, the control.
+    // h15, stored key order (line 90): letters only, the control; t0106 and t0109 (top level).
     same(
         updated(doc! { "$set": { "Z": 1, "a": 1, "B": 1, "b": 1 } }, doc! { "_id": 1, "m": 1 }),
         doc! { "_id": 1, "m": 1, "B": 1, "Z": 1, "a": 1, "b": 1 },
@@ -997,8 +1005,10 @@ fn m_new_digit_names_come_first_by_value_then_the_rest_by_bytes() {
 
 #[test]
 fn m_a_level_an_update_creates_sorts_its_digit_names_by_value() {
-    // h3, h4, h5 (lines 14-30): `s.10, s.9, s.b` with `s` absent, `s` present and
-    // empty, and written in the other order; each stores `s: {9, 10, b}`.
+    // h3, h4, h5, stored key order (lines 18, 24, 30): `s.10, s.9, s.b` with `s` absent, `s`
+    // present and empty, and written in the other order; each stores `s: {9, 10, b}`. Over a
+    // sub-document with fields, q7s2t t0063 to t0069 (`o.1 + o.10 + o.2` after `{m, k}` gives
+    // `1, 2, 10`; t0069 with letters: `1, 2, 10, B, b, z`).
     let want = doc! { "_id": 1, "s": { "9": 1, "10": 1, "b": 1 } };
     same(
         updated(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
@@ -1012,7 +1022,8 @@ fn m_a_level_an_update_creates_sorts_its_digit_names_by_value() {
         updated(doc! { "$set": { "s.b": 1, "s.9": 1, "s.10": 1 } }, doc! { "_id": 1 }),
         want.clone(),
     );
-    // h13 and h14 (lines 74-84): the same over an upsert, `$set` and `$setOnInsert`.
+    // h13 and h14, stored key order (lines 78 and 84): the same over an upsert, `$set` and
+    // `$setOnInsert`.
     same(
         upserted(doc! { "$set": { "s.10": 1, "s.9": 1, "s.b": 1 } }, doc! { "_id": 1 }),
         want.clone(),
@@ -1025,13 +1036,13 @@ fn m_a_level_an_update_creates_sorts_its_digit_names_by_value() {
 
 #[test]
 fn m_an_upsert_sorts_what_every_operator_adds_together() {
-    // h9 (line 50): `$setOnInsert` of `10, 9, a, 1`.
+    // h9, stored key order (line 54): `$setOnInsert` of `10, 9, a, 1`.
     same(
         upserted(doc! { "$setOnInsert": { "10": 1, "9": 1, "a": 1, "1": 1 } }, doc! { "_id": 1 }),
         doc! { "_id": 1, "1": 1, "9": 1, "10": 1, "a": 1 },
     );
-    // h11 (line 62): `$set` of `b, 3`, `$inc` of `20, 2, a` and `$setOnInsert` of `7, c`
-    // store `_id, 2, 3, 7, 20, a, b, c`.
+    // h11, stored key order (line 66): `$set` of `b, 3`, `$inc` of `20, 2, a` and
+    // `$setOnInsert` of `7, c` store `_id, 2, 3, 7, 20, a, b, c`.
     same(
         upserted(
             doc! {
@@ -1047,9 +1058,9 @@ fn m_an_upsert_sorts_what_every_operator_adds_together() {
 
 #[test]
 fn m_the_filter_seed_keeps_its_own_byte_order_and_the_update_adds_after_it() {
-    // h6, h7, h10 and h12 (lines 32-42, 56-60, 68-72): the seed of the filter
-    // `_id, 10, 9` is in byte order (`10` before `9`), and what the update
-    // creates follows it, digit names by value: `_id, 10, 9, 5, z`.
+    // h6, h7, h10 and h12, stored key order (lines 36, 42, 60, 72): the seed of the filter
+    // `_id, 10, 9` is in byte order (`10` before `9`), and what the update creates follows it,
+    // digit names by value: `_id, 10, 9, 5, z`.
     let seed = || doc! { "_id": 1, "10": 1, "9": 2 };
     same(
         upserted(doc! { "$set": { "z": 1, "5": 1 } }, seed()),
@@ -1071,16 +1082,407 @@ fn m_the_filter_seed_keeps_its_own_byte_order_and_the_update_adds_after_it() {
 }
 
 #[test]
-fn m_two_digit_names_of_one_value_are_told_apart_by_their_bytes() {
-    // UNRECORDED: `01` and `1` have one numeric value; the recording has no pair
-    // like it. The tie is broken by bytes, so `01` comes first.
+fn m_a_name_is_ordered_by_its_bytes_and_by_length_only_beside_another_led_by_1_to_9() {
+    // q7s2v (the groups `01, 1`, `001, 01, 1` and `0, 00`): `01` and `1` have one numeric
+    // value and no value is read; `01` is before `1` by bytes, as `0` is before `1`.
     same(
         updated(doc! { "$set": { "1": 1, "01": 1, "2": 1 } }, doc! { "_id": 1 }),
         doc! { "_id": 1, "01": 1, "1": 1, "2": 1 },
     );
-    // A name that merely contains digits is not an all-digit name.
+    // A name that merely contains digits is not ordered by them: `-1` is before every name led
+    // by 1 to 9 (q7s2v `-a, 1`, `-a, 1a`), `a1` after them, and `9` before `10` (both led by
+    // 1 to 9, the shorter first).
     same(
         updated(doc! { "$set": { "a1": 1, "10": 1, "-1": 1, "9": 1 } }, doc! { "_id": 1 }),
-        doc! { "_id": 1, "9": 1, "10": 1, "-1": 1, "a1": 1 },
+        doc! { "_id": 1, "-1": 1, "9": 1, "10": 1, "a1": 1 },
     );
+    // q7s2v `2, 10, 1a` (a name led by a digit that is not all digits sorts by length too: `1a`
+    // after `10`), `010, 2, 10, 1a` (`010` is led by 0 and goes by bytes, before them all), and
+    // `1a, 100` (`1a` is the shorter).
+    same(
+        updated(doc! { "$set": { "1a": 1, "10": 1, "2": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "2": 1, "10": 1, "1a": 1 },
+    );
+    same(
+        updated(doc! { "$set": { "1a": 1, "10": 1, "2": 1, "010": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "010": 1, "2": 1, "10": 1, "1a": 1 },
+    );
+    same(
+        updated(doc! { "$set": { "100": 1, "1a": 1 } }, doc! { "_id": 1 }),
+        doc! { "_id": 1, "1a": 1, "100": 1 },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (N) An upsert may name `_id` in its operators, if the filter's does not change
+// ---------------------------------------------------------------------------
+
+/// The update, parsed as an upsert's, applied to the seed an upsert inserts.
+fn upserted_id(update: Document, mut seed: Document) -> Result<Document, String> {
+    let parsed = update::parse(&update).map_err(|e| e.to_string())?;
+    update::apply_on_insert(&parsed, &mut seed, NOW).map_err(|e| e.to_string())?;
+    Ok(seed)
+}
+
+#[test]
+fn n_an_upsert_may_set_the_id_the_filter_gives() {
+    // q7s2o.out o0692 (line 4076), o0695 (4092), o0703 (4135; a `$in` of one value seeds
+    // the same id): the same id is no change, and the document keeps the filter's.
+    for update in [doc! { "$set": { "_id": 5 } }, doc! { "$setOnInsert": { "_id": 5 } }] {
+        same(upserted_id(update, doc! { "_id": 5 }), doc! { "_id": 5 });
+    }
+    // With a field beside it (o0747, line 4374).
+    same(
+        upserted_id(doc! { "$set": { "_id": 5, "z": 1 } }, doc! { "_id": 5, "a": 5 }),
+        doc! { "_id": 5, "a": 5, "z": 1 },
+    );
+}
+
+#[test]
+fn n_an_upsert_cannot_change_the_id_the_filter_gives() {
+    // o0693 (line 4082), o0694 (4087), o0696 (4098), o0697 (4103), o0698 (4108), o0699
+    // (4113): code 66, the immutable field.
+    for update in [
+        doc! { "$set": { "_id": 6 } },
+        doc! { "$setOnInsert": { "_id": 7 } },
+        doc! { "$inc": { "_id": 1 } },
+        doc! { "$unset": { "_id": 1 } },
+        doc! { "$min": { "_id": 1 } },
+        doc! { "$max": { "_id": 9 } },
+    ] {
+        refused(upserted_id(update, doc! { "_id": 5 }), "_id is immutable");
+    }
+    // o0702 (line 4130): a field below the id, which is a scalar.
+    assert!(upserted_id(doc! { "$set": { "_id.x": 1 } }, doc! { "_id": 5 }).is_err());
+    // o0725 (line 4251): the same number of another type is another id.
+    refused(upserted_id(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5_i64 }), "_id is immutable");
+    // o0764 (line 4470), o0762 (4460): a document id, which `$min` lowers and `$inc` cannot add to.
+    refused(
+        upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "_id": { "k": 1 } }),
+        "_id is immutable",
+    );
+    assert!(upserted_id(doc! { "$inc": { "_id": 1 } }, doc! { "_id": { "k": 1 } }).is_err());
+    // o0765 (line 4475): `$max` of a number leaves a document id as it is. o0786 (4586):
+    // so does `$min` of a number leave a null.
+    same(
+        upserted_id(doc! { "$max": { "_id": 9 } }, doc! { "_id": { "k": 1 } }),
+        doc! { "_id": { "k": 1 } },
+    );
+    same(
+        upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "_id": bson::Bson::Null }),
+        doc! { "_id": bson::Bson::Null },
+    );
+}
+
+#[test]
+fn n_an_upsert_whose_filter_gives_no_id_may_set_any() {
+    // o0736-o0743 (lines 4308-4350) and o0747-o0754 (4374-4416), a filter with no `_id`;
+    // o0791-o0792 (4614, 4620), a filter on `_id` that pins none. The id is stored first.
+    same(upserted_id(doc! { "$set": { "_id": 5 } }, doc! {}), doc! { "_id": 5 });
+    same(upserted_id(doc! { "$set": { "_id": 6 } }, doc! { "a": 5 }), doc! { "_id": 6, "a": 5 });
+    same(
+        upserted_id(doc! { "$setOnInsert": { "_id": 7 } }, doc! { "a": 5 }),
+        doc! { "_id": 7, "a": 5 },
+    );
+    same(upserted_id(doc! { "$inc": { "_id": 1 } }, doc! { "a": 5 }), doc! { "_id": 1, "a": 5 });
+    same(upserted_id(doc! { "$min": { "_id": 1 } }, doc! { "a": 5 }), doc! { "_id": 1, "a": 5 });
+    same(upserted_id(doc! { "$max": { "_id": 9 } }, doc! { "a": 5 }), doc! { "_id": 9, "a": 5 });
+    // o0752 (line 4404): `$unset` of an id that is not there leaves none, and one is made.
+    same(upserted_id(doc! { "$unset": { "_id": 1 } }, doc! { "a": 5 }), doc! { "a": 5 });
+}
+
+#[test]
+fn n_a_stored_document_is_judged_by_the_result_on_its_id() {
+    // q7s2r.out r0137 (line 2101): the same id is accepted and is no change; r0145 (line
+    // 2149) and r0139 (line 2113): another id, or another type of the number, is refused.
+    same(
+        updated(doc! { "$set": { "_id": 5 } }, doc! { "_id": 5, "a": 1 }),
+        doc! { "_id": 5, "a": 1 },
+    );
+    refused(updated(doc! { "$set": { "_id": 6 } }, doc! { "_id": 5 }), "_id is immutable");
+    refused(updated(doc! { "$set": { "_id": 5_i64 } }, doc! { "_id": 5 }), "_id is immutable");
+    // r0155 (line 2209): a rename of a missing field onto `_id`, on a matched document that
+    // is not an upsert's, moves nothing.
+    same(
+        updated(doc! { "$rename": { "y": "_id" } }, doc! { "_id": 5, "a": 1 }),
+        doc! { "_id": 5, "a": 1 },
+    );
+}
+
+#[test]
+fn n_a_rename_to_the_id_of_a_field_that_is_missing_is_no_change() {
+    // o0700 (line 4118) and o0755 (4422): the source is not there, so nothing is moved
+    // and the destination is not judged.
+    same(upserted_id(doc! { "$rename": { "y": "_id" } }, doc! { "_id": 5 }), doc! { "_id": 5 });
+    same(upserted_id(doc! { "$rename": { "y": "_id" } }, doc! { "a": 5 }), doc! { "a": 5 });
+    // UNRECORDED: a source that is there is still refused.
+    refused(upserted_id(doc! { "$rename": { "a": "_id" } }, doc! { "a": 5 }), "_id is immutable");
+}
+
+#[test]
+fn l_every_operator_reads_where_it_writes_by_position_under_the_read_rule() {
+    // A read takes `00` and `01` for field names (the resolver rule), an update path takes them
+    // for positions (q7s2g2.jsonl 34, 37). No operator computes its value from a read that
+    // follows the read rule: each reads the element it writes, `a.01` being the second. This is a
+    // guard and not a failing-first test: it passes on the code before the read-position switch
+    // too, and fails if an operator's read moves off its write when the switch is made.
+    let ten_twenty = || doc! { "_id": 1, "a": [10, 20] };
+    let nested = || doc! { "_id": 1, "a": [[1], [2]] };
+    let two_three = || doc! { "_id": 1, "a": [[1], [2, 3]] };
+    same(updated(doc! { "$inc": { "a.01": 1 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 21] });
+    same(updated(doc! { "$mul": { "a.01": 2 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 40] });
+    same(
+        updated(doc! { "$bit": { "a.01": { "or": 1 } } }, ten_twenty()),
+        doc! { "_id": 1, "a": [10, 21] },
+    );
+    same(updated(doc! { "$min": { "a.01": 5 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 5] });
+    same(updated(doc! { "$max": { "a.01": 50 } }, ten_twenty()), doc! { "_id": 1, "a": [10, 50] });
+    same(updated(doc! { "$push": { "a.01": 3 } }, nested()), two_three());
+    same(updated(doc! { "$addToSet": { "a.01": 3 } }, nested()), two_three());
+    same(updated(doc! { "$pull": { "a.01": 2 } }, two_three()), doc! { "_id": 1, "a": [[1], [3]] });
+    same(updated(doc! { "$pop": { "a.01": 1 } }, two_three()), doc! { "_id": 1, "a": [[1], [2]] });
+}
+
+// ---------------------------------------------------------------------------
+// (T) q7s2t: where a new field lands, and what a second update does (`afterOrdered`)
+// ---------------------------------------------------------------------------
+
+/// Two updates in a row, as the recording's second update runs on what the first left.
+fn then(first: Document, second: Document, stored: Document) -> Result<Document, String> {
+    let once = updated(first, stored)?;
+    updated(second, once)
+}
+
+#[test]
+fn t_mul_on_a_new_field_creates_zero_where_it_appends() {
+    // t0196 (`a.0.z` over `a: [{k, m}]`), t0214 (`o.z`), t0232 (`z`, top level).
+    same(
+        updated(doc! { "$mul": { "a.0.z": 2 } }, doc! { "_id": 1, "a": [{ "k": 1, "m": 2 }] }),
+        doc! { "_id": 1, "a": [{ "k": 1, "m": 2, "z": 0 }] },
+    );
+    same(
+        updated(doc! { "$mul": { "o.z": 2 } }, doc! { "_id": 1, "o": { "k": 1, "m": 2 } }),
+        doc! { "_id": 1, "o": { "k": 1, "m": 2, "z": 0 } },
+    );
+    same(
+        updated(doc! { "$mul": { "z": 2 } }, doc! { "_id": 1, "k": 1, "m": 2 }),
+        doc! { "_id": 1, "k": 1, "m": 2, "z": 0 },
+    );
+    // t0205 and t0241: over an existing `z` it multiplies in place.
+    same(
+        updated(doc! { "$mul": { "z": 2 } }, doc! { "_id": 1, "z": 1, "a": 2, "m": 3 }),
+        doc! { "_id": 1, "z": 2, "a": 2, "m": 3 },
+    );
+}
+
+#[test]
+fn t_push_and_add_to_set_make_an_array_of_a_new_field_and_refuse_an_int() {
+    // t0197, t0198 (`a.0.z`), t0215 (`o.z`), t0233, t0234 (top level): a new field is `[1]`.
+    for op in ["$push", "$addToSet"] {
+        same(
+            updated(doc! { op: { "z": 1 } }, doc! { "_id": 1, "k": 1, "m": 2 }),
+            doc! { "_id": 1, "k": 1, "m": 2, "z": [1] },
+        );
+        same(
+            updated(doc! { op: { "a.0.z": 1 } }, doc! { "_id": 1, "a": [{ "k": 1, "m": 2 }] }),
+            doc! { "_id": 1, "a": [{ "k": 1, "m": 2, "z": [1] }] },
+        );
+        // t0206, t0207 (`a.0.z`) and t0242, t0243 (`z`): the reference refuses with code 2, "must
+        // be an array but is of type int"; the document is as it was. Ours refuses in its own
+        // words, which are what is asserted here; the replay tool maps the class.
+        for (path, stored) in [
+            ("z", doc! { "_id": 1, "z": 1, "a": 2, "m": 3 }),
+            ("a.0.z", doc! { "_id": 1, "a": [{ "z": 1, "a": 2, "m": 3 }] }),
+        ] {
+            let err = updated(doc! { op: { path: 1 } }, stored).unwrap_err();
+            assert!(
+                err.contains("cannot apply an array operator to non-array field"),
+                "{op} {path}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn t_a_set_after_an_unset_appends_at_the_end_and_an_existing_field_keeps_its_place() {
+    let unset = |path: &str| doc! { "$unset": { path: "" } };
+    // t0259 and t0260 (top level), t0253 and t0254 (sub-document), t0247 and t0248 (array
+    // element): the field unset in the first update is new in the second.
+    same(
+        then(unset("k"), doc! { "$set": { "k": 9 } }, doc! { "_id": 1, "k": 1, "m": 2 }),
+        doc! { "_id": 1, "m": 2, "k": 9 },
+    );
+    same(
+        then(unset("k"), doc! { "$set": { "z": 9 } }, doc! { "_id": 1, "k": 1, "m": 2 }),
+        doc! { "_id": 1, "m": 2, "z": 9 },
+    );
+    same(
+        then(
+            unset("o.k"),
+            doc! { "$set": { "o.k": 9 } },
+            doc! { "_id": 1, "o": { "k": 1, "m": 2 } },
+        ),
+        doc! { "_id": 1, "o": { "m": 2, "k": 9 } },
+    );
+    same(
+        then(
+            unset("o.k"),
+            doc! { "$set": { "o.z": 9 } },
+            doc! { "_id": 1, "o": { "k": 1, "m": 2 } },
+        ),
+        doc! { "_id": 1, "o": { "m": 2, "z": 9 } },
+    );
+    same(
+        then(
+            unset("a.0.k"),
+            doc! { "$set": { "a.0.k": 9 } },
+            doc! { "_id": 1, "a": [{ "k": 1, "m": 2 }] },
+        ),
+        doc! { "_id": 1, "a": [{ "m": 2, "k": 9 }] },
+    );
+    same(
+        then(
+            unset("a.0.k"),
+            doc! { "$set": { "a.0.z": 9 } },
+            doc! { "_id": 1, "a": [{ "k": 1, "m": 2 }] },
+        ),
+        doc! { "_id": 1, "a": [{ "m": 2, "z": 9 }] },
+    );
+    // t0251, t0252, t0264: over an unsorted element the unset field comes back last, and a
+    // field that is still there keeps its place.
+    same(
+        then(
+            unset("a.0.m"),
+            doc! { "$set": { "a.0.m": 9 } },
+            doc! { "_id": 1, "a": [{ "z": 1, "a": 2, "m": 3 }] },
+        ),
+        doc! { "_id": 1, "a": [{ "z": 1, "a": 2, "m": 9 }] },
+    );
+    same(
+        then(
+            unset("a.0.m"),
+            doc! { "$set": { "a.0.z": 9 } },
+            doc! { "_id": 1, "a": [{ "z": 1, "a": 2, "m": 3 }] },
+        ),
+        doc! { "_id": 1, "a": [{ "z": 9, "a": 2 }] },
+    );
+    same(
+        then(unset("m"), doc! { "$set": { "z": 9 } }, doc! { "_id": 1, "z": 1, "a": 2, "m": 3 }),
+        doc! { "_id": 1, "z": 9, "a": 2 },
+    );
+}
+
+#[test]
+fn t_a_rename_removes_the_source_and_appends_the_destination() {
+    // t0270 and t0271: inside one sub-document, whatever the order it was stored in.
+    same(
+        updated(doc! { "$rename": { "o.k": "o.n" } }, doc! { "_id": 1, "o": { "k": 1, "m": 2 } }),
+        doc! { "_id": 1, "o": { "m": 2, "n": 1 } },
+    );
+    same(
+        updated(doc! { "$rename": { "o.k": "o.n" } }, doc! { "_id": 1, "o": { "m": 2, "k": 1 } }),
+        doc! { "_id": 1, "o": { "m": 2, "n": 1 } },
+    );
+    // t0272 and t0273: from the top level into a sub-document, after what it holds.
+    same(
+        updated(doc! { "$rename": { "k": "o.n" } }, doc! { "_id": 1, "k": 1, "o": { "m": 2 } }),
+        doc! { "_id": 1, "o": { "m": 2, "n": 1 } },
+    );
+    same(
+        updated(
+            doc! { "$rename": { "k": "o.b" } },
+            doc! { "_id": 1, "k": 1, "o": { "z": 1, "m": 2 } },
+        ),
+        doc! { "_id": 1, "o": { "z": 1, "m": 2, "b": 1 } },
+    );
+    // t0274 and t0275: at the top level.
+    same(
+        updated(doc! { "$rename": { "k": "n" } }, doc! { "_id": 1, "m": 2, "k": 1, "z": 3 }),
+        doc! { "_id": 1, "m": 2, "z": 3, "n": 1 },
+    );
+    same(
+        updated(doc! { "$rename": { "k": "b" } }, doc! { "_id": 1, "z": 1, "k": 2, "m": 3 }),
+        doc! { "_id": 1, "z": 1, "m": 3, "b": 2 },
+    );
+}
+
+#[test]
+fn t_a_rename_that_touches_an_array_element_is_refused() {
+    // t0265 and t0266 (the source), t0267 (the destination): code 2, `a.0` is an array element;
+    // t0268: a dynamic destination `a.$.n`; t0269: code 28, a path through the array by a name.
+    let stored = || doc! { "_id": 1, "a": [{ "k": 1, "m": 2 }] };
+    for (rename, stored) in [
+        (doc! { "a.0.k": "a.0.n" }, stored()),
+        (doc! { "a.0.k": "n" }, stored()),
+        (doc! { "k": "a.0.n" }, doc! { "_id": 1, "k": 1, "a": [{ "m": 2 }] }),
+        (doc! { "k": "a.$.n" }, doc! { "_id": 1, "k": 1, "a": [{ "m": 2 }] }),
+        (doc! { "a.k": "a.n" }, stored()),
+    ] {
+        assert!(updated(doc! { "$rename": rename.clone() }, stored).is_err(), "{rename}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (U) `$pull` with `$elemMatch` over array elements (q7s3g)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn u_a_pull_of_an_elem_match_reads_an_array_element_as_a_find_does() {
+    // q7s3g0243 (line 2150): `{$elemMatch: {$gt: 1}}` over `a = [[1, [2, 3]], [4]]` removes
+    // `[4]` only. A member of an array element that is itself an array is one value, compared
+    // whole and not looked into, as `find` reads it: `[2, 3]` is not greater than 1.
+    let pull = || doc! { "$pull": { "a": { "$elemMatch": { "$gt": 1 } } } };
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [[1, [2, 3]], [4]] }),
+        doc! { "_id": 1, "a": [[1, [2, 3]]] },
+    );
+    // The neighbours: members that are scalars (q7s3g0162, `a = [[1, 2], [3]]`: both elements go; q7s3g0216, `[[1, 2], 3]`: the array goes and the scalar stays), and elements
+    // that are documents or `null`, which hold nothing to search (q7s3g0189, q7s3g0270).
+    same(updated(pull(), doc! { "_id": 1, "a": [[1, 2], [3]] }), doc! { "_id": 1, "a": [] });
+    same(updated(pull(), doc! { "_id": 1, "a": [[1, 2], 3] }), doc! { "_id": 1, "a": [3] });
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [{ "b": 1 }, bson::Bson::Null] }),
+        doc! { "_id": 1, "a": [{ "b": 1 }, bson::Bson::Null] },
+    );
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [{ "b": [1, 2] }, { "b": [3] }] }),
+        doc! { "_id": 1, "a": [{ "b": [1, 2] }, { "b": [3] }] },
+    );
+    // q7s2y y0069: a nested array is a member that does not pass, whatever its depth; `[5]` has
+    // a scalar member that does.
+    same(
+        updated(pull(), doc! { "_id": 1, "a": [[[2, 3]], [[1]], [5]] }),
+        doc! { "_id": 1, "a": [[[2, 3]], [[1]]] },
+    );
+    // q7s2y y0078: a document member under a value-form body is compared whole, `{$eq: {k: 2}}`
+    // removes the element that holds `{k: 2}`.
+    same(
+        updated(
+            doc! { "$pull": { "a": { "$elemMatch": { "$eq": { "k": 2 } } } } },
+            doc! { "_id": 2, "a": [[{ "k": 2 }], [3], [{ "k": 0 }, 5]] },
+        ),
+        doc! { "_id": 2, "a": [[3], [{ "k": 0 }, 5]] },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (V) An upsert whose replacement names a Double `_id` (q7s2o)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v_a_double_id_in_a_replacement_is_refused_by_the_id_type_rule_wherever_it_is_named() {
+    // q7s2o0592 (filter `{a: 5}`), o0599 (filter `{_id: 5}`) and o0606 (filter `{_id: 5, a: 5}`):
+    // the reference stores `_id: 5.0`; this product has no Double `_id`, and says so the same way
+    // in the three, not as a change of an immutable `_id` where the filter names the equal
+    // integer 5 (`the replacement names _id 5, and the document's is 5`).
+    let replacement = || doc! { "_id": 5.0, "z": 1 };
+    for (case, seed) in [
+        ("o0592", doc! { "a": 5 }),
+        ("o0599", doc! { "_id": 5 }),
+        ("o0606", doc! { "_id": 5, "a": 5 }),
+    ] {
+        let message = upserted(replacement(), seed).unwrap_err();
+        assert!(message.contains("invalid _id type"), "{case}: {message}");
+        assert!(!message.contains("immutable"), "{case}: {message}");
+    }
 }

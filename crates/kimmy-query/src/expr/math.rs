@@ -22,6 +22,7 @@
 //! is below it) and `$round: [0.125, 2]` is `0.12` (an exact tie, to even).
 
 use bson::Bson;
+use kimmy_core::decimal::Raw;
 use kimmy_core::decimal::arith::func;
 use kimmy_core::{Error, Result};
 
@@ -37,6 +38,12 @@ pub(super) fn unary(op: Op, arg: &Bson) -> Result<Bson> {
         return Ok(Bson::Null);
     };
     match operands.remove(0) {
+        // The logarithm of a decimal `NaN` is a double `NaN`, where the other decimal functions
+        // answer a decimal one (q7s4b2687 `$ln`, q7s4b2706 `$log10`; `$sqrt` and `$exp` of it are
+        // a decimal `NaN`: 2649, 2668).
+        Operand::Decimal(Raw::Nan) if matches!(op, Op::Ln | Op::Log10) => {
+            Ok(Bson::Double(f64::NAN))
+        }
         Operand::Decimal(raw) => {
             let out = match op {
                 Op::Abs => func::abs(&raw),

@@ -1112,7 +1112,7 @@ mod tests {
 
     /// A `$sort` with no `$limit` after it, which blocks.
     fn sort() -> Stage {
-        Stage::Sort(vec![crate::shape::SortKey { path: "_id".into(), descending: false }])
+        Stage::Sort(vec![crate::shape::SortKey::new("_id", false)])
     }
 
     /// Three stages that block.
@@ -1977,7 +1977,6 @@ mod tests {
             (vec![sort(), doc! {"$limit": 150_000}, doc! {"$skip": 200_000}], true),
             (vec![sort(), doc! {"$skip": 2}], false),
             (vec![sort()], false),
-            (vec![sort(), doc! {"$match": {"a": 1}}, doc! {"$limit": 3}], false),
             (vec![sort(), doc! {"$unwind": "$a"}, doc! {"$limit": 3}], false),
             (vec![sort(), doc! {"$sort": {"b": 1}}, doc! {"$limit": 3}], false),
         ] {
@@ -1989,6 +1988,12 @@ mod tests {
             assert_eq!(at_the_head, heap, "{specs:?}");
             assert_eq!(streams_source(&stages), heap, "{specs:?}");
         }
+        // A `$match` right after a `$sort` is applied before it (q7s4l 32), so the pipeline is
+        // `[$match, $sort, $limit]`: the head is the match, and the limit is the sort's, so the
+        // source streams into the heap.
+        let stages = parsed(&[sort(), doc! {"$match": {"a": 1}}, doc! {"$limit": 3}]);
+        assert_eq!(stages[0].name(), "$match");
+        assert!(streams_source(&stages));
     }
 
     #[test]
@@ -2194,12 +2199,12 @@ mod tests {
         // the sort does not end.
         for specs in [
             vec![doc! {"$sort": {"g": 1}}],
-            vec![doc! {"$sort": {"g": 1}}, doc! {"$match": {"g": {"$gte": 0}}}, doc! {"$limit": 4}],
+            vec![doc! {"$sort": {"g": 1}}, doc! {"$unwind": "$g"}, doc! {"$limit": 4}],
             vec![doc! {"$sort": {"g": 1}}, doc! {"$skip": 1}],
             vec![
                 doc! {"$sort": {"g": 1}},
                 doc! {"$skip": 1},
-                doc! {"$match": {"g": {"$gte": 0}}},
+                doc! {"$unwind": "$g"},
                 doc! {"$limit": 2},
             ],
         ] {
@@ -2244,9 +2249,11 @@ mod tests {
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}, doc! {"$limit": 3}], true),
             (vec![doc! {"$sort": {"a": 1}}], false),
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}], false),
-            // A stage that blocks or filters between them: the limit is not the sort's.
-            (vec![doc! {"$sort": {"a": 1}}, doc! {"$match": {"a": 1}}, doc! {"$limit": 3}], false),
+            // A stage that blocks or changes the count between them: the limit is not the sort's.
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$unwind": "$a"}, doc! {"$limit": 3}], false),
+            // A `$match` right after a `$sort` is applied before it (q7s4l 32): it is no stage
+            // between them, and the limit is the sort's.
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$match": {"a": 1}}, doc! {"$limit": 3}], true),
             // A stage that neither filters nor changes the count is passed by the limit when the
             // pipeline is parsed (the window is moved ahead of it), so the two are together.
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$project": {"a": 1}}, doc! {"$limit": 3}], true),
@@ -2480,10 +2487,12 @@ mod tests {
             ),
             (vec![sort()], vec![blocks(0)]),
             (vec![sort(), doc! {"$skip": 2}], vec![blocks(0), run(1..2)]),
+            // The `$match` is applied before the `$sort` (q7s4l 32): a streaming source into a heap.
             (
                 vec![sort(), doc! {"$match": {"g": 1}}, doc! {"$limit": 3}],
-                vec![blocks(0), run(1..3)],
+                vec![run(0..1), heap(1..3, 0, 3)],
             ),
+            (vec![sort(), doc! {"$unwind": "$g"}, doc! {"$limit": 3}], vec![blocks(0), run(1..3)]),
             (
                 vec![project(), sort(), doc! {"$limit": 3}, doc! {"$unwind": "$arr"}],
                 vec![run(0..1), heap(1..3, 0, 3), run(3..4)],

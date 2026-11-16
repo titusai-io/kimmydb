@@ -76,6 +76,9 @@ pub enum OpKind {
     /// Remove every element that satisfies this condition, parsed once with the
     /// update (`$pull` with an all-operator document; see [`pull_is_condition`]).
     PullWhere(Filter),
+    /// Remove every element that is a document the query matches (`$pull` with a
+    /// document naming fields; see [`parse_pull`]).
+    PullQuery(Filter),
     /// Remove every element equal to any of these values.
     PullAll(Vec<Bson>),
     /// Remove the first (`-1`) or last (`1`) element.
@@ -98,7 +101,7 @@ impl OpKind {
             OpKind::Max(_) => "$max",
             OpKind::Push(_) | OpKind::PushEach(_) => "$push",
             OpKind::AddToSet(_) => "$addToSet",
-            OpKind::Pull(_) | OpKind::PullWhere(_) => "$pull",
+            OpKind::Pull(_) | OpKind::PullWhere(_) | OpKind::PullQuery(_) => "$pull",
             OpKind::PullAll(_) => "$pullAll",
             OpKind::Pop(_) => "$pop",
             OpKind::Rename(_) => "$rename",
@@ -160,9 +163,21 @@ impl ArraySort {
                         _ => empty,
                     }
                 }
-                items.sort_by(|a, b| {
-                    shape::compare(keys, as_document(a, &empty), as_document(b, &empty))
+                // The keys are read once per element, as a path into the element that is
+                // never refused and compares what it ends at whole (q7s3j 194-209).
+                let element_keys: Vec<Vec<Bson>> = items
+                    .iter()
+                    .map(|item| shape::element_sort_keys(keys, as_document(item, &empty)))
+                    .collect();
+                let mut order: Vec<usize> = (0..items.len()).collect();
+                order.sort_by(|a, b| {
+                    shape::compare_keys(keys, &element_keys[*a], &element_keys[*b])
                 });
+                let mut taken: Vec<Bson> =
+                    items.iter_mut().map(|slot| std::mem::replace(slot, Bson::Null)).collect();
+                for (slot, at) in items.iter_mut().zip(order) {
+                    *slot = std::mem::replace(&mut taken[at], Bson::Null);
+                }
             }
         }
     }
@@ -235,7 +250,10 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
             return Err(Error::InvalidUpdate(format!("${op} requires a document")));
         };
         for (target_path, arg) in targets {
-            if touches_id(target_path) {
+            // `_id` itself may be named: a matched document is judged by the result
+            // (see `settle_matched_id`), an inserted one by `settle_inserted_id`. A path
+            // below it is refused, whatever the document holds (q7s2r.out r0177).
+            if under_id(target_path) {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
             let kind = parse_op(op, arg)?;
@@ -277,6 +295,19 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
 
     reject_conflicting_paths(&operations)?;
     Ok(Update::Operators(operations))
+}
+
+/// Whether an operation writes a path with a digit segment that is spelled other than as the
+/// index it reads as (`01`, `00`): the only spelling that two writes can share without sharing
+/// the text, so the only one the document has to be asked about.
+fn has_padded_index(op: &Operation) -> bool {
+    let padded = |path: &str| {
+        path::segments(path)
+            .iter()
+            .skip(1)
+            .any(|segment| path::array_index(segment).is_some_and(|i| i.to_string() != *segment))
+    };
+    padded(&op.path) || matches!(&op.kind, OpKind::Rename(target) if padded(target))
 }
 
 /// Whether a path has any `$`, `$[]` or `$[<identifier>]` segment.
@@ -543,10 +574,12 @@ fn written_paths(op: &Operation) -> Vec<&str> {
 /// A positional segment is compared as written: `items.$[a].qty` and
 /// `items.$[b].qty` do not overlap here, because which elements each reaches
 /// depends on the document. [`apply_to`] checks the concrete paths they
-/// expand to, in each document. An index segment is compared by its value, so
-/// `a.1` and `a.01` are one path.
+/// expand to, in each document. A digit segment is compared as written too:
+/// `a.1` and `a.01` are one element where `a` is an array and two fields where
+/// it is a document or is missing (q7s2u, q7s2v, q7s2y), which only the
+/// document can tell, so [`claim_concrete`] reads them by its value there.
 fn reject_conflicting_paths(operations: &[Operation]) -> Result<()> {
-    let mut claims = Claims::new(operations, "");
+    let mut claims = Claims::new(operations, "", None);
     for (i, op) in operations.iter().enumerate() {
         for path in written_paths(op) {
             claims.claim(i, path)?;
@@ -570,6 +603,9 @@ struct Claims<'a> {
     operations: &'a [Operation],
     /// How the refusal says where the conflict was found.
     where_: &'static str,
+    /// The document the paths are read against, when they are: a digit segment is the index
+    /// it spells only where the value it steps into is an array.
+    doc: Option<&'a Document>,
     /// Each canonical path claimed, and the operation that claimed it first.
     exact: HashMap<String, usize>,
     /// Each proper prefix of a canonical path claimed, with the first
@@ -580,14 +616,14 @@ struct Claims<'a> {
 }
 
 impl<'a> Claims<'a> {
-    fn new(operations: &'a [Operation], where_: &'static str) -> Self {
-        Claims { operations, where_, exact: HashMap::new(), inner: HashMap::new(), probes: 0 }
+    fn new(operations: &'a [Operation], where_: &'static str, doc: Option<&'a Document>) -> Self {
+        Claims { operations, where_, doc, exact: HashMap::new(), inner: HashMap::new(), probes: 0 }
     }
 
     /// Refuse operation `i` writing `path` when another operation wrote it, a
     /// path inside it, or a path it lies inside; otherwise record it.
     fn claim(&mut self, i: usize, path: &str) -> Result<()> {
-        let path = canonical(path);
+        let path = canonical(path, self.doc);
         let prefixes: Vec<&str> = path.match_indices('.').map(|(at, _)| &path[..at]).collect();
         self.probes += 2 + prefixes.len();
         if let Some(&j) = self.exact.get(&path)
@@ -621,26 +657,41 @@ impl<'a> Claims<'a> {
     }
 }
 
-/// A path with every segment that addresses an array element by number in
-/// its decimal form: `a.01` is `a.1`, because the path language reads both as
-/// the element at index 1 (a run of ASCII digits, [`path::array_index`]), and
-/// two writes to it are one path written twice. `a.+1` is not: a sign makes
-/// the segment a field name, so it stays as written. A positional segment is left as
-/// it is. Over a document whose `a` holds an object, `01` and `1` would be
-/// two keys; they are still read as one path here, so such a pair is refused
-/// rather than told apart. The first segment is left as written: it names a
-/// field of the document itself, which is never an array, so `01` and `1`
-/// there are always two fields.
-fn canonical(path: &str) -> String {
-    path::segments(path)
-        .iter()
-        .enumerate()
-        .map(|(at, segment)| match path::array_index(segment) {
-            Some(index) if at > 0 => index.to_string(),
-            _ => (*segment).to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(".")
+/// A path as it is claimed. Without a document the path is as written. Against a document,
+/// a segment that is a run of digits is the element index it spells (`a.01` is `a.1`, by
+/// [`path::array_index`]) only where the value it steps into is an array; where that value is
+/// a document, or is not there, it is a field name and stays as written, so `o.01` and `o.1`
+/// are two fields (q7s2y 34 to 59, q7s2u, q7s2v), and two writes to one array element are one
+/// path written twice, which the reference's server aborts on (q7s2y 1 to 33 and 64). `a.+1`
+/// is not an index: a sign makes the segment a field name. A positional segment is left as it
+/// is. The first segment is left as written: it names a field of the document itself, which
+/// is never an array.
+fn canonical(path: &str, doc: Option<&Document>) -> String {
+    let segments = path::segments(path);
+    let Some(doc) = doc else { return segments.join(".") };
+    let mut held: Option<&Bson> = segments.first().and_then(|head| doc.get(*head));
+    let mut out = Vec::with_capacity(segments.len());
+    for (at, segment) in segments.iter().enumerate() {
+        if at == 0 {
+            out.push((*segment).to_string());
+            continue;
+        }
+        match (held, path::array_index(segment)) {
+            (Some(Bson::Array(items)), Some(index)) => {
+                out.push(index.to_string());
+                held = items.get(index);
+            }
+            (Some(Bson::Document(inner)), _) => {
+                out.push((*segment).to_string());
+                held = inner.get(*segment);
+            }
+            _ => {
+                out.push((*segment).to_string());
+                held = None;
+            }
+        }
+    }
+    out.join(".")
 }
 
 /// The refusal for two writes that overlap at `first` and `second`, which
@@ -674,6 +725,10 @@ fn conflict(
 /// past a check that only knew the literal name. That relocates the document
 /// out from under every index entry and oplog record that named it, silently.
 /// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
+fn under_id(path: &str) -> bool {
+    path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
+}
+
 fn touches_id(path: &str) -> bool {
     path == ID_FIELD || path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
 }
@@ -716,6 +771,9 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "pop" => match arg {
             Bson::Int32(1) | Bson::Int64(1) => OpKind::Pop(1),
             Bson::Int32(-1) | Bson::Int64(-1) => OpKind::Pop(-1),
+            // A double is a direction when it is exactly 1 or -1 (q7s2j.out j1388, j1394).
+            Bson::Double(d) if *d == 1.0 => OpKind::Pop(1),
+            Bson::Double(d) if *d == -1.0 => OpKind::Pop(-1),
             _ => return Err(Error::InvalidUpdate("$pop requires 1 or -1".into())),
         },
         "rename" => match arg {
@@ -729,20 +787,34 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
     })
 }
 
-/// Whether a `$pull` operand is a condition rather than a value to match.
+/// Whether a `$pull` operand is an operator condition rather than a value to match.
 ///
-/// The one place this is decided. A document every key of which starts with
-/// `$` is a condition, evaluated for each element with the filter matcher; any
-/// other operand (a scalar, an array, a document with no `$` key, the empty
-/// document) is a value, removed by canonical equality as `$pull` always has.
-/// A document with some `$` keys and some not is neither, and is refused by
-/// [`parse_pull`] rather than guessed at.
+/// A document every key of which starts with `$` is a condition, evaluated for
+/// each element with the filter matcher. A document with no `$` key, the empty
+/// document too, is a query on each element (see [`parse_pull`]); any other
+/// operand (a scalar, an array) is a value, removed by canonical equality. A
+/// document with some `$` keys and some not is refused by [`parse_pull`]
+/// (q7s2q.out q0194 line 1317).
 fn pull_is_condition(operand: &Bson) -> bool {
     matches!(operand, Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')))
 }
 
-/// `$pull`: a condition for an all-operator document, a value otherwise.
+/// `$pull`: a condition for an all-operator document or a regular expression,
+/// a query on each element for a document naming fields (q7s2j.out j1254),
+/// a value otherwise.
 fn parse_pull(arg: &Bson) -> Result<OpKind> {
+    if let Bson::RegularExpression(_) = arg {
+        let mut pattern = Document::new();
+        pattern.insert("$regex", arg.clone());
+        return Ok(OpKind::PullWhere(filter::parse_condition_document(&pattern)?));
+    }
+    // The empty document too: a query every document element satisfies
+    // (q7s2q.out q0240 line 1593).
+    if let Bson::Document(doc) = arg
+        && doc.keys().all(|k| !k.starts_with('$'))
+    {
+        return Ok(OpKind::PullQuery(filter::parse_pull_query(doc)?));
+    }
     if let Bson::Document(doc) = arg
         && pull_is_condition(arg)
     {
@@ -754,9 +826,8 @@ fn parse_pull(arg: &Bson) -> Result<OpKind> {
     {
         return Err(Error::InvalidUpdate(format!(
             "$pull cannot mix operators with plain fields in one document (found {operator:?} \
-             and {plain:?}); to remove the elements whose fields satisfy conditions, spell it \
-             {{\"$elemMatch\": {{...}}}}, as in {{\"$pull\": {{\"results\": {{\"$elemMatch\": \
-             {{\"score\": 8}}}}}}}}"
+             and {plain:?}); write the operators alone, as a condition on each element, or the \
+             fields alone, as a query on each document element"
         )));
     }
     Ok(OpKind::Pull(arg.clone()))
@@ -955,7 +1026,62 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
     apply_to_at(update, doc, now_ms, target, None)
 }
 
+/// Every update of every document goes through here, and a document that matched
+/// leaves through [`settle_matched_id`]: the one place its `_id` is judged. The
+/// routes (`update`, `find_and_modify`, `multi`, a pipeline update) reach it by
+/// [`apply`] and [`apply_matched`] and have no other way to a post-image.
 pub(crate) fn apply_to_at(
+    update: &Update,
+    doc: &mut Document,
+    now_ms: i64,
+    target: Target,
+    at: Option<&ArrayPosition>,
+) -> Result<()> {
+    let stored_id = (target == Target::Existing).then(|| doc.get(ID_FIELD).cloned());
+    apply_update_at(update, doc, now_ms, target, at)?;
+    if let Some(stored_id) = stored_id {
+        settle_matched_id(update, stored_id, doc)?;
+    }
+    Ok(())
+}
+
+/// The `_id` of a document that matched, once the update has run, judged by the result.
+///
+/// An operator update leaves it as it was, in value and type, compared as stored (`$set: {_id: 1}` over `1` is no change, over `1i64` or `1.0` it is a refusal:
+/// q7s2r.out r0137-r0148, r0163-r0176, r0191-r0194). A replacement keeps it as the same
+/// `DocId`, stored as the body wrote it (r0183-r0188), and so does a pipeline update
+/// (q7s2s.jsonl 1-2, 5-6, 11-12, 29-30, 41-42, 53-54). A result that dropped it, as `$unset`
+/// and a rename do, is refused (r0149-r0152); a pipeline that drops it has had the stored
+/// one put back before this runs (r0195; q7s2s.jsonl 51-62).
+fn settle_matched_id(update: &Update, stored: Option<Bson>, doc: &Document) -> Result<()> {
+    let now = doc.get(ID_FIELD);
+    let kept = match (update, stored.as_ref(), now) {
+        (_, None, None) => true,
+        // The same document id, stored as written: a replacement (r0185) and a pipeline
+        // update, which may leave `1` as `1i64` (UNRECORDED for a pipeline).
+        (Update::Replace(_) | Update::Pipeline(_), Some(was), Some(is)) => {
+            matches!(
+                (DocId::try_from_bson(was), DocId::try_from_bson(is)),
+                (Ok(was), Ok(is)) if was == is
+            )
+        }
+        (Update::Replace(_), ..) => false,
+        (_, Some(was), Some(is)) => was == is,
+        _ => false,
+    };
+    if kept {
+        return Ok(());
+    }
+    let show = |id: Option<&Bson>| id.map_or_else(|| "none".to_string(), ToString::to_string);
+    Err(Error::InvalidUpdate(format!(
+        "_id is immutable and cannot be updated: the document's is {}, and the update would \
+         make it {}",
+        show(stored.as_ref()),
+        show(now)
+    )))
+}
+
+fn apply_update_at(
     update: &Update,
     doc: &mut Document,
     now_ms: i64,
@@ -983,10 +1109,12 @@ pub(crate) fn apply_to_at(
             // never be stored under a key the store cannot read.
             let id = match (doc.get(ID_FIELD), replacement.get(ID_FIELD)) {
                 (Some(held), Some(named)) => {
-                    let same = match (DocId::try_from_bson(held), DocId::try_from_bson(named)) {
-                        (Ok(was), Ok(is)) => was == is,
-                        _ => false,
-                    };
+                    // A name that is no id (a double) is refused by the id-type rule first,
+                    // wherever the document's own `_id` came from: `_id: 5.0` over a filter's
+                    // `_id: 5` is not "a change of `_id` to 5" (q7s2o0599, o0606; o0592 is the
+                    // same refusal where the filter names none).
+                    let is = DocId::try_from_bson(named)?;
+                    let same = DocId::try_from_bson(held).is_ok_and(|was| was == is);
                     if !same {
                         return Err(Error::InvalidUpdate(format!(
                             "_id is immutable and cannot be updated: the replacement names _id \
@@ -1042,9 +1170,15 @@ pub(crate) fn apply_to_at(
                 .into(),
         ));
     }
+    // The document an upsert inserts may take the id the operators give it, if the
+    // filter gave none (see `settle_inserted_id`); a matched one is judged by
+    // `settle_matched_id`, which `apply_to_at` runs for every update.
+    let names_id = target == Target::Inserted
+        && operations.iter().any(|op| applies(op) && touches_id(&op.path));
+    let seeded_id = if names_id { doc.get(ID_FIELD).cloned() } else { None };
     let concrete = concrete_paths(operations, doc, at, applies)?;
-    if operations.iter().any(|op| has_positional(&op.path)) {
-        claim_concrete(operations, &concrete)?;
+    if operations.iter().any(|op| has_positional(&op.path) || has_padded_index(op)) {
+        claim_concrete(operations, &concrete, doc)?;
     }
 
     // Then `$setOnInsert`, only for an inserted document, and everything else.
@@ -1059,6 +1193,36 @@ pub(crate) fn apply_to_at(
         }
     }
     path::settle_created(doc, &created);
+    if names_id {
+        settle_inserted_id(doc, seeded_id)?;
+    }
+    Ok(())
+}
+
+/// The id of the document an upsert inserts, once its operators have run. An id
+/// the filter gave is held to: the update may name it, to the same value of the
+/// same type, and nothing else (q7s2o.out o0692-o0725). Where the filter gave
+/// none the operators' id stands, and is stored first, where every document
+/// keeps it (o0736-o0757).
+fn settle_inserted_id(doc: &mut Document, seeded: Option<Bson>) -> Result<()> {
+    let now = doc.get(ID_FIELD).cloned();
+    if let Some(was) = seeded
+        && now.as_ref() != Some(&was)
+    {
+        let found = now.map_or_else(|| "none".to_string(), |id| id.to_string());
+        return Err(Error::InvalidUpdate(format!(
+            "_id is immutable and cannot be updated: the filter gives _id {was}, and the update \
+             would make it {found}"
+        )));
+    }
+    if doc.contains_key(ID_FIELD) && doc.keys().next().map(String::as_str) != Some(ID_FIELD) {
+        let mut next = Document::new();
+        if let Some(id) = doc.remove(ID_FIELD) {
+            next.insert(ID_FIELD, id);
+        }
+        next.extend(std::mem::take(doc));
+        *doc = next;
+    }
     Ok(())
 }
 
@@ -1093,8 +1257,12 @@ pub(crate) fn concrete_paths(
 /// every element `a` selects, and `items.1.qty` and `items.$[].qty` meet at
 /// the second. Run only when some operation has a positional path; returns
 /// the lookups made.
-fn claim_concrete(operations: &[Operation], concrete: &[Vec<String>]) -> Result<usize> {
-    let mut claims = Claims::new(operations, " in this document");
+fn claim_concrete(
+    operations: &[Operation],
+    concrete: &[Vec<String>],
+    doc: &Document,
+) -> Result<usize> {
+    let mut claims = Claims::new(operations, " in this document", Some(doc));
     for (i, (op, paths)) in operations.iter().zip(concrete).enumerate() {
         for path in paths {
             claims.claim(i, path)?;
@@ -1263,7 +1431,21 @@ fn apply_one(
     now_ms: i64,
     created: &mut path::Created,
 ) -> Result<()> {
-    let current = path::resolve(doc, &op.path).first().cloned().cloned();
+    if matches!(
+        op.kind,
+        OpKind::Pull(_)
+            | OpKind::PullWhere(_)
+            | OpKind::PullQuery(_)
+            | OpKind::PullAll(_)
+            | OpKind::Pop(_)
+    ) {
+        refuse_untraversable(doc, op)?;
+    }
+    // The value an operator computes from is read where its write goes: documents by key,
+    // arrays by position only. `path::resolve` reads a position as a field of the elements
+    // too and fans out, which made `$inc` of `a.3` over `{a: [{"3": 5}]}` compute from 5 and
+    // write 6 at position 3.
+    let current = path::get_checked(doc, &op.path).cloned();
 
     let invalid = |msg: String| Error::InvalidUpdate(msg);
     let mut set = |doc: &mut Document, value: Bson| -> Result<()> {
@@ -1279,14 +1461,24 @@ fn apply_one(
         }
 
         OpKind::Inc(delta) => {
-            // An absent field starts at zero, so `$inc` on a new counter works.
-            let base = current.unwrap_or(Bson::Int32(0));
-            set(doc, arithmetic(&base, delta, Arith::Add, &op.path)?)?;
+            // An absent field takes the operand as it is, so `$inc` on a new counter
+            // works, and `-0.0` is created as `-0.0`, not as `0 + -0.0` (q7s2k.out
+            // k0010).
+            let Some(base) = current else {
+                return set(doc, delta.clone());
+            };
+            let result = arithmetic(&base, delta, Arith::Add, &op.path)?;
+            if !same_double(&base, &result) {
+                set(doc, result)?;
+            }
         }
 
         OpKind::Mul(factor) => {
             let base = current.unwrap_or(Bson::Int32(0));
-            set(doc, arithmetic(&base, factor, Arith::Mul, &op.path)?)?;
+            let result = arithmetic(&base, factor, Arith::Mul, &op.path)?;
+            if !same_double(&base, &result) {
+                set(doc, result)?;
+            }
         }
 
         OpKind::Bit(steps) => {
@@ -1303,6 +1495,8 @@ fn apply_one(
             };
             if replace {
                 set(doc, candidate.clone())?;
+            } else {
+                refuse_untraversable(doc, op)?;
             }
         }
 
@@ -1313,6 +1507,8 @@ fn apply_one(
             };
             if replace {
                 set(doc, candidate.clone())?;
+            } else {
+                refuse_untraversable(doc, op)?;
             }
         }
 
@@ -1380,6 +1576,17 @@ fn apply_one(
             set(doc, Bson::Array(kept))?;
         }
 
+        OpKind::PullQuery(query) => {
+            let Some(items) = pull_target(current, "$pull", &op.path)? else { return Ok(()) };
+            let mut kept = Vec::with_capacity(items.len());
+            for item in items {
+                if !filter::matches_pull_query(query, &item)? {
+                    kept.push(item);
+                }
+            }
+            set(doc, Bson::Array(kept))?;
+        }
+
         OpKind::PullAll(values) => {
             // Each listed value is matched as `$pull` matches a literal —
             // canonical equality, so `2` removes `2.0`. Pulling from a missing
@@ -1396,7 +1603,9 @@ fn apply_one(
         }
 
         OpKind::Pop(direction) => {
-            let Some(Bson::Array(mut items)) = current else {
+            // A value that is not an array is refused (code 14), a missing one is
+            // no change (q7s2j.out j0793-j0817).
+            let Some(mut items) = pull_target(current, "$pop", &op.path)? else {
                 return Ok(());
             };
             if !items.is_empty() {
@@ -1410,9 +1619,6 @@ fn apply_one(
         }
 
         OpKind::Rename(target) => {
-            if touches_id(target) {
-                return Err(invalid("_id is immutable and cannot be renamed onto".into()));
-            }
             match rename_source(doc, &op.path) {
                 // A source that is not there is nothing to move, and nothing
                 // else is looked at, the destination included (q7s2e.out lines
@@ -1429,9 +1635,14 @@ fn apply_one(
                 // A path that goes through a value it cannot enter is refused
                 // whether or not anything lies beyond it (q7s2f.out lines 5-63).
                 Source::Blocked { part, held } => {
-                    return Err(invalid(traverse_refusal(&part, &op.path, &held)));
+                    return Err(invalid(traverse_refusal("$rename", &part, &op.path, &held)));
                 }
                 Source::Found => {}
+            }
+            // The destination is judged only for a source that is there: a rename of
+            // a missing field onto `_id` is no change (q7s2o.out o0700, o0755).
+            if touches_id(target) {
+                return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
             // Renaming a missing field is a no-op, matching Mongo.
             if let Some(value) = current {
@@ -1450,7 +1661,7 @@ fn apply_one(
                     Way::Scalar { prefix } => {
                         let part = prefix.rsplit('.').next().unwrap_or(&prefix);
                         let below = target[prefix.len() + 1..].split('.').next().unwrap_or("");
-                        let held = path::resolve(doc, &prefix).first().map(|v| v.to_string());
+                        let held = path::get_checked(doc, &prefix).map(ToString::to_string);
                         return Err(invalid(format!(
                             "cannot create field '{below}' in element {{{part}: {}}}",
                             held.unwrap_or_default()
@@ -1467,6 +1678,14 @@ fn apply_one(
         }
     }
     Ok(())
+}
+
+/// Whether an arithmetic result is a double equal to the double stored, which the
+/// reference does not write: a stored zero keeps its sign (`-0.0 * -1` leaves
+/// `-0.0`), and a NaN is never equal, so it is written (q7s2k.out k0235, k0260,
+/// k0677-k0710, k0686).
+fn same_double(stored: &Bson, result: &Bson) -> bool {
+    matches!((stored, result), (Bson::Double(old), Bson::Double(new)) if old == new)
 }
 
 /// What lies in the way of a `$rename` destination in a document: the first
@@ -1545,10 +1764,25 @@ fn rename_source(doc: &Document, path: &str) -> Source {
 
 /// The refusal for a `$rename` source that goes through a value it cannot
 /// enter, naming the part of the path that names it.
-fn traverse_refusal(part: &str, path: &str, held: &Bson) -> String {
+fn traverse_refusal(operator: &str, part: &str, path: &str, held: &Bson) -> String {
     format!(
-        "$rename cannot use the part ({part} of {path}) to traverse the element ({{{part}: {held}}})"
+        "{operator} cannot use the part ({part} of {path}) to traverse the element \
+         ({{{part}: {held}}})"
     )
+}
+
+/// Refuse an operation whose path goes through a value it cannot enter (a scalar
+/// or `null` by any segment, an array by a field name), where a missing step is
+/// no change. The array operators and a `$min` or `$max` that leaves the field
+/// as it is write nothing there, and the reference refuses them all the same
+/// (q7s2j.out j0800-j0864, q7s2i.out i0418).
+fn refuse_untraversable(doc: &Document, op: &Operation) -> Result<()> {
+    match rename_source(doc, &op.path) {
+        Source::Blocked { part, held } => {
+            Err(Error::InvalidUpdate(traverse_refusal(op.kind.name(), &part, &op.path, &held)))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `$bit` over the stored value: each step in turn, the result an `Int32`
@@ -1830,6 +2064,53 @@ mod tests {
         assert_eq!(applied(doc! { "$inc": { "n": -2 } }, doc! { "n": 1 }), doc! { "n": -1 });
     }
 
+    /// The double a field holds in `doc`, from its bits, so that `-0.0` is not `0.0`.
+    fn bits_of(doc: &Document, field: &str) -> u64 {
+        match doc.get(field) {
+            Some(Bson::Double(d)) => d.to_bits(),
+            other => panic!("a double wanted, found {other:?}"),
+        }
+    }
+
+    /// k0010 (q7s2k.out line 59): `$inc` of `-0.0` over a missing field creates it as
+    /// `-0.0`, not as the `0.0` that `0 + -0.0` is.
+    #[test]
+    fn inc_of_a_missing_field_stores_the_operand_as_it_is() {
+        let out = applied(doc! { "$inc": { "n": -0.0 } }, doc! {});
+        assert_eq!(bits_of(&out, "n"), (-0.0_f64).to_bits());
+        let out = applied(doc! { "$inc": { "n": 0.0 } }, doc! {});
+        assert_eq!(bits_of(&out, "n"), 0.0_f64.to_bits());
+        assert_eq!(applied(doc! { "$inc": { "n": 7_i64 } }, doc! {}), doc! { "n": 7_i64 });
+        assert_eq!(applied(doc! { "$inc": { "n": 2.5 } }, doc! {}), doc! { "n": 2.5 });
+    }
+
+    /// A double the arithmetic leaves equal to the stored one is not written, so a stored
+    /// zero keeps its sign: k0677 (q7s2k.out line 4061), k0680 (4079), k0685 (4109), k0702
+    /// (4211), k0710 (4259), and `$inc` of `-0.0` over a stored `0.0`, k0260 (1559), and
+    /// over `-0.0`, k0235 (1409). A result that differs, or a NaN, is written (k0686, 4115).
+    #[test]
+    fn a_result_equal_to_the_stored_double_leaves_it_as_it_was() {
+        let neg = (-0.0_f64).to_bits();
+        let pos = 0.0_f64.to_bits();
+        for (update, stored, kept) in [
+            (doc! { "$mul": { "n": -1 } }, -0.0, neg),
+            (doc! { "$mul": { "n": i32::MIN } }, -0.0, neg),
+            (doc! { "$mul": { "n": -0.0 } }, -0.0, neg),
+            (doc! { "$mul": { "n": -1 } }, 0.0, pos),
+            (doc! { "$mul": { "n": i32::MIN } }, 0.0, pos),
+            (doc! { "$mul": { "n": -0.0 } }, 0.0, pos),
+            (doc! { "$inc": { "n": -0.0 } }, 0.0, pos),
+            (doc! { "$inc": { "n": -0.0 } }, -0.0, neg),
+        ] {
+            let out = applied(update.clone(), doc! { "n": stored });
+            assert_eq!(bits_of(&out, "n"), kept, "{update} over {stored:?}");
+        }
+        let out = applied(doc! { "$mul": { "n": f64::NAN } }, doc! { "n": -0.0 });
+        assert!(matches!(out.get("n"), Some(Bson::Double(d)) if d.is_nan()));
+        let out = applied(doc! { "$inc": { "n": 1 } }, doc! { "n": -0.0 });
+        assert_eq!(out, doc! { "n": 1.0 });
+    }
+
     #[test]
     fn arithmetic_keeps_integers_integral() {
         // Silently widening to a double would lose precision on large ids.
@@ -1938,20 +2219,23 @@ mod tests {
     }
 
     #[test]
-    fn push_sort_by_a_field_through_an_array_takes_the_smallest_ascending_and_the_largest_descending()
-     {
+    fn push_sort_by_a_field_through_an_array_compares_the_value_whole_and_descending_reverses_it() {
+        // q7s3m0035 and q7s3m0036 (an empty `$each` and a `$sort` only), over
+        // `[{s: 3}, {s: [0, 5]}, {s: [1, 2]}]`: the key is compared as a whole value, a number
+        // before any array and arrays element by element, and descending is the reverse of
+        // ascending. (A find or an aggregation `$sort` reduces the array to its least or
+        // greatest element instead; that rule is not this one.)
         let a = doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] };
-        // Ascending by 0, 1, 3; descending by 5, 3, 2.
         let asc =
             applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": 1 } } } }, a.clone());
         assert_eq!(
             asc,
-            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": [1, 2] }, doc! { "s": 3 }] }
+            doc! { "a": [doc! { "s": 3 }, doc! { "s": [0, 5] }, doc! { "s": [1, 2] }] }
         );
         let desc = applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": -1 } } } }, a);
         assert_eq!(
             desc,
-            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] }
+            doc! { "a": [doc! { "s": [1, 2] }, doc! { "s": [0, 5] }, doc! { "s": 3 }] }
         );
     }
 
@@ -2174,6 +2458,27 @@ mod tests {
         assert!(parse(&doc! { "$pop": { "a": 2 } }).is_err());
     }
 
+    /// A double that is `1` or `-1` is a direction, j1388 (q7s2j.out line 8366) and j1394
+    /// (line 8403); any other number is not: `0` (j1406, line 8477), `2` (j1412, 8514),
+    /// `1.5` (j1430, 8625). UNRECORDED: `2.0`, `-0.0`, `NaN`, the infinities.
+    #[test]
+    fn pop_takes_a_double_that_is_one_or_minus_one() {
+        assert_eq!(
+            applied(doc! { "$pop": { "a": 1.0 } }, doc! { "a": [1, 2, 3] }),
+            doc! { "a": [1, 2] }
+        );
+        assert_eq!(
+            applied(doc! { "$pop": { "a": -1.0 } }, doc! { "a": [1, 2, 3] }),
+            doc! { "a": [2, 3] }
+        );
+        for bad in [0.0, -0.0, 1.5, 2.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(parse(&doc! { "$pop": { "a": bad } }).is_err(), "{bad}");
+        }
+        for bad in [0, 2, -2] {
+            assert!(parse(&doc! { "$pop": { "a": bad } }).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn rename_moves_a_field() {
         assert_eq!(applied(doc! { "$rename": { "a": "b" } }, doc! { "a": 1 }), doc! { "b": 1 });
@@ -2229,10 +2534,89 @@ mod tests {
         assert!(err.contains("cannot mix"), "unhelpful error: {err}");
     }
 
+    /// An operator may name `_id`; a matched document is judged by the result, so the
+    /// operators that leave it as stored apply and no write is made (q7s2r.out lines
+    /// are those of the plain variant: r0137 2101, r0163 2257, r0165 2269, r0169 2293,
+    /// r0173 2317, r0175 2329). Every update here is a refusal in the old reading.
+    #[test]
+    fn a_matched_document_takes_an_operator_that_leaves_its_id_as_it_is() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        for update in [
+            doc! { "$set": { "_id": 1 } },
+            doc! { "$min": { "_id": 1 } },
+            doc! { "$max": { "_id": 1 } },
+            doc! { "$inc": { "_id": 0 } },
+            doc! { "$mul": { "_id": 1 } },
+            doc! { "$bit": { "_id": { "or": 0 } } },
+            // `$setOnInsert` is for an insert: skipped, whatever it holds (r0159 2233, r0161 2245).
+            doc! { "$setOnInsert": { "_id": 1 } },
+            doc! { "$setOnInsert": { "_id": 2 } },
+            // A rename of a field that is not there moves nothing (r0155 2209).
+            doc! { "$rename": { "y": "_id" } },
+        ] {
+            assert_eq!(applied(update.clone(), stored()), stored(), "{update}");
+        }
+        // Beside a real change, r0179 line 2353.
+        assert_eq!(
+            applied(doc! { "$set": { "_id": 1, "a": 2 } }, stored()),
+            doc! { "_id": 1, "a": 2 }
+        );
+    }
+
+    /// The result decides: another value, another type of the same number, a lost `_id`
+    /// and a write below it are refused with the document as it was (q7s2r.out r0139 2113,
+    /// r0141 2125, r0143 2137, r0145 2149, r0147 2161, r0149 2173, r0151 2185, r0153 2197,
+    /// r0157 2221, r0167 2281, r0171 2305, r0177 2341, r0181 2365).
+    #[test]
+    fn a_matched_document_refuses_an_operator_that_changes_its_id() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        let decimal = Bson::Decimal128("1".parse().unwrap());
+        for update in [
+            doc! { "$set": { "_id": 1_i64 } },
+            doc! { "$set": { "_id": 1.0 } },
+            doc! { "$set": { "_id": decimal } },
+            doc! { "$set": { "_id": 2 } },
+            doc! { "$set": { "_id": "1" } },
+            doc! { "$unset": { "_id": "" } },
+            doc! { "$rename": { "_id": "y" } },
+            doc! { "$rename": { "a": "_id" } },
+            doc! { "$max": { "_id": 5 } },
+            doc! { "$inc": { "_id": 1 } },
+            doc! { "$set": { "_id.x": 1 } },
+            doc! { "$set": { "a": 2, "_id": 2 } },
+        ] {
+            let message = apply_err(update.clone(), stored());
+            assert!(message.contains("_id is immutable"), "{update}: {message}");
+        }
+    }
+
+    /// `$rename _id -> _id` is refused too (r0157 2221, a refusal of its own there).
+    #[test]
+    fn a_rename_of_the_id_onto_itself_is_refused() {
+        assert!(!apply_err(doc! { "$rename": { "_id": "_id" } }, doc! { "_id": 1 }).is_empty());
+    }
+
+    /// A replacement keeps the same `DocId`, stored as the body wrote it (r0183 2377,
+    /// r0185 2389), and another is refused (r0187 2401); a body with no `_id` keeps the
+    /// stored one (r0189).
+    #[test]
+    fn a_replacement_of_a_matched_document_keeps_the_same_doc_id() {
+        let stored = || doc! { "_id": 1, "a": 1 };
+        assert_eq!(applied(doc! { "_id": 1, "z": 1 }, stored()), doc! { "_id": 1, "z": 1 });
+        let out = applied(doc! { "_id": 1_i64, "z": 1 }, stored());
+        assert_eq!(out.get("_id"), Some(&Bson::Int64(1)));
+        assert_eq!(applied(doc! { "z": 1 }, stored()), doc! { "_id": 1, "z": 1 });
+        assert!(apply_err(doc! { "_id": 2, "z": 1 }, stored()).contains("_id is immutable"));
+    }
+
     #[test]
     fn operators_may_not_touch_id() {
-        assert!(parse(&doc! { "$set": { "_id": 1 } }).is_err());
-        assert!(parse(&doc! { "$unset": { "_id": "" } }).is_err());
+        // Naming `_id` parses; what a matched document may do with it is judged by the
+        // result (see `a_matched_document_takes_an_operator...`). An `$unset` is refused.
+        assert!(parse(&doc! { "$set": { "_id": 1 } }).is_ok());
+        assert!(
+            apply_err(doc! { "$unset": { "_id": "" } }, doc! { "_id": 1 }).contains("immutable")
+        );
         assert!(parse(&doc! { "$rename": { "a": "_id" } }).is_ok_and(|u| {
             let mut d = doc! { "_id": 1, "a": 2 };
             apply(&u, &mut d, NOW).is_err()
@@ -3122,8 +3506,23 @@ mod tests {
             applied(doc! { "$set": { "01": 1, "1": 2 } }, doc! {}),
             doc! { "01": 1, "1": 2 }
         );
-        let err = conflict_err(doc! { "$set": { "a.01": 1, "a.1": 2 } });
-        assert!(err.contains("would create a conflict at \"a.1\""), "{err}");
+        // `a.01` beside `a.1` parses, and is judged against the document: one element of an
+        // array (refused), two fields of a document or of one that is missing (q7s2y).
+        let update = doc! { "$set": { "a.01": 1, "a.1": 2 } };
+        let err = apply_err(update.clone(), doc! { "a": [10, 20, 30] });
+        assert!(
+            err.contains("in this document") && err.contains("would create a conflict at \"a.1\""),
+            "{err}"
+        );
+        for (held, keys) in
+            [(doc! { "a": { "k": 1 } }, vec!["k", "01", "1"]), (doc! {}, vec!["01", "1"])]
+        {
+            let stored = applied(update.clone(), held);
+            let inner = stored.get_document("a").unwrap();
+            assert_eq!(inner.keys().map(String::as_str).collect::<Vec<_>>(), keys);
+            assert_eq!(inner.get("01"), Some(&Bson::Int32(1)));
+            assert_eq!(inner.get("1"), Some(&Bson::Int32(2)));
+        }
     }
 
     #[test]
@@ -3333,17 +3732,23 @@ mod tests {
         // The path language reads `01` as index 1, so each was a second write
         // to `a.1`, and the result followed the key order. A sign makes `+1` a
         // field name, so it is no spelling of that index.
+        // Where `a` is an array (q7s2y 1 to 16, 25 to 29): refused, in the document.
         for spelling in ["a.01", "a.001"] {
             for update in [
                 doc! { "$set": { "a.1": 5 }, "$inc": { spelling: 1 } },
                 doc! { "$inc": { spelling: 1 }, "$set": { "a.1": 5 } },
             ] {
-                let err = conflict_err(update.clone());
-                assert!(err.contains("would create a conflict at \"a.1\""), "{update}: {err}");
+                let err = apply_err(update.clone(), doc! { "a": [10, 20, 30] });
+                assert!(
+                    err.contains("in this document")
+                        && err.contains("would create a conflict at \"a.1\""),
+                    "{update}: {err}"
+                );
             }
         }
+        // A path and its own prefix conflict as written, whatever holds the field.
         let err = conflict_err(doc! { "$set": { "a": [] }, "$inc": { "a.01.n": 1 } });
-        assert!(err.contains("updating the path \"a.1.n\" would create a conflict at \"a\""));
+        assert!(err.contains("updating the path \"a.01.n\" would create a conflict at \"a\""));
         // Against a positional path, in the document.
         let err = apply_err_with(
             doc! { "$inc": { "items.$[].qty": 1 }, "$set": { "items.01.qty": 0 } },
@@ -3424,7 +3829,7 @@ mod tests {
         let concrete = concrete_paths(operations, &doc, None, |_| true).unwrap();
         let paths: usize = concrete.iter().map(Vec::len).sum();
         assert_eq!(paths, 3 * n as usize);
-        let probes = claim_concrete(operations, &concrete).unwrap();
+        let probes = claim_concrete(operations, &concrete, &doc).unwrap();
         assert_eq!(probes, 4 * paths);
         // And a conflict at the last element is still found.
         let update = parse_with_filters(
@@ -3437,9 +3842,18 @@ mod tests {
         assert!(err.contains(&format!("at \"items.{}.a\"", n - 1)), "{err}");
     }
 
+    /// `$setOnInsert` of `_id` parses, and on a document that matched it is skipped, whatever
+    /// it holds: q7s2r.out r0159 (line 2233) and r0161 (line 2245). It is for an insert, where
+    /// the filter's id decides (see `settle_inserted_id`).
     #[test]
-    fn set_on_insert_may_not_touch_id() {
-        assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_err());
+    fn set_on_insert_of_id_is_skipped_on_a_matched_document() {
+        assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_ok());
+        for id in [1, 2] {
+            assert_eq!(
+                applied(doc! { "$setOnInsert": { "_id": id } }, doc! { "_id": 1, "a": 1 }),
+                doc! { "_id": 1, "a": 1 }
+            );
+        }
     }
 
     fn dec(text: &str) -> Bson {
@@ -3630,10 +4044,6 @@ mod tests {
             doc! { "v": [3] }
         );
         assert_eq!(
-            applied(doc! { "$pull": { "v": { "$not": { "$gt": 2 } } } }, doc! { "v": [1, 2, 3] }),
-            doc! { "v": [3] }
-        );
-        assert_eq!(
             applied(doc! { "$pull": { "v": { "$regex": "^a" } } }, doc! { "v": ["ab", "ba", 5] }),
             doc! { "v": ["ba", 5] }
         );
@@ -3643,55 +4053,519 @@ mod tests {
         );
     }
 
+    /// A top-level `$elemMatch` removes no document element: q7s2q.out q0221 (line 1479)
+    /// over the documents, q0311 (2019) over the mix, q0356 (2289) over documents holding
+    /// arrays, q0401 (2559) over sub-documents, and j1296 of q7s2j.out.
     #[test]
-    fn pull_elem_match_removes_the_documents_whose_fields_match() {
+    fn pull_elem_match_leaves_the_documents() {
+        let a_is_1 = || bson::bson!({ "$elemMatch": { "a": 1 } });
+        let with_arrays = bson::bson!([{ "a": [1, 2] }, { "a": [3] }, { "a": [] }, { "a": 1 }]);
+        let sub_documents =
+            bson::bson!([{ "a": { "b": 1 } }, { "a": { "b": 2 } }, { "a": { "b": 1, "c": 1 } }]);
+        for stored in [q_documents(), q_mixed(), with_arrays, sub_documents] {
+            assert_eq!(pulled(a_is_1(), stored.clone()), stored);
+        }
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$gt": 1 } }), pull_documents()),
+            pull_documents()
+        );
+        // The same on a collection of results, whose arrays the recording does not hold.
         let out =
             applied(doc! { "$pull": { "results": { "$elemMatch": { "score": 8 } } } }, results());
-        assert_eq!(out, doc! { "results": [{ "score": 7, "item": "C" }] });
+        assert_eq!(out, results());
         let out = applied(
             doc! { "$pull": { "results": { "$elemMatch": { "score": { "$gte": 8 }, "item": "B" } } } },
             results(),
         );
-        assert_eq!(out.get_array("results").unwrap().len(), 3);
+        assert_eq!(out, results());
     }
 
+    /// The array a `$pull` of `operand` leaves of `before` at the field `f`.
+    fn pulled(operand: Bson, before: Bson) -> Bson {
+        let out = applied(doc! { "$pull": { "f": operand } }, doc! { "f": before });
+        out.get("f").cloned().expect("the field stays")
+    }
+
+    fn ints(values: &[i32]) -> Bson {
+        Bson::Array(values.iter().map(|v| Bson::Int32(*v)).collect())
+    }
+
+    /// The array every recorded `$pull` case starts from where the elements
+    /// are documents.
+    fn pull_documents() -> Bson {
+        bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }, { "a": 1, "b": 7 }])
+    }
+
+    /// A mix of an integer, an array, a document, a null and a string.
+    fn pull_mixed() -> Bson {
+        bson::bson!([1, [2], { "a": 3 }, null, "s"])
+    }
+
+    /// Removing an element equal to a whole document is `$pullAll`, which compares the
+    /// whole value: `{a: 1}` removes no `{a: 1, b: 5}` (q7s2j.out j1344, line 8094, and
+    /// j1341, line 8076) and `{a: 1, b: 5}` removes that element alone (j1350, line 8131;
+    /// j1347, line 8113). A `$pull` of the same document is a query and removes by fields.
+    /// A `$pull` of `{$eq: {k: 2}}` or `{$in: [{k: 2}]}` removes only the element equal to the
+    /// document, its field order counting, where a plain `{k: 2}` removes every document with `k`
+    /// 2 (q7s2z 1 to 12, run by the `update_table` test).
     #[test]
-    fn pull_with_a_plain_document_matches_the_whole_element() {
-        // `{score: 8}` is not a condition: it removes only the elements equal
-        // to it, not the superset `{score: 8, item: "B"}`.
-        let out = applied(doc! { "$pull": { "results": { "score": 8 } } }, results());
+    fn pull_all_is_the_whole_element_form_that_pull_by_document_replaced() {
+        let pull_all = |listed: Bson, before: Bson| -> Bson {
+            let out = applied(doc! { "$pullAll": { "f": [listed] } }, doc! { "f": before });
+            out.get("f").cloned().expect("the field stays")
+        };
+        assert_eq!(pull_all(bson::bson!({ "a": 1 }), pull_documents()), pull_documents());
         assert_eq!(
-            out,
-            doc! { "results": [
-                { "score": 8, "item": "A" },
-                { "score": 8, "item": "B" },
-                { "score": 7, "item": "C" },
-            ] }
+            pull_all(bson::bson!({ "a": 1, "b": 5 }), pull_documents()),
+            bson::bson!([{ "a": 2, "b": 6 }, { "a": 1, "b": 7 }]),
         );
-        // Field order counts, as it always has.
-        let out = applied(
-            doc! { "$pull": { "r": { "a": 1, "b": 2 } } },
-            doc! { "r": [{ "b": 2, "a": 1 }, { "a": 1, "b": 2 }] },
+        assert_eq!(
+            pull_all(
+                bson::bson!({ "a": 1, "b": 5 }),
+                bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }])
+            ),
+            bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }]),
         );
-        assert_eq!(out, doc! { "r": [{ "b": 2, "a": 1 }] });
-        // The empty document is a value too: it removes the empty documents.
-        let out = applied(doc! { "$pull": { "r": {} } }, doc! { "r": [{}, { "a": 1 }, 5] });
-        assert_eq!(out, doc! { "r": [{ "a": 1 }, 5] });
+    }
+
+    /// A document operand with no `$` key is a query on each element: a
+    /// document element it matches by those fields is removed, whatever else
+    /// it holds and in whatever order. q7s2j.out, reference 6.0.5.
+    #[test]
+    fn pull_by_document_is_a_query_on_each_element() {
+        // j1254, q7s2j.out lines 7539-7544.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), pull_documents()),
+            bson::bson!([{ "a": 2, "b": 6 }]),
+        );
+        // j1251, lines 7521-7526: both elements hold a: 1, in two field orders.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), bson::bson!([{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }])),
+            bson::bson!([]),
+        );
+        // j1260, lines 7576-7581: every field named must match.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1, "b": 7 }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }]),
+        );
+        // j1266, lines 7613-7618: the order the fields are named in does not matter.
+        assert_eq!(
+            pulled(bson::bson!({ "b": 7, "a": 1 }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 2, "b": 6 }]),
+        );
+        // j0709, lines 4250-4255: a field holding an array matches by an element of it.
+        assert_eq!(
+            pulled(bson::bson!({ "a": 1 }), bson::bson!([{ "a": [1, 2] }, { "a": [3] }])),
+            bson::bson!([{ "a": [3] }]),
+        );
+    }
+
+    /// A field of the query may carry operators: j1270 (lines 7638-7643) and
+    /// j1272 (lines 7650-7655).
+    #[test]
+    fn pull_by_document_takes_operators_on_its_fields() {
+        assert_eq!(
+            pulled(bson::bson!({ "a": { "$gte": 2 } }), pull_mixed()),
+            bson::bson!([1, [2], null, "s"]),
+        );
+        assert_eq!(
+            pulled(bson::bson!({ "a": { "$gte": 2 } }), pull_documents()),
+            bson::bson!([{ "a": 1, "b": 5 }, { "a": 1, "b": 7 }]),
+        );
+    }
+
+    /// Only a document element is tested: scalars, arrays and nulls stay,
+    /// j1252 (lines 7527-7532), j1253 (7533-7538) and j1255 (7545-7550).
+    /// An array element that holds documents stays too (q7s2y y0075, y0083, y0091).
+    #[test]
+    fn pull_by_document_leaves_the_elements_that_are_not_documents() {
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), pull_mixed()), pull_mixed());
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+        let arrays = bson::bson!([[1, 2], [2, 1], [1, 2]]);
+        assert_eq!(pulled(bson::bson!({ "a": 1 }), arrays.clone()), arrays);
+    }
+
+    /// A regular expression operand is a pattern the elements are matched
+    /// against: a string it matches is removed and nothing else is,
+    /// j1312 (lines 7897-7902) and j1310 (lines 7885-7890).
+    #[test]
+    fn pull_by_document_reads_a_regular_expression_as_a_pattern() {
+        let re = || {
+            Bson::RegularExpression(bson::Regex {
+                pattern: "^s".to_string().try_into().expect("valid pattern"),
+                options: String::new().try_into().expect("valid options"),
+            })
+        };
+        assert_eq!(pulled(re(), pull_mixed()), bson::bson!([1, [2], { "a": 3 }, null]));
+        assert_eq!(pulled(re(), pull_documents()), pull_documents());
+        assert_eq!(pulled(re(), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+    }
+
+    /// `{$elemMatch: {...}}` as the whole operand reads an element that is an
+    /// array: the scalars in an array of scalars stay, j1292 (lines 7774-7779)
+    /// and j1295 (lines 7792-7797), and the arrays one of whose members
+    /// satisfies the body go, j1294 (7786-7791) and j1297 (7804-7809).
+    #[test]
+    fn pull_by_document_reads_an_elem_match_as_a_search_of_an_array_element() {
+        let operand = || bson::bson!({ "$elemMatch": { "$gt": 1 } });
+        let longs =
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(2), Bson::Double(2.0), Bson::Int64(3)]);
+        assert_eq!(pulled(operand(), longs.clone()), longs);
+        assert_eq!(pulled(operand(), ints(&[1, 1, 2, 1])), ints(&[1, 1, 2, 1]));
+        assert_eq!(pulled(operand(), pull_mixed()), bson::bson!([1, { "a": 3 }, null, "s"]));
+        assert_eq!(pulled(operand(), pull_documents()), pull_documents());
+        assert_eq!(pulled(operand(), bson::bson!([[1, 2], [2, 1], [1, 2]])), bson::bson!([]));
+    }
+
+    /// The arrays of q7s2q.out, the recorded fixtures of cases q0151-q0426.
+    fn q_scalars() -> Bson {
+        bson::bson!([1, 2, 3, 2, "a", null, 2.0])
+    }
+    fn q_documents() -> Bson {
+        bson::bson!([{ "a": 1, "b": 2 }, { "a": 2 }, { "a": 1, "b": 3 }, { "b": 2, "a": 1 }])
+    }
+    fn q_arrays() -> Bson {
+        bson::bson!([[1, 2], [2, 3], [1], []])
+    }
+    fn q_mixed() -> Bson {
+        bson::bson!([1, { "a": 1 }, [1], "s", null, { "a": [1, 2] }])
+    }
+
+    /// The empty document is a query every document element satisfies, and no other
+    /// element does: q7s2q.out q0240 (line 1593) over the documents, q0330 (2133) over the
+    /// mix, q0195 (1323) over the scalars, q0285 (1863) over the arrays.
+    #[test]
+    fn pull_by_document_reads_the_empty_document_as_every_document() {
+        let operand = || bson::bson!({});
+        assert_eq!(pulled(operand(), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(operand(), q_mixed()), bson::bson!([1, [1], "s", null]));
+        assert_eq!(pulled(operand(), q_scalars()), q_scalars());
+        assert_eq!(pulled(operand(), q_arrays()), q_arrays());
+    }
+
+    /// A top-level `$elemMatch` pulls an element that is an array when a member satisfies
+    /// its body, and never a document or a scalar element: q7s3i.jsonl cases 127, 128, 130
+    /// (over `[[1,2],[3]]`), 140 and 143 (over `[{b:1},5,[6],null]`, where `[6]` goes), 132
+    /// and 145 (an empty body pulls none), 96-108 and 148-159 (documents), 109-121 (scalars)
+    /// and, as a query on the fields, 160.
+    #[test]
+    fn pull_elem_match_pulls_only_the_array_elements_a_member_satisfies() {
+        let gt = || bson::bson!({ "$elemMatch": { "$gt": 1 } });
+        let arrays = || bson::bson!([[1, 2], [3]]);
+        assert_eq!(pulled(gt(), arrays()), bson::bson!([]));
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$gt": 1, "$lt": 3 } }), arrays()),
+            bson::bson!([[3]])
+        );
+        assert_eq!(
+            pulled(bson::bson!({ "$elemMatch": { "$exists": true } }), arrays()),
+            bson::bson!([])
+        );
+        let mixed = || bson::bson!([{ "b": 1 }, 5, [6], null]);
+        let without = bson::bson!([{ "b": 1 }, 5, null]);
+        assert_eq!(pulled(gt(), mixed()), without);
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": { "$exists": true } }), mixed()), without);
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": {} }), arrays()), arrays());
+        assert_eq!(pulled(bson::bson!({ "$elemMatch": {} }), mixed()), mixed());
+        let docs = || bson::bson!([{ "b": 1, "c": [1, 2] }, { "b": 2 }, { "b": 3, "c": [] }]);
+        for body in [
+            bson::bson!({ "$elemMatch": { "b": 1 } }),
+            bson::bson!({ "$elemMatch": { "$gt": 1 } }),
+            bson::bson!({ "$elemMatch": {} }),
+            bson::bson!({ "$elemMatch": { "$or": [{ "b": 1 }, { "b": 3 }] } }),
+        ] {
+            assert_eq!(pulled(body.clone(), docs()), docs(), "{body}");
+        }
+        let scalars = bson::bson!([1, 2, 3]);
+        assert_eq!(pulled(gt(), scalars.clone()), scalars);
+        let nested = bson::bson!([{ "b": [{ "c": 1 }, { "c": 2 }] }, { "b": [{ "c": 3 }] }]);
+        assert_eq!(
+            pulled(bson::bson!({ "b": { "$elemMatch": { "c": 1 } } }), nested),
+            bson::bson!([{ "b": [{ "c": 3 }] }])
+        );
+    }
+
+    /// `$and`, `$or` and `$nor` are queries on the document elements, and no other element
+    /// satisfies them, a `$nor` included: q7s2q.out q0234-q0236 (lines 1557-1569) over the
+    /// documents, q0189-q0191 (1281-1299) over the scalars, q0279-q0281 (1821-1839) over the
+    /// arrays, q0324-q0326 (2097-2109) over the mix.
+    #[test]
+    fn pull_by_document_reads_the_logical_operators_as_queries_on_documents() {
+        let or = || bson::bson!({ "$or": [{ "a": 1 }, { "a": 2 }] });
+        let and = || bson::bson!({ "$and": [{ "a": 1 }, { "b": 2 }] });
+        let nor = || bson::bson!({ "$nor": [{ "a": 1 }] });
+        // q0234, q0235, q0236.
+        assert_eq!(pulled(or(), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(and(), q_documents()), bson::bson!([{ "a": 2 }, { "a": 1, "b": 3 }]));
+        assert_eq!(
+            pulled(nor(), q_documents()),
+            bson::bson!([{ "a": 1, "b": 2 }, { "a": 1, "b": 3 }, { "b": 2, "a": 1 }])
+        );
+        // q0189-q0191 and q0279-q0281: nothing else is removed, a `$nor` included.
+        for operand in [or(), and(), nor()] {
+            assert_eq!(pulled(operand.clone(), q_scalars()), q_scalars(), "{operand}");
+            assert_eq!(pulled(operand.clone(), q_arrays()), q_arrays(), "{operand}");
+        }
+        // q0324: both documents with `a: 1`, one of them with `a: [1, 2]`, go; q0325 and
+        // q0326: no document matches the `$and`, and both match `a: 1`, so the `$nor`
+        // pulls nothing.
+        assert_eq!(pulled(or(), q_mixed()), bson::bson!([1, [1], "s", null]));
+        assert_eq!(pulled(and(), q_mixed()), q_mixed());
+        assert_eq!(pulled(nor(), q_mixed()), q_mixed());
+        // An operator inside a logical clause is not a query, and is refused: q0192 (line 1305),
+        // q0193, q0237.
+        for operand in [
+            doc! { "$or": [{ "$gt": 2 }, { "$lt": 2 }] },
+            doc! { "$and": [{ "$gt": 1 }, { "$lt": 3 }] },
+        ] {
+            let message = apply_err(doc! { "$pull": { "f": operand.clone() } }, doc! { "f": [1] });
+            assert!(message.contains("$gt"), "{operand}: {message}");
+        }
+    }
+
+    /// `$ne` and `$nin` hold for a document element, which has no such value, and so remove
+    /// every one: q7s2q.out q0212 (line 1425), q0213 (1431); over the scalars q0167 (1155),
+    /// q0168 (1161) they remove what is not listed.
+    #[test]
+    fn pull_by_condition_treats_a_document_element_as_a_value_that_is_not_listed() {
+        assert_eq!(pulled(bson::bson!({ "$ne": 2 }), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(bson::bson!({ "$nin": [1, 2] }), q_documents()), bson::bson!([]));
+        assert_eq!(pulled(bson::bson!({ "$ne": 2 }), q_scalars()), bson::bson!([2, 2, 2.0]));
+        assert_eq!(
+            pulled(bson::bson!({ "$nin": [1, 2] }), q_scalars()),
+            bson::bson!([1, 2, 2, 2.0])
+        );
     }
 
     #[test]
-    fn pull_with_a_mixed_document_is_refused_saying_how_to_spell_it() {
+    fn pull_with_a_mixed_document_is_refused() {
+        // q7s2q.out q0194 (line 1317): code 2, `unknown operator: a`. The two orders of a
+        // mix and a mix with a logical operator are UNRECORDED.
         for operand in [
+            doc! { "$gt": 1, "a": 1 },
             doc! { "$gte": 6, "score": 8 },
             doc! { "score": 8, "$lt": 3 },
             doc! { "a": 1, "$elemMatch": { "b": 1 } },
         ] {
             let message = apply_err(doc! { "$pull": { "r": operand.clone() } }, results());
             assert!(
-                message.contains("$pull cannot mix operators with plain fields")
-                    && message.contains("$elemMatch"),
+                message.contains("$pull cannot mix operators with plain fields"),
                 "{operand}: {message}"
             );
+        }
+    }
+
+    fn one_op(operator: &str, path: &str, operand: impl Into<Bson>) -> Document {
+        let mut inner = Document::new();
+        inner.insert(path, operand);
+        let mut update = Document::new();
+        update.insert(operator, inner);
+        update
+    }
+
+    /// The three array operators over a path that goes through a value they
+    /// cannot enter: a scalar or `null` by any segment, an array by a field
+    /// name. The reference refuses each as a traverse (code 28) whether or
+    /// not anything lies beyond it. `$pop` rows of q7s2j.out; the `$pull`
+    /// rows (j0577-j0720, lines 3458-4316) and the `$pullAll` rows
+    /// (j0721-j0792, lines 4322-4748) hold the same shapes.
+    #[test]
+    fn array_operators_below_a_value_they_cannot_enter_are_refused() {
+        let docs = || bson::bson!([{ "a": 1 }, { "a": 2 }]);
+        let nested = || bson::bson!([[1, 2], [3]]);
+        let keyed = || bson::bson!({ "0": [1, 2], "1": 3 });
+        let shapes: Vec<(&str, &str, Bson)> = vec![
+            ("j0800 f.a over f=5, q7s2j.out 4796", "f.a", Bson::Int32(5)),
+            ("j0801 f.0 over f=5, 4802", "f.0", Bson::Int32(5)),
+            ("j0812 f.a over f=null", "f.a", Bson::Null),
+            (
+                "j0828 f.a.b over f={a:[1,2],b:2}, 4964",
+                "f.a.b",
+                bson::bson!({ "a": [1, 2], "b": 2 }),
+            ),
+            ("j0836 f.a over f=[1,2], 5012", "f.a", bson::bson!([1, 2])),
+            ("j0839 f.0.a over f=[1,2], 5030", "f.0.a", bson::bson!([1, 2])),
+            ("j0842 f.a over f=[{a:1},{a:2}], 5048", "f.a", docs()),
+            ("j0848 f.a over f=[[1,2],[3]], 5084", "f.a", nested()),
+            ("j0851 f.0.a over f=[[1,2],[3]], 5102", "f.0.a", nested()),
+            ("j0863 f.0.a over f={0:[1,2],1:3}, 5174", "f.0.a", keyed()),
+        ];
+        for (label, path, stored) in shapes {
+            for update in [
+                one_op("$pop", path, 1),
+                one_op("$pull", path, bson::bson!({ "$gt": 1 })),
+                one_op("$pullAll", path, bson::bson!([1, 9])),
+            ] {
+                let message = apply_err(update.clone(), doc! { "f": stored.clone() });
+                assert!(message.contains("cannot use the part"), "{label}: {update}: {message}");
+            }
+        }
+    }
+
+    /// An operator computes from the value at the place it writes: a path segment that is
+    /// a position reads an element and never a field of the elements, as the write
+    /// addresses it. `$inc` of `a.3` over `{a: [{"3": 5}]}` read 5 from the field and wrote
+    /// 6 at position 3; it writes 1 there (q7s3j.jsonl case 21; `$mul` 31, `$bit` 61,
+    /// `$push` 71-72, `$addToSet` 81-82, `$max` 52, `$pull` 92, `$pop` 102). The whole
+    /// table of 150 is `update_digit_tests.rs`.
+    #[test]
+    fn an_operator_reads_where_it_writes_and_not_a_field_named_like_the_position() {
+        let field = |v: Bson| doc! { "a": [{ "1": v }] };
+        let cases: Vec<(&str, Document, Document, Document)> = vec![
+            (
+                "$inc a.3",
+                doc! { "$inc": { "a.3": 1 } },
+                doc! { "a": [{ "3": 5 }] },
+                doc! { "a": [{ "3": 5 }, Bson::Null, Bson::Null, 1] },
+            ),
+            (
+                "$push a.1",
+                doc! { "$push": { "a.1": 7 } },
+                field(bson::bson!([1])),
+                doc! { "a": [{ "1": [1] }, [7]] },
+            ),
+            (
+                "$addToSet a.1",
+                doc! { "$addToSet": { "a.1": 8 } },
+                field(bson::bson!([7])),
+                doc! { "a": [{ "1": [7] }, [8]] },
+            ),
+            (
+                "$min a.1 (10 over the field 9)",
+                doc! { "$min": { "a.1": 10 } },
+                field(Bson::Int32(9)),
+                doc! { "a": [{ "1": 9 }, 10] },
+            ),
+            (
+                "$max a.1 (3 over the field 9)",
+                doc! { "$max": { "a.1": 3 } },
+                field(Bson::Int32(9)),
+                doc! { "a": [{ "1": 9 }, 3] },
+            ),
+            (
+                "$mul a.1",
+                doc! { "$mul": { "a.1": 2 } },
+                field(Bson::Int32(5)),
+                doc! { "a": [{ "1": 5 }, 0] },
+            ),
+            (
+                "$bit a.1",
+                doc! { "$bit": { "a.1": { "or": 1 } } },
+                field(Bson::Int32(4)),
+                doc! { "a": [{ "1": 4 }, 1] },
+            ),
+            // Nothing at the position: a pull or a pop has nothing to take from.
+            (
+                "$pull a.1",
+                doc! { "$pull": { "a.1": 1 } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+            (
+                "$pullAll a.1",
+                doc! { "$pullAll": { "a.1": [1] } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+            (
+                "$pop a.1",
+                doc! { "$pop": { "a.1": 1 } },
+                field(bson::bson!([1, 2])),
+                field(bson::bson!([1, 2])),
+            ),
+        ];
+        for (label, update, stored, want) in cases {
+            assert_eq!(applied(update, stored), want, "{label}");
+        }
+    }
+
+    /// The read and the write of a path through nested arrays are one place: `a.0.1` is
+    /// the second member of the first element, not the field `0` of a later element
+    /// (q7s3j.jsonl cases 24, 30, 34, 40, 64, 70 record the nested forms over a document
+    /// and an array element).
+    #[test]
+    fn the_read_and_the_write_of_a_path_through_nested_arrays_are_one_place() {
+        assert_eq!(
+            applied(doc! { "$inc": { "a.0.1": 1 } }, doc! { "a": [[5, 6], { "0": [1, 2] }] }),
+            doc! { "a": [[5, 7], { "0": [1, 2] }] }
+        );
+        assert_eq!(
+            applied(doc! { "$inc": { "a.0.1": 1 } }, doc! { "a": [[], { "0": [1, 2] }] }),
+            doc! { "a": [[Bson::Null, 1], { "0": [1, 2] }] }
+        );
+    }
+
+    /// A path with nothing at it is no change, and a path that reaches an
+    /// array through documents and indexes works: q7s2j.out j0793-j0798
+    /// (lines 4754-4795), j0818 (4904), j0824 (4940), j0831 (4982), j0857
+    /// (5138), j0860 (5156), j0861 (5162), j0864 (5180).
+    #[test]
+    fn array_operators_leave_a_missing_path_alone_and_reach_arrays_by_index() {
+        for path in ["f", "f.a", "f.0", "f.1", "f.0.a", "f.a.b"] {
+            for update in [
+                one_op("$pop", path, 1),
+                one_op("$pull", path, bson::bson!({ "$gt": 1 })),
+                one_op("$pullAll", path, bson::bson!([1, 9])),
+            ] {
+                assert_eq!(applied(update, doc! { "b": 1 }), doc! { "b": 1 }, "{path} over absent");
+            }
+        }
+        let empty = || doc! { "f": {} };
+        assert_eq!(applied(one_op("$pop", "f.a", 1), empty()), empty(), "j0818");
+        assert_eq!(applied(one_op("$pop", "f.0", 1), doc! { "f": [] }), doc! { "f": [] }, "j0831");
+        assert_eq!(
+            applied(one_op("$pop", "f.a", 1), doc! { "f": { "a": [1, 2], "b": 2 } }),
+            doc! { "f": { "a": [1], "b": 2 } },
+            "j0824"
+        );
+        assert_eq!(
+            applied(one_op("$pop", "f.0.a", 1), doc! { "f": [{ "a": [1, 2] }, { "a": [3] }] }),
+            doc! { "f": [{ "a": [1] }, { "a": [3] }] },
+            "j0857"
+        );
+        let keyed = || doc! { "f": { "0": [1, 2], "1": 3 } };
+        assert_eq!(applied(one_op("$pop", "f.a", 1), keyed()), keyed(), "j0860");
+        assert_eq!(
+            applied(one_op("$pop", "f.0", 1), keyed()),
+            doc! { "f": { "0": [1], "1": 3 } },
+            "j0861"
+        );
+        assert_eq!(applied(one_op("$pop", "f.a.b", 1), keyed()), keyed(), "j0864");
+    }
+
+    /// `$pop` of a path that holds something that is not an array is refused
+    /// (code 14), as `$pull` and `$pullAll` are: a string, `null`, a document,
+    /// an element of an array, a field of an element. q7s2j.out j0805 (line
+    /// 4826), j0811 (4862), j0817 (4898), j0837 (5018), j0845 (5066); the
+    /// `$pop` of q7s2m.out m0122 (line 728), whose other operator is fine.
+    #[test]
+    fn pop_of_a_value_that_is_not_an_array_is_refused() {
+        for (label, path, stored) in [
+            ("j0805", "f", Bson::String("s".into())),
+            ("j0811", "f", Bson::Null),
+            ("j0817", "f", Bson::Document(Document::new())),
+            ("j0837", "f.0", bson::bson!([1, 2])),
+            ("j0845", "f.0.a", bson::bson!([{ "a": 1 }, { "a": 2 }])),
+        ] {
+            let message = apply_err(one_op("$pop", path, 1), doc! { "f": stored });
+            assert!(message.contains("non-array"), "{label}: {message}");
+        }
+        let message = apply_err(
+            doc! { "$unset": { "a.b": 1 }, "$pop": { "a.c": 1 } },
+            doc! { "a": { "b": 5, "c": 6 } },
+        );
+        assert!(message.contains("non-array"), "m0122: {message}");
+    }
+
+    /// `$min` and `$max` that would leave the field as it is still refuse a
+    /// path through an array by a field name, as a write there is refused:
+    /// q7s2i.out i0418 (line 2504), `$min 3` at `f.a` over `[{a:1},{a:2}]`.
+    #[test]
+    fn min_through_an_array_by_a_field_name_is_refused_even_when_it_would_not_write() {
+        let stored = || doc! { "f": [{ "a": 1 }, { "a": 2 }] };
+        for update in [one_op("$min", "f.a", 3), one_op("$max", "f.a", 0)] {
+            let message = apply_err(update.clone(), stored());
+            assert!(message.contains("cannot"), "{update}: {message}");
         }
     }
 
@@ -3728,23 +4602,19 @@ mod tests {
         }
     }
 
+    /// A `$not` at the top of the operand is refused, whatever it holds: q7s2q.out q0177
+    /// (line 1215), q0222 (1485), q0267, q0312, q0357, q0402, code 2, `unknown top level
+    /// operator: $not`.
     #[test]
-    fn pull_with_a_not_of_no_operator_is_refused_at_parse() {
-        let message = parse(&doc! { "$pull": { "r": { "$not": { "score": 8 } } } })
-            .expect_err("a $not of a plain document")
-            .to_string();
-        assert!(
-            message.contains("$not takes operators") && message.contains("$elemMatch"),
-            "{message}"
-        );
-        // The operator form is the condition.
-        assert_eq!(
-            applied(
-                doc! { "$pull": { "r": { "$not": { "$gte": 5 } } } },
-                doc! { "r": [1, 6, 4, 9] }
-            ),
-            doc! { "r": [6, 9] }
-        );
+    fn pull_refuses_a_not_at_the_top_of_the_operand() {
+        for operand in
+            [doc! { "$not": { "$gt": 1 } }, doc! { "$not": { "score": 8 } }, doc! { "$not": 5 }]
+        {
+            let message = parse(&doc! { "$pull": { "r": operand.clone() } })
+                .expect_err(&format!("{operand} must not parse"))
+                .to_string();
+            assert!(message.contains("unknown top level operator: $not"), "{operand}: {message}");
+        }
     }
 
     #[test]
