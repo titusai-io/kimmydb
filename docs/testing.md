@@ -1345,3 +1345,13 @@ Ask: **if this broke, would anything notice?**
 
 - [Key Encoding](key-encoding.md) — the most heavily tested component
 - [Decisions](decisions.md) — the choices these tests defend
+
+## Running the suite with `field` collections
+
+`Engine::create_collection`, the helper the tests create collections with, makes `document`
+collections. In a test build (the crate's own tests, or a build with the `test-hooks` feature)
+`KIMMY_TEST_HELPER_POLICY=field` makes it create `field` collections instead, so a whole suite can
+be run over the field write path: `KIMMY_TEST_HELPER_POLICY=field cargo test -p kimmy-storage`.
+That run is a report and does not gate: tests that pin whole-document last-writer-wins, the
+order of fields after an update, or the replication of a collection are expected to differ, and
+each difference is a row to read, not a failure to fix. The gate runs with the default.
