@@ -1381,6 +1381,12 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(RemoteApplied::Superseded { released: false });
         };
+        // Merging a remote write into a field document is the apply of Step 3; until it
+        // lands an entry for one is refused by name, not stored as a document that has no
+        // state.
+        if coll.merge_policy == MergePolicy::Field {
+            return Err(refuse_field_replication());
+        }
 
         let key = doc_key(&id)?;
         let incoming = match &entry.body {
@@ -3747,4 +3753,14 @@ mod tests {
         // The body's own `_id` is kept as written, as an insert keeps it.
         assert_eq!(stored_id(&engine, &coll, &DocId::Int64(8)), Bson::Int64(8));
     }
+}
+
+/// The refusal of a remote write or snapshot document for a `field` collection, until the apply of
+/// Step 3 exists. Answered as the unbuilt capability it is (`501`).
+pub(crate) fn refuse_field_replication() -> StorageError {
+    StorageError::Core(CoreError::Unsupported(
+        "replicating a collection with merge policy `field` is not built yet: a remote write or \
+         snapshot document for it is refused (use mergePolicy `document` for a replicated collection)"
+            .into(),
+    ))
 }

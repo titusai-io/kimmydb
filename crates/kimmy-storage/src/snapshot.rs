@@ -1281,6 +1281,25 @@ impl Engine {
         // every carried delete's key in the stored form, which is all any path
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
+        // A document of a `field` collection is a merge state the receiver cannot apply until
+        // Step 3: the page is refused by name before anything of it is written.
+        {
+            let announced: std::collections::BTreeSet<CollectionId> = page
+                .collections
+                .iter()
+                .filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
+                .map(|c| CollectionId::derive(&c.db, &c.name))
+                .collect();
+            for doc in &page.documents {
+                let field = announced.contains(&doc.collection)
+                    || self
+                        .collection_by_id(doc.collection)?
+                        .is_some_and(|c| c.merge_policy == kimmy_core::MergePolicy::Field);
+                if field {
+                    return Err(crate::docs::refuse_field_replication());
+                }
+            }
+        }
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }

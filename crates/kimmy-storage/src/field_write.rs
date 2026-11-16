@@ -21,7 +21,8 @@ use bson::Document;
 use kimmy_core::effects::{Effects, Outcome, UpsertEffects};
 use kimmy_core::merge_state::bridge::{bson_to_value, document_to_fields, ordered_to_document};
 use kimmy_core::merge_state::{
-    JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, Writer, WriterId, Written,
+    JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, UpdateRefused, Writer,
+    WriterId, Written,
 };
 use kimmy_core::{Error as CoreError, Hlc, Stamp};
 
@@ -65,8 +66,15 @@ fn refused(what: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Core(CoreError::Unsupported(format!("{what}: {e}")))
 }
 
+/// The writer's refusal of an update or a creation, with its own text, as the request's error
+/// (a 400, like any invalid update).
+fn update_refused(r: UpdateRefused) -> StorageError {
+    StorageError::Core(CoreError::InvalidUpdate(r.to_string()))
+}
+
+/// A stamp the writer refused is a defect of the caller, not of the request.
 fn stamp_error(e: StampError) -> StorageError {
-    refused("the write's stamp", e)
+    StorageError::Corrupt(format!("the write's stamp was refused: {e}"))
 }
 
 /// Run one write against `prior` (the stored state, or `None` for a document never stored) and
@@ -89,7 +97,14 @@ fn write(
         m_stamp(s)
     })
     .map_err(stamp_error)?;
-    let Some(_written) = written else { return Ok(None) };
+    let Some(_written) = written else {
+        // `None` is a write that changes nothing, or one the writer refused for the cap.
+        return if w.would_hit_writer_cap() {
+            Err(update_refused(UpdateRefused::WriterCap))
+        } else {
+            Ok(None)
+        };
+    };
     let rendered = w.state.ordered_document(&opts);
     let alive = rendered.is_some();
     let body = match rendered {
@@ -155,7 +170,7 @@ pub(crate) fn update(
             Err(UpdateError::Stamp(e)) => Err(e),
         })?;
     match refusal {
-        Some(r) => Err(refused("the update", r)),
+        Some(r) => Err(update_refused(r)),
         None => Ok(image),
     }
 }
@@ -208,7 +223,7 @@ pub(crate) fn upsert(
         Err(UpdateError::Stamp(e)) => Err(e),
     })?;
     match refusal {
-        Some(r) => Err(refused("the creation", r)),
+        Some(r) => Err(update_refused(r)),
         None => Ok(image),
     }
 }

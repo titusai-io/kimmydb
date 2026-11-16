@@ -343,3 +343,54 @@ fn an_upsert_into_a_field_collection_is_created_through_the_typed_entry_with_one
         (OpKind::Insert, rec.stamp, rec.meta.as_deref())
     );
 }
+
+#[test]
+fn the_writers_refusal_of_an_update_reaches_the_request_with_its_own_text_and_writes_nothing() {
+    use crate::Candidates;
+    use kimmy_core::merge_state::{Path, Value};
+    let (e, _d) = open();
+    let (f, _) = pair(&e);
+    e.insert(&f, doc! { "_id": 1_i64, "s": "x" }).unwrap();
+    let before = raw(&e, &f, 1).unwrap();
+    let last = e.clock_last();
+    let bad = SpecFx {
+        post: doc! { "_id": 1_i64, "s": "y" },
+        fx: || {
+            let mut fx = kimmy_core::effects::Effects::new();
+            fx.inc(Path::flat("s").unwrap(), Value::Int32(1));
+            fx
+        },
+    };
+    let err = e.modify_where(&f, &Candidates::Scan, &bad, None).unwrap_err();
+    match err {
+        crate::StorageError::Core(kimmy_core::Error::InvalidUpdate(text)) => {
+            assert!(text.contains("not a number"), "{text}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(raw(&e, &f, 1).unwrap(), before, "nothing was written");
+    assert_eq!(e.clock_last(), last, "and no stamp was minted");
+}
+
+#[test]
+fn a_remote_entry_for_a_field_collection_is_refused_by_name_and_a_document_collection_still_applies_it()
+ {
+    let (a, _da) = open();
+    let (b, _db) = open();
+    let (fa, _) = pair(&a);
+    let (fb, db_) = pair(&b);
+    a.insert(&fa, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    let entry = entries(&a, &fa).remove(0);
+    let err = b.apply_remote(&fb, &entry).unwrap_err();
+    assert!(
+        matches!(&err, crate::StorageError::Core(kimmy_core::Error::Unsupported(t)) if t.contains("`field`")),
+        "{err:?}"
+    );
+    assert!(raw(&b, &fb, 1).is_none(), "nothing was stored");
+    // the same write, as a document collection's entry, applies
+    let (c, _dc) = open();
+    let (_, dc) = pair(&c);
+    c.insert(&dc, doc! { "_id": 1_i64, "a": 1 }).unwrap();
+    let e2 = entries(&c, &dc).remove(0);
+    assert!(b.apply_remote(&db_, &e2).unwrap());
+}
