@@ -733,9 +733,13 @@ operator adds them and in whatever order the request writes them:
 `{"$set": {"b": 1, "a": 2}, "$inc": {"c": 1}}` over `{_id: 1}` gives `{_id, a,
 b, c}`, and `{"$set": {"b.y": 1, "b.x": 2}}` gives `b: {x, y}`. Fields already
 there keep their place, and a document given as a value keeps its own order.
-Sorted means the names made only of digits first, by numeric value, then the
-others in byte order: `{"$set": {"10": 1, "9": 1, "1": 1, "a": 1, "B": 1}}`
-gives `{_id, 1, 9, 10, B, a}`, and `s.10`, `s.9`, `s.b` give `s: {9, 10, b}`.
+Sorted means by bytes, except that two names that both begin with a digit from `1` to
+`9` are ordered by length first (the shorter first) and then by bytes; nothing else is
+read, no numeric value and no class of digit-only names (q7s2u, q7s2v, q7s2w). So
+`{"$set": {"10": 1, "9": 1, "1": 1, "a": 1, "B": 1}}` gives `{_id, 1, 9, 10, B, a}`,
+`s.10`, `s.9`, `s.b` give `s: {9, 10, b}`, `2`, `10`, `1a` give `2, 10, 1a`, `010` and `-a`
+are before every name led by `1` to `9` (`010, 2, 10, 1a`; `-a, 1`), `1a` is before `100`, and
+`01` is before `1`. The length counts bytes (`1é` is three: `99, 1é`, `100, 1é` and `1a, 1é` in q7s4k (h)). The order is the same whatever order the request lists the names in.
 An upsert stores `_id` first, then the fields its filter implies, sorted, then
 every field the update adds (`$set`, `$setOnInsert`, `$inc`, the other
 operators), sorted together. The nested fields a dotted filter key seeds are
@@ -1516,6 +1520,14 @@ changed the descending rule from the smallest element.) It is not the rule `$loo
 element of a path that crosses an array rather than the least
 ([Aggregation](aggregation.md#lookup)).
 
+**Two keys through one array take one tuple per element.** When two sort keys reach values
+of the same array (`{"a.c": 1, "a.d": 1}` over `a: [{c: 5}, {d: 1}]`), each element gives
+one tuple of the keys, `(5, null)` and `(null, 1)` here, and the document's key is its
+least tuple ascending, compared key by key; it is not the
+least of each key taken apart, which would be `(null, null)` and would sort the document
+third. The recorded order of q7s3f0035 (`[7, 1, 3, 4, ...]`, document 2 after documents 1
+and 3) is this rule, and q7s4k (d) records it for the aggregation `$sort`.
+
 **What a sort key reaches, exactly.** The candidates are every value the path
 reaches; a `null` for a document that lacks the next field and for each element of an
 array on the path that is not a document (a number, a `null`, a nested array); and a
@@ -1617,11 +1629,13 @@ else, and never answers part of one:
   takes only the field-name reading, which is also the one an [aggregation
   expression](aggregation.md#arrays) takes. No projection selects an element
   by position; `$slice` in a pipeline does that.
-- **Outside an array, an inclusion leaves out a sub-document that holds none
-  of the paths**: `{"a.b": 1}` over `{a: {c: 1}}` answers no `a` at all,
-  where an element of an array would be `{}`. A field the path cannot
-  continue through — a number where `a.b` needs a document — is left out
-  the same way.
+- **An included path keeps its parent whatever it finds inside**, in a
+  `find` projection and in a `$project` stage alike: `{"a.b": 1}` over
+  `{a: {c: 1}}` answers `a: {}`, an array keeps one projected document per
+  document element (empty ones included, scalar elements dropped, nested
+  arrays walked the same way), and an empty document stays `{}` and an empty
+  array `[]`. Only a parent that cannot be continued through — a scalar, a
+  `null` or a missing field, where `a.b` needs a document — is left out.
 
 A value is read as a flag, not as the literal `0` or `1`: any non-zero number
 or `true` includes, `0`, `0.0` and `false` exclude, and a string, `null`, an

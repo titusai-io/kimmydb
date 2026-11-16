@@ -640,8 +640,7 @@ fn write_in_array(
 
 /// Put the keys an update created in order: at each level, the fields that
 /// were there stay where they were and the new ones follow, sorted by
-/// [`new_key_order`]: the names made of digits by their numeric value, then the
-/// others in byte order.
+/// [`new_key_order`].
 ///
 /// A document an update was given as a value is not touched, only the levels
 /// the update's own paths created or wrote into.
@@ -678,20 +677,24 @@ fn array_document_at<'a>(items: &'a mut [Bson], trail: &[String]) -> Option<&'a 
     }
 }
 
-/// The order the fields an update creates take at a level: a name made only of
-/// ASCII digits sorts before any other, by its numeric value (`9` before `10`),
-/// and the rest follow in byte order. UNRECORDED: two digit names of one value
-/// (`01` and `1`) are told apart by their bytes.
+/// The order the fields an update creates take at a level, whatever order the update lists
+/// them in (q7s2u, q7s2v and q7s2w: 490 cases, at the top level, in `o.`, in `a.0.` and in an
+/// upsert's created document). Two names compare by their **bytes**, except when **both begin
+/// with a byte `1` to `9`**: then the shorter name, by length in bytes, comes first, and names
+/// of one length compare by bytes. Nothing else: no class of all-digit names, no numeric value
+/// and no trimming of zeros (`010` is before `2`, `1a` before `20`, `9` before `10`, and `-a`
+/// before `1`). The names that begin with `1` to `9` are one contiguous block of the byte
+/// order, so re-ordering inside it leaves a total order.
+///
+/// The length is counted in **bytes**: `99, 1é`, `100, 1é`, `1ab, 1é`, `9, 1é`, `10, 1é` and `1a, 1é`
+/// are each stored with the shorter name in bytes first (q7s4k (h), cases 129 to 140, `q7s4k.out`
+/// lines 916 to 981).
 pub fn new_key_order(a: &str, b: &str) -> std::cmp::Ordering {
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
-    match (digits(a), digits(b)) {
-        (true, true) => {
-            let (x, y) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
-            x.len().cmp(&y.len()).then_with(|| x.cmp(y)).then_with(|| a.cmp(b))
-        }
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        (false, false) => a.cmp(b),
+    let led = |s: &str| matches!(s.as_bytes().first(), Some(b'1'..=b'9'));
+    if led(a) && led(b) {
+        a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    } else {
+        a.as_bytes().cmp(b.as_bytes())
     }
 }
 

@@ -11042,12 +11042,11 @@ async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
 }
 
 #[tokio::test]
-async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
-    // Finding 10's own reproduction, over the route rather than the parse
-    // layer: `items` is an array, so `$unwind: "$items.sku"` has no single
-    // place to write an element back to, whatever any particular document's
-    // `sku` holds — refused uniformly, `400`, naming the stage (ADR-130).
-    // Before this fix the server answered `200` with the document unchanged.
+async fn unwind_reads_a_path_that_crosses_an_array_as_missing_over_http() {
+    // Finding 10's reproduction, over the route: `items` is an array, so `$unwind:
+    // "$items.sku"` meets it before the last segment and the path is missing, as in the
+    // reference (q7s4i 316, 317): the document is dropped, and kept with
+    // `preserveNullAndEmptyArrays`. It is not refused.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
@@ -11066,14 +11065,17 @@ async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
             json!({"pipeline": [{"$unwind": "$items.sku"}]}),
         )
         .await;
-    assert_eq!(res.status, 400, "{:?}", res.body);
-    assert_eq!(res.body["error"], "bad_request");
-    let body = format!("{:?}", res.body);
-    assert!(body.contains("$unwind"), "{body}");
-    // The refusal names the concrete fix, not just the problem: the caller
-    // who wrote `$items.sku` is told to unwind `$items` first.
-    assert!(body.contains("$items"), "{body}");
-    assert!(body.contains("sku"), "{body}");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(0), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$unwind": {"path": "$items.sku", "preserveNullAndEmptyArrays": true}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().map(Vec::len), Some(1), "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -22648,4 +22650,152 @@ async fn a_graph_lookup_follows_a_position_written_with_a_leading_zero() {
     let want: Vec<Vec<i64>> =
         vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![1, 7], vec![]];
     assert_eq!(got, want, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_sort_on_parallel_arrays_is_refused_except_for_a_filter_of_exactly_an_id_number() {
+    // q7s4k 103, 104 and q7s4l: two sort keys that meet different arrays of a document are refused
+    // (code 2, "cannot sort with keys that are parallel arrays"), and a filter that is exactly
+    // `{_id: <number>}` reads the one document by its key and sorts nothing. Every other filter
+    // that selects the document is refused, in `find`, `find_and_modify` and `aggregate` alike.
+    // Only a number is recorded; the other types of `_id` are unrecorded.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pairs" })).await;
+    let batch = json!([
+        { "_id": 1, "a": 1, "b": 2 },
+        { "_id": 2, "a": [1, 2], "b": [3, 4] },
+        { "_id": 3, "a": 5, "b": [1, 2] },
+        { "_id": 4, "a": 0, "b": 0 },
+        { "_id": 5, "a": [7, 8], "b": 1 },
+    ]);
+    server.post("/v1/db/shop/coll/pairs/bulk", Some(&token), batch).await;
+    let coll = "/v1/db/shop/coll/pairs";
+    let sort = json!({ "a": 1, "b": 1, "_id": 1 });
+    let refused = |res: &Res| {
+        res.status == 400
+            && res.body["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with("cannot sort with keys that are parallel arrays"))
+    };
+    let ids = |res: &Res| -> Vec<i64> {
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    };
+
+    // `find`: the exempt shapes answer the one document (q7s4k 103; q7s4l 1, 23, 25, 26, 27).
+    for body in [
+        json!({ "filter": { "_id": 2 }, "sort": sort }),
+        json!({ "filter": { "_id": 2 }, "sort": { "a": 1, "b": 1 } }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "limit": 1 }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "skip": 0 }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "projection": { "a": 1 } }),
+    ] {
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(ids(&res), vec![2], "{body}");
+    }
+    // A filter that matches nothing, and one that leaves the document out (q7s4l 15, 19).
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": 99 }, "sort": sort }),
+        )
+        .await;
+    assert_eq!((res.status, ids(&res)), (200, vec![]), "{:?}", res.body);
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": { "$gt": 2 } }, "sort": sort }),
+        )
+        .await;
+    assert_eq!((res.status, ids(&res)), (200, vec![4, 3, 5]), "{:?}", res.body);
+    // `find`: every other filter that selects the document, and no filter (q7s4l 3, 5, 7, 9, 11,
+    // 17, 21; q7s4k 100, 105).
+    for filter in [
+        json!({ "_id": { "$eq": 2 } }),
+        json!({ "_id": { "$in": [2] } }),
+        json!({ "_id": 2, "a": { "$exists": true } }),
+        json!({ "$and": [{ "_id": 2 }] }),
+        json!({ "_id": { "$gte": 2, "$lte": 2 } }),
+        json!({ "_id": { "$in": [2, 3] } }),
+        json!({}),
+    ] {
+        let body = json!({ "filter": filter, "sort": sort });
+        let res = server.post(&format!("{coll}/find"), Some(&token), body.clone()).await;
+        assert!(refused(&res), "{body}: {:?}", res.body);
+    }
+
+    // `aggregate`: the `$match` first and the `$sort` after it or after a `$skip` (q7s4l 2, 29,
+    // 32); a `$limit`, `$addFields` or `$project` between keeps the refusal (28, 30, 31).
+    let aggregate = |stages: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(&format!("{coll}/aggregate"), Some(token), json!({ "pipeline": stages }))
+                .await
+        }
+    };
+    let sorted = json!({ "$sort": sort });
+    for stages in [
+        json!([{ "$match": { "_id": 2 } }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$skip": 0 }, sorted]),
+        json!([sorted, { "$match": { "_id": 2 } }]),
+    ] {
+        let res = aggregate(stages.clone()).await;
+        assert_eq!(res.status, 200, "{stages}: {:?}", res.body);
+        assert_eq!(ids(&res), vec![2], "{stages}");
+    }
+    for stages in [
+        json!([{ "$match": { "_id": 2 } }, { "$limit": 1 }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$addFields": { "z": 1 } }, sorted]),
+        json!([{ "$match": { "_id": 2 } }, { "$project": { "a": 1, "b": 1 } }, sorted]),
+        json!([{ "$match": { "_id": { "$in": [2] } } }, sorted]),
+        json!([{ "$match": {} }, sorted]),
+    ] {
+        let res = aggregate(stages.clone()).await;
+        assert!(refused(&res), "{stages}: {:?}", res.body);
+    }
+
+    // `find_and_modify`: the exempt shapes update, upsert and remove the one document
+    // (q7s4l 36, 37, 47, 52); the others are refused and write nothing (38, 39, 44, 45).
+    let modify = |body: Value| {
+        let server = &server;
+        let token = &token;
+        async move { server.post(&format!("{coll}/find_and_modify"), Some(token), body).await }
+    };
+    for body in [
+        json!({ "filter": { "_id": 2 }, "sort": sort, "update": { "$set": { "z": 1 } } }),
+        json!({ "filter": { "_id": 2 }, "sort": sort, "update": { "$set": { "z": 2 } }, "upsert": true }),
+        json!({ "filter": { "_id": 99 }, "sort": sort, "update": { "$set": { "z": 1 } }, "upsert": true }),
+    ] {
+        let res = modify(body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+    }
+    for body in [
+        json!({ "filter": { "_id": { "$in": [2] } }, "sort": sort, "update": { "$set": { "z": 3 } } }),
+        json!({ "filter": { "_id": { "$in": [2] } }, "sort": sort, "update": { "$set": { "z": 3 } }, "upsert": true }),
+        json!({ "filter": {}, "sort": sort, "update": { "$set": { "z": 3 } } }),
+        json!({ "filter": {}, "sort": sort, "remove": true }),
+    ] {
+        let res = modify(body.clone()).await;
+        assert!(refused(&res), "{body}: {:?}", res.body);
+    }
+    let res = server
+        .post(
+            &format!("{coll}/find"),
+            Some(&token),
+            json!({ "filter": { "_id": 2 }, "sort": sort }),
+        )
+        .await;
+    assert_eq!(res.body["documents"][0]["z"], 2, "{:?}", res.body);
+    let res = modify(json!({ "filter": { "_id": 2 }, "sort": sort, "remove": true })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }

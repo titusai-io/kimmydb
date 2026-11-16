@@ -589,11 +589,35 @@ fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Resu
     if weight > MAX_PIPELINE_STAGES {
         return Err(too_many_stages(weight));
     }
-    let stages = pipeline
+    let mut stages = pipeline
         .iter()
         .enumerate()
         .map(|(i, stage)| parse_stage(stage, vars, at, i))
         .collect::<Result<Vec<_>>>()?;
+    // The matches that follow a sort are moved first (q7s4l 32), the raw stages with them, and the
+    // exemption is judged on the moved pipeline.
+    let mut raw: Vec<&Document> = pipeline.iter().collect();
+    move_matches_before_sorts(&mut stages, &mut raw);
+    // A `$match` that is exactly `{_id: <number>}` ([`shape::is_one_by_id`]) at the head of the
+    // moved pipeline, with the `$sort` right after it or only a `$skip` between: the reference
+    // reads the one document by its key and does not sort it, so a document with parallel arrays
+    // is returned (q7s4k 103, 104; q7s4l 2, 29, and 32, where `[$sort, $match {_id: 2}]` is moved
+    // to this form). A `$limit`, `$addFields` or `$project` between keeps the check (q7s4l 28,
+    // 30, 31). `[$match {_id: v}, $sort, $match {...}]` moves to two matches before the sort,
+    // which is not this form and keeps the check: UNRECORDED.
+    if matches!(raw.first().and_then(|s| s.get("$match")), Some(Bson::Document(m))
+        if shape::is_one_by_id(m))
+    {
+        let at = match raw.get(1).map(|s| s.contains_key("$skip")) {
+            Some(true) => 2,
+            _ => 1,
+        };
+        if let Some(slot) = stages.get_mut(at)
+            && matches!(slot, Stage::Sort(_))
+        {
+            *slot = Stage::Sort(Vec::new());
+        }
+    }
     if let Some((at, stage)) =
         stages.iter().enumerate().find(|(i, s)| s.writes() && i + 1 < stages.len())
     {
@@ -605,6 +629,27 @@ fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Resu
         )));
     }
     Ok(move_windows(stages))
+}
+
+/// A `$match` that stands right after a `$sort` is applied **before** it, as the reference moves it:
+/// the sort then sees only the documents the match keeps. In q7s4l 32, `[$sort, $match {_id: 2}]`
+/// over a collection whose document 2 alone holds keys the sort refuses, the match leaves exactly
+/// that document, which is then read by its key and not sorted (see `parse_pipeline`). A filter
+/// does not depend on the order of the documents it filters, so the answer is otherwise the same;
+/// what changes is which documents the sort reads, and that a leading `$match` can be planned.
+/// Each `$match` of a run moves past every `$sort` it follows, and `raw`, the stages as written,
+/// moves with them.
+fn move_matches_before_sorts<T>(stages: &mut [Stage], raw: &mut [T]) {
+    let mut at = 1;
+    while at < stages.len() {
+        if matches!(stages[at], Stage::Match(_)) && matches!(stages[at - 1], Stage::Sort(_)) {
+            stages.swap(at - 1, at);
+            raw.swap(at - 1, at);
+            at = at.saturating_sub(1).max(1);
+        } else {
+            at += 1;
+        }
+    }
 }
 
 /// Whether a `$skip` and a `$limit` are moved ahead of the stage at `at` in `stages` (ADR-270),
@@ -767,7 +812,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             Ok(Stage::AddFields(parse_computed(name, as_document(name, value)?, vars)?))
         }
         "$replaceRoot" => parse_replace_root(as_document(name, value)?, vars),
-        "$sort" => Ok(Stage::Sort(shape::parse_sort(as_document(name, value)?)?)),
+        "$sort" => parse_sort_stage(as_document(name, value)?),
         "$limit" => match as_count(name, value)? {
             // As the reference refuses it: a limit of nothing is not a window, and `$skip` past
             // the end or a `$match` that selects nothing say it.
@@ -776,6 +821,13 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         },
         "$skip" => Ok(Stage::Skip(as_count(name, value)?)),
         "$count" => match value {
+            // The reference's 40160 and 40158 (q7s4d0077, d0078, a0274, a0275).
+            Bson::String(field) if field.contains('.') => Err(Error::InvalidQuery(format!(
+                "the $count field cannot contain '.', found {field:?}"
+            ))),
+            Bson::String(field) if field.starts_with('$') => Err(Error::InvalidQuery(format!(
+                "the $count field cannot be a $-prefixed path, found {field:?}"
+            ))),
             Bson::String(field) if !field.is_empty() => Ok(Stage::Count(field.clone())),
             _ => Err(Error::InvalidQuery(
                 "$count takes the name of the output field, e.g. {$count: \"total\"}".into(),
@@ -1297,13 +1349,84 @@ fn first_variable_string(doc: &Document) -> Option<String> {
     walk_doc(doc)
 }
 
-/// `{field: <expression>, ...}` — every value is an expression.
+/// `$sort`: the specification of [`shape::parse_sort`], as a stage takes it. An empty one and a
+/// key that is no field path are refused, which a find's sort accepts (q7s4a0214 `{}`: code
+/// 15976; q7s4d0052, d0053, d0057 `""`, `"a."`, `"$a"`: codes 40352, 40353, 16410).
+fn parse_sort_stage(spec: &Document) -> Result<Stage> {
+    if spec.is_empty() {
+        return Err(Error::InvalidQuery("$sort stage must have at least one sort key".into()));
+    }
+    for name in spec.keys() {
+        shape::check_field_path("$sort key", name)?;
+    }
+    Ok(Stage::Sort(shape::parse_sort(spec)?))
+}
+
+/// The leaf paths of a field specification: a value that is a document with no operator is its
+/// dotted spelling (`{o: {z: 1}}` is `{"o.z": 1}`: q7s4g 1 and 7, 4 and 14), and every other
+/// value, an empty document included, is a leaf.
+pub(crate) fn leaf_paths<'a>(prefix: &str, doc: &'a Document, out: &mut Vec<(String, &'a Bson)>) {
+    for (name, value) in doc {
+        let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}.{name}") };
+        match value {
+            Bson::Document(inner) if is_nested_spec(inner) => leaf_paths(&path, inner, out),
+            other => out.push((path, other)),
+        }
+    }
+}
+
+/// Whether a document in a field specification is a nested specification and not an operator
+/// expression: it has a key and none of its keys starts with `$`.
+pub(crate) fn is_nested_spec(doc: &Document) -> bool {
+    !doc.is_empty() && !doc.keys().any(|key| key.starts_with('$'))
+}
+
+/// Refuse a specification that names a path and one inside it: `{a: 1, "a.b": 2}` wrote `a` and
+/// then `a.b` or the other way round by the order it was written in (q7s4d0035: code 40176).
+/// Judged on the leaf paths: `{o: {z: 1}, "o.w": 2}` is `o.z` and `o.w`, which do not conflict,
+/// and the reference applies it in either order (q7s4g 5, 6, 20, 21, 44, 45).
+fn refuse_conflicting_paths(stage: &str, doc: &Document) -> Result<()> {
+    let mut leaves = Vec::new();
+    leaf_paths("", doc, &mut leaves);
+    for (at, (a, _)) in leaves.iter().enumerate() {
+        for (b, _) in &leaves[at + 1..] {
+            let inside = |long: &str, short: &str| {
+                long.len() > short.len()
+                    && long.starts_with(short)
+                    && long.as_bytes()[short.len()] == b'.'
+            };
+            if inside(a, b) || inside(b, a) {
+                return Err(Error::InvalidQuery(format!(
+                    "{stage} specification contains two conflicting paths: {a:?} and {b:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `{field: <expression>, ...}` — every value is an expression, and a document with no operator
+/// is the dotted spelling of its fields (`{o: {z: 1}}` is `{"o.z": 1}`): the stage merges it into
+/// the sub-document already there (q7s4g 1 to 8, 13 to 15).
 fn parse_computed(stage: &str, doc: &Document, vars: &[String]) -> Result<Vec<(String, Expr)>> {
     if doc.is_empty() {
         return Err(Error::InvalidQuery(format!("{stage} needs at least one field")));
     }
-    doc.iter()
-        .map(|(name, value)| Ok((name.clone(), Expr::parse_with_vars(value, vars)?)))
+    let mut leaves = Vec::new();
+    leaf_paths("", doc, &mut leaves);
+    for (path, value) in &leaves {
+        shape::check_field_path(&format!("{stage} field"), path)?;
+        // The reference's 40180 (q7s4g 3, 18, 42).
+        if matches!(value, Bson::Document(d) if d.is_empty()) {
+            return Err(Error::InvalidQuery(format!(
+                "{stage}: an empty object is not a valid value. Found empty object at path {path}"
+            )));
+        }
+    }
+    refuse_conflicting_paths(stage, doc)?;
+    leaves
+        .into_iter()
+        .map(|(path, value)| Ok((path, Expr::parse_with_vars(value, vars)?)))
         .collect()
 }
 
@@ -1318,13 +1441,33 @@ fn parse_computed(stage: &str, doc: &Document, vars: &[String]) -> Result<Vec<(S
 /// others is refused for the same reason mixing inclusion and exclusion is —
 /// the result would be ambiguous about every field nobody named.
 fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
+    // The reference's 51272 (q7s4d0017, q7s4a0026); a find's `{}` projection is the document.
+    if doc.is_empty() {
+        return Err(Error::InvalidQuery(
+            "$project specification must have at least one field".into(),
+        ));
+    }
+    // A document with no operator is the dotted spelling of its fields (`{o: {p: 1}}` is
+    // `{"o.p": 1}`: q7s4g 31 and 35, 37), and every leaf is a flag or an expression.
+    let mut leaves = Vec::new();
+    leaf_paths("", doc, &mut leaves);
+    for (path, value) in &leaves {
+        shape::check_field_path("$project field", path)?;
+        // The reference's 51270 (q7s4g 38, 57).
+        if matches!(value, Bson::Document(d) if d.is_empty()) {
+            return Err(Error::InvalidQuery(format!(
+                "$project: an empty sub-projection is not a valid value. Found empty object at \
+                 path {path}"
+            )));
+        }
+    }
     let mut computed = Vec::new();
     let mut include = Vec::new();
     let mut excluded_id = false;
     let mut excluded_other = false;
 
-    for (key, value) in doc {
-        match value {
+    for (key, value) in &leaves {
+        match *value {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Double(0.0) | Bson::Boolean(false) => {
                 if key == ID_FIELD {
                     excluded_id = true;
@@ -1357,7 +1500,11 @@ fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
     // With no computed fields this is exactly the projection it always was,
     // so defer to the one parser rather than growing a second dialect.
     if computed.is_empty() {
-        return Ok(Stage::Project { projection: shape::parse_projection(doc)?, computed });
+        let mut flat = Document::new();
+        for (path, value) in &leaves {
+            flat.insert(path.clone(), (*value).clone());
+        }
+        return Ok(Stage::Project { projection: shape::parse_projection(&flat)?, computed });
     }
 
     if excluded_other {
@@ -1621,6 +1768,20 @@ pub(crate) fn parse_accumulators(
     for (name, value) in spec {
         if skip_id && name == "_id" {
             continue;
+        }
+        // The reference's 40235 and 40236 (q7s4d0040, d0041). A `$bucket` or `$bucketAuto`
+        // output name is UNRECORDED and is not refused.
+        if stage == "$group" {
+            if name.contains('.') {
+                return Err(Error::InvalidQuery(format!(
+                    "the $group field name {name:?} cannot contain '.'"
+                )));
+            }
+            if name.starts_with('$') {
+                return Err(Error::InvalidQuery(format!(
+                    "the $group field name {name:?} cannot be an operator name"
+                )));
+            }
         }
         let acc = value.as_document().ok_or_else(|| {
             Error::InvalidQuery(format!(
@@ -2104,8 +2265,19 @@ pub fn bind_let(
 /// values, which is what filters want — `{tags: "a"}` matches any element;
 /// a field-path option wants the value *itself*, so the array stays an array
 /// and `$unwind` has something to expand.
-fn value_at<'a>(doc: &'a Document, p: &str) -> Option<&'a Bson> {
-    path::resolve(doc, p).into_iter().next()
+/// The value at `field` read as field names only: every segment is a name, a digit run
+/// included, and an array met before the last segment makes the path **missing**, never a
+/// position and never a traversal (`$unwind` and `$densify`: q7s4i 316, 317, 328, 392, 411).
+pub(crate) fn name_value<'a>(doc: &'a Document, field: &str) -> Option<&'a Bson> {
+    let mut segments = field.split('.');
+    let mut current = doc.get(segments.next()?)?;
+    for segment in segments {
+        current = match current {
+            Bson::Document(inner) => inner.get(segment)?,
+            _ => return None,
+        };
+    }
+    Some(current)
 }
 
 /// A total, order-consistent byte key for grouping.
@@ -2353,7 +2525,39 @@ pub(crate) fn project_doc(
     doc: &Document,
     vars: &[Binding<'_>],
 ) -> Result<Document> {
-    let mut projected = shape::project(projection, doc);
+    // A computed field below a field of the input is written into the shape that field has:
+    // each element of an array, and a scalar's place (q7s4g 33, 34, 39).
+    let mut tops: Vec<&str> = Vec::new();
+    let mut source: Option<Document> = None;
+    for (name, _) in computed {
+        let segments: Vec<&str> = name.split('.').collect();
+        let [top, parents @ ..] = segments.as_slice() else { continue };
+        if parents.is_empty() {
+            continue;
+        }
+        let working = source.get_or_insert_with(|| doc.clone());
+        if let Some(value) = working.get_mut(*top) {
+            *value = documents_along(value, &parents[..parents.len() - 1]);
+            if !tops.contains(top) {
+                tops.push(top);
+            }
+        }
+    }
+    let mut projected = shape::project(projection, source.as_ref().unwrap_or(doc));
+    // Where the projection kept nothing of such a field, the shape alone stays.
+    for top in tops {
+        if !projected.contains_key(top)
+            && let Some(input) = doc.get(top)
+        {
+            let name = computed
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .find(|name| name.split('.').next() == Some(top));
+            let parents: Vec<&str> = name.map_or(Vec::new(), |name| name.split('.').collect());
+            let inner = parents.get(1..parents.len().saturating_sub(1)).unwrap_or(&[]);
+            projected.insert(top, shell_along(input, inner));
+        }
+    }
     // Computed fields read the *input*, not the projection's
     // output — otherwise `{$project: {a: 0, b: "$a"}}` would
     // depend on key order, which BSON preserves and nobody
@@ -2445,8 +2649,7 @@ fn set_computed_within(
             Some(value) => {
                 let payload = known.unwrap_or_else(|| crate::expr::bson_bytes(&value));
                 let exact = admit(what, size, name, replaced, payload, max)?;
-                path::set(target, name, value)
-                    .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+                write_stage_path(target, name, Some(value));
                 size = match exact {
                     Some(after) => after,
                     None => {
@@ -2457,21 +2660,112 @@ fn set_computed_within(
                 };
             }
             None => {
-                if !path::unset(target, name) && crossing_array(target, name).is_some() {
-                    // A path the write of a value would refuse is refused for the
-                    // removal too, with the same error: a field named through an array
-                    // by a name, not a position, is not a place a field can be left out
-                    // of. A numeric position leaves a null in the array, as `$unset` does.
-                    let mut probe = target.clone();
-                    if let Err(e) = path::set(&mut probe, name, Bson::Null) {
-                        return Err(Error::InvalidQuery(format!("cannot set {name:?}: {e}")));
-                    }
-                }
+                write_stage_path(target, name, None);
                 size = crate::expr::document_bytes(target);
             }
         }
     }
     Ok(())
+}
+
+/// Write `value` at the dotted path `name` of `doc` as `$addFields`, `$set` and the computed
+/// leaves of `$project` write it (q7s4g 1 to 99): **every segment is a field name**, a run of
+/// digits included, and the write goes into every element of an array on the way. A document
+/// is entered (an existing field keeps its place, a new one is appended); an array is entered
+/// element by element, a nested array too, and an empty array stays empty; a scalar, a null or
+/// a missing value before the last segment is replaced by a new document that holds the rest of
+/// the path, so a scalar element of an array becomes one. `None` is `$$REMOVE`: the field at the
+/// end is removed, and the parents the path passes are made documents all the same
+/// (`{o: {z: "$$REMOVE"}}` over `o: 5` is `o: {}`).
+pub(crate) fn write_stage_path(doc: &mut Document, name: &str, value: Option<Bson>) {
+    let segments: Vec<&str> = name.split('.').collect();
+    write_in_document(doc, &segments, &value);
+}
+
+fn write_in_document(doc: &mut Document, segments: &[&str], value: &Option<Bson>) {
+    let Some((head, rest)) = segments.split_first() else { return };
+    if rest.is_empty() {
+        match value {
+            Some(value) => {
+                doc.insert(*head, value.clone());
+            }
+            None => {
+                doc.remove(*head);
+            }
+        }
+        return;
+    }
+    match doc.get_mut(*head) {
+        Some(child) => write_in_value(child, rest, value),
+        None => {
+            let mut fresh = Document::new();
+            write_in_document(&mut fresh, rest, value);
+            doc.insert(*head, fresh);
+        }
+    }
+}
+
+fn write_in_value(target: &mut Bson, segments: &[&str], value: &Option<Bson>) {
+    match target {
+        Bson::Document(doc) => write_in_document(doc, segments, value),
+        Bson::Array(items) => {
+            for item in items {
+                write_in_value(item, segments, value);
+            }
+        }
+        other => {
+            let mut fresh = Document::new();
+            write_in_document(&mut fresh, segments, value);
+            *other = Bson::Document(fresh);
+        }
+    }
+}
+
+/// What `$project` keeps of the structure a computed field is written into (q7s4g 33, 34, 39):
+/// each document is an empty document, each array is kept with every element made the same way,
+/// a scalar or a null is an empty document, and the path to the field is followed through the
+/// documents, so that the computed value lands in each element of an array and in a scalar's
+/// place.
+fn shell_along(value: &Bson, segments: &[&str]) -> Bson {
+    match value {
+        Bson::Array(items) => {
+            Bson::Array(items.iter().map(|item| shell_along(item, segments)).collect())
+        }
+        Bson::Document(doc) => {
+            let mut out = Document::new();
+            if let Some((head, rest)) = segments.split_first()
+                && let Some(child) = doc.get(*head)
+            {
+                out.insert(*head, shell_along(child, rest));
+            }
+            Bson::Document(out)
+        }
+        _ => Bson::Document(Document::new()),
+    }
+}
+
+/// The value a computed field is written under, with what a document gives each of its places
+/// made a document: a scalar or a null at the parent of the field, and a scalar element of an
+/// array there, become an empty document, so that an inclusion keeps them and the computed field
+/// has a place in each (q7s4g 33, where an inclusion alone drops a scalar element). The path to
+/// the parent is followed through documents and arrays.
+fn documents_along(value: &Bson, segments: &[&str]) -> Bson {
+    match value {
+        Bson::Array(items) => {
+            Bson::Array(items.iter().map(|item| documents_along(item, segments)).collect())
+        }
+        Bson::Document(doc) => match segments.split_first() {
+            Some((head, rest)) if doc.contains_key(*head) => {
+                let mut out = doc.clone();
+                if let Some(child) = out.get_mut(*head) {
+                    *child = documents_along(child, rest);
+                }
+                Bson::Document(out)
+            }
+            _ => value.clone(),
+        },
+        _ => Bson::Document(Document::new()),
+    }
 }
 
 /// The payload of the value at `name` in `target`, if the path runs through
@@ -2630,61 +2924,6 @@ pub fn check_attached(stage: &str, attached: usize, limits: &Limits) -> Result<(
     Ok(())
 }
 
-/// Where writing to `field` in `doc` would fail, if it would: `(array_path,
-/// remainder)`, `array_path` the dotted prefix naming the array itself,
-/// `remainder` what was left of `field` to read from each of its elements.
-/// `None` when the write would succeed.
-///
-/// Mirrors `path::set`'s own traversal read-only, without cloning `doc` to
-/// probe it — a non-terminal segment lands on an array whose next segment
-/// names a field rather than a numeric position, `path::set`'s one failure
-/// mode. A segment that is missing, a scalar, or an array reached by an
-/// index that is not already a document is what `path::set` vivifies or
-/// overwrites rather than fails on; none of those can already contain an
-/// array of their own, so this walk stops there and reports no crossing,
-/// exactly matching `path::set` succeeding by vivifying it.
-///
-/// A **numeric** segment after the array is the one case this deliberately
-/// does not report — `$unwind: "$a.0.b"` writes by index, same as any
-/// numeric-indexed write, and is not "crossing" in this function's sense.
-/// ADR-116 names this the one place its own non-fanning read and the
-/// expression layer's fanning read disagree, and that disagreement stays
-/// observable through `$unwind` here — see
-/// `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
-/// and ADR-130. An earlier revision of this function's own documentation
-/// claimed the uniform check made `$unwind`'s reader choice unobservable
-/// everywhere; that was wrong precisely because of this case, and is
-/// corrected here rather than repeated.
-fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
-    let segs: Vec<&str> = field.split('.').collect();
-    let mut current = doc;
-    let mut i = 0;
-    while i + 1 < segs.len() {
-        match current.get(segs[i]) {
-            Some(Bson::Document(child)) => {
-                current = child;
-                i += 1;
-            }
-            Some(Bson::Array(items)) => match path::array_index(segs[i + 1]) {
-                // A numeric next segment addresses a position, not a
-                // crossing; recurse into that element only if it is already
-                // a document — anything else is what `path::set` vivifies or
-                // overwrites, so nothing further along this path can fail.
-                Some(index) => match items.get(index) {
-                    Some(Bson::Document(child)) => {
-                        current = child;
-                        i += 2;
-                    }
-                    _ => return None,
-                },
-                None => return Some((segs[..=i].join("."), segs[i + 1..].join("."))),
-            },
-            _ => return None,
-        }
-    }
-    None
-}
-
 /// What `$unwind` does, whatever runs it.
 pub(crate) struct UnwindSpec<'a> {
     pub(crate) field: &'a str,
@@ -2731,26 +2970,12 @@ impl Fan {
     /// Look at `doc`, and decide what it becomes.
     pub(crate) fn start(spec: &UnwindSpec<'_>, mut doc: Document) -> Result<Fan> {
         let field = spec.field;
-        // Refused uniformly, for every document, before anything at `field`
-        // is read: `$unwind` names a place to write each element back to,
-        // and a path that crosses an array has none, regardless of what is
-        // sitting there — an array to expand, a scalar, `null`, or nothing
-        // at all. See ADR-130.
-        if let Some((array_path, remainder)) = crossing_array(&doc, field) {
-            return Err(Error::InvalidQuery(format!(
-                "$unwind cannot expand `{field}`: `{array_path}` is an array, so there is no \
-                 single place to write each element back to. Unwind `${array_path}` first, then \
-                 read `{remainder}` on each resulting row"
-            )));
-        }
-        // `path` is a field path: `$unwind` names the array to expand, and
-        // `path::set` writes each element back to that same place. Past the
-        // check above, `field` does not cross an array in this document, so
-        // every write below is guaranteed to succeed; the `Result` is still
-        // propagated with `?` rather than unwrapped, on the same principle
-        // as everywhere else in this module — a proof that holds today is
-        // not a reason to let a future change panic instead of refuse.
-        match value_at(&doc, field) {
+        // `field` is read as field names (`name_value`): a path that meets an array before
+        // its last segment is missing, and nothing is refused (q7s4i 316, 317, 392, 411).
+        // Past that, `field` crosses no array in this document, so every write below
+        // succeeds; the `Result` is still propagated with `?` rather than unwrapped, on the
+        // same principle as everywhere else in this module.
+        match name_value(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
                 // The array moves out of the document, so that it is held once and each
                 // element's copy of the document does not carry it.
@@ -2759,9 +2984,28 @@ impl Fan {
                     .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
                 Ok(Fan { doc, elements: Some((items.into_iter(), 0)), single: None })
             }
-            // A missing field, an explicit null, or an empty array: the reference
-            // drops the document unless asked to keep it.
-            Some(Bson::Array(_)) | Some(Bson::Null) | None => {
+            // A null is kept as the null it is when the stage is asked to keep it (q7s4a0233,
+            // a0235, a0237: `arr: null` and `n: null` stay `null`). The path is not unset.
+            Some(Bson::Null) if spec.preserve => {
+                spec.set_index(&mut doc, None)?;
+                Ok(Fan { doc: Document::new(), elements: None, single: Some((doc, false)) })
+            }
+            // A missing field: the reference drops the document unless asked to keep it, and
+            // kept it stays as it was (a0239; q7s4i 317: a path whose last segment is a digit
+            // after an array is missing, and nothing is unset there, `path::unset` reading the
+            // digit as a position).
+            None => {
+                let single = if spec.preserve {
+                    spec.set_index(&mut doc, None)?;
+                    Some((doc, true))
+                } else {
+                    None
+                };
+                Ok(Fan { doc: Document::new(), elements: None, single })
+            }
+            // An empty array, or an explicit null: dropped unless asked to keep it. Kept, an
+            // empty array loses its field (a0233).
+            Some(Bson::Array(_)) | Some(Bson::Null) => {
                 let single = if spec.preserve {
                     path::unset(&mut doc, field);
                     spec.set_index(&mut doc, None)?;
@@ -3066,6 +3310,17 @@ impl<'a> GroupState<'a> {
     /// The key of the bucket `scope`'s document belongs to.
     fn key(&self, scope: &Scope<'_>) -> Result<Bson> {
         match &self.kind {
+            // An `_id` object of exactly one field reads a missing value as null, so that
+            // `{k: null}` and `{}` are one group, `{k: null}` in either scan order (q7s4g 106,
+            // 114). Two fields or more, and a field that is itself an object, keep a missing
+            // value apart (q7s4g 107, 110, 112, 113).
+            GroupKind::Group(Expr::Object(fields)) if fields.len() == 1 => {
+                let (name, expr) = &fields[0];
+                let value = expr.eval_field(scope)?.unwrap_or(Bson::Null);
+                let mut key = Document::new();
+                key.insert(name.clone(), value);
+                Ok(Bson::Document(key))
+            }
             GroupKind::Group(expr) | GroupKind::SortByCount(expr) => expr.eval_in(scope),
             GroupKind::Bucket { group_by, boundaries, default, kind } => {
                 let value = group_by.eval_in(scope)?;
@@ -3146,10 +3401,9 @@ impl<'a> GroupState<'a> {
             .collect::<Result<Vec<_>>>()?;
         match self.kind {
             GroupKind::Group(_) => Ok(out),
-            GroupKind::SortByCount(_) => shape::sort_until_deadline(
-                &[SortKey { path: "count".into(), descending: true }],
-                out,
-            ),
+            GroupKind::SortByCount(_) => {
+                shape::sort_until_deadline(&[SortKey::new("count", true)], out)
+            }
             GroupKind::Bucket { default, .. } => {
                 let default_key = default.map(group_key);
                 out.sort_by(|a, b| {
@@ -3411,6 +3665,92 @@ pub fn join_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
     out
 }
 
+/// The `null` a local `[]` joins as.
+static NULL: Bson = Bson::Null;
+
+/// [`join_values`] for the **foreign** side of a `$lookup`: the path is read as a filter reads
+/// it, and an array reached by a **position** is not expanded (q7s4i 360: `a.0` over `[[1]]`
+/// does not join a local `1`, and `a.0.0` gives 1: q7s4i 417). Every other value is a key with
+/// the elements of the array it is.
+pub fn foreign_join_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
+    let rule = path::Rule {
+        mode: path::Mode::Filter,
+        on_ambiguous: path::OnAmbiguous::Ignore,
+        positions: path::Positions::Read,
+    };
+    let walked = path::walk_document(doc, field, rule).map(|walk| walk.values).unwrap_or_default();
+    let mut out = Vec::new();
+    for (value, by_position) in walked {
+        out.push(value);
+        if let Bson::Array(items) = value
+            && !by_position
+        {
+            out.extend(items.iter());
+        }
+    }
+    out
+}
+
+/// [`join_values`] for the **local** side of a `$lookup`. A digit segment that is a position
+/// selects the element **only if it is a document**, and every segment is also a field name in
+/// the document elements; a non-document adds nothing, and a path with nothing at it joins
+/// nothing (q7s4i 321, 340, 359: `a.0` over `[10, 20]` and over `[{"01": 5}, 9]`). A value that
+/// is an empty array is not itself a key and joins as `null`, so it meets the foreign documents
+/// whose field is `null` (and a foreign `[null]`), and not a foreign `[]` or `[[]]` (q7s4g 627:
+/// local `[]` joins 2, 3 and 6). A local `[[]]` still meets a foreign `[]` through its element
+/// and a foreign `[[]]` as itself.
+pub fn local_join_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
+    let segments: Vec<&str> = field.split('.').collect();
+    let mut found = Vec::new();
+    if let Some((head, rest)) = segments.split_first()
+        && let Some(value) = doc.get(*head)
+    {
+        local_descend(value, rest, &mut found);
+    }
+    let mut out = Vec::new();
+    for value in found {
+        match value {
+            Bson::Array(items) if items.is_empty() => out.push(&NULL),
+            Bson::Array(items) => {
+                out.push(value);
+                out.extend(items.iter());
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn local_descend<'a>(value: &'a Bson, segments: &[&str], out: &mut Vec<&'a Bson>) {
+    let Some((head, rest)) = segments.split_first() else {
+        out.push(value);
+        return;
+    };
+    match value {
+        Bson::Document(doc) => {
+            if let Some(next) = doc.get(*head) {
+                local_descend(next, rest, out);
+            }
+        }
+        Bson::Array(items) => {
+            if let Some(index) = path::read_position(head)
+                && let Some(item) = items.get(index)
+                && matches!(item, Bson::Document(_))
+            {
+                local_descend(item, rest, out);
+            }
+            for item in items {
+                if let Bson::Document(doc) = item
+                    && let Some(next) = doc.get(*head)
+                {
+                    local_descend(next, rest, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// [`join_values`] for the links of a `$graphLookup`: a position is a run of digits, leading
 /// zeros included, as the reference reads `connectFromField` (`a.00` over `[[1]]` links to 1:
 /// q7s4i 343). UNRECORDED beyond that case: the other readings of a path are [`join_values`]'s.
@@ -3438,7 +3778,7 @@ pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut keys = Vec::new();
     for doc in input {
-        for value in join_values(doc, local_field) {
+        for value in local_join_values(doc, local_field) {
             if seen.insert(group_key(value)) {
                 keys.push(value.clone());
             }
@@ -4313,108 +4653,72 @@ mod tests {
     }
 
     #[test]
-    fn unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning() {
-        // The residue ADR-130 leaves: a numeric segment after a crossed
-        // array writes by index (`path::set`'s only way into an array), so
-        // it is not "crossing" in `crossing_array`'s sense and `$unwind`
-        // does not refuse. `value_at` (`path::resolve`) reads `"0"` both as
-        // the index 0 and as a field literally named `"0"` — the filter
-        // language's rule, which ADR-116 keeps for every stage option that
-        // names a field rather than computes one. Neither element here has
-        // a field called `"0"`, so only the index reading contributes:
-        // `a.0.b` is `[1, 2]`, found once, and unwinds to two rows.
-        //
-        // The fanning expression reader ADR-116 gives `$addFields`,
-        // `$group` and the rest reads a numeric segment *only* as a field
-        // name — never an index — so `$a.0.b` there finds no element named
-        // `"0"` and is `[]`: zero rows, not two. This is the one shape
-        // where `$unwind`'s own output would differ depending on which
-        // reader answered it, and it is why `unwind_and_lookup_keys_…`
-        // above no longer needs — and cannot have — an equivalent case of
-        // its own for every crossing; this one is elsewhere.
+    fn unwind_over_a_numeric_segment_after_an_array_is_a_missing_path() {
+        // `$unwind` reads field names only (q7s4i 316, 317, 392, 411): `a.0.b` meets the array
+        // `a` before its last segment, so the path is missing and the document is dropped; it is
+        // not read as position 0 and not refused. Nothing is written back to a place that is not
+        // one.
         let input = docs(vec![doc! { "a": [{"b": [1, 2]}, {"b": [3]}] }]);
-        let out = run(vec![doc! {"$unwind": "$a.0.b"}], input).unwrap();
-        assert_eq!(
-            out,
-            docs(vec![doc! { "a": [{"b": 1}, {"b": [3]}] }, doc! { "a": [{"b": 2}, {"b": [3]}] },])
-        );
+        let out = run(vec![doc! {"$unwind": "$a.0.b"}], input.clone()).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+        let kept = run(
+            vec![doc! {"$unwind": {"path": "$a.0.b", "preserveNullAndEmptyArrays": true}}],
+            input.clone(),
+        )
+        .unwrap();
+        assert_eq!(kept, input);
     }
 
     #[test]
-    fn a_signed_segment_after_an_array_is_a_crossing_as_any_field_name_is() {
-        // A segment with a sign is a field name, not an index (the update
-        // language's rule, `path::array_index`), so `$unwind: "$arr.+0"` crosses
-        // the array as `$unwind: "$arr.x"` does, and the prediction
-        // (`crossing_array`) must agree with what `path::set` does for it.
-        // UNRECORDED: the reference's answer for a stage write through `+0`.
+    fn a_signed_segment_after_an_array_is_a_name_as_any_field_name_is() {
+        // A segment with a sign is a field name, not an index, so `$unwind: "$arr.+0"` meets
+        // the array before its last segment as `$unwind: "$arr.x"` does: the path is missing and
+        // the document is dropped. UNRECORDED: the reference's answer for `+0` itself.
         for field in ["$arr.x", "$arr.+0"] {
             let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
-            let err = run(vec![doc! {"$unwind": field}], input).unwrap_err().to_string();
-            assert!(err.contains("$unwind") && err.contains("is an array"), "{field}: {err}");
+            let out = run(vec![doc! {"$unwind": field}], input).unwrap();
+            assert!(out.is_empty(), "{field}: {out:?}");
         }
-        // And a removal through it is refused as the write of a value would be.
-        for field in ["arr.x", "arr.+0"] {
+        // And a removal through it is a write that leaves the field out of every element
+        // (q7s4g 71): the stage reads every segment as a field name.
+        for field in ["arr.x", "arr.+0", "arr.01"] {
             let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
-            let err = run(vec![doc! {"$addFields": { field: "$$REMOVE" }}], input);
-            assert!(err.is_err(), "{field}: removal through a field name on an array");
+            let out = run(vec![doc! {"$addFields": { field: "$$REMOVE" }}], input).unwrap();
+            assert_eq!(out, docs(vec![doc! { "_id": 1, "arr": [{}, {}] }]), "{field}");
         }
-        // An index spelled with digits is still no crossing.
-        let input = docs(vec![doc! { "_id": 1, "arr": [7, 8] }]);
-        run(vec![doc! {"$addFields": { "arr.01": "$$REMOVE" }}], input).unwrap();
     }
 
     #[test]
-    fn unwind_refuses_a_path_that_crosses_an_array() {
-        // The finding's shape (ADR-130): `a` is an array, so `$unwind:
-        // "$a.b"` reads the first element's `b` — [1, 2], an array — and then
-        // has to write 1 and 2 back to `a.b`, which is not a place: `a` holds
-        // two elements, and there is no single one to put either value in.
-        // Before the fix this silently emitted two byte-identical copies of
-        // the input (nothing unwound) rather than refusing; the write
-        // failure was discarded. Now it is a 400 naming the stage.
-        let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": 3}] }]);
-        let err = run(vec![doc! {"$unwind": "$a.b"}], input).unwrap_err().to_string();
-        assert!(err.contains("$unwind"), "{err}");
-        assert!(err.contains("a.b"), "{err}");
+    fn unwind_reads_a_path_that_crosses_an_array_as_missing() {
+        // The finding's shape (ADR-130): `a` is an array, so `$unwind: "$a.b"` has no single
+        // place to write an element back to. The reference does not refuse it: the path is
+        // missing (q7s4i 316, 317, 392, 411), whatever the elements hold, and the document is
+        // dropped, or kept as it was with `preserveNullAndEmptyArrays`.
+        for input in [
+            doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": 3}] },
+            doc! { "_id": 1, "a": [{"b": 9}] },
+            doc! { "_id": 1, "a": [{"b": 9}, {"b": [1, 2]}] },
+        ] {
+            let out = run(vec![doc! {"$unwind": "$a.b"}], docs(vec![input.clone()])).unwrap();
+            assert!(out.is_empty(), "{input}: {out:?}");
+            let kept = run(
+                vec![doc! {"$unwind": {"path": "$a.b", "preserveNullAndEmptyArrays": true}}],
+                docs(vec![input.clone()]),
+            )
+            .unwrap();
+            assert_eq!(kept, docs(vec![input]));
+        }
 
-        // The refusal is uniform: it depends only on the path crossing an
-        // array in this document, never on what turns out to be at the far
-        // end of it. Before this test's second fix, refusal depended on the
-        // *type* of the first crossed element's value — a scalar there (`b:
-        // 9`) skipped the write entirely and answered `200` with one row
-        // that looked unwound but was not, exactly the wrong-answer class
-        // this ADR exists to close. `a` here is one element short of the
-        // first case and its `b` is a scalar at that element; both are
-        // refused all the same.
-        let input = docs(vec![doc! { "_id": 1, "a": [{"b": 9}] }]);
-        assert!(run(vec![doc! {"$unwind": "$a.b"}], input).is_err());
-        let input = docs(vec![doc! { "_id": 1, "a": [{"b": 9}, {"b": [1, 2]}] }]);
-        assert!(
-            run(vec![doc! {"$unwind": "$a.b"}], input).is_err(),
-            "a scalar found first must not skip the refusal"
-        );
-
-        // A control proving it is the crossed array, not the dotted path,
-        // that is refused: no array is crossed here, so both elements write
-        // back cleanly and nothing changes from before.
+        // No array is crossed here: both elements write back.
         let input = docs(vec![doc! { "y": {"b": [1, 2]} }]);
         let out = run(vec![doc! {"$unwind": "$y.b"}], input).unwrap();
         assert_eq!(out, docs(vec![doc! {"y": {"b": 1}}, doc! {"y": {"b": 2}}]));
 
-        // The real corpus shape: `items` is an array of `{sku, qty}`. Under
-        // the narrow, read-dependent trigger this used to pass through
-        // unchanged — `sku` is a scalar at the first element, so nothing was
-        // ever attempted to be written — which was finding 10's own row 5,
-        // still unfixed by that version of this ADR. The uniform rule
-        // refuses it: `items` is an array and `sku` is not a numeric
-        // segment, so there is no single place to write to regardless of
-        // what `sku` holds.
+        // The corpus shape: `items` is an array of `{sku, qty}`.
         let input = docs(vec![
             doc! { "_id": 1, "items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}] },
         ]);
-        let err = run(vec![doc! {"$unwind": "$items.sku"}], input).unwrap_err().to_string();
-        assert!(err.contains("$unwind"), "{err}");
-        assert!(err.contains("items.sku"), "{err}");
+        assert!(run(vec![doc! {"$unwind": "$items.sku"}], input).unwrap().is_empty());
     }
 
     #[test]
@@ -4775,19 +5079,20 @@ mod tests {
         assert_eq!(out, vec![doc! {"_id": 7, "p": [{"_id": 1}, {}], "q": 2}]);
         let out = run(vec![doc! {"$project": {"p._id": 0}}], input.clone()).unwrap();
         assert_eq!(out, vec![doc! {"_id": 7, "qty": 2, "p": [{"n": "a"}, 5, {"n": "b"}]}]);
-        // A computed field written into the kept array has no one place to
-        // go, and is refused as `$addFields` refuses it, not written into a
-        // document standing in for the array.
-        let err =
-            run(vec![doc! {"$project": {"p._id": 1, "p.q": "$qty"}}], input.clone()).unwrap_err();
-        assert!(err.to_string().contains("cannot set \"p.q\""), "{err}");
-        // A numeric segment is the documented exception: the write follows
-        // the write rules and replaces element 0 by position, as `$addFields`
-        // does, while the flags beside it read `p.0` as a field name.
+        // A computed field below the array is written into each element, and a scalar
+        // element becomes a document (q7s4g 33, 34): every segment is a field name.
+        let out = run(vec![doc! {"$project": {"p._id": 1, "p.q": "$qty"}}], input.clone()).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "p": [{"_id": 1, "q": 2}, {"q": 2}, {"q": 2}]}]);
+        // A digit is a field name there too, as it is in `$addFields` (q7s4g 61).
         let out = run(vec![doc! {"$project": {"p._id": 1, "p.0": "$qty"}}], input.clone()).unwrap();
-        assert_eq!(out, vec![doc! {"_id": 7, "p": [2, {}]}]);
+        assert_eq!(out, vec![doc! {"_id": 7, "p": [{"_id": 1, "0": 2}, {"0": 2}, {"0": 2}]}]);
         let out = run(vec![doc! {"$addFields": {"p.0": "$qty"}}], input).unwrap();
-        assert_eq!(out, vec![doc! {"_id": 7, "qty": 2, "p": [2, 5, {"n": "b"}]}]);
+        assert_eq!(
+            out,
+            vec![
+                doc! {"_id": 7, "qty": 2, "p": [{"_id": 1, "n": "a", "0": 2}, {"0": 2}, {"n": "b", "0": 2}]}
+            ]
+        );
     }
 
     #[test]

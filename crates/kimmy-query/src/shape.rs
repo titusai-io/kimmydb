@@ -24,20 +24,45 @@ pub(crate) const ID_FIELD: &str = "_id";
 pub struct SortKey {
     pub path: String,
     pub descending: bool,
+    /// The value at `path` is compared whole, with [`canonical_cmp`]: an array is not read by
+    /// its least or greatest element and an empty array is not below `null`. Set at parse on
+    /// the one key of a sort specification that is exactly `{_id: 1}` or `{_id: -1}`: the
+    /// reference compares whole values then, wherever the `_id` came from (q7s4j: `$group`,
+    /// `$sortByCount`, `$replaceWith`, `$project`, `$addFields`, `$set`, with any stages
+    /// between), and reads every other specification by the least or greatest element.
+    pub whole: bool,
+}
+
+impl SortKey {
+    /// A key that reads its path as a sort does, with the least or greatest element of an array.
+    pub fn new(path: impl Into<String>, descending: bool) -> Self {
+        SortKey { path: path.into(), descending, whole: false }
+    }
 }
 
 /// Parse a sort specification like `{age: -1, name: 1}`.
+///
+/// A specification whose only key is `_id` marks it [`SortKey::whole`], wherever the `_id` came
+/// from and whatever stages lie between (q7s4j, 147 cases): every other specification, one
+/// with a second key included, reads an array by its least or greatest element.
 pub fn parse_sort(doc: &Document) -> Result<Vec<SortKey>> {
-    doc.iter()
+    let mut keys = doc
+        .iter()
         .map(|(path, direction)| {
             let Some(descending) = direction_of(direction) else {
                 return Err(Error::InvalidQuery(format!(
                     "sort direction for {path:?} must be 1 or -1"
                 )));
             };
-            Ok(SortKey { path: path.clone(), descending })
+            Ok(SortKey::new(path.clone(), descending))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if let [key] = keys.as_mut_slice()
+        && key.path == ID_FIELD
+    {
+        key.whole = true;
+    }
+    Ok(keys)
 }
 
 /// Whether a sort direction is descending: `Some(false)` for `1`, `Some(true)`
@@ -64,15 +89,11 @@ pub fn direction_of(direction: &Bson) -> Option<bool> {
 /// keys eagerly with [`sort_keys`], and this is for the ones that do not (and for the tests'
 /// oracle).
 pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
-    for key in keys {
-        let va = sort_value_lenient(a, &key.path, key.descending);
-        let vb = sort_value_lenient(b, &key.path, key.descending);
-        let ordering = sort_cmp(&va, &vb);
-        if ordering != Ordering::Equal {
-            return if key.descending { ordering.reverse() } else { ordering };
-        }
-    }
-    Ordering::Equal
+    let va = sort_vector(keys, a, path::OnAmbiguous::Ignore, false)
+        .unwrap_or_else(|_| vec![Bson::Null; keys.len()]);
+    let vb = sort_vector(keys, b, path::OnAmbiguous::Ignore, false)
+        .unwrap_or_else(|_| vec![Bson::Null; keys.len()]);
+    compare_keys(keys, &va, &vb)
 }
 
 /// The values a document sorts by, one per key, in `keys` order.
@@ -91,9 +112,235 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
 /// refuses whenever the reference does. A position past the end of the array never refuses
 /// (q7s3j 157-186).
 pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Result<Vec<Bson>> {
-    keys.iter()
-        .map(|key| sort_value(doc, &key.path, key.descending, path::OnAmbiguous::Error))
-        .collect()
+    sort_vector(keys, doc, path::OnAmbiguous::Error, true)
+}
+
+/// The values a document sorts by, one per key: each key's own value ([`key_value`]) unless two
+/// keys read **one array together**, and then the document's key is **one tuple**, the
+/// per-element tuple that sorts first under the whole pattern with its directions (q7s4k (d):
+/// `a.x, a.y` over `a: [{x: 1, y: 2}, {x: 3, y: 0}]` is `(1, 2)`, `a.y, a.x` is `(0, 3)`; (g):
+/// `a.0, a` over `a: [0, 9]` is `(0, 0)`). A single key, and keys of which at most one reads an
+/// array, are each key's own least or greatest value, as before.
+///
+/// Two keys that meet **different arrays** of the document are **parallel**, refused when
+/// `refuse` is set (q7s4k: code 2, "cannot sort with keys that are parallel arrays"); see
+/// [`walk_tuples`]. One walk serves `find`'s sort and the `$sort` stage.
+fn sort_vector(
+    keys: &[SortKey],
+    doc: &Document,
+    on_ambiguous: path::OnAmbiguous,
+    refuse: bool,
+) -> Result<Vec<Bson>> {
+    let own: Vec<Bson> =
+        keys.iter().map(|key| key_value(doc, key, on_ambiguous)).collect::<Result<_>>()?;
+    if keys.len() < 2 || keys.iter().any(|key| key.whole) {
+        return Ok(own);
+    }
+    let segments: Vec<Vec<&str>> = keys.iter().map(|key| key.path.split('.').collect()).collect();
+    let states: Vec<PathState<'_, '_>> = segments
+        .iter()
+        .enumerate()
+        .map(|(idx, segs)| PathState {
+            idx,
+            node: doc.get(segs[0]).map_or(Node::Missing, Node::At),
+            rest: &segs[1..],
+            whole: false,
+        })
+        .collect();
+    match walk_tuples(states, keys.len()) {
+        Err(Parallel) if refuse => {
+            Err(Error::InvalidQuery("cannot sort with keys that are parallel arrays".into()))
+        }
+        Err(Parallel) => Ok(own),
+        Ok(walk) if walk.coupled => Ok(walk
+            .tuples
+            .into_iter()
+            .min_by(|a, b| compare_keys(keys, a, b))
+            .expect("a walk yields a tuple")),
+        Ok(_) => Ok(own),
+    }
+}
+
+/// Whether a filter is exactly `{_id: <number>}`: the one document it names is read by its key and
+/// **sorted by nothing**, so a document whose sort keys are parallel arrays is returned and not
+/// refused (q7s4k 103, 104; q7s4l: `find`, `findAndModify` and a `$match` that stands first in a
+/// pipeline, with `$sort` right after it or only a `$skip` between). Any other filter that selects
+/// the document is refused: `{_id: {$eq: v}}`, `{_id: {$in: [v]}}`, `{_id: v, a: ...}`,
+/// `{$and: [{_id: v}]}` and `{_id: {$gte: v, $lte: v}}`.
+///
+/// Only a **number** is recorded. A string, an ObjectId, a Long, a Double, a Decimal128, a
+/// boolean, a `null`, a date and a document as the value are UNRECORDED, and are not exempt here;
+/// the one place that says so is this function, which the `find` and `findAndModify` handlers and
+/// the pipeline parser all call.
+pub fn is_one_by_id(filter: &Document) -> bool {
+    filter.len() == 1
+        && matches!(filter.get(ID_FIELD), Some(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)))
+}
+
+/// Where one key's path is in the document: not there, the value there, or the empty array a
+/// path ended in (which a sort reads as [`empty_array_key`]).
+#[derive(Clone, Copy)]
+enum Node<'d> {
+    Missing,
+    Empty,
+    At(&'d Bson),
+}
+
+/// One key's path, walked as far as it is: `rest` is what is left of it, and `whole` says the
+/// node was reached by a position or is an element, so that an array there is a value to compare
+/// whole and not an array to expand.
+#[derive(Clone)]
+struct PathState<'d, 's> {
+    idx: usize,
+    node: Node<'d>,
+    rest: &'s [&'s str],
+    whole: bool,
+}
+
+/// Two keys met different arrays.
+struct Parallel;
+
+struct Walk {
+    /// Every tuple of the document, one value per key.
+    tuples: Vec<Vec<Bson>>,
+    /// Two keys expanded one array together.
+    coupled: bool,
+}
+
+impl<'d, 's> PathState<'d, 's> {
+    /// Follow the path through sub-documents until it meets an array, ends or is lost.
+    fn descend(&mut self) {
+        while let Some((head, rest)) = self.rest.split_first() {
+            match self.node {
+                Node::At(Bson::Document(doc)) => {
+                    self.node = doc.get(*head).map_or(Node::Missing, Node::At);
+                    self.rest = rest;
+                    self.whole = false;
+                }
+                Node::At(Bson::Array(_)) => return,
+                _ => {
+                    self.node = Node::Missing;
+                    self.rest = &[];
+                }
+            }
+        }
+    }
+
+    /// The array this path has met, if it has: in the middle of the path, or at its end when it
+    /// was not reached by a position.
+    fn array(&self) -> Option<&'d Bson> {
+        match self.node {
+            Node::At(node)
+                if matches!(node, Bson::Array(_)) && (!self.rest.is_empty() || !self.whole) =>
+            {
+                Some(node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the path goes through the elements of the array it met: it ends there, or its
+    /// next segment names a field. A position picks one element, whatever the others are.
+    fn expands(&self) -> bool {
+        self.rest.first().is_none_or(|head| path::read_position(head).is_none())
+    }
+
+    /// The path inside `element` of an array (`None`: the array is empty, or the path picks its
+    /// element by a position).
+    fn enter(&self, items: &'d [Bson], element: Option<&'d Bson>) -> Self {
+        let mut next = self.clone();
+        match self.rest.split_first() {
+            None => {
+                next.node = match element {
+                    Some(element) => Node::At(element),
+                    None => Node::Empty,
+                };
+                next.whole = true;
+            }
+            Some((head, rest)) => match path::read_position(head) {
+                Some(position) => {
+                    next.node = items.get(position).map_or(Node::Missing, Node::At);
+                    next.rest = rest;
+                    next.whole = true;
+                }
+                None => {
+                    next.node = match element {
+                        Some(element @ Bson::Document(_)) => Node::At(element),
+                        _ => Node::Missing,
+                    };
+                    next.whole = false;
+                }
+            },
+        }
+        next
+    }
+}
+
+/// The tuples of a document's keys, walked together level by level: each path goes through
+/// sub-documents until it meets an array or ends. Two paths that meet **different** arrays of the
+/// document at one level are parallel, empty arrays included and a position or not. Paths that
+/// meet **one** array are expanded together, element by element, and the walk goes on inside each
+/// element with what is left of them: arrays in different elements are not parallel
+/// (q7s4k (b) to (g)).
+fn walk_tuples(
+    mut states: Vec<PathState<'_, '_>>,
+    width: usize,
+) -> std::result::Result<Walk, Parallel> {
+    for state in &mut states {
+        state.descend();
+    }
+    let mut met: Option<&Bson> = None;
+    for state in &states {
+        if let Some(array) = state.array() {
+            match met {
+                None => met = Some(array),
+                Some(seen) if std::ptr::eq(seen, array) => {}
+                Some(_) => return Err(Parallel),
+            }
+        }
+    }
+    let (Some(array), Some(Bson::Array(items))) = (met, met) else {
+        let mut tuple = vec![Bson::Null; width];
+        for state in &states {
+            tuple[state.idx] = match state.node {
+                Node::Missing => Bson::Null,
+                Node::Empty => empty_array_key(),
+                Node::At(value) => value.clone(),
+            };
+        }
+        return Ok(Walk { tuples: vec![tuple], coupled: false });
+    };
+    let on: Vec<usize> = (0..states.len())
+        .filter(|&at| states[at].array().is_some_and(|other| std::ptr::eq(other, array)))
+        .collect();
+    let expanding = on.iter().any(|&at| states[at].expands());
+    let elements: Vec<Option<&Bson>> =
+        if expanding && !items.is_empty() { items.iter().map(Some).collect() } else { vec![None] };
+    let mut walk = Walk { tuples: Vec::new(), coupled: expanding && on.len() >= 2 };
+    for element in elements {
+        let next: Vec<PathState<'_, '_>> = states
+            .iter()
+            .enumerate()
+            .map(
+                |(at, state)| {
+                    if on.contains(&at) { state.enter(items, element) } else { state.clone() }
+                },
+            )
+            .collect();
+        let inner = walk_tuples(next, width)?;
+        walk.coupled |= inner.coupled;
+        walk.tuples.extend(inner.tuples);
+    }
+    Ok(walk)
+}
+
+/// The value one key sorts a document by: [`sort_value`], or the whole `_id` for a key marked
+/// [`SortKey::whole`] (`null` when there is none).
+fn key_value(doc: &Document, key: &SortKey, on_ambiguous: path::OnAmbiguous) -> Result<Bson> {
+    if key.whole {
+        return Ok(doc.get(ID_FIELD).cloned().unwrap_or(Bson::Null));
+    }
+    sort_value(doc, &key.path, key.descending, on_ambiguous)
 }
 
 /// The keys of one element of the array `$sortArray` and `$push`'s `$sort` order, which are
@@ -202,11 +449,6 @@ fn sort_value(
     Ok(best.cloned().unwrap_or(Bson::Null))
 }
 
-/// [`sort_value`] for the callers that never refuse.
-fn sort_value_lenient(doc: &Document, field_path: &str, descending: bool) -> Bson {
-    sort_value(doc, field_path, descending, path::OnAmbiguous::Ignore).unwrap_or(Bson::Null)
-}
-
 /// What a sort holds for an empty array that a path reaches: an array no value is, so that it
 /// is never taken for an element or a stored value, which [`sort_cmp`] places between `MinKey`
 /// and `null`. It is still an array to anything that reads the keys apart from the order.
@@ -305,10 +547,8 @@ fn sort_keyed(
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for doc in docs {
         ticker.tick()?;
-        let sort = keys
-            .iter()
-            .map(|key| sort_value(&doc, &key.path, key.descending, on_ambiguous))
-            .collect::<Result<Vec<_>>>()?;
+        let refuse = matches!(on_ambiguous, path::OnAmbiguous::Error);
+        let sort = sort_vector(keys, &doc, on_ambiguous, refuse)?;
         if let Some(held) = held.as_deref_mut() {
             held.charge(keys_bytes(&sort))?;
         }
@@ -754,7 +994,7 @@ impl FindProjection {
 /// nothing to keep for it; the caller says so before reading any document.
 pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
     for name in doc.keys() {
-        check_field_path(name)?;
+        check_field_path("projection field", name)?;
     }
     let positional: Vec<&String> =
         doc.keys().filter(|path| path::segments(path).contains(&"$")).collect();
@@ -800,8 +1040,12 @@ pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
 /// which [`parse_find_projection`] reads. A `$` inside or at the end of a segment is a name, and
 /// so is the segment `$ref`, which the reference accepts (`a.$ref`, `a.b$`: lines 208 to 210 and
 /// 217 to 219). A `$ref` as the first segment is UNRECORDED and is accepted too.
-fn check_field_path(name: &str) -> Result<()> {
-    let refuse = |why: &str| Err(Error::InvalidQuery(format!("projection field {name:?}: {why}")));
+///
+/// `what` names the place in the message (`projection field`, `$sort key`): the stage parsers of
+/// `aggregate` refuse the same names (q7s4d0020 to d0022, d0030, d0031, d0052, d0053, d0057,
+/// d0063).
+pub(crate) fn check_field_path(what: &str, name: &str) -> Result<()> {
+    let refuse = |why: &str| Err(Error::InvalidQuery(format!("{what} {name:?}: {why}")));
     if name.is_empty() {
         return refuse("FieldPath cannot be constructed with empty string");
     }
@@ -854,10 +1098,11 @@ fn is_inclusion_flag(flag: &Bson) -> bool {
 /// (`a` and `a.b`), the shorter one decides: `a` is included, or removed,
 /// whole.
 ///
-/// Outside arrays an inclusion keeps a sub-document only when it holds at least
-/// one included path, so `{"a.b": 1}` over `{a: {c: 1}}` leaves `a` out; an
-/// element of an array is kept as `{}` instead, so the array keeps one entry
-/// per document it held. An inclusion's fields come out in the order the
+/// An included path keeps its parent whatever it finds inside: a sub-document
+/// stays a document holding only what was selected, `{}` if nothing was
+/// (`{"a.b": 1}` over `{a: {c: 1}}` answers `a: {}`), and an array keeps one
+/// entry per document it held. Only a parent that is a scalar, null or missing
+/// is left out. An inclusion's fields come out in the order the
 /// document holds them, at every level, not the order the specification names
 /// them (`_id`, which the parser appends, stays where the document has it).
 pub fn project(projection: Option<&Projection>, doc: &Document) -> Document {
@@ -971,10 +1216,7 @@ fn include_field(out: &mut Document, key: &str, value: &Bson, node: &PathTree) {
     }
     match value {
         Bson::Document(inner) => {
-            let picked = include_fields(inner, node);
-            if !picked.is_empty() {
-                out.insert(key, picked);
-            }
+            out.insert(key, include_fields(inner, node));
         }
         Bson::Array(items) => {
             out.insert(key, include_elements(items, node));
@@ -1112,7 +1354,7 @@ mod tests {
     }
 
     fn by_v() -> Vec<SortKey> {
-        vec![SortKey { path: "v".into(), descending: false }]
+        vec![SortKey::new("v", false)]
     }
 
     #[test]
@@ -1445,9 +1687,9 @@ mod tests {
             doc! { "a": [
                 { "b": [{ "c": 1 }, {}] },
                 { "b": { "c": 5 } },
-                // Outside an array a sub-document holding none of the paths is
-                // left out, as it always was; the element itself stays.
-                {},
+                // A sub-document holding none of the paths stays, empty, and so
+                // does an element that holds no `b` at all.
+                { "b": {} },
                 {},
             ] },
         );
@@ -1493,7 +1735,7 @@ mod tests {
             (doc! { "missing": 1 }, doc! { "_id": 7 }),
             (doc! { "missing": 1, "_id": 0 }, doc! {}),
             (doc! { "sub.x": 1, "_id": 0 }, doc! { "sub": { "x": 2 } }),
-            (doc! { "sub.zz": 1, "_id": 0 }, doc! {}),
+            (doc! { "sub.zz": 1, "_id": 0 }, doc! { "sub": {} }),
             (doc! { "arr.x": 1, "_id": 0 }, doc! { "arr": [{ "x": 1 }] }),
             (doc! { "f19": 1 }, doc! { "_id": 7, "f19": 19 }),
             (doc! { "f19": 1, "_id": 0 }, doc! { "f19": 19 }),

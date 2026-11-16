@@ -430,7 +430,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
         deadline::tick()?;
         lease.charge_doc(&doc)?;
         let at = docs.len();
-        let value = match path::resolve(&doc, &spec.field).into_iter().next() {
+        let value = match crate::aggregate::name_value(&doc, &spec.field) {
             // A document without the field is not part of the series.
             Some(Bson::Null) | None => {
                 passthrough.push(at);

@@ -17,6 +17,52 @@ Status meanings:
 
 ---
 
+## 🟡 The reference's constant folding changes which operand it reads first, and ours reads the operands in the order they are written
+
+**Raised 2026-11-14, from the aggregation sweep q7s4b and q7s4g.** The reference folds the constants of an expression at optimize time, moving them behind the field paths and evaluating them, so the written order is lost. Four visible effects, none followed:
+
+- **A constant that is no number beside a missing path.** `{$add: ["s", "$nope"]}`, `{$add: [true, "$nope"]}`, `{$multiply: ["s", "$nope"]}`, `{$multiply: [true, "$nope"]}` and `{$multiply: [Date(0), "$nope"]}` over a document with no `nope` answer `null` (`q7s4b.jsonl` 357, 377, 1157, 1177, 1197; `q7s4g.jsonl` 602, 606, 607), and `{$add: [Date(0), null]}` is `null` (b:396), while the same constant beside a constant `null` is refused (`{$add: ["s", null]}` code 16554, `{$multiply: ["s", null]}` and `[Date(0), null]` code 14, "Failed to optimize pipeline": b:356, 1156, 1196). Ours reads left to right: `["$nope", "s"]` is `null` and `["s", "$nope"]` is a `400`.
+- **A leading null beside a field of a bad type.** `{$add: [null, "$s"]}` and `{$add: [null, 1, "$s"]}` with `s: "x"` are refused by the reference (q7s4g:605, 610); ours answers `null`, the first operand deciding.
+- **An `$ifNull` replacement that is not taken.** `{$ifNull: ["$a", {$divide: [1, 0]}]}` over a document where `a` is set is refused by the reference, which evaluated the replacement at optimize time (q7s4g:619 to 623); ours does not read it, as `$cond` does not read the branch it does not take.
+- The order between two **field** paths at run time is as written in both: `[$n, $s]` is `null` and `[$s, $n]` is refused (q7s4g:280 to 599, which agree).
+
+**Why.** The order is an artifact of an optimizer, not a rule of the language, and following it would mean this engine folding constants in the same way, for a difference that only a pipeline written with a constant first can meet.
+
+**To close:** none planned.
+
+---
+
+
+## 🟡 A date plus or minus a `Decimal128` is a `400`, where the reference answers
+
+**Raised 2026-11-14, from the aggregation sweep q7s4g.** `$add [date, Decimal]` works in the reference: the decimal is rounded to a whole number of milliseconds (`Decimal(1000)` is `+1000`, `Decimal(1.5)` is `+2`: q7s4g:212 to 220, 242), and a Decimal `NaN` gives the date `Long.MIN` for every date (221, 222, 224, 225, 227, 228); `$subtract [date, Decimal NaN]` is code 159. Ours refuses a decimal beside a date (`$add needs numbers or one date, found a decimal`), as the entry "Arithmetic on a `Decimal128` differs from MongoDB's in four places" records ("Date arithmetic with a decimal stays refused"). The other date rows fit: a double, a long, an overflow and a `NaN` or an infinity (q7s4g:140 to 246).
+
+**Why.** Following it needs a rule for the half (unrecorded beyond 1.5) and for the `NaN`, which is a date that no client can print; the refusal says what is not supported.
+
+**To close:** a ruling on the rounding and on the `NaN` row.
+
+---
+
+## 🟡 An empty argument list of `$add`, `$multiply`, `$and` and `$or` is a `400`, where the reference answers `0`, `1`, `true` and `false`
+
+**Raised 2026-11-14, from the aggregation sweep q7s4b.** `{$add: []}` is `0`, `{$multiply: []}` is `1`, `{$and: []}` is `true` and `{$or: []}` is `false` in the reference (`q7s4b.jsonl` 2516, 2524, 3540, 3541). Each is refused here for needing at least one argument, as `$concatArrays: []` and `$setUnion: []` are (see "Set operators answer in a fixed order": q7s4c:158, 228).
+
+**Why.** An empty list is a pipeline built by a program that forgot its input; the answer that is the identity of the operator hides it. Kept strict.
+
+**To close:** none planned. A pipeline that builds the list from data wraps it: `{$add: [0, ...]}`.
+
+---
+
+## 🟡 An empty `$addFields` or `$set`, and an `includeArrayIndex` that names the unwound path, are a `400`, where the reference answers
+
+**Raised 2026-11-14, from the aggregation sweep q7s4a.** `{$addFields: {}}` and `{$set: {}}` answer the documents unchanged in the reference (`q7s4a.jsonl` 42, 55), and `{$unwind: {path: "$arr", includeArrayIndex: "arr"}}` writes the index over the element (244). Here the first two are refused (`needs at least one field`) and the third is refused (`includeArrayIndex cannot be the same field as path`: it would overwrite the unwound element with its index on every row, which [aggregation.md](aggregation.md#unwind) states). The refused combined `$lookup` (q7s4a:265) is under "Array expression operators are lenient about null where MongoDB errors". `$project {}` is refused by both.
+
+**Why.** A stage that does nothing, and a field that is written and then overwritten, are mistakes; a refusal says so.
+
+**To close:** none planned.
+
+---
+
 ## 🟡 A `find` is bounded: no `limit` is 100, more than 10,000 is 10,000, and `limit: 0` is an empty page, where the reference returns every match for a missing limit and for 0
 
 **Raised 2026-11-14, from the query sweep q7s3c and q7s3f.** In the reference a `find` with no `limit`, with `limit: 0` and with `limit: 0.0` returns every document it matches: `skip 10 limit 0` over 40 documents answers the remaining 30 in sort order (`q7s3c.out` c0031 line 1384, c0032 line 1430), and a `limit` of `0`, `0.0` and `0.5` (a double is truncated, so the last is `0` too), with and without a `skip`, answers all eight documents (`q7s3f.jsonl` lines 192 to 199). Here a find is bounded by design ([ADR-098](decisions.md)): a missing `limit` is **100**, a `limit` over **10,000** is clamped to 10,000, both silently, and `limit: 0`, or a double that truncates to `0`, is a window of nothing, an empty page with no `nextCursor` on every access path and every sort order. A client that passes `0` as the driver idiom for "no limit" gets an empty `200` and no error. The rest of the reference's rule is followed: a negative `limit` or `skip` of any type is refused (its code 51024, a `4xx` here: `q7s3c.out` c0048 line 2166, c0049 line 2212; `q7s3f.jsonl` lines 180 to 191), and a double that is not negative is truncated (`2.0`, `2.5`, `2.7` and `2.99` are `2`: lines 168 to 179, c0050 line 2258, c0051 line 2304).
@@ -606,29 +652,17 @@ systems use.
 
 ---
 
-## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
+## 🟢 An inclusion projection left out a sub-document that held none of its paths, where MongoDB answers it empty
 
-**Raised 2026-10-01, with ADR-214.** A projection through an array now does
-what MongoDB's does: the array is kept, each document element is reduced to
-the included sub-paths (or has the excluded ones removed), an element that is
-not a document is dropped from an inclusion, an element holding none of the
-paths is `{}`, nested arrays recurse, and a numeric segment names a field
-rather than a position. Until then KimmyDB answered the first element alone,
-as a document (`p: {_id: 1}` for `{"p._id": 1}`), and an exclusion through an
-array removed nothing; both are fixed, not deviations, and are recorded under
-`### Changed` in the changelog.
+**Raised 2026-10-01, with ADR-214; closed 2026-11-15 (`q7s4q`, q7s3d0025, q7s4g0099).** A projection through an array does what MongoDB's does: the array is kept, each document element is reduced to the included sub-paths (or has the excluded ones removed), an element that is not a document is dropped from an inclusion, an element holding none of the paths is `{}`, nested arrays recurse, and a numeric segment names a field rather than a position. A **sub-document outside an array** was the exception: `{"a.b": 1}` over `{a: {c: 1}}` answered no `a`, where MongoDB answers `a: {}` (and `p: [{}]` where MongoDB answers `p: [{q: {}}]` for `{"p.q.r": 1}` over `p: [{q: {x: 1}}]`).
 
-What still differs is a **sub-document outside an array**: `{"a.b": 1}` over
-`{a: {c: 1}}` answers no `a` here, where MongoDB answers `a: {}`, and the same
-holds one level into an element — `{"p.q.r": 1}` over `p: [{q: {x: 1}}]` is
-`p: [{}]` here and `p: [{q: {}}]` there. The field a caller asked for is
-absent either way; only the empty container around it differs. It is the rule
-KimmyDB's projection has always had for documents, and changing it is a change
-of its own that nobody has asked for. The recorded case of a find is `{"c.f.g": 1}` over
-`c: {d: 2}`: the reference answers `c: {}` and this build leaves `c` out
-(`q7s3d.out` q7s3d0025, line 218).
+**What changed.** An included dotted path keeps its parent whatever it finds inside, for a `find` projection and for a `$project` stage alike (both go through `shape::project`): a sub-document stays a document holding only what was selected, empty if nothing was; an array keeps one projected document per document element; only a parent that is a scalar, null or missing is left out. The recorded rows are the table `projection_included.tsv`. It is recorded under **Fixed** in the changelog.
 
-**Three smaller points, same entry.** `{"a": 1, "a.b": 1}` is accepted and
+---
+
+## 🟡 A projection accepts a path overlap MongoDB refuses, and `$project` reads `items.$` and a computed path into an array differently
+
+**Raised 2026-10-01, with ADR-214.** `{"a": 1, "a.b": 1}` is accepted and
 includes `a` whole, where MongoDB refuses the overlap as a path collision; a
 request MongoDB refuses means something here, so nothing ported changes
 meaning. In a `$project` stage `{"items.$": 1}` is a field called `$`, not the
@@ -943,15 +977,26 @@ operator; the entry below records how the conversion differs from MongoDB's.
   (`2026-8-12`), month names (`07 Sep 2026 10:00:00 GMT`) and `20260812`.
   MongoDB's parser accepts those and more, and a `timezone` argument applied
   to a zoneless string. A string neither accepts is an error in both.
-- **A double to a string is Rust's shortest round-trip digits, in plain
-  decimal, never in exponent form.** It agrees with MongoDB on every ordinary
-  value — `2` for `2.0`, `1.5`, `NaN`, `Infinity` — and disagrees on
-  magnitudes MongoDB prints in exponent form: `1e21` is
-  `"1000000000000000000000"` here and `"1e+21"` there, and `1e-7` is
-  `"0.0000001"`. The engine's own JSON edge prints doubles the same way, so a
-  converted string and a returned double read alike. A string built from a
-  large or small double therefore compares unequal to the same string built
-  there.
+- **A double to a string keeps every digit, in plain decimal, where the reference keeps
+  six significant digits and uses exponent form for a large or a small value.** The
+  reference's text is a `%g`, six significant digits and no trailing zeros. Recorded
+  (q7s4c:531, 532 and q7s4g:629 to 650): `1e20` is `"1e+20"` there and
+  `"100000000000000000000"` here; `-2147483649.0` is `"-2.14748e+09"` there and
+  `"-2147483649"` here; `1234567.5` is `"1.23457e+06"` there and `"1234567.5"` here;
+  `123456.7` is `"123457"` and `"123456.7"`; `3.14159265358979` is `"3.14159"` and
+  `"3.14159265358979"`; `1/3` is `"0.333333"` and `"0.3333333333333333"`;
+  `0.30000000000000004` is `"0.3"` and `"0.30000000000000004"`; `2^53` is `"9.0072e+15"` and
+  `"9007199254740992"`; `1e15` is `"1e+15"` and `"1000000000000000"`; `1e-7` is `"1e-07"`
+  and `"0.0000001"`; `5e-324` is `"4.94066e-324"` and a decimal of 324 places. So every
+  digit past the sixth is dropped there, for every double, and none is here, and the exponent form is used
+  there for `1234567.5` and up and for `1e-7`, never here (`123456.7` and `100000` are not
+  in the exponent form there; where it starts between `1e-7` and `0.1` is UNRECORDED). Ours is Rust's shortest round-trip digits. The two agree
+  where six digits and no exponent say the whole value: `0.1` is `"0.1"`, `2.5` is `"2.5"`,
+  `5.0` is `"5"`, `-0.0` is `"-0"`, `NaN` is `"NaN"` and `Infinity` is `"Infinity"`
+  (q7s4c:525 to 530, q7s4g:629, 641, 642, 645, 649, 650). The engine's own JSON edge prints
+  doubles as ours does, so a converted string and a returned double read alike. A string
+  built from a double therefore differs from the same string built there, and two doubles
+  that differ past the sixth digit are two strings here and one there.
 - **`decimal` converts a double by its exact binary value, rounded once to 34
   digits (ADR-252); MongoDB rounds it to 15 significant digits.** `{$toDecimal:
   0.1}` is `0.1000000000000000055511151231257827` here and `Decimal128("0.100000000000000")`
@@ -1237,7 +1282,7 @@ ignores it" clause above is scoped to the original four.
 
 **`$lookup` refuses the combined form.** MongoDB 5.0 accepts
 `localField`/`foreignField` *and* `pipeline` in one stage — the "concise
-correlated subquery". Here it is a 400 that points at the equivalent: join on
+correlated subquery". Here it is a 400 (recorded: q7s4a:265, which the reference answers) that points at the equivalent: join on
 the key with the equality form, then `$filter` or `$map` the attached array in
 the following stage, which keeps the single pass. Closing this would mean
 combining the indexed pass with the per-document loop; not planned until
@@ -1294,7 +1339,8 @@ dotted and `$`-prefixed ones included, so it is not an entry here.
 
 **Two smaller ones, same entry.** `$setUnion` and `$setIntersection` need at
 least one argument, the same minimum `$concatArrays` has here, where MongoDB
-accepts an empty list. A non-array argument is refused even beside a null, so the
+accepts an empty list (`$concatArrays: []` and `$setUnion: []` answer `[]` there,
+q7s4c:158 and 228; `$setIntersection: []` is UNRECORDED). A non-array argument is refused even beside a null, so the
 outcome does not depend on which argument is written first; what MongoDB
 answers for that pair is not verified here, so no claim is made about it.
 
