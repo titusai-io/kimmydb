@@ -23150,3 +23150,47 @@ async fn a_field_documents_etag_is_the_same_whichever_way_it_is_read() {
     let bulk = server.post("/v1/db/shop/coll/d/bulk", Some(&token), json!([{"_id":1}])).await;
     assert!(bulk.body.get("etags").is_none(), "{:?}", bulk.body);
 }
+
+/// `covers` on a read by id: for each stamp asked, whether this member's copy has seen that write, from
+/// the same record as the body. A write the copy has seen stays seen, and a stamp from the future is not.
+#[tokio::test]
+async fn a_read_by_id_answers_which_writes_the_copy_has_seen() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for (name, policy) in [("f", "field"), ("d", "document")] {
+        server
+            .post(
+                "/v1/db/shop/collections",
+                Some(&token),
+                json!({"name": name, "mergePolicy": policy}),
+            )
+            .await;
+        let first = server
+            .post(&format!("/v1/db/shop/coll/{name}/docs"), Some(&token), json!({"_id":1,"n":0}))
+            .await;
+        let s1 = stamp_of(&first.body);
+        let second = server
+            .put(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token), json!({"n": 1}))
+            .await;
+        let s2 = stamp_of(&second.body);
+        // a stamp above anything written: the same node's clock, a day later
+        let future = {
+            let mut st = kimmy_core::Stamp::decode(&s2).unwrap();
+            st.hlc = kimmy_core::Hlc::new(st.hlc.wall_ms + 86_400_000, 0);
+            st.encode()
+        };
+        let res = server
+            .get(&format!("/v1/db/shop/coll/{name}/docs/1?covers={s1},{s2},{future}"), Some(&token))
+            .await;
+        assert_eq!(res.status, 200, "{name}: {:?}", res.body);
+        assert_eq!(res.header("kimmy-covers").as_deref(), Some("true,true,false"), "{name}");
+        assert_eq!(res.body["n"], 1);
+        // no `covers`, no header
+        let plain = server.get(&format!("/v1/db/shop/coll/{name}/docs/1"), Some(&token)).await;
+        assert!(plain.header("kimmy-covers").is_none(), "{name}");
+        // a token that is not a stamp is a 400
+        let bad =
+            server.get(&format!("/v1/db/shop/coll/{name}/docs/1?covers=nope"), Some(&token)).await;
+        assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
+    }
+}

@@ -517,6 +517,55 @@ impl Engine {
         Ok(Some((version, doc)))
     }
 
+    /// [`Engine::get_versioned`], and for each of `asked` whether the stored document covers that
+    /// write: under `field`, whether the document's version vector has seen it (`vv[origin] >=
+    /// hlc`); under `document`, whether the stored stamp is at or above it. Read from the one
+    /// record, so the answer and the body are of the same state. A write that is covered is in
+    /// the body shown, and stays covered.
+    pub fn get_versioned_covering(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        asked: &[Stamp],
+    ) -> Result<Option<(kimmy_core::DocVersion, Document, Vec<bool>)>> {
+        let key = doc_key(id)?;
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+            return Ok(None);
+        };
+        let record = codec::decode_doc_record_with_meta(raw.value())?;
+        let Some(doc) = record.document()? else {
+            return Ok(None);
+        };
+        let (version, covers) = match (coll.merge_policy, record.meta.as_deref()) {
+            (MergePolicy::Field, Some(meta)) => {
+                let state = field_write::load(Some(meta))?;
+                let hash = kimmy_core::merge_state::MergeState::compact_hash_of(meta)
+                    .map_err(|e| StorageError::Corrupt(format!("the merge state: {e:?}")))?;
+                let covers = asked
+                    .iter()
+                    .map(|s| {
+                        let writer =
+                            kimmy_core::merge_state::WriterId { node: s.node, epoch: s.epoch };
+                        state.vv.get(&writer).is_some_and(|seen| *seen >= s.hlc)
+                    })
+                    .collect();
+                (kimmy_core::DocVersion::Etag(record.stamp, hash), covers)
+            }
+            (MergePolicy::Field, None) => {
+                return Err(StorageError::Corrupt(
+                    "a record of a field collection carries no merge state".into(),
+                ));
+            }
+            (MergePolicy::Document, _) => (
+                kimmy_core::DocVersion::Stamp(record.stamp),
+                asked.iter().map(|s| record.stamp >= *s).collect(),
+            ),
+        };
+        Ok(Some((version, doc, covers)))
+    }
+
     /// The stamp of a live document, or `None` if it is absent or tombstoned.
     ///
     /// Exposed so that derived data can be tagged with the version of the

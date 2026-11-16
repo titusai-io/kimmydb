@@ -1489,6 +1489,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: The version the insert produced.
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1543,6 +1549,13 @@ paths:
                       The version each document landed at, positionally
                       parallel to `insertedIds` — what `insert` reports as
                       `stamp`, once per document.
+                  etags:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      Present for a collection with merge policy `field`:
+                      what `insert` reports as `etag`, once per document,
+                      parallel to `stamps`.
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1919,6 +1932,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
                       The version the write produced. Present only when the
                       request wrote exactly one document without `multi` — a
                       version names one document, and a multi write has no
@@ -2069,6 +2088,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
                       The version the write produced. Absent when nothing was
                       written — nothing matched, or the document was
                       unchanged — and after a removal: nothing can be
@@ -2184,6 +2209,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
                       The tombstone's version. Present only when the request
                       deleted exactly one document without `multi` (ADR-084).
                       Always absent under `explain: true`.
@@ -2242,6 +2273,16 @@ paths:
         path, so either works when the id is known; this one needs no body and
         answers with the document alone.
       x-kimmy-action: read
+      parameters:
+        - name: covers
+          in: query
+          required: false
+          schema: { type: string }
+          description: |
+            Write stamps, comma separated (the `stamp` a write answered). The
+            `Kimmy-Covers` header says for each whether this member's copy of
+            the document has seen that write. A token that is not a stamp is
+            a `400`.
       responses:
         "200":
           description: |
@@ -2251,7 +2292,15 @@ paths:
           headers:
             ETag:
               schema: { type: string }
-              description: The document's stamp, quoted as an entity tag.
+              description: |
+                The document's version, quoted as an entity tag: its stamp,
+                or for a collection with merge policy `field` its etag.
+            Kimmy-Covers:
+              schema: { type: string }
+              description: |
+                Present when `covers` was asked: `true` or `false` per stamp
+                asked, comma separated, in order, read from the same record as
+                the body. A write the copy has seen is `true` and stays so.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Document" }
@@ -2322,6 +2371,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: The version the write produced. Absent when nothing was written.
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -2360,6 +2415,12 @@ paths:
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
+                  etag:
+                    type: string
+                    description: |
+                      Present for a collection with merge policy `field`: the version a
+                      conditional write names (`if_stamp`), the stamp and the hash of the
+                      merged state.
                       The tombstone's version — what `POST .../delete` of one
                       document reports. Present exactly when `deleted` is 1.
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -4248,7 +4309,10 @@ components:
           items: { $ref: "#/components/schemas/Stamp" }
           description: |
             Present when the request set `stamps: true`. Parallel to
-            `documents`: `stamps[i]` is the version of `documents[i]`.
+            `documents`: `stamps[i]` is the version of `documents[i]`. For a
+            collection with merge policy `field` each entry is the document's
+            etag (its stamp and the hash of its merged state), read from the
+            same record as the document.
         nextCursor:
           type: string
           description: |
@@ -4275,7 +4339,11 @@ components:
         (ADR-084). Compare for equality only — nothing about its shape is
         promised. Since 0.61.0 it is 60 characters (it was 35), and a stamp
         from 0.60 or older is refused as malformed, naming the length and
-        format byte that were sent.
+        format byte that were sent. For a collection with merge policy
+        `field` the version a conditional write names is the `etag` (the
+        stamp and the hash of the merged state, 82 characters), because two
+        merged states can share their newest stamp; `if_stamp` takes the
+        kind its collection's versions are.
 
     Explain:
       type: object

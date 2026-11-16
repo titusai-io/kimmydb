@@ -749,6 +749,32 @@ pub fn get_doc(
     get_doc_stamped(state, auth, db, coll, id).map(|(_, doc)| doc)
 }
 
+/// A read by id's `covers`: stamp tokens, comma separated, each a write the caller wants to know
+/// this member's copy of the document has seen.
+pub fn parse_covers(raw: &str) -> Result<Vec<kimmy_core::Stamp>, ApiError> {
+    raw.split(',')
+        .map(|t| kimmy_core::Stamp::decode(t).map_err(|_| ApiError::malformed_stamp(t)))
+        .collect()
+}
+
+/// [`get_doc_stamped`] with `covers`: the answer per asked stamp, in order.
+pub fn get_doc_covering(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    id: &str,
+    covers: &[kimmy_core::Stamp],
+) -> Result<(String, Value, Vec<bool>), ApiError> {
+    let _span = op_span("get_doc", db, Some(coll)).entered();
+    let meta = authorize(state, auth, Action::Read, db, coll)?;
+    let doc_id = parse_id(id)?;
+    match state.engine.get_versioned_covering(&meta, &doc_id, covers)? {
+        Some((version, doc, answers)) => Ok((version.encode(), document_to_json(&doc), answers)),
+        None => Err(ApiError::not_found(format!("no document with _id {id}"))),
+    }
+}
+
 /// [`get_doc`], with the document's stamp — what the HTTP edge serves as
 /// `ETag`, so a read by id and a conditional write by id pair up without a
 /// `find`.

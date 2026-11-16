@@ -1256,17 +1256,40 @@ async fn remove_webhook(
     Ok(Json(crate::webhooks::remove(&state, &auth, &db, &coll, &id)?))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct GetDocQuery {
+    /// Write stamps, comma separated: for each, whether this member's copy has seen it.
+    covers: Option<String>,
+}
+
 async fn get_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
+    QueryParams(q): QueryParams<GetDocQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (stamp, document) = exec::get_doc_stamped(&state, &auth, &db, &coll, &id)?;
-    // The document's stamp as an entity tag, so a read by id pairs with a
-    // conditional write by id without a `find`. The body stays the document
-    // exactly as stored — a version is not one of its fields (ADR-084).
-    let etag = [(axum::http::header::ETAG, format!("\"{stamp}\""))];
-    Ok((etag, Json(document)))
+    let asked = q.covers.as_deref().map(exec::parse_covers).transpose()?.unwrap_or_default();
+    let (stamp, document, covers) = exec::get_doc_covering(&state, &auth, &db, &coll, &id, &asked)?;
+    // The document's version as an entity tag (its stamp, and under `field` the etag), so a read by
+    // id pairs with a conditional write by id without a `find`. The body stays the document exactly
+    // as stored — a version is not one of its fields (ADR-084). `Kimmy-Covers` answers `covers`,
+    // one `true` or `false` per stamp asked, in order, from the same record as the body.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::ETAG,
+        axum::http::HeaderValue::from_str(&format!("\"{stamp}\""))
+            .map_err(|_| ApiError::bad_request("the version is not a header value"))?,
+    );
+    if q.covers.is_some() {
+        let answer = covers.iter().map(bool::to_string).collect::<Vec<_>>().join(",");
+        headers.insert(
+            axum::http::HeaderName::from_static("kimmy-covers"),
+            axum::http::HeaderValue::from_str(&answer)
+                .map_err(|_| ApiError::bad_request("covers is not a header value"))?,
+        );
+    }
+    Ok((headers, Json(document)))
 }
 
 #[derive(Deserialize, Default)]
