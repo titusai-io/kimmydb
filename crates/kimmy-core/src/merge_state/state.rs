@@ -1010,14 +1010,19 @@ impl MergeState {
         let by_value = o.counter_kind_by_value();
         let part = |n: &Num| if by_value { n.kind() } else { n.label() };
         let kind = terms.iter().map(|t| part(&t.2)).chain(base.map(|b| part(&b))).max()?;
-        let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
+        // With no base there is no implicit zero to start from: the first part IS the value, so a
+        // counter an `$inc` created reads its operand exactly (a `-0`, a `0E+3` and a `-0.00` keep
+        // their sign and exponent: `0 + -0` is `+0` and `0 + 0E+3` is `0`; q7s5a.out I2-I5).
+        let mut acc: Option<Num> = base.map(|b| b.to_kind(kind));
         for (_, _, d) in &terms {
-            acc = if o.no_decimal_saturation() {
-                acc.add(&d.to_kind(kind))
-            } else {
-                acc.add_sat(&d.to_kind(kind), &mut cut)
-            };
+            let d = d.to_kind(kind);
+            acc = Some(match acc {
+                None => d,
+                Some(a) if o.no_decimal_saturation() => a.add(&d),
+                Some(a) => a.add_sat(&d, &mut cut),
+            });
         }
+        let acc = acc?;
         // Q11: a merge that crosses either bound saturates: an integer at the integer bound, a
         // decimal at the largest finite value of its sign.
         let excess = match acc.int_excess(o.int_bound()) {
