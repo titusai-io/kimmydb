@@ -1481,7 +1481,8 @@ fn the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands() {
 /// cannot call kimmy-query, so this uses the primitives it calls (`decimal::arith::add`, `decode_raw`, `pack_raw`). One
 /// writer, sequential: `{x: base}` (a decimal register), then `$inc x op` once or twice; the visible bytes of x must be the
 /// product's. The first slot is the canonical ENCODING of the operand, not `0 + operand` (which would read `200` for
-/// `1E2 + 1E2`, the product stores `2E+2`); on an absent field the product adds to `Int32(0)` and the read does too.
+/// `1E2 + 1E2`, the product stores `2E+2`); on an absent field the product creates the field from the operand as it is
+/// (not `0 + operand`: q7s2k.out k0010, q7s5a.out I2-I5, q7s5b.out D1 and D2) and the read, with no base, does too.
 #[test]
 fn a_decimal_inc_reads_as_the_products_stored_decimal() {
     use crate::decimal::{arith, decode_raw, pack_raw};
@@ -1508,12 +1509,14 @@ fn a_decimal_inc_reads_as_the_products_stored_decimal() {
         }
         assert_eq!(read(&w), Value::Decimal128(want.bytes()), "{base} + {ops:?}");
     }
-    // an absent field: the product adds to Int32(0)
-    for op in ["1E3", "-0", "1E+40", "NaN", "-Infinity", "0E2015", "1E+2"] {
+    // an absent field: the product creates it from the operand as it is, its cohort member kept (the
+    // canonical encoding of the operand): `5E+3` stays `5E+3`, `-0` stays `-0`, `0E2015` stays `0E+2015`
+    // `5E+3` and `-0`: recorded (q7s5b0001, q7s5a0005); the others follow the same rule
+    for op in ["5E+3", "-0", "1E+40", "NaN", "-Infinity", "0E2015", "1E+2"] {
         let mut w = Writer::new(wid('A', 0), opts());
         w.insert(&fl(&[("y", i(1))]), 0).unwrap();
         w.write_inc_value(&p("x"), &dval(op), 0).unwrap();
-        let want = product(&pack_raw(arith::from_i64(0)), &d(op));
+        let want = pack_raw(decode_raw(&d(op)));
         assert_eq!(read(&w), Value::Decimal128(want.bytes()), "absent + {op}");
     }
 }
