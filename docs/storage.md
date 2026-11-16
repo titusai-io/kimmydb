@@ -200,6 +200,16 @@ struct DocRecord {
 }
 ```
 
+**A `field` collection's record carries its merge state.** The record is version `2` and has the
+merge state between the header and the body: `ver(2) ‖ stamp ‖ del(1) ‖ varint len ‖ merge state ‖
+BSON body`, the state in the compact form (`MergeState::encode_compact`). The record's stamp is
+the highest entry of the state's version vector, a tombstone keeps the state, and the body is the
+document the state renders, in the state's field order. A `document` collection's record is
+version `1` and is byte for byte what it was. The reader that only wants the document skips the
+state without copying it; a site that reads a record and writes it back reads the state too.
+A document's version identity is read from the stored bytes, with no decode: the header stamp and,
+for a `field` record, the hash of the stored state (the etag, [HTTP API](http-api.md)).
+
 ### OplogEntry
 
 ```
@@ -213,6 +223,11 @@ Optional fields are length-prefixed with `u32::MAX` as the "absent" sentinel, so
 replicated replace with an empty document must not be applied as a delete.
 
 `kind` is one of `Insert`, `Update`, `Replace`, `Delete`, `Collection`.
+
+An entry of a `field` collection is version `2`: the version `1` layout and then the writer's
+whole merge state of the document after the write, length-prefixed (`meta`). An entry of a
+`document` collection is version `1` and carries none. On the wire `meta` is binary and absent when
+there is none.
 
 Entries carry the **full post-image**, not a diff. Full images make replication
 application idempotent and order-independent — compare stamps, overwrite — and
@@ -422,7 +437,7 @@ table in Compatibility. This table is the engine's side of the same facts.
 
 ## Format versioning
 
-`FORMAT_VERSION` is `1`. Two independent checks:
+`FORMAT_VERSION` is `1`; a record or an entry that carries a merge state is version `2`, and nothing else is read. Two independent checks:
 
 1. **On open** — `meta.format_version` must match, or `Engine::open` fails with
    `UnsupportedFormat` rather than misreading records.
