@@ -42,17 +42,26 @@ graph LR
 { "seq": { "$mod": [4, 0] } }           // every fourth
 ```
 
-**`$in`, `$nin`, `$all` and `$ne` compare values, so a regular expression
-among their operands is refused.** A regex literal, `{"$regex": ...}` with or
-without `$options`, or the Extended JSON `{"$regularExpression": ...}` in the
-list, or as the operand of `$ne`, is a **`400`** before any document is read.
-They used to be compared as values, so `{"s": {"$in": [{"$regex": "abc"}]}}`
-matched no string, and `$nin` and `$ne` matched every one, with a `200`. To
-match any of several patterns, write an `$or` of `$regex` clauses, or one
-pattern: `{"s": {"$regex": "^(abc|def)"}}`; to exclude what a pattern matches,
-`{"s": {"$not": {"$regex": "abc"}}}`. Any other document, one with
-`$`-prefixed keys included, is still compared as a value, and `$eq` compares a
-regex as a value too. See [Deviations](deviations.md).
+**A regular expression among the members of `$in`, `$nin` and `$all` is a pattern.**
+A regex literal, `{"$regex": ...}` with or without `$options`, or the Extended
+JSON `{"$regularExpression": ...}` in the list matches the strings the field
+holds (or the elements of an array field) that match it, united with the field
+equalling any of the other members; it also matches a stored regex of the same
+pattern and flags, compared as written. `{"s": {"$in": [/^a/, "banana"]}}` matches
+`"apple"`, `["apple", "cherry"]` and `"banana"`. `$nin` is the exact complement:
+a document whose field is missing or null is in it, unless `null` is listed. In
+`$all` every pattern is a clause of its own, beside the values: `{"$all": [/^a/,
+/^c/]}` matches `["apple", "cherry"]`. A regex inside an array member
+(`{"$in": [[/^a/]]}`) is part of that value and matches nothing. An invalid
+pattern is a `400`. A filter that holds one is never answered from an index
+(`explain` shows a collection scan), and as the filter of an upsert it seeds
+nothing from a pattern. A stored document shaped exactly `{"$regex": ...}`
+cannot be found through these operators; `$eq` finds it.
+
+**`$ne` takes no regular expression.** As the operand of `$ne` it is a **`400`**
+before any document is read, as it is in the reference; to exclude what a pattern
+matches, write `{"s": {"$not": {"$regex": "abc"}}}`. `$eq` compares a regex as a
+value. See [Deviations](deviations.md).
 
 **A regular expression written as a field's value is a pattern.** `{"s": /ab/i}`,
 which over HTTP is `{"s": {"$regularExpression": {"pattern": "ab", "options":
@@ -97,21 +106,23 @@ Top-level fields are implicitly `$and`-ed.
 | `$size` | Array has exactly this length |
 | `$elemMatch` | **One** element satisfies all the conditions |
 
-**`$all` compares values, so an `$elemMatch` among them is refused.**
-`{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` is a **`400`**: it used to
-compare each element with the document `{"$elemMatch": {"qty": 5}}` and match
-nothing, with a `200`. To require an element matching each of several
-conditions, write an `$and` of `$elemMatch` clauses:
-`{"$and": [{"items": {"$elemMatch": {"qty": 5}}}, {"items": {"$elemMatch": {"sku": "a"}}}]}`.
-A document with any other key beside `$elemMatch` is still a value. See
-[Deviations](deviations.md).
+**`$all` of `$elemMatch` documents holds when the field has an element for each.**
+`{"items": {"$all": [{"$elemMatch": {"qty": 5}}, {"$elemMatch": {"sku": "a"}}]}}`
+needs an element with `qty: 5` and an element with `sku: "a"`, which may be
+different elements; it is the `$and` of the two `$elemMatch` clauses. Every
+member has to be an `$elemMatch`: a list that starts with one and holds a value,
+a document or a regex is a **`400`** ("$all/$elemMatch has to be consistent"),
+and one that holds a value before an `$elemMatch` is a `400` ("no $ expressions
+in $all"). A document with another key beside `$elemMatch` is still a value. An
+`$elemMatch` reads an element that is itself an array as one value, so
+`{"$elemMatch": {"$gt": 1}}` does not look into `[[2, 3]]`, and
+`{"$elemMatch": {}}` holds for a document or an array element and for no scalar.
+See [Deviations](deviations.md).
 
-**An empty `$all` is refused.** `{"tags": {"$all": []}}` is a **`400`** naming
-the field, before any document is read. "Every one of no values" holds for any
-array, so it used to match every document whose field holds an array (and under
-`$not`, every document whose field does not), with a `200`; a list a client
-emptied by mistake reached all of them, on a `multi` update or delete too. Send
-at least one value, or leave the condition out. See
+**An empty `$all` matches no document.** `{"tags": {"$all": []}}` selects
+nothing, as the reference answers it, where "every one of no values" would hold
+for any array; a `multi` update or delete by it touches nothing, an upsert by it
+seeds nothing, and under `$not` it matches every document. See
 [Deviations](deviations.md).
 
 ### `$expr` — comparing fields of the same document

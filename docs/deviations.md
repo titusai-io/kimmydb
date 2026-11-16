@@ -813,84 +813,88 @@ pattern and flags (the flags compared as written, as the reference compares them
 
 ---
 
-## 🟡 A regular expression inside `$in`, `$nin` or `$all`, or under `$ne`, is refused, where MongoDB matches it as a pattern
+## 🟢 A regular expression inside `$in`, `$nin` or `$all` was refused; it is a pattern, and under `$ne` it is refused as the reference refuses it
 
-**Raised 2026-10-01, by the review of the change that keeps a `$regex`
-compiled.** The three operators compare values, and a regex among them was
-compared as one: `{"s": {"$in": [/abc/]}}` matched only a stored regex
-`/abc/` and never the string `"xabcx"`, and `$nin` matched every string.
-Over HTTP it was worse, because the JSON decoder has no
-`$regularExpression` form: `{"$in": [{"$regex": "abc"}]}` and the Extended
-JSON spelling both arrived as ordinary documents, matched nothing under `$in`
-and everything under `$nin`, and answered `200`. MongoDB matches each such
-element as a pattern.
+**Was** (raised 2026-10-01, by the review of the change that keeps a `$regex`
+compiled). The operators compare values, and a regex among them was compared as
+one: `{"s": {"$in": [/abc/]}}` matched only a stored regex `/abc/` and never the
+string `"xabcx"`, and `$nin` matched every string. Over HTTP it was worse,
+because the JSON decoder had no `$regularExpression` form:
+`{"$in": [{"$regex": "abc"}]}` arrived as an ordinary document, matched nothing
+under `$in` and everything under `$nin`, and answered `200`. The decoder reads
+`$regularExpression` since 0.59.0. Rather than answer that, a regex among the
+members of `$in`, `$nin` or `$all`, or as the operand of `$ne`, was a `400`.
 
-**The rule.** A regex literal, a document whose keys are `$regex` and
-optionally `$options`, or a document whose only key is `$regularExpression`,
-among the values of `$in`, `$nin` or `$all`, wherever the operator is written
-(under `$not` and inside `$elemMatch` too), is a `400` naming the operator and
-the value, and saying that alternatives belong in an `$or` of `$regex` clauses
-or in one pattern. The same shapes as the operand of `$ne` are refused too,
-pointing to `{"$not": {"$regex": ...}}`: `$ne` compared them as values, so
-`{"s": {"$ne": {"$regex": "abc"}}}` held for every string, the ones the pattern
-matches included (raised by the same review, a day later). `$eq` still compares
-a regex as a value.
+**Now** (closed 2026-11-14). A regex literal, a document whose keys are `$regex`
+and optionally `$options`, or a document whose only key is
+`$regularExpression`, among the members of `$in`, `$nin` or `$all`, is a
+pattern, as the reference reads it. In `$in` the field, or an element of the
+field, equals one of the other members or matches the pattern, and a stored
+regex of the same pattern and flags matches it too (`q7s2r.out` r0006 to
+r0022). `$nin` is the exact complement, a missing or null field included unless
+`null` is listed (r0023 to r0027). In `$all` each pattern is a clause of its
+own that the field, or an element of it, must match, beside the values it holds
+(r0028 to r0032). A regex inside an array member is part of that value and
+matches nothing (r0022). A filter holding one is never answered from an index
+(`explain` shows a collection scan), and an upsert it filters seeds nothing from
+a pattern. An invalid pattern is a `400`, where the reference answers its code
+51091.
 
-**What that costs.** A stored document may hold `$`-prefixed keys, so a
-document shaped exactly `{"$regex": ...}` cannot be found through `$in`; `$eq`
-still finds it, and `$in` still compares a document of any other shape, a
-`{"$regex": ..., "kind": ...}` among them. A filter written for MongoDB that
-uses a pattern inside `$in` must be rewritten as an `$or`.
-
-**Closing it** means matching a regex element as a pattern, as the reference does.
-The JSON decoder reads a `$regularExpression` form since 0.59.0, so a regex can
-be sent as a value. Not planned until someone needs patterns in a list; the
-`$or` says the same thing.
+**What stays.** A regex as the operand of `$ne` is refused, as the reference
+refuses it (code 2, "Can't have regex as arg to $ne.", r0033), pointing to
+`{"$not": {"$regex": ...}}`; `$eq` compares a regex as a value. The cost of the
+change: a stored document shaped exactly `{"$regex": ...}` (or
+`{"$regularExpression": ...}`) cannot be found through `$in`, `$nin` or `$all`;
+`$eq` still finds it, and a document of any other shape, a
+`{"$regex": ..., "kind": ...}` among them, is still compared as a value. The
+options `z` and `g` cannot be recorded from the client and are refused as
+before (UNRECORDED).
 
 ---
 
-## 🟡 An `$elemMatch` inside `$all` is refused, where MongoDB matches each one against an element
+## 🟢 An `$elemMatch` inside `$all` was refused; each is read as an `$elemMatch` of its own
 
-**Raised 2026-10-01, by the same review.** `$all` compares values, so
+**Was** (raised 2026-10-01, by the same review). `$all` compared values, so
 `{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` compared each element with
 the document `{"$elemMatch": {"qty": 5}}` and matched nothing, even over an
-element holding `qty: 5`, and even `{"$elemMatch": {"$eq": "q"}}` over an array
-holding `"q"`; it answered `200`. MongoDB reads each `$elemMatch` in the list as
-a condition some element must satisfy.
+element holding `qty: 5`; it answered `200`. A document whose only key is
+`$elemMatch` among the values of `$all` was a `400` instead.
 
-**The rule.** A document whose only key is `$elemMatch`, among the values of
-`$all`, wherever the operator is written, is a `400` naming the value and
-pointing to an `$and` of `$elemMatch` clauses, which says the same thing.
+**Now** (closed 2026-11-14). An `$all` whose members are all `$elemMatch`
+documents holds when the field has an element for each, each by an element of
+its own: `{"$all": [{"$elemMatch": {"a": 1}}, {"$elemMatch": {"a": 2}}]}` over
+`[{a: 1}, {a: 2}]` (`q7s2r.out` r0049 to r0066). The bodies are an
+`$elemMatch`'s: documents and conditions on scalars, `$elemMatch` and `$size`
+among them. A list that mixes an `$elemMatch` with another member is refused
+with the reference's own text: one that starts with an `$elemMatch` and holds a
+value, a document or a regex is "$all/$elemMatch has to be consistent" (r0054,
+r0056, r0063), one that starts with a value and holds an `$elemMatch` is "no $
+expressions in $all" (r0055). A document with another key beside `$elemMatch` is
+a value, as before. As the filter of an upsert it seeds nothing (r0118, r0120).
+Along with it, an `$elemMatch` reads an element that is an array as one value
+(the comparisons, `$in`, `$regex` and `$type` are made on the array and not on
+its members: r0040, r0052), and `{"$elemMatch": {}}` holds for a document or an
+array element and for no scalar (r0059).
 
-**What that costs.** A stored document shaped exactly `{"$elemMatch": ...}`
-cannot be found through `$all`; one with any other key beside it still can. A
-filter written for MongoDB that uses this form must be rewritten as the `$and`.
-
-**Closing it** means evaluating each such element as an `$elemMatch`, as MongoDB
-does. Not planned: the `$and` is the same query.
+**UNRECORDED.** The positional `$` of an update after an `$all` of `$elemMatch`
+documents: with one member it is the position of the `$elemMatch`, as if that were
+written alone; with several none is recorded.
 
 ---
 
-## 🟡 An empty `$all` is refused, where MongoDB matches no document
+## 🟢 An empty `$all` was refused; it matches no document
 
-**Raised 2026-10-01.** `{"tags": {"$all": []}}` matched every document whose
-`tags` holds an array, since every one of no values is in any array, and under
-`$not` every document whose `tags` does not; it answered `200`. A list that
-arrives empty is far more often a client's bug (a filter built from a
-selection nobody made) than a question, and on a `multi` update or delete it
-reached every such document. MongoDB matches no document.
+**Was** (raised 2026-10-01). `{"tags": {"$all": []}}` matched every document
+whose `tags` holds an array, since every one of no values is in any array, and
+under `$not` every document whose `tags` does not; it answered `200`. A list
+that arrives empty is far more often a client's bug than a question, and on a
+`multi` update or delete it reached every such document, so an empty list was a
+`400` naming the field.
 
-**The rule.** An empty `$all` list, wherever it is written (under `$not`, in
-an `$or` branch, inside `$elemMatch`), is a `400` naming the field (or "an
-array element") and asking for at least one value.
-
-**What that costs.** A caller relying on MongoDB's empty answer, for example to
-build a filter that matches nothing on purpose, gets a `400` instead and must
-leave the condition out or skip the request.
-
-**Closing it** means answering it as MongoDB does, matching nothing. Not
-planned: the refusal says more than an empty answer would, and an empty answer
-on a write would be just as silent about the bug.
+**Now** (closed 2026-11-14). An empty `$all` matches no document, as the
+reference answers it (`q7s2r.out` r0067, r0135, r0136): a find returns nothing, a
+`multi` update or delete touches nothing, and an upsert by it inserts a document
+seeded with nothing. Under `$not` it matches every document.
 
 ---
 

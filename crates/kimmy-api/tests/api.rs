@@ -14084,19 +14084,22 @@ async fn type_number_finds_every_numeric_type_and_an_unknown_alias_or_flag_is_a_
 }
 
 #[tokio::test]
-async fn a_regex_in_in_nin_or_all_is_refused_and_a_dollar_keyed_document_is_not() {
-    // `$in` compares values, and over HTTP a regex arrives as a document:
-    // `{$in: [{$regex: "abc"}]}` matched nothing and `$nin` everything, with a
-    // 200. Refused now, while a stored document with `$`-prefixed keys stays
-    // reachable by `$eq` and by `$in` of any other shape.
+async fn a_regex_in_in_nin_and_all_matches_as_a_pattern_over_http() {
+    // A regex arrives as `{$regex: ..}` or as `{$regularExpression: ..}`, and among the members
+    // of `$in` and `$all` it is a pattern, as the reference reads it (q7s2r.out r0006 to r0032).
+    // `$nin` is the complement of `$in`. A stored document shaped `{$regex: ..}` is found by
+    // `$eq`, no longer by `$in`; `$ne` of a regex stays refused (r0033).
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "names" })).await;
     let docs = "/v1/db/shop/coll/names/docs";
     for doc in [
-        json!({ "_id": 1, "s": "xabcx" }),
-        json!({ "_id": 2, "s": { "$regex": "abc" } }),
-        json!({ "_id": 3, "s": { "$regex": "abc", "kind": "note" } }),
+        json!({ "_id": 1, "s": "apple" }),
+        json!({ "_id": 2, "s": "banana" }),
+        json!({ "_id": 3, "s": ["apple", "cherry"] }),
+        json!({ "_id": 4, "s": 5 }),
+        json!({ "_id": 5 }),
+        json!({ "_id": 6, "s": { "$regex": "^a" } }),
     ] {
         let stored = server.post(docs, Some(&token), doc).await;
         assert_eq!(stored.status, 200, "a document may hold a $-prefixed key: {:?}", stored.body);
@@ -14114,41 +14117,149 @@ async fn a_regex_in_in_nin_or_all_is_refused_and_a_dollar_keyed_document_is_not(
         ids.sort_unstable();
         ids
     };
-
-    for op in ["$in", "$nin", "$all"] {
-        for value in [
-            json!({ "$regex": "abc" }),
-            json!({ "$regex": "abc", "$options": "i" }),
-            json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
-        ] {
-            let res = find(json!({ "s": { op: ["plain", value.clone()] } })).await;
-            assert_eq!(res.status, 400, "{op} with {value}: {:?}", res.body);
-            let message = res.body["message"].as_str().unwrap();
-            assert!(
-                message.contains(&format!("{op} cannot hold a regular expression"))
-                    && message.contains("$or of $regex clauses"),
-                "{message}"
-            );
-        }
+    let ext = json!({ "$regularExpression": { "pattern": "^a", "options": "" } });
+    for (filter, want) in [
+        (json!({ "s": { "$in": [{ "$regex": "^a" }] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [ext.clone()] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [ext.clone(), "banana"] } }), vec![1, 2, 3]),
+        (json!({ "s": { "$in": [{ "$regex": "^A", "$options": "i" }] } }), vec![1, 3]),
+        (json!({ "s": { "$in": [{ "$regex": "^A" }] } }), vec![]),
+        (json!({ "s": { "$nin": [{ "$regex": "^a" }] } }), vec![2, 4, 5, 6]),
+        (json!({ "s": { "$nin": [ext.clone(), "banana"] } }), vec![4, 5, 6]),
+        (json!({ "s": { "$not": { "$in": [ext.clone()] } } }), vec![2, 4, 5, 6]),
+        (json!({ "s": { "$all": [{ "$regex": "^a" }] } }), vec![1, 3]),
+        (json!({ "s": { "$all": [ext.clone(), "cherry"] } }), vec![3]),
+        (json!({ "s": { "$all": [ext.clone(), { "$regex": "^c" }] } }), vec![3]),
+        // The stored `{$regex: "^a"}` is a value to `$eq`, which still finds it.
+        (json!({ "s": { "$eq": { "$regex": "^a" } } }), vec![6]),
+    ] {
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{filter}");
     }
-    // What the refusal points to answers the question.
-    let either =
-        find(json!({ "$or": [{ "s": { "$regex": "abc" } }, { "s": { "$regex": "^q" } }] }));
-    assert_eq!(ids(&either.await.body), [1]);
-    // The stored `{$regex: "abc"}` is a value like any other to `$eq`, and
-    // a document of another shape is still compared by `$in`.
-    let eq = find(json!({ "s": { "$eq": { "$regex": "abc" } } })).await;
-    assert_eq!(ids(&eq.body), [2], "{:?}", eq.body);
-    let other =
-        find(json!({ "s": { "$in": [{ "$regex": "abc", "kind": "note" }, "xabcx"] } })).await;
-    assert_eq!(ids(&other.body), [1, 3], "{:?}", other.body);
+    for value in [
+        json!({ "$regex": "abc" }),
+        json!({ "$regex": "abc", "$options": "i" }),
+        json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
+    ] {
+        let res = find(json!({ "s": { "$ne": value.clone() } })).await;
+        assert_eq!(res.status, 400, "$ne with {value}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("$ne cannot take a regular expression"), "{message}");
+    }
+    // An invalid pattern is a 400, not an empty answer (r0048).
+    let bad = find(
+        json!({ "s": { "$in": [{ "$regularExpression": { "pattern": "(", "options": "" } }] } }),
+    )
+    .await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+
+    // As the filter of a multi-update (r0075: `n` 3 of 16 there) and of an upsert (r0076: it
+    // seeds nothing).
+    let update = server
+        .post(
+            "/v1/db/shop/coll/names/update",
+            Some(&token),
+            json!({ "filter": { "s": { "$in": [ext.clone()] } }, "update": { "$set": { "z": 1 } },
+                    "multi": true }),
+        )
+        .await;
+    assert_eq!(update.status, 200, "{:?}", update.body);
+    assert_eq!(update.body["matched"], 2, "{:?}", update.body);
+    let upsert = server
+        .post(
+            "/v1/db/shop/coll/names/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "s": { "$in": [{ "$regex": "^zz" }] } },
+                    "update": { "$set": { "w": 9 } }, "upsert": true, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `w` are seeded: {made}");
 }
 
 #[tokio::test]
-async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
-    // `$ne` compares values, so `{$ne: {$regex: "abc"}}` held for every
-    // string; `$all` compares values, so `[{$elemMatch: ...}]` matched
-    // nothing. Both answered 200.
+async fn a_pattern_in_an_in_or_nin_list_is_never_answered_from_an_index() {
+    // A plain `$in` of values is answered by probing an index on the field; with a pattern among
+    // the members the filter gets a collection scan, because a probe would read the pattern as
+    // a value and drop what it matches. The answer is the same with and without the index.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "fruit" })).await;
+    for doc in [
+        json!({ "_id": 1, "s": "apple" }),
+        json!({ "_id": 2, "s": "banana" }),
+        json!({ "_id": 3, "s": "cherry" }),
+        json!({ "_id": 4, "s": "avocado" }),
+        json!({ "_id": 5 }),
+    ] {
+        let res = server.post("/v1/db/shop/coll/fruit/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let pattern = json!({ "$regularExpression": { "pattern": "^a", "options": "" } });
+    let filters = [
+        (
+            "in, value and pattern",
+            json!({ "s": { "$in": ["banana", pattern.clone()] } }),
+            vec![1, 2, 4],
+        ),
+        ("in, pattern alone", json!({ "s": { "$in": [pattern.clone()] } }), vec![1, 4]),
+        (
+            "nin, value and pattern",
+            json!({ "s": { "$nin": ["banana", pattern.clone()] } }),
+            vec![3, 5],
+        ),
+        ("not in", json!({ "s": { "$not": { "$in": [pattern.clone()] } } }), vec![2, 3, 5]),
+    ];
+    async fn run_find(server: &Server, token: &str, filter: Value) -> (Vec<i64>, String) {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/fruit/find",
+                Some(token),
+                json!({ "filter": filter, "explain": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let mut ids: Vec<i64> = res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        (ids, res.body["explain"]["strategy"].as_str().unwrap().to_string())
+    }
+    let run = |filter: Value| run_find(&server, &token, filter);
+    for (label, filter, want) in &filters {
+        let (ids, strategy) = run(filter.clone()).await;
+        assert_eq!((&ids, strategy.as_str()), (want, "collectionScan"), "{label}, no index");
+    }
+    let made = server
+        .post(
+            "/v1/db/shop/coll/fruit/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "s" }] }),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    // The contrast: the same field with values only is answered from the index.
+    let (ids, strategy) = run(json!({ "s": { "$in": ["banana", "cherry"] } })).await;
+    assert_eq!((ids, strategy.as_str()), (vec![2, 3], "indexUnion"));
+    for (label, filter, want) in &filters {
+        let (ids, strategy) = run(filter.clone()).await;
+        assert_eq!(strategy, "collectionScan", "{label}: a pattern member is not an index probe");
+        assert_eq!(&ids, want, "{label}: the answer is the one without the index");
+    }
+}
+
+#[tokio::test]
+async fn a_regex_under_ne_is_refused_and_an_elem_match_under_all_is_read_per_member() {
+    // `$ne` of a regex is a 400 as in the reference (q7s2r.out r0033); `$all` of `$elemMatch`
+    // documents holds when the field has an element for each (r0049 to r0066), as a find, a
+    // multi-update filter and an upsert filter (r0117 to r0134); a list that mixes an
+    // `$elemMatch` with anything else is refused as the reference refuses it (r0054 to r0056).
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "carts" })).await;
@@ -14156,6 +14267,7 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
     for doc in [
         json!({ "_id": 1, "s": "xabcx", "items": [{ "qty": 5, "sku": "b" }, { "qty": 1, "sku": "a" }] }),
         json!({ "_id": 2, "s": "q", "items": ["q"] }),
+        json!({ "_id": 3, "s": "r", "items": [[1, 2], [3]] }),
     ] {
         let stored = server.post(docs, Some(&token), doc).await;
         assert_eq!(stored.status, 200, "{:?}", stored.body);
@@ -14185,23 +14297,66 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
         assert!(message.contains("$ne cannot take a regular expression"), "{message}");
     }
     let not = find(json!({ "s": { "$not": { "$regex": "abc" } } })).await;
-    assert_eq!(ids(&not.body), [2], "{:?}", not.body);
+    assert_eq!(ids(&not.body), [2, 3], "{:?}", not.body);
 
-    for filter in [
-        json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }] } }),
-        json!({ "items": { "$all": [{ "$elemMatch": { "$eq": "q" } }] } }),
+    for (filter, want) in [
+        (json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }] } }), vec![1]),
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "a" } }] } }),
+            vec![1],
+        ),
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "z" } }] } }),
+            vec![],
+        ),
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$eq": "q" } }] } }), vec![2]),
+        // An element that is an array is one value: `$gt` does not look into it (r0052).
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$gt": 2 } }] } }), vec![]),
+        (json!({ "items": { "$all": [{ "$elemMatch": { "$size": 2 } }] } }), vec![3]),
+        (json!({ "items": { "$not": { "$all": [{ "$elemMatch": { "qty": 5 } }] } } }), vec![2, 3]),
+    ] {
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        assert_eq!(ids(&res.body), want, "{filter}");
+    }
+    for (filter, message) in [
+        (
+            json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }, 2] } }),
+            "$all/$elemMatch has to be consistent",
+        ),
+        (
+            json!({ "items": { "$all": [1, { "$elemMatch": { "qty": 5 } }] } }),
+            "no $ expressions in $all",
+        ),
     ] {
         let res = find(filter.clone()).await;
         assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
-        let message = res.body["message"].as_str().unwrap();
-        assert!(message.contains("$all cannot hold an $elemMatch"), "{message}");
+        assert!(res.body["message"].as_str().unwrap().contains(message), "{:?}", res.body);
     }
-    let both = find(json!({ "$and": [
-        { "items": { "$elemMatch": { "qty": 5 } } },
-        { "items": { "$elemMatch": { "sku": "a" } } },
-    ] }))
-    .await;
-    assert_eq!(ids(&both.body), [1], "{:?}", both.body);
+
+    // The same form as the filter of a multi update, and of an upsert that seeds nothing from it.
+    let update = server
+        .post(
+            "/v1/db/shop/coll/carts/update",
+            Some(&token),
+            json!({ "filter": { "items": { "$all": [{ "$elemMatch": { "sku": "a" } }] } },
+                    "update": { "$set": { "z": 1 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(update.status, 200, "{:?}", update.body);
+    assert_eq!(update.body["matched"], 1, "{:?}", update.body);
+    let upsert = server
+        .post(
+            "/v1/db/shop/coll/carts/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "items": { "$all": [{ "$elemMatch": { "sku": "zz" } }] } },
+                    "update": { "$set": { "w": 9 } }, "upsert": true, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `w` are seeded: {made}");
 }
 
 #[tokio::test]
@@ -14262,10 +14417,10 @@ async fn a_regex_written_as_a_fields_value_matches_as_a_pattern_over_http() {
 }
 
 #[tokio::test]
-async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
-    // `{tags: {$all: []}}` held for every document whose `tags` is an array,
-    // so a list a client emptied by mistake reached all of them, on a `multi`
-    // delete or update too, with a 200.
+async fn an_empty_all_matches_no_document_on_every_route() {
+    // `{tags: {$all: []}}` matches no document (q7s2r.out r0067, r0135, r0136): not every
+    // document whose `tags` is an array. A `multi` update or delete by it touches nothing, and an
+    // upsert by it inserts a document seeded with nothing.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
@@ -14273,16 +14428,12 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
         (0..5i64).map(|i| json!({ "_id": i, "tags": ["a", format!("t{i}")] })).collect();
     server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
     let empty = json!({ "tags": { "$all": [] } });
-    let refused = |res: &Res, route: &str| {
-        assert_eq!(res.status, 400, "{route}: {:?}", res.body);
-        let message = res.body["message"].as_str().unwrap();
-        assert!(message.contains(r#"$all on "tags" has an empty list"#), "{route}: {message}");
-    };
     let coll = "/v1/db/shop/coll/posts";
     let res = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": empty })).await;
-    refused(&res, "find");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([]), "find");
     let res = server.post(&format!("{coll}/count"), Some(&token), json!({ "filter": empty })).await;
-    refused(&res, "count");
+    assert_eq!((res.status, &res.body["count"]), (200, &json!(0)), "{:?}", res.body);
     let res = server
         .post(
             &format!("{coll}/update"),
@@ -14290,11 +14441,20 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
             json!({ "filter": empty, "update": { "$set": { "hit": true } }, "multi": true }),
         )
         .await;
-    refused(&res, "update");
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(0)), "{:?}", res.body);
     let res = server
         .post(&format!("{coll}/delete"), Some(&token), json!({ "filter": empty, "multi": true }))
         .await;
-    refused(&res, "delete");
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(0)), "{:?}", res.body);
+    // Under `$not` it is every document.
+    let res = server
+        .post(
+            &format!("{coll}/count"),
+            Some(&token),
+            json!({ "filter": { "tags": { "$not": { "$all": [] } } } }),
+        )
+        .await;
+    assert_eq!(res.body["count"], 5, "{:?}", res.body);
 
     // Nothing was written or removed, and one value still selects.
     let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
@@ -14309,6 +14469,20 @@ async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
         )
         .await;
     assert_eq!(one.body["count"], 1, "{:?}", one.body);
+
+    // As the filter of an upsert it matches nothing and seeds nothing.
+    let upsert = server
+        .post(
+            &format!("{coll}/find_and_modify"),
+            Some(&token),
+            json!({ "filter": empty, "update": { "$set": { "hit": true } }, "upsert": true,
+                    "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upserted"], true, "{:?}", upsert.body);
+    let made = &upsert.body["document"];
+    assert_eq!(made.as_object().unwrap().len(), 2, "only `_id` and `hit` are seeded: {made}");
 }
 
 #[tokio::test]

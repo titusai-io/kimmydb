@@ -1,9 +1,8 @@
 //! Which filter forms seed an upsert, as recorded in `q7s2g.out` (cases g4.1 to
 //! g4.12, reference 6.0.5, a filter that matches nothing, update `{$set: {z: 1}}`).
 //!
-//! Not recorded, so not seeded here: a `$in` or an `$all` of one regular
-//! expression, and an `$all` with an `$elemMatch` (UNRECORDED). Both are refused
-//! when the filter is parsed, so no seed is asked of them. Also UNRECORDED: an
+//! The seeds of a regular expression and of an `$elemMatch` in a list are in
+//! `patterns_in_lists.rs`. UNRECORDED: an
 //! array or a document as the single `$all` member, and `null` (`{a: null}`,
 //! `$eq: null`); the build seeds the value as given.
 
