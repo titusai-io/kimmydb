@@ -7414,6 +7414,58 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }
 
+/// U1: a pushed window that meets an entry of a field collection whose clock is past the receiver's bound
+/// is not taken from that entry on, and the receiver says so in its normal `Pushed` reply (`clock_refused`
+/// and `stopped_at`), never in a fault. The pusher's confirmation for a change behind the stop is "not yet":
+/// neither confirmed (the member did not take it) nor refused (the member did not decline it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_stopped_by_the_receivers_clock_bound_is_not_yet_for_the_confirm_waiter() {
+    let a = node().await;
+    let b = node().await;
+    let orders = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    // B takes the creation first: a schema change is not bounded.
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(b.engine.get_collection("shop", "orders").is_ok(), "premise: B holds the collection");
+    // From here B's clock, as the bound reads it, is behind A's by more than the bound: what A writes now is
+    // far-future to B.
+    b.engine.set_clock_offset_for_tests(-310_000);
+    a.engine.insert(&orders, doc! { "_id": 1 }).unwrap();
+    a.engine.create_collection("shop", "later").unwrap();
+    let entries = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 1_024, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
+    let creation = entries.last().expect("the creation of `later`");
+    assert_eq!(creation.kind, kimmy_core::OpKind::CreateCollection);
+
+    let (resolution, windows) = confirm(&a, &b, creation).await;
+
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert_eq!(
+        windows[0].clock_refused, 1,
+        "the reply is a Pushed frame, not a Fault: the stop is said in it: {windows:?}"
+    );
+    assert!(windows[0].stopped_at().is_some(), "and names the entry it stopped at: {windows:?}");
+    assert!(b.engine.get_collection("shop", "later").is_err(), "nothing behind the stop was taken");
+    let outcome = resolution.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            kimmy_cluster::ConfirmOutcome::Confirmed | kimmy_cluster::ConfirmOutcome::Refused
+        ),
+        "not yet: never confirmed and never refused: {resolution:?}"
+    );
+    assert_eq!(
+        outcome.label(),
+        "clock_refused",
+        "not yet: the outcome is clock_refused: {resolution:?}"
+    );
+}
+
 /// The other side of the same gate: a window that genuinely brings the
 /// *first-ever* entry from an origin this node has never witnessed anything
 /// from must read as advanced. This is the case a naive per-origin exclusion

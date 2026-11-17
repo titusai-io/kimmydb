@@ -1608,6 +1608,9 @@ impl Engine {
             return Ok(RemoteApplied::Superseded { released: false });
         };
         if coll.merge_policy == MergePolicy::Field {
+            // U1: the one place every field entry and state passes, whatever brought it (a pull, a
+            // push, a replay, a snapshot page) and in whatever position. Before anything is written.
+            self.refuse_if_far_future(entry)?;
             // A snapshot document of a field collection is state without an entry: it joins, and
             // no oplog entry or held mark is written for it (it is not history). A carried delete
             // arrives with no merge state to join: its apply is item 3.2, and until then it is
@@ -1769,6 +1772,20 @@ impl Engine {
     /// not below retention's horizon for its origin, so a member that took it serves it onward
     /// whatever else it holds: a member that pulls only from this one reads the same state, and
     /// the members of a cluster hold the same set of entries (the rewind folds over it).
+    /// U1: refuse, by name and until due, an entry or state of a `field` collection whose clock is
+    /// more than `max_clock_skew_secs` ahead of this member's physical clock. Nothing has been written
+    /// when this returns the error, and the entry is not witnessed: it applies once it is due.
+    fn refuse_if_far_future(&self, entry: &OplogEntry) -> Result<()> {
+        let vv_max_wall_ms = match entry.meta.as_deref() {
+            Some(meta) => field_write::vv_max_wall_ms(meta)?,
+            None => None,
+        };
+        match self.clock_bound().check(self.clock_bound_now_ms(), &entry.stamp, vv_max_wall_ms) {
+            Some(stop) => Err(StorageError::ClockRefused(Box::new(stop))),
+            None => Ok(()),
+        }
+    }
+
     fn apply_field_in_txn(
         &self,
         txn: &WriteTxn<'_>,

@@ -58,6 +58,14 @@ pub(crate) fn load(meta: Option<&[u8]>) -> Result<MergeState> {
         .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))
 }
 
+/// The newest wall time any origin of an entry's merged state has written: what U1 holds the entry's state to
+/// (`max(vv)`). `None` for an empty version vector.
+pub(crate) fn vv_max_wall_ms(meta: &[u8]) -> Result<Option<u64>> {
+    let state = MergeState::decode_compact(meta)
+        .map_err(|e| StorageError::Corrupt(format!("the merge state of an entry: {e:?}")))?;
+    Ok(state.vv.values().map(|hlc| hlc.wall_ms).max())
+}
+
 fn m_stamp(s: Stamp) -> MStamp {
     MStamp { hlc: s.hlc, writer: WriterId { node: s.node, epoch: s.epoch } }
 }

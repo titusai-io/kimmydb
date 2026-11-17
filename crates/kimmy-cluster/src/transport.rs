@@ -1634,6 +1634,14 @@ where
                         &mut outcome,
                     )
                 });
+                #[cfg(test)]
+                let applied = if test_hooks::push_clock_stops(engine.node_id()) {
+                    Err(kimmy_storage::StorageError::ClockRefused(Box::new(
+                        test_hooks::a_clock_stop(),
+                    )))
+                } else {
+                    applied
+                };
                 // A clock refusal that came back as an error (U1) is answered as the stop it is:
                 // the normal `Pushed` reply carrying `clock_refused` and `stopped_at`, which is the
                 // "not yet" the pusher's confirmation waits on. Never a Fault frame, which the
@@ -2353,13 +2361,17 @@ pub(crate) fn replay_apply(
             .map_err(|e| ProtocolError::Local(format!("writing the catching-up marker: {e}")))?;
         let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
             .map_err(|e| ProtocolError::Local(e.to_string()))?;
-        if outcome.unknown.is_some() {
+        if outcome.stopped() {
+            // Whatever stopped the batch, the page is not done: the replay asks for it again. The
+            // stall names the cause (a clock stop applies once the entry is due).
             replay_counters().bump(via, ReplayResult::Stalled);
-            return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::UnknownCollection));
-        }
-        if outcome.purge_pending > 0 {
-            replay_counters().bump(via, ReplayResult::Stalled);
-            return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::PurgePending));
+            return Ok(ReplayPage::Stalled(if outcome.unknown.is_some() {
+                crate::protocol::ReplayStall::UnknownCollection
+            } else if outcome.purge_pending > 0 {
+                crate::protocol::ReplayStall::PurgePending
+            } else {
+                crate::protocol::ReplayStall::ClockRefused
+            }));
         }
     }
     if !own.is_empty() {
@@ -3226,6 +3238,7 @@ where
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
             counted.purge_pending += outcome.purge_pending;
+            counted.clock_refused += outcome.clock_refused;
             counted.deferred += outcome.deferred;
             #[cfg(test)]
             let applied = if test_hooks::clock_stops_after_apply(engine.node_id()) {
@@ -3260,7 +3273,7 @@ where
             // the tail (ADR-148).
             // Nor did one stopped at a creation waiting for the drop purger
             // (ADR-189).
-            let stopped = outcome.unknown_collection > 0 || outcome.purge_pending > 0;
+            let stopped = outcome.stopped();
             window_exhausted = exhausted && !stopped;
             // And whether the loop should spend another of this tick's
             // pulls here (ADR-157). `exhausted` is the peer's own statement
@@ -3313,7 +3326,9 @@ where
                         // purger took nothing from the stop on (ADR-189), so
                         // the replay resumes after the last entry before it,
                         // not after the window.
-                        let next = match outcome.purge_pending_at {
+                        // The same for a batch stopped at an entry whose clock is not due yet
+                        // (U1): it was refused, not taken, and the replay must not resume past it.
+                        let next = match outcome.stopped_at() {
                             Some(stop) => entries
                                 .iter()
                                 .take_while(|entry| entry.stamp != stop)
@@ -3914,6 +3929,9 @@ pub struct AppliedCounts {
     pub deferred: usize,
     /// Batches stopped at a creation waiting for the drop purger (ADR-189).
     pub purge_pending: usize,
+    /// Batches stopped at an entry or state of a `field` collection whose clock is past the bound (U1):
+    /// `SyncOutcome::clock_refused`, summed.
+    pub clock_refused: usize,
 }
 
 /// Local apply time a round's deadline does not charge the peer for
@@ -6686,6 +6704,32 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// The push receiver of this node answers its next batches as if the apply had returned U1's
+    /// refusal as an *error*: the hook that exercises the fold into a `Pushed` reply, which the
+    /// designed route (the batch loop turns the refusal into an outcome first) never reaches.
+    pub static PUSH_CLOCK_STOP: std::sync::Mutex<Option<kimmy_core::NodeId>> =
+        std::sync::Mutex::new(None);
+
+    pub fn push_clock_stops(node: kimmy_core::NodeId) -> bool {
+        *PUSH_CLOCK_STOP.lock().unwrap_or_else(|e| e.into_inner()) == Some(node)
+    }
+
+    /// [`PUSH_CLOCK_STOP`] set for `node` until dropped.
+    pub struct ClockStoppingAPush(());
+
+    impl ClockStoppingAPush {
+        pub fn at(node: kimmy_core::NodeId) -> Self {
+            *PUSH_CLOCK_STOP.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+            Self(())
+        }
+    }
+
+    impl Drop for ClockStoppingAPush {
+        fn drop(&mut self) {
+            *PUSH_CLOCK_STOP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// [`CLOCK_STOP_AFTER_APPLY`] set for `node` until dropped.
     pub struct ClockStoppingAfterApply(());
 
@@ -6913,6 +6957,12 @@ mod yield_tests;
 
 #[cfg(test)]
 mod replay_tests;
+
+#[cfg(test)]
+mod clock_stop_site_tests;
+
+#[cfg(test)]
+mod clock_stop_push_tests;
 
 #[cfg(test)]
 mod digest_repair_tests;

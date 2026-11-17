@@ -99,10 +99,13 @@ pub enum ConfirmOutcome {
     /// The request stopped waiting before any of the above: its client went
     /// away, and the request with it.
     Cancelled,
+    /// The member's batch stopped at an entry or state of a `field` collection whose clock is past
+    /// its `max_clock_skew_secs` (U1). Pending: the window applies once the entry is due.
+    ClockRefused,
 }
 
 impl ConfirmOutcome {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Confirmed,
         Self::Refused,
@@ -115,6 +118,7 @@ impl ConfirmOutcome {
         Self::TaskEnded,
         Self::Backoff,
         Self::Cancelled,
+        Self::ClockRefused,
     ];
 
     pub const fn slot(self) -> usize {
@@ -134,6 +138,7 @@ impl ConfirmOutcome {
             Self::TaskEnded => "task_ended",
             Self::Backoff => "backoff",
             Self::Cancelled => "cancelled",
+            Self::ClockRefused => "clock_refused",
         }
     }
 }
@@ -261,6 +266,7 @@ struct Reply {
     ddl_declined: usize,
     unknown_collection: usize,
     purge_pending: usize,
+    clock_refused: usize,
     refused: Vec<Stamp>,
     stopped_at: Option<Stamp>,
 }
@@ -763,6 +769,7 @@ impl Confirmer {
                 unknown_collection,
                 ddl_declined,
                 purge_pending,
+                clock_refused,
                 refused,
                 stopped_at,
                 ..
@@ -775,6 +782,7 @@ impl Confirmer {
                     ddl_declined,
                     unknown_collection,
                     purge_pending,
+                    clock_refused,
                     refused,
                     stopped_at,
                 },
@@ -932,6 +940,13 @@ fn resolve_answered(waiter: &Waiter, answer: &Answer) -> Option<Resolution> {
             }
             Some(if reply.purge_pending > 0 {
                 Resolution::pending(ConfirmOutcome::Purging, "still purging a drop of this name")
+            } else if reply.clock_refused > 0 {
+                // Not yet, and never a verdict on the change (U1): the member's batch stopped at an
+                // entry whose clock is past its bound, and the window applies once it is due.
+                Resolution::pending(
+                    ConfirmOutcome::ClockRefused,
+                    "the window stopped before it, at an entry whose clock is past the member's bound",
+                )
             } else if stop == Some(index) {
                 Resolution::Refused
             } else {
