@@ -766,6 +766,21 @@ fn a_converge_page_for_a_collection_this_member_lacks_creates_nothing() {
     assert_eq!((created, left), (0, 1));
 }
 
+/// The same for a field collection (item 3.1): its page documents are state, and a Converge page
+/// for a collection the requester lacks still creates nothing and leaves the row.
+#[test]
+fn a_converge_page_for_a_field_collection_this_member_lacks_creates_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let ca = a
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    let (created, left) = converge_created(&b, &a);
+    assert!(b.get_collection("shop", "orders").is_err(), "a Converge page created a collection");
+    assert_eq!((created, left), (0, 1));
+}
+
 /// A newer tombstone over an older held tombstone replaces it under Converge (repair review C
 /// m2; the design's "gap" is closed): no document is brought back, no row is written, and a live
 /// row stamped between the two deletes that arrives later loses to the newer stamp. The page
