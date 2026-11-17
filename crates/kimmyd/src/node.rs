@@ -276,6 +276,13 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
     result
 }
 
+/// Hand the engine the join retention `R` a `field` collection created here takes (this member's
+/// tombstone retention). Read at creation only: a collection carries its own value from then on,
+/// the creator's.
+fn apply_join_retention(engine: &Engine, storage: &crate::config::StorageConfig) {
+    engine.set_default_join_retention(Duration::from_secs(storage.tombstone_retention_secs));
+}
+
 /// Hand the engine the clock skew bound (U1) from the configuration. Called once, right after the
 /// open and before the cluster is started, so that no round, snapshot or push applies a remote
 /// entry under the engine's 300 s default whatever the configuration says.
@@ -860,6 +867,7 @@ async fn start_and_serve(
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     apply_clock_bound(&engine, &config.storage);
+    apply_join_retention(&engine, &config.storage);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
@@ -3448,10 +3456,36 @@ mod tests {
         let source = include_str!("node.rs");
         let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
         let open = production.find("Engine::open_with(&path, &options)").expect("the open");
-        let set =
-            production.find("apply_clock_bound(&engine, &config.storage);").expect("the call");
         let spawn = production.find("let cluster = spawn_cluster(").expect("the spawn");
-        assert!(open < set && set < spawn, "open {open} < set {set} < spawn {spawn}");
+        // The HTTP app that reaches the engine (a client's create among it) is installed on the front only
+        // after the engine is configured: until then the front refuses.
+        let install = production.find("front.install(app);").expect("the install");
+        for call in [
+            "apply_clock_bound(&engine, &config.storage);",
+            "apply_join_retention(&engine, &config.storage);",
+        ] {
+            let set = production.find(call).expect(call);
+            assert!(
+                open < set && set < spawn && set < install,
+                "{call}: open {open} < set {set} < spawn {spawn} and install {install}"
+            );
+        }
+    }
+
+    /// The default join retention `R` a field collection created here takes comes from the tombstone retention
+    /// in the configuration, not from the engine's default.
+    #[test]
+    fn the_configured_join_retention_reaches_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join(DATABASE_FILE)).unwrap();
+        let storage =
+            crate::config::StorageConfig { tombstone_retention_secs: 7_200, ..Default::default() };
+        super::apply_join_retention(&engine, &storage);
+        assert_eq!(
+            engine.default_join_retention_ms(),
+            7_200_000,
+            "the configured tombstone retention reached the engine's default join retention"
+        );
     }
 
     /// The open that returns says the rebuild completed, so an exit of this

@@ -39,6 +39,9 @@ mod clock_stop_tests;
 #[cfg(test)]
 mod codec_tests;
 
+#[cfg(test)]
+mod join_retention_tests;
+
 pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };

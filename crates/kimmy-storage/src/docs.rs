@@ -318,8 +318,24 @@ struct CheckedInsert {
 impl Engine {
     /// This member's writer identity in a field document's merge state: its node and the epoch
     /// it opened with, the same pair its stamps carry.
-    pub(crate) fn field_writer(&self) -> kimmy_core::merge_state::WriterId {
+    pub(crate) fn field_writer_id(&self) -> kimmy_core::merge_state::WriterId {
         kimmy_core::merge_state::WriterId { node: self.node_id(), epoch: self.epoch() }
+    }
+
+    /// The writer of `coll`'s documents with the collection's own join retention `R`, which it carries from
+    /// its creation (never this member's local setting). Every creation of a `field` collection carries one
+    /// (`Engine::require_join_retention`), so a collection that holds none is corrupt and is refused as such.
+    pub(crate) fn field_writer(
+        &self,
+        coll: &CollectionMeta,
+    ) -> Result<crate::field_write::FieldWriter> {
+        let retention_ms = coll.join_retention_ms.ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "the field collection {}.{} holds no join retention",
+                coll.db, coll.name
+            ))
+        })?;
+        Ok(crate::field_write::FieldWriter { writer: self.field_writer_id(), retention_ms })
     }
 
     // -----------------------------------------------------------------------
@@ -879,12 +895,14 @@ impl Engine {
             };
             let doc: Document = bson::deserialize_from_slice(&body)?;
             let image = match creation {
-                Some(creation) => {
-                    field_write::upsert(self.field_writer(), prior, creation, &doc, &mut || {
-                        self.next_stamp()
-                    })?
-                }
-                None => field_write::insert(self.field_writer(), prior, &doc, &mut || {
+                Some(creation) => field_write::upsert(
+                    self.field_writer(coll)?,
+                    prior,
+                    creation,
+                    &doc,
+                    &mut || self.next_stamp(),
+                )?,
+                None => field_write::insert(self.field_writer(coll)?, prior, &doc, &mut || {
                     self.next_stamp()
                 })?,
             }
@@ -1079,8 +1097,8 @@ impl Engine {
             };
             if field && existed && expected.is_none_or(|e| current == Some(e)) {
                 let state = prior.clone().expect("a field record has a state");
-                let writer = self.field_writer();
-                let probe = field_write::provisional(writer, &state);
+                let writer = self.field_writer(coll)?;
+                let probe = field_write::provisional(writer.writer, &state);
                 match field_write::replace(writer, state, &doc, &mut || probe)? {
                     None => unchanged = true,
                     Some(image) => {
@@ -1142,7 +1160,7 @@ impl Engine {
             // Minted only once there is something to write, and still under
             // the writer (ADR-148).
             let (stamp, meta) = if field {
-                let writer = self.field_writer();
+                let writer = self.field_writer(coll)?;
                 let image = match (existed, prior) {
                     (true, Some(state)) => {
                         field_write::replace(writer, state, &doc, &mut || self.next_stamp())?
@@ -1378,13 +1396,12 @@ impl Engine {
             // declines, is not an event and does not tick the clock.
             let (stamp, meta) = match state {
                 Some(state) => {
-                    let image =
-                        field_write::delete(self.field_writer(), state, &mut || self.next_stamp())?
-                            .ok_or_else(|| {
-                                StorageError::Corrupt(
-                                    "a live field document has no life to delete".into(),
-                                )
-                            })?;
+                    let image = field_write::delete(self.field_writer(coll)?, state, &mut || {
+                        self.next_stamp()
+                    })?
+                    .ok_or_else(|| {
+                        StorageError::Corrupt("a live field document has no life to delete".into())
+                    })?;
                     (image.stamp.expect("a delete mints a stamp"), Some(image.meta))
                 }
                 None => (self.next_stamp(), None),
@@ -1817,7 +1834,7 @@ impl Engine {
                 Some(record) => Some(field_write::load(record.meta.as_deref())?),
                 None => None,
             };
-            let joined = field_write::join(self.field_writer(), prior, &other)?;
+            let joined = field_write::join(self.field_writer(coll)?, prior, &other)?;
             if !joined.changed && existing.is_some() {
                 drop(docs);
                 return self.field_entry_kept(txn, entry, position);

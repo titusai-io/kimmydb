@@ -42,10 +42,33 @@ pub(crate) struct Image {
     pub stamp: Option<Stamp>,
 }
 
-/// The join options of a `field` collection's documents. The retention is the library default
-/// until the source of R is decided (a replicated, per-collection value fixed at creation).
-pub(crate) fn options() -> JoinOptions {
-    JoinOptions::default()
+/// The default join retention `R` of a `field` collection created on a member whose tombstone retention
+/// is not configured: 24 hours, in milliseconds, the default of `storage.tombstone_retention_secs`.
+pub(crate) const DEFAULT_JOIN_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Who writes, and under which join retention `R`: the collection's, fixed at its creation, replicated with
+/// it and immutable, so that every member computes the same horizon `H = max(vv) - R`. Never read from a
+/// local setting after the creation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FieldWriter {
+    pub writer: WriterId,
+    pub retention_ms: u64,
+}
+
+impl FieldWriter {
+    /// The join options of the collection's documents: the library's, with the collection's `R`.
+    pub(crate) fn options(&self) -> JoinOptions {
+        JoinOptions::default().with_retention(self.retention_ms)
+    }
+}
+
+/// A writer with the default retention, for the tests of this module and the ones that need a writer and
+/// not a collection; production passes the collection's own.
+#[cfg(test)]
+impl From<WriterId> for FieldWriter {
+    fn from(writer: WriterId) -> Self {
+        Self { writer, retention_ms: JoinOptions::default().retention }
+    }
 }
 
 /// The merge state a stored record carries. A `field` record without meta is not one this code
@@ -88,7 +111,7 @@ fn stamp_error(e: StampError) -> StorageError {
 /// Run one write against `prior` (the stored state, or `None` for a document never stored) and
 /// render the result. `mint` is called once per stamp the write needs.
 fn write(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: Option<MergeState>,
     mint: &mut dyn FnMut() -> Stamp,
     body: impl FnOnce(
@@ -96,8 +119,9 @@ fn write(
         &mut dyn FnMut() -> MStamp,
     ) -> std::result::Result<Option<Written>, StampError>,
 ) -> Result<Option<Image>> {
-    let opts = options();
-    let mut w = Writer::from_state(writer, prior.unwrap_or_default(), opts.clone());
+    let writer = writer.into();
+    let opts = writer.options();
+    let mut w = Writer::from_state(writer.writer, prior.unwrap_or_default(), opts.clone());
     let mut minted: Option<Stamp> = None;
     let written = body(&mut w, &mut || {
         let s = mint();
@@ -143,12 +167,13 @@ pub(crate) struct Joined {
 /// join: the same entries in any order, with repeats, give the same state. Loss records the join
 /// reports are not kept here (records are converged by Step 4).
 pub(crate) fn join(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: Option<MergeState>,
     other: &MergeState,
 ) -> Result<Joined> {
-    let opts = options();
-    let mut w = Writer::from_state(writer, prior.unwrap_or_default(), opts.clone());
+    let writer = writer.into();
+    let opts = writer.options();
+    let mut w = Writer::from_state(writer.writer, prior.unwrap_or_default(), opts.clone());
     let received = w.receive_report(other);
     let rendered = w.state.ordered_document(&opts);
     let alive = rendered.is_some();
@@ -173,7 +198,7 @@ pub(crate) fn provisional(writer: WriterId, prior: &MergeState) -> Stamp {
 /// An insert: a new life, over `prior` when the key holds a tombstone. `None` when a life is
 /// alive already (the caller has checked the key; this is the writer's own refusal).
 pub(crate) fn insert(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: Option<MergeState>,
     doc: &Document,
     mint: &mut dyn FnMut() -> Stamp,
@@ -185,7 +210,7 @@ pub(crate) fn insert(
 /// A replace: the fields that changed are set, the ones that are gone are unset, as one write.
 /// `None` when nothing would change: no stamp is minted and nothing is stored.
 pub(crate) fn replace(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: MergeState,
     doc: &Document,
     mint: &mut dyn FnMut() -> Stamp,
@@ -198,7 +223,7 @@ pub(crate) fn replace(
 /// concurrent write of another field, or another member's increment, is kept by the join. `None`
 /// when nothing changes (no stamp is minted). A refusal of the writer is an error here; W6 maps it.
 pub(crate) fn update(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: MergeState,
     effects: &Effects,
     mint: &mut dyn FnMut() -> Stamp,
@@ -246,7 +271,7 @@ fn post_image_order(doc: &Document) -> Vec<Path> {
 /// entry: the stamp is the later of the two the writer takes (the creation and, beside creation
 /// cells, the increment write).
 pub(crate) fn upsert(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: Option<MergeState>,
     fx: &UpsertEffects,
     doc: &Document,
@@ -280,7 +305,7 @@ pub(crate) fn upsert(
 /// A delete: the state keeps the delete and its context, so the record is a tombstone that
 /// still carries the state. `None` when no life is alive.
 pub(crate) fn delete(
-    writer: WriterId,
+    writer: impl Into<FieldWriter>,
     prior: MergeState,
     mint: &mut dyn FnMut() -> Stamp,
 ) -> Result<Option<Image>> {

@@ -323,6 +323,13 @@ impl JoinOptions {
         Ok(o)
     }
 
+    /// These options with the join retention `R` set to `retention` (wall milliseconds): how far behind the
+    /// newest known HLC deletes, dead lives and loss records are kept. Everything else is as it was.
+    #[must_use]
+    pub fn with_retention(self, retention: u64) -> Self {
+        Self { retention, ..self }
+    }
+
     /// The integer bound: totals saturate to `[-bound - 1, bound]`.
     pub fn int_bound(&self) -> i64 {
         self.int_bound

@@ -374,6 +374,11 @@ pub struct CollectionState {
     /// holding another creation of the name settles on the later one. `None` reads as `created`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_policy_at: Option<Hlc>,
+    /// The collection's join retention `R` (`CollectionMeta::join_retention_ms`), carried with the
+    /// creation it belongs to, so a member that takes the collection by snapshot holds the creator's
+    /// value and never its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_retention_ms: Option<u64>,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -392,6 +397,7 @@ impl From<CollectionMeta> for CollectionState {
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,
             merge_policy_at: meta.merge_policy_at,
+            join_retention_ms: meta.join_retention_ms,
         }
     }
 }
@@ -2677,6 +2683,7 @@ impl Engine {
                 adopted,
                 None,
                 state.merge_policy,
+                state.join_retention_ms,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -2703,8 +2710,29 @@ impl Engine {
         // merge policy follows the later creation, as it does on the entries route, when the
         // page's coverage names that creation (ADR-163). A held policy never changes otherwise.
         let policy_at = state.merge_policy_at.unwrap_or(state.created);
+        // A creation cannot have two join retentions: a page that carries another `R` than the one held
+        // for the SAME creation is refused by name (the sender is inconsistent), never applied over it.
+        {
+            let held = self.get_collection(&state.db, &state.name)?;
+            if held.merge_policy_at.unwrap_or(held.created) == policy_at
+                && held.merge_policy == state.merge_policy.fixed_for(&state.name)
+                && held.join_retention_ms != state.join_retention_ms
+            {
+                return Err(crate::StorageError::Core(kimmy_core::Error::Unsupported(format!(
+                    "a creation cannot have two join retentions: {}.{} holds {:?} for the creation at \
+                     {policy_at:?} and the page carries {:?}",
+                    state.db, state.name, held.join_retention_ms, state.join_retention_ms
+                ))));
+            }
+        }
         if hlc_is_named(policy_at, versions) {
-            self.adopt_creation_policy(&state.db, &state.name, state.merge_policy, policy_at)?;
+            self.adopt_creation_policy(
+                &state.db,
+                &state.name,
+                state.merge_policy,
+                state.join_retention_ms,
+                policy_at,
+            )?;
         }
 
         // A page can name a life of the collection this node has seen dropped
