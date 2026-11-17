@@ -40,7 +40,7 @@ use crate::tables;
 
 /// Records examined in one chunk, and removed at most: one transaction holds
 /// the writer for no more than this.
-const SWEEP_CHUNK: usize = 1_000;
+pub(crate) const SWEEP_CHUNK: usize = 1_000;
 
 /// And the bytes of the records examined in one chunk, since a thousand large
 /// documents are a large transaction and a large `found`.
@@ -109,6 +109,9 @@ struct SweepEnd {
 /// What one chunk of a sweep did.
 struct Chunk {
     removed: usize,
+    /// Records of a `field` collection the sweep rewrote from a live document to a tombstone that keeps
+    /// the state left of them: they left the live set as the removed ones did.
+    killed: usize,
     skipped: usize,
     last: Option<Vec<u8>>,
     exhausted: bool,
@@ -125,6 +128,36 @@ struct Buried {
     key: Vec<u8>,
     document: Option<bson::Document>,
     state: Option<Vec<u8>>,
+}
+
+/// A record of a `field` collection the sweep writes again: the document it held, if it was live, the one it
+/// holds now, if it is, and the record. A tombstone with a state of its own is rewritten with what is left of it.
+struct Rewrite {
+    key: Vec<u8>,
+    previous: Option<bson::Document>,
+    next: Option<bson::Document>,
+    record: kimmy_core::DocRecord,
+}
+
+/// What the sweep makes of a record of a `field` collection stamped after the drop.
+enum Thinned {
+    /// Nothing of it is at or below the drop.
+    Same,
+    /// Something is, and something after the drop stays: the record is written again.
+    Rewrite(Rewrite),
+    /// Nothing after the drop is left of it: buried as a record at or below the drop is.
+    History(Buried),
+    /// Its state does not read; left where it is, counted.
+    Unreadable,
+}
+
+/// The state a burial tombstone of a `field` record keeps: what is left of the record's own when
+/// everything at or below the drop is dropped. A record whose state does not read keeps an empty one:
+/// the sweep that buries it must not stop on it.
+fn bare_state(meta: Option<&[u8]>, dropped: Hlc) -> Vec<u8> {
+    let mut state = crate::field_write::load(meta).unwrap_or_default();
+    state.drop_at_or_below(dropped);
+    state.encode_compact()
 }
 
 /// Whether a collection standing here owes a sweep for a drop stamped
@@ -219,7 +252,7 @@ impl Engine {
                 );
             }
             let chunk = self.remove_stragglers(&txn, &standing, dropped, after)?;
-            removed += chunk.removed;
+            removed += chunk.removed + chunk.killed;
             skipped += chunk.skipped;
             kept_after |= chunk.kept;
             first_arrival = match (first_arrival, chunk.first_arrival) {
@@ -253,7 +286,7 @@ impl Engine {
                     .open_table(tables::LIVE_COUNTS)?
                     .get(standing.id.0)?
                     .map_or(0, |count| count.value())
-                    .saturating_sub(chunk.removed as u64);
+                    .saturating_sub((chunk.removed + chunk.killed) as u64);
                 let redated = standing.is_redated();
                 // A shadow is the parent's: while the parent stands with a vector
                 // configuration the shadow stands too, empty if need be.
@@ -394,6 +427,48 @@ impl Engine {
         Ok(())
     }
 
+    /// One record of a `field` collection stamped after the drop `dropped`: what the drop leaves of it. The
+    /// record keeps its stamp (its newest write is after the drop) and what of its state is stamped after the
+    /// drop; a live one is rendered again from that state, a tombstone keeps it as the state it carries.
+    fn thin_field_record(
+        &self,
+        standing: &CollectionMeta,
+        dropped: Hlc,
+        key: &[u8],
+        raw: &[u8],
+    ) -> Result<Thinned> {
+        let Ok(record) = codec::decode_doc_record_with_meta(raw) else {
+            return Ok(Thinned::Unreadable);
+        };
+        let Ok(mut state) = crate::field_write::load(record.meta.as_deref()) else {
+            return Ok(Thinned::Unreadable);
+        };
+        if !state.drop_at_or_below(dropped) {
+            return Ok(Thinned::Same);
+        }
+        let previous = record.document()?;
+        if state.is_bare() {
+            return Ok(Thinned::History(Buried {
+                key: key.to_vec(),
+                document: previous,
+                state: Some(state.encode_compact()),
+            }));
+        }
+        let joined = crate::field_write::join(self.field_writer(standing)?, None, &state)?;
+        // A live record whose state renders dead is not reached by honest histories (a live life beside a delete
+        // after the drop was made after that delete, so it is after the drop and stays alive), but a peer's or a
+        // damaged store's state can, and the sweep must neither stop nor miscount on it: it becomes a tombstone.
+        let (rewritten, next) = if joined.alive {
+            let next: bson::Document = bson::deserialize_from_slice(&joined.body)?;
+            (kimmy_core::DocRecord::live(record.stamp, joined.body.clone()), Some(next))
+        } else {
+            (kimmy_core::DocRecord::tombstone(record.stamp), None)
+        };
+        let mut rewritten = rewritten;
+        rewritten.meta = Some(joined.meta);
+        Ok(Thinned::Rewrite(Rewrite { key: key.to_vec(), previous, next, record: rewritten }))
+    }
+
     /// One chunk: examine the collection's records after `after`, and replace
     /// each live one stamped at or before the drop with a tombstone at the
     /// drop's stamp.
@@ -405,6 +480,10 @@ impl Engine {
     /// record whose header does not decode is left (counted, warned by the
     /// caller); one whose body does not decode is tombstoned without index
     /// maintenance, as nothing can be said of the entries it made.
+    ///
+    /// A record of a `field` collection stamped after the drop is thinned ([`Self::thin_field_record`]) and written
+    /// again with only what its state holds after the drop; one at or below it is buried with a tombstone that keeps
+    /// its version vector as its state.
     fn remove_stragglers(
         &self,
         txn: &crate::engine::WriteTxn<'_>,
@@ -414,9 +493,11 @@ impl Engine {
     ) -> Result<Chunk> {
         // Bounded by SWEEP_CHUNK rows or SWEEP_CHUNK_BYTES examined; the stop
         // is looked for between chunks (walks_stop: a bounded read).
-        // Each record the sweep removes, with the document it held, and for a `field` collection the
-        // state its burial tombstone keeps.
+        // Each record the sweep buries, with the document it held, and for a `field` collection the
+        // state its burial tombstone keeps; and each record of a `field` collection it rewrites.
         let mut found: Vec<Buried> = Vec::new();
+        let mut rewrites: Vec<Rewrite> = Vec::new();
+        let field = standing.merge_policy == kimmy_core::MergePolicy::Field;
         let (mut examined, mut bytes, mut skipped) = (0usize, 0usize, 0usize);
         let mut last = after.clone();
         let mut exhausted = true;
@@ -459,6 +540,28 @@ impl Engine {
                     let seq = seq.value();
                     first_arrival = Some(first_arrival.map_or(seq, |first| first.min(seq)));
                 }
+                if field && stamp.hlc > dropped.hlc {
+                    // A record of a `field` collection stamped after the drop can still carry cells of
+                    // the life before it: the state is cumulative. Only what is stamped after the drop
+                    // stays of it. A record that holds nothing else of the life is a write after the
+                    // drop and is kept, as is the record with nothing to thin.
+                    match self.thin_field_record(
+                        standing,
+                        dropped.hlc,
+                        key.value().1,
+                        value.value(),
+                    )? {
+                        Thinned::Same => {}
+                        Thinned::Rewrite(rewrite) => rewrites.push(rewrite),
+                        Thinned::History(buried) => {
+                            found.push(buried);
+                            continue;
+                        }
+                        Thinned::Unreadable => skipped += 1,
+                    }
+                    kept = true;
+                    continue;
+                }
                 if !live {
                     // A delete after the drop is a write after it (ADR-236): it stays.
                     kept |= stamp.hlc > dropped.hlc;
@@ -475,7 +578,6 @@ impl Engine {
                     });
                 kept |= stamp.hlc > dropped.hlc && !orphaned;
                 if stamp.hlc <= dropped.hlc || orphaned {
-                    let field = standing.merge_policy == kimmy_core::MergePolicy::Field;
                     let decoded = match field {
                         true => codec::decode_doc_record_with_meta(value.value()),
                         false => codec::decode_doc_record(value.value()),
@@ -485,10 +587,10 @@ impl Engine {
                         warn!(error = %e, "a record of the life before a drop does not decode; removed without its index entries");
                         (None, None)
                     });
-                    // A tombstone of a `field` collection keeps a state (a stateless one is not a
-                    // valid row, and a snapshot that carries it is refused): here the record's own,
-                    // reduced to its version vector, since every cell of it is at or below the drop.
-                    let state = field.then(|| crate::field_write::vv_only(meta.as_deref()));
+                    // A tombstone of a `field` collection keeps a state: here what the record's own is
+                    // left with when everything at or below the drop is dropped, which for a record
+                    // at or below it is its version vector alone.
+                    let state = field.then(|| bare_state(meta.as_deref(), dropped.hlc));
                     found.push(Buried { key: key.value().1.to_vec(), document, state });
                 }
             }
@@ -506,12 +608,39 @@ impl Engine {
             };
             crate::live_count::put_bare_tombstone(txn, &mut docs, standing.id.0, key, &tombstone)?;
         }
+        for rewrite in &rewrites {
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                standing.id.0,
+                &rewrite.key,
+                &codec::encode_doc_record(&rewrite.record),
+            )?;
+        }
         drop(docs);
         for Buried { key, document: previous, .. } in &found {
             // A removal has no document to key and so no violation to report.
             crate::index::maintain_remote(self, txn, standing, previous.as_ref(), None, key)?;
         }
-        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival, kept })
+        let mut killed = 0usize;
+        for rewrite in &rewrites {
+            killed += usize::from(rewrite.previous.is_some() && rewrite.next.is_none());
+            if rewrite.previous.is_none() && rewrite.next.is_none() {
+                continue;
+            }
+            // Fields only go, so no violation can come of it; a key it stops holding moves the index
+            // entry, and the multikey flag can only stay.
+            let (_, multikey, _) = crate::index::maintain_remote(
+                self,
+                txn,
+                standing,
+                rewrite.previous.as_ref(),
+                rewrite.next.as_ref(),
+                &rewrite.key,
+            )?;
+            crate::index::mark_multikey(txn, &standing.db, &standing.name, &multikey)?;
+        }
+        Ok(Chunk { removed: found.len(), killed, skipped, last, exhausted, first_arrival, kept })
     }
 
     /// A replicated drop of the collection `db.name` has reached a member whose
