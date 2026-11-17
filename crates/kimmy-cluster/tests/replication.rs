@@ -711,6 +711,73 @@ async fn a_field_delete_crosses_the_wire_in_a_snapshot_and_kills_the_life_the_re
     );
 }
 
+/// Step 3, fix 32f: the document repair of a collection a member has swept applies at a member that holds the
+/// collection and has not taken the drop. A holds X; B and C take it; A drops the collection; B, which writes Y
+/// after the drop, takes the drop and its sweep buries X with a tombstone. C is made to believe it has witnessed
+/// all of B without applying the drop (as the count-divergence test does for its hole), so it holds X, no floor
+/// and no drop tombstone, and its digest of the collection differs from B's. The repair pulls B's page as a
+/// Converge page, which does not carry the floor: the burial tombstone is a carried delete of a field document
+/// for C, and C refuses one with no state as corrupt, on every round, until the repair is abandoned.
+#[tokio::test]
+async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_has_not_taken_the_drop()
+ {
+    use kimmy_cluster::{DigestRepairOutcome, RowResult};
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1, "a": 1 }).unwrap();
+    let b = node().await;
+    let c = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection arrives");
+
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    std::thread::sleep(Duration::from_millis(5));
+    let y = b.engine.insert(&cb, doc! { "_id": 2 }).unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb =
+        b.engine.get_collection("shop", "orders").expect("the write after the drop keeps the life");
+    assert!(b.engine.get(&cb, &x).unwrap().is_none(), "premise: the sweep removed X on B");
+    assert!(b.engine.get(&cb, &y).unwrap().is_some(), "premise: Y, written after the drop, stays");
+    let page = b.engine.snapshot_page(None, Some(cb.id)).unwrap();
+    assert_eq!(page.deleted_documents.len(), 1, "premise: B's page carries X's burial tombstone");
+
+    let theirs = b.engine.version_vector().unwrap();
+    c.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    let cc = c.engine.get_collection("shop", "orders").expect("C holds the collection");
+    assert!(c.engine.get(&cc, &x).unwrap().is_some(), "premise: C still holds X");
+    assert!(cc.incarnation_floor.is_none(), "premise: C has no floor");
+    assert!(
+        c.engine.collection_dropped_at(cc.id).unwrap().is_none(),
+        "premise: C holds no drop tombstone"
+    );
+
+    let (totals, _) =
+        repair_loop(&b, &c, |_| {}, |_, totals| totals.digest_repairs.iter().sum::<usize>() >= 1)
+            .await;
+    assert!(
+        totals.digest_repairs[DigestRepairOutcome::Applied.index()] >= 1,
+        "the repair of the swept member's collection ran to its end: {totals:?}"
+    );
+    assert_eq!(
+        totals.digest_repairs[DigestRepairOutcome::Abandoned.index()],
+        0,
+        "the repair is not abandoned: {totals:?}"
+    );
+    // The page was applied: the row for Y, which C had never seen, was written. (The burial tombstone
+    // does not kill X on C, which has not taken the drop, so the digests still differ: the repair is judged
+    // ineffective, and the drop reaches C by the entries.)
+    assert!(
+        totals.digest_rows[RowResult::Created.index()] >= 1,
+        "premise: the repair applied a Converge page: {totals:?}"
+    );
+    assert!(c.engine.get(&cc, &y).unwrap().is_some(), "premise: C holds Y after the repair");
+}
+
 #[tokio::test]
 async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     // The test above passes for a collection whose derived id happens to sit
