@@ -81,6 +81,15 @@ pub(crate) fn load(meta: Option<&[u8]>) -> Result<MergeState> {
         .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))
 }
 
+/// The state a burial tombstone of a record keeps when every cell of the record is at or below the drop
+/// that buries it: no life, delete, cell, order entry or loss record, and the record's version vector,
+/// which says what the member has seen. A record whose state does not read keeps an empty one: the sweep
+/// that buries it must not stop on it.
+pub(crate) fn vv_only(meta: Option<&[u8]>) -> Vec<u8> {
+    let vv = load(meta).map(|state| state.vv).unwrap_or_default();
+    MergeState { vv, ..MergeState::default() }.encode_compact()
+}
+
 /// The newest wall time any origin of an entry's merged state has written: what U1 holds the entry's state to
 /// (`max(vv)`). `None` for an empty version vector.
 pub(crate) fn vv_max_wall_ms(meta: &[u8]) -> Result<Option<u64>> {
