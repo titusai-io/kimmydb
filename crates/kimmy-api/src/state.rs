@@ -283,6 +283,8 @@ impl AppState {
             // release counter above cannot say: it moves only when a mark
             // goes (ADR-160, ADR-172).
             held_marks: self.engine.held_marks()?,
+            // What U1 refused, by origin (a monotonic count the engine keeps, capped at 64 labels).
+            clock_refusals: self.engine.clock_refusals(),
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.
@@ -728,6 +730,29 @@ pub(crate) mod tests {
         members.remove_for_test(&"127.0.0.1:7001".parse().unwrap());
         let out = state.metrics.render_with(&state.storage_readings().unwrap());
         assert!(out.contains("\nkimmy_cluster_members 1\n"), "{out}");
+    }
+
+    /// U1's refusals reach the scrape by origin: what the engine counted is what the readings carry and what
+    /// `/metrics` renders under `kimmy_sync_clock_refused_total{origin}`.
+    #[test]
+    fn the_engines_clock_refusals_reach_the_readings_by_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
+        let node = kimmy_core::NodeId::from_bytes([7; 16]);
+        state
+            .engine
+            .count_clock_refused(&kimmy_core::Origin { node, epoch: kimmy_core::Epoch::ZERO }, 3);
+        let readings = state.storage_readings().unwrap();
+        assert_eq!(
+            readings.clock_refusals,
+            vec![(node.to_string(), 3)],
+            "the readings carry the engine's count"
+        );
+        let out = state.metrics.render_with(&readings);
+        assert!(
+            out.contains(&format!("kimmy_sync_clock_refused_total{{origin=\"{node}\"}} 3\n")),
+            "the scrape names the origin: {out}"
+        );
     }
 
     /// `kimmy_epoch_origins` is the length of the member's own version vector at
