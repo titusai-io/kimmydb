@@ -643,6 +643,74 @@ async fn a_member_past_the_retention_horizon_takes_a_field_document_by_snapshot_
     assert_eq!(second.total(), 0, "a caught-up member does not keep resyncing: {second:?}");
 }
 
+/// Step 3, item (3.2): the delete of a field document crosses the wire in a snapshot with the state its
+/// tombstone keeps, and the receiver joins it. B holds X; A inserts Y, then deletes X; B, which has not
+/// seen the delete, writes X.b above it. A's collection of garbage purges the insert of Y, which B's
+/// position is below, so B cannot be served by pull and is caught up by snapshot (a delete alone would
+/// not force it: A keeps a field delete). The delete kills the life B wrote into, though B's record is
+/// stamped above it.
+#[tokio::test]
+async fn a_field_delete_crosses_the_wire_in_a_snapshot_and_kills_the_life_the_receiver_wrote_into()
+{
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection arrives");
+    assert!(b.engine.get(&cb, &x).unwrap().is_some(), "premise: B holds X");
+
+    // Y is the entry B's position is below and that A's collection of garbage purges.
+    let y = a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    a.engine.delete(&ca, &x).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    b.engine.replace(&cb, &x, doc! { "_id": 1, "b": 2 }, false).unwrap();
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+    // Premises: the delete is kept on A and Y is purged, so B is behind A's horizon and a pull cannot
+    // serve it; and B's record of X is stamped above the delete.
+    let a_entries = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
+    let delete_stamp = a_entries
+        .iter()
+        .find(|e| e.kind == kimmy_core::OpKind::Delete && e.doc_id.as_ref() == Some(&x))
+        .expect("premise: A keeps the delete of X")
+        .stamp;
+    assert!(
+        !a_entries.iter().any(|e| e.doc_id.as_ref() == Some(&y)),
+        "premise: the insert of Y is purged, so B's pull has a gap and a snapshot serves it"
+    );
+    let (version, _) =
+        b.engine.get_versioned(&cb, &x).unwrap().expect("premise: B holds its write");
+    let kimmy_core::DocVersion::Etag(b_stamp, _) = version else {
+        panic!("premise: a field document's version is an etag");
+    };
+    assert!(b_stamp.hlc > delete_stamp.hlc, "premise: B's record is stamped above the delete");
+
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(
+        b.engine.get(&cb, &x).unwrap(),
+        None,
+        "the delete crossed in the snapshot and killed the life B wrote into"
+    );
+    assert!(
+        b.engine.get(&cb, &y).unwrap().is_some(),
+        "premise: Y, whose entry no longer exists on A, reached B, and only a snapshot carries that"
+    );
+}
+
 #[tokio::test]
 async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     // The test above passes for a collection whose derived id happens to sit

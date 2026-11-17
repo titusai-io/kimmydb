@@ -323,6 +323,14 @@ snapshot page, and holds it for its whole life (it does not change, as the merge
 meets the collection holds the creator's value and never its own setting. A creation of a `field` collection that
 carries none, whether an entry or a snapshot page, is not a valid creation and is refused as corrupt.
 
+**Deletes in a snapshot.** A document of a `field` collection that was deleted keeps its merged state in its
+tombstone (the delete and its context), and a snapshot page carries that state with the delete. The receiver
+joins it into what it holds under the key, so the delete kills the life it killed on the sender whatever the
+stamps say (a write above the delete's stamp, into a life the delete's context does not name, is killed too),
+and a member that held nothing keeps the context, so a write into the killed life that arrives later does not
+bring the document back. It is state, not history: no oplog entry is written for it and no held mark is left.
+A tombstone of a `field` collection with no state is not a valid row and is refused as corrupt.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is
