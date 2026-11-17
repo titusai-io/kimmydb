@@ -108,6 +108,9 @@ mod clock_bound_entry_tests;
 mod clock_bound_state_tests;
 
 #[cfg(test)]
+mod join_retention_tests;
+
+#[cfg(test)]
 mod field_snapshot_tests;
 
 #[cfg(test)]

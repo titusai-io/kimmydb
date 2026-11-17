@@ -884,12 +884,14 @@ impl Engine {
         } else {
             None
         };
-        let writer = self.field_writer();
+        // Only a `field` collection has one: it carries the collection's own join retention.
+        let writer = if field { Some(self.field_writer(coll)?) } else { None };
         // What the writer stores, which is what the validator and the indexes look at.
         let mut rendered: Option<Document> = None;
         match (&state, next) {
             (Some(state), Some(doc)) => {
-                let probe = field_write::provisional(writer, state);
+                let writer = writer.expect("a field document has a writer");
+                let probe = field_write::provisional(writer.writer, state);
                 let image = match effects {
                     Some(effects) => {
                         field_write::update(writer, state.clone(), effects, &mut || probe)?
@@ -932,6 +934,7 @@ impl Engine {
         // (ADR-148): an unchanged document must not advance the clock.
         let (stamp, meta) = match (state, next) {
             (Some(state), Some(doc)) => {
+                let writer = writer.expect("a field document has a writer");
                 let image = match effects {
                     Some(effects) => {
                         field_write::update(writer, state, effects, &mut || self.next_stamp())?
@@ -944,6 +947,7 @@ impl Engine {
                 (image.stamp.expect("a write that changes mints a stamp"), Some(image.meta))
             }
             (Some(state), None) => {
+                let writer = writer.expect("a field document has a writer");
                 let image = field_write::delete(writer, state, &mut || self.next_stamp())?
                     .ok_or_else(|| {
                         StorageError::Corrupt("a live field document has no life to delete".into())

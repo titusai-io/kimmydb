@@ -160,6 +160,10 @@ pub struct Engine {
     /// collection may be, in milliseconds (U1, `storage.max_clock_skew_secs`). Set from
     /// configuration at startup; a local setting, not replicated.
     max_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// The join retention `R`, in milliseconds, a `field` collection created HERE takes at creation: this
+    /// member's tombstone retention. Local configuration, read at creation only; the collection carries its
+    /// own value from then on, which is what every member uses.
+    default_join_retention_ms: std::sync::atomic::AtomicU64,
     /// What U1 has refused since start, by the origin that sent it (capped, the rest under
     /// `other`).
     clock_refusals: Mutex<crate::clock_bound::RefusalCounts>,
@@ -1617,6 +1621,9 @@ impl Engine {
             max_clock_skew_ms: std::sync::atomic::AtomicU64::new(
                 crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS,
             ),
+            default_join_retention_ms: std::sync::atomic::AtomicU64::new(
+                crate::field_write::DEFAULT_JOIN_RETENTION_MS,
+            ),
             clock_refusals: Mutex::new(Default::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
@@ -2224,6 +2231,19 @@ impl Engine {
     /// Count `n` entries refused for a `field` collection (a remote write, a snapshot document).
     pub(crate) fn count_field_replication_refused(&self, n: u64) {
         self.field_replication_refusals.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The join retention `R` a `field` collection created on this member takes (its tombstone retention),
+    /// in milliseconds.
+    pub fn default_join_retention_ms(&self) -> u64 {
+        self.default_join_retention_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the join retention a `field` collection created on this member takes, from its tombstone
+    /// retention. Read at creation only: a collection carries its own `R` from then on.
+    pub fn set_default_join_retention(&self, retention: std::time::Duration) {
+        let ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.default_join_retention_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The bound U1 holds a replicated `field` entry or state to (`storage.max_clock_skew_secs`).
@@ -4577,6 +4597,11 @@ impl Engine {
     /// `document` whatever is asked. [`Engine::create_collection`] (the helper for internal
     /// and test use) creates `document` collections; the HTTP route defaults to
     /// [`kimmy_core::MergePolicy::DEFAULT`] and calls this.
+    ///
+    /// A `field` collection takes its join retention `R` from this member's tombstone retention
+    /// ([`Self::set_default_join_retention`]) at creation: it is carried by the creation entry and the
+    /// snapshot page, fixed for the collection's life, and every other member holds this value and never
+    /// its own.
     pub fn create_collection_with_policy(
         &self,
         db: &str,
@@ -4600,8 +4625,28 @@ impl Engine {
                 None,
                 validator.as_ref().map(|spec| (spec, None)),
                 policy,
+                (policy.fixed_for(name) == kimmy_core::MergePolicy::Field)
+                    .then(|| self.default_join_retention_ms()),
             )?
             .expect("a creation that judges nothing history always creates"))
+    }
+
+    /// Every creation of a `field` collection carries its join retention `R`, whichever route made it: a
+    /// local one takes this member's default, a replicated one (an entry, a snapshot page) the creator's. One
+    /// that carries none is not a valid creation and is refused here, before anything is written, so that no
+    /// `field` collection is ever held without one.
+    fn require_join_retention(
+        db: &str,
+        name: &str,
+        policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
+    ) -> Result<()> {
+        if policy == kimmy_core::MergePolicy::Field && join_retention_ms.is_none() {
+            return Err(StorageError::Corrupt(format!(
+                "the field collection {db}.{name} holds no join retention"
+            )));
+        }
+        Ok(())
     }
 
     /// Converge the merge policy of a collection held already on the creation that wins: a
@@ -4615,6 +4660,7 @@ impl Engine {
         db: &str,
         name: &str,
         policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
         at: Hlc,
     ) -> Result<CollectionMeta> {
         let policy = policy.fixed_for(name);
@@ -4623,9 +4669,13 @@ impl Engine {
             if !meta.policy_yields_to(at, policy) {
                 return Ok(meta);
             }
+            Self::require_join_retention(db, name, policy, join_retention_ms)?;
             let read = meta.clone();
             meta.merge_policy = policy;
             meta.merge_policy_at = Some(at);
+            // R follows the creation that wins, as the policy does: both belong to it.
+            meta.join_retention_ms =
+                join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
             let txn = self.begin_write(WriterHolder::Ddl)?;
             if !Self::definition_is(&txn, &read)? {
                 txn.abort()?;
@@ -4667,6 +4717,7 @@ impl Engine {
             None,
             None,
             kimmy_core::MergePolicy::Document,
+            None,
         )
     }
 
@@ -4698,6 +4749,7 @@ impl Engine {
                 None,
                 Some((&validator, None)),
                 kimmy_core::MergePolicy::Document,
+                None,
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -4719,6 +4771,7 @@ impl Engine {
         sender_floor: Option<Hlc>,
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
         policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -4739,9 +4792,18 @@ impl Engine {
         // that reason: a caller that mints one mints it with the writer held,
         // and a replicated shadow takes its configuration entry's stamp.
         let mint = || self.next_stamp();
-        match self
-            .create_collection_in_txn(&txn, db, name, log, origin, history, mint, validator, policy)
-        {
+        match self.create_collection_in_txn(
+            &txn,
+            db,
+            name,
+            log,
+            origin,
+            history,
+            mint,
+            validator,
+            policy,
+            join_retention_ms,
+        ) {
             Ok(InTxn::Created(mut meta, logged)) => {
                 let mut changed = false;
                 if let Some(from) = redated_from {
@@ -4814,9 +4876,11 @@ impl Engine {
         mint: impl FnOnce() -> Stamp,
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
         policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
     ) -> Result<InTxn> {
         // System collections and vector shadows are `document`, whatever was asked.
         let policy = policy.fixed_for(name);
+        Self::require_join_retention(db, name, policy, join_retention_ms)?;
         let id = CollectionId::derive(db, name);
         let (meta, stamp) = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -4946,6 +5010,11 @@ impl Engine {
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             meta.merge_policy = policy;
             meta.merge_policy_at = Some(origin.unwrap_or(stamp.hlc));
+            // R is the creator's, carried by the creation: a `field` collection created here takes this
+            // member's default (its caller passed it), one created from an entry or a page takes the value
+            // that came with it, and never this member's own.
+            meta.join_retention_ms =
+                join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.
@@ -5002,6 +5071,7 @@ impl Engine {
                     name: name.to_string(),
                     merge_policy: policy,
                     validator: validator.map(|(spec, _)| spec.clone()),
+                    join_retention_ms: meta.join_retention_ms,
                 },
             )?;
             append_oplog(txn, &entry)?;

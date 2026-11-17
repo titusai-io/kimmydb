@@ -2084,7 +2084,7 @@ mod tests {
 
         // B's record: the same newest stamp, a state that holds only the field `b`
         let image = crate::field_write::insert(
-            a.field_writer(),
+            a.field_writer_id(),
             None,
             &doc! { "_id": 1, "b": 2 },
             &mut || stamp,

@@ -2491,14 +2491,37 @@ impl Engine {
                     // of the name. The validator it carries is then a change like a
                     // `ConfigureValidator`'s, last writer winning on the stamp.
                     Ok(held) => {
+                        // A creation cannot have two join retentions: the same creation (its stamp) met
+                        // again, carrying another `R` than the one this member holds for it, is
+                        // inconsistent and is refused by name, counted and not applied. R is fixed at
+                        // creation and immutable, so every member computes the same horizon.
+                        if held.merge_policy_at == Some(entry.stamp.hlc)
+                            && held.merge_policy == target.merge_policy.fixed_for(&target.name)
+                            && held.join_retention_ms != target.join_retention_ms
+                        {
+                            warn!(
+                                db = %target.db,
+                                collection = %target.name,
+                                held = ?held.join_retention_ms,
+                                entry = ?target.join_retention_ms,
+                                "a creation carries another join retention than the one held for the same \
+                                 creation; refused: a creation cannot have two Rs"
+                            );
+                            return Ok(DdlOutcome::Refused);
+                        }
                         // The policy is fixed at creation, and two members can create the
                         // name at once under different ones: it follows the creation with the
-                        // later stamp, on every member, whichever arrives first.
-                        if held.merge_policy != target.merge_policy.fixed_for(&target.name) {
+                        // later stamp, on every member, whichever arrives first. So does its join
+                        // retention `R`, which belongs to the creation: two creations of the one name
+                        // under the same policy and different `R` settle on the later one too.
+                        if held.merge_policy != target.merge_policy.fixed_for(&target.name)
+                            || held.join_retention_ms != target.join_retention_ms
+                        {
                             let kept = self.adopt_creation_policy(
                                 &target.db,
                                 &target.name,
                                 target.merge_policy,
+                                target.join_retention_ms,
                                 entry.stamp.hlc,
                             )?;
                             warn!(
@@ -2506,7 +2529,7 @@ impl Engine {
                                 collection = %target.name,
                                 entry = %target.merge_policy,
                                 standing = %kept.merge_policy,
-                                "a creation names a merge policy other than the one held; the later creation's stands"
+                                "a creation names a merge policy or a join retention other than the one held; the later creation's stands"
                             );
                         }
                         if let Some(outcome) = self.validator_of_a_creation(&target, entry)? {
@@ -2532,6 +2555,7 @@ impl Engine {
                             None,
                             target.validator.as_ref().map(|spec| (spec, Some(entry.stamp))),
                             target.merge_policy,
+                            target.join_retention_ms,
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");

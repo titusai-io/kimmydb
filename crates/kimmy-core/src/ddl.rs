@@ -132,6 +132,12 @@ pub struct CollectionCreate {
     pub merge_policy: MergePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator: Option<ValidatorSpec>,
+    /// `R`, the join retention of a `field` collection's documents, in milliseconds: how far behind
+    /// the newest known HLC deletes and dead lives are kept. Chosen by the creating member (its tombstone
+    /// retention), fixed for the life of the creation, replicated with it and immutable, so every member
+    /// computes the same horizon. `None` for a `document` collection, which has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_retention_ms: Option<u64>,
 }
 
 /// The reserved collection name a database's drop is filed under (ADR-229).
@@ -209,6 +215,7 @@ mod tests {
             name: "orders".into(),
             merge_policy: MergePolicy::Field,
             validator: None,
+            join_retention_ms: Some(86_400_000),
         };
         let bytes = bson::serialize_to_vec(&with).unwrap();
         assert_eq!(bson::deserialize_from_slice::<CollectionCreate>(&bytes).unwrap(), with);

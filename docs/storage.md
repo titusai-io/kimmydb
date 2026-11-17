@@ -316,6 +316,13 @@ entry, or a state that holds one, is refused until it is due: it is not applied 
 window or snapshot page stops at it and is asked for again, and it applies once this member's clock
 has caught up to within the bound. The setting is local to the member and is not replicated.
 
+**Join retention (`R`).** The horizon below which a `field` collection's deletes and dead lives are pruned is
+`max(vv) - R`, so every member must use the same `R`. It is per collection: a `field` collection takes the
+creating member's `storage.tombstone_retention_secs` at creation, carries it in its creation entry and in a
+snapshot page, and holds it for its whole life (it does not change, as the merge policy does not). A member that
+meets the collection holds the creator's value and never its own setting. A creation of a `field` collection that
+carries none, whether an entry or a snapshot page, is not a valid creation and is refused as corrupt.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is
