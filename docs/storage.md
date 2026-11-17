@@ -334,6 +334,16 @@ Every producer keeps one: the tombstone a late drop's sweep leaves for a field r
 record's version vector as its state, with no life, delete, cell, order entry or loss record, since every cell of
 the record is at or below the drop.
 
+**Holes of a state with no entry.** A state applied as state (a snapshot page's document, a delete a page carries)
+has no oplog entry, so the writes it holds are a hole in what this member can serve: a peer behind them, pulling
+from here, is sent to a snapshot rather than served a window that lacks them. The hole is recorded in the
+transaction that applies the state, for every writer in its version vector and by that writer's node and epoch,
+whether the page was a whole-database snapshot's or a repair's, and whether or not the servable vector already
+claims the write. It is conservative: a peer behind the point is sent to a snapshot even where this member holds
+some of those entries. This member's own live origin is left out, since its own writes are in its own oplog until
+retention collects them. A page that is refused is rolled back whole and leaves no hole; an entry applied by a pull
+is history and leaves none. A hole is only ever raised.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is

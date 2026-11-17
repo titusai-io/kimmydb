@@ -10974,6 +10974,53 @@ async fn a_lost_update_is_repaired_by_the_document_repair_and_judged_effective()
     assert_eq!(last.digest_repair_stopped, 0);
 }
 
+/// Step 3, item (3.3): the member that repaired a field document holds its state and no entry for the write the
+/// repair brought, so it must not serve a window that claims it: a member that pulls only from it is sent to a
+/// snapshot and ends with the repaired document.
+#[tokio::test]
+async fn a_member_that_repaired_a_field_document_is_not_served_a_window_without_it_by_a_peer_behind()
+ {
+    use kimmy_cluster::Judgement;
+    let a = node().await;
+    let b = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "v": 0 }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    a.engine.replace(&ca, &DocId::Int64(2), doc! { "_id": 2i64, "v": 1 }, false).unwrap();
+    // B is made to believe it has witnessed the update without applying it.
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert_eq!(version_of(&b, 2), 0, "premise: B holds the stale version");
+    repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            totals.digest_judgements[Judgement::Effective.index()] >= 1
+                && report.digest_divergent_collections == 0
+        },
+    )
+    .await;
+    assert_eq!(version_of(&b, 2), 1, "premise: B repaired the document");
+
+    // P, with nothing, pulls only from B.
+    let p = node().await;
+    sync(&b, &p).await;
+    sync(&b, &p).await;
+    assert_eq!(
+        version_of(&p, 2),
+        1,
+        "P pulled only the member that repaired X and holds the repaired document"
+    );
+}
+
 #[tokio::test]
 async fn with_the_switch_off_the_finding_stands_and_nothing_is_planned() {
     use kimmy_cluster::DigestRepairOutcome;
