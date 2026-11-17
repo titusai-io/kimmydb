@@ -1635,7 +1635,8 @@ impl Engine {
             if position == Position::Hold && entry.meta.is_none() {
                 return Err(refuse_field_replication());
             }
-            return self.apply_field_in_txn(txn, coll, entry, id, position);
+            let key = doc_key(&id)?;
+            return self.apply_field_in_txn(txn, coll, entry, key, Some(id), position);
         }
 
         let key = doc_key(&id)?;
@@ -1800,13 +1801,6 @@ impl Engine {
         self.refuse_if_past_the_bound(&entry.stamp, vv_max_wall_ms)
     }
 
-    /// [`Self::refuse_if_far_future`] for a carried delete of a snapshot page, which has no entry and no
-    /// state to join, only a stamp: the same bound, checked before the delete is applied or recorded as
-    /// a bare tombstone (U1).
-    pub(crate) fn refuse_stamp_if_far_future(&self, stamp: &Stamp) -> Result<()> {
-        self.refuse_if_past_the_bound(stamp, None)
-    }
-
     fn refuse_if_past_the_bound(&self, stamp: &Stamp, vv_max_wall_ms: Option<u64>) -> Result<()> {
         match self.clock_bound().check(self.clock_bound_now_ms(), stamp, vv_max_wall_ms) {
             Some(stop) => Err(StorageError::ClockRefused(Box::new(stop))),
@@ -1814,15 +1808,35 @@ impl Engine {
         }
     }
 
+    /// Apply the delete a snapshot page carries for a document of a `field` collection: `entry` carries
+    /// the state its tombstone keeps, which is joined into what is held under `key` as the state of a page
+    /// document is, and no entry and no held mark is written (it is state, not history). It is bounded
+    /// like any entry of a field collection (U1), before anything is written.
+    ///
+    /// `id` is the held document's own `_id` when a live document is held under `key` (the one case
+    /// that needs it: the delete moves its indexes), and `None` where a tombstone or nothing is held,
+    /// because a tombstone has no `_id` to give.
+    pub(crate) fn apply_carried_field_delete(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+        key: &[u8],
+        id: Option<DocId>,
+    ) -> Result<RemoteApplied> {
+        self.refuse_if_far_future(entry)?;
+        self.apply_field_in_txn(txn, coll, entry, key.to_vec(), id, Position::Hold)
+    }
+
     fn apply_field_in_txn(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         entry: &OplogEntry,
-        id: DocId,
+        key: Vec<u8>,
+        id: Option<DocId>,
         position: Position,
     ) -> Result<RemoteApplied> {
-        let key = doc_key(&id)?;
         let other = field_write::load(entry.meta.as_deref())?;
         let (joined, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
@@ -1869,6 +1883,9 @@ impl Engine {
             // The merged state moved and the document did not.
             return self.field_entry_kept(txn, entry, position);
         }
+        let id = id.ok_or_else(|| {
+            StorageError::Corrupt("a field document moved with no _id to name it by".into())
+        })?;
         let (violations, newly_multikey, filings) =
             index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;

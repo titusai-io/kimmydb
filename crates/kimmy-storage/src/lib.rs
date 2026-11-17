@@ -117,6 +117,9 @@ mod field_snapshot_tests;
 mod carried_delete_state_tests;
 
 #[cfg(test)]
+mod carried_delete_join_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]

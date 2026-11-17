@@ -2033,11 +2033,19 @@ impl Engine {
                 }
                 continue;
             };
-            // U1: a carried delete of a field collection has no state, only a stamp, and it is bounded
-            // like any entry of one, whether it is applied over a live document or recorded as a bare
-            // tombstone: the page stops here, as it does at a document.
+            // A tombstone of a `field` collection keeps the document's merged state and carries it: it is
+            // joined, as a page document's state is, and never compared by its stamp or recorded bare.
             if collection.merge_policy == kimmy_core::MergePolicy::Field {
-                self.refuse_stamp_if_far_future(&tombstone.stamp)?;
+                if self.apply_carried_field_tombstone(
+                    txn,
+                    &collection,
+                    tombstone,
+                    converge.as_mut(),
+                    pending,
+                )? {
+                    recorded += 1;
+                }
+                continue;
             }
 
             let existing = {
@@ -2105,6 +2113,95 @@ impl Engine {
             }
         }
         Ok(recorded)
+    }
+
+    /// The carried delete of one document of a `field` collection (item 3.2): the state the tombstone
+    /// keeps is joined into what is held under its key ([`Self::apply_carried_field_delete`], bounded
+    /// by U1), whatever is held there: a live document is killed, in the life the delete saw, by its
+    /// context and not by the stamp; a tombstone or nothing takes the state, so the context of the
+    /// delete is not lost. `true` when it recorded a state where no document was held or the delete
+    /// out-stamps the tombstone held (what [`Self::apply_carried_document_deletes`] counts as recorded).
+    ///
+    /// A tombstone of a `field` collection with no state is not a valid row: refused, by name.
+    ///
+    /// Under `Converge` nothing is written where nothing is held, as for a document.
+    fn apply_carried_field_tombstone(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &std::sync::Arc<CollectionMeta>,
+        tombstone: &CarriedDelete,
+        mut converge: Option<&mut ConvergeTombstones<'_>>,
+        pending: &mut Vec<Pending>,
+    ) -> Result<bool> {
+        let Some(meta) = tombstone.meta.clone() else {
+            return Err(crate::StorageError::Corrupt(format!(
+                "a carried delete of field collection {} carries no state",
+                tombstone.collection
+            )));
+        };
+        let existing = {
+            let docs = txn.open_table(tables::DOCS)?;
+            match docs.get((collection.id.0, tombstone.key.as_slice()))? {
+                Some(raw) => Some(codec::decode_doc_record(raw.value())?),
+                None => None,
+            }
+        };
+        if existing.is_none()
+            && let Some(c) = converge.as_mut()
+        {
+            *c.left += 1;
+            return Ok(false);
+        }
+        let held_id = match existing.as_ref().map(|record| record.document()).transpose()?.flatten()
+        {
+            Some(document) => {
+                let Some(value) = document.get(crate::ID_FIELD) else {
+                    return Ok(false);
+                };
+                let id = DocId::try_from_bson(value)?;
+                // The id read back from the body must encode to the key the tombstone names, or the
+                // delete would land on another document.
+                if crate::docs::doc_key(&id)? != tombstone.key {
+                    warn!(
+                        collection = %tombstone.collection,
+                        "a document's _id does not encode to the key it is stored under; the carried \
+                         delete is not applied"
+                    );
+                    return Ok(false);
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        let entry = OplogEntry {
+            stamp: tombstone.stamp,
+            kind: OpKind::Delete,
+            collection: collection.id,
+            doc_id: held_id.clone(),
+            body: None,
+            meta: Some(meta),
+        };
+        let first_state_here = existing.as_ref().is_none_or(|current| {
+            current.document().ok().flatten().is_none() && tombstone.stamp.wins_over(&current.stamp)
+        });
+        match self.apply_carried_field_delete(txn, collection, &entry, &tombstone.key, held_id)? {
+            RemoteApplied::Applied { id, violations, unkeyed, .. } => {
+                pending.push(Pending {
+                    collection: collection.clone(),
+                    entry,
+                    id,
+                    violations,
+                    unkeyed,
+                });
+                Ok(false)
+            }
+            _ => {
+                if first_state_here && let Some(c) = converge.as_mut() {
+                    *c.replaced_at_cut += usize::from((c.at_cut)(tombstone.stamp));
+                }
+                Ok(first_state_here)
+            }
+        }
     }
 
     /// Record a delete this node holds nothing for, as a tombstone under the key the
