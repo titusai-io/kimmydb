@@ -1682,6 +1682,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 slower(slowest_contact, contact.peer, contact.total_took + took);
                             contact.finish();
                         }
+                        // The apply stopped at an entry that is not due yet (U1): the
+                        // peer sent what it holds and this node's storage is fine. No
+                        // backoff, no failed round: the window is pulled again on the
+                        // next tick and applies once the entry is due.
+                        Err(crate::protocol::ProtocolError::ClockStop(reason)) => {
+                            debug!(%peer, %reason, "sync round ended at an entry that is not due yet");
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
+                            contact.finish();
+                        }
                         // A peer being unreachable is the normal state of a
                         // cluster, not an error worth stopping for — but it is
                         // worth backing off, so a node that is not coming back
@@ -4494,6 +4504,62 @@ mod tests {
         // received: the collection's creation is an apply, and the refused
         // index is not.
         assert_eq!(seen.ddl_applied, 1, "the collection, not the refused index: {seen:?}");
+    }
+
+    /// U1's refusal is nobody's failure even if it surfaces as an error out of a pull: no backoff, no
+    /// failed round, nothing counted in `report.failed`, and the next tick pulls again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_that_ends_at_a_clock_stop_is_not_a_failure_and_is_pulled_again() {
+        const SECRET: &str = "a-loop-test-secret";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::transport::serve(Arc::clone(&a), listener, SECRET.into()));
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(Engine::open(&b_dir.path().join("kimmy.redb")).unwrap());
+        let b_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let stopping = crate::transport::test_hooks::ClockStoppingAfterApply::against(b.node_id());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![a_addr])], SECRET.into(), b_addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&b), config));
+
+        // Deterministic: one entry is written before each pull that is expected, and the next is written only
+        // once the hook has refused the previous one (the first pull needs no write: the creation is there). A pull happens only when the donor is ahead, so each
+        // write is exactly one pull; the wait is on that event, with a generous bound only to fail a hang.
+        // The donor already holds the collection's creation, so the first pull (and the first refusal) is that.
+        for expected in 1..=4usize {
+            if expected > 1 {
+                a.insert(&orders, bson::doc! { "_id": expected as i64 }).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while stopping.hits() < expected {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the next tick pulls again: pull {expected} never came"));
+        }
+        looping.abort();
+
+        let mut seen = RoundReport::default();
+        while let Ok(report) = rx.try_recv() {
+            seen.failed += report.failed;
+            seen.backing_off = seen.backing_off.max(report.backing_off);
+        }
+        assert!(
+            stopping.hits() >= 4,
+            "one refused pull for the creation and for each entry written"
+        );
+        assert_eq!(seen.failed, 0, "a clock stop is no failed round: {seen:?}");
+        assert_eq!(seen.backing_off, 0, "and no peer is backed off for it: {seen:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

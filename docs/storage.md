@@ -308,6 +308,14 @@ tombstones are kept; a background pass collects expired ones every
 data, however old — and the index entries were already removed when the delete
 was applied, so nothing is left referring to the collected key.
 
+**Clock skew bound.** `storage.max_clock_skew_secs` (default 300 s) is how far ahead of
+this member's own clock an entry or snapshot document of a collection with merge policy
+`field` may be stamped. A write from the far future would move the horizon that prunes delete
+records on every member that joined it, and a pruned delete cannot be brought back, so such an
+entry, or a state that holds one, is refused until it is due: it is not applied or witnessed, the
+window or snapshot page stops at it and is asked for again, and it applies once this member's clock
+has caught up to within the bound. The setting is local to the member and is not replicated.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is

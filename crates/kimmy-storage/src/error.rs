@@ -98,6 +98,20 @@ pub enum StorageError {
     )]
     CollectionPurging { db: String, name: String, id: kimmy_core::CollectionId },
 
+    /// A replicated entry or state of a `field` collection whose clock is more than the allowed
+    /// skew ahead of this member's physical clock (U1). Nothing was written and nothing was
+    /// witnessed: it applies once it is due. Not a fault of the peer or of this node, and never
+    /// to be skipped: the apply of a batch ends at it and a snapshot page that meets it is
+    /// rolled back whole (see [`crate::clock_bound`]).
+    #[error(
+        "refused until due: the {} of an entry from {} is {} ms past the allowed clock skew \
+         ahead of this member's clock",
+        .0.reason,
+        .0.origin.node,
+        .0.due_in_ms
+    )]
+    ClockRefused(Box<crate::clock_bound::ClockStop>),
+
     /// The store was refused before anything opened it for writing, and
     /// nothing in it was changed (ADR-190): a newer build wrote it, its
     /// sidecar is unreadable, or it could not be read. `kind` says which of

@@ -276,6 +276,13 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
     result
 }
 
+/// Hand the engine the clock skew bound (U1) from the configuration. Called once, right after the
+/// open and before the cluster is started, so that no round, snapshot or push applies a remote
+/// entry under the engine's 300 s default whatever the configuration says.
+fn apply_clock_bound(engine: &Engine, storage: &crate::config::StorageConfig) {
+    engine.set_max_clock_skew(Duration::from_secs(storage.max_clock_skew_secs));
+}
+
 /// Take the engine from its last owner and close it on this thread
 /// ([`Engine::close`]); `Err` with the reason it could not be.
 ///
@@ -852,6 +859,7 @@ async fn start_and_serve(
             .context("writing the replay floor")?;
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
+    apply_clock_bound(&engine, &config.storage);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
@@ -3421,6 +3429,31 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// U1's bound reaches the engine from the configuration: the value in the file, not the default.
+    #[test]
+    fn the_configured_clock_skew_reaches_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join(DATABASE_FILE)).unwrap();
+        assert_eq!(engine.clock_bound().skew_ms, 300_000, "premise: the default");
+        let storage = crate::config::StorageConfig { max_clock_skew_secs: 7, ..Default::default() };
+        super::apply_clock_bound(&engine, &storage);
+        assert_eq!(engine.clock_bound().skew_ms, 7_000, "the configured value reached the engine");
+    }
+
+    /// The bound is set before the cluster can apply a remote entry: right after the open, and
+    /// before `spawn_cluster` starts the replication listener and the sync loop. A source check, as
+    /// the open's is: a real start cannot be stopped between the two.
+    #[test]
+    fn the_clock_bound_is_set_before_the_cluster_is_spawned() {
+        let source = include_str!("node.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let open = production.find("Engine::open_with(&path, &options)").expect("the open");
+        let set =
+            production.find("apply_clock_bound(&engine, &config.storage);").expect("the call");
+        let spawn = production.find("let cluster = spawn_cluster(").expect("the spawn");
+        assert!(open < set && set < spawn, "open {open} < set {set} < spawn {spawn}");
+    }
+
     /// The open that returns says the rebuild completed, so an exit of this
     /// run before `settle` stops passing the decision to force on (the marker
     /// an exit writes is a function of whether the rebuild completed, B3 review

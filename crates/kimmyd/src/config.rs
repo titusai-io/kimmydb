@@ -559,6 +559,15 @@ pub struct StorageConfig {
     /// How much oplog history to keep for change-stream resumption and peer
     /// catch-up. A subscriber that lags past this gets an `invalidate`.
     pub oplog_retention_secs: u64,
+    /// How far ahead of this member's own clock, in seconds, an entry or snapshot document of a
+    /// collection with merge policy `field` may be stamped before this member refuses to apply it.
+    ///
+    /// A far-future write would move the horizon that prunes delete records on every member that
+    /// joins it, and a pruned delete cannot be brought back, so such an entry is refused by name
+    /// until this member's clock has caught up to within this bound, and applies then. A local
+    /// setting, not replicated. It also bounds the clock skew the tombstone retention is
+    /// expected to absorb. Collections with merge policy `document` are not affected.
+    pub max_clock_skew_secs: u64,
     /// Bound on the storage engine's page cache, in bytes.
     ///
     /// This is most of a node's resident memory. redb keeps up to this many
@@ -1357,6 +1366,7 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("/var/lib/kimmy"),
             tombstone_retention_secs: 24 * 60 * 60,
             oplog_retention_secs: 24 * 60 * 60,
+            max_clock_skew_secs: kimmy_storage::DEFAULT_MAX_CLOCK_SKEW_MS / 1000,
             cache_bytes: 256 * 1024 * 1024,
             // Frequent enough that disk use tracks retention rather than
             // sawtoothing, rare enough that the scan is not a background load.
@@ -1696,6 +1706,13 @@ impl Config {
         }
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
+        }
+
+        if self.storage.max_clock_skew_secs == 0 {
+            anyhow::bail!(
+                "storage.max_clock_skew_secs must be greater than zero; a bound of nothing \
+                 would refuse every entry from a member whose clock is a tick ahead of this one"
+            );
         }
 
         if self.storage.tombstone_retention_secs == 0 {
@@ -2397,6 +2414,17 @@ mod tests {
         cfg.storage.tombstone_retention_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn max_clock_skew_secs_defaults_to_300_and_zero_is_refused() {
+        assert_eq!(valid().storage.max_clock_skew_secs, 300, "max_clock_skew_secs defaults to 300");
+        let mut cfg = valid();
+        cfg.storage.max_clock_skew_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_clock_skew_secs"), "zero is refused by name: {err}");
+        cfg.storage.max_clock_skew_secs = 1;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
