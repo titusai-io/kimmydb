@@ -1828,6 +1828,27 @@ impl Engine {
         self.apply_field_in_txn(txn, coll, entry, key.to_vec(), id, Position::Hold)
     }
 
+    /// The floor a state taken into `coll` is held to: the later of the collection's incarnation floor and
+    /// the drop tombstones this member holds for it, the collection's and its database's, read in the
+    /// transaction that applies the state. The floor alone is set when a sweep of a late drop is done (or
+    /// when the collection is created over a tombstone), so a state that arrives while the sweep is still
+    /// under way would otherwise be taken in with the cells of the life the drop ended. A tombstone is
+    /// not strict, as the floor is not: a tie goes to the drop (ADR-236).
+    pub(crate) fn floor_of(
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+    ) -> Result<Option<kimmy_core::Hlc>> {
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let mut floor = coll.incarnation_floor;
+        for id in [coll.id, kimmy_core::database_drop_id(&coll.db)] {
+            if let Some(raw) = dropped.get(id.0)? {
+                let at = codec::decode_oplog_key(raw.value())?.hlc;
+                floor = Some(floor.map_or(at, |floor| floor.max(at)));
+            }
+        }
+        Ok(floor)
+    }
+
     fn apply_field_in_txn(
         &self,
         txn: &WriteTxn<'_>,
@@ -1837,7 +1858,20 @@ impl Engine {
         id: Option<DocId>,
         position: Position,
     ) -> Result<RemoteApplied> {
-        let other = field_write::load(entry.meta.as_deref())?;
+        let mut other = field_write::load(entry.meta.as_deref())?;
+        // The floor of the life this collection stands in: a state is cumulative, so one stamped above
+        // the floor can still carry the cells of the life before it, and those are history whatever
+        // the stamp of the state says. The one place every field entry and state passes, whatever
+        // brought it, so the pre-checks that judge it whole by its newest stamp stay as they are.
+        // A state with nothing left is no state: it is superseded, counted once, as the entry the
+        // whole-stamp check turns away is, and records no hole.
+        // The state this member holds is held to it too, before the join: a life of the life before the
+        // drop that is still held must not take part in the concurrent-first-insert rule against a life
+        // with a write after the drop, or it would win it and the write would be lost.
+        let floor = Self::floor_of(txn, coll)?;
+        if floor.is_some_and(|floor| other.drop_at_or_below(floor)) && other.is_bare() {
+            return self.field_entry_kept(txn, entry, position);
+        }
         // A state applied as state has no entry behind it: what it holds of every writer is a hole in
         // what this member can serve, recorded in the transaction that applies it (a page that is rolled
         // back leaves none). Conservative: a peer behind it is sent to a snapshot even if this member
@@ -1854,12 +1888,17 @@ impl Engine {
                 Some(raw) => Some(codec::decode_doc_record_with_meta(raw.value())?),
                 None => None,
             };
-            let prior = match &existing {
+            let mut prior = match &existing {
                 Some(record) => Some(field_write::load(record.meta.as_deref())?),
                 None => None,
             };
+            // What thinning the held state drops is written back even where the join moves nothing.
+            let prior_thinned = match (prior.as_mut(), floor) {
+                (Some(prior), Some(floor)) => prior.drop_at_or_below(floor),
+                _ => false,
+            };
             let joined = field_write::join(self.field_writer(coll)?, prior, &other)?;
-            if !joined.changed && existing.is_some() {
+            if !joined.changed && !prior_thinned && existing.is_some() {
                 drop(docs);
                 return self.field_entry_kept(txn, entry, position);
             }
