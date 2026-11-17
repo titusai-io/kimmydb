@@ -1286,7 +1286,40 @@ impl Engine {
     ///
     /// `progress` is the receiver's, carried between pages and rounds; a
     /// page applied under it is never asked for again.
+    ///
+    /// **A document whose clock is past the bound (U1) stops the snapshot here, never skips.** The page
+    /// is one transaction, so the refusal rolls the whole page back: nothing on it is applied, `progress`
+    /// does not move and no coverage is granted, and the answer is `Ok` with
+    /// [`SnapshotApplied::clock_refused`] set, not an error, because the peer is not at fault. The same
+    /// page is asked for again in a later round and applies once the document is due. Skipping the
+    /// document instead would let the completed snapshot's coverage mark its origin covered, and it
+    /// would never be sent again.
     pub fn apply_snapshot_page(
+        &self,
+        peer: NodeId,
+        progress: &mut SnapshotProgress,
+        page: &SnapshotPage,
+    ) -> Result<SnapshotApplied> {
+        match self.apply_snapshot_page_inner(peer, progress, page) {
+            // The one place the refusal is turned into the page's stop: nothing else matches it.
+            Err(crate::StorageError::ClockRefused(stop)) => {
+                self.count_clock_refused(&stop.origin, 1);
+                warn!(
+                    origin = %stop.origin.node,
+                    reason = %stop.reason,
+                    stamp = ?stop.stamp,
+                    due_in_ms = stop.due_in_ms,
+                    "refused a snapshot page: a document's clock is more than max_clock_skew_secs ahead of \
+                     this member's clock; the page was rolled back whole, the snapshot did not move, and \
+                     it is asked for again and applies once the document is due"
+                );
+                Ok(SnapshotApplied { clock_refused: Some(*stop), ..Default::default() })
+            }
+            other => other,
+        }
+    }
+
+    fn apply_snapshot_page_inner(
         &self,
         peer: NodeId,
         progress: &mut SnapshotProgress,
@@ -1982,6 +2015,12 @@ impl Engine {
                 }
                 continue;
             };
+            // U1: a carried delete of a field collection has no state, only a stamp, and it is bounded
+            // like any entry of one, whether it is applied over a live document or recorded as a bare
+            // tombstone: the page stops here, as it does at a document.
+            if collection.merge_policy == kimmy_core::MergePolicy::Field {
+                self.refuse_stamp_if_far_future(&tombstone.stamp)?;
+            }
 
             let existing = {
                 let docs = txn.open_table(tables::DOCS)?;

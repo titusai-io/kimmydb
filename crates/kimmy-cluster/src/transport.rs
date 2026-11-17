@@ -6465,6 +6465,21 @@ where
         // snapshot ends here for this round, planned as it was, and asks for
         // the same page once the drop purger is done: pulling on would only
         // be refused the same way.
+        // A document of a field collection whose clock is past the bound (U1): the page was rolled back
+        // whole and the snapshot did not move. A stop, never a skip: it is asked for again next round
+        // from the same cursor and applies once the document is due. The peer is not at fault.
+        if let Some(stop) = &applied.clock_refused {
+            outcome.clock_refused += 1;
+            outcome.clock_refused_at = Some(stop.clone());
+            stalls.applied.clock_refused += 1;
+            stalls.snapshot_waiting(node);
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
+        }
         if let Some(waiting) = applied.purge_pending {
             outcome.purge_pending += 1;
             stalls.applied.purge_pending += 1;
