@@ -129,6 +129,12 @@ mod rewind_field_tests;
 mod floor_filter_tests;
 
 #[cfg(test)]
+mod sweep_rewrite_tests;
+
+#[cfg(test)]
+mod sweep_resume_tests;
+
+#[cfg(test)]
 mod state_hold_tests;
 
 #[cfg(test)]

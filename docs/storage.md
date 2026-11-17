@@ -360,6 +360,15 @@ life with a write after the drop. A write after the drop into a life that lost a
 member knew of the drop is lost at that member, as it would be without the drop, and is reported; it survives
 wherever the floor was known first, and the members converge to it.
 
+**The sweep of a late drop thins a `field` record that stays.** A record of a `field` collection stamped after the
+drop is a write after it and is kept, but its state is cumulative and can still carry cells of the life before.
+The sweep reads such a record, drops what is stamped at or below the drop, and writes the record again with the
+state that is left, under the stamp it had: a live document is rendered again from it and its index entries move,
+a document the state no longer keeps alive becomes a tombstone carrying it, and a record with nothing after the
+drop is buried as one at or below it is. It reads the drop's own stamp, not the collection's floor, which the
+sweep sets last. Like the removals of the sweep it publishes nothing: it is this member's own state coming to
+what every member holds. A record with nothing to thin is not written, so a second pass writes nothing.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is
