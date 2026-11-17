@@ -1835,6 +1835,11 @@ mod tests {
             .await;
     }
 
+    /// The push deadline of [`the_driver_set_stays_bounded`]: far above any load the
+    /// suite runs under, so a loaded runner never turns one of its 200 confirmations
+    /// into a deadline failure. The deadline is not what that test measures.
+    const LOAD_PROOF: Duration = Duration::from_secs(120);
+
     /// How many confirmations [`the_driver_set_stays_bounded`] makes: enough
     /// that a prune which misses only now and then still leaves the set above
     /// the bound of 2 at some round, not only one that never prunes.
@@ -1850,13 +1855,14 @@ mod tests {
     /// set still holds at the next look is what the enqueue's own prune left,
     /// and that is what is asserted: without the prune the set grows by one
     /// per confirmation. Each answer is awaited without a deadline of the
-    /// test's own (one of 200 confirmations, each under a 10 s deadline,
-    /// outran it under a full-workspace run): the set's size is the property,
-    /// not the speed.
+    /// test's own, and under a push deadline ([`LOAD_PROOF`]) far above the
+    /// load (one of 200 confirmations, each under `quick()`'s 10 s, outran it
+    /// under a full-workspace run): the set's size is the property, not the
+    /// speed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_driver_set_stays_bounded() {
         let b = member().await;
-        let a = pusher_for(&b, quick());
+        let a = pusher_for(&b, ConfirmConfig { request_timeout: LOAD_PROOF, ..quick() });
         let node = b.engine.node_id();
         let idle = Arc::strong_count(&a.confirmer);
         let mut peak = 0;
