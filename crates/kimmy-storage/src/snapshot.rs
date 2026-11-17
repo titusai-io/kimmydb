@@ -424,6 +424,11 @@ pub struct SnapshotDoc {
     /// thing the cluster ever sends.
     #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
+    /// The merged state of a document of a `field` collection, in the compact form: what the receiver
+    /// joins (the body is the document that state renders). `None` for a `document` collection's.
+    /// Left out of the wire form when `None`, so a page of document collections is the bytes it was.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub meta: Option<Vec<u8>>,
 }
 
 /// One deleted document, as the sender's walk found it: by **key**, because a
@@ -1153,7 +1158,7 @@ impl Engine {
                         // worth end here rather than with an empty page after it.
                         return Ok((out, deleted, resumed(&resume)));
                     }
-                    let record = codec::decode_doc_record(value.value())?;
+                    let record = codec::decode_doc_record_with_meta(value.value())?;
                     // A tombstone travels by KEY (ADR-167): it has no `_id` to
                     // recover, so it cannot be a `SnapshotDoc`, and a receiver
                     // below this node's horizon may well hold the document.
@@ -1172,12 +1177,16 @@ impl Engine {
                             Some(value) => DocId::try_from_bson(value)?,
                             None => continue,
                         };
-                        let bytes = record.body.len() + id_wire_len(&id) + DOCUMENT_OVERHEAD;
+                        let bytes = record.body.len()
+                            + record.meta.as_ref().map_or(0, Vec::len)
+                            + id_wire_len(&id)
+                            + DOCUMENT_OVERHEAD;
                         let document = SnapshotDoc {
                             collection: CollectionId(collection),
                             id,
                             stamp: record.stamp,
                             body: Some(record.body),
+                            meta: record.meta,
                         };
                         (bytes, PageRow::Document(document))
                     };
@@ -1256,47 +1265,6 @@ impl Engine {
         Ok(waits)
     }
 
-    /// `page` without the documents of collections with merge policy `field`, which cannot be
-    /// applied yet (Step 3). Counted, and named in one log line for the page.
-    fn without_field_documents(&self, page: &SnapshotPage) -> Result<SnapshotPage> {
-        let announced: std::collections::BTreeSet<CollectionId> = page
-            .collections
-            .iter()
-            .filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
-            .map(|c| CollectionId::derive(&c.db, &c.name))
-            .collect();
-        let mut kept = Vec::with_capacity(page.documents.len());
-        let mut refused = 0u64;
-        let mut named: Vec<String> = Vec::new();
-        for doc in &page.documents {
-            let local = self.collection_by_id(doc.collection)?;
-            let field = announced.contains(&doc.collection)
-                || local.as_ref().is_some_and(|c| c.merge_policy == kimmy_core::MergePolicy::Field);
-            if !field {
-                kept.push(doc.clone());
-                continue;
-            }
-            refused += 1;
-            let name = local.map_or_else(
-                || format!("collection {}", doc.collection.0),
-                |c| format!("{}.{}", c.db, c.name),
-            );
-            if !named.contains(&name) {
-                named.push(name);
-            }
-        }
-        if refused == 0 {
-            return Ok(page.clone());
-        }
-        self.count_field_replication_refused(refused);
-        tracing::warn!(
-            entries = refused,
-            collections = %named.join(", "),
-            "refused snapshot documents for collections with merge policy `field`: their replication is not built yet; the rest of the page was applied"
-        );
-        Ok(SnapshotPage { documents: kept, ..page.clone() })
-    }
-
     /// Apply one page of a peer's snapshot, and move `progress` past it.
     ///
     /// The page's documents are one transaction: every one that wins
@@ -1322,11 +1290,6 @@ impl Engine {
         // every carried delete's key in the stored form, which is all any path
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
-        // A document of a `field` collection is a merge state the receiver cannot apply until
-        // Step 3: those documents are left out of the page and counted, once per page in the log,
-        // and the rest of the page is applied and the cursor moves on. Failing the page would
-        // hold the whole snapshot at this page and stall every other collection behind it.
-        let page = &self.without_field_documents(page)?;
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
@@ -1527,7 +1490,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
-                    meta: None,
+                    meta: document.meta.clone(),
                 };
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
@@ -1779,7 +1742,7 @@ impl Engine {
                     collection: collection.id,
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
-                    meta: None,
+                    meta: document.meta.clone(),
                 };
                 if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
@@ -5069,6 +5032,7 @@ mod tests {
             id: DocId::Int64(key),
             stamp: Stamp::new(Hlc::new(wall, 0), high, Epoch::ZERO),
             body: Some(bson::serialize_to_vec(&doc! { "_id": key }).unwrap()),
+            meta: None,
         };
         let page = SnapshotPage {
             collections: Vec::new(),
@@ -5562,6 +5526,7 @@ mod tests {
                     a.epoch(),
                 ),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 424_242, "v": 2 }).unwrap()),
+                meta: None,
             }],
             next: None,
             versions: VersionVector::new(),
@@ -7735,6 +7700,7 @@ mod tests {
             collection: cb.id,
             id: DocId::Int64(2),
             body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            meta: None,
             stamp: older,
         });
         let cc = c.get_collection("shop", "orders").unwrap();

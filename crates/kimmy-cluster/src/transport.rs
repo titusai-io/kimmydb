@@ -8731,6 +8731,7 @@ mod tests {
                 id: kimmy_core::DocId::Int64(wall as i64),
                 stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin, Epoch::ZERO),
                 body: Some(bson::serialize_to_vec(&bson::doc! { "_id": wall as i64 }).unwrap()),
+                meta: None,
             })
             .collect();
         SnapshotPage {

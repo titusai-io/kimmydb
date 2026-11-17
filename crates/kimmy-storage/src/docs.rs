@@ -1608,9 +1608,11 @@ impl Engine {
             return Ok(RemoteApplied::Superseded { released: false });
         };
         if coll.merge_policy == MergePolicy::Field {
-            // A snapshot document of a field collection is state without an entry: its apply is
-            // the snapshot work of Step 3 (item 3), and until then it is refused by name.
-            if position == Position::Hold {
+            // A snapshot document of a field collection is state without an entry: it joins, and
+            // no oplog entry or held mark is written for it (it is not history). A carried delete
+            // arrives with no merge state to join: its apply is item 3.2, and until then it is
+            // refused by name rather than dropped.
+            if position == Position::Hold && entry.meta.is_none() {
                 return Err(refuse_field_replication());
             }
             return self.apply_field_in_txn(txn, coll, entry, id, position);
@@ -1825,7 +1827,12 @@ impl Engine {
         let (violations, newly_multikey, filings) =
             index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
-        let released = crate::engine::append_oplog_at(txn, entry, position)?;
+        // A snapshot document is state, not history: no entry, no held mark.
+        let released = if position == Position::Hold {
+            false
+        } else {
+            crate::engine::append_oplog_at(txn, entry, position)?
+        };
         self.witness(&entry.stamp);
         let unkeyed = self.append_unkeyed(txn, unkeyed_details(coll.id, &id, &filings))?;
         Ok(RemoteApplied::Applied { id, violations, unkeyed, released })
@@ -1839,7 +1846,9 @@ impl Engine {
         entry: &OplogEntry,
         position: Position,
     ) -> Result<RemoteApplied> {
-        let released = if crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
+        let released = if position == Position::Hold {
+            false
+        } else if crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
             crate::engine::append_oplog_at(txn, entry, position)?
         } else {
             position == Position::InWindow

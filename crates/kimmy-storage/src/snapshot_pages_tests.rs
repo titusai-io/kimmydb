@@ -415,6 +415,7 @@ fn the_row_overheads_bound_the_encoding() {
                 id: id.clone(),
                 stamp,
                 body: Some(body.clone()),
+                meta: None,
             })
             .collect();
         let page = SnapshotPage { documents, ..bare.clone() };
