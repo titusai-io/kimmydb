@@ -158,6 +158,34 @@ fn the_bound_applies_inside_and_refuses_past_it() {
     assert_eq!(outcome.clock_refused, 1, "past the bound is refused: {outcome:?}");
 }
 
+/// The bound is the receiver's PHYSICAL clock at apply, not its logical one (Chris's ruling). An honest entry 200 s
+/// ahead, inside the bound, pushes the receiver's logical clock 200 s past its physical clock when it is applied; an
+/// entry 400 s ahead is then past the bound by the physical clock and only 200 s ahead of the logical one. Judged
+/// against the logical clock it would be let in, and the horizon it carries would move for every member that joined it.
+#[test]
+fn the_bound_is_judged_against_the_physical_clock_and_not_the_hlc() {
+    let f = fixture(MergePolicy::Field);
+    let honest = f.write(1);
+    let mut inside = honest.clone();
+    inside.stamp = far(physical_now_ms() + 200_000, &honest.stamp);
+    let outcome = f.b.apply_batch(std::slice::from_ref(&inside)).unwrap();
+    assert_eq!(
+        (outcome.applied, outcome.clock_refused),
+        (1, 0),
+        "premise: inside the bound applies: {outcome:?}"
+    );
+
+    let second = f.write(2);
+    let mut beyond = second.clone();
+    beyond.stamp = far(physical_now_ms() + 400_000, &second.stamp);
+    let outcome = f.b.apply_batch(std::slice::from_ref(&beyond)).unwrap();
+
+    assert_eq!(
+        outcome.clock_refused, 1,
+        "the bound is judged against the physical clock, not the HLC: {outcome:?}"
+    );
+}
+
 #[test]
 fn a_refused_entry_applies_once_it_is_due() {
     let f = fixture(MergePolicy::Field);
