@@ -838,6 +838,48 @@ async fn a_snapshot_over_a_floor_brings_the_cells_above_it_and_none_of_the_life_
     );
 }
 
+/// Step 3, item (3.4b): a member that wrote into a field document after a drop it had not heard of sheds the
+/// cells of the life before when it takes the drop. A holds X = {a}; B takes it; A drops the collection and
+/// creates it again; B, which has not heard, writes X.b above the drop, so its record holds both. B then takes
+/// the drop: the record is stamped after it and stays, with only what is stamped after the drop.
+#[tokio::test]
+async fn a_member_that_wrote_after_a_drop_sheds_the_life_before_when_it_takes_the_drop() {
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1, "a": 1 }).unwrap();
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection arrives");
+    assert!(b.engine.get(&cb, &x).unwrap().is_some(), "premise: B holds X");
+
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    a.engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    b.engine.replace(&cb, &x, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
+    assert_eq!(
+        b.engine.get(&cb, &x).unwrap(),
+        Some(doc! { "_id": 1, "a": 1, "b": 2 }),
+        "premise: B holds the cell of the life before and the write after the drop"
+    );
+
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the life stands on B");
+    assert!(cb.incarnation_floor.is_some(), "premise: B took the drop and its sweep finished");
+    assert_eq!(
+        b.engine.get(&cb, &x).unwrap(),
+        Some(doc! { "_id": 1, "b": 2 }),
+        "the cell of the life before the drop did not stay in the record the member wrote after it"
+    );
+}
+
 #[tokio::test]
 async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     // The test above passes for a collection whose derived id happens to sit
