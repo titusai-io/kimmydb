@@ -241,6 +241,12 @@ pub struct RoundReport {
     /// place until the purge is done; nothing is missing, so no repair is
     /// planned.
     pub entries_skipped_purge_pending: usize,
+    /// Batches the rounds in this tick stopped short at an entry of a field collection whose clock is
+    /// more than `max_clock_skew_secs` ahead of this node's, and snapshot pages stopped at such a
+    /// document — `SyncOutcome::clock_refused`, summed (U1). A counter. Each one is a window or page
+    /// re-served from the same place until the entry is due; nothing is missing, so no repair is
+    /// planned.
+    pub entries_skipped_clock_refused: usize,
     /// Pulls in this tick spent on a *count* repair against a peer (ADR-148):
     /// re-serving its oplog from below this node's position, or pulling its
     /// snapshot, because the check confirmed a divergence against it or a
@@ -1402,6 +1408,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     report.entries_skipped_unknown_collection += applied.unknown_collection;
                     report.entries_skipped_beyond_advertised += applied.deferred;
                     report.entries_skipped_purge_pending += applied.purge_pending;
+                    report.entries_skipped_clock_refused += applied.clock_refused;
                     tick_reached.extend(stalls.take_reached_after(&pulled));
                     match pulled {
                         Ok(outcome) if outcome.horizon_deferred => {

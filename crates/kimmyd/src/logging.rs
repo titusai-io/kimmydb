@@ -2228,6 +2228,13 @@ impl TelemetryGuard {
             "Sync batches stopped at a replicated creation waiting for this node's drop purger; re-served from the same place until the purge is done.",
             sync_entries_skipped_purge_pending
         );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entries_skipped.clock_refused",
+            "{batch}",
+            "Sync batches and snapshot pages stopped at an entry whose clock is past max_clock_skew_secs; re-served from the same place until the entry is due.",
+            sync_entries_skipped_clock_refused
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
@@ -2662,6 +2669,16 @@ fn meter_provider(cfg: &TelemetryConfig, resource: Resource) -> Result<SdkMeterP
 /// instruments above this list; an empty list says the series has none.
 #[cfg(test)]
 const NOT_BRIDGED: &[(&str, &str, &[&str])] = &[
+    (
+        "kimmy_sync_clock_refused_total",
+        "Labelled by the origin (node id) of the entry, a label that comes from a peer's \
+         stamp and is capped at 64 names on `/metrics`; every instrument on this bridge \
+         is a fixed scalar read from a `Copy` snapshot, so a per-origin family would need \
+         its own attributes and its own cardinality bound here. The total is bridged as \
+         `kimmy.sync.entries_skipped.clock_refused` (the same stops, summed), which is \
+         what a collector alerts on; the origin is on the scrape.",
+        &[],
+    ),
     (
         "kimmy_request_duration_seconds",
         "A histogram. Every instrument on this bridge is observable (async): a \

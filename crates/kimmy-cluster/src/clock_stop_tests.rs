@@ -106,3 +106,43 @@ async fn a_far_future_field_document_in_a_snapshot_page_is_not_held_or_covered_a
     assert_eq!(db, doc! { "_id": 1 });
     assert_eq!(vb, va, "with the donor's version identity");
 }
+
+/// The round loop reports a refused window in `entries_skipped_clock_refused` (the metric's source), and the engine
+/// names the origin: the two things an operator reads on `/metrics`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_round_report_and_the_engine_count_a_refused_window_by_origin() {
+    use crate::discovery::SeedSource;
+    use crate::peers::{ReplicationConfig, RoundReport, replicate};
+
+    let (a, a_addr, _a_dir) = donor().await;
+    let (b, _b_dir) = engine();
+    b.set_clock_offset_for_tests(-(SKEW_MS + 10_000));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let b_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a_addr])], SECRET.into(), b_addr);
+    config.sync_interval = std::time::Duration::from_millis(100);
+    config.discovery_interval = std::time::Duration::from_millis(100);
+    config.on_round = Some(std::sync::Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(std::sync::Arc::clone(&b), config));
+
+    let reported = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let report = rx.recv().await.expect("the loop keeps reporting");
+            if report.entries_skipped_clock_refused > 0 {
+                return report;
+            }
+        }
+    })
+    .await
+    .expect("a round reported the refused window");
+    looping.abort();
+
+    assert_eq!(reported.failed, 0, "a clock stop is no failed round: {reported:?}");
+    let counts = b.clock_refusals();
+    assert_eq!(counts.len(), 1, "one origin named: {counts:?}");
+    assert_eq!(counts[0].0, a.node_id().to_string(), "the donor's node id");
+    assert!(counts[0].1 >= 1);
+}

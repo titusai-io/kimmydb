@@ -72,7 +72,7 @@ const EPOCH_ORIGINS_HELP: &str = "Origins (node and epoch) in this member's own 
 /// bridge's export callback — each take a fresh reading so neither reports a
 /// window the other measured. Every field is a level or a monotonic count,
 /// so a reading taken at read time is exact.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StorageReadings {
     pub databases: u64,
     pub collections: u64,
@@ -170,6 +170,9 @@ pub struct StorageReadings {
     pub held_marks_released: u64,
     /// Entries held as state right now (`Engine::held_marks`, ADR-160).
     pub held_marks: u64,
+    /// What U1 has refused since start, by the origin's node id in hex: at most 64 named and the
+    /// rest summed under `other` (`Engine::clock_refusals`). Not a level: a monotonic count.
+    pub clock_refusals: Vec<(String, u64)>,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -582,6 +585,7 @@ pub struct MetricsSnapshot {
     pub sync_entries_skipped_unknown_collection: u64,
     pub sync_entries_skipped_beyond_advertised: u64,
     pub sync_entries_skipped_purge_pending: u64,
+    pub sync_entries_skipped_clock_refused: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -722,6 +726,7 @@ pub struct Metrics {
     sync_entries_skipped_unknown_collection: AtomicU64,
     sync_entries_skipped_beyond_advertised: AtomicU64,
     sync_entries_skipped_purge_pending: AtomicU64,
+    sync_entries_skipped_clock_refused: AtomicU64,
     sync_repair_rounds: AtomicU64,
     sync_reset_ticks: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
@@ -843,6 +848,7 @@ impl Default for Metrics {
             sync_entries_skipped_unknown_collection: AtomicU64::new(0),
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
             sync_entries_skipped_purge_pending: AtomicU64::new(0),
+            sync_entries_skipped_clock_refused: AtomicU64::new(0),
             sync_repair_rounds: AtomicU64::new(0),
             sync_reset_ticks: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
@@ -1123,6 +1129,7 @@ impl Metrics {
             round.entries_skipped_unknown_collection as u64,
             round.entries_skipped_beyond_advertised as u64,
             round.entries_skipped_purge_pending as u64,
+            round.entries_skipped_clock_refused as u64,
         );
         self.sync_repair_rounds.fetch_add(round.repair_rounds as u64, Ordering::Relaxed);
         self.sync_reset_ticks.fetch_add(u64::from(round.reset), Ordering::Relaxed);
@@ -1134,17 +1141,20 @@ impl Metrics {
     /// [`Self::record_ddl_refused`] gives: `unknown_collection` batches
     /// stopped at a collection this node lacks, `beyond_advertised` entries
     /// left for a later window, `purge_pending` batches stopped at a creation
-    /// waiting for the drop purger (ADR-189).
+    /// waiting for the drop purger (ADR-189), `clock_refused` batches and snapshot pages stopped at an
+    /// entry or document whose clock is past `max_clock_skew_secs` (U1).
     pub fn record_entries_skipped(
         &self,
         unknown_collection: u64,
         beyond_advertised: u64,
         purge_pending: u64,
+        clock_refused: u64,
     ) {
         self.sync_entries_skipped_unknown_collection
             .fetch_add(unknown_collection, Ordering::Relaxed);
         self.sync_entries_skipped_beyond_advertised.fetch_add(beyond_advertised, Ordering::Relaxed);
         self.sync_entries_skipped_purge_pending.fetch_add(purge_pending, Ordering::Relaxed);
+        self.sync_entries_skipped_clock_refused.fetch_add(clock_refused, Ordering::Relaxed);
     }
 
     /// Count schema changes a peer pushed to this node that it could not
@@ -1176,6 +1186,7 @@ impl Metrics {
             outcome.unknown_collection as u64,
             outcome.deferred as u64,
             outcome.purge_pending as u64,
+            outcome.clock_refused as u64,
         );
     }
 
@@ -1579,6 +1590,7 @@ impl Metrics {
             sync_entries_skipped_beyond_advertised: self
                 .get(&self.sync_entries_skipped_beyond_advertised),
             sync_entries_skipped_purge_pending: self.get(&self.sync_entries_skipped_purge_pending),
+            sync_entries_skipped_clock_refused: self.get(&self.sync_entries_skipped_clock_refused),
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
@@ -2014,11 +2026,15 @@ impl Metrics {
              # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
-             # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation, and snapshot pages that would create a collection, of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned and a repair waiting on one is not abandoned, the window or page is asked for again from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design.\n\
+             # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation, and snapshot pages that would create a collection, of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned and a repair waiting on one is not abandoned, the window or page is asked for again from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design. clock_refused: batches stopped at an entry of a field collection, and snapshot pages stopped at a document, whose clock is more than max_clock_skew_secs ahead of this node's (U1); nothing is missing, so no repair is planned, nothing stamped after it is taken meanwhile, and the window or page is asked for again from the same place and applies once the entry is due; see kimmy_sync_clock_refused_total for the origin.\n\
              # TYPE kimmy_sync_entries_skipped_total counter\n\
              kimmy_sync_entries_skipped_total{{reason=\"unknown_collection\"}} {sync_skipped_unknown}\n\
              kimmy_sync_entries_skipped_total{{reason=\"beyond_advertised\"}} {sync_skipped_beyond}\n\
              kimmy_sync_entries_skipped_total{{reason=\"purge_pending\"}} {sync_skipped_purge}\n\
+             kimmy_sync_entries_skipped_total{{reason=\"clock_refused\"}} {sync_skipped_clock}\n\
+             # HELP kimmy_sync_clock_refused_total Replicated entries and snapshot documents of a field collection this node refused until due because their clock is more than max_clock_skew_secs ahead of its own (U1), by the origin (node id) that sent them. One per stopped batch or page, counted once its commit is final; at most 64 origins are named and the rest are summed under origin=\"other\", because the label comes from a peer's stamp. A refused entry is neither applied nor witnessed and applies once it is due: a rising value names a member whose clock is ahead of this one by more than the bound, or a write from the future.\n\
+             # TYPE kimmy_sync_clock_refused_total counter\n\
+             {sync_clock_refused_lines}\
              # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.\n\
              # TYPE kimmy_sync_held_marks_released_total counter\n\
              kimmy_sync_held_marks_released_total {sync_held_released}\n\
@@ -2248,6 +2264,20 @@ impl Metrics {
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
             sync_skipped_purge = self.get(&self.sync_entries_skipped_purge_pending),
+            sync_skipped_clock = self.get(&self.sync_entries_skipped_clock_refused),
+            // One sample per origin the engine names; `origin="other"` alone, at zero, before anything
+            // has been refused, so the series always exists and a rate over it is defined.
+            sync_clock_refused_lines = if readings.clock_refusals.is_empty() {
+                "kimmy_sync_clock_refused_total{origin=\"other\"} 0\n".to_string()
+            } else {
+                readings
+                    .clock_refusals
+                    .iter()
+                    .map(|(origin, n)| {
+                        format!("kimmy_sync_clock_refused_total{{origin=\"{origin}\"}} {n}\n")
+                    })
+                    .collect::<String>()
+            },
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
@@ -3022,6 +3052,7 @@ mod tests {
             entries_skipped_unknown_collection: 72,
             entries_skipped_beyond_advertised: 74,
             entries_skipped_purge_pending: 77,
+            entries_skipped_clock_refused: 82,
             repair_rounds: 76,
             reset: true,
             early_retry: false,
@@ -3069,6 +3100,7 @@ mod tests {
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
             entries_skipped_purge_pending: 1,
+            entries_skipped_clock_refused: 0,
             repair_rounds: 1,
             reset: false,
             early_retry: false,
@@ -3249,6 +3281,10 @@ mod tests {
             writer_hold_max_us: 52_500_000,
             held_marks_released: 53,
             held_marks: 54,
+            clock_refusals: vec![
+                ("01010101010101010101010101010101".to_string(), 94),
+                ("other".to_string(), 95),
+            ],
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -4003,11 +4039,16 @@ kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"form
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
-# HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation, and snapshot pages that would create a collection, of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned and a repair waiting on one is not abandoned, the window or page is asked for again from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design.
+# HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation, and snapshot pages that would create a collection, of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned and a repair waiting on one is not abandoned, the window or page is asked for again from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design. clock_refused: batches stopped at an entry of a field collection, and snapshot pages stopped at a document, whose clock is more than max_clock_skew_secs ahead of this node's (U1); nothing is missing, so no repair is planned, nothing stamped after it is taken meanwhile, and the window or page is asked for again from the same place and applies once the entry is due; see kimmy_sync_clock_refused_total for the origin.
 # TYPE kimmy_sync_entries_skipped_total counter
 kimmy_sync_entries_skipped_total{reason=\"unknown_collection\"} 73
 kimmy_sync_entries_skipped_total{reason=\"beyond_advertised\"} 75
 kimmy_sync_entries_skipped_total{reason=\"purge_pending\"} 78
+kimmy_sync_entries_skipped_total{reason=\"clock_refused\"} 82
+# HELP kimmy_sync_clock_refused_total Replicated entries and snapshot documents of a field collection this node refused until due because their clock is more than max_clock_skew_secs ahead of its own (U1), by the origin (node id) that sent them. One per stopped batch or page, counted once its commit is final; at most 64 origins are named and the rest are summed under origin=\"other\", because the label comes from a peer's stamp. A refused entry is neither applied nor witnessed and applies once it is due: a rising value names a member whose clock is ahead of this one by more than the bound, or a write from the future.
+# TYPE kimmy_sync_clock_refused_total counter
+kimmy_sync_clock_refused_total{origin=\"01010101010101010101010101010101\"} 94
+kimmy_sync_clock_refused_total{origin=\"other\"} 95
 # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.
 # TYPE kimmy_sync_held_marks_released_total counter
 kimmy_sync_held_marks_released_total 53
@@ -4686,6 +4727,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_sync_entries_skipped_total{{reason=\"purge_pending\"}} {}\n",
             s.sync_entries_skipped_purge_pending
         ));
+        expect(&format!(
+            "kimmy_sync_entries_skipped_total{{reason=\"clock_refused\"}} {}\n",
+            s.sync_entries_skipped_clock_refused
+        ));
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
         expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
@@ -5020,8 +5065,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // decide them, went with ADR-238.)
         assert_eq!(
             samples,
+            // Since U1, the skipped-entries series for `clock_refused` and the one `origin="other"`
+            // sample of `kimmy_sync_clock_refused_total` that exists before any origin is named.
+            2
             // Since Q7 Step 1, `kimmy_epoch_origins`.
-            1 + 108 + 6 + 17
+            + 1 + 108 + 6 + 17
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT
@@ -5253,6 +5301,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             unknown_collection: 1,
             deferred: 1,
             purge_pending: 1,
+            clock_refused: 1,
             ..Default::default()
         });
         let s = m.snapshot();
@@ -5264,10 +5313,40 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             (
                 s.sync_entries_skipped_unknown_collection,
                 s.sync_entries_skipped_beyond_advertised,
-                s.sync_entries_skipped_purge_pending
+                s.sync_entries_skipped_purge_pending,
+                s.sync_entries_skipped_clock_refused
             ),
-            (1, 1, 1)
+            (1, 1, 1, 1)
         );
+    }
+
+    /// U1: a pulled round's stops and a pushed window's stops land on one skipped-entries series, and the engine's
+    /// per-origin count is rendered by origin, with `origin="other"` present before anything is refused.
+    #[test]
+    fn clock_stops_are_counted_on_the_skipped_series_and_by_origin() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(
+            empty.contains("kimmy_sync_clock_refused_total{origin=\"other\"} 0\n"),
+            "the series exists before anything is refused"
+        );
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            entries_skipped_clock_refused: 3,
+            ..Default::default()
+        });
+        m.record_pushed(&kimmy_storage::SyncOutcome { clock_refused: 2, ..Default::default() });
+        let readings = StorageReadings {
+            clock_refusals: vec![("ab".to_string(), 4), ("other".to_string(), 6)],
+            ..Default::default()
+        };
+        let out = m.render_with(&readings);
+        assert!(
+            out.contains("kimmy_sync_entries_skipped_total{reason=\"clock_refused\"} 5\n"),
+            "a round's and a push's clock stops are on the skipped series: {out}"
+        );
+        assert!(out.contains("kimmy_sync_clock_refused_total{origin=\"ab\"} 4\n"));
+        assert!(out.contains("kimmy_sync_clock_refused_total{origin=\"other\"} 6\n"));
+        assert!(!out.contains("kimmy_sync_clock_refused_total{origin=\"other\"} 0\n"));
     }
 
     #[test]
@@ -5311,6 +5390,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
+            entries_skipped_clock_refused: 0,
             repair_rounds: 0,
             reset: false,
             early_retry: false,
@@ -5351,6 +5431,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
+            entries_skipped_clock_refused: 0,
             repair_rounds: 0,
             reset: false,
             early_retry: false,
@@ -5582,6 +5663,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
+            entries_skipped_clock_refused: 0,
             repair_rounds: 0,
             reset: false,
             early_retry: false,

@@ -12071,6 +12071,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_entries_skipped_total",
+        "kimmy_sync_entries_skipped_total",
+        // Since U1: the one `origin="other"` sample of the per-origin refusal family, before any origin is named.
+        "kimmy_sync_clock_refused_total",
         "kimmy_sync_held_marks_released_total",
         "kimmy_sync_held_marks",
         "kimmy_sync_repair_rounds_total",
