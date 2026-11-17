@@ -131,6 +131,19 @@ impl Engine {
                 collections.insert(meta.id.0, meta);
             }
         }
+        // A `field` collection's state at the target is the join of the merge states its entries carry,
+        // which is not built yet; the route below puts back a body with no merge state, a record the
+        // collection cannot read. Refused by name, before anything is read or written.
+        if let Some(field) =
+            collections.values().find(|meta| meta.merge_policy == kimmy_core::MergePolicy::Field)
+        {
+            return Err(StorageError::Core(kimmy_core::Error::Unsupported(format!(
+                "rewinding to a point in time is not built yet for a collection with merge policy \
+                 `field` ({}.{}): the rewind is refused rather than put back a record with no merge \
+                 state",
+                field.db, field.name
+            ))));
+        }
         // A drop this member knows of only by its tombstone or by a floor, one a
         // snapshot page carried, is a schema change as much as one whose entry
         // the oplog holds, and a drop after the target is refused however it

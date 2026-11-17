@@ -123,6 +123,9 @@ mod carried_delete_join_tests;
 mod sweep_tombstone_tests;
 
 #[cfg(test)]
+mod rewind_field_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]
