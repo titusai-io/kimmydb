@@ -14,6 +14,7 @@
 pub mod backup;
 pub mod check;
 pub mod class_step;
+pub mod clock_bound;
 pub mod codec;
 mod database_tombstone;
 pub mod definition_digest;
@@ -163,6 +164,7 @@ mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
 
+pub use clock_bound::{ClockBound, ClockRefusal, ClockStop, DEFAULT_MAX_CLOCK_SKEW_MS};
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
 pub use definition_digest::{DefinitionKey, DefinitionKind};
 pub use definition_probe::{

@@ -136,6 +136,16 @@ pub struct SyncOutcome {
     /// The entry a batch stopped at when [`Self::purge_pending`] is non-zero,
     /// so a replay resumes just before it rather than past the window.
     pub purge_pending_at: Option<kimmy_core::Stamp>,
+    /// Batches this round stopped short at an entry or state of a `field` collection whose clock is
+    /// more than `max_clock_skew_secs` ahead of this member's physical clock (U1): refused until due,
+    /// not applied, not witnessed, with everything stamped after it left for the next window. At
+    /// most one per batch. A stop, not a decision: it is not part of [`Self::total`], and
+    /// [`Self::stopped`] is what carries it. Nothing is missing, so no repair is planned: the
+    /// window is asked for again from the same place and applies once the entry is due.
+    pub clock_refused: usize,
+    /// The refusal a batch stopped at when [`Self::clock_refused`] is non-zero: which entry, from
+    /// which origin, by which check, and how long until it is due.
+    pub clock_refused_at: Option<crate::clock_bound::ClockStop>,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds of history —
@@ -461,7 +471,21 @@ impl SyncOutcome {
     /// (ADR-148, ADR-189): it and everything after it in the window were not
     /// taken.
     pub fn stopped_at(&self) -> Option<Stamp> {
-        self.unknown.as_ref().map(|unknown| unknown.stamp).or(self.purge_pending_at)
+        self.unknown
+            .as_ref()
+            .map(|unknown| unknown.stamp)
+            .into_iter()
+            .chain(self.purge_pending_at)
+            .chain(self.clock_refused_at.as_ref().map(|stop| stop.stamp))
+            .min()
+    }
+
+    /// Whether the batch ended at an entry it did not take, for any of the three reasons a batch
+    /// stops: a collection this node lacks, a creation waiting for the drop purger, or a clock past
+    /// the bound. The one question every site that decides "stop, or move on" asks, so that the
+    /// next kind of stop cannot be missed at one of them. `total() == 0` does not answer it.
+    pub fn stopped(&self) -> bool {
+        self.unknown_collection > 0 || self.purge_pending > 0 || self.clock_refused > 0
     }
 
     /// Every entry the batch decided on, whatever it decided. A schema

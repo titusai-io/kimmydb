@@ -556,6 +556,12 @@ pub struct SnapshotApplied {
     /// `progress` did not move, and the drop purger has been asked to take
     /// the id next: the same page is asked for again in a later round.
     pub purge_pending: Option<CollectionId>,
+    /// A document of a `field` collection on the page whose clock is more than
+    /// `max_clock_skew_secs` ahead of this member's physical clock (U1). The page was rolled back
+    /// whole: nothing on it was applied, `progress` did not move, and no coverage was granted. It is
+    /// a stop, never a skip: the same page is asked for again in a later round and applies once the
+    /// document is due. Not an error, because the peer is not at fault.
+    pub clock_refused: Option<crate::clock_bound::ClockStop>,
 }
 
 /// One page of a snapshot.
@@ -1613,6 +1619,7 @@ impl Engine {
                 history: false,
                 sender_dropped: false,
                 purge_pending: None,
+                clock_refused: None,
             }),
         }
     }

@@ -221,6 +221,9 @@ pub enum ReplayStall {
     UnknownCollection,
     /// A page named a collection whose drop this member is still purging.
     PurgePending,
+    /// A page carried an entry of a `field` collection whose clock is past this member's
+    /// `max_clock_skew_secs` (U1): the page applies once the entry is due.
+    ClockRefused,
 }
 
 /// What one side says to the other.
@@ -584,6 +587,11 @@ pub enum Message {
         /// Batches the receiver stopped at a creation that waits for its drop
         /// purger (ADR-189).
         purge_pending: usize,
+        /// Batches the receiver stopped at an entry or state of a `field` collection whose clock
+        /// is past its `max_clock_skew_secs` (U1): refused until due, not taken, with everything
+        /// stamped after it left. `stopped_at` names the entry. Not a refusal of the change: the
+        /// pusher's confirmation waits for it, and never counts it confirmed or refused.
+        clock_refused: usize,
         /// The entries in the window the receiver refused or declined, by
         /// stamp (ADR-191): what lets a pusher whose window carried several
         /// changes say which of them a member could not take.
@@ -644,6 +652,15 @@ pub enum ProtocolError {
     /// once it runs again.
     #[error("this node is shutting down: {0}")]
     Stopping(String),
+    /// An apply stopped at an entry or state of a `field` collection whose clock is not yet within
+    /// this member's `max_clock_skew_secs` (U1). Neither the peer's failure (it sent what it holds)
+    /// nor this node's (its storage is fine): the entry applies once it is due, and the window or
+    /// page is asked for again on the next tick. The designed paths turn the refusal into an
+    /// outcome (`SyncOutcome::clock_refused`, `SnapshotApplied::clock_refused`) before it can get
+    /// here; this is the answer if one surfaces as an error anyway, so that it is never counted as
+    /// a malformed frame and never backs the peer off.
+    #[error("stopped at an entry that is not due yet: {0}")]
+    ClockStop(String),
     /// The peer at the far end of the connection is this node itself (the
     /// handshake named this node's own id): a seed that names it by an address
     /// it does not bind, a wildcard bind reached by a loopback address. No round
@@ -1150,6 +1167,7 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
+                clock_refused: 0,
                 refused: vec![kimmy_core::Stamp::new(
                     Hlc::new(3, 1),
                     NodeId::from_bytes([7; 16]),
@@ -1255,6 +1273,7 @@ mod tests {
                     ddl_declined: 0,
                     deferred: 1,
                     purge_pending: 1,
+                    clock_refused: 0,
                     refused: Vec::new(),
                     stopped_at: None,
                 },

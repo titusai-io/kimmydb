@@ -714,6 +714,8 @@ impl ServeFailure {
             // Handled before this is asked: a node shutting down refuses
             // pushes, which is not a failure to count.
             ProtocolError::Stopping(_) => None,
+            // An entry that is not due yet is nobody's failure: it applies on a later tick.
+            ProtocolError::ClockStop(_) => None,
             // This node dialled itself; the dialler ends it, and it is not a
             // failure of a peer.
             ProtocolError::SelfContact => None,
@@ -946,6 +948,8 @@ pub(crate) fn from_storage(
         kimmy_storage::StorageError::Stopping(reason) => {
             ProtocolError::Stopping(reason.to_string())
         }
+        // Not a fault of the peer's frame or of this node's storage (U1): retried on the tick.
+        e @ kimmy_storage::StorageError::ClockRefused(_) => ProtocolError::ClockStop(e.to_string()),
         e => otherwise(e.to_string()),
     }
 }
@@ -974,7 +978,10 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::UnsupportedFormat { .. }
         | E::UnparseablePartialFilter { .. }
         | E::Stale { .. }
-        | E::CollectionPurging { .. } => false,
+        | E::CollectionPurging { .. }
+        // Placed, but never asked: a clock refusal is answered as `ProtocolError::ClockStop` by the
+        // callers (`from_storage`, the push receiver) before this is, and it is nobody's failure.
+        | E::ClockRefused(_) => false,
         // A snapshot page's row no page can carry: about the row, never an
         // apply's (ADR-249).
         E::SnapshotRowTooLarge { .. } => false,
@@ -1627,6 +1634,18 @@ where
                         &mut outcome,
                     )
                 });
+                // A clock refusal that came back as an error (U1) is answered as the stop it is:
+                // the normal `Pushed` reply carrying `clock_refused` and `stopped_at`, which is the
+                // "not yet" the pusher's confirmation waits on. Never a Fault frame, which the
+                // pusher reads as a failed push and backs off from.
+                let applied = match applied {
+                    Err(kimmy_storage::StorageError::ClockRefused(stop)) => {
+                        outcome.clock_refused = outcome.clock_refused.max(1);
+                        outcome.clock_refused_at = Some(*stop);
+                        Ok(())
+                    }
+                    other => other,
+                };
                 // Whether or not the window then failed: the outcome holds
                 // only what a commit made final, as a pulled window's does,
                 // and what none did is delivered again and counted then
@@ -1656,6 +1675,7 @@ where
                         ddl_declined: outcome.ddl_declined,
                         deferred: outcome.deferred,
                         purge_pending: outcome.purge_pending,
+                        clock_refused: outcome.clock_refused,
                         refused: outcome.refused_at.clone(),
                         stopped_at: outcome.stopped_at(),
                     },
@@ -3207,6 +3227,12 @@ where
             counted.unknown_collection += outcome.unknown_collection;
             counted.purge_pending += outcome.purge_pending;
             counted.deferred += outcome.deferred;
+            #[cfg(test)]
+            let applied = if test_hooks::clock_stops_after_apply(engine.node_id()) {
+                Err(kimmy_storage::StorageError::ClockRefused(Box::new(test_hooks::a_clock_stop())))
+            } else {
+                applied
+            };
             applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
             #[cfg(test)]
             if test_hooks::fails_after_apply(peer) {
@@ -6627,6 +6653,58 @@ pub(crate) mod test_hooks {
 
     pub fn fails_after_apply(peer: std::net::SocketAddr) -> bool {
         *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) == Some(peer)
+    }
+
+    /// Pulls APPLIED BY this node end with U1's clock refusal surfacing as an *error* out of the apply, which
+    /// the designed paths never do: the hook that exercises what the round loop does with one. Keyed by the
+    /// pulling engine's node id (random per engine), never by an address: tests run concurrently on ephemeral
+    /// ports the OS reuses, and a hook keyed by a port fires against whichever test gets it next.
+    pub static CLOCK_STOP_AFTER_APPLY: std::sync::Mutex<Option<kimmy_core::NodeId>> =
+        std::sync::Mutex::new(None);
+    /// How many pulls [`CLOCK_STOP_AFTER_APPLY`] has refused since it was last set.
+    pub static CLOCK_STOPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn clock_stops_after_apply(node: kimmy_core::NodeId) -> bool {
+        let on = *CLOCK_STOP_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) == Some(node);
+        if on {
+            CLOCK_STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        on
+    }
+
+    pub fn a_clock_stop() -> kimmy_storage::ClockStop {
+        let node = kimmy_core::NodeId::from_bytes([9; 16]);
+        kimmy_storage::ClockStop {
+            origin: kimmy_core::Origin { node, epoch: kimmy_core::Epoch::ZERO },
+            stamp: kimmy_core::Stamp::new(
+                kimmy_core::Hlc::new(1, 0),
+                node,
+                kimmy_core::Epoch::ZERO,
+            ),
+            reason: kimmy_storage::ClockRefusal::Vv,
+            due_in_ms: 1,
+        }
+    }
+
+    /// [`CLOCK_STOP_AFTER_APPLY`] set for `node` until dropped.
+    pub struct ClockStoppingAfterApply(());
+
+    impl ClockStoppingAfterApply {
+        pub fn against(node: kimmy_core::NodeId) -> Self {
+            CLOCK_STOPS.store(0, std::sync::atomic::Ordering::SeqCst);
+            *CLOCK_STOP_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+            Self(())
+        }
+
+        pub fn hits(&self) -> usize {
+            CLOCK_STOPS.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ClockStoppingAfterApply {
+        fn drop(&mut self) {
+            *CLOCK_STOP_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// [`FAIL_AFTER_APPLY`] set for `peer` until dropped, so a test that panics
@@ -10895,6 +10973,47 @@ mod tests {
         assert!(is_local_failure(&E::Io(std::io::ErrorKind::StorageFull.into())));
         assert!(is_local_failure(&E::Database("no space".into())));
         assert!(!is_local_failure(&E::Corrupt("document too short".into())));
+    }
+
+    /// A test hook never fires against another test: it is keyed by an engine's random node id, not by an address
+    /// that a concurrent test can be given a moment later.
+    #[test]
+    fn a_hook_set_for_one_engine_never_fires_for_another() {
+        let (one, other) = (NodeId::from_bytes([21; 16]), NodeId::from_bytes([22; 16]));
+        let stopping = test_hooks::ClockStoppingAfterApply::against(one);
+        assert!(!test_hooks::clock_stops_after_apply(other), "not another engine");
+        assert_eq!(stopping.hits(), 0, "and not counted");
+        assert!(test_hooks::clock_stops_after_apply(one));
+        assert_eq!(stopping.hits(), 1);
+        drop(stopping);
+        assert!(!test_hooks::clock_stops_after_apply(one), "cleared on drop");
+    }
+
+    /// U1's refusal is neither the peer's frame nor this node's storage: if one surfaces as an error
+    /// anyway it becomes a `ClockStop`, which is not a serve failure and is not counted as malformed.
+    #[test]
+    fn a_clock_refusal_that_surfaces_as_an_error_is_nobodys_failure() {
+        use kimmy_storage::StorageError as E;
+        let stop = kimmy_storage::ClockStop {
+            origin: kimmy_core::Origin {
+                node: NodeId::from_bytes([3; 16]),
+                epoch: kimmy_core::Epoch::ZERO,
+            },
+            stamp: kimmy_core::Stamp::new(
+                Hlc::new(9, 0),
+                NodeId::from_bytes([3; 16]),
+                kimmy_core::Epoch::ZERO,
+            ),
+            reason: kimmy_storage::ClockRefusal::Vv,
+            due_in_ms: 5,
+        };
+        let refusal = || E::ClockRefused(Box::new(stop.clone()));
+        let mapped = from_storage(refusal(), ProtocolError::Malformed);
+        assert!(matches!(mapped, ProtocolError::ClockStop(_)), "not Malformed: {mapped:?}");
+        let mapped = from_storage(refusal(), ProtocolError::Local);
+        assert!(matches!(mapped, ProtocolError::ClockStop(_)), "not Local: {mapped:?}");
+        assert_eq!(ServeFailure::of(&mapped), None, "not a serve failure of anyone");
+        assert!(!is_local_failure(&refusal()), "and not this node's storage");
     }
 
     #[test]

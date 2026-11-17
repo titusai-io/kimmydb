@@ -156,6 +156,18 @@ pub struct Engine {
     /// Remote writes and snapshot documents refused because their collection has merge policy
     /// `field` (the apply of Step 3 does not exist yet): counted per entry.
     field_replication_refusals: std::sync::atomic::AtomicU64,
+    /// How far ahead of this member's physical clock a replicated entry or state of a `field`
+    /// collection may be, in milliseconds (U1, `storage.max_clock_skew_secs`). Set from
+    /// configuration at startup; a local setting, not replicated.
+    max_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// What U1 has refused since start, by the origin that sent it (capped, the rest under
+    /// `other`).
+    clock_refusals: Mutex<crate::clock_bound::RefusalCounts>,
+    /// Milliseconds added to this engine's physical clock for the U1 check, so a test can make
+    /// a stamp far-future or due without waiting. Per engine: no other engine and no other test
+    /// sees it. Exists only in test builds and under `test-hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    clock_offset_ms: std::sync::atomic::AtomicI64,
     /// The parsed validators and their counters (ADR-257).
     pub(crate) validators: crate::validator::ValidatorState,
     /// Documents a `multi: true` filtered write commits per transaction
@@ -1602,6 +1614,12 @@ impl Engine {
             hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
             field_replication_refusals: std::sync::atomic::AtomicU64::new(0),
+            max_clock_skew_ms: std::sync::atomic::AtomicU64::new(
+                crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS,
+            ),
+            clock_refusals: Mutex::new(Default::default()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
             validators: Default::default(),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -2206,6 +2224,58 @@ impl Engine {
     /// Count `n` entries refused for a `field` collection (a remote write, a snapshot document).
     pub(crate) fn count_field_replication_refused(&self, n: u64) {
         self.field_replication_refusals.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bound U1 holds a replicated `field` entry or state to (`storage.max_clock_skew_secs`).
+    pub fn clock_bound(&self) -> crate::clock_bound::ClockBound {
+        crate::clock_bound::ClockBound {
+            skew_ms: self.max_clock_skew_ms.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Set the bound U1 holds a replicated `field` entry or state to. Set from configuration at
+    /// startup; the configuration refuses zero, so a zero here is clamped to one millisecond
+    /// rather than refusing every entry from a peer whose clock is a tick ahead.
+    pub fn set_max_clock_skew(&self, skew: std::time::Duration) {
+        let ms = u64::try_from(skew.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.max_clock_skew_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This member's physical clock as U1 reads it: [`physical_now_ms`], and in a test build or
+    /// under `test-hooks` plus this engine's own offset ([`Self::set_clock_offset_for_tests`]).
+    pub fn clock_bound_now_ms(&self) -> u64 {
+        physical_now_ms().saturating_add_signed(self.clock_offset())
+    }
+
+    /// This engine's offset of the U1 clock: the test offset in a test build or under
+    /// `test-hooks`, and nothing otherwise.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn clock_offset(&self) -> i64 {
+        self.clock_offset_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn clock_offset(&self) -> i64 {
+        0
+    }
+
+    /// Move this engine's physical clock, as U1 reads it, by `ms` (negative: back, so stamps made
+    /// from the real clock are ahead of it). Per engine, so no other engine and no other test in
+    /// the binary is affected. Test builds and `test-hooks` only: it is not a configuration knob.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_clock_offset_for_tests(&self, ms: i64) {
+        self.clock_offset_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count `n` refusals U1 made of entries or states from `origin`.
+    pub fn count_clock_refused(&self, origin: &kimmy_core::Origin, n: u64) {
+        self.clock_refusals.lock().add(origin, n);
+    }
+
+    /// What U1 has refused since start, by the origin's node id in hex, at most 64 named and the
+    /// rest summed under `other`: `kimmy_sync_clock_refused_total{origin}`.
+    pub fn clock_refusals(&self) -> Vec<(String, u64)> {
+        self.clock_refusals.lock().snapshot()
     }
 
     /// How many windows this node has refused a peer since start because they
