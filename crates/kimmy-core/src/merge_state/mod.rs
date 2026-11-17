@@ -67,6 +67,7 @@ pub mod bridge;
 mod codec;
 mod compact;
 mod counter;
+mod floor;
 mod join;
 mod ord;
 mod state;
@@ -85,6 +86,8 @@ mod counter_tests;
 mod counter_type_tests;
 #[cfg(test)]
 mod depth_tests;
+#[cfg(test)]
+mod floor_tests;
 #[cfg(test)]
 mod hand_built;
 #[cfg(test)]
