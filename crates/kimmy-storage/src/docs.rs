@@ -1780,7 +1780,18 @@ impl Engine {
             Some(meta) => field_write::vv_max_wall_ms(meta)?,
             None => None,
         };
-        match self.clock_bound().check(self.clock_bound_now_ms(), &entry.stamp, vv_max_wall_ms) {
+        self.refuse_if_past_the_bound(&entry.stamp, vv_max_wall_ms)
+    }
+
+    /// [`Self::refuse_if_far_future`] for a carried delete of a snapshot page, which has no entry and no
+    /// state to join, only a stamp: the same bound, checked before the delete is applied or recorded as
+    /// a bare tombstone (U1).
+    pub(crate) fn refuse_stamp_if_far_future(&self, stamp: &Stamp) -> Result<()> {
+        self.refuse_if_past_the_bound(stamp, None)
+    }
+
+    fn refuse_if_past_the_bound(&self, stamp: &Stamp, vv_max_wall_ms: Option<u64>) -> Result<()> {
+        match self.clock_bound().check(self.clock_bound_now_ms(), stamp, vv_max_wall_ms) {
             Some(stop) => Err(StorageError::ClockRefused(Box::new(stop))),
             None => Ok(()),
         }

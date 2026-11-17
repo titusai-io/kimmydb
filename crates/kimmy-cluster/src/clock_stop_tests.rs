@@ -61,3 +61,48 @@ async fn a_pull_stopped_at_a_clock_refused_entry_is_not_exhausted_and_the_next_p
     assert_eq!(b.get(&cb, &DocId::Int64(1)).unwrap(), Some(doc! { "_id": 1 }), "applied once due");
     drop(a);
 }
+
+/// A member that can only be caught up by snapshot takes a page with a far-future document: it neither holds the
+/// document nor marks its origin covered, the snapshot does not complete (a stop, never a skip), and a later sync
+/// brings the document, with the donor's version identity, once it is due.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_far_future_field_document_in_a_snapshot_page_is_not_held_or_covered_and_arrives_once_due()
+ {
+    let (a, a_addr, _a_dir) = donor().await;
+    // A's history is gone, so B can only be caught up by snapshot.
+    a.collect_garbage_at(
+        kimmy_storage::physical_now_ms() + 1_000_000_000,
+        kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+    )
+    .unwrap();
+    let (b, _b_dir) = engine();
+    b.set_clock_offset_for_tests(-(SKEW_MS + 10_000));
+
+    let outcome = sync_once(&b, a_addr, SECRET, None).await.expect(
+        "B does not hold the far-future document: the sync must end in a stop, not an error",
+    );
+
+    assert_eq!(
+        outcome.clock_refused, 1,
+        "B does not hold the far-future document: the stop was not reported: {outcome:?}"
+    );
+    let held =
+        b.get_collection("shop", "orders").ok().and_then(|c| b.get(&c, &DocId::Int64(1)).unwrap());
+    assert_eq!(held, None, "B does not hold the far-future document");
+    assert_eq!(
+        b.witnessed_vector().unwrap().get(a.origin()),
+        kimmy_core::Hlc::ZERO,
+        "B did not mark its origin covered"
+    );
+
+    // Due: the snapshot resumes from where it stopped and the document arrives.
+    b.set_clock_offset_for_tests(0);
+    let again = sync_once(&b, a_addr, SECRET, None).await.unwrap();
+    assert_eq!(again.clock_refused, 0, "{again:?}");
+    let cb = b.get_collection("shop", "orders").unwrap();
+    let ca = a.get_collection("shop", "orders").unwrap();
+    let (vb, db) = b.get_versioned(&cb, &DocId::Int64(1)).unwrap().expect("arrives once due");
+    let (va, _) = a.get_versioned(&ca, &DocId::Int64(1)).unwrap().unwrap();
+    assert_eq!(db, doc! { "_id": 1 });
+    assert_eq!(vb, va, "with the donor's version identity");
+}

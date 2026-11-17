@@ -105,6 +105,9 @@ mod field_digest_tests;
 mod clock_bound_entry_tests;
 
 #[cfg(test)]
+mod clock_bound_state_tests;
+
+#[cfg(test)]
 mod field_snapshot_tests;
 
 #[cfg(test)]
