@@ -344,6 +344,22 @@ some of those entries. This member's own live origin is left out, since its own 
 retention collects them. A page that is refused is rolled back whole and leaves no hole; an entry applied by a pull
 is history and leaves none. A hole is only ever raised.
 
+**The floor at the cell.** A collection that is dropped and created again stands over a floor, the stamp of the
+drop: what is stamped at or below it belongs to the life before, and what is stamped after it is kept. The state of
+a `field` document is cumulative, so one state, stamped above the floor by its newest write, can still carry the
+cells of the life before. Every state a `field` collection takes in, by an entry, a push, a replay or a snapshot
+page, is judged cell by cell before it is joined: a register or a counter slot stamped at or below the floor is
+dropped, and so is a delete, so that the delete of the life before cannot kill a life made after the drop. The
+version vector is not touched. A counter slot is one cell, judged by the stamp of its last increment: a slot
+stamped above the floor is a write after the drop and is kept whole, as a `document` record written after the
+drop is kept whole, the fields it saw included. A state with nothing left is superseded, is counted once, and
+leaves no hole. The floor is the later of the collection's incarnation floor and the drop tombstones this member holds
+for the collection and its database, and the state this member already holds is held to it too before the join, so a
+life of the life before the drop that is still held never takes part in the concurrent-first-insert rule against a
+life with a write after the drop. A write after the drop into a life that lost a concurrent first insert before the
+member knew of the drop is lost at that member, as it would be without the drop, and is reported; it survives
+wherever the floor was known first, and the members converge to it.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is
