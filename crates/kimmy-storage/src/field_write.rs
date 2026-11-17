@@ -24,7 +24,7 @@ use kimmy_core::merge_state::{
     JoinOptions, MStamp, MergeState, Path, StampError, UpdateError, UpdateRefused, Writer,
     WriterId, Written,
 };
-use kimmy_core::{Error as CoreError, Hlc, Stamp};
+use kimmy_core::{Error as CoreError, Hlc, Origin, Stamp};
 
 use crate::error::{Result, StorageError};
 
@@ -96,6 +96,18 @@ pub(crate) fn vv_max_wall_ms(meta: &[u8]) -> Result<Option<u64>> {
     let state = MergeState::decode_compact(meta)
         .map_err(|e| StorageError::Corrupt(format!("the merge state of an entry: {e:?}")))?;
     Ok(state.vv.values().map(|hlc| hlc.wall_ms).max())
+}
+
+/// The holes a state applied as state (a page document, a carried delete) leaves: the newest write each
+/// writer of its version vector made, by the writer's node and epoch. This member's own live origin is left
+/// out: every write of its own epoch is in its own oplog until retention collects it, which has its own
+/// path, and a hole over them would send its peers to a snapshot for writes it can serve. An older epoch of
+/// its own node is not its live origin and is held like any other.
+pub(crate) fn state_holes(vv: &kimmy_core::merge_state::Vv, own: Origin) -> Vec<(Origin, Hlc)> {
+    vv.iter()
+        .map(|(writer, hlc)| (Origin::new(writer.node, writer.epoch), *hlc))
+        .filter(|(origin, _)| *origin != own)
+        .collect()
 }
 
 fn m_stamp(s: Stamp) -> MStamp {
@@ -439,5 +451,28 @@ mod tests {
         let mut low = || Stamp::new(Hlc::new(5, 0), w.node, w.epoch);
         let r = replace(w, state_of(&first), &doc! { "_id": 1, "a": 2 }, &mut low);
         assert!(r.is_err(), "{r:?}");
+    }
+
+    /// An older epoch of the receiver's own node is not its live origin: its writes are held like any other's.
+    #[test]
+    fn an_older_epoch_of_the_receivers_own_node_is_not_skipped() {
+        let node = NodeId::from_bytes([3; 16]);
+        let own = Origin::new(node, Epoch::from_u64(2));
+        let older = Origin::new(node, Epoch::from_u64(1));
+        let other = Origin::new(NodeId::from_bytes([4; 16]), Epoch::from_u64(1));
+        let mut vv = kimmy_core::merge_state::Vv::new();
+        for (origin, wall) in [(own, 30u64), (older, 20), (other, 10)] {
+            vv.insert(
+                kimmy_core::merge_state::WriterId { node: origin.node, epoch: origin.epoch },
+                Hlc::new(wall, 0),
+            );
+        }
+
+        let holes = state_holes(&vv, own);
+
+        let origins: Vec<Origin> = holes.iter().map(|(origin, _)| *origin).collect();
+        assert!(!origins.contains(&own), "the live origin is skipped: {origins:?}");
+        assert!(origins.contains(&older), "an older epoch of the same node is not: {origins:?}");
+        assert!(origins.contains(&other), "nor is another node: {origins:?}");
     }
 }
