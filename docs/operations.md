@@ -2517,6 +2517,7 @@ window.
 | Refusal | Why |
 |---|---|
 | A target before the oplog horizon | Nothing describes the database before that point |
+| A collection with merge policy `field` | Its state at the target is the join of the merge states its entries carry, which the rewind does not build yet; it would put back records with no merge state. The refusal names the collection and is lifted when that rewind is built. Restore without `--until` |
 | A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either. A drop counts whether the member holds its oplog entry or knows it only as a collection or database tombstone, or as a collection's incarnation floor, as a snapshot page leaves it |
 | A document whose value at the target the member does not hold | It changed after the target, and the value it had there is not in this member's oplog: retention collected it, the member holds the document only as a snapshot page's state, or its entries at or below the target are of a collection life a drop ended. It is named in the error |
 
