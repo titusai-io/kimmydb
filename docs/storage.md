@@ -330,6 +330,9 @@ stamps say (a write above the delete's stamp, into a life the delete's context d
 and a member that held nothing keeps the context, so a write into the killed life that arrives later does not
 bring the document back. It is state, not history: no oplog entry is written for it and no held mark is left.
 A tombstone of a `field` collection with no state is not a valid row and is refused as corrupt.
+Every producer keeps one: the tombstone a late drop's sweep leaves for a field record it removes carries the
+record's version vector as its state, with no life, delete, cell, order entry or loss record, since every cell of
+the record is at or below the drop.
 
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key

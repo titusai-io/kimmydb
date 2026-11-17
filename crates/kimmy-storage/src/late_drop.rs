@@ -119,6 +119,14 @@ struct Chunk {
     kept: bool,
 }
 
+/// A record the sweep removes: its key, the document it held (for the index entries that move), and for a
+/// `field` collection the state its burial tombstone keeps.
+struct Buried {
+    key: Vec<u8>,
+    document: Option<bson::Document>,
+    state: Option<Vec<u8>>,
+}
+
 /// Whether a collection standing here owes a sweep for a drop stamped
 /// `dropped`: its life began after the drop (`created` above it) and its floor
 /// has not been taken up to it.
@@ -406,7 +414,9 @@ impl Engine {
     ) -> Result<Chunk> {
         // Bounded by SWEEP_CHUNK rows or SWEEP_CHUNK_BYTES examined; the stop
         // is looked for between chunks (walks_stop: a bounded read).
-        let mut found: Vec<(Vec<u8>, Option<bson::Document>)> = Vec::new();
+        // Each record the sweep removes, with the document it held, and for a `field` collection the
+        // state its burial tombstone keeps.
+        let mut found: Vec<Buried> = Vec::new();
         let (mut examined, mut bytes, mut skipped) = (0usize, 0usize, 0usize);
         let mut last = after.clone();
         let mut exhausted = true;
@@ -465,23 +475,39 @@ impl Engine {
                     });
                 kept |= stamp.hlc > dropped.hlc && !orphaned;
                 if stamp.hlc <= dropped.hlc || orphaned {
-                    let document = codec::decode_doc_record(value.value())
-                        .and_then(|record| Ok(record.document()?))
-                        .unwrap_or_else(|e| {
-                            warn!(error = %e, "a record of the life before a drop does not decode; removed without its index entries");
-                            None
-                        });
-                    found.push((key.value().1.to_vec(), document));
+                    let field = standing.merge_policy == kimmy_core::MergePolicy::Field;
+                    let decoded = match field {
+                        true => codec::decode_doc_record_with_meta(value.value()),
+                        false => codec::decode_doc_record(value.value()),
+                    }
+                    .and_then(|record| Ok((record.document()?, record.meta)));
+                    let (document, meta) = decoded.unwrap_or_else(|e| {
+                        warn!(error = %e, "a record of the life before a drop does not decode; removed without its index entries");
+                        (None, None)
+                    });
+                    // A tombstone of a `field` collection keeps a state (a stateless one is not a
+                    // valid row, and a snapshot that carries it is refused): here the record's own,
+                    // reduced to its version vector, since every cell of it is at or below the drop.
+                    let state = field.then(|| crate::field_write::vv_only(meta.as_deref()));
+                    found.push(Buried { key: key.value().1.to_vec(), document, state });
                 }
             }
         }
-        let tombstone = codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(dropped));
+        let plain = codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(dropped));
         let mut docs = txn.open_table(tables::DOCS)?;
-        for (key, _) in &found {
+        for Buried { key, state, .. } in &found {
+            let tombstone = match state {
+                Some(meta) => {
+                    let mut record = kimmy_core::DocRecord::tombstone(dropped);
+                    record.meta = Some(meta.clone());
+                    codec::encode_doc_record(&record)
+                }
+                None => plain.clone(),
+            };
             crate::live_count::put_bare_tombstone(txn, &mut docs, standing.id.0, key, &tombstone)?;
         }
         drop(docs);
-        for (key, previous) in &found {
+        for Buried { key, document: previous, .. } in &found {
             // A removal has no document to key and so no violation to report.
             crate::index::maintain_remote(self, txn, standing, previous.as_ref(), None, key)?;
         }

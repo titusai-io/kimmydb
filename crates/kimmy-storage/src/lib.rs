@@ -120,6 +120,9 @@ mod carried_delete_state_tests;
 mod carried_delete_join_tests;
 
 #[cfg(test)]
+mod sweep_tombstone_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]
