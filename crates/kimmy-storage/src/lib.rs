@@ -126,6 +126,9 @@ mod sweep_tombstone_tests;
 mod rewind_field_tests;
 
 #[cfg(test)]
+mod state_hold_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]

@@ -3275,7 +3275,10 @@ impl Engine {
     /// Record that a grant to `stamp` raises this node's servable vector over
     /// history it holds no entries for, if it does: the grant is above the
     /// servable vector now, in the caller's transaction. Only ever raises.
-    fn record_state_held_in_txn(txn: &redb::WriteTransaction, stamp: &Stamp) -> Result<bool> {
+    pub(crate) fn record_state_held_in_txn(
+        txn: &redb::WriteTransaction,
+        stamp: &Stamp,
+    ) -> Result<bool> {
         let servable = {
             let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             let current = versions.get(stamp.origin().to_bytes().as_slice())?;
@@ -3287,14 +3290,28 @@ impl Engine {
         if stamp.hlc <= servable {
             return Ok(false);
         }
-        let key = format!("{}{}", tables::META_STATE_HELD_PREFIX, stamp.origin());
+        Self::record_state_held_at_in_txn(txn, stamp.origin(), stamp.hlc)
+    }
+
+    /// Record that this node holds writes of `origin` up to `hlc` as state and not as entries, in the
+    /// caller's transaction: a peer behind that point is sent to a snapshot, not served a window that
+    /// lacks them. The row is keyed by the origin's node and epoch, as the version vectors are, and only
+    /// ever raised. Unlike [`Self::record_state_held_in_txn`] this does not ask whether the servable
+    /// vector is below `hlc`: a state applied as state (a page document, a carried delete) can hold
+    /// writes the servable vector already claims, and there is no entry for them either way.
+    pub(crate) fn record_state_held_at_in_txn(
+        txn: &redb::WriteTransaction,
+        origin: Origin,
+        hlc: Hlc,
+    ) -> Result<bool> {
+        let key = format!("{}{}", tables::META_STATE_HELD_PREFIX, origin);
         let mut meta = txn.open_table(tables::META)?;
         let higher = match meta.get(key.as_str())? {
-            Some(held) => stamp.hlc > decode_hlc(held.value())?,
+            Some(held) => hlc > decode_hlc(held.value())?,
             None => true,
         };
         if higher {
-            meta.insert(key.as_str(), stamp.hlc.to_bytes().as_slice())?;
+            meta.insert(key.as_str(), hlc.to_bytes().as_slice())?;
         }
         Ok(higher)
     }
