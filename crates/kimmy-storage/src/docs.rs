@@ -1838,6 +1838,16 @@ impl Engine {
         position: Position,
     ) -> Result<RemoteApplied> {
         let other = field_write::load(entry.meta.as_deref())?;
+        // A state applied as state has no entry behind it: what it holds of every writer is a hole in
+        // what this member can serve, recorded in the transaction that applies it (a page that is rolled
+        // back leaves none). Conservative: a peer behind it is sent to a snapshot even if this member
+        // happens to hold some of those entries. Before the join and its early returns, because a state
+        // that moves nothing here is still held.
+        if position == Position::Hold {
+            for (origin, hlc) in field_write::state_holes(&other.vv, self.origin()) {
+                Self::record_state_held_at_in_txn(txn, origin, hlc)?;
+            }
+        }
         let (joined, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let existing = match docs.get((coll.id.0, key.as_slice()))? {

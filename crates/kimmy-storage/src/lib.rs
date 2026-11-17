@@ -129,6 +129,9 @@ mod rewind_field_tests;
 mod state_hold_tests;
 
 #[cfg(test)]
+mod state_hold_rule_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]
