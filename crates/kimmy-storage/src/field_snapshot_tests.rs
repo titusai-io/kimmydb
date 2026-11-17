@@ -77,3 +77,88 @@ fn a_member_that_takes_a_field_document_by_snapshot_holds_its_state_and_no_entri
     assert_eq!(b.field_replication_refusals(), 0, "nothing was refused");
     let _ = DocId::Int64(1);
 }
+
+/// The same snapshot taken in several pages. A snapshot grants its coverage, and with it releases
+/// any held mark the pages left, only when its LAST page applies, so a mark written for a document
+/// by an earlier page would sit there for as long as the snapshot is in flight (or for good, if it
+/// is interrupted) and be gone by the time a one-page snapshot has been read back. The rule is
+/// therefore asserted after EVERY page: no held mark and no oplog entry for the documents applied
+/// so far, which are state, not history.
+#[test]
+fn a_snapshot_of_several_pages_leaves_no_held_mark_and_no_entry_after_any_page() {
+    let (a, _da) = engine();
+    let ca = a.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
+    for i in 0..6i64 {
+        a.insert(&ca, doc! { "_id": i, "pad": "x".repeat(200) }).unwrap();
+    }
+    // The size of a document's page row is measured, not guessed: the smallest budget (in steps)
+    // whose snapshot completes, takes at least three pages, and carries documents before its last.
+    let (bytes, pages) = (0..64usize)
+        .find_map(|step| {
+            let bytes = 500 + step * 250;
+            a.set_snapshot_page_bytes_for_test(Some(bytes));
+            let mut pages = Vec::new();
+            let mut after = None;
+            loop {
+                let page = a.snapshot_page(after.take(), None).ok()?;
+                after = page.next.clone();
+                pages.push(page);
+                if after.is_none() {
+                    break;
+                }
+                if pages.len() > 50 {
+                    return None;
+                }
+            }
+            let early_rows = pages[..pages.len() - 1].iter().any(|p| !p.documents.is_empty());
+            (pages.len() >= 3 && early_rows).then_some((bytes, pages))
+        })
+        .expect("a page budget that splits six documents into three pages or more");
+
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let mut applied = 0usize;
+    let mut documents_before_the_end = false;
+    for (n, page) in pages.iter().enumerate() {
+        b.apply_snapshot_page(a.node_id(), &mut progress, page).unwrap();
+        applied += page.documents.len();
+        documents_before_the_end |= page.next.is_some() && !page.documents.is_empty();
+        assert_eq!(
+            b.held_len().unwrap(),
+            0,
+            "no held mark for the {applied} documents applied so far, after page {n} of {} \
+             ({bytes} B pages): state, not history",
+            pages.len()
+        );
+        let entries = b
+            .entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .count();
+        assert_eq!(
+            entries, 0,
+            "no entry for the {applied} documents applied so far, after page {n}: state, not history"
+        );
+        let held = b
+            .get_collection("shop", "orders")
+            .ok()
+            .map(|c| usize::try_from(b.count(&c, WalkScope::Request).unwrap()).unwrap());
+        assert_eq!(held.unwrap_or(0), applied, "the documents of the pages so far are held");
+    }
+    assert!(progress.is_complete(), "the snapshot ended");
+    assert!(
+        documents_before_the_end,
+        "premise: a page before the last carried documents, so a one-page run cannot pass"
+    );
+    assert_eq!(applied, 6, "premise: every document travelled");
+    let cb = b.get_collection("shop", "orders").unwrap();
+    for i in 0..6i64 {
+        let id = DocId::Int64(i);
+        let (vb, db) = b.get_versioned(&cb, &id).unwrap().expect("B holds the document");
+        let (va, da) = a.get_versioned(&ca, &id).unwrap().unwrap();
+        assert_eq!(db, da, "the same document");
+        assert_eq!(vb, va, "the donor's version identity");
+    }
+}
