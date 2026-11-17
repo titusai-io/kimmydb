@@ -101,6 +101,9 @@ mod field_apply_tests;
 mod field_digest_tests;
 
 #[cfg(test)]
+mod field_snapshot_tests;
+
+#[cfg(test)]
 mod held_gap_tests;
 
 #[cfg(test)]

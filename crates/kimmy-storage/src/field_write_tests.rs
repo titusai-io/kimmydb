@@ -416,7 +416,7 @@ fn a_batch_with_a_field_entry_applies_both_and_counts_no_refusal() {
 }
 
 #[test]
-fn a_snapshot_page_with_a_field_document_applies_the_rest_and_the_cursor_moves_on() {
+fn a_snapshot_page_with_a_field_document_applies_it_as_state_and_the_cursor_moves_on() {
     let (a, _da) = open();
     let (b, _db) = open();
     let (fa, da) = pair(&a);
@@ -435,9 +435,13 @@ fn a_snapshot_page_with_a_field_document_applies_the_rest_and_the_cursor_moves_o
     assert!(after.is_none(), "the snapshot ended");
     let fb = b.get_collection("app", "f").unwrap();
     let db_ = b.get_collection("app", "d").unwrap();
-    assert!(raw(&b, &fb, 1).is_none());
+    assert_eq!(
+        raw(&b, &fb, 1),
+        raw(&a, &fa, 1),
+        "the field document is held as the donor holds it"
+    );
     assert!(raw(&b, &db_, 2).is_some());
-    assert_eq!(b.field_replication_refusals(), 1);
+    assert_eq!(b.field_replication_refusals(), 0, "nothing is refused");
 }
 
 #[test]
