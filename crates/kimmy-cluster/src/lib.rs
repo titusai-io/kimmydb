@@ -34,6 +34,9 @@ pub mod transport;
 pub mod yielding;
 
 #[cfg(test)]
+mod clock_stop_tests;
+
+#[cfg(test)]
 mod codec_tests;
 
 pub use confirm::{

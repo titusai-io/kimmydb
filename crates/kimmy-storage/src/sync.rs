@@ -1279,6 +1279,7 @@ impl Engine {
     ) -> Result<()> {
         let (unknown, deferred, purging) =
             (outcome.unknown_collection, outcome.deferred, outcome.purge_pending);
+        let (clock, clock_at) = (outcome.clock_refused, outcome.clock_refused_at.clone());
         let mut run = Run::default();
         let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
         let refused = std::mem::take(&mut run.refused);
@@ -1292,6 +1293,8 @@ impl Engine {
                     outcome.unknown_collection = unknown;
                     outcome.deferred = deferred;
                     outcome.purge_pending = purging;
+                    outcome.clock_refused = clock;
+                    outcome.clock_refused_at = clock_at;
                 }
                 // Read after the error, so what landed before it is what
                 // decides. A read that fails counts nothing: under-counting
@@ -1319,6 +1322,8 @@ impl Engine {
         let mut witnessed = VersionVector::new();
         let mut memo = Memo::default();
         let mut stopped_at: Option<Stamp> = None;
+        // The U1 refusal this batch ended at, if any: counted and said once its commit is final.
+        let mut clock_stopped: Option<crate::clock_bound::ClockStop> = None;
         // A window a peer introduced is served from this node's own position,
         // so it is contiguous for every origin it carries (ADR-148); only then
         // may an entry already held as state be released (ADR-169). A batch
@@ -1352,7 +1357,22 @@ impl Engine {
                 witnessed.observe(entry.stamp);
                 continue;
             }
-            match self.apply_one(entry, position, run, &mut memo, outcome)? {
+            let step = match self.apply_one(entry, position, run, &mut memo, outcome) {
+                Ok(step) => step,
+                // U1: an entry or state of a `field` collection whose clock is past the bound. Nothing
+                // was written and the entry is not observed: the batch ends here, so everything
+                // stamped after it (from any origin) is left for the next window and the witnessed
+                // vector stays just below it. It is re-served and applies once it is due.
+                Err(crate::error::StorageError::ClockRefused(stop)) => {
+                    outcome.clock_refused += 1;
+                    outcome.clock_refused_at = Some((*stop).clone());
+                    clock_stopped = Some(*stop);
+                    stopped_at = Some(entry.stamp);
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            match step {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
@@ -1459,6 +1479,22 @@ impl Engine {
             let local = self.origin();
             outcome.coverage_raised |=
                 witnessed.iter().any(|(origin, hlc)| origin != local && hlc > mine.get(origin));
+        }
+
+        // Counted and said once the commit has made the stop final, once per batch, and not again for
+        // the batch that re-serves it: the window ended before it, so it is the same entry each time
+        // until it is due.
+        if let Some(stop) = &clock_stopped {
+            self.count_clock_refused(&stop.origin, 1);
+            warn!(
+                origin = %stop.origin.node,
+                reason = %stop.reason,
+                stamp = ?stop.stamp,
+                due_in_ms = stop.due_in_ms,
+                "refused a replicated entry whose clock is more than max_clock_skew_secs ahead of this \
+                 member's clock; it was not applied or witnessed, nothing stamped after it was taken, \
+                 and the window is re-served from here and applies once the entry is due"
+            );
         }
 
         if let Some(unknown) = &outcome.unknown {

@@ -1482,6 +1482,13 @@ impl TelemetryGuard {
             "Schema-change confirmations on a member that ended cancelled.",
             |s| s.ddl_confirmations[ConfirmOutcome::Cancelled.slot()]
         );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.clock_refused",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended clock_refused.",
+            |s| s.ddl_confirmations[ConfirmOutcome::ClockRefused.slot()]
+        );
         // Each reason a peer connection failed to be served, one instrument
         // per label value, in `ServeFailure::ALL` order.
         use kimmy_cluster::ServeFailure;
