@@ -111,6 +111,13 @@ impl Cluster {
     }
 }
 
+/// Applies `batch` and fails by name when the engine did not apply every entry of it: a setup entry the
+/// parent drops silently would otherwise surface as an unrelated `unwrap` on `None` further down.
+fn premise_applied(e: &Engine, batch: &[OplogEntry], what: &str) {
+    let out = e.apply_batch(batch).unwrap();
+    assert_eq!(out.applied, batch.len(), "premise: {what}: {out:?}");
+}
+
 /// The same two entries in either order give one state, whichever is applied first, and both stay
 /// in the oplog to be served on.
 #[test]
@@ -123,7 +130,7 @@ fn the_same_two_field_entries_in_either_order_give_one_state_hash() {
     later();
     let x = a.insert(&ca, doc! { "_id": 1 }).unwrap();
     let insert = c.after(&a);
-    m.apply_batch(&insert).unwrap();
+    premise_applied(&m, &insert, "M applied A's insert of X");
     let cm = m.get_collection("shop", "orders").unwrap();
     later();
     a.replace(&ca, &x, doc! { "_id": 1, "a": 1 }, false).unwrap();
@@ -133,8 +140,8 @@ fn the_same_two_field_entries_in_either_order_give_one_state_hash() {
     let s2 = c.after(&m).last().unwrap().clone();
     assert!(s2.stamp > s1.stamp, "premise: M's write is stamped above A's");
 
-    p1.apply_batch(&insert).unwrap();
-    p2.apply_batch(&insert).unwrap();
+    premise_applied(&p1, &insert, "P1 applied A's insert of X");
+    premise_applied(&p2, &insert, "P2 applied A's insert of X");
     p1.apply_batch(&[s2.clone(), s1.clone()]).unwrap();
     p2.apply_batch(&[s1.clone(), s2.clone()]).unwrap();
     let c1 = p1.get_collection("shop", "orders").unwrap();
@@ -161,14 +168,14 @@ fn a_covered_field_entry_arriving_in_window_is_kept_and_moves_nothing() {
     later();
     let x = a.insert(&ca, doc! { "_id": 1 }).unwrap();
     let insert = c.after(&a);
-    m.apply_batch(&insert).unwrap();
-    p.apply_batch(&insert).unwrap();
+    premise_applied(&m, &insert, "M applied A's insert of X");
+    premise_applied(&p, &insert, "P applied A's insert of X");
     let cm = m.get_collection("shop", "orders").unwrap();
     let cp = p.get_collection("shop", "orders").unwrap();
     later();
     a.replace(&ca, &x, doc! { "_id": 1, "a": 1 }, false).unwrap();
     let s1 = c.after(&a).last().unwrap().clone();
-    m.apply_batch(std::slice::from_ref(&s1)).unwrap();
+    premise_applied(&m, std::slice::from_ref(&s1), "M applied A's write s1");
     later();
     // M writes again over what it merged: its entry carries a and b
     m.replace(&cm, &x, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
@@ -197,8 +204,8 @@ fn a_carried_delete_below_the_record_stamp_still_kills_the_life_that_did_not_see
         later();
         let x = a.insert(&ca, doc! { "_id": 1 }).unwrap();
         let insert = c.after(&a);
-        m.apply_batch(&insert).unwrap();
-        p.apply_batch(&insert).unwrap();
+        premise_applied(&m, &insert, "M applied A's insert of X");
+        premise_applied(&p, &insert, "P applied A's insert of X");
         let cm = m.get_collection("shop", "orders").unwrap();
         let cp = p.get_collection("shop", "orders").unwrap();
         later();
