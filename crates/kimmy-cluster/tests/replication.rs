@@ -593,6 +593,56 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
 }
 
+/// Step 3, item (3.1): the snapshot leg of a field collection. A member brought up past its peer's
+/// retention horizon takes a field document written in two steps by snapshot, and reads the merged
+/// document with the donor's version identity (the stamp and the hash of the merged state). It holds
+/// no oplog entry for the document's writes (state, not history) and a second round moves nothing.
+#[tokio::test]
+async fn a_member_past_the_retention_horizon_takes_a_field_document_by_snapshot_with_the_donors_version()
+ {
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    a.engine.replace(&ca, &x, doc! { "_id": 1, "a": 1 }, false).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    a.engine.replace(&ca, &x, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
+
+    // A's history is gone, so B can only be caught up by snapshot.
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection must arrive");
+    assert_eq!(cb.merge_policy, kimmy_core::MergePolicy::Field, "the policy travels with it");
+    let (vb, db) =
+        b.engine.get_versioned(&cb, &x).unwrap().expect("B holds the document by snapshot");
+    let (va, _) = a.engine.get_versioned(&ca, &x).unwrap().unwrap();
+    assert_eq!(db, doc! { "_id": 1, "a": 1, "b": 2 }, "the merged document, both fields");
+    assert_eq!(vb, va, "the donor's version identity: the stamp and the hash of the merged state");
+    let document_entries = b
+        .engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.kind.is_document())
+        .count();
+    assert_eq!(document_entries, 0, "B holds the state of X, no entry of its writes");
+
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(second.total(), 0, "a caught-up member does not keep resyncing: {second:?}");
+}
+
 #[tokio::test]
 async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     // The test above passes for a collection whose derived id happens to sit
