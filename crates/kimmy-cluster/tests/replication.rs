@@ -778,6 +778,66 @@ async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_
     assert!(c.engine.get(&cc, &y).unwrap().is_some(), "premise: C holds Y after the repair");
 }
 
+/// Step 3, item (3.4a): a member that stands over an incarnation floor takes a field document by snapshot
+/// from a member that has not heard of the drop, and gets the cells stamped above the floor and none of
+/// the life before. A holds X = {a}; B takes it; A drops the collection and creates it again; B, which has
+/// not heard, inserts Y and writes X.b above the floor. B's collection of garbage purges the entry of Y,
+/// which A's position is below, so A is caught up by snapshot: a page whose state of X is stamped above the
+/// floor and carries X.a, a cell below it.
+#[tokio::test]
+async fn a_snapshot_over_a_floor_brings_the_cells_above_it_and_none_of_the_life_before() {
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1, "a": 1 }).unwrap();
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection arrives");
+    assert!(b.engine.get(&cb, &x).unwrap().is_some(), "premise: B holds X");
+
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    assert!(ca.incarnation_floor.is_some(), "premise: A stands over a floor");
+    std::thread::sleep(Duration::from_millis(5));
+    let y = b.engine.insert(&cb, doc! { "_id": 2 }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    b.engine.replace(&cb, &x, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
+    b.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let b_entries = b
+        .engine
+        .entries_for_peer(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
+    assert!(
+        !b_entries.iter().any(|e| e.doc_id.as_ref() == Some(&y)),
+        "premise: the entry of Y is purged on B, so A's pull has a gap and a snapshot serves it"
+    );
+
+    sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
+    assert!(
+        a.engine.get(&ca, &y).unwrap().is_some(),
+        "premise: Y, whose entry no longer exists on B, reached A, and only a snapshot carries that"
+    );
+    assert_eq!(
+        a.engine.get(&ca, &x).unwrap(),
+        Some(doc! { "_id": 1, "b": 2 }),
+        "the cell of the life before the drop did not come back with the write after it"
+    );
+}
+
 #[tokio::test]
 async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     // The test above passes for a collection whose derived id happens to sit
