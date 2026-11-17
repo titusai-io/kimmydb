@@ -72,8 +72,8 @@ fn a_far_future_carried_delete_of_a_field_document_stops_the_page_like_a_state()
     let stop = applied.clock_refused.as_ref().expect("a carried delete stops the page");
     assert_eq!(
         stop.reason,
-        ClockRefusal::Stamp,
-        "a carried delete has no state: its stamp is checked"
+        ClockRefusal::Vv,
+        "a carried delete carries its state, which is checked before its stamp"
     );
     assert!(!progress.is_complete());
     assert_eq!(
@@ -85,7 +85,7 @@ fn a_far_future_carried_delete_of_a_field_document_stops_the_page_like_a_state()
 /// The audit of every route that writes a document record (and so a tombstone or a merge state) is in
 /// `q7-step3-u1-plan.md`; this is its tripwire. A file of production code that builds a `DocRecord` is a route
 /// a stamp or a state can enter by, and U1 holds only the routes it names to the bound. A new one fails here
-/// until it is placed in the table (through the choke point, checked by `refuse_stamp_if_far_future`, or
+/// until it is placed in the table (through the choke point, or
 /// shown to carry no remote stamp or state) and added below.
 #[test]
 fn every_file_that_writes_a_document_record_is_a_route_the_audit_names() {
@@ -94,7 +94,7 @@ fn every_file_that_writes_a_document_record_is_a_route_the_audit_names() {
         "late_drop.rs", // a drop's bare tombstones, stamped by the (collection-level) drop entry
         "modify.rs", // a local update's write
         "rewind.rs", // a local rewind of this member's own records
-        "snapshot.rs", // the bare tombstone, bounded by `refuse_stamp_if_far_future`
+        "snapshot.rs", // the bare tombstone (document policy only: a field tombstone is joined behind the choke point)
     ]
     .into_iter()
     .collect();
