@@ -1635,6 +1635,7 @@ mod tests {
                 collection: CollectionId(7),
                 key: vec![4, 5],
                 stamp: stamp(600),
+                meta: None,
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),

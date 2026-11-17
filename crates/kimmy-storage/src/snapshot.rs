@@ -449,6 +449,11 @@ pub struct SnapshotTombstone {
     pub key: Vec<u8>,
     /// The stamp of the delete.
     pub stamp: Stamp,
+    /// The merged state a deleted document of a `field` collection keeps (the delete and its
+    /// context), as it is stored; `None` for a collection of any other policy, whose tombstone is
+    /// only a stamp. A `field` tombstone without it is not a valid row.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub meta: Option<Vec<u8>>,
 }
 
 /// A delete a received page carries, as the receiver's paths work with it.
@@ -460,6 +465,8 @@ struct CarriedDelete {
     /// The stored key.
     key: Vec<u8>,
     stamp: Stamp,
+    /// The state a `field` document's delete keeps.
+    meta: Option<Vec<u8>>,
 }
 
 impl CarriedDelete {
@@ -471,6 +478,7 @@ impl CarriedDelete {
                 collection: tombstone.collection,
                 key: tombstone.key.clone(),
                 stamp: tombstone.stamp,
+                meta: tombstone.meta.clone(),
             })
             .collect()
     }
@@ -1175,12 +1183,16 @@ impl Engine {
                     // recover, so it cannot be a `SnapshotDoc`, and a receiver
                     // below this node's horizon may well hold the document.
                     let (bytes, item) = if !record.is_live() {
+                        let bytes = doc_key.len()
+                            + record.meta.as_ref().map_or(0, Vec::len)
+                            + TOMBSTONE_OVERHEAD;
                         let tombstone = SnapshotTombstone {
                             collection: CollectionId(collection),
                             key: doc_key.to_vec(),
                             stamp: record.stamp,
+                            meta: record.meta,
                         };
-                        (doc_key.len() + TOMBSTONE_OVERHEAD, PageRow::Tombstone(tombstone))
+                        (bytes, PageRow::Tombstone(tombstone))
                     } else {
                         let Some(document) = record.document()? else {
                             continue;
@@ -6431,6 +6443,7 @@ mod tests {
             collection: ca.id,
             key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
             stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()),
+            meta: None,
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -6687,6 +6700,7 @@ mod tests {
                 collection: id,
                 key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
                 stamp: delete,
+                meta: None,
             }],
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,

@@ -427,6 +427,7 @@ fn the_row_overheads_bound_the_encoding() {
                 collection: kimmy_core::CollectionId(u64::MAX),
                 key: key.clone(),
                 stamp,
+                meta: None,
             })
             .collect();
         let page = SnapshotPage { deleted_documents: tombstones, ..bare.clone() };
