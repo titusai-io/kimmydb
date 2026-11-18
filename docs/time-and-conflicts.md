@@ -218,7 +218,7 @@ sequenceDiagram
 ```
 
 **Retention.** Tombstones are kept for `storage.tombstone_retention_secs`
-(default 24 h) and collected past that age by the retention pass in
+(default the oplog window plus the clock bound: 24 h and 5 min) and collected past that age by the retention pass in
 `kimmy-storage/src/gc.rs`, alongside oplog entries older than
 `storage.oplog_retention_secs`.
 
@@ -229,8 +229,8 @@ sequenceDiagram
 
 Two things bound it operationally ([ADR-085](decisions.md)). The node
 **refuses to start** with `tombstone_retention_secs` shorter than
-`oplog_retention_secs` — the one setting under which a partition *shorter*
-than the oplog window resurrects data, because a peer replays the delete's
+`oplog_retention_secs` plus `max_clock_skew_secs` — the setting under which a partition *shorter*
+than the oplog window, or a clock wrong by the bound, resurrects data, because a peer replays the delete's
 entry after the tombstone it needs to lose against is gone. And a peer that
 comes back trailing this node by **more than tombstone retention** is named:
 one `WARN` from the replication loop the round it is noticed, and

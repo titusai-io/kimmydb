@@ -695,9 +695,11 @@ impl ReplicationConfig {
             announce: None,
             members: None,
             on_lag: None,
-            // The storage default; a caller with a configured window passes
+            // The storage default (the oplog window plus the clock bound); a caller with a configured window passes
             // its own, and zero disables the check.
-            tombstone_retention: Duration::from_secs(24 * 60 * 60),
+            tombstone_retention: Duration::from_millis(
+                24 * 60 * 60 * 1000 + kimmy_storage::DEFAULT_MAX_CLOCK_SKEW_MS,
+            ),
             on_peer_staleness: None,
             on_round: None,
             lag_vectors: None,

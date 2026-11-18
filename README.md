@@ -190,7 +190,7 @@ The settings worth knowing before you deploy:
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | Optional. Federate with an external OIDC provider alongside local users; obliges `auth.oidc.audience`, and `https` only. `admin` cannot be granted through it; `ddl` can. See [Security](docs/security.md). |
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |
-| `storage.tombstone_retention_secs` | — | Must exceed your worst tolerable partition, or deleted documents resurrect. See below. |
+| `storage.tombstone_retention_secs` | — | Must exceed your worst tolerable partition, or deleted documents resurrect, and be at least `storage.oplog_retention_secs` plus `storage.max_clock_skew_secs` (the node refuses to start with less; the default is 86700). See below. |
 | `storage.gc_interval_secs` | — | How often retention is enforced (default 10 min). `0` disables collection and the oplog grows without bound. |
 
 `--insecure-no-auth` is refused on any non-loopback bind address, and clustering

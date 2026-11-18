@@ -552,7 +552,8 @@ pub struct StorageConfig {
     pub data_dir: PathBuf,
     /// How long deleted documents are retained as tombstones.
     ///
-    /// This must exceed the longest network partition you are willing to
+    /// At least `oplog_retention_secs` plus `max_clock_skew_secs`: the node refuses to start with less. This
+    /// must also exceed the longest network partition you are willing to
     /// tolerate. If a partitioned peer rejoins after its tombstones have been
     /// collected here, documents it deleted will resurrect.
     pub tombstone_retention_secs: u64,
@@ -1360,13 +1361,21 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// The default oplog window.
+pub const DEFAULT_OPLOG_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// The default bound on how far a clock may be wrong, in seconds.
+pub const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = kimmy_storage::DEFAULT_MAX_CLOCK_SKEW_MS / 1000;
+/// The default tombstone retention: the oplog window plus the clock bound, the least the config check accepts.
+pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 =
+    DEFAULT_OPLOG_RETENTION_SECS + DEFAULT_MAX_CLOCK_SKEW_SECS;
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("/var/lib/kimmy"),
-            tombstone_retention_secs: 24 * 60 * 60,
-            oplog_retention_secs: 24 * 60 * 60,
-            max_clock_skew_secs: kimmy_storage::DEFAULT_MAX_CLOCK_SKEW_MS / 1000,
+            tombstone_retention_secs: DEFAULT_TOMBSTONE_RETENTION_SECS,
+            oplog_retention_secs: DEFAULT_OPLOG_RETENTION_SECS,
+            max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
             cache_bytes: 256 * 1024 * 1024,
             // Frequent enough that disk use tracks retention rather than
             // sawtoothing, rare enough that the scan is not a background load.
@@ -1755,14 +1764,22 @@ impl Config {
             );
         }
 
-        if self.storage.tombstone_retention_secs < self.storage.oplog_retention_secs {
+        // The covered-entry skip needs a document's version vector to outlive the oplog that can still replay
+        // its entries, by the most a clock can be wrong: a tombstone collected inside that margin leaves a
+        // replayed old entry nothing to lose against.
+        let floor =
+            self.storage.oplog_retention_secs.saturating_add(self.storage.max_clock_skew_secs);
+        if self.storage.tombstone_retention_secs < floor {
             anyhow::bail!(
                 "storage.tombstone_retention_secs ({}) is shorter than \
-                 storage.oplog_retention_secs ({}); a delete would be collected while the \
-                 oplog still offers it to peers, and a peer that missed it could resurrect \
-                 the document. Raise tombstone retention to at least the oplog window.",
+                 storage.oplog_retention_secs ({}) plus storage.max_clock_skew_secs ({}); a \
+                 delete would be collected while the oplog still offers it to peers, or inside \
+                 the margin a clock can be wrong by, and a peer that missed it could resurrect \
+                 the document. Raise tombstone retention to at least {} seconds.",
                 self.storage.tombstone_retention_secs,
                 self.storage.oplog_retention_secs,
+                self.storage.max_clock_skew_secs,
+                floor,
             );
         }
 
@@ -2661,23 +2678,73 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
     }
 
     #[test]
-    fn tombstone_retention_shorter_than_the_oplog_window_is_rejected() {
-        // The one retention setting that makes a partition *shorter* than the
-        // oplog window resurrect data: a peer replays the delete's entry
-        // after the tombstone it needs to lose against is gone (ADR-085).
+    fn tombstone_retention_shorter_than_the_oplog_window_plus_the_skew_is_rejected() {
+        // The setting under which a partition shorter than the oplog window, or a clock wrong by the
+        // bound, resurrects data: a peer replays the delete's entry after the tombstone it needs to
+        // lose against is gone (ADR-085), and the covered-entry skip needs the document's version
+        // vector to outlive the oplog by the skew.
         let mut cfg = valid();
         cfg.storage.oplog_retention_secs = 3_600;
-        cfg.storage.tombstone_retention_secs = 600;
+        cfg.storage.max_clock_skew_secs = 300;
         cfg.storage.gc_interval_secs = 60;
 
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
-
-        // Equal is the floor, and longer is the recommendation.
-        cfg.storage.tombstone_retention_secs = 3_600;
-        cfg.validate().unwrap();
+        for refused in [600, 3_600, 3_899] {
+            cfg.storage.tombstone_retention_secs = refused;
+            let err = cfg
+                .validate()
+                .expect_err("a tombstone retention below the oplog window plus the skew is refused")
+                .to_string();
+            assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+            for key in ["tombstone_retention_secs", "oplog_retention_secs", "max_clock_skew_secs"] {
+                assert!(err.contains(key), "the error names {key}: {err}");
+            }
+        }
+        // The oplog window plus the skew is the floor, and longer is the recommendation.
+        cfg.storage.tombstone_retention_secs = 3_900;
+        cfg.validate().expect("the oplog window plus the skew is accepted");
         cfg.storage.tombstone_retention_secs = 86_400;
+        cfg.validate().expect("a longer tombstone retention is accepted");
+    }
+
+    #[test]
+    fn a_larger_skew_raises_the_floor_of_the_tombstone_retention() {
+        let mut cfg = valid();
+        cfg.storage.oplog_retention_secs = 3_600;
+        cfg.storage.gc_interval_secs = 60;
+        cfg.storage.max_clock_skew_secs = 600;
+        cfg.storage.tombstone_retention_secs = 3_900;
+        assert!(cfg.validate().is_err(), "oplog plus 300 is below oplog plus 600");
+        cfg.storage.tombstone_retention_secs = 4_200;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_default_tombstone_retention_is_the_default_oplog_window_plus_the_skew() {
+        let storage = StorageConfig::default();
+        assert_eq!(
+            storage.tombstone_retention_secs,
+            storage.oplog_retention_secs + storage.max_clock_skew_secs,
+            "the default tombstone retention is the least the check accepts"
+        );
+        assert_eq!(
+            storage.oplog_retention_secs,
+            24 * 60 * 60,
+            "the documented oplog window is kept"
+        );
+        valid().validate().unwrap();
+    }
+
+    #[test]
+    fn an_oplog_window_that_overflows_the_floor_is_refused_without_a_panic() {
+        let mut cfg = valid();
+        cfg.storage.oplog_retention_secs = u64::MAX;
+        cfg.storage.tombstone_retention_secs = u64::MAX - 1;
+        cfg.storage.gc_interval_secs = 60;
+        let err = cfg
+            .validate()
+            .expect_err("an oplog window that overflows the floor is refused")
+            .to_string();
+        assert!(err.contains("tombstone_retention_secs"), "refused by name: {err}");
     }
 
     #[test]

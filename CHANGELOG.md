@@ -26,6 +26,8 @@ A path through arrays now has one rule for a filter, a sort and an index, and a 
 
 **Changed (breaking): documents are ordered by the type of their values, then their names, then the values, recursively, where they were ordered by name first.** `{c: "z"}` is after `{d: 1}` now. A sort, a comparison, `$cmp`, `$min` and `$max` of every kind, a `$group` `$min` and `$max`, an update `$min` and `$max`, and the key order of an index over documents follow it. `$setWindowFields` (`sortBy`, `partitionBy`) and `$densify` (`partitionByFields`) order documents the same way (recorded: q7s4t).
 
+**Changed (breaking): the node refuses to start with `storage.tombstone_retention_secs` shorter than `storage.oplog_retention_secs` plus `storage.max_clock_skew_secs`, and the default tombstone retention is that sum (86700 s).** It was refused below the oplog window alone. A document's version vector must outlive the oplog that can replay its entries by the most a clock can be wrong, or a replayed old entry finds nothing to lose against. A configuration that sets the two equal, as the defaults did, is refused by name; set `tombstone_retention_secs` to at least the sum.
+
 **Before the wipe, find what 0.60.0 accepted that this release refuses.** Run on 0.60.0, per collection. (1) For each unique index on a path `arr.f` through one array, the documents with an element that is not a document or lacks `f`, plus the documents `{"arr.f": null}` matches today; more than one in total is a reseed refused at the second. Deeper paths need one `$map` per array level.
 
 ```
