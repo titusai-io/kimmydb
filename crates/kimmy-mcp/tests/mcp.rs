@@ -635,6 +635,18 @@ async fn a_read_only_token_can_read_but_not_write() {
     assert_eq!(after["count"], 3);
 }
 
+/// The create tool takes the create default: a collection made without a policy is `field`, as over HTTP.
+#[tokio::test]
+async fn a_collection_the_create_tool_makes_has_the_default_merge_policy() {
+    let server = Server::start().await;
+    let builder = server.token("builder", vec![Grant::new("app", "*", vec![Action::Ddl])]);
+    server
+        .call_ok(&builder, "create_collection", json!({"database":"app","name":"memories"}))
+        .await;
+    let meta = server.engine.get_collection("app", "memories").unwrap();
+    assert_eq!(meta.merge_policy, kimmy_core::MergePolicy::Field, "the create default");
+}
+
 #[tokio::test]
 async fn a_ddl_token_can_create_a_collection_and_write_needs_its_own_grant() {
     // The first thing an agent does with a fresh database is create the

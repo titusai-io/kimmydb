@@ -5467,7 +5467,7 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
     let res = client
         .post(a.url("/v1/db/shop/collections"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "name": "orders" }))
+        .json(&serde_json::json!({ "name": "orders", "mergePolicy": "document" }))
         .send()
         .await
         .unwrap();
@@ -5656,7 +5656,7 @@ async fn a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_rem
     let res = client
         .post(a.url("/v1/db/shop/collections"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "name": "orders" }))
+        .json(&serde_json::json!({ "name": "orders", "mergePolicy": "document" }))
         .send()
         .await
         .unwrap();
