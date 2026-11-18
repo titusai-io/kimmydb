@@ -190,8 +190,11 @@ data_dir = "/var/lib/kimmy"
 #
 # This must exceed the longest network partition you are willing to tolerate.
 # If a partitioned peer rejoins after tombstones have been collected here, the
-# documents it deleted will come back from the dead.
-tombstone_retention_secs = 86400
+# documents it deleted will come back from the dead. It must also be at least
+# oplog_retention_secs plus max_clock_skew_secs (the node refuses to start with
+# less): a tombstone must outlive the oplog that can replay its delete by the
+# most a clock can be wrong.
+tombstone_retention_secs = 86700
 
 # How much oplog history to retain, which bounds two things: how long a
 # disconnected change-stream client can be away and still resume, and how far

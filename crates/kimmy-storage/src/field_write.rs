@@ -43,8 +43,10 @@ pub(crate) struct Image {
 }
 
 /// The default join retention `R` of a `field` collection created on a member whose tombstone retention
-/// is not configured: 24 hours, in milliseconds, the default of `storage.tombstone_retention_secs`.
-pub(crate) const DEFAULT_JOIN_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// is not configured: 24 hours of oplog window plus the clock bound, in milliseconds, the default of
+/// `storage.tombstone_retention_secs`.
+pub(crate) const DEFAULT_JOIN_RETENTION_MS: u64 =
+    24 * 60 * 60 * 1000 + crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS;
 
 /// Who writes, and under which join retention `R`: the collection's, fixed at its creation, replicated with
 /// it and immutable, so that every member computes the same horizon `H = max(vv) - R`. Never read from a
