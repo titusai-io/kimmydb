@@ -93,6 +93,9 @@ mod merge_policy_tests;
 mod converge_tests;
 
 #[cfg(test)]
+mod converge_field_tests;
+
+#[cfg(test)]
 mod definition_repair_tests;
 
 #[cfg(test)]

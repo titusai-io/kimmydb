@@ -369,6 +369,18 @@ drop is buried as one at or below it is. It reads the drop's own stamp, not the 
 sweep sets last. Like the removals of the sweep it publishes nothing: it is this member's own state coming to
 what every member holds. A record with nothing to thin is not written, so a second pass writes nothing.
 
+**The young rule of a repair pull judges a `field` row by its lives.** A repair pull (the `Converge` policy of a scoped
+snapshot) creates a row this member holds nothing for only when the row is young: newer than every tombstone either
+member has collected, so that no delete it has forgotten can have killed it. For a `document` collection the stamp of
+the record is the answer. The stamp of a `field` row is only its newest write, and the state under it holds the lives:
+a delete kills the lives whose creator had not seen it, whatever the stamps, so a life made at or below the horizon may
+be one a collected delete killed, and a newer write into it does not make it young. A `field` row is young when every
+life of its state that is not marked dead was made above the horizon, the state first held to the floor of the
+collection as every state is on its way in, so that a life only the cells before a drop keep does not count. A dead
+life renders nothing and is not brought back. A row that is not young is left whole and counted as left, as before:
+the row is never applied in part, one life without the lives beside it, so a member past the retention horizon
+diverges on that document as it does on a `document` row.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is

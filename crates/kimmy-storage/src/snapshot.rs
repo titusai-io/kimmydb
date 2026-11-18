@@ -1784,7 +1784,10 @@ impl Engine {
                             owes
                         }
                     };
-                    let is_young = young_above.is_some_and(|above| document.stamp.hlc > above);
+                    let is_young = match young_above {
+                        Some(above) => Self::row_is_young(&txn, &collection, document, above)?,
+                        None => false,
+                    };
                     if !is_young || owes {
                         left += 1;
                         if left_ids.len() < LEFT_IDS_NAMED {
@@ -1863,6 +1866,48 @@ impl Engine {
                 ..Default::default()
             }),
         }
+    }
+
+    /// The state a page document of a `field` collection brings, held to the floor of the collection as
+    /// every state is on its way in (the cells of the life before a drop are history): what a row would
+    /// leave here. `None` for a state that does not decode, which is judged by nothing.
+    fn row_state(
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+        document: &SnapshotDoc,
+    ) -> Result<Option<kimmy_core::merge_state::MergeState>> {
+        let Ok(mut state) = crate::field_write::load(document.meta.as_deref()) else {
+            return Ok(None);
+        };
+        if let Some(floor) = Self::floor_of(txn, collection)? {
+            state.drop_at_or_below(floor);
+        }
+        Ok(Some(state))
+    }
+
+    /// Whether a row of a `Converge` page that this member holds nothing for is young: newer than every
+    /// tombstone either member has collected, so that no delete it has forgotten can have killed it.
+    /// `above` is the later of the two horizons.
+    ///
+    /// A `document` row is the one record and its stamp is the answer. The stamp of a `field` row is only
+    /// its newest write; the state under it holds the lives, and a delete kills the lives whose creator
+    /// had not seen it, whatever the stamps, so a life made at or below the horizon may be one a collected
+    /// delete killed. A `field` row is young when every life of its state that is not dead was made above
+    /// the horizon, the state held to the floor first (a life only the cells before a drop keep is gone
+    /// from what the row would leave). A row that is not young is left whole: a life is not brought back
+    /// without the lives beside it, so a member past the retention horizon diverges on the document as it
+    /// does for a `document` row. A state that does not decode is not young.
+    fn row_is_young(
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+        document: &SnapshotDoc,
+        above: Hlc,
+    ) -> Result<bool> {
+        if collection.merge_policy != kimmy_core::MergePolicy::Field {
+            return Ok(document.stamp.hlc > above);
+        }
+        Ok(Self::row_state(txn, collection, document)?
+            .is_some_and(|state| state.alive_lives().all(|life| life.hlc > above)))
     }
 
     /// Whether the first page of a scoped repair pull carries the successor of the life
