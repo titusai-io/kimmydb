@@ -265,3 +265,73 @@ fn a_row_whose_state_does_not_decode_is_left() {
     );
     assert_eq!((done.created, done.left), (0, 1));
 }
+
+// -- at_cut: what a pull counts as progress ----------------------------------------------
+
+/// The cut of a finding that stands at `stamp` for the origin that made it.
+fn cut_at(stamp: kimmy_core::Stamp) -> VersionVector {
+    let mut cut = VersionVector::new();
+    cut.observe(stamp);
+    cut
+}
+
+/// A made X and wrote to it again: the row carries both writes, under the stamp of the second. The cut is
+/// between them, so the first is at the cut and the stamp of the row is above it.
+fn a_row_with_a_write_at_the_cut_under_a_stamp_above_it(
+    a: &Engine,
+) -> (kimmy_core::DocId, VersionVector) {
+    let ca = coll(a);
+    let x = a.insert(&ca, doc! { "_id": 3, "a": 1 }).unwrap();
+    let first = everything(a).into_iter().find(|e| e.kind == kimmy_core::OpKind::Insert).unwrap();
+    later();
+    a.replace(&ca, &x, doc! { "_id": 3, "a": 1, "b": 2 }, false).unwrap();
+    let page = a.snapshot_page(None, Some(orders())).unwrap();
+    let cut = cut_at(first.stamp);
+    assert!(
+        page.documents[0].stamp.hlc > cut.get(page.documents[0].stamp.origin()),
+        "premise: the stamp of the row is above the cut"
+    );
+    (x, cut)
+}
+
+#[test]
+fn a_row_applied_with_a_write_at_the_cut_under_a_stamp_above_it_counts_at_the_cut() {
+    let (a, b, _d) = field_pair();
+    let ca = coll(&a);
+    let x = a.insert(&ca, doc! { "_id": 3, "a": 1 }).unwrap();
+    let first = everything(&a).into_iter().find(|e| e.kind == kimmy_core::OpKind::Insert).unwrap();
+    b.apply_batch(&everything(&a)).unwrap();
+    later();
+    a.replace(&ca, &x, doc! { "_id": 3, "a": 1, "b": 2 }, false).unwrap();
+    let done = converge(&b, &a, cut_at(first.stamp));
+    assert_eq!(b.get(&coll(&b), &x).unwrap(), Some(doc! { "_id": 3, "a": 1, "b": 2 }));
+    assert_eq!(done.applied, 1, "premise: the row was applied");
+    assert_eq!(
+        done.applied_at_cut, 1,
+        "the row carries a write at the cut, which ordinary replication would not have delivered"
+    );
+}
+
+#[test]
+fn a_row_created_with_a_write_at_the_cut_under_a_stamp_above_it_counts_at_the_cut() {
+    let (a, b, _d) = field_pair();
+    let (x, cut) = a_row_with_a_write_at_the_cut_under_a_stamp_above_it(&a);
+    let done = converge(&b, &a, cut);
+    assert_eq!(b.get(&coll(&b), &x).unwrap(), Some(doc! { "_id": 3, "a": 1, "b": 2 }));
+    assert_eq!(done.created, 1, "premise: the row was created");
+    assert_eq!(done.created_at_cut, 1, "the row carries a write at the cut");
+}
+
+#[test]
+fn a_row_with_every_write_above_the_cut_does_not_count_at_the_cut() {
+    let (a, b, _d) = field_pair();
+    a_row_with_a_write_at_the_cut_under_a_stamp_above_it(&a);
+    let long_ago = Hlc::new(crate::physical_now_ms() - 3_600_000, 0);
+    let done = converge(&b, &a, cut_at(kimmy_core::Stamp::new(long_ago, a.node_id(), a.epoch())));
+    assert_eq!(done.created, 1, "premise: the row was created");
+    assert_eq!(
+        (done.created_at_cut, done.applied_at_cut),
+        (0, 0),
+        "a row of tail writes is one ordinary replication also brings"
+    );
+}
