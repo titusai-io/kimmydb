@@ -293,6 +293,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          bounds it (ADR-192), and each candidate it passes ticks the request's deadline",
     ),
     (
+        "missing::remove_collection_chunk",
+        "at most the purge chunk's rows left over (DROP_PURGE_CHUNK, a thousand, less what the chunk already removed) of one collection, in the one write of `purge_chunk`: close_writes bounds it (ADR-192), and the stop lands between chunks, where `warm_purge_chunk` has read ahead stop-aware",
+    ),
+    (
         "purge::Engine::owed_purges",
         "the dropped registry, and one row per drop: whether rows are left",
     ),

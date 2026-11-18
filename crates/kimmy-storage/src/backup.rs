@@ -85,6 +85,7 @@ const T_OPLOG_ARRIVAL_SEQ: u8 = 8;
 const T_COLLECTIONS_DROPPED: u8 = 9;
 const T_OPLOG_VERSIONS: u8 = 10;
 const T_INDEXES_DROPPED: u8 = 11;
+const T_MISSING_THROUGH: u8 = 12;
 
 /// What a backup or restore moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -177,6 +178,13 @@ impl Engine {
             out
         });
         simple!(T_DOCS, tables::DOCS, |k: (u64, &[u8])| {
+            let mut out = k.0.to_be_bytes().to_vec();
+            out.extend_from_slice(k.1);
+            out
+        });
+        // What a document no longer holds as an entry: a restored member must not forget what its oplog collected,
+        // or a rewind would take a document with a collected prefix for complete (`missing.rs`).
+        simple!(T_MISSING_THROUGH, tables::MISSING_THROUGH, |k: (u64, &[u8])| {
             let mut out = k.0.to_be_bytes().to_vec();
             out.extend_from_slice(k.1);
             out
@@ -384,6 +392,7 @@ pub fn restore_with(
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+            let mut missing = txn.open_table(tables::MISSING_THROUGH)?;
 
             loop {
                 let (tag, key, value) = match pending.pop_front() {
@@ -433,6 +442,10 @@ pub fn restore_with(
                     T_DOCS => {
                         let (id, rest) = split_u64(&key)?;
                         docs.insert((id, rest), value.as_slice())?;
+                    }
+                    T_MISSING_THROUGH => {
+                        let (id, rest) = split_u64(&key)?;
+                        missing.insert((id, rest), value.as_slice())?;
                     }
                     T_INDEX_ENTRIES => {
                         let (coll, rest) = split_u64(&key)?;
@@ -579,7 +592,7 @@ fn split_u64(key: &[u8]) -> Result<(u64, &[u8])> {
 #[cfg(test)]
 mod tests {
     use bson::doc;
-    use kimmy_core::{DocId, index_meta::IndexField};
+    use kimmy_core::{DocId, MergePolicy, index_meta::IndexField};
 
     use super::*;
 
@@ -625,6 +638,7 @@ mod tests {
         "COLLECTIONS_DROPPED",
         "OPLOG_VERSIONS",
         "INDEXES_DROPPED",
+        "MISSING_THROUGH",
     ];
 
     /// The tables it does not, and why. Each is node-local or derived; the doc
@@ -765,6 +779,21 @@ mod tests {
         // And a dropped index, so its tombstone is too.
         engine.create_index("shop", "orders", vec![field("qty")], false, None).unwrap();
         engine.drop_index("shop", "orders", "qty_1").unwrap();
+        // And a `field` document this member holds only as state, which a snapshot page installed and no entry
+        // backs, so the missing-through vector has a row (`missing.rs`): the way it is written in production.
+        let donor_dir = tempfile::tempdir().unwrap();
+        let donor = Engine::open(&donor_dir.path().join("kimmy.redb")).unwrap();
+        let notes =
+            donor.create_collection_with_policy("shop", "notes", MergePolicy::Field, None).unwrap();
+        donor.insert(&notes, doc! { "_id": 1i64, "text": "a" }).unwrap();
+        let page = donor.snapshot_page(None, None).unwrap();
+        engine
+            .apply_snapshot_page(
+                donor.node_id(),
+                &mut crate::SnapshotProgress::whole_database(),
+                &page,
+            )
+            .unwrap();
         (engine, dir)
     }
 
@@ -832,6 +861,19 @@ mod tests {
             restored.version_vector().unwrap(),
             before_versions,
             "the version vector must survive, or the node re-requests history it already has"
+        );
+
+        // What the oplog no longer holds of a document comes back too, or a rewind would take a document
+        // with a collected prefix for complete.
+        let notes = engine.get_collection("shop", "notes").unwrap();
+        let rnotes =
+            restored.get_collection("shop", "notes").expect("the field collection restores");
+        let missing = engine.missing_through(&notes, &DocId::Int64(1)).unwrap();
+        assert!(!missing.is_empty(), "premise: the fixture's document is held as state alone");
+        assert_eq!(
+            restored.missing_through(&rnotes, &DocId::Int64(1)).unwrap(),
+            missing,
+            "the missing-through row survives a restore"
         );
 
         // The index has to be usable, not merely present.
