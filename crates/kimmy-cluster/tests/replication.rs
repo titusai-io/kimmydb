@@ -778,6 +778,76 @@ async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_
     assert!(c.engine.get(&cc, &y).unwrap().is_some(), "premise: C holds Y after the repair");
 }
 
+/// Step 3, item (3.5): the repair of a member that has collected the tombstone of a field document does not bring
+/// the document back from a member that holds a life the delete killed. A makes X = {a}; B and C take it. C deletes
+/// it and collects the tombstone, so its horizon stands above the delete. B, which has not heard of the delete,
+/// writes X.b after it: the row B would send carries a stamp above C's horizon, but the life under it was made
+/// before. C holds a document W that B lacks, so that the two collections hold one document each (a difference in
+/// count is the count half's business, and a repair by digest needs the counts equal), and each is made to believe
+/// it has witnessed the other without applying anything: only the repair loop can move a document, and it must
+/// leave X.
+#[tokio::test]
+async fn the_repair_of_a_member_that_collected_a_delete_does_not_bring_back_the_life_the_delete_killed()
+ {
+    use kimmy_cluster::RowResult;
+    let a = node().await;
+    let ca = a
+        .engine
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    let x = a.engine.insert(&ca, doc! { "_id": 1, "a": 1 }).unwrap();
+    let b = node().await;
+    let c = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection arrives");
+    let cc = c.engine.get_collection("shop", "orders").expect("the collection arrives");
+
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(c.engine.delete(&cc, &x).unwrap(), "premise: C deleted X");
+    std::thread::sleep(Duration::from_millis(5));
+    c.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms(),
+            kimmy_storage::RetentionPolicy::new(u64::MAX, 0),
+        )
+        .unwrap();
+    let horizon = c.engine.tombstone_horizon().unwrap().expect("premise: C has a horizon");
+    std::thread::sleep(Duration::from_millis(5));
+    b.engine.replace(&cb, &x, doc! { "_id": 1, "a": 1, "b": 2 }, false).unwrap();
+    let page = b.engine.snapshot_page(None, Some(cb.id)).unwrap();
+    assert!(page.documents[0].stamp.hlc > horizon, "premise: B's write is above C's horizon");
+    c.engine.insert(&cc, doc! { "_id": 2 }).unwrap();
+    assert!(c.engine.get(&cc, &x).unwrap().is_none(), "premise: C holds nothing of X");
+    let count = |n: &Node, meta: &kimmy_storage::CollectionMeta| {
+        n.engine.count(meta, kimmy_storage::WalkScope::Request).unwrap()
+    };
+    assert_eq!((count(&b, &cb), count(&c, &cc)), (1, 1), "premise: one document each");
+
+    let theirs = b.engine.version_vector().unwrap();
+    c.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    let ours = c.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&ours, &[], Hlc::ZERO, true).unwrap();
+    let (totals, _) =
+        repair_loop(&b, &c, |_| {}, |_, totals| totals.digest_repairs.iter().sum::<usize>() >= 1)
+            .await;
+    assert!(
+        totals.digest_rows[RowResult::Created.index()]
+            + totals.digest_rows[RowResult::Left.index()]
+            >= 1,
+        "premise: a Converge page for X reached C: {totals:?}"
+    );
+    assert_eq!(
+        totals.digest_rows[RowResult::Created.index()],
+        0,
+        "the repair did not create the row of a life the delete killed: {totals:?}"
+    );
+    assert!(
+        c.engine.get(&cc, &x).unwrap().is_none(),
+        "the life the collected delete killed is not back on C"
+    );
+}
+
 /// Step 3, item (3.4a): a member that stands over an incarnation floor takes a field document by snapshot
 /// from a member that has not heard of the drop, and gets the cells stamped above the floor and none of
 /// the life before. A holds X = {a}; B takes it; A drops the collection and creates it again; B, which has
