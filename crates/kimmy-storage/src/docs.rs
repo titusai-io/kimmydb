@@ -1845,7 +1845,15 @@ impl Engine {
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
     ) -> Result<Option<kimmy_core::Hlc>> {
-        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        Self::floor_in(&txn.open_table(tables::COLLECTIONS_DROPPED)?, coll)
+    }
+
+    /// [`Self::floor_of`] over the drop tombstones as a table, so a read transaction (the rewind's plan) judges a
+    /// state by the same floor and no second copy of the rule exists.
+    pub(crate) fn floor_in(
+        dropped: &impl redb::ReadableTable<u64, &'static [u8]>,
+        coll: &CollectionMeta,
+    ) -> Result<Option<kimmy_core::Hlc>> {
         let mut floor = coll.incarnation_floor;
         for id in [coll.id, kimmy_core::database_drop_id(&coll.db)] {
             if let Some(raw) = dropped.get(id.0)? {

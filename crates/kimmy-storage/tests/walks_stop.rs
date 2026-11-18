@@ -306,6 +306,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("rewind::Engine::rewind_to", "`kimmyd rewind`, which runs on a stopped node"),
     (
+        "rewind::Engine::plan_field_documents",
+        "only `rewind_to` calls it, which is `kimmyd restore --until`: it opens the file the restore has just written, offline, before any node serves it, so there is no live engine to hold up and no stop to honour (the entry above)",
+    ),
+    (
         "snapshot::Engine::collection_states",
         "the collection registry: one row per collection, however many documents",
     ),

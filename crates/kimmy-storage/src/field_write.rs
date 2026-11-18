@@ -103,7 +103,7 @@ pub(crate) fn state_holes(vv: &kimmy_core::merge_state::Vv, own: Origin) -> Vec<
         .collect()
 }
 
-fn m_stamp(s: Stamp) -> MStamp {
+pub(crate) fn m_stamp(s: Stamp) -> MStamp {
     MStamp { hlc: s.hlc, writer: WriterId { node: s.node, epoch: s.epoch } }
 }
 
