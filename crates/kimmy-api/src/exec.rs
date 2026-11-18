@@ -174,14 +174,7 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
-    create_collection_validated(
-        state,
-        auth,
-        db,
-        name,
-        None,
-        kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
-    )
+    create_collection_validated(state, auth, db, name, None, kimmy_core::MergePolicy::DEFAULT)
 }
 
 /// [`create_collection`] with a validator set at creation (ADR-257).
@@ -3516,7 +3509,7 @@ fn write_sink(
             state.engine.create_collection_with_policy(
                 &db,
                 &coll,
-                kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
+                kimmy_core::MergePolicy::DEFAULT,
                 None,
             )
         }) {

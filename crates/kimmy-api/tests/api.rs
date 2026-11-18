@@ -3289,7 +3289,9 @@ async fn a_replaced_document_reads_back_with_its_id_first() {
 async fn a_no_op_update_is_not_written() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"g":"x"})).await;
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"g":"x"})).await;
     async fn stamps(server: &Server, token: &str) -> Value {
@@ -3361,7 +3363,9 @@ async fn a_no_op_update_is_not_written() {
 async fn a_replace_with_the_stored_body_is_not_written() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted =
         server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"k","a":1,"b":2})).await;
     let stamp = inserted.body["stamp"].as_str().unwrap().to_string();
@@ -4748,7 +4752,14 @@ async fn a_multi_update_reports_its_commits() {
 async fn standing_unique_violations_are_reported_until_resolved() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    // a violation is recorded when a whole document is replicated in: `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "users", "mergePolicy": "document" }),
+        )
+        .await;
     let res = server
         .post(
             "/v1/db/shop/coll/users/indexes",
@@ -4824,7 +4835,14 @@ async fn standing_unique_violations_are_reported_until_resolved() {
 async fn a_violation_names_a_uuid_holder_with_its_subtype() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    // a violation is recorded when a whole document is replicated in: `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "users", "mergePolicy": "document" }),
+        )
+        .await;
     let res = server
         .post(
             "/v1/db/shop/coll/users/indexes",
@@ -4888,7 +4906,14 @@ async fn a_violation_names_a_uuid_holder_with_its_subtype() {
 async fn a_rewritten_member_leaves_its_violation_group() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    // a violation is recorded when a whole document is replicated in: `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "users", "mergePolicy": "document" }),
+        )
+        .await;
     let res = server
         .post(
             "/v1/db/shop/coll/users/indexes",
@@ -5026,7 +5051,14 @@ async fn a_rewritten_member_leaves_its_violation_group() {
 async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_standing() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    // a violation is recorded when a whole document is replicated in: `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "users", "mergePolicy": "document" }),
+        )
+        .await;
     server
         .post(
             "/v1/db/shop/coll/users/indexes",
@@ -5212,7 +5244,9 @@ fn stamp_of(body: &Value) -> String {
 async fn a_read_by_id_carries_its_stamp_as_an_etag_and_find_can_return_stamps() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted =
         server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
     let stamp = stamp_of(&inserted.body);
@@ -5251,7 +5285,9 @@ async fn a_delete_by_id_reports_the_tombstone_stamp() {
     // 0.20.0.
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
 
     let read = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
@@ -5287,7 +5323,9 @@ async fn a_delete_by_id_reports_the_tombstone_stamp() {
 async fn a_conditional_replace_succeeds_at_the_current_stamp_and_moves_it() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted =
         server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
     let first = stamp_of(&inserted.body);
@@ -5320,7 +5358,9 @@ async fn a_conditional_replace_succeeds_at_the_current_stamp_and_moves_it() {
 async fn a_stale_write_leaves_the_document_the_oplog_and_the_commit_count_alone() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted =
         server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
     let first = stamp_of(&inserted.body);
@@ -5365,7 +5405,9 @@ async fn a_stale_write_leaves_the_document_the_oplog_and_the_commit_count_alone(
 async fn a_conditional_write_on_a_missing_document_is_stale_not_a_no_op() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1})).await;
     let stamp = stamp_of(&inserted.body);
     server.delete("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
@@ -5403,7 +5445,9 @@ async fn a_conditional_write_on_a_missing_document_is_stale_not_a_no_op() {
 async fn if_stamp_refuses_multi_upsert_and_garbage() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1})).await;
     let stamp = stamp_of(&inserted.body);
 
@@ -5441,7 +5485,13 @@ async fn if_stamp_refuses_multi_upsert_and_garbage() {
 async fn explain_refuses_if_stamp() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"cond"})).await;
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({"name":"cond","mergePolicy":"document"}),
+        )
+        .await;
     let inserted = server.post("/v1/db/shop/coll/cond/docs", Some(&token), json!({"_id":1})).await;
     let stamp = stamp_of(&inserted.body);
 
@@ -5483,7 +5533,14 @@ async fn explain_refuses_if_stamp() {
 async fn if_stamp_null_is_refused_on_every_write_shape_rather_than_read_as_absent() {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    // the test compares the ETag with the stamp, which is the version of a `document` collection only.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "c", "mergePolicy": "document" }),
+        )
+        .await;
 
     let refuses = |res: &Res| {
         assert_eq!(res.status, 422, "{:?}", res.body);
@@ -5852,7 +5909,9 @@ async fn every_optional_field_of_a_closed_request_shape_refuses_an_explicit_null
 async fn racing_conditional_writers_produce_exactly_one_winner() {
     let server = Arc::new(Server::start().await);
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let inserted =
         server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"owner":null})).await;
     let stamp = stamp_of(&inserted.body);
@@ -7399,7 +7458,9 @@ async fn filtered_writes_report_a_stamp_only_when_one_document_was_written() {
     // several documents; the response is honest in the same way.
     let server = Server::start().await;
     let root = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&root), json!({ "name": "c" })).await;
+    server
+        .post("/v1/db/shop/collections", Some(&root), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     let bulk = server
         .post(
             "/v1/db/shop/coll/c/bulk",
@@ -13644,7 +13705,14 @@ async fn the_storage_cache_series_read_this_nodes_engine() {
 /// A server whose collection `u` holds one keyable document under the compound
 /// index `ab`, and a collection `src` holding documents to merge from.
 async fn indexed_collection(server: &Server, token: &str) {
-    server.post("/v1/db/shop/collections", Some(token), json!({ "name": "u" })).await;
+    // the tests replicate whole documents in (`replicated`): `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(token),
+            json!({ "name": "u", "mergePolicy": "document" }),
+        )
+        .await;
     let seeded = server
         .post("/v1/db/shop/coll/u/docs", Some(token), json!({ "_id": 1, "a": 1, "b": 1 }))
         .await;
@@ -17333,7 +17401,14 @@ async fn an_index_carries_every_field_the_specification_requires() {
 
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    // the test replicates whole documents in (`replicated_into`): `document` semantics.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "orders", "mergePolicy": "document" }),
+        )
+        .await;
     // A partial compound index, then documents with arrays at both of its
     // paths arriving as another member's writes do, which it cannot key: one the
     // filter selects, by a decimal's exact value, so `unkeyed` is not merely
@@ -17913,7 +17988,10 @@ async fn deleting_a_role_twice_reaches_its_holders_both_times() {
 async fn adr208_server() -> (Server, String) {
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    // ADR-208 is about the version of a `document` collection: a stamp is what `if_stamp` takes there.
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"c","mergePolicy":"document"}))
+        .await;
     (server, token)
 }
 
@@ -19028,8 +19106,7 @@ async fn a_merge_into_another_database_needs_the_grant_there() {
 }
 
 /// An implicitly created `$out` or `$merge` target is a collection like one created over HTTP
-/// without a `mergePolicy`: it has the create default. Until Step 3's apply commit that is the interim
-/// `document` (`MergePolicy::INTERIM_CREATE_DEFAULT`); the commit flips it to `DEFAULT`, `field`.
+/// without a `mergePolicy`: it has the create default, `field` (`MergePolicy::DEFAULT`).
 #[tokio::test]
 async fn an_implicitly_created_sink_target_has_the_default_merge_policy() {
     let server = Server::start().await;
@@ -19049,11 +19126,7 @@ async fn an_implicitly_created_sink_target_has_the_default_merge_policy() {
     assert_eq!(made.status, 200, "{:?}", made.body);
     for name in ["snap", "joined", "made"] {
         let meta = server.state.engine.get_collection("shop", name).unwrap();
-        assert_eq!(
-            meta.merge_policy,
-            kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
-            "shop.{name}"
-        );
+        assert_eq!(meta.merge_policy, kimmy_core::MergePolicy::Field, "shop.{name}");
     }
 }
 
@@ -23108,20 +23181,20 @@ async fn a_filter_of_exactly_one_id_literal_sorts_nothing_whatever_its_type_but_
     }
 }
 
-/// The merge policy over HTTP: named at creation or the interim default, answered by the create and by
+/// The merge policy over HTTP: named at creation or the default (`field`), answered by the create and by
 /// `describe` with the guidance, and a value that is neither `field` nor `document` is a `400`.
 #[tokio::test]
 async fn the_merge_policy_is_chosen_at_creation_and_described_with_its_guidance() {
     let server = Server::start().await;
     let token = server.root().await;
     for (name, body, want) in [
-        ("plain", json!({"name": "plain"}), "document"),
+        ("plain", json!({"name": "plain"}), "field"),
         ("wide", json!({"name": "wide", "mergePolicy": "field"}), "field"),
         ("whole", json!({"name": "whole", "mergePolicy": "document"}), "document"),
     ] {
         let made = server.post("/v1/db/shop/collections", Some(&token), body).await;
         assert_eq!(made.status, 200, "{:?}", made.body);
-        assert_eq!(made.body["mergePolicy"], want, "{name}");
+        assert_eq!(made.body["mergePolicy"], want, "{name}: the create answer carries the policy");
         let described =
             server.get(&format!("/v1/db/shop/coll/{name}/describe"), Some(&token)).await;
         assert_eq!(described.status, 200, "{:?}", described.body);
@@ -23159,7 +23232,14 @@ async fn a_field_collections_writes_carry_an_etag_and_if_stamp_takes_it() {
         .post("/v1/db/shop/collections", Some(&token), json!({"name":"f","mergePolicy":"field"}))
         .await;
     assert_eq!(made.status, 200, "{:?}", made.body);
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"d"})).await;
+    // the contrast with `field`: a `document` collection answers no etag.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "d", "mergePolicy": "document" }),
+        )
+        .await;
 
     let ins = server.post("/v1/db/shop/coll/f/docs", Some(&token), json!({"_id":1,"n":0})).await;
     assert_eq!(ins.status, 200, "{:?}", ins.body);
@@ -23261,7 +23341,14 @@ async fn a_field_documents_etag_is_the_same_whichever_way_it_is_read() {
         }
     }
     // a document collection is as before: stamps are stamp tokens and there are no etags
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"d"})).await;
+    // the contrast with `field`: a `document` collection has stamp tokens and no etags.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "d", "mergePolicy": "document" }),
+        )
+        .await;
     let bulk = server.post("/v1/db/shop/coll/d/bulk", Some(&token), json!([{"_id":1}])).await;
     assert!(bulk.body.get("etags").is_none(), "{:?}", bulk.body);
 }
