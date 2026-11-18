@@ -406,7 +406,6 @@ fn a_batch_with_a_field_entry_applies_both_and_counts_no_refusal() {
     let all = a.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).unwrap().entries;
     let out = b.apply_batch(&all).unwrap();
     assert_eq!(out.applied, 2, "the field entry and the document entry");
-    assert_eq!(b.field_replication_refusals(), 0);
     let fb = b.get_collection("app", "f").unwrap();
     let db_ = b.get_collection("app", "d").unwrap();
     assert!(raw(&b, &fb, 1).is_some(), "the field document is stored");
@@ -441,7 +440,6 @@ fn a_snapshot_page_with_a_field_document_applies_it_as_state_and_the_cursor_move
         "the field document is held as the donor holds it"
     );
     assert!(raw(&b, &db_, 2).is_some());
-    assert_eq!(b.field_replication_refusals(), 0, "nothing is refused");
 }
 
 #[test]

@@ -1629,11 +1629,14 @@ impl Engine {
             // push, a replay, a snapshot page) and in whatever position. Before anything is written.
             self.refuse_if_far_future(entry)?;
             // A snapshot document of a field collection is state without an entry: it joins, and
-            // no oplog entry or held mark is written for it (it is not history). A carried delete
-            // arrives with no merge state to join: its apply is item 3.2, and until then it is
-            // refused by name rather than dropped.
+            // no oplog entry or held mark is written for it (it is not history). One that carries
+            // no merge state has nothing to join: a malformed page, refused by name rather than
+            // dropped.
             if position == Position::Hold && entry.meta.is_none() {
-                return Err(refuse_field_replication());
+                return Err(StorageError::Corrupt(
+                    "a snapshot document of a collection with merge policy field carries no merge state"
+                        .into(),
+                ));
             }
             let key = doc_key(&id)?;
             return self.apply_field_in_txn(txn, coll, entry, key, Some(id), position);
@@ -2590,16 +2593,6 @@ pub(crate) fn record_stamp(
         Some(raw) => Ok(Some(codec::decode_doc_record(raw.value())?.stamp)),
         None => Ok(None),
     }
-}
-
-/// The refusal of a remote write or snapshot document for a `field` collection, until the apply of
-/// Step 3 exists. Answered as the unbuilt capability it is (`501`).
-pub(crate) fn refuse_field_replication() -> StorageError {
-    StorageError::Core(CoreError::Unsupported(
-        "replicating a collection with merge policy `field` is not built yet: a remote write or \
-         snapshot document for it is refused (use mergePolicy `document` for a replicated collection)"
-            .into(),
-    ))
 }
 
 /// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read

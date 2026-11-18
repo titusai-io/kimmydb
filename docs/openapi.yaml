@@ -4624,9 +4624,9 @@ components:
         keeps every concurrent `$inc`, at the cost of a merge state stored
         with each document (about 45 bytes per field at 20 fields, measured);
         `document` keeps the later whole document. **A create request that
-        names none gets `document` in this build**: a collection with policy
-        `field` is not replicated yet, and a remote write for one is refused
-        and counted (`kimmy_sync_field_refused_total`).
+        names none gets `document` in this build**. A collection with policy
+        `field` replicates by its entries and by snapshot pages, each carrying
+        the document's merged state.
     CollectionDescription:
       type: object
       required:
