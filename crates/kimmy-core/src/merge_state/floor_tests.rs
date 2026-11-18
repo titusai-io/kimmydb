@@ -18,13 +18,7 @@ fn writer(c: char, o: &JoinOptions) -> Writer {
 
 /// Every stamp a state names by a cell, a life or a delete: the floors worth trying on it.
 fn stamps(st: &MergeState) -> BTreeSet<Hlc> {
-    st.lives
-        .keys()
-        .chain(st.deletes.keys())
-        .chain(st.regs.values().map(|r| &r.stamp))
-        .chain(st.slots.values().map(|s| &s.stamp))
-        .map(|s| s.hlc)
-        .collect()
+    st.write_stamps().map(|s| s.hlc).collect()
 }
 
 /// Whether, in what two states hold together, a life at or below the floor that holds no cell above it could

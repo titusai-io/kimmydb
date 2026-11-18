@@ -1808,11 +1808,17 @@ impl Engine {
                 if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
                 {
+                    let at_the_cut = usize::from(Self::row_is_at_the_cut(
+                        &txn,
+                        &collection,
+                        document,
+                        &progress.cut,
+                    )?);
                     if young {
                         created += 1;
-                        created_at_cut += usize::from(at_cut(document.stamp));
+                        created_at_cut += at_the_cut;
                     } else {
-                        applied_at_cut += usize::from(at_cut(document.stamp));
+                        applied_at_cut += at_the_cut;
                     }
                     pending.push(Pending { collection, entry, id, violations, unkeyed });
                 }
@@ -1908,6 +1914,32 @@ impl Engine {
         }
         Ok(Self::row_state(txn, collection, document)?
             .is_some_and(|state| state.alive_lives().all(|life| life.hlc > above)))
+    }
+
+    /// Whether a row of a `Converge` page is at the cut of the finding that planned the pull: one that
+    /// ordinary replication would not have delivered, and so progress of the repair.
+    ///
+    /// A `document` row is at the cut when its stamp is at or below the cut of the origin that made it. The
+    /// stamp of a `field` row is only its newest write, and its state can hold writes at or below the cut
+    /// under a record stamp above it, so a `field` row is at the cut when any write its state records, the
+    /// state held to the floor as the row would leave it, is at or below the cut of the origin that made
+    /// that write. A state that does not decode is judged by its record stamp.
+    fn row_is_at_the_cut(
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+        document: &SnapshotDoc,
+        cut: &VersionVector,
+    ) -> Result<bool> {
+        let by_record = document.stamp.hlc <= cut.get(document.stamp.origin());
+        if collection.merge_policy != kimmy_core::MergePolicy::Field {
+            return Ok(by_record);
+        }
+        Ok(match Self::row_state(txn, collection, document)? {
+            Some(state) => state.write_stamps().any(|write| {
+                write.hlc <= cut.get(kimmy_core::Origin::new(write.writer.node, write.writer.epoch))
+            }),
+            None => by_record,
+        })
     }
 
     /// Whether the first page of a scoped repair pull carries the successor of the life
