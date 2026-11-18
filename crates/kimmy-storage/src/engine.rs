@@ -1473,6 +1473,7 @@ impl Engine {
             let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
             let _ = txn.open_table(tables::LIVE_DIGESTS)?;
             let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
+            let _ = txn.open_table(tables::MISSING_THROUGH)?;
             // The first write of a start that decided the rebuild is forced:
             // from here the store says "rebuild required" whatever any exit
             // marker says (B3 design 2.1, layer 2).
@@ -5739,6 +5740,13 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
+                // What was recorded of the collected entries of its documents goes with the collection, in
+                // chunks like the documents (`missing.rs`).
+                removed += crate::missing::remove_collection_chunk(
+                    &txn,
+                    id.0,
+                    DROP_PURGE_CHUNK.saturating_sub(removed),
+                )?;
                 if removed < DROP_PURGE_CHUNK {
                     let mut indexes = txn.open_table(tables::INDEX_ENTRIES)?;
                     let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = {

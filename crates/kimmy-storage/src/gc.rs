@@ -258,6 +258,7 @@ impl Engine {
             // that is gone is a row nothing will ever remove. ADR-160.
             let mut held = txn.open_table(tables::OPLOG_HELD)?;
             let mut violations = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            let mut missing = txn.open_table(tables::MISSING_THROUGH)?;
             // Removing entries appends nothing, so the live counts' mark is
             // carried across the removal here (ADR-174). An emptied oplog or
             // index would otherwise leave it behind, and force a rebuild.
@@ -287,7 +288,24 @@ impl Engine {
                         crate::violations_table::row_key(collection, key.as_slice()).as_slice(),
                     )?;
                 } else {
-                    drop(old);
+                    // An entry of a `field` document that carries its state: what it recorded of its writer is no
+                    // longer an entry here, which the rewind of the document must know (`missing.rs`), in the
+                    // transaction that removes it.
+                    if codec::oplog_entry_carries_state(old.value())
+                        && let Ok(entry) = codec::decode_oplog_entry(key, old.value())
+                        && entry.kind.is_document()
+                        && let Some(id) = &entry.doc_id
+                    {
+                        drop(old);
+                        crate::missing::raise(
+                            &mut missing,
+                            entry.collection.0,
+                            &crate::docs::doc_key(id)?,
+                            [(entry.stamp.origin(), entry.stamp.hlc)],
+                        )?;
+                    } else {
+                        drop(old);
+                    }
                 }
                 removed += 1;
                 if let Ok(stamp) = codec::decode_oplog_key(key) {
@@ -444,6 +462,8 @@ impl Engine {
                 };
                 if unchanged && crate::live_count::remove_record(&txn, &mut docs, key.0, key.1)? {
                     removed += 1;
+                    // The document is gone for good: so is what was recorded of its collected entries.
+                    crate::missing::remove_in_txn(&txn, key.0, key.1)?;
                 }
             }
         }

@@ -435,6 +435,12 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     out
 }
 
+/// Whether an encoded oplog entry carries a merge state: the entry of a `field` collection does, and one of a
+/// `document` collection does not, which its version byte says before anything else is read.
+pub fn oplog_entry_carries_state(input: &[u8]) -> bool {
+    input.first() == Some(&META_FORMAT_VERSION)
+}
+
 /// The kind and collection of an encoded oplog entry, read from its fixed-width
 /// header without touching the document id or the body.
 ///

@@ -45,6 +45,7 @@ mod live_walk;
 pub mod merge;
 pub mod meta;
 pub mod migrate;
+mod missing;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
@@ -112,6 +113,9 @@ mod clock_bound_state_tests;
 
 #[cfg(test)]
 mod clock_bound_frame_tests;
+
+#[cfg(test)]
+mod missing_tests;
 
 #[cfg(test)]
 mod clock_bound_claim_tests;

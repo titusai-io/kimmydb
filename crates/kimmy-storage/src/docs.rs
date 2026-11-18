@@ -1888,6 +1888,16 @@ impl Engine {
             for (origin, hlc) in field_write::state_holes(&other.vv, self.origin()) {
                 Self::record_state_held_at_in_txn(txn, origin, hlc)?;
             }
+            // And per document: every write the state has seen is held only as that state, so a rewind of the
+            // document must not take it for complete (`missing.rs`).
+            crate::missing::raise_in_txn(
+                txn,
+                coll.id.0,
+                &key,
+                other.vv.iter().map(|(writer, hlc)| {
+                    (kimmy_core::Origin::new(writer.node, writer.epoch), *hlc)
+                }),
+            )?;
         }
         let (joined, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
