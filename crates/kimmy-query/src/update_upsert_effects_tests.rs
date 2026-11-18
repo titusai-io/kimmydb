@@ -325,6 +325,29 @@ fn the_filters_id_paths_are_left_out() {
 }
 
 #[test]
+fn an_id_the_update_names_is_the_upserts_key_and_no_effect() {
+    // `$set` and `$setOnInsert` alike: the document ends with that `_id` first, and the effects never name it.
+    for update in [doc! {"$set": {"_id": 8}}, doc! {"$setOnInsert": {"_id": 8}}] {
+        let (fx, post) = match plan_upsert(&parse(update.clone()), &filt(doc! {"k": "new"}), NOW)
+            .unwrap_or_else(|e| panic!("{update}: an upsert that names its _id is planned: {e}"))
+        {
+            UpsertPlan::Effects { effects, post_image } => (effects, post_image),
+            UpsertPlan::Replace { .. } => panic!("a replacement"),
+        };
+        assert_eq!(post, doc! {"_id": 8, "k": "new"}, "{update}");
+        assert_eq!(fx.from_filter, vec![(p("k"), v("new"))], "{update}");
+        assert!(
+            fx.set.is_empty() && fx.set_on_insert.is_empty(),
+            "{update}: no effect names `_id`"
+        );
+    }
+    // The same `_id` as the filter's changes nothing.
+    let (fx, post) = plan(doc! {"_id": 9}, doc! {"$set": {"_id": 9, "a": 1}});
+    assert_eq!(post, doc! {"_id": 9, "a": 1});
+    assert_eq!(fx.set, vec![(p("a"), v(1))]);
+}
+
+#[test]
 fn a_pipeline_upsert_sets_what_the_stages_changed() {
     let stages = vec![Bson::Document(doc! {"$set": {"t": 2, "k": 9}})];
     let update = update::parse_pipeline(&stages, &[]).unwrap();
