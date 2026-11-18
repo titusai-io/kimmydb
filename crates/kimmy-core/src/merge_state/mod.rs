@@ -70,6 +70,7 @@ mod counter;
 mod floor;
 mod join;
 mod ord;
+mod stamps;
 mod state;
 mod types;
 #[cfg(test)]
@@ -98,6 +99,8 @@ mod ord_codec_tests;
 mod ord_tests;
 #[cfg(test)]
 mod prop_tests;
+#[cfg(test)]
+mod stamps_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
