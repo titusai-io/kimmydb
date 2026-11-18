@@ -27,7 +27,18 @@
 //! turns away (`Engine::is_history`), and the rewind never puts it back
 //! (ADR-248).
 //!
-//! The third case is refused rather than guessed, and the documents are named.
+//! # `field` collections
+//!
+//! A `field` document's record carries its merge state, and so does each of its entries (the writer's whole state
+//! at that write), so its state at `T` is not the image of one entry: it is the join of the states of every entry
+//! at or below `T`, folded in ascending stamp order through the collection's floor
+//! ([`kimmy_core::merge_state::state_at`]), which keeps what concurrent members wrote of different fields and
+//! each writer's counter total as of `T`. What the retained entries do not hold is named by the document's
+//! missing-through vector (`missing.rs`): a document is **refused, never guessed**, when a write of some writer at
+//! or below `T` may be in the missing range and no retained entry's state covers it, and so is one held only as a
+//! state that has writes above `T`, which nothing here can take back.
+//!
+//! //! The third case is refused rather than guessed, and the documents are named.
 //! A rewind that silently substituted a later value would produce a database
 //! that looks restored and is not — the worst outcome available here.
 //!
@@ -54,9 +65,10 @@
 //!
 //! [ADR-008]: ../../../docs/decisions.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use kimmy_core::{DocId, Hlc, OpKind, OplogEntry, Stamp, VersionVector};
+use kimmy_core::merge_state::{MergeState, state_at};
+use kimmy_core::{DocId, DocRecord, Hlc, MergePolicy, OpKind, OplogEntry, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::info;
 
@@ -85,8 +97,24 @@ const MAX_NAMED: usize = 20;
 /// A document's storage key: `(collection id, encoded _id)`.
 type DocKey = (u64, Vec<u8>);
 
-/// What a document should become, or `None` to remove it.
-type PlannedChange = (DocKey, Option<OplogEntry>);
+/// What a document should become.
+enum Planned {
+    /// A `document` collection's document: the post-image of this entry, or `None` to remove it.
+    Entry(Option<OplogEntry>),
+    /// A `field` collection's document: the state at the target, folded from the entries it holds.
+    Field(FieldTarget),
+}
+
+/// A `field` document at the target.
+enum FieldTarget {
+    /// It did not exist then: the row goes, with no tombstone.
+    Gone,
+    /// The record the state at the target renders: live, or a tombstone that keeps the state; and the
+    /// document the index maintenance moves to (`None` for a tombstone).
+    Record { record: DocRecord, after: Option<bson::Document> },
+}
+
+type PlannedChange = (DocKey, Planned);
 
 /// One document's history either side of the target.
 #[derive(Default)]
@@ -130,19 +158,6 @@ impl Engine {
             for meta in self.list_collections(&db_meta.name)? {
                 collections.insert(meta.id.0, meta);
             }
-        }
-        // A `field` collection's state at the target is the join of the merge states its entries carry,
-        // which is not built yet; the route below puts back a body with no merge state, a record the
-        // collection cannot read. Refused by name, before anything is read or written.
-        if let Some(field) =
-            collections.values().find(|meta| meta.merge_policy == kimmy_core::MergePolicy::Field)
-        {
-            return Err(StorageError::Core(kimmy_core::Error::Unsupported(format!(
-                "rewinding to a point in time is not built yet for a collection with merge policy \
-                 `field` ({}.{}): the rewind is refused rather than put back a record with no merge \
-                 state",
-                field.db, field.name
-            ))));
         }
         // A drop this member knows of only by its tombstone or by a floor, one a
         // snapshot page carried, is a schema change as much as one whose entry
@@ -250,33 +265,48 @@ impl Engine {
             histories.into_iter().filter(|(_, h)| h.earliest_after.is_some()).collect();
 
         let mut plan: Vec<PlannedChange> = Vec::new();
-        let mut unrecoverable: Vec<(u64, DocId)> = Vec::new();
+        let mut unrecoverable: Vec<(u64, String)> = Vec::new();
+        let mut field_changed: Vec<(DocKey, OplogEntry)> = Vec::new();
 
         for (key, history) in changed {
+            // A `field` collection's document is the fold of the states its entries carry, not the
+            // post-image of one of them: planned below, from every entry at or below the target.
+            if collections.get(&key.0).is_some_and(|meta| meta.merge_policy == MergePolicy::Field) {
+                field_changed.push((key, history.earliest_after.expect("filtered above")));
+                continue;
+            }
             match history.latest_at_or_before {
                 // Its value at the target is still in the log.
-                Some(entry) => plan.push((key, Some(entry))),
+                Some(entry) => plan.push((key, Planned::Entry(Some(entry)))),
                 None => {
                     let earliest = history.earliest_after.as_ref().expect("filtered above");
                     if earliest.kind == OpKind::Insert {
                         // Created after the target: it did not exist then.
-                        plan.push((key, None));
+                        plan.push((key, Planned::Entry(None)));
                     } else {
                         // It existed, and the value it had has been collected.
                         if let Some(id) = earliest.doc_id.clone() {
-                            unrecoverable.push((earliest.collection.0, id));
+                            unrecoverable.push((earliest.collection.0, format!("{id:?}")));
                         }
                     }
                 }
             }
         }
+        self.plan_field_documents(
+            until,
+            &collections,
+            field_changed,
+            &mut memo,
+            &mut plan,
+            &mut unrecoverable,
+        )?;
 
         if !unrecoverable.is_empty() {
             let total = unrecoverable.len();
             let named: Vec<String> = unrecoverable
                 .iter()
                 .take(MAX_NAMED)
-                .map(|(coll, id)| format!("collection {coll} {id:?}"))
+                .map(|(coll, id)| format!("collection {coll} {id}"))
                 .collect();
             let more = total.saturating_sub(named.len());
             return Err(StorageError::Database(format!(
@@ -304,17 +334,70 @@ impl Engine {
         {
             let mut docs = txn.open_table(tables::DOCS)?;
 
-            for ((collection_id, key), restore_to) in plan {
+            for ((collection_id, key), planned) in plan {
+                let before = match docs.get((collection_id, key.as_slice()))? {
+                    Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
+                    None => None,
+                };
+
+                let restore_to = match planned {
+                    Planned::Entry(restore_to) => restore_to,
+                    // The record the fold of the state at the target renders, or the row removed. The
+                    // vectors' floor is the target for these (design m3): nothing at or below it was judged
+                    // and dropped, so a restored field document asks for nothing lower.
+                    Planned::Field(target) => {
+                        let after = match target {
+                            FieldTarget::Gone => {
+                                crate::live_count::remove_record(
+                                    &txn,
+                                    &mut docs,
+                                    collection_id,
+                                    &key,
+                                )?;
+                                outcome.removed += 1;
+                                None
+                            }
+                            FieldTarget::Record { record, after } => {
+                                crate::live_count::put_record(
+                                    &txn,
+                                    &mut docs,
+                                    collection_id,
+                                    &key,
+                                    &codec::encode_doc_record(&record),
+                                )?;
+                                if after.is_some() {
+                                    outcome.reverted += 1;
+                                } else {
+                                    outcome.removed += 1;
+                                }
+                                after
+                            }
+                        };
+                        if let Some(meta) = collections.get(&collection_id) {
+                            let (newly_multikey, filings) = index::maintain_rewound(
+                                self,
+                                &txn,
+                                meta,
+                                before.as_ref(),
+                                after.as_ref(),
+                                &key,
+                            )?;
+                            index::mark_multikey(&txn, &meta.db, &meta.name, &newly_multikey)?;
+                            if let Some(after) = after.as_ref().filter(|_| !filings.is_empty()) {
+                                let id = crate::docs::extract_id(after)?;
+                                unkeyed
+                                    .extend(crate::docs::unkeyed_details(meta.id, &id, &filings));
+                            }
+                        }
+                        continue;
+                    }
+                };
                 if let Some(entry) = &restore_to {
                     restored_floor = Some(match restored_floor {
                         Some(floor) => floor.min(entry.stamp.hlc),
                         None => entry.stamp.hlc,
                     });
                 }
-                let before = match docs.get((collection_id, key.as_slice()))? {
-                    Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
-                    None => None,
-                };
 
                 let after = match &restore_to {
                     Some(entry) if entry.kind != OpKind::Delete => match &entry.body {
@@ -565,6 +648,167 @@ impl Engine {
         );
         let _ = discardable;
         Ok(outcome)
+    }
+
+    /// The state at `until` of every `field` document that changed after it, and the documents it cannot be put
+    /// back for (design q7-step3-rewind-design.md, sections 3, 6 and 7).
+    ///
+    /// `changed` is each such document's key and its earliest entry above the target. For each, the entries it
+    /// still holds at or below the target (of the standing life) are folded in ascending order through the
+    /// collection's floor ([`kimmy_core::merge_state::state_at`]); the result is rendered as the record the apply
+    /// path would store for that state. A document is **refused, never guessed**, when a write of some writer at
+    /// or below the target is not in the fold: the missing-through vector (`missing.rs`) names the newest write of
+    /// each writer this member no longer holds as an entry, and one above what the fold saw of that writer and at
+    /// or below the target is a write the state at the target may lack. A document held only as a state that has
+    /// writes above the target, with no entry above it to discard, is refused too: nothing here can undo them.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_field_documents(
+        &self,
+        until: Hlc,
+        collections: &HashMap<u64, crate::CollectionMeta>,
+        changed: Vec<(DocKey, OplogEntry)>,
+        memo: &mut crate::sync::Memo,
+        plan: &mut Vec<PlannedChange>,
+        unrecoverable: &mut Vec<(u64, String)>,
+    ) -> Result<()> {
+        let wanted: HashSet<DocKey> = changed.iter().map(|(key, _)| key.clone()).collect();
+        let txn = self.db().begin_read()?;
+
+        // The entries at or below the target of the documents that changed after it, in stamp order.
+        let mut held: HashMap<DocKey, Vec<(Stamp, MergeState)>> = HashMap::new();
+        if !wanted.is_empty() {
+            let oplog = txn.open_table(tables::OPLOG)?;
+            for row in oplog.iter()? {
+                let (key, value) = row?;
+                let entry = codec::decode_oplog_entry(key.value(), value.value())?;
+                if entry.stamp.hlc > until {
+                    break;
+                }
+                if !matches!(
+                    entry.kind,
+                    OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete
+                ) {
+                    continue;
+                }
+                let Some(id) = &entry.doc_id else { continue };
+                let Ok(doc_key) = crate::docs::doc_key(id) else { continue };
+                let doc_key = (entry.collection.0, doc_key);
+                if !wanted.contains(&doc_key) {
+                    continue;
+                }
+                if self.is_history(
+                    memo,
+                    collections.get(&entry.collection.0),
+                    entry.collection,
+                    entry.stamp,
+                )? {
+                    continue;
+                }
+                let state = crate::field_write::load(entry.meta.as_deref())?;
+                held.entry(doc_key).or_default().push((entry.stamp, state));
+            }
+        }
+
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let missing_rows = txn.open_table(tables::MISSING_THROUGH)?;
+        let stored_state = |key: &DocKey| -> Result<Option<MergeState>> {
+            match docs.get((key.0, key.1.as_slice()))? {
+                Some(raw) => {
+                    let record = codec::decode_doc_record_with_meta(raw.value())?;
+                    match record.meta.as_deref() {
+                        Some(meta) => Ok(Some(crate::field_write::load(Some(meta))?)),
+                        None => Ok(None),
+                    }
+                }
+                None => Ok(None),
+            }
+        };
+
+        for (key, earliest_after) in changed {
+            let Some(meta) = collections.get(&key.0) else { continue };
+            let name =
+                earliest_after.doc_id.as_ref().map_or_else(String::new, |id| format!("{id:?}"));
+            let writer = self.field_writer(meta)?;
+            let floor = Self::floor_in(&dropped, meta)?;
+            let entries = held.remove(&key).unwrap_or_default();
+            let state = state_at(
+                entries.iter().map(|(stamp, state)| (crate::field_write::m_stamp(*stamp), state)),
+                until,
+                floor,
+                &writer.options(),
+            );
+            let missing = crate::missing::read(&missing_rows, key.0, &key.1)?;
+            // A write of a writer at or below the target that the fold may lack: collected, or held only as a
+            // state, and above everything the fold saw of that writer (a later entry's state covers it).
+            let incomplete = missing.iter().any(|(origin, at)| {
+                at <= until && at > state.vv.get(&origin).copied().unwrap_or(Hlc::ZERO)
+            });
+            if incomplete {
+                unrecoverable.push((key.0, name));
+                continue;
+            }
+            if entries.is_empty() {
+                // Nothing at or below the target to fold. It did not exist then only if the stored state holds no
+                // write at or below the target either (it existed with a state no entry here carries
+                // otherwise) and its earliest entry above the target starts it.
+                let existed = stored_state(&key)?
+                    .is_some_and(|state| state.write_stamps().any(|write| write.hlc <= until));
+                if !existed && earliest_after.kind == OpKind::Insert {
+                    plan.push((key, Planned::Field(FieldTarget::Gone)));
+                } else {
+                    unrecoverable.push((key.0, name));
+                }
+                continue;
+            }
+            if state.is_bare() {
+                // Every entry at or below the target is of a life the floor ended: no document stood then.
+                plan.push((key, Planned::Field(FieldTarget::Gone)));
+                continue;
+            }
+            let joined = crate::field_write::join(writer, None, &state)?;
+            let newest = state
+                .vv
+                .iter()
+                .map(|(writer, hlc)| (*hlc, *writer))
+                .max()
+                .expect("a state with a life has a version vector");
+            let stamp = Stamp::new(newest.0, newest.1.node, newest.1.epoch);
+            let mut record = if joined.alive {
+                DocRecord::live(stamp, joined.body.clone())
+            } else {
+                DocRecord::tombstone(stamp)
+            };
+            record.meta = Some(joined.meta);
+            let after = if joined.alive {
+                Some(bson::deserialize_from_slice::<bson::Document>(&joined.body)?)
+            } else {
+                None
+            };
+            plan.push((key, Planned::Field(FieldTarget::Record { record, after })));
+        }
+
+        // A document held as a state that has writes above the target and no entry above it: there is nothing to
+        // discard and nothing to fold, so the rewind could not take them back.
+        for row in missing_rows.iter()? {
+            let (key, _) = row?;
+            let (collection, doc_key) = key.value();
+            let key: DocKey = (collection, doc_key.to_vec());
+            if wanted.contains(&key)
+                || !collections
+                    .get(&collection)
+                    .is_some_and(|meta| meta.merge_policy == MergePolicy::Field)
+            {
+                continue;
+            }
+            if stored_state(&key)?.is_some_and(|state| {
+                state.vv.values().copied().max().is_some_and(|newest| newest > until)
+            }) {
+                let hex: String = key.1.iter().map(|byte| format!("{byte:02x}")).collect();
+                unrecoverable.push((collection, format!("key {hex}")));
+            }
+        }
+        Ok(())
     }
 
     /// Every rewind this database has taken, oldest first.
