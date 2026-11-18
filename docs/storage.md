@@ -381,6 +381,12 @@ life renders nothing and is not brought back. A row that is not young is left wh
 the row is never applied in part, one life without the lives beside it, so a member past the retention horizon
 diverges on that document as it does on a `document` row.
 
+The progress of such a pull is counted against the cut of the finding that planned it: a row is at the cut when
+ordinary replication would not have delivered it. A `field` row is at the cut when any write its state records,
+held to the floor as the row would leave it, is at or below the cut of the origin that made it, not when the stamp
+of the record is: the record of a row carries its newest write, and a write at the cut can sit under a stamp above
+it. A `document` row is at the cut by its stamp.
+
 **What a pass costs, and what it never does.** A pass never holds the single
 writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
 range — the oplog is keyed by stamp — so nothing past the expired prefix is
