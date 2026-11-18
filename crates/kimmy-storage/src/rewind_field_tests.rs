@@ -251,3 +251,123 @@ fn a_document_held_only_as_a_state_with_writes_above_the_target_is_refused() {
     assert!(err.to_string().contains("only as a snapshot page's state"), "{err}");
     assert!(read(&b, &cb, 1).is_some(), "nothing was written");
 }
+
+/// The rewound state is the stored state in every table that follows a record: the counts and the cut digest (moved by
+/// the one way a record is written) and an index, as for any write.
+#[test]
+fn the_counts_the_digest_and_the_indexes_follow_a_rewound_field_document() {
+    use crate::live_count::test_support::{assert_counts_exact, assert_digests_exact};
+
+    let (a, _da) = engine();
+    let ca = field_collection(&a);
+    a.create_index("shop", "orders", vec![kimmy_core::IndexField::ascending("x")], false, None)
+        .unwrap();
+    a.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+    let target = newest(&a);
+    later();
+    a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "x": 2 }, false).unwrap();
+    a.insert(&ca, doc! { "_id": 2, "x": 3 }).unwrap();
+
+    a.rewind_to(target).unwrap();
+
+    assert_counts_exact(&a, "after the rewind");
+    assert_digests_exact(&a, "after the rewind");
+    let index_entries = {
+        use redb::{ReadableDatabase, ReadableTableMetadata};
+        let txn = a.db().begin_read().unwrap();
+        txn.open_table(crate::tables::INDEX_ENTRIES).unwrap().len().unwrap()
+    };
+    assert_eq!(
+        index_entries, 1,
+        "one entry, for the document at the target: the future's are gone"
+    );
+}
+
+/// The member that rewound mints a fresh epoch at its next open, above the one it had and inside the clock bound, and a
+/// second rewind mints another above that (L26: restore twice).
+#[test]
+fn the_epoch_after_a_field_rewind_is_above_the_last_and_inside_the_clock_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let first = {
+        let a = Engine::open(&path).unwrap();
+        let ca = field_collection(&a);
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        let target = newest(&a);
+        later();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        let before = a.epoch();
+        a.rewind_to(target).unwrap();
+        a.close().expect("closes");
+        before
+    };
+    let second = {
+        let a = Engine::open(&path).unwrap();
+        let after = a.epoch();
+        assert!(after > first, "a fresh epoch above the last: {first:?} then {after:?}");
+        let gap = after.start_hlc().wall_ms.saturating_sub(crate::physical_now_ms());
+        assert!(
+            gap <= crate::DEFAULT_MAX_CLOCK_SKEW_MS,
+            "the epoch starts inside the clock bound, or peers hold the origin until due: {gap} ms ahead"
+        );
+        let ca = a.get_collection("shop", "orders").unwrap();
+        let target = newest(&a);
+        later();
+        a.insert(&ca, doc! { "_id": 3 }).unwrap();
+        a.rewind_to(target).unwrap();
+        a.close().expect("closes");
+        after
+    };
+    let third = Engine::open(&path).unwrap().epoch();
+    assert!(
+        third > second,
+        "and a second rewind mints another above that: {second:?} then {third:?}"
+    );
+}
+
+#[test]
+fn an_epoch_that_starts_past_the_default_clock_bound_is_named_and_one_inside_it_is_not() {
+    use crate::engine::epoch_start_gap_ms;
+
+    let now = 1_000_000_000;
+    let start = |ahead: u64| Hlc::new(now + ahead, 0);
+    assert_eq!(epoch_start_gap_ms(start(0), now), None);
+    assert_eq!(
+        epoch_start_gap_ms(start(crate::DEFAULT_MAX_CLOCK_SKEW_MS), now),
+        None,
+        "the bound itself"
+    );
+    assert_eq!(
+        epoch_start_gap_ms(start(crate::DEFAULT_MAX_CLOCK_SKEW_MS + 1), now),
+        Some(crate::DEFAULT_MAX_CLOCK_SKEW_MS + 1)
+    );
+    assert_eq!(epoch_start_gap_ms(Hlc::new(5, 0), now), None, "behind the clock is no gap");
+}
+
+/// A stream opened after a rewind reads the retained entries only: an event is the stored entry itself, and the
+/// rewind removed the discarded ones with their arrival rows.
+#[tokio::test]
+async fn a_stream_opened_after_a_field_rewind_sees_only_the_retained_entries() {
+    let (a, _da) = engine();
+    let ca = field_collection(&a);
+    a.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+    let target = newest(&a);
+    later();
+    a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "x": 2 }, false).unwrap();
+    a.rewind_to(target).unwrap();
+
+    let options = crate::WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() };
+    let mut stream = a.watch(crate::WatchScope::Collection(ca.id), options).unwrap();
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(300), stream.next(&a)).await
+    {
+        if let crate::ChangeEvent::Change { entry, .. } = event
+            && entry.kind.is_document()
+        {
+            seen.push(entry.kind);
+        }
+    }
+
+    assert_eq!(seen, vec![OpKind::Insert], "the undone replace is not delivered: {seen:?}");
+}
