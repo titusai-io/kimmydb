@@ -22,6 +22,15 @@ pub const COLLECTIONS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::n
 /// contiguous range, making scans and drops a single range operation.
 pub const DOCS: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("docs");
 
+/// The missing-through vector of a `field` document (`missing.rs`): `(collection id, document key)` to the records
+/// `origin (34 bytes) || stamp (10 bytes)`, the newest stamp per writer of a write to the document that this member
+/// no longer holds as an entry. Raised in the transaction that removes an entry (retention) and in the one that
+/// installs a state as state (a page document, a carried delete); removed with the tombstone retention collects and
+/// with the collection the drop purger removes. Node-local, outside the replicated state, and carried by a backup:
+/// the rewind's refusal of a document whose missing range may reach the target reads it.
+pub const MISSING_THROUGH: TableDefinition<(u64, &[u8]), &[u8]> =
+    TableDefinition::new("missing_through");
+
 /// `collection id -> live records under that id in DOCS` (ADR-174).
 ///
 /// Kept, not derived on read: moved in the transaction of every write to
