@@ -1437,7 +1437,11 @@ impl Engine {
                     )),
                 },
             };
-            witnessed.merge(&coverage_up_to(theirs, end));
+            // What the peer says it has processed is believed up to the clock bound and no further
+            // (the frame check): a claim past it would mark every real entry of that origin below it
+            // as held, and they would never be asked for. A refused field entry already ended the
+            // window below itself; this is the claim of a window that carried no such entry.
+            witnessed.merge(&self.clamp_peer_vector(&coverage_up_to(theirs, end)));
         }
 
         // The witnessed vector rides in the last run's transaction. A batch

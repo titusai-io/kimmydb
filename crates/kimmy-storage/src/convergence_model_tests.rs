@@ -563,6 +563,13 @@ fn err(what: &str, e: impl std::fmt::Display) -> String {
     format!("{what}: {e}")
 }
 
+/// A member's clock, as the clock bound reads it, a thousand seconds past `base`: the schedule's stamps are an hour
+/// ahead of the wall clock, and a member that took a window's claim of them from a peer would otherwise read it only
+/// up to its own clock. Modelled as the receivers' clocks being where the schedule is, not as a peer being far ahead.
+fn model_clock(engine: &Engine, base: u64) {
+    engine.set_clock_offset_for_tests((base + 1_000_000) as i64 - crate::physical_now_ms() as i64);
+}
+
 impl Cluster {
     fn new(base: u64) -> Self {
         let members = templates()
@@ -572,6 +579,7 @@ impl Cluster {
                 let path = dir.path().join("kimmy.redb");
                 std::fs::copy(template, &path).unwrap();
                 let engine = Engine::open(&path).unwrap();
+                model_clock(&engine, base);
                 Member { _dir: dir, path, engine: Some(engine) }
             })
             .collect();
@@ -1090,6 +1098,7 @@ impl Cluster {
         let engine = self.members[m].engine.take().expect("open");
         engine.close().map_err(|e| format!("close: {e:?}"))?;
         let engine = Engine::open(&self.members[m].path).map_err(|e| err("open", e))?;
+        model_clock(&engine, self.base);
         engine.reconcile_database_tombstones().map_err(|e| err("reconcile_database", e))?;
         engine.reconcile_late_drops().map_err(|e| err("reconcile_late_drops", e))?;
         engine.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
