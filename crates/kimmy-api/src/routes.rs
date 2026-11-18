@@ -1051,7 +1051,7 @@ async fn create_collection(
     }
     .into_spec()?;
     let policy = match body.merge_policy.as_deref() {
-        None => kimmy_core::MergePolicy::INTERIM_CREATE_DEFAULT,
+        None => kimmy_core::MergePolicy::DEFAULT,
         Some(text) => kimmy_core::MergePolicy::parse(text).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "`mergePolicy` must be `field` or `document`, not `{text}`"

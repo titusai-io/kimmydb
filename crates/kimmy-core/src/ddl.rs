@@ -75,15 +75,9 @@ pub fn merge_policy_steering() -> String {
 }
 
 impl MergePolicy {
-    /// What a create request that names no policy gets: the ruled default, `field`. Not yet what
-    /// the create paths use: see [`MergePolicy::INTERIM_CREATE_DEFAULT`].
+    /// What a create request that names no policy gets: the ruled default, `field`. The create
+    /// paths (the HTTP route, the create command and the implicit `$out` and `$merge` targets) use it.
     pub const DEFAULT: MergePolicy = MergePolicy::Field;
-
-    /// What the create paths (the HTTP route, the implicit `$out` and `$merge` targets) use while a
-    /// remote write for a `field` collection is refused, which is until Step 3's apply commit.
-    /// That commit deletes this constant, points the three uses back at [`MergePolicy::DEFAULT`] and
-    /// flips the text of `describe`, the OpenAPI document and the HTTP reference together.
-    pub const INTERIM_CREATE_DEFAULT: MergePolicy = MergePolicy::Document;
 
     pub fn as_str(self) -> &'static str {
         match self {

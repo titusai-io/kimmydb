@@ -621,7 +621,7 @@ set the collection's validator ([Validators](validation.md)); a schema that does
 not parse is `400` and creates nothing.
 
 `mergePolicy` is `document` or `field`, chosen here and never changed; any other
-value is `400`. A request that names none gets **`document`** in this build.
+value is `400`. A request that names none gets **`field`**; the same goes for a collection a `$out` or `$merge` stage creates.
 `field` merges concurrent writes to different fields of one document and keeps
 every concurrent `$inc`; it stores a merge state with each document, about 45
 bytes per field at 20 fields (the measured figure, which later measurements

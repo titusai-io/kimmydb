@@ -28,6 +28,10 @@ A path through arrays now has one rule for a filter, a sort and an index, and a 
 
 **Changed (breaking): the node refuses to start with `storage.tombstone_retention_secs` shorter than `storage.oplog_retention_secs` plus `storage.max_clock_skew_secs`, and the default tombstone retention is that sum (86700 s).** It was refused below the oplog window alone. A document's version vector must outlive the oplog that can replay its entries by the most a clock can be wrong, or a replayed old entry finds nothing to lose against. A configuration that sets the two equal, as the defaults did, is refused by name; set `tombstone_retention_secs` to at least the sum.
 
+**Changed (breaking): a collection created without a `mergePolicy` has merge policy `field`.** It was `document`. The HTTP create route, the create command and the collection an `$out` or `$merge` stage creates all take the new default; name `mergePolicy: "document"` for a collection written whole, for large values or for write-once data. A write to a `field` collection answers an `etag` beside the `stamp`, and `if_stamp` takes the etag there. The default changes with the wipe: no existing collection changes policy, a policy is fixed at creation.
+
+**Removed: the series `kimmy_sync_field_refused_total` and the OTLP counter `kimmy.sync.field_refused`.** They counted the snapshot documents of `field` collections a member refused while their apply was not built, and read 0 always since it was. A dashboard or an alert that names them goes blank; delete the panel.
+
 **Before the wipe, find what 0.60.0 accepted that this release refuses.** Run on 0.60.0, per collection. (1) For each unique index on a path `arr.f` through one array, the documents with an element that is not a document or lacks `f`, plus the documents `{"arr.f": null}` matches today; more than one in total is a reseed refused at the second. Deeper paths need one `$map` per array level.
 
 ```
