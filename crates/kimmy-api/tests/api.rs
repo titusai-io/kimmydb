@@ -22300,6 +22300,117 @@ async fn an_upsert_seeds_the_filter_fields_in_name_order_for_every_kind_of_updat
     assert_eq!(got, want(id, json!({ "v": 1 })));
 }
 
+/// A `field` collection `pf` holding `{_id: 7, k: "a"}`, and the route that upserts into it.
+async fn field_upserts() -> (Server, String) {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let made = server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"pf","mergePolicy":"field"}))
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    let seeded =
+        server.post("/v1/db/shop/coll/pf/docs", Some(&token), json!({ "_id": 7, "k": "a" })).await;
+    assert_eq!(seeded.status, 200, "{:?}", seeded.body);
+    (server, token)
+}
+
+async fn field_upsert(server: &Server, token: &str, body: Value) -> Res {
+    server.post("/v1/db/shop/coll/pf/find_and_modify", Some(token), body).await
+}
+
+/// Under `field`, an upsert that inserts takes its `_id` from `$set` or `$setOnInsert` as the new document's
+/// key, as the document policy does (the effects never name `_id`).
+#[tokio::test]
+async fn a_field_upsert_that_names_its_id_inserts_that_id() {
+    let (server, token) = field_upserts().await;
+    for (id, op) in [(8, "$set"), (9, "$setOnInsert")] {
+        let res = field_upsert(
+            &server,
+            &token,
+            json!({ "filter": { "k": format!("new{id}") }, "update": { op: { "_id": id } },
+                    "upsert": true, "returnDocument": "after" }),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{op}: {:?}", res.body);
+        assert_eq!(
+            res.body["document"],
+            json!({ "_id": id, "k": format!("new{id}") }),
+            "{op}: the operators' id is the one inserted under field"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_field_upsert_naming_the_filters_id_is_no_change_to_it() {
+    let (server, token) = field_upserts().await;
+    let res = field_upsert(
+        &server,
+        &token,
+        json!({ "filter": { "_id": 9 }, "update": { "$set": { "_id": 9 } },
+                "upsert": true, "returnDocument": "after" }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["document"],
+        json!({ "_id": 9 }),
+        "the same id as the filter's under field"
+    );
+}
+
+#[tokio::test]
+async fn a_field_upsert_naming_another_id_than_the_filters_is_refused() {
+    let (server, token) = field_upserts().await;
+    let res = field_upsert(
+        &server,
+        &token,
+        json!({ "filter": { "_id": 10 }, "update": { "$set": { "_id": 11 } }, "upsert": true }),
+    )
+    .await;
+    assert_eq!(
+        res.status, 400,
+        "another id than the filter's is a 400 under field: {:?}",
+        res.body
+    );
+    for id in [10, 11] {
+        let found = server.get(&format!("/v1/db/shop/coll/pf/docs/{id}"), Some(&token)).await;
+        assert_eq!(found.status, 404, "nothing is inserted under {id}");
+    }
+}
+
+#[tokio::test]
+async fn a_field_upsert_naming_an_existing_id_is_a_duplicate_and_overwrites_nothing() {
+    let (server, token) = field_upserts().await;
+    let res = field_upsert(
+        &server,
+        &token,
+        json!({ "filter": { "k": "other" }, "update": { "$set": { "_id": 7 } }, "upsert": true }),
+    )
+    .await;
+    assert_eq!(res.status, 409, "an existing id is a duplicate under field: {:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    let kept = server.get("/v1/db/shop/coll/pf/docs/7", Some(&token)).await;
+    assert_eq!(kept.body, json!({ "_id": 7, "k": "a" }), "the document stays");
+}
+
+#[tokio::test]
+async fn a_field_upsert_naming_an_id_that_is_no_document_id_is_refused() {
+    let (server, token) = field_upserts().await;
+    for update in [json!({ "$set": { "_id": 5.5 } }), json!({ "$set": { "_id.x": 1 } })] {
+        let res = field_upsert(
+            &server,
+            &token,
+            json!({ "filter": { "k": "bad" }, "update": update, "upsert": true }),
+        )
+        .await;
+        assert_eq!(
+            res.status, 400,
+            "{update}: refused as an insert's id is under field: {:?}",
+            res.body
+        );
+    }
+}
+
 /// An upsert whose operators name `_id` inserts as any insert does (q7s2o.out o0692-o0799):
 /// the id it ends with is judged as an insert's, a duplicate is a conflict that overwrites
 /// nothing, and a document that matched is never given another `_id`.

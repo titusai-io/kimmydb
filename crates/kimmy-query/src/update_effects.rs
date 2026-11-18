@@ -359,6 +359,12 @@ pub fn plan_upsert(update: &Update, filter: &Filter, now_ms: i64) -> Result<Upse
             }
         }
     }
+    // An `_id` the update names is the upsert's key, and the engine's insert owns it (S2b): it is the id
+    // the document in `post` ends with, judged as any insert's is (the same as the filter's is no change,
+    // another is the insert's refusal, an existing one a duplicate). It is no effect.
+    let names_id = |(p, _): &(Path, Value)| p.segments().first().is_some_and(|s| s == "_id");
+    fx.set.retain(|entry| !names_id(entry));
+    fx.set_on_insert.retain(|entry| !names_id(entry));
     let rank_of =
         |p: &Path, v: &Value| if *v == Value::Unset { Vec::new() } else { rank(&post, p) };
     fx.set.sort_by_cached_key(|(p, v)| rank_of(p, v));
