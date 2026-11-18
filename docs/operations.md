@@ -2516,9 +2516,9 @@ window.
 | Refusal | Why |
 |---|---|
 | A target before the oplog horizon | Nothing describes the database before that point |
-| A collection with merge policy `field` | Its state at the target is the join of the merge states its entries carry, which the rewind does not build yet; it would put back records with no merge state. The refusal names the collection and is lifted when that rewind is built. Restore without `--until` |
 | A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either. A drop counts whether the member holds its oplog entry or knows it only as a collection or database tombstone, or as a collection's incarnation floor, as a snapshot page leaves it |
 | A document whose value at the target the member does not hold | It changed after the target, and the value it had there is not in this member's oplog: retention collected it, the member holds the document only as a snapshot page's state, or its entries at or below the target are of a collection life a drop ended. It is named in the error |
+| A document of a `field` collection whose history at the target may be incomplete | A write of some writer at or below the target is not among the entries the member holds, and no retained entry's state covers it (retention collected it, or the member holds the document only as a state a snapshot page gave it). A document held only as such a state that has writes above the target is refused too: there is no entry to discard and nothing to fold. It is named in the same error |
 
 The last one is the important one. The oplog stores what a document *became*,
 never what it was, and a delete stores nothing at all — so a document untouched
@@ -2526,6 +2526,19 @@ since before the horizon and then changed cannot be put back. Leaving it at its
 later value would produce a database that looks restored and is not, so the
 whole rewind is refused instead. **Nothing is written until every check has
 passed**, so a refusal leaves the file exactly as the restore wrote it.
+
+**`field` collections.** A document's state at the target is the join of the merge states its entries carry,
+folded in stamp order: what two members wrote concurrently of different fields is both put back, a counter has
+each writer's total as of the target, and a delete at or below the target is applied with the lives its context
+kills. A collected entry is no reason to refuse when a later retained entry carries its writer's whole state; the
+member keeps, per document, the newest write of each writer it no longer holds as an entry, and refuses only when
+one of those lies at or below the target and above what the retained entries saw. The retention horizon is the
+oplog's (`storage.oplog_retention_secs`), as for any collection. Two things a rewind of a `field` collection does
+that a `document` one does not need said: a TTL collection's documents whose `expiresAt` passed between the target
+and now are deleted again by the next TTL pass, and every rewind starts a new writer identity (the next open mints
+a fresh epoch), which uses one more counter slot per counter and per document for good. Members agree on the state
+at the target when they hold the same entries at or below it; an entry stamped at or below the target that reaches
+a member after its rewind is joined by the ordinary apply, and the cluster converges on the state of all of them.
 
 > ⚠️ **A rewound database must not rejoin a cluster that still holds the undone
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
