@@ -2283,6 +2283,33 @@ impl Engine {
         self.clock_refusals.lock().snapshot()
     }
 
+    /// A peer's vector as this member may believe it: [`crate::ClockBound::clamp_vector`] at this
+    /// member's physical clock. A component past the bound is lowered to it and an origin minted
+    /// past it is left out; either is counted under the origin that sent it
+    /// (`kimmy_sync_clock_refused_total`) and said once, and what the peer claimed beyond the
+    /// bound is believed once the clock has caught up and the peer is asked again, as an entry
+    /// refused until due is.
+    pub fn clamp_peer_vector(
+        &self,
+        vector: &kimmy_core::VersionVector,
+    ) -> kimmy_core::VersionVector {
+        let clamped = self.clock_bound().clamp_vector(self.clock_bound_now_ms(), vector);
+        if let Some(stop) = &clamped.stop {
+            self.count_clock_refused(&stop.origin, 1);
+            warn!(
+                origin = %stop.origin.node,
+                reason = %stop.reason,
+                stamp = ?stop.stamp,
+                due_in_ms = stop.due_in_ms,
+                components = clamped.changed,
+                "a peer's version vector claims a clock more than max_clock_skew_secs ahead of this \
+                 member's; the claim was believed only up to the bound (and an origin minted past it \
+                 was left out), and the rest is believed once it is due"
+            );
+        }
+        clamped.vector
+    }
+
     /// How many windows this node has refused a peer since start because they
     /// would have crossed history it holds only as the state a snapshot gave it
     /// (ADR-224). A refusal for retention is not counted here.
