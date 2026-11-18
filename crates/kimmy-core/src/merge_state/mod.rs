@@ -72,6 +72,7 @@ mod join;
 mod ord;
 mod stamps;
 mod state;
+mod state_at;
 mod types;
 #[cfg(test)]
 mod work;
@@ -100,6 +101,9 @@ mod ord_tests;
 #[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
+mod state_at_tests;
+
+#[cfg(test)]
 mod stamps_tests;
 #[cfg(test)]
 mod tests;
@@ -122,6 +126,7 @@ pub use state::{
     Excess, Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey,
     OverCaps, Reg, Slot, Vv,
 };
+pub use state_at::state_at;
 pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
     WriterId,
