@@ -74,8 +74,34 @@ fn a_member_that_takes_a_field_document_by_snapshot_holds_its_state_and_no_entri
         "no held mark for X's stamp {:?}: state, not history (the one document is the only thing B took)",
         document_entries.last().map(|e| e.stamp)
     );
-    assert_eq!(b.field_replication_refusals(), 0, "nothing was refused");
     let _ = DocId::Int64(1);
+}
+
+/// A page document of a `field` collection that carries no merge state has nothing to join: a malformed page,
+/// refused as corrupt and named, not as a capability that does not exist.
+#[test]
+fn a_page_document_of_a_field_collection_with_no_merge_state_is_refused_as_corrupt() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let ca = a.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
+    a.insert(&ca, doc! { "_id": 1 }).unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    assert!(!page.documents.is_empty(), "premise: the page carries the document");
+    for document in &mut page.documents {
+        document.meta = None;
+    }
+    let refused = b
+        .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect_err("a page document with no merge state is refused");
+    assert!(
+        matches!(
+            &refused,
+            crate::StorageError::Corrupt(text)
+                if text.contains("a snapshot document of a collection with merge policy field carries no merge state")
+        ),
+        "refused as corrupt, by the page document's own name (a record's load says the same of a record, not of a \
+         page document): {refused:?}"
+    );
 }
 
 /// The same snapshot taken in several pages. A snapshot grants its coverage, and with it releases

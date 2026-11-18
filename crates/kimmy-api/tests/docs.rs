@@ -575,7 +575,6 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         index_unkeyed_refusals: 12,
         sync_ddl_relogged: 16,
         sync_horizon_state_held: 18,
-        sync_field_refused: 19,
         writer_wait: kimmy_storage::WriterWaitSnapshot::default(),
         writer_wait_timeouts: 12,
         writer_hold_max_us: 13,
