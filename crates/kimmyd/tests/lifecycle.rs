@@ -2713,6 +2713,65 @@ fn restore(config: &Path, backup: &Path) -> std::process::Output {
     out
 }
 
+/// `kimmyd restore --until` on a collection with merge policy `field` (the default): the user-facing path, end to
+/// end. The rewind folds the states the collection's entries carry, so the document written before the target is
+/// put back as it was and the one created after it is gone, in the store the restore wrote.
+#[test]
+fn restore_until_rewinds_a_field_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
+    let orders = source
+        .create_collection_with_policy("shop", "orders", kimmy_core::MergePolicy::Field, None)
+        .unwrap();
+    source.insert(&orders, bson::doc! { "_id": 1, "x": 1 }).unwrap();
+    let written = source.version_vector().unwrap().get(source.origin()).wall_ms;
+    std::thread::sleep(Duration::from_millis(50));
+    source
+        .replace(&orders, &kimmy_core::DocId::Int64(1), bson::doc! { "_id": 1, "x": 2 }, false)
+        .unwrap();
+    source.insert(&orders, bson::doc! { "_id": 2 }).unwrap();
+    let backup = dir.path().join("backup.bin");
+    source
+        .backup_to(&mut std::fs::File::create(&backup).unwrap(), kimmy_storage::WalkScope::Request)
+        .unwrap();
+    drop(source);
+    let config = dir.path().join("restore.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:0\"\n\n[storage]\ndata_dir = \"{}\"\n",
+            dir.path().join("data").display()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        .arg("--config")
+        .arg(&config)
+        .arg("restore")
+        .arg("--from")
+        .arg(&backup)
+        .arg("--until")
+        .arg((written + 10).to_string())
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("running kimmyd restore --until");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a field collection is rewound, not refused: {stderr}");
+    assert!(stderr.contains("1 document(s) reverted, 1 removed"), "{stderr}");
+    let restored =
+        kimmy_storage::Engine::open(&dir.path().join("data").join("kimmy.redb")).unwrap();
+    let orders = restored.get_collection("shop", "orders").unwrap();
+    let one = restored.get(&orders, &kimmy_core::DocId::Int64(1)).unwrap().expect("document 1");
+    assert_eq!(one.get_i32("x").unwrap(), 1, "put back as it was at the target: {one:?}");
+    assert_eq!(
+        restored.get(&orders, &kimmy_core::DocId::Int64(2)).unwrap(),
+        None,
+        "the one created after the target is gone"
+    );
+}
+
 /// A restore writes the marker, and a standalone start after it discards it and
 /// is ready and unmarked: the case the restore command has always served, which a
 /// marker that outlived it would turn into a node that answers `503` for two
