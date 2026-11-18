@@ -2498,6 +2498,19 @@ impl Engine {
                 let epoch = Epoch::generate(start);
                 txn.open_table(tables::META)?.insert(tables::META_EPOCH, epoch.0.as_slice())?;
                 info!(epoch = %epoch.to_hex(), %start, "minted a new epoch");
+                if let Some(gap) = epoch_start_gap_ms(start, physical_now_ms()) {
+                    warn!(
+                        epoch = %epoch.to_hex(),
+                        %start,
+                        ahead_ms = gap,
+                        "the new epoch starts {gap} ms ahead of this member's clock, more than the default \
+                         storage.max_clock_skew_secs: the store holds a stamp that far ahead (an entry of a \
+                         document collection, which the bound does not hold, or a clock that ran ahead), and \
+                         the epoch is minted above every stamp the store holds so that it orders above every \
+                         epoch this node has had. A peer holds an origin whose epoch starts past its bound \
+                         until it is due, so this member's writes of a field collection wait there until then"
+                    );
+                }
                 (epoch, true)
             }
         };
@@ -6400,6 +6413,19 @@ pub(crate) fn index_range(
 /// clock logic remains deterministically testable.
 /// Milliseconds since the Unix epoch.
 ///
+/// How far past `now_ms` a minted epoch starts, when that is more than the default clock bound
+/// (`storage.max_clock_skew_secs`): `None` when it is within it. The mint stays at the clock resumed from the
+/// store's highest stamp, never lowered to the physical clock: an epoch must order above every epoch this node has
+/// had, which a start below a stamp or an epoch the store holds would break. A start this far ahead can come only of
+/// a stamp the bound does not hold (a document collection's entry, or a clock that ran ahead), and is said at the
+/// mint, since peers hold the origin until it is due.
+pub(crate) fn epoch_start_gap_ms(start: Hlc, now_ms: u64) -> Option<u64> {
+    start
+        .wall_ms
+        .checked_sub(now_ms)
+        .filter(|gap| *gap > crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS)
+}
+
 /// Public so that tests elsewhere in the workspace can express "far in the
 /// future" against the same clock retention uses.
 pub fn physical_now_ms() -> u64 {
