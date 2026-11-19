@@ -128,7 +128,9 @@ fn a_field_delete_leaves_a_tombstone_with_the_state_and_an_insert_over_it_is_a_n
     e.insert(&f, doc! { "_id": 1_i64, "a": 1 }).unwrap();
     assert!(e.delete(&f, &DocId::Int64(1)).unwrap());
     let t = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
-    assert!(t.deleted && t.body.is_empty());
+    // A tombstone of a field collection keeps the `_id` and exactly that (C4c); it was an empty body.
+    assert!(t.deleted && t.tombstone_id() == Some(DocId::Int64(1)), "the tombstone keeps the id");
+    assert_eq!(t.body, bson::serialize_to_vec(&doc! { "_id": 1_i64 }).unwrap(), "and nothing else");
     let meta = t.meta.clone().expect("the tombstone keeps the state");
     let es = entries(&e, &f);
     assert_eq!(

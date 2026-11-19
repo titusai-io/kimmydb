@@ -1410,7 +1410,12 @@ impl Engine {
                 }
                 None => (self.next_stamp(), None),
             };
-            let mut tombstone = DocRecord::tombstone(stamp);
+            // A tombstone of a `field` collection keeps the `_id` and nothing else of the document.
+            let mut tombstone = if field {
+                DocRecord::field_tombstone(stamp, id)
+            } else {
+                DocRecord::tombstone(stamp)
+            };
             tombstone.meta = meta.clone();
             crate::live_count::put_record(
                 txn,
@@ -1916,7 +1921,10 @@ impl Engine {
             return Ok(kept);
         }
         let mut stored = if held.deleted {
-            DocRecord::tombstone(held.stamp)
+            // The tombstone keeps the body it had: the `_id` and nothing else.
+            let mut tombstone = DocRecord::tombstone(held.stamp);
+            tombstone.body = held.body.clone();
+            tombstone
         } else {
             DocRecord::live(held.stamp, held.body.clone())
         };
@@ -2095,10 +2103,16 @@ impl Engine {
                 Some(record) => record.document()?,
                 None => None,
             };
+            // The `_id` of a tombstone: the entry's, or the one the row held (a live document's, a tombstone's).
+            let kept_id =
+                id.clone().or_else(|| existing.as_ref().and_then(|r| r.id_for_tombstone()));
             let mut record = if joined.alive {
                 DocRecord::live(record_stamp, joined.body.clone())
             } else {
-                DocRecord::tombstone(record_stamp)
+                match &kept_id {
+                    Some(id) => DocRecord::field_tombstone(record_stamp, id),
+                    None => DocRecord::tombstone(record_stamp),
+                }
             };
             record.meta = Some(joined.meta.clone());
             crate::live_count::put_record(

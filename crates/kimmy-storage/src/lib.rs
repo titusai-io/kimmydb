@@ -280,3 +280,5 @@ mod loss_entry_tests;
 mod loss_free_digest_tests;
 #[cfg(test)]
 mod loss_lifecycle_tests;
+#[cfg(test)]
+mod tombstone_id_tests;

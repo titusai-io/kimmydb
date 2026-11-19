@@ -128,6 +128,9 @@ struct Buried {
     key: Vec<u8>,
     document: Option<bson::Document>,
     state: Option<Vec<u8>>,
+    /// The `_id` the record being buried held (a live document's, or a tombstone's), which the tombstone it becomes
+    /// keeps.
+    id: Option<kimmy_core::DocId>,
 }
 
 /// A record of a `field` collection the sweep writes again: the document it held, if it was live, the one it
@@ -452,6 +455,7 @@ impl Engine {
                 key: key.to_vec(),
                 document: previous,
                 state: Some(state.encode_compact()),
+                id: record.id_for_tombstone(),
             }));
         }
         let joined = crate::field_write::join(self.field_writer(standing)?, None, &state)?;
@@ -462,7 +466,12 @@ impl Engine {
             let next: bson::Document = bson::deserialize_from_slice(&joined.body)?;
             (kimmy_core::DocRecord::live(record.stamp, joined.body.clone()), Some(next))
         } else {
-            (kimmy_core::DocRecord::tombstone(record.stamp), None)
+            // The `_id` it keeps: the live document's or the tombstone's, and only that.
+            let tombstone = match record.id_for_tombstone() {
+                Some(id) => kimmy_core::DocRecord::field_tombstone(record.stamp, &id),
+                None => kimmy_core::DocRecord::tombstone(record.stamp),
+            };
+            (tombstone, None)
         };
         let mut rewritten = rewritten;
         rewritten.meta = Some(joined.meta);
@@ -582,25 +591,30 @@ impl Engine {
                         true => codec::decode_doc_record_with_meta(value.value()),
                         false => codec::decode_doc_record(value.value()),
                     }
-                    .and_then(|record| Ok((record.document()?, record.meta)));
-                    let (document, meta) = decoded.unwrap_or_else(|e| {
+                    .and_then(|record| {
+                        Ok((record.document()?, record.id_for_tombstone(), record.meta))
+                    });
+                    let (document, id, meta) = decoded.unwrap_or_else(|e| {
                         warn!(error = %e, "a record of the life before a drop does not decode; removed without its index entries");
-                        (None, None)
+                        (None, None, None)
                     });
                     // A tombstone of a `field` collection keeps a state: here what the record's own is
                     // left with when everything at or below the drop is dropped, which for a record
                     // at or below it is its version vector alone.
                     let state = field.then(|| bare_state(meta.as_deref(), dropped.hlc));
-                    found.push(Buried { key: key.value().1.to_vec(), document, state });
+                    found.push(Buried { key: key.value().1.to_vec(), document, state, id });
                 }
             }
         }
         let plain = codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(dropped));
         let mut docs = txn.open_table(tables::DOCS)?;
-        for Buried { key, state, .. } in &found {
+        for Buried { key, state, id, .. } in &found {
             let tombstone = match state {
                 Some(meta) => {
-                    let mut record = kimmy_core::DocRecord::tombstone(dropped);
+                    let mut record = match id {
+                        Some(id) => kimmy_core::DocRecord::field_tombstone(dropped, id),
+                        None => kimmy_core::DocRecord::tombstone(dropped),
+                    };
                     record.meta = Some(meta.clone());
                     codec::encode_doc_record(&record)
                 }
