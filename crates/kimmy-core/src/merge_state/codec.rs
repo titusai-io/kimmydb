@@ -87,6 +87,14 @@ pub enum DecodeError {
     TooDeep,
     #[error("merge state: not canonical (map keys duplicated or out of order)")]
     NotCanonical,
+    #[error(
+        "merge state: the version byte says records follow where none do, or none where some do"
+    )]
+    VersionDisagreesWithRecords,
+    #[error(
+        "merge state: the loss-free hash in the header is not the hash of the state without its records"
+    )]
+    LossFreeHashMismatch,
     #[error("merge state: a dead life is not listed in `lives`")]
     DeadLifeNotListed,
     #[error("merge state: the version vector does not cover a stamp the state holds")]

@@ -179,8 +179,22 @@ use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Va
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-/// The format version byte of this form: for every state, with or without an order state.
+/// The format version byte of this form for a state that holds **no loss record**, with or without an order state.
 const VERSION: u8 = 2;
+
+/// The version byte of a state that **holds loss records**: `MAGIC ‖ 3 ‖ the loss-free hash (16 bytes) ‖ the body`.
+///
+/// **This is not a revision of the format.** The body is the one version 2 has, and the form is the same; the byte
+/// says that records follow and puts the hash of the state *without them* in the header, so that the digest term and
+/// the etag of a record (which hash the state without its records) are read from the bytes with no decode, for a
+/// state that holds records as for one that does not. A state with no record is written as version 2, byte for byte
+/// as it always was, so nothing that pins those bytes or their hash moves. Do not read the 3 as a reason to bump
+/// past it: a future change of the form is a new byte beyond it, and a decoder that meets 3 on a state with no
+/// record, or 2 on one with records, refuses it.
+const VERSION_WITH_RECORDS: u8 = 3;
+
+/// The width of the loss-free hash in the header of version 3.
+const HASH_LEN: usize = 16;
 
 /// The type code of a counter amount, in the type byte of a typed total and in the slot flag
 /// byte: 0 `Int64`, 1 `Int32`, 2 `Decimal128`. 3 is not a type.
@@ -646,23 +660,34 @@ impl MergeState {
         bare.compact_hash()
     }
 
-    /// [`MergeState::loss_free_hash`] of an encoded state, read from its bytes: the state is decoded (every
-    /// refusal of [`MergeState::decode_compact`] applies), and one with no record is hashed from the bytes as
-    /// they are, with no second encoding.
+    /// [`MergeState::loss_free_hash`] of an encoded state, read from its bytes **with no decode**: the hash of the
+    /// body of a version 2 state, the header's hash for a version 3 one. It does not check the body (a caller that
+    /// has not written the bytes itself decodes them, and [`MergeState::decode_compact`] checks the header's hash).
     pub fn loss_free_hash_of(bytes: &[u8]) -> Result<[u8; 16], DecodeError> {
-        let state = MergeState::decode_compact(bytes)?;
-        if state.losses.is_empty() {
-            return MergeState::compact_hash_of(bytes);
+        let mut r = R::new(bytes);
+        if r.take(3)? != MAGIC {
+            return Err(DecodeError::BadHeader);
         }
-        Ok(state.loss_free_hash())
+        match r.u8()? {
+            // No record: the hash of the body is the loss-free hash.
+            VERSION => Ok(hash128(&bytes[4..])),
+            // Records: the loss-free hash is the header's. `decode_compact` checks it against the body.
+            VERSION_WITH_RECORDS => r.arr::<HASH_LEN>(),
+            _ => Err(DecodeError::BadHeader),
+        }
     }
 
     /// The whole state in the compact form, for a round trip with
-    /// [`MergeState::decode_compact`]: the magic, the format version 2, then
-    /// [`MergeState::compact_bytes`].
+    /// [`MergeState::decode_compact`]: the magic, the format version byte (2 for a state with no loss record; 3 for
+    /// one that holds some, followed by the loss-free hash), then [`MergeState::compact_bytes`].
     pub fn encode_compact(&self) -> Vec<u8> {
         let mut out = Vec::from(MAGIC);
-        out.push(VERSION);
+        if self.losses.is_empty() {
+            out.push(VERSION);
+        } else {
+            out.push(VERSION_WITH_RECORDS);
+            out.extend_from_slice(&self.loss_free_hash());
+        }
         out.extend_from_slice(&self.write_compact_body());
         out
     }
@@ -673,10 +698,18 @@ impl MergeState {
     /// canonical; a caller that has not written the bytes itself decodes them.
     pub fn compact_hash_of(bytes: &[u8]) -> Result<[u8; 16], DecodeError> {
         let mut r = R::new(bytes);
-        if r.take(3)? != MAGIC || r.u8()? != VERSION {
+        if r.take(3)? != MAGIC {
             return Err(DecodeError::BadHeader);
         }
-        Ok(hash128(&bytes[4..]))
+        match r.u8()? {
+            VERSION => Ok(hash128(&bytes[4..])),
+            // The body follows the loss-free hash.
+            VERSION_WITH_RECORDS => {
+                r.arr::<HASH_LEN>()?;
+                Ok(hash128(&bytes[4 + HASH_LEN..]))
+            }
+            _ => Err(DecodeError::BadHeader),
+        }
     }
 
     /// The body of a loss-record entry ([`crate::OpKind::LossRecord`]): the compact form of a state that holds
@@ -706,9 +739,12 @@ impl MergeState {
         if r.take(3)? != MAGIC {
             return Err(DecodeError::BadHeader);
         }
-        if r.u8()? != VERSION {
+        let version = r.u8()?;
+        if version != VERSION && version != VERSION_WITH_RECORDS {
             return Err(DecodeError::BadHeader);
         }
+        let stored_hash =
+            if version == VERSION_WITH_RECORDS { Some(r.arr::<HASH_LEN>()?) } else { None };
         r.tables()?;
         let mut s = MergeState::default();
         for _ in 0..r.len()? {
@@ -823,6 +859,14 @@ impl MergeState {
         }
         r.finish()?;
         s.check_decoded()?;
+        // The version byte says whether records follow, and the header's hash is what the digest term and the etag
+        // are read from: both must be true of the state the body holds (a peer sends states).
+        if (version == VERSION_WITH_RECORDS) == s.losses.is_empty() {
+            return Err(DecodeError::VersionDisagreesWithRecords);
+        }
+        if stored_hash.is_some_and(|stored| stored != s.loss_free_hash()) {
+            return Err(DecodeError::LossFreeHashMismatch);
+        }
         Ok(s)
     }
 }

@@ -28,8 +28,22 @@ fn opts() -> JoinOptions {
 /// Encode, decode, and check that the bytes are exactly what the decoded state encodes to.
 fn round_trip(st: &MergeState) -> Vec<u8> {
     let enc = st.encode_compact();
-    assert_eq!(&enc[..4], b"QMS\x02", "the version byte is 2 for every state");
-    assert_eq!(&enc[4..], st.compact_bytes());
+    // Version 2 for a state with no loss record, exactly as before; 3 for one that holds records, with the loss-free
+    // hash between the version byte and the body.
+    let with_records = !st.losses.is_empty();
+    assert_eq!(
+        &enc[..4],
+        if with_records { b"QMS\x03" } else { b"QMS\x02" },
+        "the version byte follows the records"
+    );
+    if with_records {
+        assert_eq!(
+            &enc[4..20],
+            st.loss_free_hash().as_slice(),
+            "version 3 names the loss-free hash"
+        );
+    }
+    assert_eq!(&enc[if with_records { 20 } else { 4 }..], st.compact_bytes());
     let back = MergeState::decode_compact(&enc).unwrap();
     assert_eq!(&back, st);
     assert_eq!(back.encode_compact(), enc, "encode(decode(b)) == b");
@@ -1377,7 +1391,8 @@ fn section_ten_is_decoded_strictly() {
         })),
         Err(DecodeError::Trailing(1))
     );
-    for version in [0u8, 1, 3, 4, 0xff] {
+    // 3 is a version of its own (a state with records, behind the loss-free hash), tested in `loss_free_hash_tests`.
+    for version in [0u8, 1, 4, 0xff] {
         assert_eq!(
             MergeState::decode_compact(&body(version, false, true, 5, &good)),
             Err(DecodeError::BadHeader),
