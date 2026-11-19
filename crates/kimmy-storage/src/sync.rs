@@ -2289,8 +2289,10 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
-        // A legacy `Collection` entry names nothing and cannot be acted on.
-        if !entry.kind.is_document() {
+        // A legacy `Collection` entry names nothing and cannot be acted on. A loss record goes on: it is
+        // judged by its collection as a document is, and relayed (kept in the oplog, written to no document)
+        // by `apply_remote_in_txn`.
+        if !entry.kind.is_document() && !entry.kind.is_loss_record() {
             return Ok(Step::Taken);
         }
 

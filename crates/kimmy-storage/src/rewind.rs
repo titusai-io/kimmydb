@@ -198,6 +198,10 @@ impl Engine {
                 match entry.kind {
                     // Not a mutation, and not something a rewind has to undo.
                     OpKind::UniqueViolation | OpKind::UnkeyedDocument => continue,
+                    // A loss record is no mutation of a document and no write to take back. The rewind
+                    // learns to collect the ones at or below the target when it folds them in (the commit
+                    // that extends `state_at`); until then it leaves them, as it leaves the entries above.
+                    OpKind::LossRecord => continue,
                     OpKind::CreateCollection
                     | OpKind::DropCollection
                     | OpKind::CreateIndex

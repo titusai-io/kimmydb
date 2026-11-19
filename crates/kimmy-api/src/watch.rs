@@ -221,6 +221,7 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::ConfigureValidator => "configureValidator",
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
         kimmy_core::OpKind::UnkeyedDocument => "unkeyedDocument",
+        kimmy_core::OpKind::LossRecord => "conflictResolved",
     }
 }
 
@@ -302,5 +303,18 @@ mod tests {
         assert_eq!(event["reason"], "parallel_arrays", "{event}");
         assert_eq!(event["documentKey"]["_id"]["$binary"]["subType"], "04", "{event}");
         assert!(event["resumeToken"].is_string() && event["clusterTime"].is_string(), "{event}");
+    }
+
+    /// A loss record is replicated history, not a change a client asked for: until the stream has an event for
+    /// it, it is not rendered as an ordinary document change.
+    #[test]
+    fn a_loss_record_is_not_rendered_as_a_document_change() {
+        let token =
+            ResumeToken::from_stamp(Stamp::new(Hlc::new(5, 0), NodeId::generate(), Epoch::ZERO));
+        let loss = entry(OpKind::LossRecord, DocId::Int64(1), Some(vec![1, 2, 3]));
+        assert!(
+            render(&ChangeEvent::Change { entry: Arc::new(loss), token }, true).is_none(),
+            "a loss record is not rendered as a document change"
+        );
     }
 }

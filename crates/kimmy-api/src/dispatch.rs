@@ -2421,6 +2421,7 @@ pub(crate) mod tests {
             OpKind::DropIndex,
             OpKind::UniqueViolation,
             OpKind::UnkeyedDocument,
+            OpKind::LossRecord,
         ] {
             assert!(!wanted(&entry(kind, 1, 1), 1, &[]), "{kind:?} must not be delivered");
         }

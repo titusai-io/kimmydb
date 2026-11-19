@@ -655,6 +655,27 @@ impl MergeState {
         Ok(hash128(&bytes[4..]))
     }
 
+    /// The body of a loss-record entry ([`crate::OpKind::LossRecord`]): the compact form of a state that holds
+    /// this one record and nothing else, so the key, the value and the writer of the loser's stamp are spelled
+    /// exactly as a state spells them and every refusal of [`MergeState::decode_compact`] applies to them.
+    pub fn encode_loss_record(key: &LossKey, val: &LossValue) -> Vec<u8> {
+        let mut state = MergeState::default();
+        state.losses.insert(key.clone(), val.clone());
+        state.encode_compact()
+    }
+
+    /// The inverse of [`MergeState::encode_loss_record`]. Refuses bytes that are not a state, a state that holds
+    /// anything but one record, and every state [`MergeState::decode_compact`] refuses.
+    pub fn decode_loss_record(bytes: &[u8]) -> Result<(LossKey, LossValue), DecodeError> {
+        let state = MergeState::decode_compact(bytes)?;
+        let only_losses =
+            MergeState { losses: BTreeMap::new(), ..state.clone() } == MergeState::default();
+        match (only_losses, state.losses.len()) {
+            (true, 1) => Ok(state.losses.into_iter().next().expect("one record")),
+            _ => Err(DecodeError::NotCanonical),
+        }
+    }
+
     /// The inverse of [`MergeState::encode_compact`].
     pub fn decode_compact(bytes: &[u8]) -> Result<MergeState, DecodeError> {
         let mut r = R::new(bytes);

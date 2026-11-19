@@ -385,6 +385,7 @@ fn op_kind_tag(kind: OpKind) -> u8 {
         OpKind::ConfigureVectors => 11,
         OpKind::ConfigureValidator => 12,
         OpKind::UnkeyedDocument => 13,
+        OpKind::LossRecord => 14,
     }
 }
 
@@ -403,6 +404,7 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
         11 => OpKind::ConfigureVectors,
         12 => OpKind::ConfigureValidator,
         13 => OpKind::UnkeyedDocument,
+        14 => OpKind::LossRecord,
         other => return Err(corrupt(&format!("unknown op kind {other}"))),
     })
 }
