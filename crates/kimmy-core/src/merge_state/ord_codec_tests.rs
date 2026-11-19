@@ -75,7 +75,11 @@ fn states_with_order_entries_obey_the_laws_and_both_codecs() {
                 assert_eq!(&back, st);
                 assert_eq!(back.encode_compact(), c, "canonical");
                 assert_eq!(back.compact_hash(), st.compact_hash());
-                assert_eq!(&c[..4], b"QMS\x02", "the version byte is 2 for every state");
+                assert_eq!(
+                    &c[..4],
+                    if st.losses.is_empty() { b"QMS\x02" } else { b"QMS\x03" },
+                    "the version byte is 2 for a state with no record and 3 for one with records"
+                );
                 if !st.ords.is_empty() {
                     assert!(!st.v1_can_hold(), "version 1 cannot spell an order state");
                     assert_eq!(st.try_encode(), Err(V1CannotHold));
@@ -238,7 +242,7 @@ fn a_state_whose_order_state_empties_encodes_like_one_that_never_had_it() {
         "the life is dead: no cells, no entries"
     );
     assert_same_state(&killed, &killed_never, "after a delete");
-    assert_eq!(killed.encode_compact()[3], 2);
+    assert_eq!(killed.encode_compact()[3], if killed.losses.is_empty() { 2 } else { 3 });
     // and the other way round
     assert_same_state(&join(&d, &with, &o).0, &killed_never, "after a delete, the other way");
 
@@ -607,13 +611,16 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // RE-PINNED for Amendment 9 (the operand stamps are spelled only when they are not the usual ones): the corpus is again 243 states of
     // 72,990 B, the seeded damage is the damage of before the stamps, and so are the figures: accepted 10,453 -> 10,601; the laws over the
     // accepted damaged entries triples 131,748 -> 140,112, agreeing 106,374 -> 110,634, not associative 456 -> 444.
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_601));
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_283));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_112, 110_634, 444));
+    // RE-PINNED for the version byte that says a state holds loss records (C3b): the corpus states that hold records now
+    // spell a 16-byte hash after the version byte, so the seeded damage lands on other bytes, and a damaged hash is
+    // refused: accepted 10,601 -> 10,283; triples 140,112 -> 140,106, agreeing 110,634 -> 110,628, not associative 444 -> 444.
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_106, 110_628, 444));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }

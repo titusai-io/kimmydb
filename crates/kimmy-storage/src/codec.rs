@@ -357,13 +357,10 @@ pub fn doc_record_view(input: &[u8]) -> Result<RecordView> {
     };
     let state = kimmy_core::merge_state::MergeState::decode_compact(meta)
         .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
-    // Without its loss records (the state is decoded above, so this encodes again only when it holds one).
-    let hash = if state.losses.is_empty() {
-        kimmy_core::merge_state::MergeState::compact_hash_of(meta)
-            .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?
-    } else {
-        state.loss_free_hash()
-    };
+    // Without its loss records: read from the header, no second encoding (the state was decoded above, which
+    // checked the header's hash).
+    let hash = kimmy_core::merge_state::MergeState::loss_free_hash_of(meta)
+        .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
     let origins = state
         .vv
         .iter()
