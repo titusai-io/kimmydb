@@ -72,6 +72,15 @@ pub enum OpKind {
     /// so it **must not be replicated**. Carries no `doc_id`; the document is
     /// named in the body.
     UnkeyedDocument,
+    /// A member holds a loss record the join detected (a `conflictResolved`): the key `(kind, path, loser
+    /// stamp)` and the loser's value, cut. Body: a records-only merge state, see
+    /// [`crate::merge_state::MergeState::encode_loss_record`]. It carries the document it is about (`doc_id`).
+    ///
+    /// Not a mutation of the document, and **replicated**, unlike [`OpKind::UniqueViolation`] and
+    /// [`OpKind::UnkeyedDocument`]: its stamp is a fresh stamp of the appending member, so it is served from the
+    /// oplog in windows and snapshots like a write, and a member that receives one relays it. It is the carrier
+    /// of a record to a member that takes the record by no other route.
+    LossRecord,
 }
 
 impl OpKind {
@@ -86,6 +95,12 @@ impl OpKind {
                 | Self::ConfigureVectors
                 | Self::ConfigureValidator
         )
+    }
+
+    /// Whether this entry carries a loss record ([`OpKind::LossRecord`]): replicated like a write, applied to no
+    /// document.
+    pub fn is_loss_record(self) -> bool {
+        matches!(self, Self::LossRecord)
     }
 
     /// Whether this entry is a member's own observation of its data, written
@@ -343,6 +358,35 @@ mod tests {
 
     fn token() -> ResumeToken {
         ResumeToken::new(Hlc::new(1_700_000_000_000, 42), origin(9, 4))
+    }
+
+    #[test]
+    fn a_loss_record_is_replicated_and_is_no_document_and_no_schema_change() {
+        let loss = OpKind::LossRecord;
+        assert!(loss.is_loss_record(), "it is what it is");
+        assert!(!loss.is_document(), "it merges into no document");
+        assert!(!loss.is_ddl(), "it changes no schema");
+        assert!(
+            !loss.is_local_observation(),
+            "it is replicated: a local observation is never served to a peer, and this one must be"
+        );
+        for other in [
+            OpKind::Insert,
+            OpKind::Update,
+            OpKind::Replace,
+            OpKind::Delete,
+            OpKind::Collection,
+            OpKind::UniqueViolation,
+            OpKind::CreateCollection,
+            OpKind::DropCollection,
+            OpKind::CreateIndex,
+            OpKind::DropIndex,
+            OpKind::ConfigureVectors,
+            OpKind::ConfigureValidator,
+            OpKind::UnkeyedDocument,
+        ] {
+            assert!(!other.is_loss_record(), "{other:?} is not a loss record");
+        }
     }
 
     #[test]

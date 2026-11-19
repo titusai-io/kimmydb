@@ -271,3 +271,5 @@ pub use watch::{
     ChangeEvent, ChangeStream, ExamineBudget, InvalidateReason, OplogWindow, WatchOptions,
     WatchScope, set_test_serve_walk_budget, set_test_serve_walk_linear,
 };
+#[cfg(test)]
+mod loss_entry_tests;

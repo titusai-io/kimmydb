@@ -95,6 +95,8 @@ mod hand_built;
 #[cfg(test)]
 mod loss_receive_tests;
 #[cfg(test)]
+mod loss_record_body_tests;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod ord_codec_tests;

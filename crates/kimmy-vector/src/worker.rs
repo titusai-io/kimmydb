@@ -1680,8 +1680,9 @@ impl EmbeddingWorker {
         // Not every oplog entry describes a mutation. A unique-violation or an
         // unkeyed-document entry reports something that happened *to* the data
         // and has nothing to embed. It would be filtered by the `doc_id` check
-        // below anyway, but relying on that would make the safety incidental.
-        if entry.kind.is_local_observation() {
+        // below anyway, but relying on that would make the safety incidental. A loss record names its
+        // document and describes no change to it, so it is not a reason to embed again.
+        if entry.kind.is_local_observation() || entry.kind.is_loss_record() {
             return Ok(Prepared::Done(Outcome::Skipped));
         }
 

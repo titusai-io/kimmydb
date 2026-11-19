@@ -1637,6 +1637,9 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(RemoteApplied::Superseded { released: false });
         };
+        if entry.kind.is_loss_record() {
+            return self.relay_loss_record(txn, coll, entry, position);
+        }
         if coll.merge_policy == MergePolicy::Field {
             // U1: the one place every field entry and state passes, whatever brought it (a pull, a
             // push, a replay, a snapshot page) and in whatever position. Before anything is written.
@@ -1806,6 +1809,44 @@ impl Engine {
     /// not below retention's horizon for its origin, so a member that took it serves it onward
     /// whatever else it holds: a member that pulls only from this one reads the same state, and
     /// the members of a cluster hold the same set of entries (the rewind folds over it).
+    /// A loss-record entry that reaches this member: **kept in the oplog and applied to nothing.** What the
+    /// member's servable vector covers for an origin its oplog holds, and the entry's stamp is in the
+    /// appender's origin space, so the entry is appended exactly as a field entry that moved no document is
+    /// (always keep: unless it is already there or at or below what retention collected) and witnessed. No
+    /// state, document, index or event is touched: the record reaches the state in the commit that applies
+    /// it. A snapshot never carries one (`Position::Hold` is refused). Refused by name, nothing written, when
+    /// the body is not a record or the entry's stamp is past the clock bound (until due, as any entry of a
+    /// `field` collection is); ignored when its collection is not a `field` collection.
+    fn relay_loss_record(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+        position: Position,
+    ) -> Result<RemoteApplied> {
+        if coll.merge_policy != MergePolicy::Field {
+            warn!(
+                collection = %coll.id.0,
+                "a loss record for a collection that is not a field collection is ignored"
+            );
+            self.witness(&entry.stamp);
+            return Ok(RemoteApplied::Superseded { released: false });
+        }
+        if position == Position::Hold {
+            return Err(StorageError::Corrupt(
+                "a snapshot page carries a loss record, which is history and never state".into(),
+            ));
+        }
+        self.refuse_if_past_the_bound(&entry.stamp, None)?;
+        let body = entry
+            .body
+            .as_deref()
+            .ok_or_else(|| StorageError::Corrupt("a loss record carries no body".into()))?;
+        kimmy_core::merge_state::MergeState::decode_loss_record(body)
+            .map_err(|e| StorageError::Corrupt(format!("the body of a loss record: {e:?}")))?;
+        self.field_entry_kept(txn, entry, position, false)
+    }
+
     /// U1: refuse, by name and until due, an entry or state of a `field` collection whose clock is
     /// more than `max_clock_skew_secs` ahead of this member's physical clock. Nothing has been written
     /// when this returns the error, and the entry is not witnessed: it applies once it is due.
