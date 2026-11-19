@@ -8103,8 +8103,22 @@ mod tests {
             let meta = meta.clone();
             std::thread::spawn(move || engine.insert(&meta, bson::doc! { "_id": 1 }))
         };
-        // The commit has landed and its committer sleeps the window as leader.
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // The commit has landed and its committer sleeps the window as leader. Waited for as that condition, not
+        // as a pause: on a machine under load the insert thread may not have got that far in any fixed time, and
+        // the close would then find nothing waiting on the barrier.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine
+            .coalescer
+            .lock()
+            .as_ref()
+            .is_some_and(|c| c.issued == 1 && c.flushed < c.issued && c.leader_running)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the commit never landed and led the barrier"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let fsyncs = engine.fsyncs();
         let started = std::time::Instant::now();
         assert!(engine.close_writes(std::time::Duration::from_secs(5)));
