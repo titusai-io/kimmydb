@@ -132,3 +132,141 @@ pub(crate) fn expire(txn: &redb::WriteTransaction, now_ms: u64) -> Result<usize>
     }
     Ok(gone.len())
 }
+
+/// A rewind to `until`: delete the parked records whose entry was stamped above it, as the rewind discards the
+/// entries themselves. The entry's oplog key is the third part of the row's key. Returns how many.
+pub(crate) fn remove_above(txn: &redb::WriteTransaction, until: Hlc) -> Result<usize> {
+    let mut table = txn.open_table(tables::LOSS_PENDING)?;
+    let mut gone: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new();
+    for row in table.iter()? {
+        let (k, _) = row?;
+        let (c, d, e) = k.value();
+        if crate::codec::decode_oplog_key(e)?.hlc > until {
+            gone.push((c, d.to_vec(), e.to_vec()));
+        }
+    }
+    for (c, d, e) in &gone {
+        table.remove((*c, d.as_slice(), e.as_slice()))?;
+    }
+    Ok(gone.len())
+}
+
+/// The purge of a dropped collection: delete up to `limit` of its parked records whose entry was stamped at or below
+/// the drop's `dropped` (a collection created again under the name has the same id, and what is parked after the drop
+/// belongs to the new incarnation, which the fold's floor check judges). Returns how many.
+pub(crate) fn remove_collection_chunk(
+    txn: &redb::WriteTransaction,
+    collection: u64,
+    dropped: Hlc,
+    limit: usize,
+) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut table = txn.open_table(tables::LOSS_PENDING)?;
+    let mut gone: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for row in table.range((collection, &[][..], &[][..])..)? {
+        let (k, _) = row?;
+        let (c, d, e) = k.value();
+        if c != collection || gone.len() >= limit {
+            break;
+        }
+        if crate::codec::decode_oplog_key(e)?.hlc <= dropped {
+            gone.push((d.to_vec(), e.to_vec()));
+        }
+    }
+    for (d, e) in &gone {
+        table.remove((collection, d.as_slice(), e.as_slice()))?;
+    }
+    Ok(gone.len())
+}
+
+impl crate::Engine {
+    /// Build `LOSS_PENDING` from the oplog if this store has not (`META_LOSS_PENDING_BUILT` says so): a restore
+    /// carries the loss entries and not the table, and skips the marker. A fresh store has the marker from its
+    /// first commit (it has nothing to park), so a start of one makes no commit here; this runs at the end of the
+    /// open, after every check that can refuse the store, and writes only for a store a restore made. One bounded walk at open, before the node
+    /// serves: the oplog from the start of the largest emission window of any `field` collection (that collection's
+    /// `R` before now) upward, judging each entry on its nine-byte header. A loss record still inside its window,
+    /// whose document has no row or a bare one, is parked; the marker is written in the same transaction.
+    pub(crate) fn rebuild_loss_pending_if_needed(&self) -> Result<()> {
+        use redb::{ReadableDatabase, ReadableTable};
+        let (built, collections) = {
+            let txn = self.db().begin_read()?;
+            let built =
+                txn.open_table(tables::META)?.get(tables::META_LOSS_PENDING_BUILT)?.is_some();
+            let collections = if built { Vec::new() } else { Self::all_collections_in(&txn)? };
+            (built, collections)
+        };
+        if built {
+            return Ok(());
+        }
+        let mut windows = std::collections::HashMap::new();
+        for meta in collections.iter().filter(|c| c.merge_policy == kimmy_core::MergePolicy::Field)
+        {
+            windows.insert(meta.id.0, self.field_writer(meta)?.options().retention);
+        }
+        let now_ms = self.clock_bound_now_ms();
+        let widest = windows.values().copied().max().unwrap_or(0);
+        let from = kimmy_core::Stamp::new(
+            Hlc::new(now_ms.saturating_sub(widest), 0),
+            kimmy_core::NodeId::from_bytes([0; 16]),
+            kimmy_core::Epoch::ZERO,
+        );
+        let txn = self.begin_write(crate::engine::WriterHolder::Ddl)?;
+        if !windows.is_empty() {
+            let mut found: Vec<(Vec<u8>, kimmy_core::OplogEntry)> = Vec::new();
+            {
+                let oplog = txn.open_table(tables::OPLOG)?;
+                for row in oplog.range(crate::codec::oplog_key(&from).as_slice()..)? {
+                    let (key, value) = row?;
+                    let Ok((kind, collection)) =
+                        crate::codec::decode_oplog_kind_and_collection(value.value())
+                    else {
+                        continue;
+                    };
+                    if kind == kimmy_core::OpKind::LossRecord && windows.contains_key(&collection.0)
+                    {
+                        found.push((
+                            key.value().to_vec(),
+                            crate::codec::decode_oplog_entry(key.value(), value.value())?,
+                        ));
+                    }
+                }
+            }
+            let docs = txn.open_table(tables::DOCS)?;
+            for (entry_key, entry) in found {
+                let (Some(id), Some(body)) = (entry.doc_id.as_ref(), entry.body.as_deref()) else {
+                    continue;
+                };
+                let key = crate::docs::doc_key(id)?;
+                let held =
+                    docs.get((entry.collection.0, key.as_slice()))?.map(|raw| raw.value().to_vec());
+                let has_a_state = match held
+                    .map(|raw| crate::codec::decode_doc_record_with_meta(&raw))
+                    .transpose()?
+                {
+                    Some(record) => match record.meta.as_deref() {
+                        Some(meta) => !crate::field_write::load(Some(meta))?.is_bare(),
+                        None => false,
+                    },
+                    None => false,
+                };
+                if !has_a_state {
+                    park(
+                        &txn,
+                        entry.collection.0,
+                        &key,
+                        &entry_key,
+                        body,
+                        windows[&entry.collection.0],
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+        txn.open_table(tables::META)?.insert(tables::META_LOSS_PENDING_BUILT, [1u8].as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+}

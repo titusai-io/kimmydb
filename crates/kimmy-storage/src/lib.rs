@@ -278,3 +278,5 @@ mod loss_apply_tests;
 mod loss_entry_tests;
 #[cfg(test)]
 mod loss_free_digest_tests;
+#[cfg(test)]
+mod loss_lifecycle_tests;

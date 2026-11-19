@@ -1816,7 +1816,7 @@ impl Engine {
     /// The state of a field row a local write is about to store, with what was parked for its document folded in:
     /// the write that gives a document a row is one of the writes that fold (one range read when nothing is
     /// parked, which is every write but the first after a loss entry arrived ahead of its document).
-    fn with_parked_records(
+    pub(crate) fn with_parked_records(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
