@@ -1586,6 +1586,8 @@ impl Engine {
             let mut memo = Memo::default();
             let txn = self.begin_write(WriterHolder::Repair)?;
             let mut pending = Vec::new();
+            // Documents whose stored state moved with the document as it was: written into the transaction.
+            let mut state_moved = 0usize;
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
 
@@ -1638,10 +1640,14 @@ impl Engine {
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
                 // `Position::Hold`.
-                if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
-                    self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
-                {
-                    pending.push(Pending { collection, entry, id, violations, unkeyed });
+                match self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)? {
+                    RemoteApplied::Applied { id, violations, unkeyed, .. } => {
+                        pending.push(Pending { collection, entry, id, violations, unkeyed });
+                    }
+                    // The state stored for the document moved and the document did not: the row is in
+                    // this transaction, and a page that aborts for want of a write would roll it back.
+                    RemoteApplied::Written { .. } => state_moved += 1,
+                    RemoteApplied::Superseded { .. } => {}
                 }
             }
 
@@ -1664,7 +1670,7 @@ impl Engine {
             // batch's vector).
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
-            let mut wrote = !pending.is_empty() || recorded > 0;
+            let mut wrote = !pending.is_empty() || recorded > 0 || state_moved > 0;
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
                 // And the sender's forgetting with it: a member that was behind forgets
@@ -1841,6 +1847,9 @@ impl Engine {
             let mut owing: std::collections::HashMap<CollectionId, bool> =
                 std::collections::HashMap::new();
             let mut pending = Vec::new();
+            // Rows held here whose stored state moved with the document as it was: written into the
+            // transaction, and the repair's progress (the state is what the pull exists to move).
+            let mut state_moved = 0usize;
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
                 if self.is_history(
@@ -1900,22 +1909,35 @@ impl Engine {
                     body: document.body.clone(),
                     meta: document.meta.clone(),
                 };
-                if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
-                    self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
-                {
-                    let at_the_cut = usize::from(Self::row_is_at_the_cut(
-                        &txn,
-                        &collection,
-                        document,
-                        &progress.cut,
-                    )?);
-                    if young {
-                        created += 1;
-                        created_at_cut += at_the_cut;
-                    } else {
-                        applied_at_cut += at_the_cut;
+                match self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)? {
+                    RemoteApplied::Applied { id, violations, unkeyed, .. } => {
+                        let at_the_cut = usize::from(Self::row_is_at_the_cut(
+                            &txn,
+                            &collection,
+                            document,
+                            &progress.cut,
+                        )?);
+                        if young {
+                            created += 1;
+                            created_at_cut += at_the_cut;
+                        } else {
+                            applied_at_cut += at_the_cut;
+                        }
+                        pending.push(Pending { collection, entry, id, violations, unkeyed });
                     }
-                    pending.push(Pending { collection, entry, id, violations, unkeyed });
+                    RemoteApplied::Written { .. } => {
+                        // A page whose only effect is a state move is still a write: without this the page
+                        // aborts and the move is rolled back, and the repair that planned the pull is judged
+                        // ineffective for ever.
+                        state_moved += 1;
+                        applied_at_cut += usize::from(Self::row_is_at_the_cut(
+                            &txn,
+                            &collection,
+                            document,
+                            &progress.cut,
+                        )?);
+                    }
+                    RemoteApplied::Superseded { .. } => {}
                 }
             }
             let documents_applied = pending.len();
@@ -1935,13 +1957,13 @@ impl Engine {
             )?;
             applied_at_cut += replaced_at_cut
                 + pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
-            if pending.is_empty() && replaced == 0 {
+            if pending.is_empty() && replaced == 0 && state_moved == 0 {
                 txn.abort()?;
             } else {
                 txn.commit()?;
             }
             let (count, error) = self.report_pending(pending);
-            applied = count - created + replaced;
+            applied = count - created + replaced + state_moved;
             failed = error;
         }
         *progress = progress.advanced(page, applied + created, deletes.len());
@@ -2367,7 +2389,16 @@ impl Engine {
                 });
                 Ok(false)
             }
-            _ => {
+            // The state the carried delete keeps moved the state held under the key (a tombstone's, where the
+            // document is as it was): the row is written, so it is recorded, or a page with nothing else on it
+            // aborts and rolls the move back.
+            RemoteApplied::Written { .. } => {
+                if let Some(c) = converge.as_mut() {
+                    *c.replaced_at_cut += usize::from((c.at_cut)(tombstone.stamp));
+                }
+                Ok(true)
+            }
+            RemoteApplied::Superseded { .. } => {
                 if first_state_here && let Some(c) = converge.as_mut() {
                     *c.replaced_at_cut += usize::from((c.at_cut)(tombstone.stamp));
                 }
