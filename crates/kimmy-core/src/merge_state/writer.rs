@@ -1690,17 +1690,7 @@ impl Writer {
     /// it is already below the horizon, already known, or a counter total past
     /// [`MAX_TOTAL`]. True when added.
     pub fn receive_loss(&mut self, key: LossKey, val: LossValue) -> bool {
-        if key.stamp.hlc < self.horizon() || self.state.losses.contains_key(&key) {
-            return false;
-        }
-        // A total past `MAX_TOTAL`, or a decimal no writer produces, is one `decode` refuses: never store a state that
-        // cannot be read back.
-        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) || !t.is_canonical())
-        {
-            return false;
-        }
-        self.state.losses.insert(key, val);
-        true
+        self.state.receive_loss(key, val, &self.opts)
     }
 }
 
