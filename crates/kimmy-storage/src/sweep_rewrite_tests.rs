@@ -182,6 +182,11 @@ fn the_sweep_thins_the_state_a_tombstone_stamped_after_the_drop_keeps() {
         Some(dropped.hlc),
         "the collection stands, over the drop"
     );
+    assert_eq!(
+        m.snapshot_page(None, Some(cm.id)).unwrap().deleted_documents[0].id,
+        Some(x.clone()),
+        "the tombstone the sweep thinned keeps its `_id`"
+    );
     assert_counts_exact(&m, "a tombstone thinned by the sweep");
     assert_digests_exact(&m, "a tombstone thinned by the sweep");
 }
@@ -256,7 +261,35 @@ fn a_live_record_whose_surviving_state_renders_dead_becomes_a_tombstone_and_is_c
     let page = b.snapshot_page(None, Some(cb.id)).unwrap();
     assert_eq!(page.deleted_documents.len(), 1);
     assert_eq!(page.deleted_documents[0].stamp, stamp, "at its own stamp");
+    assert_eq!(
+        page.deleted_documents[0].id,
+        Some(kimmy_core::DocId::Int64(1)),
+        "the tombstone a live record became keeps its `_id` (and not its document)"
+    );
     let kept = crate::field_write::load(page.deleted_documents[0].meta.as_deref()).unwrap();
     assert!(kept.lives.is_empty() && kept.deletes.len() == 1, "keeping the delete after the drop");
     assert_counts_exact(&b, "a live record thinned to a tombstone");
+}
+
+/// A live record at or below the drop is buried: it becomes the drop's own tombstone, with what is left of its state,
+/// and keeps its `_id` and none of its document. (A tombstone at or below the drop is left: the sweep passes it.)
+#[test]
+fn the_sweep_buries_a_live_record_at_or_below_the_drop_and_the_tombstone_keeps_its_id() {
+    let (a, _da) = engine();
+    let (m, _dm) = engine();
+    let ca = a.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
+    let x = a.insert(&ca, doc! { "_id": 1, "a": 1, "b": "a body that is not kept" }).unwrap();
+    let all = a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap().entries;
+    let insert = all.iter().find(|e| e.kind == OpKind::Insert).unwrap().clone();
+    let cm = m.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
+    assert!(m.apply_remote(&cm, &insert).unwrap(), "premise: M takes the document");
+    let dropped = Stamp::new(Hlc::new(insert.stamp.hlc.wall_ms + 1, 0), m.node_id(), m.epoch());
+    m.record_collection_drop(cm.id, dropped).unwrap();
+
+    m.sweep_late_drop("shop", "orders", dropped).unwrap();
+
+    assert_eq!(m.get(&cm, &x).unwrap(), None, "premise: the record is buried");
+    let page = m.snapshot_page(None, Some(cm.id)).unwrap();
+    assert_eq!(page.deleted_documents.len(), 1, "one tombstone");
+    assert_eq!(page.deleted_documents[0].id, Some(x), "keeping the `_id`");
 }

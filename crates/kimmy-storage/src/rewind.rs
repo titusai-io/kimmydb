@@ -791,7 +791,11 @@ impl Engine {
             let mut record = if joined.alive {
                 DocRecord::live(stamp, joined.body.clone())
             } else {
-                DocRecord::tombstone(stamp)
+                // A tombstone keeps the `_id` and nothing else, however the document it replaces was.
+                match &earliest_after.doc_id {
+                    Some(id) => DocRecord::field_tombstone(stamp, id),
+                    None => DocRecord::tombstone(stamp),
+                }
             };
             record.meta = Some(joined.meta);
             let after = if joined.alive {

@@ -454,6 +454,11 @@ pub struct SnapshotTombstone {
     /// only a stamp. A `field` tombstone without it is not a valid row.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub meta: Option<Vec<u8>>,
+    /// The `_id` of the deleted document of a `field` collection, which its tombstone keeps (the key is one-way and
+    /// the merge state keeps none): a member that holds the document only as this tombstone can still name it. `None`
+    /// for a collection of any other policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<DocId>,
 }
 
 /// A delete a received page carries, as the receiver's paths work with it.
@@ -467,6 +472,8 @@ struct CarriedDelete {
     stamp: Stamp,
     /// The state a `field` document's delete keeps.
     meta: Option<Vec<u8>>,
+    /// The `_id` its tombstone kept at the sender, for a `field` collection.
+    id: Option<DocId>,
 }
 
 impl CarriedDelete {
@@ -479,6 +486,7 @@ impl CarriedDelete {
                 key: tombstone.key.clone(),
                 stamp: tombstone.stamp,
                 meta: tombstone.meta.clone(),
+                id: tombstone.id.clone(),
             })
             .collect()
     }
@@ -1190,6 +1198,7 @@ impl Engine {
                             collection: CollectionId(collection),
                             key: doc_key.to_vec(),
                             stamp: record.stamp,
+                            id: record.tombstone_id(),
                             meta: record.meta,
                         };
                         (bytes, PageRow::Tombstone(tombstone))
@@ -2365,7 +2374,11 @@ impl Engine {
                 }
                 Some(id)
             }
-            None => None,
+            // No live document is held: the id the sender's tombstone kept, if it names this key.
+            None => match &tombstone.id {
+                Some(id) if crate::docs::doc_key(id)? == tombstone.key => Some(id.clone()),
+                _ => None,
+            },
         };
         let entry = OplogEntry {
             stamp: tombstone.stamp,
@@ -6753,6 +6766,7 @@ mod tests {
             key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
             stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()),
             meta: None,
+            id: None,
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
@@ -7010,6 +7024,7 @@ mod tests {
                 key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
                 stamp: delete,
                 meta: None,
+                id: None,
             }],
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,

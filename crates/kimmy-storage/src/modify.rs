@@ -961,7 +961,16 @@ impl Engine {
             Some(body) => (DocRecord::live(stamp, body.clone()), OpKind::Replace),
             // A tombstone, exactly as an ordinary delete leaves — so a removal
             // through this route replicates and streams like any other delete.
-            None => (DocRecord::tombstone(stamp), OpKind::Delete),
+            None => (
+                match &meta {
+                    // A field collection's tombstone keeps the `_id`, and only that.
+                    Some(_) => {
+                        DocRecord::field_tombstone(stamp, &crate::docs::extract_id(&found.doc)?)
+                    }
+                    None => DocRecord::tombstone(stamp),
+                },
+                OpKind::Delete,
+            ),
         };
         record.meta = meta.clone();
 
