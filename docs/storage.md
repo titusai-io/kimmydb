@@ -317,6 +317,19 @@ entry, or a state that holds one, is refused until it is due: it is not applied 
 window or snapshot page stops at it and is asked for again, and it applies once this member's clock
 has caught up to within the bound. The setting is local to the member and is not replicated.
 
+The same bound covers what a peer says about its clock, whatever the merge policy. A schema change (a
+drop, a creation, a definition) stamped past the bound is refused until due as an entry is, before anything
+is written, and so is a snapshot page that carries one; a drop stamped far ahead would be the floor of the
+collection on every member that took it and would move this member's own clock to it. What a peer says it has
+processed, in a window it served, in a snapshot page's coverage, in the vectors it answers a round with, is
+believed up to the bound and no further: a component past it is lowered to it, and an origin whose epoch
+starts past it is left out, so a claim of far-future coverage cannot mark real entries below it as held and
+never asked for. A tombstone horizon a snapshot page carries is adopted only up to this member's own clock,
+since an honest horizon is the sender's clock minus the join retention and never ahead of it; and a replay
+position past the bound is not served. All of it is counted in `kimmy_sync_clock_refused_total{origin}`, once
+for a frame. The entries and documents of a `document` collection are applied as before. `Hello`, `Welcome`
+and `Confirm` carry no time and are not checked.
+
 **Join retention (`R`).** The horizon below which a `field` collection's deletes and dead lives are pruned is
 `max(vv) - R`, so every member must use the same `R`. It is per collection: a `field` collection takes the
 creating member's `storage.tombstone_retention_secs` at creation, carries it in its creation entry and in a
