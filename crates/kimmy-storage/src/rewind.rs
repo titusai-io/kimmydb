@@ -369,8 +369,9 @@ impl Engine {
                                 if let (Some(meta), Some(state)) =
                                     (collections.get(&collection_id), record.meta.take())
                                 {
-                                    record.meta =
-                                        Some(self.with_parked_records(&txn, meta, &key, state)?);
+                                    record.meta = Some(
+                                        self.with_parked_records(&txn, meta, &key, state, None)?,
+                                    );
                                 }
                                 crate::live_count::put_record(
                                     &txn,
