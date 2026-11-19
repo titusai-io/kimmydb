@@ -1804,7 +1804,11 @@ impl Engine {
         self.refuse_if_past_the_bound(&entry.stamp, vv_max_wall_ms)
     }
 
-    fn refuse_if_past_the_bound(&self, stamp: &Stamp, vv_max_wall_ms: Option<u64>) -> Result<()> {
+    pub(crate) fn refuse_if_past_the_bound(
+        &self,
+        stamp: &Stamp,
+        vv_max_wall_ms: Option<u64>,
+    ) -> Result<()> {
         match self.clock_bound().check(self.clock_bound_now_ms(), stamp, vv_max_wall_ms) {
             Some(stop) => Err(StorageError::ClockRefused(Box::new(stop))),
             None => Ok(()),

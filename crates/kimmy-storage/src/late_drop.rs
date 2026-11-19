@@ -2299,7 +2299,7 @@ mod tests {
         let (b, _db) = engine();
         let (c, _dc) = engine();
         let (d, _dd) = engine();
-        let base = crate::engine::physical_now_ms() + 3_600_000;
+        let base = crate::engine::physical_now_ms() + 60_000;
         let at = |e: &Engine, t: u64| {
             e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id(), e.epoch()));
         };

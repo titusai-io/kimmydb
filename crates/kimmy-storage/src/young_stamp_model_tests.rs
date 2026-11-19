@@ -110,6 +110,8 @@ const OPEN_POST: u32 = 40;
 /// Retentions, virtual ms. `NEVER` collects nothing.
 const NEVER: u32 = u32::MAX;
 const RETENTIONS: [u32; 6] = [2, 8, 24, 60, 200, NEVER];
+/// How far ahead of the wall clock a member's clock reads for the clock bound: past every stamp a schedule mints.
+const MODEL_CLOCK_OFFSET_MS: i64 = 10_000_000;
 /// Skews, virtual ms. `FAR` is a clock ahead of every start in the run.
 const FAR: i32 = 100_000;
 const SKEWS: [i32; 5] = [0, -3, 4, 12, FAR];
@@ -1100,6 +1102,9 @@ impl Cluster {
             }
         }
         let engine = Engine::open_as(&path, None, &build).map_err(|e| err("open", e))?;
+        // The member's clock, as the clock bound reads it, is where the schedule is (the base runs ahead of the wall
+        // clock and a skewed member further): a peer's horizon is then never ahead of it, as an honest one never is.
+        engine.set_clock_offset_for_tests(MODEL_CLOCK_OFFSET_MS);
         engine.reconcile_database_tombstones().map_err(|e| err("reconcile_database", e))?;
         engine.reconcile_late_drops().map_err(|e| err("reconcile_late_drops", e))?;
         engine.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;

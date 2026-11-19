@@ -1331,9 +1331,9 @@ impl Engine {
                     reason = %stop.reason,
                     stamp = ?stop.stamp,
                     due_in_ms = stop.due_in_ms,
-                    "refused a snapshot page: a document's clock is more than max_clock_skew_secs ahead of \
-                     this member's clock; the page was rolled back whole, the snapshot did not move, and \
-                     it is asked for again and applies once the document is due"
+                    "refused a snapshot page: a document, a drop or a creation on it is stamped more than \
+                     max_clock_skew_secs ahead of this member's clock; the page was rolled back whole, the \
+                     snapshot did not move, and it is asked for again and applies once it is due"
                 );
                 Ok(SnapshotApplied { clock_refused: Some(*stop), ..Default::default() })
             }
@@ -1393,6 +1393,32 @@ impl Engine {
         now
     }
 
+    /// U1 for the schema stamps a page carries (the frame check): the drops it names, and the creation,
+    /// definition and floor stamps of the collections it defines. A stamp that carries no origin (a
+    /// creation's `created`, a floor) is the sender's.
+    fn refuse_far_future_definitions(&self, peer: NodeId, page: &SnapshotPage) -> Result<()> {
+        let named = |hlc: Hlc| Stamp::new(hlc, peer, Epoch::ZERO);
+        let mut stamps: Vec<Stamp> = Vec::new();
+        stamps.extend(page.dropped);
+        stamps.extend(page.dropped_collections.iter().map(|(_, stamp)| *stamp));
+        for state in &page.collections {
+            stamps.push(named(state.created));
+            stamps.extend(state.vector_changed);
+            stamps.extend(state.validator_changed);
+            stamps.extend(
+                [state.merge_policy_at, state.redated_from, state.incarnation_floor]
+                    .into_iter()
+                    .flatten()
+                    .map(named),
+            );
+        }
+        let (bound, now) = (self.clock_bound(), self.clock_bound_now_ms());
+        match stamps.iter().find_map(|stamp| bound.check_stamp(now, stamp)) {
+            Some(stop) => Err(crate::StorageError::ClockRefused(Box::new(stop))),
+            None => Ok(()),
+        }
+    }
+
     fn apply_snapshot_page_inner(
         &self,
         peer: NodeId,
@@ -1403,6 +1429,10 @@ impl Engine {
         // every carried delete's key in the stored form, which is all any path
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
+        // A drop or a creation the page carries, stamped more than `max_clock_skew_secs` ahead of this
+        // member's clock, is refused until due whatever the collection's merge policy, before anything is
+        // applied: the page is a stop, as a far-future document of a `field` collection is.
+        self.refuse_far_future_definitions(peer, page)?;
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
@@ -6335,8 +6365,10 @@ mod tests {
         let mut page = a.snapshot_page(None, Some(ca.id)).unwrap();
         // A denial of the very collection the receiver holds, at a stamp above
         // its incarnation -- which on the whole-database route would take it.
-        page.dropped_collections =
-            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch()))];
+        page.dropped_collections = vec![(
+            victim.id,
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch()),
+        )];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
             .unwrap();
@@ -6375,9 +6407,12 @@ mod tests {
             "the fixture must deny a collection the same page defines, which is the case that \
              shows the denial is not a stale echo of something the sender dropped"
         );
+        // Above the sender's coverage, and inside the clock bound: a stamp past the bound is a stop of its
+        // own (the page is refused until due), and this is the gate the coverage is.
+        let denied_at = Hlc::new(crate::physical_now_ms() + 60_000, 0);
         page.dropped_collections = vec![
-            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
-            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id(), a.epoch())),
+            (victim.id, Stamp::new(denied_at, a.node_id(), a.epoch())),
+            (local.id, Stamp::new(denied_at, a.node_id(), a.epoch())),
         ];
 
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6390,10 +6425,10 @@ mod tests {
             b.get_collection("shop", "local-only").is_ok(),
             "least of all one the sender has never held"
         );
-        // The half that makes it unrecoverable rather than merely wrong: at
-        // `Hlc::MAX` no stamp the cluster can ever mint clears the tombstone,
-        // and `gc` expires on `stamp.hlc < cutoff`, so it is never collected
-        // either. Recording one would be permanent.
+        // The half that makes it unrecoverable rather than merely wrong: a tombstone
+        // above every stamp the cluster has yet minted is not cleared by one it
+        // mints next, and `gc` expires on `stamp.hlc < cutoff`, so it is not
+        // collected for as long as it stays ahead. Recording one would be permanent.
         assert!(
             b.collections_dropped().unwrap().is_empty(),
             "and it must not be recorded, or it outlives every recovery and rides every page \

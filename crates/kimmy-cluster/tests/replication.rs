@@ -9154,6 +9154,11 @@ async fn an_address_that_answered_as_this_node_is_dialled_again_after_the_rechec
 // An epoch's start HLC and a clock behind it
 // ---------------------------------------------------------------------------
 
+/// The peers of the test below: their clocks, as the clock bound reads them, are where the writer's clock is, an hour
+/// and a minute past this machine's. The writer is the one whose clock is behind its epoch's start; a peer whose clock
+/// is not there refuses its writes until due, which is the bound and not what that test is about.
+const HOUR_AHEAD_MS: i64 = 3_660_000;
+
 /// A member whose epoch was minted at T, reopened on a clock behind T with nothing written under
 /// it: the epoch row a mint on a host whose clock read an hour ahead left (a data directory moved
 /// to a host whose clock is behind, a boot before the clock was stepped forward, `kimmyd restore`
@@ -9188,6 +9193,7 @@ async fn a_write_on_a_clock_behind_its_epochs_start_is_pulled_and_confirmed_only
 
     // A push to a peer that has never heard of the origin: confirmed only once it holds the write.
     let pushed_to = node().await;
+    pushed_to.engine.set_clock_offset_for_tests(HOUR_AHEAD_MS);
     let (pushed, windows) = confirm(&writer, &pushed_to, &entry).await;
     let pushed_held = held(&pushed_to);
 
@@ -9195,6 +9201,7 @@ async fn a_write_on_a_clock_behind_its_epochs_start_is_pulled_and_confirmed_only
     // concern against that peer: it witnesses the origin through the write, so a confirmation
     // is only right if it holds it.
     let puller = node().await;
+    puller.engine.set_clock_offset_for_tests(HOUR_AHEAD_MS);
     let outcome = sync_once(&puller.engine, writer.addr, SECRET, None).await.unwrap();
     let pulled = held(&puller);
     let witnessed = puller.engine.witnessed_vector().unwrap().get(origin);

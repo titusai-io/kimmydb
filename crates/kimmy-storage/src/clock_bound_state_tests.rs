@@ -10,6 +10,18 @@ use crate::{ClockRefusal, Engine, SnapshotProgress, WalkScope};
 
 const SKEW_MS: i64 = 300_000;
 
+/// The page with the creation of each collection it defines made long ago. The receiver's clock is moved back so
+/// that the documents are past the bound, and a creation made just now would be past it too: a schema stamp past the
+/// bound stops a page before its documents are read (the frame check), and these tests are about the documents.
+fn with_honest_definitions(mut page: crate::SnapshotPage) -> crate::SnapshotPage {
+    for state in &mut page.collections {
+        let long_ago = kimmy_core::Hlc::new(crate::physical_now_ms() - 3_600_000, 0);
+        state.created = long_ago;
+        state.merge_policy_at = state.merge_policy_at.map(|_| long_ago);
+    }
+    page
+}
+
 fn engine() -> (Engine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
@@ -22,7 +34,7 @@ fn a_far_future_state_by_snapshot_is_refused_and_the_page_rolls_back() {
     for i in 0..3i64 {
         a.insert(&ca, doc! { "_id": i, "n": i }).unwrap();
     }
-    let page = a.snapshot_page(None, None).unwrap();
+    let page = with_honest_definitions(a.snapshot_page(None, None).unwrap());
     assert_eq!(page.documents.len(), 3, "premise: the page carries the three documents");
 
     let (b, _db) = engine();
@@ -69,7 +81,7 @@ fn a_far_future_carried_delete_of_a_field_document_is_not_taken_and_comes_once_d
     let x = a.insert(&ca, doc! { "_id": 1 }).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(3));
     a.delete(&ca, &x).unwrap();
-    let page = a.snapshot_page(None, None).unwrap();
+    let page = with_honest_definitions(a.snapshot_page(None, None).unwrap());
     assert!(!page.deleted_documents.is_empty(), "premise: the page carries the delete");
     let deleted_at = a.version_vector().unwrap().get(a.origin());
 

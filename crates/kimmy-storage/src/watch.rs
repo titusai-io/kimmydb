@@ -2131,7 +2131,8 @@ mod tests {
     async fn a_drop_in_the_lifes_own_hlc_ends_a_stream_on_it() {
         let (engine, coll, _dir) = setup();
         let mut stream = engine.watch(WatchScope::Collection(coll.id), Default::default()).unwrap();
-        let tied = Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
+        let tied =
+            Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         let drop = crate::engine::ddl_entry(
             tied,
             OpKind::DropCollection,

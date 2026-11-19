@@ -250,3 +250,128 @@ fn a_drop_past_the_bound_that_the_pages_own_vector_names_is_not_believed() {
     );
     assert!(b.clock_last() < far.hlc, "and the clock moved to it");
 }
+
+/// B's clock moved back so that everything the donor wrote just now is far-future to it.
+fn far_future_for(b: &Engine) {
+    b.set_clock_offset_for_tests(-((SKEW_MS + 60_000) as i64));
+}
+
+#[test]
+fn a_creation_past_the_bound_is_refused_until_due_whatever_the_policy() {
+    for policy in [MergePolicy::Document, MergePolicy::Field] {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection_with_policy("shop", "orders", policy, None).unwrap();
+        let creation =
+            a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+        far_future_for(&b);
+
+        let outcome = b.apply_batch(&creation).unwrap();
+
+        let stop = outcome.clock_refused_at.as_ref().unwrap_or_else(|| {
+            panic!("a creation past the bound is refused by name ({policy:?}): {outcome:?}")
+        });
+        assert_eq!(stop.reason, crate::ClockRefusal::Stamp, "refused by name: stamp");
+        assert_eq!((outcome.clock_refused, outcome.ddl), (1, 0), "{policy:?}: {outcome:?}");
+        assert!(b.get_collection("shop", "orders").is_err(), "{policy:?}: not created");
+        assert_eq!(
+            b.witnessed_vector().unwrap().get(a.origin()),
+            Hlc::ZERO,
+            "{policy:?}: not witnessed"
+        );
+
+        b.set_clock_offset_for_tests(0);
+        let outcome = b.apply_batch(&creation).unwrap();
+        assert!(
+            outcome.clock_refused == 0 && outcome.ddl >= 1,
+            "{policy:?}: due, and the creation is taken: {outcome:?}"
+        );
+        assert!(b.get_collection("shop", "orders").is_ok(), "{policy:?}: applies once due");
+    }
+}
+
+#[test]
+fn a_drop_past_the_bound_is_refused_until_due_and_the_collection_stands() {
+    for policy in [MergePolicy::Document, MergePolicy::Field] {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection_with_policy("shop", "orders", policy, None).unwrap();
+        let creation =
+            a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+        b.apply_batch(&creation).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        a.drop_collection("shop", "orders").unwrap();
+        let drop_entry = a
+            .entries_for_peer(creation.last().unwrap().stamp.hlc, 10_000, WalkScope::Background)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.kind == kimmy_core::OpKind::DropCollection)
+            .expect("the donor's drop");
+        far_future_for(&b);
+
+        let outcome = b.apply_batch(std::slice::from_ref(&drop_entry)).unwrap();
+
+        assert_eq!((outcome.clock_refused, outcome.ddl), (1, 0), "{policy:?}: {outcome:?}");
+        assert!(b.get_collection("shop", "orders").is_ok(), "{policy:?}: the collection stands");
+        assert!(b.collections_dropped().unwrap().is_empty(), "{policy:?}: no tombstone recorded");
+        assert!(b.clock_last() < drop_entry.stamp.hlc, "{policy:?}: the clock moved to the drop");
+
+        b.set_clock_offset_for_tests(0);
+        let outcome = b.apply_batch(std::slice::from_ref(&drop_entry)).unwrap();
+        assert_eq!(outcome.ddl, 1, "{policy:?}: due: {outcome:?}");
+        assert!(b.get_collection("shop", "orders").is_err(), "{policy:?}: applies once due");
+    }
+}
+
+#[test]
+fn a_page_that_defines_a_collection_created_past_the_bound_is_a_stop_until_due() {
+    let d = donor();
+    let (b, _db) = engine();
+    let mut page = d.engine.snapshot_page(None, None).unwrap();
+    let honest = page.collections[0].created;
+    page.collections[0].created = Hlc::new(physical_now_ms() + 3_600_000, 0);
+    let mut progress = SnapshotProgress::whole_database();
+
+    let applied = b.apply_snapshot_page(d.engine.node_id(), &mut progress, &page).unwrap();
+
+    let stop = applied.clock_refused.expect("the page is a stop");
+    assert_eq!(stop.reason, crate::ClockRefusal::Stamp);
+    assert!(b.get_collection("shop", "orders").is_err(), "nothing on the page was applied");
+    assert_eq!(b.clock_refusals().len(), 1, "counted: {:?}", b.clock_refusals());
+
+    page.collections[0].created = honest;
+    let applied = b.apply_snapshot_page(d.engine.node_id(), &mut progress, &page).unwrap();
+    assert!(applied.clock_refused.is_none(), "the same page, due, applies");
+    assert!(b.get_collection("shop", "orders").is_ok());
+}
+
+#[test]
+fn a_page_that_carries_a_drop_past_the_bound_is_a_stop_until_due_on_either_route() {
+    let d = donor();
+    let (b, _db) = engine();
+    let mut page = a_page_for(&d, &b);
+    let victim = b.get_collection("shop", "orders").unwrap();
+    let far = Stamp::new(Hlc::new(physical_now_ms() + 3_600_000, 0), d.origin.node, d.origin.epoch);
+    page.dropped_collections = vec![(victim.id, far)];
+
+    let whole = b
+        .apply_snapshot_page(d.engine.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .unwrap();
+    assert!(whole.clock_refused.is_some(), "the whole-database route is a stop");
+
+    // The scoped route is judged by the drop the page names for its collection alone: the whole-database half's
+    // `dropped_collections` is cleared, so a page whose `dropped` is not checked would be applied.
+    page.dropped_collections.clear();
+    page.dropped = Some(far);
+    let scoped = b
+        .apply_snapshot_page(
+            d.engine.node_id(),
+            &mut SnapshotProgress::of_collection(victim.id),
+            &page,
+        )
+        .unwrap();
+    assert!(scoped.clock_refused.is_some(), "and so is the scoped one");
+    assert!(b.get_collection("shop", "orders").is_ok());
+    assert!(b.collections_dropped().unwrap().is_empty(), "no tombstone was recorded");
+}

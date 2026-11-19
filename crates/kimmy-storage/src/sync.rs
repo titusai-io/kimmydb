@@ -2427,6 +2427,13 @@ impl Engine {
         entry: &OplogEntry,
         position: crate::engine::Position,
     ) -> Result<DdlOutcome> {
+        // A schema change is refused until due when its stamp is more than `max_clock_skew_secs` ahead of
+        // this member's physical clock, whatever the collection's merge policy and before anything is
+        // written (the frame check, as for a `field` entry): a drop stamped far ahead is the floor of the
+        // collection on every member that takes it, kills the name until the clock passes it and moves the
+        // member's own clock to it, and a creation stamped far ahead outlives every honest drop. The entry
+        // is not witnessed and the window ends at it (`apply_batch_run` turns the error into the stop).
+        self.refuse_if_past_the_bound(&entry.stamp, None)?;
         let Some(body) = &entry.body else {
             // A legacy `Collection` entry, which names nothing.
             return Ok(DdlOutcome::Applied);
@@ -8743,7 +8750,7 @@ mod tests {
             .collection_dropped_at(CollectionId::derive("shop", &shadow))
             .unwrap()
             .expect("the shadow's drop");
-        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         let entry = crate::engine::ddl_entry(
             tied,
             OpKind::ConfigureVectors,
@@ -8860,7 +8867,7 @@ mod tests {
             .cloned()
             .expect("the index's entry");
         index.stamp =
-            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::MAX);
+            Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]), Epoch::ZERO);
         assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
         let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
         assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
