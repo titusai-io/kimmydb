@@ -120,6 +120,7 @@ impl Engine {
         if oplog_removed > 0 {
             self.trim_violation_rows()?;
         }
+        self.expire_parked_loss_records(now_ms)?;
         let outcome = GcOutcome {
             oplog_removed,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
@@ -212,6 +213,30 @@ impl Engine {
     /// rows), so it goes. The table is one row per violation entry, so this
     /// reads a handful of keys and not the oplog; the scan is a read, and the
     /// write is taken only when there is something to remove (ADR-200).
+    /// Delete the loss records parked for a document with no row whose window has closed (`loss_pending.rs`). A
+    /// read first, so a pass with nothing to delete writes nothing.
+    fn expire_parked_loss_records(&self, now_ms: u64) -> Result<()> {
+        let due = {
+            let txn = self.db().begin_read()?;
+            let table = txn.open_table(tables::LOSS_PENDING)?;
+            let mut due = false;
+            for row in table.iter()? {
+                if crate::loss_pending::is_expired(row?.1.value(), now_ms)? {
+                    due = true;
+                    break;
+                }
+            }
+            due
+        };
+        if !due {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Retention)?;
+        crate::loss_pending::expire(&txn, now_ms)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     fn trim_violation_rows(&self) -> Result<()> {
         let stale: Vec<Vec<u8>> = {
             let txn = self.db().begin_read()?;

@@ -297,6 +297,33 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "at most the purge chunk's rows left over (DROP_PURGE_CHUNK, a thousand, less what the chunk already removed) of one collection, in the one write of `purge_chunk`: close_writes bounds it (ADR-192), and the stop lands between chunks, where `warm_purge_chunk` has read ahead stop-aware",
     ),
     (
+        "loss_pending::any",
+        "a range of one document's parked rows, stopped at the first: the read every write of a field row pays \
+         before it folds",
+    ),
+    (
+        "loss_pending::fold_into",
+        "a range of one document's parked rows, inside the write that gives the document a row: the rows a \
+         document can have parked are its loss entries of the last emission window, and close_writes bounds \
+         the write (ADR-192)",
+    ),
+    (
+        "loss_pending::expire",
+        "the retention pass's removal of parked rows whose window has closed, in one write: the table holds at \
+         most the loss entries of the last emission window of documents with no row, and close_writes bounds \
+         the write (ADR-192)",
+    ),
+    (
+        "gc::Engine::expire_parked_loss_records",
+        "the retention pass's read of the parked table for a row whose window has closed, in a read \
+         transaction that holds no writer, before it asks for one: the table is the loss entries of the last \
+         emission window of documents with no row",
+    ),
+    (
+        "loss_apply_tests::parked_rows",
+        "test code counting the parked rows of a store of a few rows it wrote itself",
+    ),
+    (
         "purge::Engine::owed_purges",
         "the dropped registry, and one row per drop: whether rows are left",
     ),

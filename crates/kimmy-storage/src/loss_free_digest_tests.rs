@@ -99,3 +99,52 @@ fn the_check_of_a_conditional_write_and_the_version_of_an_entry_do_not_see_loss_
         "the version an entry's write produced"
     );
 }
+
+/// Not a test of behaviour: the cost the loss-free hash adds to reading a record's hash, for the number the design
+/// asks for. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn what_the_loss_free_hash_costs_per_read() {
+    use std::time::Instant;
+    let writer_id = WriterId { node: id(1), epoch: kimmy_core::Epoch::ZERO };
+    let opts = kimmy_core::merge_state::JoinOptions::new(1_000_000, i64::MAX).unwrap();
+    let mut writer = Writer::new(writer_id, opts.clone());
+    let fields: Vec<(Path, Value)> =
+        (0..12).map(|n| (Path::flat(&format!("f{n}")).unwrap(), Value::Int64(n))).collect();
+    writer.insert(&fields, 0).unwrap();
+    let bare = writer.state.clone();
+    let mut recorded = bare.clone();
+    for n in 0..4u64 {
+        let loser = MStamp { hlc: Hlc::new(n + 1, 0), writer: writer_id };
+        recorded.receive_loss(
+            LossKey::field(LossKind::Clash, Path::flat(&format!("f{n}")).unwrap(), loser),
+            LossValue::Value(Value::Int64(5)),
+            &opts,
+        );
+    }
+    let (b_bytes, r_bytes) = (bare.encode_compact(), recorded.encode_compact());
+    let time = |name: &str, f: &dyn Fn()| {
+        let rounds = 20_000;
+        let t = Instant::now();
+        for _ in 0..rounds {
+            f();
+        }
+        println!("{name}: {:.2} us", t.elapsed().as_secs_f64() * 1e6 / rounds as f64);
+    };
+    println!("state bytes: {} without records, {} with four", b_bytes.len(), r_bytes.len());
+    time("full hash from bytes, no records (before)   ", &|| {
+        std::hint::black_box(MergeState::compact_hash_of(&b_bytes).unwrap());
+    });
+    time("loss-free hash from bytes, no records (now) ", &|| {
+        std::hint::black_box(MergeState::loss_free_hash_of(&b_bytes).unwrap());
+    });
+    time("full hash from bytes, four records (before) ", &|| {
+        std::hint::black_box(MergeState::compact_hash_of(&r_bytes).unwrap());
+    });
+    time("loss-free hash from bytes, four records (now)", &|| {
+        std::hint::black_box(MergeState::loss_free_hash_of(&r_bytes).unwrap());
+    });
+    time("decode_compact alone, four records           ", &|| {
+        std::hint::black_box(MergeState::decode_compact(&r_bytes).unwrap());
+    });
+}

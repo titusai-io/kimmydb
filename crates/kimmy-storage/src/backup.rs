@@ -651,6 +651,10 @@ mod tests {
         ("OPLOG_WITNESSED", "derived from the oplog by the first open"),
         ("OPLOG_COLLECTED", "derived by the first open"),
         ("OPLOG_HELD", "re-derived by `restore` from the backup's vector (ADR-244)"),
+        (
+            "LOSS_PENDING",
+            "node-local and short-lived: the loss entries a backup carries park again at open",
+        ),
         ("UNIQUE_VIOLATIONS", "derived from the oplog"),
         (
             "VECTOR_VERIFIED",
