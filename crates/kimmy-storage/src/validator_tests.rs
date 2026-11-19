@@ -491,8 +491,7 @@ fn a_page_whose_stamp_its_senders_coverage_does_not_name_is_ignored() {
     let mut page = a.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         if let Some(stamp) = &mut state.validator_changed {
-            *stamp =
-                Stamp::new(Hlc::new(stamp.hlc.wall_ms + 10_000_000, 0), stamp.node, stamp.epoch);
+            *stamp = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 60_000, 0), stamp.node, stamp.epoch);
         }
     }
     b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();

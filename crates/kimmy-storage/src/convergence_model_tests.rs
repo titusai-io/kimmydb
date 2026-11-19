@@ -1025,6 +1025,15 @@ impl Cluster {
             let applied = dst
                 .apply_snapshot_page(src.node_id(), &mut progress, &page)
                 .map_err(|e| err("apply_snapshot_page", e))?;
+            if let Some(stop) = &applied.clock_refused {
+                // A stop is not progress: the same page is asked for again and refused again until it is due,
+                // so a schedule whose stamps are past the clock bound would loop here for ever.
+                return Err(format!(
+                    "{}<-{}: a page was refused until due by the clock bound ({stop:?}): the schedule's \
+                     stamps are past it",
+                    LETTERS[to], LETTERS[from]
+                ));
+            }
             if applied.purge_pending.is_none() {
                 self.check_the_clock_followed(to, from, scope, &page);
                 continue;
@@ -3220,8 +3229,13 @@ fn a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_
         let mut applied = 0;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            applied +=
-                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap().applied;
+            let page_applied =
+                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            assert!(
+                page_applied.clock_refused.is_none(),
+                "a page refused until due by the clock bound never completes: {page_applied:?}"
+            );
+            applied += page_applied.applied;
         }
         applied
     };
@@ -3916,8 +3930,13 @@ fn residual_4_is_closed_by_the_document_repair() {
         let mut pages = 0;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            applied +=
-                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap().applied;
+            let page_applied =
+                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            assert!(
+                page_applied.clock_refused.is_none(),
+                "a page refused until due by the clock bound never completes: {page_applied:?}"
+            );
+            applied += page_applied.applied;
             pages += 1;
             assert!(pages < 16, "a repair that never completes");
         }
