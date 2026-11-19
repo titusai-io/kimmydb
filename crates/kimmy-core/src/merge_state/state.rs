@@ -689,6 +689,25 @@ impl MergeState {
         sub_ret(self.max_vv(), o.retention)
     }
 
+    /// A loss-record entry joined into this state (the model's `receive_entry` for a loss): kept unless it is
+    /// already below the horizon, already known, or a counter total past [`MAX_TOTAL`] or a decimal no writer
+    /// produces. True when added. It does not move the version vector, and it needs no writer: the rule is a
+    /// function of the state and the options, so a fold of entries (the rewind's) can apply it as the live apply
+    /// does ([`super::Writer::receive_loss`] calls it).
+    pub fn receive_loss(&mut self, key: LossKey, val: LossValue, o: &JoinOptions) -> bool {
+        if key.stamp.hlc < self.horizon(o) || self.losses.contains_key(&key) {
+            return false;
+        }
+        // A total past `MAX_TOTAL`, or a decimal no writer produces, is one `decode` refuses: never store a state that
+        // cannot be read back.
+        if matches!(&val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) || !t.is_canonical())
+        {
+            return false;
+        }
+        self.losses.insert(key, val);
+        true
+    }
+
     pub(crate) fn alive_set(&self, ret: u64) -> BTreeSet<MStamp> {
         self.lives
             .iter()

@@ -93,6 +93,8 @@ mod floor_tests;
 #[cfg(test)]
 mod hand_built;
 #[cfg(test)]
+mod loss_receive_tests;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod ord_codec_tests;
@@ -262,6 +264,7 @@ const _: () = {
     let _: fn(&mut Writer, &MergeState) -> Received = Writer::receive_report;
     let _: fn(&mut Writer, &MergeState) -> Vec<LossKey> = Writer::receive;
     let _: fn(&mut Writer, LossKey, LossValue) -> bool = Writer::receive_loss;
+    let _: fn(&mut MergeState, LossKey, LossValue, &JoinOptions) -> bool = MergeState::receive_loss;
     let _: fn(&Writer) -> Option<BTreeMap<Path, Value>> = Writer::visible;
     let _: fn(&Writer) -> BTreeMap<Path, i128> = Writer::hidden_all;
 };

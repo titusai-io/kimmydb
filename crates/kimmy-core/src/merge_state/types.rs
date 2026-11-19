@@ -356,11 +356,11 @@ pub enum LossKind {
     InsertLost,
     /// Declared for the retired-writer rule; not produced in P0.
     RetiredWriter,
-    /// A scalar write against a map (or the reverse) at one path: declared for the nested
-    /// stage; nothing produces it yet.
+    /// A scalar or array write against a cell below it, concurrent by the version vectors (the side the
+    /// type rule hides loses): produced by the join.
     TypeClash,
-    /// Two concurrent array registers at one path: declared for the nested stage; nothing
-    /// produces it yet.
+    /// Two concurrent array registers at one path: produced by the join (a `clash` of arrays reads as this
+    /// kind unless the options say otherwise).
     ArrayClash,
 }
 
