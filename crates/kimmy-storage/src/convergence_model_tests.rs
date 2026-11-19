@@ -564,8 +564,9 @@ fn err(what: &str, e: impl std::fmt::Display) -> String {
 }
 
 /// A member's clock, as the clock bound reads it, a thousand seconds past `base`: the schedule's stamps are an hour
-/// ahead of the wall clock, and a member that took a window's claim of them from a peer would otherwise read it only
-/// up to its own clock. Modelled as the receivers' clocks being where the schedule is, not as a peer being far ahead.
+/// ahead of the wall clock, and a member that took them from a peer would otherwise refuse them (a schema change
+/// past the bound is refused until due) and adopt a collected horizon only up to its own clock. Modelled as the
+/// receivers' clocks being where the schedule is, not as a peer being far ahead.
 fn model_clock(engine: &Engine, base: u64) {
     engine.set_clock_offset_for_tests((base + 1_000_000) as i64 - crate::physical_now_ms() as i64);
 }

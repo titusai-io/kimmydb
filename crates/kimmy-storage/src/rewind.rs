@@ -975,9 +975,10 @@ mod tests {
         );
     }
 
-    /// An hour ahead of the wall clock, so every stamp a fixture mints is `base + t`.
+    /// A minute ahead of the wall clock, so every stamp a fixture mints is `base + t`: inside the clock bound, which a
+    /// schema change or a page carrying one is held to (the frame check).
     fn base() -> u64 {
-        crate::engine::physical_now_ms() + 60 * 60 * 1000
+        crate::engine::physical_now_ms() + 60 * 1000
     }
 
     /// Move `engine`'s clock to `base + t` before a local step.
@@ -1006,6 +1007,10 @@ mod tests {
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             let applied = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            assert!(
+                applied.clock_refused.is_none(),
+                "a page refused until due by the clock bound never completes: {applied:?}"
+            );
             if applied.purge_pending.is_some() {
                 into.finish_purges_now().unwrap();
             }

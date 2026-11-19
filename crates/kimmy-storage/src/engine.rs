@@ -2294,20 +2294,61 @@ impl Engine {
         vector: &kimmy_core::VersionVector,
     ) -> kimmy_core::VersionVector {
         let clamped = self.clock_bound().clamp_vector(self.clock_bound_now_ms(), vector);
-        if let Some(stop) = &clamped.stop {
-            self.count_clock_refused(&stop.origin, 1);
-            warn!(
-                origin = %stop.origin.node,
-                reason = %stop.reason,
-                stamp = ?stop.stamp,
-                due_in_ms = stop.due_in_ms,
-                components = clamped.changed,
-                "a peer's version vector claims a clock more than max_clock_skew_secs ahead of this \
-                 member's; the claim was believed only up to the bound (and an origin minted past it \
-                 was left out), and the rest is believed once it is due"
-            );
-        }
+        self.say_clamped(&clamped);
         clamped.vector
+    }
+
+    /// [`Self::clamp_peer_vector`] for the two vectors one frame carries (a peer's servable and
+    /// witnessed ones): counted and said once for the frame, under the first origin either names.
+    pub fn clamp_peer_vectors(
+        &self,
+        first: &kimmy_core::VersionVector,
+        second: &kimmy_core::VersionVector,
+    ) -> (kimmy_core::VersionVector, kimmy_core::VersionVector) {
+        let (bound, now) = (self.clock_bound(), self.clock_bound_now_ms());
+        let (mut first, second) = (bound.clamp_vector(now, first), bound.clamp_vector(now, second));
+        let stop = first.stop.take().or_else(|| second.stop.clone());
+        let changed = first.changed + second.changed;
+        self.say_clamped(&crate::clock_bound::Clamped {
+            vector: kimmy_core::VersionVector::new(),
+            stop,
+            changed,
+        });
+        (first.vector, second.vector)
+    }
+
+    /// A replay position a peer asks after, as this member may believe it: `None` when it is past the
+    /// clock bound (or its epoch was minted past it), counted and said as a vector's claim is. The
+    /// peer asks again, and the replay is served once the position is due.
+    pub fn believed_replay_from(&self, asked: Option<Stamp>) -> Option<Stamp> {
+        let asked = asked?;
+        // The position's epoch is a sentinel (the largest, "every epoch of the node": `replay_after`), not a
+        // minted one, so only its time is held to the bound.
+        let time = Stamp::new(asked.hlc, asked.node, kimmy_core::Epoch::ZERO);
+        let Some(stop) = self.clock_bound().check_stamp(self.clock_bound_now_ms(), &time) else {
+            return Some(asked);
+        };
+        self.say_clamped(&crate::clock_bound::Clamped {
+            vector: kimmy_core::VersionVector::new(),
+            stop: Some(stop),
+            changed: 1,
+        });
+        None
+    }
+
+    fn say_clamped(&self, clamped: &crate::clock_bound::Clamped) {
+        let Some(stop) = &clamped.stop else { return };
+        self.count_clock_refused(&stop.origin, 1);
+        warn!(
+            origin = %stop.origin.node,
+            reason = %stop.reason,
+            stamp = ?stop.stamp,
+            due_in_ms = stop.due_in_ms,
+            components = clamped.changed,
+            "a peer's clock claim is more than max_clock_skew_secs ahead of this member's; it was \
+             believed only up to the bound (an origin minted past it was left out, a replay position \
+             past it was not served), and the rest is believed once it is due"
+        );
     }
 
     /// How many windows this node has refused a peer since start because they

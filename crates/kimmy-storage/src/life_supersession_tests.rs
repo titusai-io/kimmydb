@@ -25,6 +25,10 @@ fn transfer_under(into: &Engine, from: &Engine, mut progress: SnapshotProgress) 
     while !progress.is_complete() {
         let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
         let outcome = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        assert!(
+            outcome.clock_refused.is_none(),
+            "a page refused until due by the clock bound never completes: {outcome:?}"
+        );
         if outcome.purge_pending.is_some() {
             assert!(!waited, "a purge that never finishes");
             waited = true;
@@ -1167,9 +1171,9 @@ fn the_clock_passes_an_adopted_floor() {
     let (a, _da) = engine();
     let (r, _dr) = engine();
     a.create_collection("shop", "orders").unwrap();
-    // A floor an hour ahead of this machine's clock, named by the page's coverage, with the
+    // A floor a minute ahead of this machine's clock, named by the page's coverage, with the
     // life created above it and not named.
-    let ahead = Hlc::new(kimmy_storage_now_ms() + 3_600_000, 0);
+    let ahead = Hlc::new(kimmy_storage_now_ms() + 60_000, 0);
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
         state.incarnation_floor = Some(ahead);

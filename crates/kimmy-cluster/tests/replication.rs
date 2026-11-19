@@ -2601,6 +2601,11 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
     sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
 
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    // Thirty-six hours pass for both members: their clocks, as the clock bound reads them, are where the write
+    // is. (A peer far ahead of a member is what the bound refuses and clamps, and is not what this tests.)
+    for member in [&a, &b] {
+        member.engine.set_clock_offset_for_tests((37 * HOUR_MS) as i64);
+    }
     a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
     a.engine
         .collect_garbage_at(

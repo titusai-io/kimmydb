@@ -370,7 +370,11 @@ fn transfer(into: &Engine, from: &Engine) {
         let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
         let page: crate::SnapshotPage =
             bson::deserialize_from_slice(&bson::serialize_to_vec(&page).unwrap()).unwrap();
-        into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        let outcome = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        assert!(
+            outcome.clock_refused.is_none(),
+            "a page refused until due by the clock bound never completes: {outcome:?}"
+        );
     }
 }
 
