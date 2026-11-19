@@ -2782,6 +2782,9 @@ where
                 });
             }
             stalls.echoes_read.push((their_node, echo));
+            // A replay position past the clock bound is not served this round: the peer asks again
+            // once it is due.
+            let replay_from = engine.believed_replay_from(replay_from);
             (servable, witnessed, facts, replay_from)
         }
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
@@ -2793,14 +2796,22 @@ where
     // is handed on: the count half's gate below defers on it.
     let peer_catching_up = their_facts.as_ref().is_some_and(|facts| facts.catching_up);
     let processed = &their_witnessed;
+    // What the peer says it holds and has processed is believed up to the clock bound and no further
+    // by what only reads it: the lag gauge and the catching-up judgement. A component far ahead would
+    // otherwise never be covered (the member stays catching up for ever) or would settle a replay that
+    // was not answered. The pull itself and the apply keep the vectors as sent: the apply clamps what it
+    // takes as coverage (`apply_peer_window_into`), and an entry the peer holds is applied or refused
+    // by the rule of its own collection, not by what the peer claims of its clock.
+    let (believed_servable, believed_witnessed) =
+        engine.clamp_peer_vectors(&theirs, &their_witnessed);
     // For the lag gauge, whatever becomes of the round from here.
-    stalls.vectors_read.push((peer, theirs.clone()));
+    stalls.vectors_read.push((peer, believed_servable.clone()));
     // What this contact read, for the catching-up marker's judgement (ADR-202):
     // kept by the loop only if the round then succeeds.
     stalls.reached_candidates.push(crate::catchup::Reached {
         node: their_node,
-        servable: theirs.clone(),
-        witnessed: their_witnessed.clone(),
+        servable: believed_servable,
+        witnessed: believed_witnessed,
         facts: their_facts,
     });
 
@@ -8077,6 +8088,112 @@ mod tests {
         );
         assert!(!outcome.count_probe_deferred, "{outcome:?}");
     }
+
+    /// What a peer says it holds and has processed is believed up to the clock bound and no further, where the
+    /// frame is read: the round, the lag gauge and the catching-up judgement all see the clamped vectors.
+    ///
+    /// A peer that answers one round (it processed all this node has, so nothing is pulled and the check comes
+    /// next) with `answer`, and what the round read of it.
+    async fn a_round_answered_with(
+        engine: &Engine,
+        answer: Message,
+        orders: kimmy_core::CollectionId,
+    ) -> PeerStalls {
+        use tokio::io::DuplexStream;
+
+        async fn fake_peer(mut stream: DuplexStream, answer: Message) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { .. } => {}
+                other => panic!("the round opens by asking for both vectors, got {other:?}"),
+            }
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("nothing to pull, so the check comes next, got {other:?}"),
+            }
+            let divergence = Message::Divergence {
+                collections: Vec::new(),
+                probe_count: Some(1),
+                incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
+                definitions: None,
+            };
+            write_frame(&mut stream, &divergence).await.unwrap();
+        }
+
+        let probe = Some(DivergenceProbe { id: orders, mine_count: Some(1), mine_at: None });
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(theirs, answer));
+        let mut stalls = PeerStalls::new();
+        sync_over(engine, ours, addr, node(9), probe, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        stalls
+    }
+
+    #[tokio::test]
+    async fn a_vector_frame_is_read_up_to_the_clock_bound_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let mine = engine.witnessed_vector().unwrap();
+        let stranger = kimmy_core::Origin { node: node(77), epoch: kimmy_core::Epoch::ZERO };
+        let claimed = Hlc::new(kimmy_storage::physical_now_ms() + 3_600_000, 0);
+        let mut processed = mine.clone();
+        processed.insert(stranger, claimed);
+        let answer = Message::Vectors {
+            servable: mine,
+            witnessed: processed,
+            facts: None,
+            facts_gen: None,
+            echo: None,
+            replay_from: None,
+        };
+
+        let stalls = a_round_answered_with(&engine, answer, orders.id).await;
+
+        let limit = kimmy_storage::physical_now_ms() + kimmy_storage::DEFAULT_MAX_CLOCK_SKEW_MS;
+        let read = stalls.reached_candidates[0].witnessed.get(stranger);
+        assert!(
+            read.wall_ms <= limit && read < claimed,
+            "the frame's claim of an hour ahead was read as it stands: {read:?}"
+        );
+        assert_eq!(
+            engine.clock_refusals(),
+            vec![(stranger.node.to_string(), 1)],
+            "counted once for the frame, under the origin that made the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_position_past_the_clock_bound_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let mine = engine.witnessed_vector().unwrap();
+        let far = kimmy_core::Stamp::new(
+            Hlc::new(kimmy_storage::physical_now_ms() + 3_600_000, 0),
+            node(9),
+            kimmy_core::Epoch::ZERO,
+        );
+        let answer = Message::Vectors {
+            servable: mine.clone(),
+            witnessed: mine,
+            facts: None,
+            facts_gen: None,
+            echo: None,
+            replay_from: Some(far),
+        };
+
+        // The round goes on to the check: the replay was not served, so no replay page was sent.
+        a_round_answered_with(&engine, answer, orders.id).await;
+
+        assert_eq!(engine.clock_refusals(), vec![(node(9).to_string(), 1)], "counted, by the peer");
+    }
+
     /// The served side records the block a requester sends and answers with its
     /// own, and notes that the requester has read it (ADR-201). A requester that
     /// sends none is answered the same.

@@ -52,8 +52,18 @@ fn a_far_future_state_by_snapshot_is_refused_and_the_page_rolls_back() {
     assert!(progress.is_complete());
 }
 
+/// A carried delete past the bound is not taken, and comes by entries once it is due.
+///
+/// It is no longer a stop of the page with the state's reason (`Vv`), as a far-future page document is: the carried
+/// delete is judged by the sender's coverage before the bound (`apply_carried_document_deletes`), and the page's
+/// coverage is clamped to the bound on arrival (the frame check), so a delete past the bound is above the coverage
+/// and is ignored, with a warning. U1's refusal of it by the state's version vector is therefore not reachable
+/// through a page; it stays covered for an entry (`clock_bound_entry_tests`) and for a page document
+/// (`a_far_future_state_by_snapshot_is_refused_and_the_page_rolls_back`). The outcome is as safe as the stop was:
+/// nothing is applied or recorded, and the coverage the page grants stops below the delete, so the delete is served
+/// again by entries, where it is refused until due.
 #[test]
-fn a_far_future_carried_delete_of_a_field_document_stops_the_page_like_a_state() {
+fn a_far_future_carried_delete_of_a_field_document_is_not_taken_and_comes_once_due() {
     let (a, _da) = engine();
     let ca = a.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
     let x = a.insert(&ca, doc! { "_id": 1 }).unwrap();
@@ -61,24 +71,32 @@ fn a_far_future_carried_delete_of_a_field_document_stops_the_page_like_a_state()
     a.delete(&ca, &x).unwrap();
     let page = a.snapshot_page(None, None).unwrap();
     assert!(!page.deleted_documents.is_empty(), "premise: the page carries the delete");
+    let deleted_at = a.version_vector().unwrap().get(a.origin());
 
     let (b, _db) = engine();
     b.set_clock_offset_for_tests(-(SKEW_MS + 10_000));
     let mut progress = SnapshotProgress::whole_database();
     let applied = b
         .apply_snapshot_page(a.node_id(), &mut progress, &page)
-        .expect("a carried delete stops the page: Ok(clock_refused), not an error");
+        .expect("the page is answered, with the delete left");
 
-    let stop = applied.clock_refused.as_ref().expect("a carried delete stops the page");
+    assert!(applied.clock_refused.is_none(), "not a stop of the page: {applied:?}");
+    let cb = b.get_collection("shop", "orders").unwrap();
     assert_eq!(
-        stop.reason,
-        ClockRefusal::Vv,
-        "a carried delete carries its state, which is checked before its stamp"
+        crate::docs::record_stamp(&b, &cb, &DocId::Int64(1)).unwrap(),
+        None,
+        "nothing was recorded for the document"
     );
-    assert!(!progress.is_complete());
-    assert_eq!(
-        b.get(&b.get_collection("shop", "orders").unwrap(), &DocId::Int64(1)).unwrap(),
-        None
+    assert!(
+        b.witnessed_vector().unwrap().get(a.origin()) < deleted_at,
+        "the coverage stops at the clamp, below the delete, so the entry comes again"
+    );
+
+    b.set_clock_offset_for_tests(0);
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(
+        crate::docs::record_stamp(&b, &cb, &DocId::Int64(1)).unwrap().is_some(),
+        "once due, the same page applies the delete"
     );
 }
 

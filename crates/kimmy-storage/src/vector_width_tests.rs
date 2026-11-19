@@ -43,7 +43,11 @@ fn transfer(into: &Engine, from: &Engine) {
     let mut progress = SnapshotProgress::whole_database();
     while !progress.is_complete() {
         let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        let outcome = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        assert!(
+            outcome.clock_refused.is_none(),
+            "a page refused until due by the clock bound never completes: {outcome:?}"
+        );
     }
 }
 

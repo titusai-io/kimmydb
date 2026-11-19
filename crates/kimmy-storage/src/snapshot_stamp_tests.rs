@@ -28,6 +28,10 @@ fn transfer_under(into: &Engine, from: &Engine, mut progress: SnapshotProgress) 
     while !progress.is_complete() {
         let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
         let outcome = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        assert!(
+            outcome.clock_refused.is_none(),
+            "a page refused until due by the clock bound never completes: {outcome:?}"
+        );
         if outcome.purge_pending.is_some() {
             assert!(!waited, "a purge that never finishes");
             waited = true;
@@ -55,11 +59,12 @@ fn field(path: &str) -> Vec<IndexField> {
     vec![IndexField::ascending(path)]
 }
 
-/// An engine whose clock runs an hour ahead of this host's, as a peer's can.
-fn engine_an_hour_ahead() -> (Engine, tempfile::TempDir, Hlc) {
+/// An engine whose clock runs a minute ahead of this host's, as a peer's can: inside the clock bound, which a peer
+/// a further way ahead is held to (the frame check), so what a page carries of it is still taken in.
+fn engine_a_minute_ahead() -> (Engine, tempfile::TempDir, Hlc) {
     let (a, dir) = engine();
     let ahead = Stamp::new(
-        Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
+        Hlc::new(crate::physical_now_ms() + 60_000, 0),
         NodeId::from_bytes([9; 16]),
         Epoch::ZERO,
     );
@@ -82,10 +87,10 @@ fn assert_clock_behind(receiver: &Engine, ahead: Hlc) {
 
 // -- A restore moves the clock -----------------------------------------------------------
 
-/// `a` runs an hour ahead and drops and recreates `shop.orders` (empty); `b`
+/// `a` runs a minute ahead and drops and recreates `shop.orders` (empty); `b`
 /// takes it by snapshot, and so restores the sender's incarnation floor.
 fn receiver_behind_a_restored_floor() -> (Engine, Engine, [tempfile::TempDir; 2]) {
-    let (a, da, _) = engine_an_hour_ahead();
+    let (a, da, _) = engine_a_minute_ahead();
     let (b, db) = engine();
     a.create_collection("shop", "orders").unwrap();
     a.drop_collection("shop", "orders").unwrap();
@@ -125,7 +130,7 @@ fn the_sender_keeps_the_receivers_acknowledged_write() {
 
 #[test]
 fn a_restored_creation_moves_the_clock() {
-    let (a, _da, ahead) = engine_an_hour_ahead();
+    let (a, _da, ahead) = engine_a_minute_ahead();
     let (b, _db) = engine();
     let created = a.create_collection("shop", "orders").unwrap().created;
     assert_clock_behind(&b, ahead);
@@ -135,7 +140,7 @@ fn a_restored_creation_moves_the_clock() {
 
 #[test]
 fn a_restored_index_creation_moves_the_clock() {
-    let (a, _da, _) = engine_an_hour_ahead();
+    let (a, _da, _) = engine_a_minute_ahead();
     let (b, _db) = engine();
     a.create_collection("shop", "orders").unwrap();
     // The collection first, so the index's stamp is the only thing past it.
@@ -157,7 +162,7 @@ fn a_restored_index_creation_moves_the_clock() {
 
 #[test]
 fn a_carried_collection_drop_moves_the_clock_though_the_receiver_never_held_it() {
-    let (a, _da, ahead) = engine_an_hour_ahead();
+    let (a, _da, ahead) = engine_a_minute_ahead();
     let (b, _db) = engine();
     a.create_collection("shop", "gone").unwrap();
     a.drop_collection("shop", "gone").unwrap();
@@ -171,7 +176,7 @@ fn a_carried_collection_drop_moves_the_clock_though_the_receiver_never_held_it()
 
 #[test]
 fn a_carried_collection_drop_of_a_held_collection_moves_the_clock() {
-    let (a, _da, ahead) = engine_an_hour_ahead();
+    let (a, _da, ahead) = engine_a_minute_ahead();
     let (b, _db) = engine();
     let first = a.create_collection("shop", "orders").unwrap();
     a.insert(&first, doc! { "_id": 1 }).unwrap();
@@ -187,7 +192,7 @@ fn a_carried_collection_drop_of_a_held_collection_moves_the_clock() {
 
 #[test]
 fn a_carried_index_drop_moves_the_clock() {
-    let (a, _da, _) = engine_an_hour_ahead();
+    let (a, _da, _) = engine_a_minute_ahead();
     let (b, _db) = engine();
     a.create_collection("shop", "orders").unwrap();
     a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
@@ -212,7 +217,7 @@ fn a_carried_index_drop_moves_the_clock() {
 
 #[test]
 fn a_scoped_pages_drop_moves_the_clock() {
-    let (a, _da, ahead) = engine_an_hour_ahead();
+    let (a, _da, ahead) = engine_a_minute_ahead();
     let (b, _db) = engine();
     let first = a.create_collection("shop", "orders").unwrap();
     // The receiver holds it, so the scoped page's `dropped` is applied to it.
@@ -231,7 +236,7 @@ fn a_scoped_drop_or_a_creation_the_senders_coverage_does_not_name_moves_nothing(
     let (b, _db) = engine();
     let orders = a.create_collection("shop", "orders").unwrap();
     transfer(&b, &a);
-    let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
+    let far = Hlc::new(crate::physical_now_ms() + 60_000, 0);
     let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
     page.dropped = Some(Stamp::new(far, a.node_id(), a.epoch()));
     for state in &mut page.collections {
@@ -250,8 +255,7 @@ fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
     let (b, _db) = engine();
     a.create_collection("shop", "orders").unwrap();
     transfer(&b, &a);
-    let far =
-        Stamp::new(Hlc::new(crate::physical_now_ms() + 86_400_000, 0), a.node_id(), a.epoch());
+    let far = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id(), a.epoch());
     let mut page = a.snapshot_page(None, None).unwrap();
     page.dropped_collections.push((CollectionId::derive("shop", "other"), far));
     page.dropped_indexes.push((CollectionId::derive("shop", "orders"), 7, far));
@@ -266,7 +270,7 @@ fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
 /// that ended before it: the acknowledged drop was undone everywhere.
 #[test]
 fn a_local_drop_is_minted_above_a_creation_the_clock_never_witnessed() {
-    let (a, _da, _) = engine_an_hour_ahead();
+    let (a, _da, _) = engine_a_minute_ahead();
     let (relay, _dr) = engine();
     let (c, _dc) = engine();
     let orders = a.create_collection("shop", "orders").unwrap();
@@ -437,7 +441,7 @@ fn the_clock_resumes_past_a_collection_tombstone_a_scoped_restore_recorded() {
     // A scoped snapshot grants no coverage, so the vectors that would name the
     // sender's drop stamp are not raised; the tombstone has no oplog entry here.
     // Only the metadata at open can carry the clock past it.
-    let (a, _da, _) = engine_an_hour_ahead();
+    let (a, _da, _) = engine_a_minute_ahead();
     let (b, db) = engine();
     let first = a.create_collection("shop", "orders").unwrap();
     pull(&b, &a);
@@ -451,7 +455,7 @@ fn the_clock_resumes_past_a_collection_tombstone_a_scoped_restore_recorded() {
 
 #[test]
 fn the_clock_resumes_past_an_index_tombstone_a_scoped_restore_recorded() {
-    let (a, _da, _) = engine_an_hour_ahead();
+    let (a, _da, _) = engine_a_minute_ahead();
     let (b, db) = engine();
     let orders = a.create_collection("shop", "orders").unwrap();
     a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();

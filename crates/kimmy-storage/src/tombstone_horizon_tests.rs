@@ -353,6 +353,9 @@ fn a_completed_whole_database_snapshot_raises_the_receivers_horizon_to_the_sende
     let (b, _db) = engine();
     a.create_collection("shop", "orders").unwrap();
     let sender = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    // The receiver's clock, as the bound reads it, is where the sender's is: an honest horizon is never ahead of the
+    // receiver's own clock (a horizon ahead of it is adopted only up to it).
+    b.set_clock_offset_for_tests(2 * 3_600_000);
     let before = b.tombstone_horizon().unwrap().unwrap();
     assert!(before < sender, "premise");
     whole_database_pull(&b, &a, |page| page.tombstone_horizon = Some(sender));
@@ -379,6 +382,7 @@ fn a_page_that_is_not_the_last_adopts_nothing() {
         a.insert(&meta, doc! { "_id": i }).unwrap();
     }
     let sender = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    b.set_clock_offset_for_tests(2 * 3_600_000);
     let own = b.tombstone_horizon().unwrap().unwrap();
     let mut progress = crate::SnapshotProgress::whole_database();
     let mut page = a.snapshot_page(None, None).unwrap();

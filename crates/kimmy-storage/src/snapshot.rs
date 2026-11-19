@@ -1318,6 +1318,10 @@ impl Engine {
         progress: &mut SnapshotProgress,
         page: &SnapshotPage,
     ) -> Result<SnapshotApplied> {
+        // What the sender says about its own clock and coverage is believed up to the clock bound
+        // and no further, once, before anything below reads it (see `believed_page`).
+        let believed = self.believed_page(page);
+        let page = believed.as_ref().unwrap_or(page);
         match self.apply_snapshot_page_inner(peer, progress, page) {
             // The one place the refusal is turned into the page's stop: nothing else matches it.
             Err(crate::StorageError::ClockRefused(stop)) => {
@@ -1335,6 +1339,58 @@ impl Engine {
             }
             other => other,
         }
+    }
+
+    /// The page as this member may believe it (the frame check): `None` when its coverage is not past the clock
+    /// bound, so a page is copied only when it was lying about the future.
+    ///
+    /// `versions` is the coverage the sender grants. A whole-database page's is absorbed into this member's
+    /// witnessed and servable vectors, so a component far ahead would mark every real entry of its origin below it
+    /// as held, never to be asked for; and it is the evidence that makes a carried drop or creation "named by the
+    /// sender's coverage" and so safe to move this member's own clock to. It is clamped
+    /// ([`Self::clamp_peer_vector`]): a component past the bound is lowered to it and an origin minted past it is
+    /// left out, and a carried stamp past the bound is then not named, which the page's own judgement already
+    /// ignores and warns of.
+    ///
+    /// The page's `tombstone_horizon` is **not** changed here: it is read raw by the young-stamp rule and clamped
+    /// where it is adopted ([`Self::adoptable_horizon`]), because the two uses are safe in opposite directions.
+    fn believed_page(&self, page: &SnapshotPage) -> Option<SnapshotPage> {
+        let versions = self.clamp_peer_vector(&page.versions);
+        if versions == page.versions {
+            return None;
+        }
+        let mut believed = page.clone();
+        believed.versions = versions;
+        Some(believed)
+    }
+
+    /// The horizon a completed whole-database page may raise this member's own to: the sender's, and no further
+    /// than this member's physical clock.
+    ///
+    /// Adoption is a maximum, written once and never lowered, so a horizon ahead of the clock would make this
+    /// member forget every delete up to a future time, and a forgotten delete cannot be brought back. LOWERING what
+    /// is adopted is the safe direction (tombstones are kept longer). An honest horizon is the sender's clock minus
+    /// the tombstone retention, which 3.6 holds to at least the oplog retention plus the clock bound, and a
+    /// sender's clock is at most the bound ahead of this member's: so it is at most this member's clock minus the
+    /// oplog retention, and this clamp never bites on an honest sender. A sender whose horizon is ahead of the
+    /// clock is counted under the sender in `kimmy_sync_clock_refused_total` and said once.
+    fn adoptable_horizon(&self, peer: NodeId, sender: Hlc) -> Hlc {
+        let now = Hlc::new(self.clock_bound_now_ms(), 0);
+        if sender <= now {
+            return sender;
+        }
+        self.count_clock_refused(
+            &kimmy_core::Origin { node: peer, epoch: kimmy_core::Epoch::ZERO },
+            1,
+        );
+        warn!(
+            %peer,
+            horizon = ?sender,
+            now = ?now,
+            "a snapshot page's tombstone horizon is ahead of this member's clock, which an honest sender's \
+             never is; it is adopted only up to this member's clock"
+        );
+        now
     }
 
     fn apply_snapshot_page_inner(
@@ -1584,7 +1640,10 @@ impl Engine {
                 // And the sender's forgetting with it: a member that was behind forgets
                 // what the sender has forgotten, and serves on with that horizon.
                 if let Some(sender) = page.tombstone_horizon {
-                    wrote |= crate::tombstone_horizon::adopt_in_txn(&txn, sender)?;
+                    wrote |= crate::tombstone_horizon::adopt_in_txn(
+                        &txn,
+                        self.adoptable_horizon(peer, sender),
+                    )?;
                 }
             }
             // Where the pull has got to, in the page's own transaction so a
@@ -1735,6 +1794,12 @@ impl Engine {
             // judging with a horizon that has not moved while the tombstone is gone. The
             // sender's rides on the page; absent (a sender that has collected nothing) turns
             // the rule off for the pull. An absent own key fails closed too.
+            // The sender's is read RAW, never lowered to this member's clock as adoption's is: here a
+            // lower horizon is the unsafe direction (more rows count as young, so a row whose delete the
+            // sender collected is written back, resurrected), and a higher one only leaves more rows. An
+            // honest horizon is always below this member's clock (see `adoptable_horizon`), so a raw value
+            // is never above it; a sender that lies about a horizon in the future can only stall the
+            // converge it is the sender of.
             let young_above =
                 match (crate::tombstone_horizon::read_in_txn(&txn)?, page.tombstone_horizon) {
                     (Some(own), Some(sender)) => Some(own.max(sender)),
@@ -3447,6 +3512,10 @@ mod tests {
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             let outcome = into.apply_snapshot_page(from.node_id(), progress, &page).unwrap();
+            assert!(
+                outcome.clock_refused.is_none(),
+                "a page refused until due by the clock bound never completes: {outcome:?}"
+            );
             // A page that waits on a purge moved nothing. Between rounds the
             // receiver's drop purger runs, so a transfer finishes it here,
             // once; a page that waits again after that would never advance,
@@ -6776,7 +6845,7 @@ mod tests {
         let (b, _db) = engine();
         let (c, _dc) = engine();
         let ahead = Stamp::new(
-            Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
+            Hlc::new(crate::physical_now_ms() + 60_000, 0),
             NodeId::from_bytes([9; 16]),
             Epoch::ZERO,
         );
@@ -7797,7 +7866,7 @@ mod tests {
         let (b, _db) = engine();
         let mut page = a.snapshot_page(None, None).unwrap();
         let far = Stamp::new(
-            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            Hlc::new(crate::engine::physical_now_ms() + 60_000, 0),
             a.node_id(),
             a.epoch(),
         );
@@ -7882,7 +7951,7 @@ mod tests {
         let (b, _db) = engine();
         let cb = b.create_collection("shop", "orders").unwrap();
         let far = Stamp::new(
-            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            Hlc::new(crate::engine::physical_now_ms() + 60_000, 0),
             NodeId::from_bytes([6; 16]),
             Epoch::ZERO,
         );
@@ -8927,7 +8996,7 @@ mod tests {
         let (a, _da, b, _db) = both_hold_a_configuration();
         a.disable_vectors("shop", "orders", false).unwrap();
         let mut page = a.snapshot_page(None, None).unwrap();
-        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 60_000, 0);
         for state in &mut page.collections {
             if let Some(stamp) = &mut state.vector_changed {
                 stamp.hlc = ahead;
@@ -9016,7 +9085,7 @@ mod tests {
     /// Two origins' changes at one `Hlc`: ON from the lower node id, OFF from the higher.
     /// The whole `Stamp` orders them (the node breaks the tie), so the OFF wins.
     fn on_and_off_at_one_hlc() -> (Stamp, Stamp) {
-        let hlc = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let hlc = Hlc::new(crate::engine::physical_now_ms() + 60_000, 0);
         let x = NodeId::from_bytes([1; 16]);
         let y = NodeId::from_bytes([2; 16]);
         (Stamp::new(hlc, x, Epoch::ZERO), Stamp::new(hlc, y, Epoch::ZERO))
@@ -9093,7 +9162,7 @@ mod tests {
         // resumed from the oplog tail alone would mint the next change below it.
         let (a, _da, b, _db) = both_hold_a_configuration();
         a.disable_vectors("shop", "orders", false).unwrap();
-        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 60_000, 0);
         let mut page = a.snapshot_page(None, None).unwrap();
         for state in &mut page.collections {
             if let Some(stamp) = &mut state.vector_changed {
@@ -9125,7 +9194,7 @@ mod tests {
         // stamps it covers need not be in the oplog. The clock had folded them in; a
         // restart must not lose them.
         let (a, _da) = aged_origin(3);
-        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 60_000, 0);
         let mut page = a.snapshot_page(None, None).unwrap();
         page.versions.insert(a.origin(), ahead);
         let dir = tempfile::tempdir().unwrap();
@@ -9153,7 +9222,7 @@ mod tests {
             a.insert(&ca, doc! { "_id": i }).unwrap();
         }
         a.disable_vectors("shop", "orders", false).unwrap();
-        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 60_000, 0);
         let mut page = a.snapshot_page(None, None).unwrap();
         assert!(page.next.is_some(), "premise: more than one page");
         for state in &mut page.collections {
@@ -9438,6 +9507,10 @@ mod relog {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope())?;
             let outcome =
                 into.apply_snapshot_page(from.node_id(), &mut progress, &over_the_wire(page))?;
+            assert!(
+                outcome.clock_refused.is_none(),
+                "a page refused until due by the clock bound never completes: {outcome:?}"
+            );
             // As `transfer_under`: the purger runs between rounds, once.
             if outcome.purge_pending.is_some() {
                 assert!(!waited, "a page waited on a purge the purger had finished: {outcome:?}");

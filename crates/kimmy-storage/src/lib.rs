@@ -114,6 +114,9 @@ mod clock_bound_state_tests;
 mod clock_bound_frame_tests;
 
 #[cfg(test)]
+mod clock_bound_claim_tests;
+
+#[cfg(test)]
 mod join_retention_tests;
 
 #[cfg(test)]
