@@ -426,6 +426,10 @@ pub fn restore_with(
                     // finds no row and mints one, so what the restore threw away stays owed
                     // under the old epoch and the new writes cannot be mistaken for it.
                     T_META if key.as_slice() == crate::tables::META_EPOCH.as_bytes() => {}
+                    // The marker that `LOSS_PENDING` was built from the oplog: the table is not carried, so
+                    // the restored store must build it again at its first open.
+                    T_META
+                        if key.as_slice() == crate::tables::META_LOSS_PENDING_BUILT.as_bytes() => {}
                     T_META => {
                         meta.insert(as_str(&key)?, value.as_slice())?;
                     }

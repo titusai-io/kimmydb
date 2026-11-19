@@ -337,6 +337,8 @@ impl Engine {
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
             let mut docs = txn.open_table(tables::DOCS)?;
+            // The loss records parked from the entries this rewind discards are discarded with them.
+            crate::loss_pending::remove_above(&txn, until)?;
 
             for ((collection_id, key), planned) in plan {
                 let before = match docs.get((collection_id, key.as_slice()))? {
@@ -361,7 +363,15 @@ impl Engine {
                                 outcome.removed += 1;
                                 None
                             }
-                            FieldTarget::Record { record, after } => {
+                            FieldTarget::Record { mut record, after } => {
+                                // A row the rewind writes is a row written: what is parked for the document is
+                                // folded into the state it leaves.
+                                if let (Some(meta), Some(state)) =
+                                    (collections.get(&collection_id), record.meta.take())
+                                {
+                                    record.meta =
+                                        Some(self.with_parked_records(&txn, meta, &key, state)?);
+                                }
                                 crate::live_count::put_record(
                                     &txn,
                                     &mut docs,

@@ -340,6 +340,11 @@ pub const META_NODE_ID: &str = "node_id";
 /// its own transaction, so the next open mints a new epoch there too. Minted at the open that
 /// finds no row, never from a value read from the store.
 pub const META_EPOCH: &str = "epoch";
+
+/// Set, in the transaction that parks the loss records of the oplog, once `LOSS_PENDING` has been built from it
+/// (`loss_pending.rs`). A restore **skips** it (the table is not carried, so a carried marker would lie), so a
+/// restored store has none and its first open builds the table again; a new store builds an empty one.
+pub const META_LOSS_PENDING_BUILT: &str = "loss_pending_built";
 pub const META_FORMAT_VERSION: &str = "format_version";
 /// Left over from counter-allocated collection ids. Ids are derived from the
 /// collection name now, so nothing reads this; it is kept so that a database

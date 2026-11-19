@@ -320,6 +320,28 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          emission window of documents with no row",
     ),
     (
+        "loss_pending::remove_above",
+        "a rewind's removal of the parked records of the entries it discards, in the rewind's one write: the \
+         table holds at most the loss entries of the last emission window of documents with no row, and \
+         close_writes bounds the write (ADR-192)",
+    ),
+    (
+        "loss_pending::remove_collection_chunk",
+        "at most the purge chunk's removals (what `purge_chunk` has left of DROP_PURGE_CHUNK) of one collection's \
+         parked records, in the one write of `purge_chunk`: close_writes bounds it (ADR-192)",
+    ),
+    (
+        "loss_pending::Engine::rebuild_loss_pending_if_needed",
+        "at open, before the node serves, once for a store that has not built the table (a restored one, which \
+         skips the marker): the oplog from the start of the largest emission window of any field collection \
+         upward, each entry judged on its nine-byte header and only a loss record read, so the walk is the oplog's \
+         tail of one retention window and not its length",
+    ),
+    (
+        "loss_lifecycle_tests::parked_rows",
+        "test code counting the parked rows of a store of a few rows it wrote itself",
+    ),
+    (
         "loss_apply_tests::parked_rows",
         "test code counting the parked rows of a store of a few rows it wrote itself",
     ),

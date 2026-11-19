@@ -1454,6 +1454,10 @@ impl Engine {
                 if meta.get(crate::format::META_REDB_VERSION)?.is_none() {
                     let ours = format!("{}.{}", cleared.build.redb.0, cleared.build.redb.1);
                     meta.insert(crate::format::META_REDB_VERSION, ours.as_bytes())?;
+                    // A store with no redb recorded is a fresh one (a restore records it before the store is
+                    // opened): it has no loss entries to park, so `LOSS_PENDING` counts as built from its first
+                    // commit, and no later commit is spent on it (the rebuild below is for a restored store).
+                    meta.insert(crate::tables::META_LOSS_PENDING_BUILT, [1u8].as_slice())?;
                 }
             }
             let _ = txn.open_table(tables::DATABASES)?;
@@ -1686,6 +1690,10 @@ impl Engine {
         // long as the drop had left, and a restart part-way through a large
         // purge is exactly when a node is most wanted back.
         engine.announce_owed_purges()?;
+
+        // The loss records parked for documents that have no row, rebuilt from the oplog when this store has not
+        // built them: a restore carries the entries and not the table.
+        engine.rebuild_loss_pending_if_needed()?;
 
         // Whether the violations table is complete: after the reports above, so
         // the tail it is compared with includes them (ADR-200).
@@ -5761,6 +5769,16 @@ impl Engine {
                     id.0,
                     DROP_PURGE_CHUNK.saturating_sub(removed),
                 )?;
+                // The loss records parked for its documents (`loss_pending.rs`), those of the entries stamped at or
+                // below the drop: what is parked after it belongs to a collection created again under the name.
+                if let Some(dropped) = self.collection_dropped_at(id)? {
+                    removed += crate::loss_pending::remove_collection_chunk(
+                        &txn,
+                        id.0,
+                        dropped.hlc,
+                        DROP_PURGE_CHUNK.saturating_sub(removed),
+                    )?;
+                }
                 if removed < DROP_PURGE_CHUNK {
                     let mut indexes = txn.open_table(tables::INDEX_ENTRIES)?;
                     let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = {
