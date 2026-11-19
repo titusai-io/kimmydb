@@ -163,7 +163,7 @@ fn write(
 }
 
 /// What joining a remote entry's state into the stored one leaves for the caller to store.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Joined {
     /// The compact bytes of the merged state: the record's `meta`.
     pub meta: Vec<u8>,
@@ -174,6 +174,9 @@ pub(crate) struct Joined {
     /// Whether the merged state differs from the stored one. A join that does not change it is an
     /// entry the member already covers: nothing is rewritten.
     pub changed: bool,
+    /// The loss records the join put into the state that it did not hold: each enters the state here, so the member
+    /// appends an entry of its own for it (V6M2).
+    pub fresh: Vec<(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)>,
 }
 
 /// The apply of one replicated entry of a `field` collection: the join of the state it carries
@@ -197,7 +200,12 @@ pub(crate) fn join(
         )?,
         None => Vec::new(),
     };
-    Ok(Joined { meta: w.state.encode_compact(), body, alive, changed: received.changed })
+    let fresh = received
+        .fresh
+        .into_iter()
+        .filter_map(|key| w.state.losses.get(&key).cloned().map(|value| (key, value)))
+        .collect();
+    Ok(Joined { meta: w.state.encode_compact(), body, alive, changed: received.changed, fresh })
 }
 
 /// A stamp for a dry run: strictly above everything `prior` has seen, so the writer accepts it,

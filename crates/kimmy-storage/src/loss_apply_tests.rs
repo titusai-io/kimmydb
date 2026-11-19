@@ -261,7 +261,10 @@ fn a_parked_record_whose_window_has_closed_is_not_folded_and_one_that_never_had_
     let options = kimmy_core::merge_state::JoinOptions::default();
     let entered =
         crate::loss_pending::fold_into(&txn, 7, b"k", &mut state, &options, None, 1_420_000)
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
     txn.commit().unwrap();
 
     assert_eq!(
@@ -291,7 +294,10 @@ fn a_parked_record_at_or_below_the_floor_is_not_folded() {
         Some(Hlc::new(940_000, 0)),
         1_100_000,
     )
-    .unwrap();
+    .unwrap()
+    .into_iter()
+    .map(|(key, _)| key)
+    .collect::<Vec<_>>();
     txn.commit().unwrap();
 
     assert_eq!(

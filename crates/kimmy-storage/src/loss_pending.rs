@@ -12,7 +12,7 @@
 //! the replicated state, the digest and the etag, and a backup does not carry it.
 
 use kimmy_core::Hlc;
-use kimmy_core::merge_state::{JoinOptions, LossKey, MergeState};
+use kimmy_core::merge_state::{JoinOptions, LossKey, LossValue, MergeState};
 use redb::ReadableTable;
 
 use crate::error::{Result, StorageError};
@@ -76,7 +76,7 @@ pub(crate) fn any(txn: &redb::WriteTransaction, collection: u64, key: &[u8]) -> 
 
 /// Fold what is parked for the document into `state` and delete it all: each record that is still in the window
 /// at `now_ms` goes through [`MergeState::receive_loss`] (the horizon, the floor, the known key). Returns the
-/// records that entered the state. The caller writes the state, in this same transaction.
+/// records that entered the state, with their values. The caller writes the state, in this same transaction.
 pub(crate) fn fold_into(
     txn: &redb::WriteTransaction,
     collection: u64,
@@ -85,7 +85,7 @@ pub(crate) fn fold_into(
     options: &JoinOptions,
     floor: Option<Hlc>,
     now_ms: u64,
-) -> Result<Vec<LossKey>> {
+) -> Result<Vec<(LossKey, LossValue)>> {
     let mut table = txn.open_table(tables::LOSS_PENDING)?;
     let mut rows: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
     for row in table.range((collection, key, &[][..])..=(collection, key, &[0xff; 64][..]))? {
@@ -104,8 +104,8 @@ pub(crate) fn fold_into(
         if floor.is_some_and(|floor| record.stamp.hlc <= floor) {
             continue;
         }
-        if state.receive_loss(record.clone(), value, options) {
-            entered.push(record);
+        if state.receive_loss(record.clone(), value.clone(), options) {
+            entered.push((record, value));
         }
     }
     Ok(entered)
