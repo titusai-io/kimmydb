@@ -31,6 +31,19 @@ pub const DOCS: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("doc
 pub const MISSING_THROUGH: TableDefinition<(u64, &[u8]), &[u8]> =
     TableDefinition::new("missing_through");
 
+/// The loss records parked for a `field` document that has no life or delete to hold them (`loss_pending.rs`):
+/// `(collection id, document key, the loss entry's oplog key)` to `expires_ms (8 bytes) || the record's body`
+/// ([`kimmy_core::merge_state::MergeState::encode_loss_record`]). Written, with the entry's relay, in the
+/// transaction that receives a loss entry for a missing or bare row; folded into the state by the next write
+/// that gives the document a row; deleted by that fold or by expiry (the emission window), by a rewind of the
+/// entries it was parked from, and with a dropped collection. Node-local, outside the replicated state and the
+/// digest, and **not** carried by a backup: the entries are, and `Engine::open` parks again what a restore lost.
+pub const LOSS_PENDING: TableDefinition<ParkedKey<'static>, &[u8]> =
+    TableDefinition::new("loss_pending");
+
+/// The key of [`LOSS_PENDING`]: collection id, document key, the loss entry's oplog key.
+pub type ParkedKey<'a> = (u64, &'a [u8], &'a [u8]);
+
 /// `collection id -> live records under that id in DOCS` (ADR-174).
 ///
 /// Kept, not derived on read: moved in the transaction of every write to

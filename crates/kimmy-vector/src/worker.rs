@@ -1682,7 +1682,7 @@ impl EmbeddingWorker {
         // and has nothing to embed. It would be filtered by the `doc_id` check
         // below anyway, but relying on that would make the safety incidental. A loss record names its
         // document and describes no change to it, so it is not a reason to embed again.
-        if entry.kind.is_local_observation() || entry.kind.is_loss_record() {
+        if !describes_a_change_to_embed(entry.kind) {
             return Ok(Prepared::Done(Outcome::Skipped));
         }
 
@@ -3213,8 +3213,31 @@ impl VectorError {
     }
 }
 
+/// Whether an oplog entry of this kind can be a reason to embed a document again: not a member's own observation
+/// of its data (a unique violation, a document filed unkeyed) and not a loss record, which names a document and
+/// describes no change to it.
+fn describes_a_change_to_embed(kind: OpKind) -> bool {
+    !kind.is_local_observation() && !kind.is_loss_record()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn only_a_change_to_a_document_is_a_reason_to_embed_again() {
+        for kind in [OpKind::UniqueViolation, OpKind::UnkeyedDocument, OpKind::LossRecord] {
+            assert!(!describes_a_change_to_embed(kind), "{kind:?} is no reason to embed again");
+        }
+        for kind in [
+            OpKind::Insert,
+            OpKind::Update,
+            OpKind::Replace,
+            OpKind::Delete,
+            OpKind::ConfigureVectors,
+        ] {
+            assert!(describes_a_change_to_embed(kind), "{kind:?} may be");
+        }
+    }
+
     use async_trait::async_trait;
     use bson::doc;
     use kimmy_core::{ChunkConfig, Metric, ProviderConfig};

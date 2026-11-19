@@ -1474,6 +1474,7 @@ impl Engine {
             let _ = txn.open_table(tables::LIVE_DIGESTS)?;
             let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
             let _ = txn.open_table(tables::MISSING_THROUGH)?;
+            let _ = txn.open_table(tables::LOSS_PENDING)?;
             // The first write of a start that decided the rebuild is forced:
             // from here the store says "rebuild required" whatever any exit
             // marker says (B3 design 2.1, layer 2).

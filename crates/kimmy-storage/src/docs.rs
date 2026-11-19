@@ -919,7 +919,10 @@ impl Engine {
             None => self.next_stamp(),
         };
         let (body, meta) = match field {
-            Some(image) => (image.body, Some(image.meta)),
+            Some(image) => {
+                let meta = self.with_parked_records(txn, coll, &key, image.meta)?;
+                (image.body, Some(meta))
+            }
             None => (body, None),
         };
         {
@@ -1177,7 +1180,8 @@ impl Engine {
                         "the stored image differs from the image of the dry run".into(),
                     ));
                 }
-                (image.stamp.expect("a write that changes mints a stamp"), Some(image.meta))
+                let meta = self.with_parked_records(txn, coll, &key, image.meta)?;
+                (image.stamp.expect("a write that changes mints a stamp"), Some(meta))
             } else {
                 (self.next_stamp(), None)
             };
@@ -1809,12 +1813,42 @@ impl Engine {
     /// not below retention's horizon for its origin, so a member that took it serves it onward
     /// whatever else it holds: a member that pulls only from this one reads the same state, and
     /// the members of a cluster hold the same set of entries (the rewind folds over it).
-    /// A loss-record entry that reaches this member: **kept in the oplog and applied to nothing.** What the
+    /// The state of a field row a local write is about to store, with what was parked for its document folded in:
+    /// the write that gives a document a row is one of the writes that fold (one range read when nothing is
+    /// parked, which is every write but the first after a loss entry arrived ahead of its document).
+    fn with_parked_records(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        key: &[u8],
+        meta: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if !crate::loss_pending::any(txn, coll.id.0, key)? {
+            return Ok(meta);
+        }
+        let mut state = field_write::load(Some(&meta))?;
+        let options = self.field_writer(coll)?.options();
+        let floor = Self::floor_of(txn, coll)?;
+        crate::loss_pending::fold_into(
+            txn,
+            coll.id.0,
+            key,
+            &mut state,
+            &options,
+            floor,
+            self.clock_bound_now_ms(),
+        )?;
+        Ok(state.encode_compact())
+    }
+
+    /// A loss-record entry that reaches this member: **kept in the oplog, then applied to the state of its document
+    /// if that has a life or a delete, and parked if it has not** (see [`crate::loss_pending`]). What the
     /// member's servable vector covers for an origin its oplog holds, and the entry's stamp is in the
     /// appender's origin space, so the entry is appended exactly as a field entry that moved no document is
-    /// (always keep: unless it is already there or at or below what retention collected) and witnessed. No
-    /// state, document, index or event is touched: the record reaches the state in the commit that applies
-    /// it. A snapshot never carries one (`Position::Hold` is refused). Refused by name, nothing written, when
+    /// (always keep: unless it is already there or at or below what retention collected) and witnessed. The
+    /// record goes through [`kimmy_core::merge_state::MergeState::receive_loss`] into the stored state of a document that has a life or a
+    /// delete (the floor first), and no document, index, count or event is touched; for a missing or bare row it
+    /// is parked. A snapshot never carries one (`Position::Hold` is refused). Refused by name, nothing written, when
     /// the body is not a record or the entry's stamp is past the clock bound (until due, as any entry of a
     /// `field` collection is); ignored when its collection is not a `field` collection.
     fn relay_loss_record(
@@ -1842,9 +1876,65 @@ impl Engine {
             .body
             .as_deref()
             .ok_or_else(|| StorageError::Corrupt("a loss record carries no body".into()))?;
-        kimmy_core::merge_state::MergeState::decode_loss_record(body)
+        let (record, value) = kimmy_core::merge_state::MergeState::decode_loss_record(body)
             .map_err(|e| StorageError::Corrupt(format!("the body of a loss record: {e:?}")))?;
-        self.field_entry_kept(txn, entry, position, false)
+        let kept = self.field_entry_kept(txn, entry, position, false)?;
+        let id = entry
+            .doc_id
+            .as_ref()
+            .ok_or_else(|| StorageError::Corrupt("a loss record names no document".into()))?;
+        let key = doc_key(id)?;
+        let options = self.field_writer(coll)?.options();
+        let now_ms = self.clock_bound_now_ms();
+        // Applied to the state of a row that has a life or a delete; parked for any other (no row, or one of
+        // records alone), so that no row is ever built from records.
+        let held = {
+            let docs = txn.open_table(tables::DOCS)?;
+            let raw = docs.get((coll.id.0, key.as_slice()))?.map(|raw| raw.value().to_vec());
+            raw.map(|raw| codec::decode_doc_record_with_meta(&raw)).transpose()?
+        };
+        let state = match held.as_ref().and_then(|record| record.meta.as_deref()) {
+            Some(meta) => Some(field_write::load(Some(meta))?).filter(|state| !state.is_bare()),
+            None => None,
+        };
+        let (Some(held), Some(mut state)) = (held, state) else {
+            crate::loss_pending::park(
+                txn,
+                coll.id.0,
+                &key,
+                &codec::oplog_key(&entry.stamp),
+                body,
+                options.retention,
+                now_ms,
+            )?;
+            return Ok(kept);
+        };
+        let floor = Self::floor_of(txn, coll)?;
+        if floor.is_some_and(|floor| record.stamp.hlc <= floor)
+            || !state.receive_loss(record, value, &options)
+        {
+            return Ok(kept);
+        }
+        let mut stored = if held.deleted {
+            DocRecord::tombstone(held.stamp)
+        } else {
+            DocRecord::live(held.stamp, held.body.clone())
+        };
+        stored.meta = Some(state.encode_compact());
+        let mut docs = txn.open_table(tables::DOCS)?;
+        crate::live_count::put_record(
+            txn,
+            &mut docs,
+            coll.id.0,
+            &key,
+            &codec::encode_doc_record(&stored),
+        )?;
+        Ok(match kept {
+            RemoteApplied::Written { released } | RemoteApplied::Superseded { released } => {
+                RemoteApplied::Written { released }
+            }
+            applied => applied,
+        })
     }
 
     /// U1: refuse, by name and until due, an entry or state of a `field` collection whose clock is
@@ -1940,6 +2030,21 @@ impl Engine {
         let floor = Self::floor_of(txn, coll)?;
         if floor.is_some_and(|floor| other.drop_at_or_below(floor)) && other.is_bare() {
             return self.field_entry_kept(txn, entry, position, false);
+        }
+        // What was parked for this document, for want of a row, is folded in by the write that gives it one
+        // (and by every later write, which finds nothing parked): into the incoming state, so the join below
+        // carries it and the row is written when it moves the state.
+        if !other.is_bare() && crate::loss_pending::any(txn, coll.id.0, &key)? {
+            let options = self.field_writer(coll)?.options();
+            crate::loss_pending::fold_into(
+                txn,
+                coll.id.0,
+                &key,
+                &mut other,
+                &options,
+                floor,
+                self.clock_bound_now_ms(),
+            )?;
         }
         // A state applied as state has no entry behind it: what it holds of every writer is a hole in
         // what this member can serve, recorded in the transaction that applies it (a page that is rolled

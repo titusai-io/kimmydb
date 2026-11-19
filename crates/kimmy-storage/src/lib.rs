@@ -42,6 +42,7 @@ mod late_drop;
 mod live_count;
 pub mod live_digest;
 mod live_walk;
+mod loss_pending;
 pub mod merge;
 pub mod meta;
 pub mod migrate;
@@ -271,6 +272,8 @@ pub use watch::{
     ChangeEvent, ChangeStream, ExamineBudget, InvalidateReason, OplogWindow, WatchOptions,
     WatchScope, set_test_serve_walk_budget, set_test_serve_walk_linear,
 };
+#[cfg(test)]
+mod loss_apply_tests;
 #[cfg(test)]
 mod loss_entry_tests;
 #[cfg(test)]
