@@ -633,6 +633,30 @@ impl MergeState {
         hash128(&self.compact_bytes())
     }
 
+    /// The state hash **without its loss records**: the digest term and the etag of a record hash this, so a loss
+    /// record that arrives (it travels by its own entries, and which records a member holds depends on the order
+    /// of its joins) neither changes the digest nor makes a client's conditional write fail. It is
+    /// [`MergeState::compact_hash`] of the state with its `losses` emptied; a state with none is hashed as it is.
+    pub fn loss_free_hash(&self) -> [u8; 16] {
+        if self.losses.is_empty() {
+            return self.compact_hash();
+        }
+        let mut bare = self.clone();
+        bare.losses.clear();
+        bare.compact_hash()
+    }
+
+    /// [`MergeState::loss_free_hash`] of an encoded state, read from its bytes: the state is decoded (every
+    /// refusal of [`MergeState::decode_compact`] applies), and one with no record is hashed from the bytes as
+    /// they are, with no second encoding.
+    pub fn loss_free_hash_of(bytes: &[u8]) -> Result<[u8; 16], DecodeError> {
+        let state = MergeState::decode_compact(bytes)?;
+        if state.losses.is_empty() {
+            return MergeState::compact_hash_of(bytes);
+        }
+        Ok(state.loss_free_hash())
+    }
+
     /// The whole state in the compact form, for a round trip with
     /// [`MergeState::decode_compact`]: the magic, the format version 2, then
     /// [`MergeState::compact_bytes`].

@@ -39,7 +39,7 @@ use crate::tables;
 /// The digest format: what is hashed, and how a row is laid out. A build that
 /// changes either changes this, which moves the mark, so rows written under
 /// the old format are rebuilt rather than trusted.
-pub const FORMAT: u8 = 3;
+pub const FORMAT: u8 = 4;
 
 /// The key of the digest mark in [`tables::LIVE_DIGESTS_THROUGH`].
 pub(crate) const THROUGH: &str = "arrival";
@@ -451,7 +451,7 @@ mod tests {
     /// hold origins, so a store of the earlier format is rebuilt, not trusted.
     #[test]
     fn the_format_and_the_row_version_moved_with_the_stamp() {
-        assert_eq!(FORMAT, 3);
+        assert_eq!(FORMAT, 4);
         assert_eq!(ROW_VERSION, 2);
         let mut old = DigestRow::default().encode();
         old[0] = 1;

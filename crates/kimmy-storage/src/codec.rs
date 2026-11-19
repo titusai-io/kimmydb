@@ -250,7 +250,7 @@ fn decode_doc_record_inner(mut input: &[u8], keep_meta: bool) -> Result<DocRecor
 /// without copying or decoding the state: `None` for a version 1 record (no state) or bytes
 /// that are not a record.
 pub fn doc_record_state_hash(input: &[u8]) -> Option<[u8; 16]> {
-    kimmy_core::merge_state::MergeState::compact_hash_of(doc_record_meta(input)?).ok()
+    kimmy_core::merge_state::MergeState::loss_free_hash_of(doc_record_meta(input)?).ok()
 }
 
 /// The merged-state bytes of an encoded record, borrowed: `None` for a version 1 record.
@@ -333,7 +333,8 @@ pub fn doc_record_header(mut input: &[u8]) -> Result<(Stamp, bool)> {
 pub struct RecordView {
     pub stamp: Stamp,
     pub live: bool,
-    /// The hash of the merged state's compact bytes; `None` for a `document` record.
+    /// The hash of the merged state's compact bytes without its loss records
+    /// ([`kimmy_core::merge_state::MergeState::loss_free_hash`]); `None` for a `document` record.
     pub state: Option<[u8; 16]>,
     /// Every origin the merged state has seen, with its newest write: what the record vouches for
     /// beyond the origin of its own newest stamp. Empty for a `document` record.
@@ -356,8 +357,13 @@ pub fn doc_record_view(input: &[u8]) -> Result<RecordView> {
     };
     let state = kimmy_core::merge_state::MergeState::decode_compact(meta)
         .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
-    let hash = kimmy_core::merge_state::MergeState::compact_hash_of(meta)
-        .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?;
+    // Without its loss records (the state is decoded above, so this encodes again only when it holds one).
+    let hash = if state.losses.is_empty() {
+        kimmy_core::merge_state::MergeState::compact_hash_of(meta)
+            .map_err(|e| StorageError::Corrupt(format!("the merge state of a record: {e:?}")))?
+    } else {
+        state.loss_free_hash()
+    };
     let origins = state
         .vv
         .iter()

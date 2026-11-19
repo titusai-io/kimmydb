@@ -451,7 +451,7 @@ fn the_version_of_a_field_document_is_its_stamp_and_the_hash_of_its_state() {
         e.insert(c, doc! { "_id": 1_i64, "a": 1 }).unwrap();
     }
     let rec = crate::codec::decode_doc_record_with_meta(&raw(&e, &f, 1).unwrap()).unwrap();
-    let hash = MergeState::compact_hash_of(rec.meta.as_deref().unwrap()).unwrap();
+    let hash = MergeState::loss_free_hash_of(rec.meta.as_deref().unwrap()).unwrap();
     let (v, d) = e.get_versioned(&f, &DocId::Int64(1)).unwrap().unwrap();
     assert_eq!(v, DocVersion::Etag(rec.stamp, hash));
     assert_eq!(d, doc! { "_id": 1_i64, "a": 1 });

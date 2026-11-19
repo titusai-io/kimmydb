@@ -273,3 +273,5 @@ pub use watch::{
 };
 #[cfg(test)]
 mod loss_entry_tests;
+#[cfg(test)]
+mod loss_free_digest_tests;

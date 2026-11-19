@@ -582,7 +582,7 @@ impl Engine {
         let (version, covers) = match (coll.merge_policy, record.meta.as_deref()) {
             (MergePolicy::Field, Some(meta)) => {
                 let state = field_write::load(Some(meta))?;
-                let hash = kimmy_core::merge_state::MergeState::compact_hash_of(meta)
+                let hash = kimmy_core::merge_state::MergeState::loss_free_hash_of(meta)
                     .map_err(|e| StorageError::Corrupt(format!("the merge state: {e:?}")))?;
                 let covers = asked
                     .iter()
@@ -2693,17 +2693,18 @@ pub(crate) fn record_stamp(
     }
 }
 
-/// The hash of the merged state a record carries (`MergeState::compact_hash` of its meta), read
-/// from the stored bytes without decoding the state. `None` for a record with no meta.
+/// The hash of the merged state a record carries without its loss records (`MergeState::loss_free_hash_of` of
+/// its meta). `None` for a record with no meta. Every etag and every conditional check hashes this, so a loss
+/// record that arrives moves neither.
 pub(crate) fn state_hash_of(record: Option<&DocRecord>) -> Option<kimmy_core::StateHash> {
     let meta = record?.meta.as_deref()?;
-    kimmy_core::merge_state::MergeState::compact_hash_of(meta).ok()
+    kimmy_core::merge_state::MergeState::loss_free_hash_of(meta).ok()
 }
 
 /// The version identity an oplog entry's write produced: the stamp, and for a `field` entry the
 /// hash of the merged state it carries.
 pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
-    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::compact_hash_of) {
+    match entry.meta.as_deref().map(kimmy_core::merge_state::MergeState::loss_free_hash_of) {
         Some(Ok(hash)) => kimmy_core::DocVersion::Etag(entry.stamp, hash),
         _ => kimmy_core::DocVersion::Stamp(entry.stamp),
     }

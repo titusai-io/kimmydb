@@ -17,7 +17,7 @@ use crate::hlc::Stamp;
 
 const ETAG_FORMAT: u8 = 0x02;
 
-/// The hash of a merged state (`MergeState::compact_hash`): 16 bytes.
+/// The hash of a merged state without its loss records (`MergeState::loss_free_hash`): 16 bytes.
 pub type StateHash = [u8; 16];
 
 /// A document's version identity.
