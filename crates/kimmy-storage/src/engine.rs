@@ -8428,8 +8428,12 @@ mod tests {
         engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
         let coll = engine.create_collection("app", "c").unwrap();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The flipper's count, readable while it runs: the wait below needs
+        // it, since a flipper starved by a busy machine gets few turns.
+        let switched = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let flipper = {
-            let (engine, stop) = (Arc::clone(&engine), Arc::clone(&stop));
+            let (engine, stop, switched) =
+                (Arc::clone(&engine), Arc::clone(&stop), Arc::clone(&switched));
             std::thread::spawn(move || {
                 let mut n = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -8443,6 +8447,7 @@ mod tests {
                         std::time::Duration::from_micros(300 + (n % 5) * 200),
                     );
                     n += 1;
+                    switched.store(n, std::sync::atomic::Ordering::SeqCst);
                     std::thread::sleep(std::time::Duration::from_micros(300 + (n % 7) * 120));
                 }
                 n
@@ -8466,13 +8471,18 @@ mod tests {
             .ok()
             .and_then(|ms| ms.parse().ok())
             .unwrap_or(1500);
-        // At least that long, and until enough coalesced commits have been
-        // judged to mean something: on a machine busy with the rest of the
-        // suite, fsyncs are slow and a fixed time can judge almost none.
+        // At least that long, and until both things the premise below asks
+        // for have happened: enough coalesced commits judged to mean
+        // something, and enough class switches among them. On a machine busy
+        // with the rest of the suite, fsyncs are slow and the flipper is
+        // starved, so a fixed time can judge almost none of either.
         let started = std::time::Instant::now();
+        let enough = || {
+            engine.grouped_commits() >= 200
+                && switched.load(std::sync::atomic::Ordering::SeqCst) > 100
+        };
         while started.elapsed() < std::time::Duration::from_millis(run_ms)
-            || (engine.grouped_commits() < 200
-                && started.elapsed() < std::time::Duration::from_secs(60))
+            || (!enough() && started.elapsed() < std::time::Duration::from_secs(60))
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -8484,8 +8494,17 @@ mod tests {
         println!(
             "{written} writes, {grouped} coalesced, {flips} class switches, {violations} violations"
         );
-        assert!(grouped >= 200 && flips > 100, "premise: the load and the switching both ran");
-        assert_eq!(violations, 0, "coalesced commits acknowledged with no flush after them");
+        let counts = format!(
+            "{written} writes, {grouped} coalesced, {flips} class switches, {violations} \
+             violations, after {:?}",
+            started.elapsed()
+        );
+        assert!(grouped >= 200, "premise (too few coalesced commits judged, need 200): {counts}");
+        assert!(flips > 100, "premise (too few class switches, need more than 100): {counts}");
+        assert_eq!(
+            violations, 0,
+            "VIOLATION (coalesced commits acknowledged with no flush after them): {counts}"
+        );
     }
 
     #[test]
