@@ -8046,11 +8046,12 @@ mod tests {
     #[cfg(feature = "cache-metrics")]
     #[test]
     fn reading_the_cache_while_another_thread_commits_does_not_panic() {
-        // redb 4.3 and 4.4 count a write's cache hit before its total, and derives
+        // redb 4.3 and 4.4 counted a write's cache hit before its total, and derived
         // the misses as the difference, so a reading taken between the two
-        // increments underflows: a panic under overflow checks, which debug
-        // and test builds have. `[profile.dev.package.redb]` turns them off
-        // for redb alone; this is what holds that line in place.
+        // increments underflowed: a panic under overflow checks, which debug
+        // and test builds have. 4.5 fixed it, and this test holds it fixed: it
+        // runs with overflow checks on, as the workspace no longer turns them off
+        // for redb.
         use bson::doc;
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());

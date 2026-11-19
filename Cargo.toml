@@ -119,11 +119,11 @@ bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 
 # Storage
-# Pinned to 4.4.x: a redb minor may change allocator or system-table rules,
+# Pinned to 4.5.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
 # redb's `cache_metrics` is not enabled here: kimmy-storage's `cache-metrics`
 # feature turns it on, for a build that wants `kimmy_storage_cache_*`.
-redb = "~4.4"
+redb = "~4.5"
 
 # HTTP client, for every request the node makes outward: webhook deliveries,
 # the remote embedding providers, and OIDC discovery and JWKS. One spec, so
@@ -261,18 +261,6 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # The shipped binary is unaffected: `release` and `dist` set their own.
 [profile.dev]
 debug = "line-tables-only"
-
-# redb 4.3 and 4.4 count a write's cache hit before its total and
-# subtract one from the other, so a reading taken between the two increments
-# underflows. With overflow checks, as in dev and test builds, that is a
-# panic on roughly one `/metrics` scrape in a hundred during writes; a release
-# build wraps a value this code never reads. It matters only in a build with
-# the `storage-cache-metrics` feature, the only one that reads the
-# statistics. Off for redb alone, and only here. Reported upstream; this goes when a redb release fixes it, and
-# `reading_the_cache_while_another_thread_commits_does_not_panic` says when
-# that has happened.
-[profile.dev.package.redb]
-overflow-checks = false
 
 [profile.release]
 opt-level = 3
