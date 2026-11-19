@@ -335,3 +335,210 @@ fn a_row_with_every_write_above_the_cut_does_not_count_at_the_cut() {
         "a row of tail writes is one ordinary replication also brings"
     );
 }
+
+// ---- a state-only move is a write (the page that moves only a document's stored state) -------------------
+
+/// Two members of one `field` collection that hold the same document, `{x: 7}`, with different states:
+/// both wrote `x = 7` concurrently, and only `a` has taken the other's write. `a`'s state holds both writes
+/// (its version vector names both writers and its records name the clash); `b`'s holds its own. The document
+/// either renders is the same, so what a pull from `a` has to move into `b` is the state and nothing else.
+fn a_richer_and_a_poorer_member() -> (Engine, Engine, kimmy_core::DocId, [tempfile::TempDir; 2]) {
+    let (a, b, dirs) = field_pair();
+    let (ca, cb) = (coll(&a), coll(&b));
+    let id = a.insert(&ca, doc! { "_id": 1, "x": 0 }).unwrap();
+    later();
+    b.apply_batch(&everything(&a)).unwrap();
+    a.replace(&ca, &id, doc! { "_id": 1, "x": 7 }, false).unwrap();
+    b.replace(&cb, &id, doc! { "_id": 1, "x": 7 }, false).unwrap();
+    later();
+    a.apply_batch(&everything(&b)).unwrap();
+    assert_eq!(
+        a.get(&ca, &id).unwrap(),
+        Some(doc! { "_id": 1, "x": 7 }),
+        "premise: the richer member"
+    );
+    assert_eq!(
+        b.get(&cb, &id).unwrap(),
+        Some(doc! { "_id": 1, "x": 7 }),
+        "premise: the poorer member"
+    );
+    assert_ne!(
+        state_of_the_row(&a),
+        state_of_the_row(&b),
+        "premise: the same document over different states"
+    );
+    (a, b, id, dirs)
+}
+
+#[test]
+fn a_converge_pull_that_moves_only_a_documents_state_writes_it() {
+    let (a, b, id, _d) = a_richer_and_a_poorer_member();
+
+    let done = converge(&b, &a, VersionVector::new());
+
+    assert_eq!(
+        b.get(&coll(&b), &id).unwrap(),
+        Some(doc! { "_id": 1, "x": 7 }),
+        "the document is as it was"
+    );
+    assert_eq!(
+        state_of_the_row(&b),
+        state_of_the_row(&a),
+        "the stored state is the richer member's"
+    );
+    assert_eq!(done.applied, 1, "and the pull counts it, or the repair is judged ineffective");
+}
+
+#[test]
+fn a_page_of_a_whole_database_snapshot_that_is_not_the_last_and_moves_only_a_state_writes_it() {
+    let (a, b, id, _d) = a_richer_and_a_poorer_member();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    // Not the last page: no grant rides it, so the only thing that can commit it is a write.
+    page.next = Some(crate::SnapshotCursor {
+        collection: orders(),
+        after_key: vec![0xff],
+        until_key: None,
+    });
+
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+    assert_eq!(
+        b.get(&coll(&b), &id).unwrap(),
+        Some(doc! { "_id": 1, "x": 7 }),
+        "the document is as it was"
+    );
+    assert_eq!(
+        state_of_the_row(&b),
+        state_of_the_row(&a),
+        "the stored state is the richer member's"
+    );
+}
+
+#[test]
+fn a_window_that_moves_only_a_documents_state_writes_it() {
+    // The other two routes already kept the move: a run's transaction commits whole. Pinned so the new outcome
+    // cannot change it.
+    let (a, b, id, _d) = a_richer_and_a_poorer_member();
+
+    b.apply_batch(&everything(&a)).unwrap();
+
+    assert_eq!(b.get(&coll(&b), &id).unwrap(), Some(doc! { "_id": 1, "x": 7 }));
+    assert_eq!(state_of_the_row(&b), state_of_the_row(&a));
+}
+
+#[test]
+fn a_single_entry_whose_state_moves_only_the_stored_state_is_committed() {
+    let (a, b, id, _d) = a_richer_and_a_poorer_member();
+    let before = state_of_the_row(&b);
+    let replace = everything(&a)
+        .into_iter()
+        .filter(|entry| {
+            entry.stamp.node == a.node_id() && entry.kind == kimmy_core::OpKind::Replace
+        })
+        .max_by_key(|entry| entry.stamp)
+        .expect("the richer member's own write");
+
+    let applied = b.apply_remote(&coll(&b), &replace).unwrap();
+
+    assert!(!applied, "the document did not move, so no entry won");
+    assert_eq!(b.get(&coll(&b), &id).unwrap(), Some(doc! { "_id": 1, "x": 7 }));
+    assert_ne!(
+        state_of_the_row(&b),
+        before,
+        "the stored state moved: a rollback would have left it as it was"
+    );
+}
+
+// ---- the same for the state a carried delete brings (a tombstone's) --------------------------------------
+
+/// Two members that both deleted the one document: `a` has taken the other's delete and so holds a tombstone whose
+/// state keeps both; `b` holds the tombstone of its own delete. No document is rendered on either side, so what a
+/// pull from `a` has to move into `b` is the tombstone's state and nothing else.
+fn a_richer_and_a_poorer_tombstone() -> (Engine, Engine, [tempfile::TempDir; 2]) {
+    let (a, b, dirs) = field_pair();
+    let (ca, cb) = (coll(&a), coll(&b));
+    let id = a.insert(&ca, doc! { "_id": 1, "x": 0 }).unwrap();
+    later();
+    b.apply_batch(&everything(&a)).unwrap();
+    assert!(a.delete(&ca, &id).unwrap());
+    assert!(b.delete(&cb, &id).unwrap());
+    later();
+    a.apply_batch(&everything(&b)).unwrap();
+    assert_ne!(
+        state_of_the_tombstone(&a),
+        state_of_the_tombstone(&b),
+        "premise: the same absence over different states"
+    );
+    (a, b, dirs)
+}
+
+/// The state the sender's scoped page carries for its one tombstone.
+fn state_of_the_tombstone(from: &Engine) -> MergeState {
+    let page = from.snapshot_page(None, Some(orders())).unwrap();
+    assert_eq!(page.deleted_documents.len(), 1, "premise: one tombstone");
+    crate::field_write::load(page.deleted_documents[0].meta.as_deref()).unwrap()
+}
+
+#[test]
+fn a_converge_pull_that_moves_only_a_tombstones_state_writes_it() {
+    let (a, b, _d) = a_richer_and_a_poorer_tombstone();
+
+    converge(&b, &a, VersionVector::new());
+
+    assert_eq!(
+        state_of_the_tombstone(&b),
+        state_of_the_tombstone(&a),
+        "the stored state is the richer member's"
+    );
+}
+
+#[test]
+fn a_page_of_a_whole_database_snapshot_that_is_not_the_last_and_moves_only_a_tombstones_state_writes_it()
+ {
+    let (a, b, _d) = a_richer_and_a_poorer_tombstone();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    page.next = Some(crate::SnapshotCursor {
+        collection: orders(),
+        after_key: vec![0xff],
+        until_key: None,
+    });
+
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+    assert_eq!(
+        state_of_the_tombstone(&b),
+        state_of_the_tombstone(&a),
+        "the stored state is the richer member's"
+    );
+}
+
+// ---- an entry the member covers but does not hold is kept by the single-entry apply (always keep) --------------
+
+#[test]
+fn a_single_entry_a_member_covers_but_does_not_hold_is_appended_to_its_oplog() {
+    let (a, b, _d) = field_pair();
+    let (ca, cb) = (coll(&a), coll(&b));
+    let id = a.insert(&ca, doc! { "_id": 1, "x": 0 }).unwrap();
+    later();
+    a.replace(&ca, &id, doc! { "_id": 1, "x": 1 }, false).unwrap();
+    let mut writes: Vec<_> =
+        everything(&a).into_iter().filter(|entry| entry.doc_id.is_some()).collect();
+    writes.sort_by_key(|entry| entry.stamp);
+    assert_eq!(writes.len(), 2, "premise: an insert and a replace");
+    assert!(b.apply_remote(&cb, &writes[1]).unwrap(), "premise: the later entry is applied");
+    let held = |e: &Engine, stamp| {
+        e.read_oplog_from(Hlc::ZERO, 10_000, WalkScope::Background)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.stamp == stamp)
+    };
+    assert!(!held(&b, writes[0].stamp), "premise: the earlier entry is not in the member's oplog");
+
+    let applied = b.apply_remote(&cb, &writes[0]).unwrap();
+
+    assert!(!applied, "the state already covers it, so no entry won");
+    assert!(
+        held(&b, writes[0].stamp),
+        "an entry owed to the oplog is appended, and the single-entry apply commits what it appended"
+    );
+}

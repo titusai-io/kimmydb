@@ -2358,6 +2358,13 @@ impl Engine {
                 outcome.superseded += 1;
                 run.released += u64::from(released);
             }
+            // The state stored for the document moved and the document did not: the row is in the run's
+            // transaction, which commits whole (`commit_run`), so a window needs no more than it counted
+            // before (a superseded entry).
+            RemoteApplied::Written { released } => {
+                outcome.superseded += 1;
+                run.released += u64::from(released);
+            }
         }
         Ok(Step::Taken)
     }

@@ -1567,14 +1567,27 @@ impl Engine {
             return Ok(false);
         }
         let txn = self.begin_write(WriterHolder::Replication)?;
-        let RemoteApplied::Applied { id, violations, unkeyed, .. } =
-            self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)?
-        else {
-            // Nothing was written, so nothing is committed — a superseded
-            // entry must not cost an fsync.
-            txn.abort()?;
-            return Ok(false);
-        };
+        let (id, violations, unkeyed) =
+            match self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)? {
+                RemoteApplied::Applied { id, violations, unkeyed, .. } => (id, violations, unkeyed),
+                RemoteApplied::Written { .. } => {
+                    // The document did not move but something was written (the state stored for it, an entry
+                    // owed to the oplog, a held mark released): committed, nothing to publish, and not an
+                    // entry that won (the document is as it was).
+                    txn.commit()?;
+                    return Ok(false);
+                }
+                RemoteApplied::Superseded { released } => {
+                    // Nothing was written, so nothing is committed — a superseded
+                    // entry must not cost an fsync. (A held mark released is a write.)
+                    if released {
+                        txn.commit()?;
+                    } else {
+                        txn.abort()?;
+                    }
+                    return Ok(false);
+                }
+            };
         txn.commit()?;
         let published = self.report_remote_write(
             WriterHolder::Replication,
@@ -1885,7 +1898,7 @@ impl Engine {
         // with a write after the drop, or it would win it and the write would be lost.
         let floor = Self::floor_of(txn, coll)?;
         if floor.is_some_and(|floor| other.drop_at_or_below(floor)) && other.is_bare() {
-            return self.field_entry_kept(txn, entry, position);
+            return self.field_entry_kept(txn, entry, position, false);
         }
         // A state applied as state has no entry behind it: what it holds of every writer is a hole in
         // what this member can serve, recorded in the transaction that applies it (a page that is rolled
@@ -1925,7 +1938,7 @@ impl Engine {
             let joined = field_write::join(self.field_writer(coll)?, prior, &other)?;
             if !joined.changed && !prior_thinned && existing.is_some() {
                 drop(docs);
-                return self.field_entry_kept(txn, entry, position);
+                return self.field_entry_kept(txn, entry, position, false);
             }
             // The record carries the newest write merged in.
             let record_stamp = match &existing {
@@ -1954,8 +1967,9 @@ impl Engine {
         let next: Option<Document> =
             if joined.alive { Some(bson::deserialize_from_slice(&joined.body)?) } else { None };
         if previous == next {
-            // The merged state moved and the document did not.
-            return self.field_entry_kept(txn, entry, position);
+            // The merged state moved and the document did not: the row is written (above), so the outcome
+            // says so, and a page that commits only on a write commits it.
+            return self.field_entry_kept(txn, entry, position, true);
         }
         let id = id.ok_or_else(|| {
             StorageError::Corrupt("a field document moved with no _id to name it by".into())
@@ -1976,22 +1990,36 @@ impl Engine {
 
     /// An entry of a `field` collection that moved no document: appended when it is owed (always
     /// keep), its held mark released when it arrives in position, witnessed, and not published.
+    ///
+    /// `row_written` says the stored state was written into `txn` all the same (the merged state moved and the
+    /// document did not). The answer is [`RemoteApplied::Written`] whenever anything was written into `txn`
+    /// (that row, an appended entry, a released mark): a caller that commits only when something was written
+    /// must commit it. [`RemoteApplied::Superseded`] is left for an entry that wrote nothing.
     fn field_entry_kept(
         &self,
         txn: &WriteTxn<'_>,
         entry: &OplogEntry,
         position: Position,
+        row_written: bool,
     ) -> Result<RemoteApplied> {
-        let released = if position == Position::Hold {
-            false
+        let (released, appended) = if position == Position::Hold {
+            (false, false)
         } else if crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
-            crate::engine::append_oplog_at(txn, entry, position)?
+            (crate::engine::append_oplog_at(txn, entry, position)?, true)
         } else {
-            position == Position::InWindow
-                && crate::engine::release_held_in_position(txn, &entry.stamp)?
+            (
+                position == Position::InWindow
+                    && crate::engine::release_held_in_position(txn, &entry.stamp)?,
+                false,
+            )
         };
         self.witness(&entry.stamp);
-        Ok(RemoteApplied::Superseded { released })
+        let wrote = row_written || appended || released;
+        Ok(if wrote {
+            RemoteApplied::Written { released }
+        } else {
+            RemoteApplied::Superseded { released }
+        })
     }
 
     /// The part of a replicated write that must follow its commit: count and
@@ -2164,6 +2192,13 @@ pub(crate) enum RemoteApplied {
     /// it was, save for a held mark released on arrival in a window
     /// (ADR-169), which `released` reports for the caller to count on commit.
     Superseded { released: bool },
+    /// A `field` entry moved no document, and **something was written into the transaction all the same**: the
+    /// state stored for its document moved (a version vector component, a dead life, a counter slot, a loss
+    /// record), or the entry was appended because it is owed (always keep), or a held mark was released.
+    /// Nothing is to be published and there is no `Pending`. A caller that commits only when something was
+    /// written must commit it, or the write is rolled back with the transaction. `released` is as for
+    /// [`Self::Superseded`].
+    Written { released: bool },
 }
 
 /// A group's identity for deduplication: its ids, order-free.
