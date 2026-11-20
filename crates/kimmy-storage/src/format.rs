@@ -1815,6 +1815,7 @@ mod tests {
     /// and nothing is written, the sidecar included.
     #[test]
     fn a_store_another_holder_has_open_is_refused_and_its_sidecar_untouched() {
+        let _gate = lock_sensitive();
         let (_dir, path) = a_store();
         let holder = Engine::open(&path).unwrap();
         let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
@@ -2005,19 +2006,48 @@ mod tests {
         outcome: String,
     }
 
+    /// Every spawn of a child process in this binary holds this for writing,
+    /// and every test that asserts a store's lock was let go, or is held,
+    /// holds it for reading ([`lock_sensitive`]).
+    ///
+    /// Between the fork and the exec a child's descriptor table still refers to
+    /// every open file description the parent has, whichever thread opened it,
+    /// and the locks on a store (`flock` and redb's byte-range locks) belong to
+    /// the description, not to the descriptor. A child forked while a test
+    /// holds a store's descriptor keeps its lock after the test drops it, for
+    /// as long as the exec takes, and the test's next open is refused as in
+    /// use. Reading holds the spawns off for the whole of such a test.
+    static SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// For a test that asserts a lock released or held: no child is forked
+    /// while the returned guard lives. Never held by a test that spawns one
+    /// itself, which takes the gate for writing inside [`spawn_gated`].
+    fn lock_sensitive() -> std::sync::RwLockReadGuard<'static, ()> {
+        SPAWN_GATE.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `command.spawn()` with no [`lock_sensitive`] test running. `spawn`
+    /// returns once the child has exec'd, which closes the descriptors it
+    /// inherited, so the gate is released when nothing is left to inherit.
+    fn spawn_gated(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+        let _gate = SPAWN_GATE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        command.spawn()
+    }
+
     /// Run this test binary again, as a child running [`child_probe`] with
     /// `var` set to `path`, and return what it printed. A child still running
     /// after `limit` is killed, and the test fails: a regression to the hang
     /// neither hangs the suite nor keeps allocating.
     fn run_child(var: &str, path: &Path, limit: std::time::Duration) -> String {
         use std::io::Read as _;
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
-            .env(var, path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_gated(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
+                .env(var, path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let deadline = std::time::Instant::now() + limit;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -2360,16 +2390,49 @@ mod tests {
     /// damaged; with nothing holding it, the put-back lets the lock go after.
     #[test]
     fn the_sidecar_is_put_back_only_under_the_stores_lock() {
+        put_back_under_the_stores_lock(false);
+    }
+
+    /// The same, with a child forked while the probe holds the store, and kept
+    /// from exec for longer than the test takes to drop the probe. A child
+    /// that got that far would hold the probe's lock past the drop (see
+    /// [`SPAWN_GATE`]) and the open after it would be refused as in use; the
+    /// spawn waits for the test instead.
+    #[test]
+    fn a_spawn_waits_while_a_test_holds_a_store_so_no_child_keeps_its_lock() {
+        put_back_under_the_stores_lock(true);
+    }
+
+    fn put_back_under_the_stores_lock(spawn_while_held: bool) {
+        use std::os::unix::process::CommandExt as _;
+        let gate = lock_sensitive();
         let (_dir, path) = a_store();
         with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         damage_page_order(&path, 1);
         let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
         let hold = std::rc::Rc::clone(&holder);
+        let spawner = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let spawning = std::rc::Rc::clone(&spawner);
         crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| {
             *p.borrow_mut() = Some(Box::new(move |path: &Path| {
                 let other = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
                 other.try_lock().unwrap();
                 *hold.borrow_mut() = Some(other);
+                if spawn_while_held {
+                    *spawning.borrow_mut() = Some(std::thread::spawn(|| {
+                        let mut command = std::process::Command::new("true");
+                        // SAFETY: the closure only sleeps, and runs between the fork and the exec.
+                        unsafe {
+                            command.pre_exec(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                Ok(())
+                            })
+                        };
+                        spawn_gated(&mut command).unwrap().wait().unwrap();
+                    }));
+                    // Long enough for an ungated spawn to have forked.
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
             }));
         });
         let result = Engine::open(&path);
@@ -2394,6 +2457,10 @@ mod tests {
         assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore { .. })));
         assert_eq!(read_sidecar(&path).unwrap().redb_file_format, REDB_FILE_FORMAT - 1, "put back");
         std::fs::File::open(&path).unwrap().try_lock().expect("the put-back let the lock go");
+        drop(gate);
+        if let Some(spawned) = spawner.borrow_mut().take() {
+            spawned.join().unwrap();
+        }
     }
 
     /// After redb's read-write open panicked, the store's lock is gone: the
@@ -2401,6 +2468,7 @@ mod tests {
     /// descriptor can lock the file.
     #[test]
     fn a_panic_in_redbs_open_releases_the_store() {
+        let _gate = lock_sensitive();
         let (_dir, path) = a_store();
         damage_page_order_validly(&path, 1);
         for attempt in ["first", "second"] {
@@ -2576,13 +2644,14 @@ mod tests {
         use std::io::BufRead as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
-        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
-            .env(PROBE_HOLD, &path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut holder = spawn_gated(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
+                .env(PROBE_HOLD, &path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+        )
+        .unwrap();
         let ready = std::io::BufReader::new(holder.stdout.take().unwrap())
             .lines()
             .map_while(|l| l.ok())
@@ -2689,6 +2758,7 @@ mod tests {
     /// range lock alone.
     #[test]
     fn a_flock_held_by_another_descriptor_refuses_the_open_before_anything_is_written() {
+        let _gate = lock_sensitive();
         let (_dir, path) = a_store();
         with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let holder = std::fs::File::open(&path).unwrap();
@@ -2704,6 +2774,7 @@ mod tests {
     /// is refused.
     #[test]
     fn while_an_engine_holds_the_store_a_flock_from_another_descriptor_is_refused() {
+        let _gate = lock_sensitive();
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
         let other = std::fs::File::open(&path).unwrap();
@@ -2717,6 +2788,7 @@ mod tests {
     /// and read-only opens.
     #[test]
     fn while_an_engine_holds_the_store_redbs_own_locks_are_refused() {
+        let _gate = lock_sensitive();
         use redb::StorageBackend as _;
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
@@ -2746,6 +2818,7 @@ mod tests {
     /// older redb stamped.
     #[test]
     fn a_second_engine_on_a_held_store_is_refused_before_it_writes_the_sidecar() {
+        let _gate = lock_sensitive();
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
         with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
@@ -2760,6 +2833,7 @@ mod tests {
     /// neither lock.
     #[test]
     fn the_lock_is_held_while_the_sidecar_is_written() {
+        let _gate = lock_sensitive();
         use redb::StorageBackend as _;
         let (_dir, path) = a_store();
         with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
