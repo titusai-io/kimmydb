@@ -1641,14 +1641,33 @@ def stale_records(records, log):
 def killed_superseded_any(log):
     """V7m4: for each first insert that is superseded AND killed by a delete that neither saw it nor was seen by it,
     the sets of keys of which at least one must be reported: insertLost for the whole insert, or deleteWon of one of
-    its fields."""
+    its fields. The fields are asked for as HEADS (as `loss_oracle` asks for them): a field the life's own later write
+    overwrote in sequence is no longer a head, and the later write's cell is, whether it lies at that path or an
+    increment slot does; a head that a delete saw is not asked for (that delete took it knowingly)."""
     dels = [st for st, (ctx, m) in log.items() if m["kind"] == "delete"]
+    gen = make_gen(log)
     out = []
     for L in superseded_lives(log):
         ctx, m = log[L]
         if (any(d not in ctx and d[0] >= L[0] - RET for d in dels)
                 and not any(L in log[d][0] for d in dels)):      # killed, and no delete observed it
-            out.append({("_", L)} | {(p, L) for p in touched(m)})
+            keys = {("_", L)}
+            into = {st: m2 for st, (c2, m2) in log.items() if m2.get("life") == L}
+            for p in touched(m):
+                regs = [st for st, m2 in into.items() if m2["kind"] in ("insert", "reg") and p in m2["paths"]]
+                for st in regs:
+                    if (not any(st in log[s2][0] for s2 in regs if s2 != st) and into[st]["vals"][p] != MAPI
+                            and not any(st in log[d][0] for d in dels)):
+                        keys.add((p, st))
+                by_slot = {}
+                for st, m2 in into.items():
+                    if p in incs_of(m2):
+                        by_slot.setdefault((st[1], gen(st, p)), []).append(st)
+                for sts in by_slot.values():
+                    head = max(sts)
+                    if not any(head in log[d][0] for d in dels):
+                        keys.add((p, head))
+            out.append(keys)
     return out
 
 
