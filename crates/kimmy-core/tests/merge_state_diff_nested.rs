@@ -954,7 +954,7 @@ fn the_vendored_model_is_the_reviewed_one() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
-        ("model6.py", "f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61"),
+        ("model6.py", "3b577688cd7e2e66161422c9797ab632d7b6864f76635614db2ab357777ccfa6"),
         ("pullmodel6.py", "6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"),
     ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
@@ -962,7 +962,7 @@ fn the_vendored_model_is_the_reviewed_one() {
         assert_eq!(got, want, "{file}");
     }
     let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-    assert!(recorded.contains("f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61"));
+    assert!(recorded.contains("3b577688cd7e2e66161422c9797ab632d7b6864f76635614db2ab357777ccfa6"));
     assert!(recorded.contains("6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"));
 }
 

@@ -678,19 +678,54 @@ pub fn stale_records(
 /// V7m4: for each first insert that is superseded AND killed by a delete that
 /// neither saw it nor was seen by it, the sets of keys of which at least one
 /// must be reported: insertLost for the whole insert, or deleteWon of one of
-/// its fields.
+/// its fields. The fields are asked for as HEADS (as [`loss_oracle`] asks for
+/// them): a field the life's own later write overwrote in sequence is no longer
+/// a head, and the later write's cell is, whether it lies at that path or an
+/// increment slot does; a head that a delete saw is not asked for (that delete
+/// took it knowingly). model6.py's `killed_superseded_any`.
 pub fn killed_superseded_any(log: &Log, ret: u64) -> Vec<BTreeSet<Head>> {
     let dels = deletes(log);
+    let gener = make_gen(log, ret);
+    let saw_by_a_delete = |st: &MStamp| dels.iter().any(|d| log[d].0.contains(st));
     let mut out = Vec::new();
     for l in superseded_lives(log, None) {
         let (ctx, m) = &log[&l];
         // killed, and no delete observed it
         if dels.iter().any(|d| !ctx.contains(d) && t(d) >= t(&l) - i128::from(ret))
-            && !dels.iter().any(|d| log[d].0.contains(&l))
+            && !saw_by_a_delete(&l)
         {
             let mut set: BTreeSet<Head> = BTreeSet::new();
             set.insert((whole_document(), l));
-            set.extend(m.paths.iter().map(|p| (p.clone(), l)));
+            let into: Vec<(&MStamp, &(BTreeSet<MStamp>, WriteRecord))> =
+                log.iter().filter(|(_, (_, m2))| m2.life == Some(l)).collect();
+            for p in touched(m) {
+                let regs: Vec<MStamp> = into
+                    .iter()
+                    .filter(|(_, (_, m2))| is_reg_kind(m2.kind) && m2.paths.contains(p))
+                    .map(|(st, _)| **st)
+                    .collect();
+                for st in &regs {
+                    if !regs.iter().any(|s2| s2 != st && log[s2].0.contains(st))
+                        && log[st].1.vals[p] != Value::ImplicitMap
+                        && !saw_by_a_delete(st)
+                    {
+                        set.insert((p.clone(), *st));
+                    }
+                }
+                let mut by_slot: BTreeMap<(WriterId, Option<MStamp>), Vec<MStamp>> =
+                    BTreeMap::new();
+                for (st, (_, m2)) in &into {
+                    if m2.kind == WriteKind::Inc && m2.paths.contains(p) {
+                        by_slot.entry((st.writer, gener.of(**st, p))).or_default().push(**st);
+                    }
+                }
+                for sts in by_slot.values() {
+                    let head = *sts.iter().max().unwrap();
+                    if !saw_by_a_delete(&head) {
+                        set.insert((p.clone(), head));
+                    }
+                }
+            }
             out.push(set);
         }
     }
