@@ -456,6 +456,118 @@ pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
             problems,
         ));
     }
+    // ---- the absorbed pair belongs to the life of the base write that made it (note q7-absorbed-by-writing-life, section 7.1) ----
+    {
+        // (1) a base made into a life that is then superseded absorbs nothing (the shape of rich seeds 943 and 2570): A upserts `$inc c 1`
+        // (life U); B inserts `{k: 1}` (P, newer than U by writer name); A receives P and unsets `c`, a base INTO P that folds U's slot; C
+        // inserts `{k: 2}` with the newest stamp: P is superseded and the write into it is dropped. `c` reads 1 on every member.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].upsert_inc("c", 1, &mut log, 0);
+        ms[1].insert(&[("k", Value::Int64(1))], &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        ms[0].unset("c", &mut log, 0);
+        ms[2].insert(&[("k", Value::Int64(2))], &mut log, 100);
+        fixpoint(&mut ms, 40);
+        out.push((
+            "fold: a base made into a superseded life absorbs nothing".to_string(),
+            all_read(&ms, "c", 1),
+        ));
+    }
+    {
+        // (2) case_two_writing_lives: ONE slot absorbed by two bases in two writing lives, the higher pair in the life that loses. A upserts
+        // `+1` (U); D pulls it; A adds `+1` (the slot reads 2); B inserts P; A pulls P and unsets `c` INTO P (the pair of P is 2); D, holding
+        // only U, sets `c` to 5 INTO U (the pair of U is 1); C inserts Q, newer: P is superseded. The value is 6. The only case that kills a
+        // single-pair-per-slot layout. A fresh node E pulls A, then D, then C BEFORE the fixpoint and must read 6 on its own: the fixpoint's
+        // member order alone is not enough (a change of the pull order, the skip or the stamps could make the members converge on 6 under
+        // the mutant and the probe would pass). E reads 6 with the design and 7 under `single_pair`.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].upsert_inc("c", 1, &mut log, 0);
+        pull(&mut ms, 3, 0, None);
+        ms[0].inc("c", 1, &mut log, 0);
+        ms[1].insert(&[("k", Value::Int64(1))], &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        ms[0].unset("c", &mut log, 0);
+        ms[3].set("c", Value::Int64(5), &mut log, 3);
+        ms[2].insert(&[("k", Value::Int64(2))], &mut log, 9);
+        ms.push(Node::new('E', cfg));
+        pull(&mut ms, 4, 0, None);
+        pull(&mut ms, 4, 3, None);
+        pull(&mut ms, 4, 2, None);
+        let mut problems = all_read(&ms[4..5], "c", 6);
+        fixpoint(&mut ms, 40);
+        problems.extend(all_read(&ms, "c", 6));
+        out.push((
+            "fold: two writing lives absorb one slot at different stamps".to_string(),
+            problems,
+        ));
+    }
+    {
+        // (3) case_unset_several_lives: one base (`$unset c`) absorbs the slots of TWO other lives (two upserts of `c`, U1 and U2) from P; P
+        // is superseded. Both counters keep their increments: 1 + 2 = 3.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].upsert_inc("c", 1, &mut log, 0);
+        ms[3].upsert_inc("c", 2, &mut log, 0);
+        ms[1].insert(&[("k", Value::Int64(1))], &mut log, 1);
+        pull(&mut ms, 0, 3, None);
+        pull(&mut ms, 0, 1, None);
+        ms[0].unset("c", &mut log, 0);
+        ms[2].insert(&[("k", Value::Int64(2))], &mut log, 9);
+        fixpoint(&mut ms, 40);
+        out.push((
+            "fold: one base into a lost life absorbs the slots of two other lives".to_string(),
+            all_read(&ms, "c", 3),
+        ));
+    }
+    {
+        // (4) case_upsert_writes_absorb_insert_slot: the writing life is the UPSERT life U (newer than the first insert P) and the absorbed
+        // slot is P's; P is then superseded. Reads 7. And NO PAIR is left without its slot or with a dead writing life, on any member.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[1].insert(&[("k", Value::Int64(1))], &mut log, 0);
+        ms[1].inc("c", 4, &mut log, 0);
+        ms[0].upsert_inc("c", 1, &mut log, 3);
+        pull(&mut ms, 0, 1, None);
+        ms[0].set("c", Value::Int64(7), &mut log, 0);
+        ms[2].insert(&[("k", Value::Int64(2))], &mut log, 9);
+        fixpoint(&mut ms, 40);
+        let mut problems = all_read(&ms, "c", 7);
+        for n in &ms {
+            let alive = n.w.alive();
+            for (k, sl) in n.state().slots.iter() {
+                if !alive.contains(&k.0) {
+                    problems.push(format!("{}: a slot of the dead life {:?}", n.name, k.0));
+                }
+                for pr in &sl.absorbed {
+                    if !alive.contains(&pr.life) {
+                        problems.push(format!(
+                            "{}: a pair of the dead writing life {:?}",
+                            n.name, pr.life
+                        ));
+                    }
+                }
+            }
+        }
+        out.push(("fold: no pair outlives its slot or its writing life".to_string(), problems));
+    }
+    {
+        // (5) case_inc_after_absorb_in_lost_life: after the absorbing unset, A adds `+2` (a new slot in P); P is superseded: reads 1.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].upsert_inc("c", 1, &mut log, 0);
+        ms[1].insert(&[("k", Value::Int64(1))], &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        ms[0].unset("c", &mut log, 0);
+        ms[0].inc("c", 2, &mut log, 0);
+        ms[2].insert(&[("k", Value::Int64(2))], &mut log, 9);
+        fixpoint(&mut ms, 40);
+        out.push((
+            "fold: an increment after the absorb, into the lost life, is lost with it".to_string(),
+            all_read(&ms, "c", 1),
+        ));
+    }
     out
 }
 

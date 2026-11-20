@@ -194,6 +194,18 @@ pub fn mutants() -> Vec<Mutant> {
             probe: Fold,
         },
         Mutant {
+            name: "a base write files its absorbed pair under the life of its slot, not the life it is made in  [absorbed, keying]",
+            apply: |c| c.opts.set_absorb_by_slot_life(true),
+            grader: Random { restore: true },
+            probe: Fold,
+        },
+        Mutant {
+            name: "a join keeps one absorbed pair per slot, picked before the alive filter  [absorbed, single pair]",
+            apply: |c| c.opts.set_single_pair(true),
+            grader: Random { restore: true },
+            probe: Fold,
+        },
+        Mutant {
             name: "a map-marker base write folds no slot  [M2 fold, marker]",
             apply: |c| c.opts.set_no_fold_marker(true),
             grader: Random { restore: true },

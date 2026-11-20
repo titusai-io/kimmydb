@@ -1431,3 +1431,94 @@ fn typed_upsert_pools_round_trip_the_compact_form() {
     }
     assert!(slots > 200, "the pools hold counters: {slots}");
 }
+
+// ---- the absorbed pair sets (q7-absorbed) -----------------------------------------------------------------
+
+/// States whose counter slots hold SETS of absorbed pairs, one per writing life: three alive lives, slots of two writers at one path in
+/// each life a state lists, and on each slot a pair of every writing life the state lists with a draw (a stamp at or below the slot's, its
+/// total a function of the stamp, as an honest writer's is). The states are closed: every pair names a listed life, and the version vector
+/// covers every stamp. The join of two of them unions the pairs by life with the higher stamp per life and keeps those of an alive life: it
+/// is commutative, idempotent and absorbing, and associative within retention (the laws of [`check_laws_on`]), the hash does not depend on
+/// the order, and what it makes is a state `decode` accepts. (The generated runs hold pair sets too, since a base write is made in the
+/// newest alive life and folds the slots of the others; this pool makes the shapes certain.)
+#[test]
+fn join_laws_on_absorbed_pair_sets() {
+    use super::tests::wid;
+    let lives = [
+        MStamp { hlc: Hlc::new(1, 0), writer: wid('A', 0) },
+        MStamp { hlc: Hlc::new(2, 0), writer: wid('B', 0) },
+        MStamp { hlc: Hlc::new(3, 0), writer: wid('A', 0) },
+    ];
+    let o = opts(1_000_000_000);
+    let mut rng = Rng(0x5041_4952_5345_5453);
+    let mut pool: Vec<Vec<MergeState>> = Vec::new();
+    let (mut multi, mut total_pairs) = (0usize, 0usize);
+    for _ in 0..40 {
+        let mut states = Vec::new();
+        for _ in 0..6 {
+            let mut s = MergeState::default();
+            for (i, l) in lives.iter().enumerate() {
+                if i == 0 || rng.below(3) != 0 {
+                    s.lives.insert(
+                        *l,
+                        Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+                    );
+                }
+            }
+            let listed: Vec<MStamp> = s.lives.keys().copied().collect();
+            for sl_life in &listed {
+                for w in ['A', 'B'] {
+                    if rng.below(3) == 0 {
+                        continue;
+                    }
+                    let wall = 10 + 2 * rng.below(4) as u64;
+                    let stamp = MStamp { hlc: Hlc::new(wall, 0), writer: wid(w, 0) };
+                    let mut slot = Slot::new(stamp, Num::from(i128::from(wall) * 10), None);
+                    for wl in &listed {
+                        if rng.below(2) == 0 {
+                            continue;
+                        }
+                        let pw = 10 + 2 * rng.below(((wall - 10) / 2 + 1) as usize) as u64;
+                        let pstamp = MStamp { hlc: Hlc::new(pw, 0), writer: wid(w, 0) };
+                        slot.absorbed.push(Pair {
+                            life: *wl,
+                            stamp: pstamp,
+                            total: Num::from(i128::from(pw) * 10),
+                        });
+                    }
+                    slot.absorbed.sort_by_key(|pr| pr.life);
+                    s.slots.insert((*sl_life, p("c"), wid(w, 0), None), slot);
+                }
+            }
+            for w in ['A', 'B'] {
+                s.vv.insert(wid(w, 0), Hlc::new(20, 0));
+            }
+            let s = join(&s, &MergeState::default(), &o).0;
+            assert!(s.check_decoded().is_ok(), "a built state is closed: {:?}", s.check_decoded());
+            states.push(s);
+        }
+        pool.push(states);
+    }
+    check_laws_on(&o, true, &pool, 3000);
+    for states in &pool {
+        for pair in states.windows(2) {
+            let j = join(&pair[0], &pair[1], &o).0;
+            assert!(j.check_decoded().is_ok(), "the join of two closed states is closed");
+            let alive: BTreeSet<MStamp> = j.lives.keys().copied().collect();
+            for (k, sl) in &j.slots {
+                assert!(alive.contains(&k.0));
+                assert!(sl.absorbed.iter().all(|pr| alive.contains(&pr.life)));
+                assert!(
+                    sl.absorbed.windows(2).all(|w| w[0].life < w[1].life),
+                    "sorted, one per life"
+                );
+                total_pairs += sl.absorbed.len();
+                multi += usize::from(sl.absorbed.len() > 1);
+            }
+        }
+    }
+    assert!(
+        multi > 100 && total_pairs > 300,
+        "the pool holds pair sets: {multi} slots with several pairs of {total_pairs}"
+    );
+}
