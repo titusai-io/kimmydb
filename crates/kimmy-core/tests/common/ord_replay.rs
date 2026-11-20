@@ -17,7 +17,12 @@ const SCRIPTS: &str = include_str!("../data/ord_diff_scripts.json");
 const MODEL6_SHA256: &str = "f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61";
 
 fn wid(c: char) -> WriterId {
-    WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(0) }
+    wid_at(c, 0)
+}
+
+/// The writer of member `c` in its `epoch`th life (a restore takes the next).
+fn wid_at(c: char, epoch: u64) -> WriterId {
+    WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(epoch) }
 }
 
 fn path(j: &J) -> Path {
@@ -161,7 +166,7 @@ fn member(w: &Writer) -> (String, String, String) {
 fn stamp_of(j: &J) -> Option<MStamp> {
     (!j.is_null()).then(|| MStamp {
         hlc: kimmy_core::hlc::Hlc::new(j[0].as_u64().unwrap(), 0),
-        writer: wid(j[1].as_str().unwrap().chars().next().unwrap()),
+        writer: wid_at(j[1].as_str().unwrap().chars().next().unwrap(), j[2].as_u64().unwrap_or(0)),
     })
 }
 
@@ -221,31 +226,169 @@ pub struct Found {
     pub ordered_docs: usize,
     pub ord_keys: usize,
     pub bad: Vec<String>,
+    /// What the DELIVERY scripts did (see [`replay_delivery`]); all 0 for the plain scripts.
+    pub delivery: Delivery,
 }
 
+/// How many times the delivery scripts hit each way a state reaches a member besides its own writes, as the Rust replay ran them.
+#[derive(Default, Debug, PartialEq)]
+pub struct Delivery {
+    /// A snapshot: the peer's current state joined, no oplog entry.
+    pub snaps: usize,
+    pub backups: usize,
+    /// A restore: the member back at its backup under the next epoch.
+    pub restores: usize,
+    pub scripts_with_a_restore: usize,
+    /// A pull: a window of the peer's oplog entries (a stamp each), in stamp order.
+    pub pulls: usize,
+    /// A pull whose window stopped with entries after it (a truncated window).
+    pub truncated: usize,
+    /// The entries of the windows the receiver's vector covered, and so skipped; and those it joined.
+    pub skipped: usize,
+    pub applied: usize,
+    /// A write by a member after one of its restores (a stamp of epoch above 0).
+    pub writes_after_a_restore: usize,
+    /// A script in which a member that had restored then joined a pulled entry (or took a snapshot).
+    pub restore_then_a_pull_that_joined: usize,
+    pub restore_then_a_snapshot: usize,
+}
+
+/// The plain scripts: local writes and whole-state receives.
 pub fn replay(opts: &JoinOptions) -> Found {
+    replay_scripts(opts, false)
+}
+
+/// The DELIVERY scripts: the same writes, with the other ways a state reaches a member (a snapshot, a window of the peer's oplog entries
+/// each skipped when the receiver's vector covers it and joined otherwise, a window cut short, a backup and a restore under the next epoch).
+pub fn replay_delivery(opts: &JoinOptions) -> Found {
+    replay_scripts(opts, true)
+}
+
+type Oplog = BTreeMap<MStamp, MergeState>;
+
+fn replay_scripts(opts: &JoinOptions, delivery: bool) -> Found {
     let all: J = serde_json::from_str(SCRIPTS).unwrap();
     assert_eq!(all["model6_sha256"], MODEL6_SHA256);
     let mut f = Found::default();
     for sc in all["scripts"].as_array().unwrap() {
+        if sc.get("delivery").is_some() != delivery {
+            continue;
+        }
         f.scripts += 1;
         let names: Vec<char> =
             "ABCD".chars().take(sc["members"].as_u64().unwrap() as usize).collect();
         let mut ws: BTreeMap<char, Writer> =
             names.iter().map(|c| (*c, Writer::new(wid(*c), opts.clone()))).collect();
+        // the delivery scripts' members also keep an oplog (the state each entry carries, by stamp) and a backup of it
+        let mut logs: BTreeMap<char, Oplog> = names.iter().map(|c| (*c, Oplog::new())).collect();
+        let mut saved: BTreeMap<char, (MergeState, Oplog)> = BTreeMap::new();
+        let mut restored: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+        let (mut restored_pull, mut restored_snap) = (false, false);
         let tag = format!("{} {}", sc["kind"].as_str().unwrap(), sc["seed"]);
         'steps: for (i, step) in sc["steps"].as_array().unwrap().iter().enumerate() {
             f.steps += 1;
             let who = step["m"].as_str().unwrap().chars().next().unwrap();
-            if step["k"] == "recv" {
+            let kind = step["k"].as_str().unwrap();
+            let peer = || step["from"].as_str().unwrap().chars().next().unwrap();
+            if kind == "recv" {
                 f.receives += 1;
-                let from =
-                    ws[&step["from"].as_str().unwrap().chars().next().unwrap()].state.clone();
+                let from = ws[&peer()].state.clone();
                 ws.get_mut(&who).unwrap().receive_report(&from);
+            } else if kind == "snap" {
+                f.receives += 1;
+                f.delivery.snaps += 1;
+                let from = ws[&peer()].state.clone();
+                ws.get_mut(&who).unwrap().receive_report(&from);
+                restored_snap |= restored.contains(&who);
+            } else if kind == "backup" {
+                f.delivery.backups += 1;
+                saved.insert(who, (ws[&who].state.clone(), logs[&who].clone()));
+            } else if kind == "restore" {
+                f.delivery.restores += 1;
+                let (state, log) = saved.get(&who).expect("a restore follows a backup").clone();
+                let w = ws.get_mut(&who).unwrap();
+                // the state goes back and the writer takes the next epoch; its clock is kept (the model's restore)
+                w.state = state;
+                w.id = wid_at(who, step["epoch"].as_u64().unwrap());
+                logs.insert(who, log);
+                restored.insert(who);
+            } else if kind == "pull" {
+                f.delivery.pulls += 1;
+                f.delivery.truncated += usize::from(step["truncated"].as_bool().unwrap());
+                let from = peer();
+                let stamps = step["stamps"].as_array().unwrap();
+                for (n, sj) in stamps.iter().enumerate() {
+                    f.receives += 1;
+                    let st = stamp_of(sj).unwrap();
+                    let Some(entry) = logs[&from].get(&st).cloned() else {
+                        f.bad.push(format!("{tag} step {i}: {from} holds no entry at {sj}"));
+                        break 'steps;
+                    };
+                    // the covered skip: the receiver's vector covers every writer of the entry's state
+                    let w = ws.get_mut(&who).unwrap();
+                    let covered =
+                        entry.vv.iter().all(|(wr, h)| w.state.vv.get(wr).is_some_and(|x| x >= h));
+                    if covered != step["skipped"][n].as_bool().unwrap() {
+                        f.bad.push(format!(
+                            "{tag} step {i} entry {sj}: rust skips {covered}, model {}",
+                            step["skipped"][n]
+                        ));
+                        break 'steps;
+                    }
+                    if covered {
+                        f.delivery.skipped += 1;
+                        continue;
+                    }
+                    f.delivery.applied += 1;
+                    let changed = w.receive_report(&entry).changed;
+                    restored_pull |= restored.contains(&who);
+                    // the entry is appended when it changed the state and was not held (the model's rule)
+                    let appends = changed && !logs[&who].contains_key(&st);
+                    if appends != step["appended"][n].as_bool().unwrap() {
+                        f.bad.push(format!(
+                            "{tag} step {i} entry {sj}: rust appends {appends}, model {}",
+                            step["appended"][n]
+                        ));
+                        break 'steps;
+                    }
+                    if appends {
+                        logs.get_mut(&who).unwrap().insert(st, entry);
+                    }
+                }
             } else {
                 f.writes += 1;
-                let got = write(ws.get_mut(&who).unwrap(), step).map(|w| w.stamp);
+                let w = ws.get_mut(&who).unwrap();
+                let got = if delivery && step["op"] == "upsert_soi" {
+                    // two writes, each an oplog entry the model serves: the creation, then the increment on its life (as the sim does)
+                    let held = slot_in_alive_life(w);
+                    let arg = &step["arg"];
+                    let (skew, at) = (step["skew"].as_u64().unwrap(), path(&step["path"]));
+                    let first = w.upsert_soi_create(
+                        &fields(&arg["fields"]),
+                        &at,
+                        &fields(&arg["sets"]),
+                        skew,
+                    );
+                    assert!(
+                        first.is_none() || !held,
+                        "a creation was accepted over a slot of an alive life"
+                    );
+                    let second = first.as_ref().and_then(|c| {
+                        logs.get_mut(&who).unwrap().insert(c.stamp, w.state.clone());
+                        w.upsert_inc_on(c.stamp, &at, arg["n"]["v"].as_i64().unwrap(), skew)
+                    });
+                    second.map(|x| x.stamp)
+                } else {
+                    write(w, step).map(|x| x.stamp)
+                };
                 f.refused += usize::from(got.is_none());
+                if let Some(st) = got {
+                    f.delivery.writes_after_a_restore +=
+                        usize::from(st.writer.epoch != Epoch::from_u64(0));
+                    if delivery {
+                        logs.get_mut(&who).unwrap().insert(st, ws[&who].state.clone());
+                    }
+                }
                 if got != stamp_of(&step["res"]) {
                     f.bad.push(format!(
                         "{tag} step {i} {} {who}: rust stamp {got:?}, model {}",
@@ -265,6 +408,9 @@ pub fn replay(opts: &JoinOptions) -> Found {
             f.ordered_docs += usize::from(dt != "-");
             f.ord_keys += ws[&who].state.ords.len();
         }
+        f.delivery.scripts_with_a_restore += usize::from(!restored.is_empty());
+        f.delivery.restore_then_a_pull_that_joined += usize::from(restored_pull);
+        f.delivery.restore_then_a_snapshot += usize::from(restored_snap);
         if f.bad.last().is_some_and(|b| b.starts_with(&tag)) {
             continue;
         }
@@ -298,7 +444,7 @@ pub fn off_differences() -> Vec<(String, u64, usize, bool)> {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|sc| sc.get("off").is_some())
+        .filter(|sc| sc.get("off").is_some() && sc.get("delivery").is_none())
         .map(|sc| {
             let off = &sc["off"];
             let i = off["step"].as_u64().unwrap() as usize;
@@ -348,6 +494,7 @@ pub fn nested_upserts() -> usize {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|sc| sc.get("delivery").is_none())
         .flat_map(|sc| sc["steps"].as_array().unwrap())
         .filter(|s| s["k"] == "op" && matches!(s["op"].as_str(), Some("upsert_inc" | "upsert_soi")))
         .filter(|s| nested(s))
