@@ -42,6 +42,9 @@
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
+#[path = "common/loss_law.rs"]
+#[allow(dead_code)]
+mod loss_law;
 #[path = "merge_state_sim/oracle.rs"]
 #[allow(dead_code)]
 mod oracle;
@@ -383,6 +386,17 @@ fn explain(sc: &J, i: usize, k: usize, rust: &[String]) -> String {
     format!("\n  only in rust: {only_rust:#?}\n  only in the model: {only_py:#?}")
 }
 
+/// The pre-sync law check joins every `LAW_EVERY`th ordered triple by default; `Q7DIFF_LAW=all` joins all of them.
+const LAW_EVERY: usize = 1;
+
+/// The crowd-out the law check finds in the default 300 scripts (all ordered triples of the scripts of retention 10^9), per `K` the scripts drew:
+/// `(K, results judged, results that miss a required head, of those the results whose required heads alone fit under K)`, and the
+/// number of required heads missing from a result at `K` that holds an allowed record the oracle does not require (`Counts::crowded`).
+/// PINNED: a change in what the join detects, or in the rate of extras, changes them. Not re-pinned for a speed-up.
+const PINNED_LAW_CROWD_OUT_300: &[(usize, usize, usize, usize)] =
+    &[(4, 1620, 954, 92), (5, 1224, 708, 8), (8, 1800, 902, 58), (64, 6164, 0, 0)];
+const PINNED_LAW_CROWDED_HEADS_300: usize = 8886;
+
 /// What the replay of one script found.
 struct Replay {
     bad: Vec<String>,
@@ -390,10 +404,17 @@ struct Replay {
     /// The fingerprint of the script: every member's state and reads after every step, and every
     /// step's result (see `common/fingerprint.rs`).
     fp: u64,
+    /// What the law check did in this script (all zero where it did not run).
+    law: loss_law::Counts,
 }
 
 /// Replay one script with `opts`; the mismatches against the model's answers.
 fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
+    run_script_planted(sc, tweak, loss_law::Plant::None)
+}
+
+/// [`run_script`] with a plant in the pre-sync law check (`common/loss_law.rs`): the test of the test.
+fn run_script_planted(sc: &J, tweak: &dyn Fn(&mut JoinOptions), plant: loss_law::Plant) -> Replay {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
@@ -408,7 +429,8 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
         .map(|c| Mem { w: Writer::new(wid(c, 0), opts.clone()), contained: BTreeSet::new() })
         .collect();
     let mut log = oracle::Log::new();
-    let mut rep = Replay { bad: Vec::new(), ops: BTreeMap::new(), fp: 0 };
+    let mut rep =
+        Replay { bad: Vec::new(), ops: BTreeMap::new(), fp: 0, law: loss_law::Counts::default() };
     let mut fp = fingerprint::Fp::new();
     let ops = sc["ops"].as_array().unwrap();
     let exp = sc["expect"]["steps"].as_array().unwrap();
@@ -514,6 +536,26 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
                 return rep;
             }
         }
+    }
+    // The join law over the members as they stand, and what the records of every route may be (`common/loss_law.rs`): the
+    // pairs in every script, the state law inside the bound, the records where nothing outruns the retention.
+    let members: Vec<loss_law::Member> = ms
+        .iter()
+        .map(|m| loss_law::Member { state: &m.w.state, contained: &m.contained })
+        .collect();
+    let (bad, counts) = loss_law::check(
+        &members,
+        &log,
+        &opts,
+        ret,
+        bound,
+        loss_law::Scope::from_env(LAW_EVERY),
+        plant,
+    );
+    rep.law = counts;
+    if !bad.is_empty() {
+        rep.bad.push(loss_law::report(&bad));
+        return rep;
     }
     // final full-mesh sync
     for _ in 0..12 {
@@ -684,10 +726,21 @@ struct Verdict {
     ops: BTreeMap<String, usize>,
     /// The sum of the scripts' fingerprints, so that it does not depend on the threads.
     fp: u64,
+    /// What the law check did, summed.
+    law: loss_law::Counts,
 }
 
 /// Replay every script of `dir` on the Rust side, in `workers()` threads.
 fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> Verdict {
+    replay_planted(dir, tweak, loss_law::Plant::from_env())
+}
+
+/// [`replay`] with a plant in the pre-sync law check.
+fn replay_planted(
+    dir: &std::path::Path,
+    tweak: &(dyn Fn(&mut JoinOptions) + Sync),
+    plant: loss_law::Plant,
+) -> Verdict {
     let mut paths: Vec<PathBuf> =
         std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
     paths.sort();
@@ -703,14 +756,16 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
                         fails: Vec::new(),
                         ops: BTreeMap::new(),
                         fp: 0,
+                        law: loss_law::Counts::default(),
                     };
                     for p in ps {
                         let sc: J = serde_json::from_str(&std::fs::read_to_string(p).unwrap())
                             .expect("a script");
                         v.scripts += 1;
                         v.steps += sc["ops"].as_array().unwrap().len();
-                        let r = run_script(&sc, tweak);
+                        let r = run_script_planted(&sc, tweak, plant);
                         v.fp = v.fp.wrapping_add(r.fp);
+                        v.law.add(&r.law);
                         for (k, n) in r.ops {
                             *v.ops.entry(k).or_default() += n;
                         }
@@ -724,12 +779,20 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
             .collect();
         hs.into_iter().map(|h| h.join().expect("replay thread")).collect()
     });
-    let mut all = Verdict { scripts: 0, steps: 0, fails: Vec::new(), ops: BTreeMap::new(), fp: 0 };
+    let mut all = Verdict {
+        scripts: 0,
+        steps: 0,
+        fails: Vec::new(),
+        ops: BTreeMap::new(),
+        fp: 0,
+        law: loss_law::Counts::default(),
+    };
     for v in parts {
         all.scripts += v.scripts;
         all.steps += v.steps;
         all.fails.extend(v.fails);
         all.fp = all.fp.wrapping_add(v.fp);
+        all.law.add(&v.law);
         for (k, n) in v.ops {
             *all.ops.entry(k).or_default() += n;
         }
@@ -811,14 +874,64 @@ fn nested_differential_against_the_python_model() {
         v.fails.len()
     );
     println!("nested differential fingerprint ({n} scripts): {:#018x}", v.fp);
-    if n == 300 {
-        assert_eq!(v.fp, PINNED_300, "a state or a read changed");
+    println!(
+        "nested differential law check, before the final sync: {} ordered triples joined both ways ({} state laws checked, {} triples of small-retention scripts outside the per-origin bound), {} results judged in {:.1} s of thread time",
+        v.law.triples,
+        v.law.state_checked,
+        v.law.state_outside_bound,
+        v.law.results,
+        v.law.micros as f64 / 1e6,
+    );
+    for line in v.law.crowd_out_lines() {
+        println!("nested differential {line}");
     }
-    assert_eq!(v.scripts as u64, n, "every script was replayed");
+    println!(
+        "nested differential required heads crowded out by extras (a result at K that misses a required head and holds an allowed record that is not required): {}",
+        v.law.crowded
+    );
     for f in v.fails.iter().take(5) {
         println!("MISMATCH {f}");
     }
+    if n == 300 {
+        assert_eq!(v.fp, PINNED_300, "a state or a read changed");
+        if std::env::var("Q7DIFF_LAW").is_err() {
+            let per_k: Vec<(usize, usize, usize, usize)> =
+                v.law.per_k.iter().map(|(k, (r, m, c))| (*k, *r, *m, *c)).collect();
+            assert_eq!(
+                per_k, PINNED_LAW_CROWD_OUT_300,
+                "the detection or the rate of extras changed"
+            );
+            assert_eq!(
+                v.law.crowded, PINNED_LAW_CROWDED_HEADS_300,
+                "the detection or the rate of extras changed"
+            );
+        }
+    }
+    assert_eq!(v.scripts as u64, n, "every script was replayed");
     assert!(v.fails.is_empty(), "{} scripts disagree with the Python model", v.fails.len());
+}
+
+/// The test of the law check: each plant makes the check's own joins wrong in one defined way (`common/loss_law.rs`, `Plant`), and the
+/// check must fail with the tag it was designed to fail with (among its failures, in every script it fails) and fail at least one script.
+#[test]
+fn the_law_check_catches_its_plants() {
+    let scratch = Scratch::new("law-plants");
+    generate(&scratch.0, runs().min(300), None);
+    let base = replay_planted(&scratch.0, &|_| {}, loss_law::Plant::None);
+    assert!(base.fails.is_empty(), "the unplanted replay agrees: {:?}", base.fails.first());
+    for plant in loss_law::Plant::NESTED {
+        let v = replay_planted(&scratch.0, &|_| {}, plant);
+        println!("law plant {plant:?}: {} of {} scripts fail", v.fails.len(), v.scripts);
+        assert!(!v.fails.is_empty(), "the law check missed the plant {plant:?}");
+        for f in &v.fails {
+            let report = f.lines().nth(1).unwrap_or("");
+            assert!(
+                report.contains(&format!("{}=", plant.tag())),
+                "the plant {plant:?} must fail with {}, and failed: {report}",
+                plant.tag()
+            );
+        }
+    }
 }
 
 /// SEED 792, pinned. The nested script of seed 792 (4 members, retention 5) reaches a state the first 300 scripts do not: a register
