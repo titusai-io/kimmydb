@@ -431,6 +431,14 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 
 ---
 
+## 🟡 A `$setOnInsert` cell that an insert suppressed is reported as lost, and is never a side of a conflict
+
+**Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).** When an upsert and an explicit insert of one `_id` race, the insert's document is the base and the upsert's `$setOnInsert` cells are dropped. The dropped cell is reported (at least once) as an `insertLost` at its path. It is not also a `clash` or a `typeClash`: a conflict is between values the document could have shown, and the insert's own value, which it shows, is never named as the loser of one against a cell that is not in it. Two upserts that meet before the insert reaches a member can still have reported a `clash` between their cells, which stands (records are a union).
+
+**To close:** none planned.
+
+---
+
 ## 🟡 A loss record can name a write that is alive, and `retiredWriter` is reserved
 
 **Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).**

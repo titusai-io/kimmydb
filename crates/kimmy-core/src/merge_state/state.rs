@@ -729,14 +729,14 @@ impl MergeState {
     }
 
     /// Is some alive life an explicit insert (any insert, re-inserts included)?
-    fn insert_alive(&self, al: &BTreeSet<MStamp>) -> bool {
+    pub(super) fn insert_alive(&self, al: &BTreeSet<MStamp>) -> bool {
         al.iter().any(|a| self.lives.get(a).is_some_and(|v| v.kind == LifeKind::Insert))
     }
 
     /// V6m2: the creation cells of an upsert-created life are dropped when an
     /// explicit insert is alive (any insert, re-inserts included). `insert_alive` is that
     /// answer, asked for the first time it is needed and kept by the caller.
-    fn suppressed(
+    pub(super) fn suppressed(
         &self,
         life: &MStamp,
         r: &Reg,

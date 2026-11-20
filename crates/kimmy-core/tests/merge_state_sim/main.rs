@@ -469,13 +469,23 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   horizon 0xa3c93e720200ee58 -> 0xe89b742957e0c7f0
     //   bounded 0x83e73911c4ed16af (unchanged)
     //   bounded nested 0xdba30f39f2adb4df -> 0x633b0e853e0a1cd0
+    // RE-PINNED for the Step 4 delta (c) (Q7 Step 4, C5c2): a creation cell that an insert suppressed is no side of a clash or a
+    // typeClash, and is reported as an insertLost, so the runs that race an upsert with an explicit insert hold other loss records.
+    // `sequential` and `bounded nested` did not move.
+    //   restore 0x6441e0101b32f979 -> 0xef061166e78cce22
+    //   no restore 0xefc216dd0dfe3e52 -> 0x135909c1f3ed3659
+    //   bound 1000 0x251c0e78a7a72923 -> 0xa1fa6f923996f7a6
+    //   sequential 0xbb67e71425fc62ec (unchanged)
+    //   horizon 0xe89b742957e0c7f0 -> 0x50b53c2af7019e1c
+    //   bounded 0x83e73911c4ed16af -> 0x6da0bc5de4bfe6ed
+    //   bounded nested 0x633b0e853e0a1cd0 (unchanged)
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x6441e0101b32f979),
-        ("no restore", 0xefc216dd0dfe3e52),
-        ("bound 1000", 0x251c0e78a7a72923),
+        ("restore", 0xef061166e78cce22),
+        ("no restore", 0x135909c1f3ed3659),
+        ("bound 1000", 0xa1fa6f923996f7a6),
         ("sequential", 0xbb67e71425fc62ec),
-        ("horizon", 0xe89b742957e0c7f0),
-        ("bounded", 0x83e73911c4ed16af),
+        ("horizon", 0x50b53c2af7019e1c),
+        ("bounded", 0x6da0bc5de4bfe6ed),
         ("bounded nested", 0x633b0e853e0a1cd0),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");

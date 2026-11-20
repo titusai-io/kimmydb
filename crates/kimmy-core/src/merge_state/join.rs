@@ -554,6 +554,13 @@ pub(super) fn join_into(
         // The cells of both sides, before the join.
         let s = Side { regs: &out.regs, slots: &out.slots, vv: &out.vv };
         let t_side = Side { regs: &t.regs, slots: &t.slots, vv: &t.vv };
+        // A creation cell that an alive explicit insert suppresses (V6m2) is not a competitor of the
+        // insert's own cells: it takes part in no clash and no typeClash, and is reported by the
+        // insertLost below (the delta (c)). THE predicate of the read side, the one place it is decided,
+        // with its mutant switch.
+        let insert_alive = std::cell::RefCell::new(None);
+        let suppressed =
+            |l: &MStamp, r: &Reg| out.suppressed(l, r, &al, o, &mut insert_alive.borrow_mut());
 
         // (1) same-path register clashes: a register of s against a register of t,
         // concurrent by the version vectors. Two arrays are an `arrayClash`. Only a register
@@ -564,7 +571,7 @@ pub(super) fn join_into(
         #[cfg(test)]
         super::work::bump(super::work::Counter::Visits, t_side.regs.len());
         for ((l, p), r) in t_side.regs {
-            if alive.has(l) && !cov(s.vv, &r.stamp) {
+            if alive.has(l) && !cov(s.vv, &r.stamp) && !suppressed(l, r) {
                 by_path.entry(p).or_default().1.push(r);
             }
         }
@@ -574,6 +581,7 @@ pub(super) fn join_into(
             for ((l, p), r) in s.regs {
                 if alive.has(l)
                     && !cov(t_side.vv, &r.stamp)
+                    && !suppressed(l, r)
                     && let Some(group) = by_path.get_mut(p)
                 {
                     group.0.push(r);
@@ -620,14 +628,20 @@ pub(super) fn join_into(
                 }
                 let mut cells: Option<Vec<(&Path, MStamp, Held)>> = None;
                 for ((l, p), r) in a_st.regs {
-                    if !alive.has(l) || !r.value.is_plain() || cov(b_st.vv, &r.stamp) {
+                    if !alive.has(l)
+                        || !r.value.is_plain()
+                        || cov(b_st.vv, &r.stamp)
+                        || suppressed(l, r)
+                    {
                         continue;
                     }
                     let cells = cells.get_or_insert_with(|| {
                         let mut cells: Vec<(&Path, MStamp, Held)> = b_st
                             .regs
                             .iter()
-                            .filter(|(k, r)| alive.has(&k.0) && r.value.is_plain())
+                            .filter(|(k, r)| {
+                                alive.has(&k.0) && r.value.is_plain() && !suppressed(&k.0, r)
+                            })
                             .map(|(k, r)| (&k.1, r.stamp, Held::Value(&r.value)))
                             .chain(
                                 b_st.slots
@@ -693,19 +707,15 @@ pub(super) fn join_into(
             }
         }
 
-        // V6m2: creation cells of an upsert life dropped for an alive explicit first insert.
-        if al.iter().any(|l| out.lives[l].kind == LifeKind::Insert) {
-            for src in [&s, &t_side] {
-                for (k, r) in src.regs {
-                    if r.soi
-                        && alive.has(&k.0)
-                        && out.lives.get(&k.0).is_some_and(|l| l.kind == LifeKind::Upsert)
-                    {
-                        new.insert(
-                            key(LossKind::InsertLost, &k.1, r.stamp),
-                            LossValue::Value(r.value.clone()),
-                        );
-                    }
+        // V6m2: creation cells of an upsert life dropped for an alive explicit first insert: the cells
+        // the predicate suppresses, each reported (at least once) as an insertLost.
+        for src in [&s, &t_side] {
+            for (k, r) in src.regs {
+                if alive.has(&k.0) && suppressed(&k.0, r) {
+                    new.insert(
+                        key(LossKind::InsertLost, &k.1, r.stamp),
+                        LossValue::Value(r.value.clone()),
+                    );
                 }
             }
         }
