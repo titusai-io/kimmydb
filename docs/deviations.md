@@ -4179,6 +4179,68 @@ update its own rule.
 
 **Recorded 2026-11-15 (`q7s3n`, three containers; `q7s3k0001` and `q7s3k0008`).** A sort with no unique last key leaves the order of tied documents to the engine. Ours keeps the stored order, ascending and descending alike, for `find` and for a `$sort` stage. The reference does the same when it sorts in memory: with no index on `v`, `{v: -1}` answers `[1, 2, 13, 14, 3, 4, 5, 6, 7, 8, 11, 12, 9, 10]` and `{v: 1}` answers `[9, 10, 11, 12, 7, 8, 5, 6, 3, 4, 13, 14, 1, 2]`, the same lists as with `_id: 1` added. With an index on `v`, `{v: 1}` gives that same ascending list, and a sort that ends in `_id` gives the in-memory lists whatever the index. The reference reverses ties only when a descending sort without a unique key is served by a backward index scan: `{v: -1}` then answers `[2, 1, 14, 13, 4, 3, 6, 5, 8, 7, 12, 11, 10, 9]`, the exact reverse of the ascending list, ties included. Unhinted and hinted answers agree. `sort_ties.rs` compares the no-index rows and every row that ends in `_id` exactly, and the index-served `{v: -1}` rows (find and `$sort` stage) group by group: the sequence of distinct key values equal, each group of equal keys the same ids as a set. `nan_inf_index.rs` does the same for a sorted row of q7s3k whose sort has no unique last key. A kept difference: no engine change, since the order of ties is unspecified. **To close:** none planned; a descending read of an index would have to reverse its ties.
 
+When members write one document concurrently, every member serves the same order, and that order is the outcome of some order the writes could have been applied in, one the writes' causal order allows (the field-order D-item, 2026-10-31). It need not be the order of the write timestamps. The five entries are the cases where the order is NOT the outcome of any such order. In all of them the VALUES are what the merge rules give; only the position of a field differs, the same on every member.
+
+<a id="order-noop-unset-q7"></a>
+
+## 🟡 An update that `$unset`s a field it never saw can still move that field
+
+**What you will see.** An `$unset` removes what its writer saw. If the writer never saw the field, the `$unset` removes nothing, and a concurrent write to that field survives. When that `$unset` sits in an update that changes something else, the field is also re-placed: it is shown after the fields the updating member knew, as if it had been created after the update.
+
+**Example.** A document `{k: 0, a: {c: 1}}` is on members A, B and C. B runs `$set a {d: 1, c: 2}`, so `a` reads `{d, c}`. C, which has not seen `a.d`, runs `update {$unset: {"a.d": ""}, $inc: {k: 1}}`. The `$unset` removes nothing at C; only the `$inc` is a change. Every member serves `a = {c: 2, d: 1}`: `d` is kept and shown after `c`. Had C's update run first, `a` would read `{d, c}`; had it run second, `d` would be gone.
+
+**Why.** The update records where the field's place restarts, so that the same field ends up in the same place on every member.
+
+**Workaround.** None needed for values. If the order of a document's fields must be exact, write the whole document with one whole-document replace (a `PUT` of the document by id): it names the order.
+
+<a id="order-r-floor-q7"></a>
+
+## 🟡 When two writers replace or set a document at the same time, the replace that is newest names the order of the fields it names
+
+**What you will see.** A replace (or a `$set` of a whole sub-document) re-assigns the positions of the fields it names, in the order it names them. When another member changed some of those fields at the same time, the fields the newest replace names keep ITS order, even where the order the writes could have run in would give another.
+
+**Example.** A document `{a: {b: 0, c: 2, d: {e: 1}}}` is on members A, B and C. A runs `$set a {c: 2, b: 1}` (so `c` before `b`). C, which saw A's write, runs `$set a.b "s"`. B, which saw neither, replaces the document with `{a: {b: 0, d: {e: 1}, c: 2}, z: 1}` (so `b` before `c`) and then runs `$set a.c 2.5`. Every member serves `a = {b: "s", c: 2.5}`: `b` before `c`, the order B's replace names. No order the writes could have run in gives these values together with that order: the orders that keep `b: "s"` and `c: 2.5` list `c` before `b` or keep `d`.
+
+**Why.** The newest replace re-assigns the positions of what it names, whatever other members did to those fields.
+
+**Workaround.** A client that needs an order under concurrency makes one member write it.
+
+<a id="order-survivors-q7"></a>
+
+## 🟡 A field written at the same time as a replace or an unset survives it, and is shown after the fields the replace names
+
+**What you will see.** A replace (or `$unset`) removes what its writer saw. A field that another member wrote at the same time, which the writer had not seen, stays. It is shown after the fields the replace names and before any field made later. Fields that survive together are ordered by when they were written and, when that ties (they came from one write, or from before what the replacing member knew), by path name.
+
+**Example.** A document `{x: 1, z: 0}` is on members A, B, C and D. C runs `update {$set: {y: 0, z: 1}}`. B, which has not seen C's write, replaces the document with `{x: 2, z: 9}`; its `z` is newer and wins. D, which saw both, runs `$set w 1` and then `$set y 5`. Every member serves `{x: 2, z: 9, y: 5, w: 1}`. The replace never saw `y`, so `y` survives it and keeps its place before `w`, which D made later. Replaying the writes in any order that gives the same values puts `y` after `w`.
+
+**Why.** An unset removes only what its writer saw; what remains is placed as if it were created just after the replace.
+
+**Workaround.** To drop every field of a document and keep none that another member adds at the same time, serialize the replace through one member.
+
+<a id="order-counter-summing-q7"></a>
+
+## 🟡 A counter that is added to while another member sets it keeps the place of the first addition
+
+**What you will see.** Under the `field` merge policy a `$set` does not erase an increment its writer did not see: the counter reads the set value plus the increment. The counter's field keeps the place of the FIRST write that made it, even where the value only comes out right if the `$set` ran before the increment.
+
+**Example.** A document `{k: 2}` is on members A, B and C. A runs `$inc a.b 2` (which creates `a`). B runs `$set c 0`. C, which saw B's write but not A's, runs `$set a.b 7`. Every member serves `{k: 2, a: {b: 9}, c: 0}`. The value 9 needs the `$set` to run before the `$inc`, and then `a` would be created after `c`; the document shows `a` before `c`, where A's increment made it.
+
+**Why.** A field's place is the stamp of the write that made it, and a stamp cannot say "as if it ran later".
+
+**Workaround.** None needed for values. Do not rely on the order of fields that are created through counters by members writing at the same time.
+
+<a id="order-surviving-counter-q7"></a>
+
+## 🟡 Increments that survive a replace sit at the time they were made, and by path name when that ties
+
+**What you will see.** A counter has no position of its own. When a replace removes a field but leaves increments another member made at the same time, those increments are the field. The field sits where the increment was made. Two such fields made by ONE write tie, and go by path name, not in the order the write named them.
+
+**Example.** A document `{k: 0, a: {c: 1, d: 1}}` is on members A and B. A runs `update {$inc: {"a.d": 1, "a.c": 1}}` (naming `d` first). B, which has not seen it, replaces the document with `{k: 5}`. Every member serves `{k: 5, a: {c: 1, d: 1}}`: the replace removed what B saw, and the increments survive as `c: 1`, `d: 1`, shown `c` then `d`. Replaying A's update after the replace names them `d` then `c`.
+
+**Why.** A surviving counter is placed at the time of its last increment with position 0, so two of them from one write tie, and a tie is broken by path (the rule for every field of a level, `(born, path)`).
+
+**Workaround.** None needed for values. Do not rely on the order of two counters under a field that another member replaces.
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —

@@ -247,7 +247,17 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
             fg(g),
             fs(&sl.stamp),
             total(&sl.total),
-            sl.pair().map_or("-".to_string(), |(st, n)| format!("{},{}", fs(&st), total(&n)))
+            if sl.absorbed.is_empty() {
+                "-".to_string()
+            } else {
+                // one pair per writing life, sorted by life, as the model's digest spells them
+                let pairs: Vec<String> = sl
+                    .absorbed
+                    .iter()
+                    .map(|p| format!("{}@{},{}", fs(&p.life), fs(&p.stamp), total(&p.total)))
+                    .collect();
+                pairs.join(";")
+            }
         ));
     }
     for (w, h) in &s.vv {
@@ -777,7 +787,11 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// RE-PINNED for the pair list (a slot's absorbed pairs are a count, then each pair's life index, stamp, type byte and payload): the
 /// states' compact bytes moved and no read did; 0 scripts disagree with the model.
 /// 0x219a_e1c8_86cc_57a7 to 0x179f_3394_5810_5e45. With `Q7DIFF_FORCE_K=64` it is 0x8acc_d209_bbe5_f90c, the pin before the cap, exactly.
-const PINNED_300: u64 = 0x179f_3394_5810_5e45;
+///
+/// RE-PINNED for the absorbed pair keyed by its WRITING life (model f9702ee2): the digest text spells a slot's pairs by writing life
+/// (`abs=<life>@<stamp>,<total>;...`) and the fingerprint folds it. 0 scripts disagree with the new model.
+/// 0x179f_3394_5810_5e45 to 0x333d_accd_3881_0900. With `Q7DIFF_FORCE_K=64` it is 0x25f1_d951_4570_4ad5, the pin before the cap, exactly.
+const PINNED_300: u64 = 0x333d_accd_3881_0900;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -940,7 +954,7 @@ fn the_vendored_model_is_the_reviewed_one() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
-        ("model6.py", "76dedeaaab9fd6b8534739c852fc7be2b426215b7eb923ae8c3406b69797da4f"),
+        ("model6.py", "f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61"),
         ("pullmodel6.py", "6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"),
     ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
@@ -948,7 +962,7 @@ fn the_vendored_model_is_the_reviewed_one() {
         assert_eq!(got, want, "{file}");
     }
     let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-    assert!(recorded.contains("76dedeaaab9fd6b8534739c852fc7be2b426215b7eb923ae8c3406b69797da4f"));
+    assert!(recorded.contains("f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61"));
     assert!(recorded.contains("6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"));
 }
 

@@ -178,10 +178,13 @@ pub struct OverCaps {
 }
 
 /// What a base write absorbed of a slot: the highest `(stamp, total)` of THIS slot that a base write made in the life
-/// `life` had held when it wrote (see [`Slot`]). The pairs of a slot are kept sorted by `life`, one per life.
+/// `life` had held when it wrote (see [`Slot`]). A pair is a fact about the WRITE, as the write's register, its generation's `seen`
+/// and its order candidates are, and goes with the write's life: a write into a superseded life is dropped, and so is what it absorbed.
+/// The pairs of a slot are kept sorted by `life`, one per life.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Pair {
-    /// The life the base write was made in. Today (the layout of the pair list) it is the slot's own life.
+    /// The life the base write was made in (the WRITING life, not the slot's: a base made into one life can absorb the slots of
+    /// another). The pair goes when that life is not alive, and when the life of its slot is not.
     pub life: MStamp,
     pub stamp: MStamp,
     pub total: Num,
@@ -195,7 +198,8 @@ pub struct Pair {
 /// so the read side counts only what the slot gained since the highest pair of a live life
 /// ([`Slot::effective_pair`], [`MergeState::value`]); the stamp tells a slot that has not moved since from one that
 /// moved and came back to the same total (the B1 rule: the field is present when the slot moved). The pairs live on
-/// the slot: they are joined by life, the higher stamp per life, and dropped with the slot's life. An honest pair is
+/// the slot: they are joined by life, the higher stamp per life, and dropped with their writing life and with the life of their slot (no
+/// pair without its slot). An honest pair is
 /// never above the slot (`stamp <= slot stamp`) and equals it in the total when the stamps are equal.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
@@ -306,6 +310,20 @@ impl Slot {
             Err(i) => {
                 self.absorbed.insert(i, Pair { life, stamp: self.stamp, total: self.total });
             }
+        }
+    }
+
+    /// Re-home the pair `p`, whose writing life is gone, onto `life` (the slot's own): it becomes the pair of `life`,
+    /// merged with the one already there by the higher stamp. The list stays sorted by life, one pair per life.
+    pub(super) fn rehome(&mut self, life: MStamp, p: Pair) {
+        let p = Pair { life, ..p };
+        match self.absorbed.binary_search_by(|x| x.life.cmp(&life)) {
+            Ok(i) => {
+                if p.stamp > self.absorbed[i].stamp {
+                    self.absorbed[i] = p;
+                }
+            }
+            Err(i) => self.absorbed.insert(i, p),
         }
     }
 

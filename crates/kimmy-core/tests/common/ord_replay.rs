@@ -14,7 +14,7 @@ use kimmy_core::merge_state::{
 use serde_json::Value as J;
 
 const SCRIPTS: &str = include_str!("../data/ord_diff_scripts.json");
-const MODEL6_SHA256: &str = "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d";
+const MODEL6_SHA256: &str = "f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61";
 
 fn wid(c: char) -> WriterId {
     WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(0) }

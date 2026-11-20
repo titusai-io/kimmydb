@@ -92,6 +92,16 @@ pub struct JoinOptions {
     /// (the newest alive life), not those of the other alive lives of the path. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     fold_life_only: bool,
+    /// Counter cell mutant (the absorbed pair's keying): a base write files its absorbed pair under
+    /// the life of the slot it names, not under the life the write is made in (the old rule). Off in
+    /// the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    absorb_by_slot_life: bool,
+    /// Counter cell mutant (the absorbed pair's layout): a join keeps ONE pair per slot, the highest
+    /// stamp, picked before the alive filter, so a dominated pair of a surviving life is lost with the
+    /// winner's life. Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    single_pair: bool,
     /// Counter cell mutant (review m5): a write of a map marker (`$set a {..}` over a counter at
     /// `a`) folds no slot of the path; the other base writes do. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
@@ -243,6 +253,10 @@ impl Default for JoinOptions {
             fold_counted_only: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             fold_life_only: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            absorb_by_slot_life: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            single_pair: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_fold_marker: false,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -403,6 +417,8 @@ impl JoinOptions {
     switch!(creation_without_generation, set_creation_without_generation, false);
     switch!(fold_counted_only, set_fold_counted_only, false);
     switch!(fold_life_only, set_fold_life_only, false);
+    switch!(absorb_by_slot_life, set_absorb_by_slot_life, false);
+    switch!(single_pair, set_single_pair, false);
     switch!(no_fold_marker, set_no_fold_marker, false);
     switch!(normalize_writes, set_normalize_writes, true);
     switch!(type_ignores_recency, set_type_ignores_recency, false);
@@ -806,8 +822,9 @@ pub(super) fn join_into_counted(
             out.regs.insert(k.clone(), r.clone());
         }
     }
-    // A slot: the higher stamp wins; its absorbed pair joins on its own, the higher absorbed
-    // stamp winning (the pair of the slot that lost is kept if it is the higher).
+    // A slot: the higher stamp wins; its absorbed pairs join on their own, by writing life, the higher
+    // stamp per life winning (the pairs of the slot that lost are kept). A pair of a life that is not
+    // alive goes after the union, below, with the slot of a life that is not alive.
     for (k, v) in &t.slots {
         if !alive.has(&k.0) {
             continue;
@@ -861,6 +878,21 @@ pub(super) fn join_into_counted(
     let alive = Alive::new(&al);
     out.regs.retain(|k, _| alive.has(&k.0));
     out.slots.retain(|k, _| alive.has(&k.0));
+    // The pairs: a pair goes with its writing life, and with the life of its slot (the slot is gone
+    // above, and its pairs with it): no pair without its slot, as the model's join drops it. (The
+    // mutant `single_pair` keeps one pair per slot, the highest stamp, picked BEFORE this filter,
+    // so the pair of a life that stays is lost with the winner's life.)
+    #[cfg(any(test, feature = "merge-mutants"))]
+    if o.single_pair() {
+        for s in out.slots.values_mut() {
+            if let Some(best) = s.absorbed.iter().max_by_key(|p| (p.stamp, p.life)).copied() {
+                s.absorbed = vec![best];
+            }
+        }
+    }
+    for s in out.slots.values_mut() {
+        s.absorbed.retain(|p| alive.has(&p.life));
+    }
     out.gens.retain(|k, _| alive.has(&k.0));
     // an entry that says nothing is no entry: an empty one and none are the same state
     out.ords.retain(|k, x| alive.has(&k.0) && !x.is_empty());

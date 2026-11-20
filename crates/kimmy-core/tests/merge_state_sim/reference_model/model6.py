@@ -50,6 +50,9 @@ ARRAYS_ELEMENTWISE = False # mutant: concurrent array registers merge element-wi
 NO_IMPLICIT_MARKER = False  # mutant: a leaf write under an absent map writes no marker (an emptied map vanishes)
 # option A (field order). ORDER_STATE False = the model without order state (visible keys sorted by path, as before).
 ORDER_STATE = True
+ABSORB_BY_WRITING_LIFE = True   # an absorbed pair belongs to the life the base write was made in (it goes when that life is dropped, and when the life of its slot is); False = mutant: the old keying, by the slot's own life
+ABSORB_SINGLE_PAIR = False      # mutant: one pair per slot (the highest stamp), tagged with its writing life: a dominated pair of another life is lost with the winner's life
+READ_WITHOUT_OBS = False        # run the families on the Rust's read: the register `obs` is not consulted (only the absorbed pairs), so a layout mistake the obs would hide shows
 ABSORBED = True            # Q6: a counter cell remembers the highest (stamp, total) of each slot that any base write observed
 COPY_DEEP = False          # State.copy by copy.deepcopy (the model5 way) instead of the structural copy
 ORD_GC = False             # collect an Ord with no valid candidate and a floor older than the horizon
@@ -331,7 +334,7 @@ class State:
         self.lives, self.deletes, self.regs, self.slots = {}, {}, {}, {}
         self.gens, self.vv, self.losses = {}, {}, {}
         self.ords = {}             # option A: (life, path) -> Ord (the field-order state)
-        self.absorbed = {}         # Q6: slot key (life, path, writer, gen) -> the highest (slot stamp, total) any base write observed
+        self.absorbed = {}         # Q6: (writing life, slot key (life, path, writer, gen)) -> the highest (slot stamp, total) a base write made in that life observed; dropped with the writing life
         self.dead = set()          # lives known dead; grow-only until their stamp passes the horizon
         self.contained = set()      # ORACLE ONLY
 
@@ -421,9 +424,12 @@ class State:
     def eff_obs(self, obs, k):
         """What has been observed of slot k: the winning base's own observation, or (Q6) the highest observation any base write
         on the path made, whichever is later."""
-        o = obs.get(k[0:1] + k[2:])
+        o = None if READ_WITHOUT_OBS else obs.get(k[0:1] + k[2:])
         if ABSORBED:
-            a = self.absorbed.get(k)
+            a, akey = None, None
+            for (wl, *sk), v in self.absorbed.items():      # only base writes made in a life that is still alive count (they are dropped with it)
+                if tuple(sk) == k and (akey is None or (v[0], wl) > akey):      # the highest stamp; equal stamps (not honest) by writing life, never by dict order
+                    a, akey = v, (v[0], wl)
             if a is not None and (o is None or a[0] > o[0]):
                 return a
         return o
@@ -580,6 +586,16 @@ def obs_key(L, w, gen):
     return (L,) + (w, gen)
 
 
+def _single_pair(absorbed):
+    """MUTANT (ABSORB_SINGLE_PAIR): one pair per slot, the highest stamp, tagged with its writing life."""
+    best = {}
+    for k, v in absorbed.items():
+        sk = k[1:]
+        if sk not in best or (v[0], k) > (absorbed[best[sk]][0], best[sk]):
+            best[sk] = k
+    return {k: absorbed[k] for k in best.values()}
+
+
 def _prefilter(st, H):
     st = st.copy()
     for d in [d for d in st.deletes if d[0] < H]:
@@ -596,7 +612,9 @@ _LOSS_KIND_ORDER = {"clash": 0, "deleteWon": 1, "insertLost": 2, "retiredWriter"
 def loss_rank(key):
     """The order the cap keeps the greatest of (Rust `LossKey::rank_cmp`): the loser's stamp, then what the record is
     about (a path compared segment by segment, the whole document `_` first among equals), then the kind in the
-    order of the Rust enum (clash, deleteWon, insertLost, retiredWriter, typeClash, arrayClash)."""
+    order of the Rust enum (clash, deleteWon, insertLost, retiredWriter, typeClash, arrayClash). The model spells the whole
+    document and a field named `_` alike (both the path `_`), where Rust puts the document first of the two; the generators
+    never draw a field named `_`, so no script tells them apart."""
     kind, path, stamp = key
     return (stamp, (tuple(path.split(".")), 0 if path == "_" else 1), _LOSS_KIND_ORDER[kind])
 
@@ -644,6 +662,8 @@ def join(s, t, tag=None):
     for k, v in t.absorbed.items():
         if ok(k[0]) and (k not in out.absorbed or v[0] > out.absorbed[k][0]):
             out.absorbed[k] = v
+    if ABSORB_SINGLE_PAIR:           # the mutant picks the winner BEFORE the alive filter below, so the pair of a surviving life is lost with the winner's life
+        out.absorbed = _single_pair(out.absorbed)
     for k, o in t.ords.items():
         if ok(k[0]):
             out.ords[k] = ord_join(out.ords.get(k), o)
@@ -735,6 +755,10 @@ def join(s, t, tag=None):
     for store in (out.regs, out.slots, out.gens, out.ords, out.absorbed):
         for k in [k for k in store if k[0] not in al]:
             del store[k]
+    if ABSORB_BY_WRITING_LIFE:       # a pair goes with the life of its slot as well (k[1]): no pair without its slot (the Rust holds the pair on the slot)
+        for k in [k for k in out.absorbed if k[1] not in al]:
+            del out.absorbed[k]
+
     H = out.horizon()
     for d in [d for d in out.deletes if d[0] < H]:
         del out.deletes[d]
@@ -799,9 +823,11 @@ class Member:
             held = {(k[0], k[2], k[3]): (v[0], v[1]) for k, v in s.slots.items() if k[1] == p and k[0] in set(s.alive())}
             for src in (obs, held):
                 for (l2, w2, g2), sv in src.items():
-                    key = (l2, p, w2, g2)
+                    key = (L if ABSORB_BY_WRITING_LIFE else l2, l2, p, w2, g2)
                     if key not in s.absorbed or sv[0] > s.absorbed[key][0]:
                         s.absorbed[key] = sv
+            if ABSORB_SINGLE_PAIR:
+                s.absorbed = _single_pair(s.absorbed)
         if not numeric(v):
             s.gens[(L, p)] = (st, dict(vvnow))      # kept only for the V3M3 mutant
 
@@ -1063,7 +1089,10 @@ class Member:
         self._ord_apply(self._events(items), st)
         if incs and not eff and len(incs) == 1:
             (q, n), = incs.items()
-            return self.finish(st, log, {"kind": "inc", "life": L, "paths": [q], "n": n, "gen": gens[q], "items": items})
+            meta = {"kind": "inc", "life": L, "paths": [q], "n": n, "gen": gens[q], "items": items}
+            if len(ops) > 1:
+                meta["replay"] = intent          # the update also held operators that were no-ops at its writer (a `$unset` of an absent field): the serial replay must run them
+            return self.finish(st, log, meta)
         meta = {"kind": "reg", "life": L, "paths": list(eff), "vals": dict(eff), "intent": intent, "items": list(items)}
         if incs:
             meta["incs"], meta["ipaths"] = dict(incs), list(incs)
@@ -1748,7 +1777,17 @@ def intent_of(m):
     """The operation a log entry stands for, or None for entries the replay does not model."""
     if m.get("upsert") or m.get("soi") is not None or m["kind"] == "insert" and m.get("upsert"):
         return "unsupported"
+    if m.get("replay") is not None:
+        return m["replay"]
     if m["kind"] == "inc":
+        if m.get("insert"):                         # an `$inc` that CREATES the document (an upsert): the insert of its creation document
+            doc = {}
+            segs = m["paths"][0].split(".")
+            d = doc
+            for sg in segs[:-1]:
+                d = d.setdefault(sg, {})
+            d[segs[-1]] = m["n"]
+            return ("insert", None, doc)
         return ("inc", m["paths"][0], m["n"])
     it = m.get("intent")
     if it is None or it[0] == "implicit":
@@ -1862,32 +1901,397 @@ class _Counter(dict):
 ORDER_STATS = _Counter()
 
 
+ORDER_EXT_BOUND = 10000    # complete linear extensions the serial-order walk tries per history; past it the history is decided by the order RULE alone (below)
+
+
+def serial_orders(log, cap=None):
+    """The linear extensions of the log's causal order (every write after everything in its causal past), the stamp order first.
+    Yields at most `cap` COMPLETE extensions (the unit is complete extensions, not tree nodes); the returned state says whether more existed."""
+    cap = ORDER_EXT_BOUND if cap is None else cap
+    ss = sorted(log)
+    state = {"n": 0, "cut": False}
+
+    def rec(done, placed, rest):
+        if state["cut"]:
+            return
+        if not rest:
+            if state["n"] >= cap:
+                state["cut"] = True
+                return
+            state["n"] += 1
+            yield done
+            return
+        for s_ in rest:
+            if log[s_][0] <= placed:
+                yield from rec(done + [s_], placed | {s_}, [r for r in rest if r != s_])
+                if state["cut"]:
+                    return
+    return rec([], frozenset(), ss), state
+
+
+# --- the order RULE restated from the log (closed form), used to test the placement of a mismatching level EXACTLY -----------------------------
+# The order check restates the few helpers it shares with the writer, so a defect in one of them cannot hide itself (the writer's insert items, ancestors and path
+# lookups are what the items it emitted are judged against).
+def _o_parent(p):
+    return p[:p.rindex(".")] if "." in p else None
+
+
+def _o_ancestors(p):
+    out, cur = [], ""
+    for seg in p.split(".")[:-1]:
+        cur = cur + "." + seg if cur else seg
+        out.append(cur)
+    return out
+
+
+def _o_get(d, p):
+    for seg in p.split("."):
+        if not isinstance(d, dict) or seg not in d:
+            return None
+        d = d[seg]
+    return d
+
+
+def _o_plain(v):
+    return v is not None and not (isinstance(v, str) and v in (MAP, MAPI))
+
+
+def _o_insert_items(doc, prefix=""):
+    """An insert names every map and every leaf of its document, in document order (a map before what is in it)."""
+    out = []
+    for k, v in doc.items():
+        q = prefix + k
+        out.append((q, "w"))
+        if isinstance(v, dict):
+            out += _o_insert_items(v, q + ".")
+    return out
+
+
+_BIG = 10 ** 9
+
+
+class _Rule:
+    """The field order the design's rule gives, computed from the log alone (never from a replicated Ord state): per path, the candidates (writes that name
+    it), the floors (unsets and resets), the per-writer first valid candidate and the latest write, the survivor clamp, the level floor. Fields of a
+    level are shown sorted by (born, path)."""
+
+    def __init__(self, log):
+        self.log = log
+        self.cands, self.floors, self.lvl, self.pos = {}, {}, {}, {}
+        for w, (ctx, m) in log.items():
+            seen = {}
+            others = any(md not in ("u", "L") for q, md in m.get("items", []))
+            for q, md in m.get("items", []):
+                if md == "L":
+                    self.lvl[q] = max(self.lvl.get(q, w), w)
+                elif md == "u":
+                    self.floors.setdefault(q, []).append((w, "u", others))
+                else:
+                    d = seen.setdefault(_o_parent(q), {})
+                    if q not in d:
+                        d[q] = len(d)
+                    self.cands.setdefault(q, []).append((w, d[q]))
+                    if md == "r":
+                        self.floors.setdefault(q, []).append((w, "r", others))
+        self.memo = {}
+
+    @staticmethod
+    def _valid(c, f):
+        return f is None or c[0] > f[0] or (c[0] == f[0] and f[1] == "r")
+
+    def _floor(self, q, within=None):
+        fs = [f for f in self.floors.get(q, []) if within is None or f[0] in within]
+        return max(fs, key=lambda f: (f[0], f[1] == "r")) if fs else None
+
+    def _born0(self, q):
+        """The candidates of q under its own floors: per writer the first write since the floors that writer KNEW (a later write of its own is not kept
+        once the floor dropped the first: the approximate case of ruling (a)), and the latest write overall."""
+        cs = self.cands.get(q, [])
+        if not cs:
+            return None, None
+        F = self._floor(q)
+        by_w = {}
+        for w, pos in cs:
+            by_w.setdefault(w[1], []).append((w, pos))
+        firsts = []
+        for W, lst in by_w.items():
+            lst.sort()
+            first, timeline = None, []
+            for w, pos in lst:
+                ctx = self.log[w][0] | {w}
+                Fv = self._floor(q, ctx)
+                if first is not None and not self._valid(first, Fv):
+                    first = None
+                if first is None:
+                    first = (w, pos)
+                    timeline.append(first)
+            firsts += [c for c in timeline if self._valid(c, F)]
+        last = max(cs)
+        cand = firsts + ([last] if self._valid(last, F) else [])
+        return (min(cand) if cand else None), F
+
+    def _plain_winner(self, q):
+        best = None
+        for w, (ctx, m) in self.log.items():
+            if q in m.get("paths", []) and m["kind"] in ("insert", "reg"):
+                if best is None or w > best[0]:
+                    best = (w, m["vals"].get(q))
+        return best
+
+    def _slot_cands(self, q, fstamp, place):
+        out = []
+        incs = {}
+        for w, (ctx, m) in self.log.items():
+            if q in incs_of(m):
+                incs.setdefault(w[1], []).append(w)
+        bases = [(w, ctx) for w, (ctx, m) in self.log.items() if q in m.get("paths", []) and m["kind"] in ("insert", "reg")]
+        for W, ws in incs.items():
+            latest = max(ws)
+            if latest < fstamp and not any(latest in ctx for w, ctx in bases):
+                out.append(place((latest, 0)))
+        return out
+
+    def born(self, q):
+        if q in self.memo:
+            return self.memo[q]
+        self.memo[q] = None                      # guards recursion
+        b, F = self._born0(q)
+        if F is not None and F[1] == "u":
+            fstamp, others = F[0], F[2]
+            prev = max([c[0] for c in self.log[fstamp][0]], default=0)
+            after_known = (prev, ("\U0010ffff", 0))
+            def place(c):
+                if others:
+                    return (fstamp, _BIG, c)
+                return c if c[0] >= after_known else (after_known, 0)
+            surv = self._slot_cands(q, fstamp, place)
+            win = self._plain_winner(q)
+            if win is not None and _o_plain(win[1]) and win[0] < fstamp:
+                surv.append(place((win[0], 0)))
+            below = {p for p in list(self.cands) + [x for w, (c, m) in self.log.items() for x in incs_of(m)] if p.startswith(q + ".")}
+            for r in sorted(below):
+                wr = self._plain_winner(r)
+                if wr is not None and _o_plain(wr[1]) and wr[0] < fstamp:
+                    br = self.born(r)
+                    surv.append(place(br if br is not None else (wr[0], 0)))
+                surv += self._slot_cands(r, fstamp, place)
+            for c in surv:
+                b = c if b is None or c < b else b
+        par = _o_parent(q) or ""
+        lv = self.lvl.get(par)
+        if b is not None and lv is not None and b[0] < lv:
+            b = (lv, _BIG, b)
+        self.memo[q] = b
+        return b
+
+    def level_order(self, level, fields):
+        """`fields` ordered by (born, path); a field with no born last."""
+        def key(f):
+            q = (level + "." if level else "") + f
+            b = self.born(q)
+            return (1, (), q) if b is None else (0, b, q)
+        return sorted(fields, key=key)
+
+
+def _item_summary(items):
+    """What an item list says: the fields a write names, per parent, in the order it names them; which of them it resets; the paths it unsets; the levels it marks."""
+    names, resets, unsets, levels = {}, set(), set(), set()
+    for q, md in items:
+        if md == "u":
+            unsets.add(q)
+        elif md == "L":
+            levels.add(q)
+        else:
+            lst = names.setdefault(_o_parent(q), [])
+            if q not in lst:
+                lst.append(q)
+            if md == "r":
+                resets.add(q)
+    return names, resets, unsets, levels
+
+
+def _want_items(intent, view):
+    """The order items a write with `intent` must carry, from the document its writer saw (`view`), derived from the design's words and not from the writer's
+    code (Rust's `order_oracle::write_ord` does the same): a value written at a path names it; a document names the map, marks the level, names every field it
+    holds as a reset and unsets what the writer saw below the path that it lacks; a scalar over a map unsets what was below; an unset removes the leaves and maps
+    the writer saw, deepest first; every ancestor of a written path is named once before it; an unset of what the writer did not see is a no-op that leaves a
+    floor (the hybrid, ruled 2026-11-03) at the end of an update that stands."""
+    op, p, arg = intent
+    view = view or {}
+    out, anc_seen, pending = [], set(), []
+
+    def below_unset(path, o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                below_unset(path + "." + k, v)
+        out.append((path, "u"))
+
+    def value_at(path, cur, n, mode):
+        if n is None:
+            if cur is not None:
+                below_unset(path, cur)
+            return
+        if isinstance(n, dict):
+            curd = cur if isinstance(cur, dict) else None
+            out.append((path, mode))
+            out.append((path, "L"))
+            for k, v in n.items():
+                value_at(path + "." + k, curd.get(k) if curd is not None else None, v, "r")
+            if curd is not None:
+                for k, ov in curd.items():
+                    if k not in n:
+                        below_unset(path + "." + k, ov)
+            return
+        if isinstance(cur, dict):
+            for k, ov in cur.items():
+                below_unset(path + "." + k, ov)
+        out.append((path, mode))
+
+    def anc(q):
+        for a in _o_ancestors(q):
+            if a not in anc_seen:
+                anc_seen.add(a)
+                out.append((a, "w"))
+
+    def one(o_, q, v):
+        cur = _o_get(view, q)
+        if o_ == "set":
+            anc(q)
+            value_at(q, cur, v, "w")
+        elif o_ == "unset":
+            if cur is None:
+                pending.append((q, "u"))
+            else:
+                below_unset(q, cur)
+        else:                                            # inc
+            anc(q)
+            if isinstance(cur, float):
+                value_at(q, cur, cur + v, "w")
+            else:
+                out.append((q, "w"))
+
+    if op == "insert":
+        return _o_insert_items(arg)
+    if op == "replace":
+        out.append(("", "L"))
+        for t, v in arg.items():
+            value_at(t, view.get(t), v, "r")
+        for t, ov in view.items():
+            if t not in arg:
+                below_unset(t, ov)
+        return out
+    if op in ("set", "unset", "inc"):
+        one(op, p, arg)
+    elif op == "setmany":
+        for q, v in arg:
+            one("set", q, v)
+    elif op == "update":
+        for o_, q, v in arg:
+            one(o_, q, v)
+    return out + pending
+
+
+def order_item_errors(log):
+    """The order items every write emitted against the items its intent and its writer's document give (`_want_items`). The rule above reads the logged items, so
+    a writer that emitted a wrong item would agree with itself and with the state it built: this check is what makes the items independent of the writer.
+    A write is compared as a summary (the names per parent in order, the resets, the unsets, the levels)."""
+    errs = []
+    for w, (ctx, m) in log.items():
+        items = m.get("items")
+        if items is None or m.get("upsert"):
+            continue
+        it = m.get("replay") or m.get("intent")
+        if it is None and m["kind"] == "inc" and m.get("paths"):
+            it = intent_of(m)
+        if it is None or it[0] not in ("insert", "replace", "set", "unset", "inc", "setmany", "update"):
+            continue
+        want = _item_summary(_want_items(it, oracle_at(log, ctx)))
+        got = _item_summary(items)
+        if want != got:
+            names = ["names", "resets", "unsets", "levels"]
+            diff = [n for n, a, b in zip(names, want, got) if a != b]
+            errs.append((w, "items differ from the intent: " + ",".join(diff), [(a, b) for a, b in zip(want, got) if a != b][:1]))
+    return errs
+
+
+def _levels(d, path=""):
+    """(level path, the field names of that level in served order) for every level of a document."""
+    if isinstance(d, dict):
+        yield path, list(d.keys())
+        for k, v in d.items():
+            yield from _levels(v, (path + "." if path else "") + k)
+
+
 def order_errors(state, log):
-    """Random-run check of the derived order against the stamp-ordered serial history. Returns (errors, deviations):
-    errors are mismatches no known cause explains; deviations are those explained by the ruling-(a) approximation."""
+    """Random-run check of the derived order. Returns (errors, deviations).
+    The contract (design, field-order D-item and ruling (a)): the order is the outcome of SOME serial order of the same writes, values and order from ONE
+    order. The stamp-ordered serial history is tried first, then every linear extension of the causal order (at most ORDER_EXT_BOUND complete ones).
+    A history with more than one alive life (an upsert life included) has no serial oracle and is skipped (ruling of 2026-11-04).
+    In a TOTALLY ORDERED history (no two writes concurrent) the stamp order is the only serial order and no mechanism can act: any other order is an error.
+    When no serial order explains the order, the history is a deviation only if the order RULE (`_Rule`: the design's rule restated from the log
+    alone, never from a replicated Ord state: candidates, floors, per-writer first candidates, the survivor clamp, the level floor, `(born, path)`)
+    gives the served order of EVERY level of the document, exactly. That is the placement test of every accepted mechanism at once (the no-op floor,
+    Q4(a)'s r floor and level floor, the survivors of an unset, ruling (a), D6 summing); any other order is an error. A history whose values no
+    serial order gives is checked the same way (it was skipped before)."""
     if not ORDER_STATE:
         return [], []
     vis = state.visible()
     if vis is None:
         return [], []
-    if sum(m["kind"] == "insert" for c, m in log.values()) != 1 or any(m["kind"] == "delete" for c, m in log.values()):
-        return [], []                      # one life only: the reference has no merge of concurrent lives
-    ref = stamp_outcome(log)
-    if ref in ("invalid", None):
+    if sum(m["kind"] == "insert" or bool(m.get("insert")) for c, m in log.values()) != 1 or any(m["kind"] == "delete" for c, m in log.values()):
+        return [], []                      # one life only (a creating `$inc` is the life's insert): the reference has no merge of concurrent lives
+    if len(state.alive()) != 1:
+        ORDER_STATS["skipped (more than one alive life: no serial oracle)"] += 1
         return [], []
-    if concurrent_replace(log) and not ORD_LEVEL_FLOOR:
-        ORDER_STATS["concurrent replace (Q4 diff semantics; order not compared)"] += 1
+    ie = order_item_errors(log)
+    if ie:
+        ORDER_STATS["ERROR: a write's order items do not follow from its intent"] += 1
+        return [("order-items",) + e for e in ie[:3]], []
+    ref = stamp_outcome(log)                         # 'invalid' when an operation fails in the stamp order (then only the walk and the rule decide)
+    stamp_values_ok = ref not in ("invalid", None) and sortdoc(vis) == sortdoc(ref) and M_TYPES(vis) == M_TYPES(ref)
+    stamp_bad = _cmp_levels(vis, ref) if stamp_values_ok else None
+    if stamp_bad == []:
+        ORDER_STATS["compared"] += 1
+        return [], []                                # the stamp-ordered serial history gives the document and its order
+    if totally_ordered(log):
+        # a sequential history has ONE serial order and no concurrency: none of the ruled mechanisms can act in it, so the stamp order is the only answer
+        if ref in ("invalid", None):                     # no serial reading to compare with: the order rule decides (an error if it disagrees)
+            rule = _Rule(log)
+            errs = [("order", level, keys, rule.level_order(level, keys)) for level, keys in _levels(vis) if rule.level_order(level, keys) != keys]
+            if errs:
+                return errs, []
+            ORDER_STATS["sequential history the reference cannot replay: placed by the order rule"] += 1
+            return [], []
+        bad = _cmp_levels(vis, ref)                      # the relative order of the fields both documents hold (values may differ: they are graded elsewhere)
+        if bad:
+            ORDER_STATS["ERROR: a sequential history's order is not the serial order"] += 1
+            return [("order",) + b for b in bad], []
+        ORDER_STATS["compared"] += 1
         return [], []
-    if sortdoc(vis) != sortdoc(ref) or M_TYPES(vis) != M_TYPES(ref):
-        ORDER_STATS["value-deviation (order not compared)"] += 1       # e.g. a replace keeps a field it never saw (Q4)
-        return [], []
-    bad = _cmp_levels(vis, ref)
-    ORDER_STATS["compared"] += 1
-    if not bad:
-        return [], []
-    if approx_triggers(log):
-        return [], bad
-    return [("order",) + b for b in bad], []
+    gen, st = serial_orders(log)
+    first_bad = None
+    for order in gen:
+        out = serial_outcome(log, order)
+        if out in ("invalid", None) or sortdoc(vis) != sortdoc(out) or M_TYPES(vis) != M_TYPES(out):
+            continue
+        mism = _cmp_levels(vis, out)
+        if not mism:
+            ORDER_STATS["compared (some serial order, not the stamp order)"] += 1
+            return [], []
+        if first_bad is None:
+            first_bad = mism
+    if st["cut"]:
+        ORDER_STATS["walk cut at ORDER_EXT_BOUND: decided by the order rule"] += 1
+    rule = _Rule(log)
+    errs = []
+    for level, keys in _levels(vis):
+        exp = rule.level_order(level, keys)
+        if exp != keys:
+            errs.append(("order", level, keys, exp))
+    if errs:
+        return errs, []
+    ORDER_STATS["deviation, placed by the order rule"] += 1
+    return [], (first_bad or stamp_bad or [("", [], [])])
 
 
 # ---------------------------------------------------------------------------

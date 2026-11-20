@@ -147,9 +147,9 @@ def check_obs_structural(s):
         for (l2, w2, g2), o in r[2].items():
             k = (l2, p, w2, g2)
             if k in s.slots:
-                a = s.absorbed.get(k)
+                a = s.absorbed.get((L,) + k)       # the pair is keyed by the WRITING life: the life of this register
                 assert a is not None and a[0] >= o[0], \
-                    "a register obs entry %r of %r is not covered by the slot's absorbed pair %r" % (o, k, a)
+                    "a register obs entry %r of %r is not covered by the slot's absorbed pair of its writing life %r" % (o, k, a)
 
 
 def check_obs_dead(s):
@@ -507,7 +507,7 @@ class EncCompact:
             self.opt_stamp(k[3])
             self.stamp(sl[0])
             # the flag byte: bit 0 the absorbed pairs follow (a count, then each pair's life index, stamp, type byte (0 Int64,
-            # 1 Int32, 2 Decimal128) and payload; this model keeps one pair per slot, of the slot's own life); bits 1-2 the
+            # 1 Int32, 2 Decimal128) and payload; one pair per WRITING life, sorted by life); bits 1-2 the
             # total's type and bits 3-4 are 0; bit 7: the operand stamps are spelled, then bit 5 says the stamp of the slot's
             # latest Int64-or-wider operand (`wide_at`) follows and bit 6 that of its latest Decimal128 operand
             # (`decimal_at`). The usual stamps of a slot whose operands were all of its total's width, the latest at its
@@ -515,22 +515,23 @@ class EncCompact:
             # spelled and have no bit. Every operand of the model is an Int64, so by default the slot is Int64 with the
             # usual stamp; a state that is typed on purpose (`typed`, keyed by path) is given the labels and the stamps
             # it has, a Decimal128 payload as its 16 bytes
-            pair = st.absorbed.get(k)
+            pairs = sorted(((wl, v) for (wl, *sk), v in st.absorbed.items() if tuple(sk) == k), key=lambda e: k_stamp(e[0]))
             ty = getattr(self, "typed", {}).get(k[1], {})
             tl, pl = ty.get("total", 0), ty.get("pair", 0)
             usual = (None if tl == 1 else sl[0], sl[0] if tl == 2 else None)
             wide = ty["wide"] if "wide" in ty else usual[0]
             dec = ty["dec"] if "dec" in ty else usual[1]
             spelled = (wide, dec) != usual
-            self.u8((1 if pair is not None else 0) | tl << 1
+            self.u8((1 if pairs else 0) | tl << 1
                     | ((0x80 | (0x20 if wide is not None else 0) | (0x40 if dec is not None else 0)) if spelled else 0))
             self.slot_payload(tl, ty.get("total_raw", sl[1]))
-            if pair is not None:
-                self.vi(1)
-                self.life(k[0])
-                self.stamp(pair[0])
-                self.u8(pl)
-                self.slot_payload(pl, ty.get("pair_raw", pair[1]))
+            if pairs:
+                self.vi(len(pairs))
+                for wl, pair in pairs:       # one pair per WRITING life, sorted by life
+                    self.life(wl)
+                    self.stamp(pair[0])
+                    self.u8(pl)
+                    self.slot_payload(pl, ty.get("pair_raw", pair[1]))
             if spelled:
                 if wide is not None:
                     self.stamp(wide)

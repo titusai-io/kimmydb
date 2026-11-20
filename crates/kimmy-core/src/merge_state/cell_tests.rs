@@ -1765,3 +1765,104 @@ fn pair_lists_join_by_life_with_the_higher_stamp_per_life() {
     assert_eq!(Slot::join_pairs(&b, &a), joined, "commutative");
     assert_eq!(Slot::join_pairs(&joined, &joined), joined, "idempotent");
 }
+
+// ---- the absorbed pair belongs to its WRITING life (q7-absorbed) ------------------------------------------
+
+/// The value of the counter `c` as a member reads it (`None`: nothing there).
+fn reads(w: &Writer, o: &JoinOptions) -> Option<Value> {
+    w.state.visible(o).and_then(|m| m.get(&p("c")).cloned())
+}
+
+/// A base write files its pair under the life it is made in, not under its slot's life. The slot is C's, in C's insert life;
+/// the write is made in the newest alive life, D's upsert life. (The killer of the switch `absorb_by_slot_life`.)
+#[test]
+fn a_base_write_files_its_pair_under_the_life_it_is_made_in() {
+    let (sl, other) = base_in_the_newest_life(&opts());
+    assert!(other);
+    let writing = sl.absorbed[0].life;
+    assert_eq!(sl.absorbed.len(), 1);
+    assert_eq!(writing, st(1, 'D'), "the writing life is D's upsert life, the newest alive one");
+    assert_ne!(writing, st(1, 'C'), "and not the slot's own life");
+    let mut o = opts();
+    o.set_absorb_by_slot_life(true);
+    let (sl, _) = base_in_the_newest_life(&o);
+    assert_eq!(sl.absorbed[0].life, st(1, 'C'), "the mutant files it under the slot's life");
+}
+
+/// The shape of rich seeds 943, 2570 and 13787, as a Writer history (`q7-absorbed-probe-p6.py`): A upserts `$inc c 1` (life U); B
+/// inserts `{k: 1}` (P, newer than U); A receives P and unsets `c`, a base write INTO P that folds U's slot; C inserts `{k: 2}`, newer
+/// than P, which wins the first-insert rule and supersedes P. The write into P is dropped with P, so its absorption must go with it:
+/// `c` reads 1 on every member, as the oracle says, not the 0 the old keying (the pair stays with U's slot) reads.
+fn base_into_a_superseded_life(o: &JoinOptions) -> Vec<Writer> {
+    let mut ws: Vec<Writer> = "ABC".chars().map(|c| Writer::new(wid(c, 0), o.clone())).collect();
+    ws[0].upsert_inc(&p("c"), 1, 0).unwrap();
+    ws[1].insert(&fl(&[("k", i(1))]), 0).unwrap();
+    let b = ws[1].state.clone();
+    ws[0].receive(&b);
+    ws[0].write_unset(&p("c"), 0).unwrap();
+    ws[2].insert(&fl(&[("k", i(2))]), 100).unwrap();
+    mesh(&mut ws);
+    mesh(&mut ws);
+    ws
+}
+
+#[test]
+fn a_base_made_into_a_superseded_life_absorbs_nothing() {
+    let o = opts();
+    for w in base_into_a_superseded_life(&o) {
+        assert_eq!(reads(&w, &o), Some(i(1)), "{:?}: the upsert's increment stands", w.id);
+        for sl in w.state.slots.values() {
+            let alive = w.alive();
+            assert!(
+                sl.absorbed.iter().all(|pr| alive.contains(&pr.life)),
+                "{:?}: no pair of a life that is gone",
+                w.id
+            );
+        }
+    }
+    // the old keying keeps the pair with U's slot, alive, and subtracts what the dropped write had seen
+    let mut bad = opts();
+    bad.set_absorb_by_slot_life(true);
+    let ws = base_into_a_superseded_life(&bad);
+    assert!(ws.iter().any(|w| reads(w, &bad) != Some(i(1))), "the mutant reads another value");
+}
+
+/// Probe 2 of the note (`case_two_writing_lives`): ONE slot absorbed by two bases made in two writing lives, the higher pair in the life
+/// that loses. A upserts `+1` (U); D pulls it; A adds `+1` (the slot reads 2); B inserts P; A receives P and unsets `c` INTO P (pair of P =
+/// 2); D, holding only U, sets `c` to 5 INTO U (pair of U = 1); C inserts Q, newer: P is superseded. The value is 6 (5 and the one
+/// increment D never saw). A fresh member E that joins the states one after the other reads 6 at once; a join that keeps one pair per slot,
+/// the highest stamp, picked before the alive filter, loses the pair of U with P and reads 7.
+fn two_writing_lives(o: &JoinOptions) -> Writer {
+    let mut ws: Vec<Writer> = "ABCD".chars().map(|c| Writer::new(wid(c, 0), o.clone())).collect();
+    ws[0].upsert_inc(&p("c"), 1, 0).unwrap();
+    let a = ws[0].state.clone();
+    ws[3].receive(&a);
+    ws[0].write_inc(&p("c"), 1, 0).unwrap();
+    ws[1].insert(&fl(&[("k", i(1))]), 0).unwrap();
+    let b = ws[1].state.clone();
+    ws[0].receive(&b);
+    ws[0].write_unset(&p("c"), 0).unwrap();
+    ws[3].write_set(&p("c"), i(5), 3).unwrap();
+    ws[2].insert(&fl(&[("k", i(2))]), 9).unwrap();
+    let mut e = Writer::new(wid('E', 0), o.clone());
+    for k in [0, 3, 2] {
+        let s = ws[k].state.clone();
+        e.receive(&s);
+    }
+    e
+}
+
+#[test]
+fn two_writing_lives_absorb_one_slot_at_different_stamps() {
+    let o = opts();
+    let e = two_writing_lives(&o);
+    assert_eq!(reads(&e, &o), Some(i(6)));
+    let mut one = opts();
+    one.set_single_pair(true);
+    let e = two_writing_lives(&one);
+    assert_eq!(
+        reads(&e, &one),
+        Some(i(7)),
+        "one pair per slot, picked before the alive filter, reads 7"
+    );
+}

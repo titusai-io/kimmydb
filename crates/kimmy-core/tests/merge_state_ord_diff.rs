@@ -48,8 +48,11 @@ fn the_writers_order_state_and_ordered_document_equal_the_models_after_every_ste
     // the upserts of nested paths (A2.3 and eb40bbcf name their ancestors): drawn, and compared like every other step
     assert_eq!(ord_replay::nested_upserts(), 94);
     // THE FLIP'S EVIDENCE. The scripts are the model's with ABSORBED on, which the writers equal. Run with ABSORBED off, the
-    // model makes another script of these seeds: in 7 of the 300 the digest of an operation (or its result) differs at the
+    // model makes another script of these seeds: in 4 of the 300 the digest of an operation (or its result) differs at the
     // step given, in 5 more only the digest after the full sync differs (step 30). The seeds are pinned.
+    // (Re-vendored for the absorbed pair keyed by its writing life: a base write made into a life that the newest insert then
+    // supersedes no longer absorbs the counters it saw, so the model's ABSORBED-on scripts of flat 138, nested 1083 and nested 1141
+    // are the ABSORBED-off ones, and 7 of the 300 became 4. The 5 at the full sync are the same seeds as before.)
     let d = ord_replay::off_differences();
     assert!(
         d.iter().all(|x| x.3),
@@ -64,15 +67,7 @@ fn the_writers_order_state_and_ordered_document_equal_the_models_after_every_ste
     };
     assert_eq!(
         key(&in_step),
-        want(&[
-            ("flat", 40, 20),
-            ("flat", 80, 22),
-            ("flat", 132, 16),
-            ("flat", 138, 11),
-            ("flat", 143, 28),
-            ("nested", 1083, 9),
-            ("nested", 1141, 26),
-        ])
+        want(&[("flat", 40, 20), ("flat", 80, 22), ("flat", 132, 16), ("flat", 143, 28),])
     );
     assert_eq!(
         key(&at_sync),

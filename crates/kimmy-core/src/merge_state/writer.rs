@@ -507,12 +507,16 @@ impl Writer {
         }
     }
 
-    /// Fold the slots at `keys`: each takes its own `(stamp, total)` as its absorbed pair, when
-    /// that is above the pair it has (the model's max by stamp). The pair is the slot's own life's.
-    fn fold(&mut self, keys: Vec<(MStamp, Path, WriterId, Option<MStamp>)>) {
+    /// Fold the slots at `keys`: each takes its own `(stamp, total)` as its absorbed pair of the
+    /// life `l` the base write is made in, when that is above the pair of `l` it has (the model's
+    /// max by stamp). The pair belongs to the WRITING life, not to the slot's: it is a fact about
+    /// the write, and goes with its life as the write's register does (the mutant
+    /// `absorb_by_slot_life` keys it by the slot's life, the old rule).
+    fn fold(&mut self, l: MStamp, keys: Vec<(MStamp, Path, WriterId, Option<MStamp>)>) {
+        let by_slot = self.opts.absorb_by_slot_life();
         for k in keys {
             if let Some(s) = self.state.slots.get_mut(&k) {
-                s.absorb_under(k.0);
+                s.absorb_under(if by_slot { k.0 } else { l });
             }
         }
     }
@@ -550,7 +554,7 @@ impl Writer {
         // (the mutant `no_fold_marker`: a map marker write, explicit or implicit, folds nothing)
         if !(self.opts.no_fold_marker() && v.is_marker()) {
             let folded = self.fold_keys(p, al, win);
-            self.fold(folded);
+            self.fold(l, folded);
         }
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
