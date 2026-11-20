@@ -489,13 +489,25 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   horizon 0x50b53c2af7019e1c -> 0x57c404a3301caca5
     //   bounded 0x6da0bc5de4bfe6ed -> 0xa326f2cc0700a136
     //   bounded nested 0x633b0e853e0a1cd0 -> 0x243523d5c46867cb
+    // RE-PINNED for the absorbed pair keyed by its WRITING life (model f9702ee2): a base write files its pair under the life it is made
+    // in, so a run in which a write is made into another life than the slot's holds another pair list (the bytes), and the join drops
+    // a pair whose writing life or whose slot's life is gone (a read: a base made into a superseded life absorbs nothing). The sim
+    // grades every read against the model and the oracle, and passes. `no restore`, `sequential`, `horizon` and `bounded nested` did
+    // not move.
+    //   restore 0x2cfc35dfd93dc82e -> 0xcdf88c07b7d92892
+    //   no restore 0xe4d0d012e879dfd2 (unchanged)
+    //   bound 1000 0x9f7c2b8a9911faea -> 0x0b458cfd83f35ac6
+    //   sequential 0x3cdd2f55580ef9e2 (unchanged)
+    //   horizon 0x57c404a3301caca5 (unchanged)
+    //   bounded 0xa326f2cc0700a136 -> 0x9ee508570c2db112
+    //   bounded nested 0x243523d5c46867cb (unchanged)
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x2cfc35dfd93dc82e),
+        ("restore", 0xcdf88c07b7d92892),
         ("no restore", 0xe4d0d012e879dfd2),
-        ("bound 1000", 0x9f7c2b8a9911faea),
+        ("bound 1000", 0x0b458cfd83f35ac6),
         ("sequential", 0x3cdd2f55580ef9e2),
         ("horizon", 0x57c404a3301caca5),
-        ("bounded", 0xa326f2cc0700a136),
+        ("bounded", 0x9ee508570c2db112),
         ("bounded nested", 0x243523d5c46867cb),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");

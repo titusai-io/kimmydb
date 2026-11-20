@@ -20,13 +20,21 @@
 //! after the floor is kept (ruling (a)), so a delete cannot kill it. A delete above the floor still
 //! kills every life that had not seen it. The divergence is transient and resolves to alive.
 //!
+//! A counter's absorbed pair belongs to the life of the base write that made it. When the floor removes
+//! that life but keeps the slot the pair names, the pair is re-homed onto the slot's own life, so the
+//! pre-floor increments stay absorbed. A member that joined a state in which the life was already
+//! superseded before it learned the floor has no pair to re-home, and reads the slot without that
+//! absorption until a snapshot repair joins it with a member that floored first; the repair settles on
+//! the absorbed value (more absorption never raises the count, and a join never removes the pair of an
+//! alive writing life). The divergence is transient.
+//!
 //! This is not an operation of the reference model; it is bounded by the properties the tests state
 //! (idempotent, leaves the version vector alone, leaves a state `decode` accepts).
 
 use std::collections::BTreeSet;
 
 use super::ord::{FieldOrd, OrdAt};
-use super::state::MergeState;
+use super::state::{MergeState, Pair};
 use super::types::{MStamp, Path};
 use crate::hlc::Hlc;
 
@@ -67,6 +75,19 @@ impl MergeState {
             .chain(self.slots.keys().map(|k| k.0))
             .collect();
         self.lives.retain(|life, _| life.hlc > floor || held.contains(life));
+        // An absorbed pair belongs to the life of the base write that made it. When the floor removes that
+        // life and keeps the slot the pair names, the pair is re-homed onto the slot's own life (merged
+        // with the pair already there by the higher stamp), so the increments the write had seen stay
+        // absorbed. The pairs of a slot that goes went with it.
+        for (key, slot) in self.slots.iter_mut() {
+            let (kept, gone): (Vec<Pair>, Vec<Pair>) = std::mem::take(&mut slot.absorbed)
+                .into_iter()
+                .partition(|p| self.lives.contains_key(&p.life));
+            slot.absorbed = kept;
+            for p in gone {
+                slot.rehome(key.0, p);
+            }
+        }
         self.regs.retain(|(life, _), _| self.lives.contains_key(life));
         self.dead.retain(|life| self.lives.contains_key(life));
         self.gens.retain(|key, _| self.lives.contains_key(&key.0));

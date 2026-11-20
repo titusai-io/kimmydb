@@ -213,9 +213,9 @@ def check_obs_structural(s):
         for (l2, w2, g2), o in r[2].items():
             k = (l2, p, w2, g2)
             if k in s.slots:
-                a = s.absorbed.get(k)
+                a = s.absorbed.get((L,) + k)       # the pair is keyed by the WRITING life: the life of this register
                 assert a is not None and a[0] >= o[0], \
-                    "a register obs entry %r of %r is not covered by the slot's absorbed pair %r" % (o, k, a)
+                    "a register obs entry %r of %r is not covered by the slot's absorbed pair of its writing life %r" % (o, k, a)
 
 
 # What the shape of seed 792 is counted by, per script (REPORTED on stdout by `main`, one line per script; nothing in the script file or in
@@ -267,10 +267,10 @@ def digest_lines(s):
             g = fs(gen[0]) + "/seen" + fobs({k: str(t) for k, t in gen[2].items()})
         soi = 1 if len(r) > 4 and r[4] == "soi" else 0
         out.append("reg %s %s %s %s gen=%s soi=%d" % (fs(L), p, fs(r[0]), fv(r[1]), g, soi))
-    assert set(s.absorbed) <= set(s.slots), "an absorbed pair without its slot"
+    assert {k[1:] for k in s.absorbed} <= set(s.slots), "an absorbed pair without its slot"
     for (L, p, w, g), (st, tot) in s.slots.items():
-        a = s.absorbed.get((L, p, w, g))
-        ab = "-" if a is None else "%s,%d" % (fs(a[0]), a[1])
+        a = sorted((wl, v) for (wl, *sk), v in s.absorbed.items() if tuple(sk) == (L, p, w, g))      # one pair per writing life
+        ab = "-" if not a else ";".join("%s@%s,%d" % (fs(wl), fs(v[0]), v[1]) for wl, v in a)
         out.append("slot %s %s %s %s %s %d abs=%s" % (fs(L), p, fw(w), fg(g), fs(st), tot, ab))
     for w, h in s.vv.items():
         out.append("vv %s %d" % (fw(w), h))

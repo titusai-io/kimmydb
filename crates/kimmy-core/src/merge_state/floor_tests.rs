@@ -444,3 +444,192 @@ fn the_identity_alone_is_no_reason_to_keep_a_life_at_or_below_the_floor() {
     assert!(st.is_bare(), "a life with nothing after the floor but its `_id` goes");
     assert!(st.regs.is_empty(), "and takes its `_id` with it");
 }
+
+// ---- the absorbed pair and the floor (q7-absorbed, F1 and F4) ---------------------------------------------
+
+fn read(st: &MergeState, o: &JoinOptions, path: &str) -> Option<Value> {
+    st.visible(o).and_then(|m| m.get(&p(path)).cloned())
+}
+
+/// Every pair of every slot, as `(slot life, writing life, pair)`.
+fn pairs_of(st: &MergeState) -> Vec<(MStamp, MStamp, Pair)> {
+    st.slots
+        .iter()
+        .flat_map(|(k, s)| s.absorbed.iter().map(move |pr| (k.0, pr.life, *pr)))
+        .collect()
+}
+
+/// F1: a pair goes with its slot. L is inserted; A adds 5 (a slot of 5) and sets `c` to 0 (the base absorbs the slot); the floor is the
+/// set; B writes `x` above it; A applies the floor and adds 1. The slot and its pair are gone: `c` reads 1, never the -4 a pair that
+/// outlived its slot would subtract (`1 - 5`).
+#[test]
+fn a_pair_goes_with_its_slot_at_the_floor_and_a_new_increment_reads_whole() {
+    let o = opts(1_000_000_000);
+    let (mut a, mut b) = (writer('A', &o), writer('B', &o));
+    b.insert(&fl(&[("k", i(1))]), 0).unwrap();
+    let ins = b.state.clone();
+    a.receive(&ins);
+    a.write_inc(&p("c"), 5, 0).unwrap();
+    let floor = a.write_set(&p("c"), i(0), 0).unwrap().stamp.hlc;
+    assert!(!pairs_of(&a.state).is_empty(), "premise: the base absorbed the slot");
+    b.write_set(&p("x"), i(1), 1_000).unwrap();
+    let w = b.state.clone();
+    a.receive(&w);
+    assert!(a.state.drop_at_or_below(floor));
+    assert!(pairs_of(&a.state).is_empty(), "the slot went with its stamp, and its pair with it");
+    assert!(a.state.check_decoded().is_ok());
+    a.write_inc(&p("c"), 1, 0).unwrap();
+    assert_eq!(read(&a.state, &o, "c"), Some(i(1)));
+    assert_eq!(read(&a.state, &o, "x"), Some(i(1)));
+}
+
+/// The history of F4 and F5 (`q7-floor-probes.py`, `q7-floor-commute.py`): A upserts `+1` (life U); D adds 2 into U; B inserts P (newer than
+/// U); A receives both and sets `c` to 0 INTO P (a base made in P that absorbs both U slots: the pairs are P's). Returns A, C and the floor, with
+/// `second_base` adding a base made in U itself before P exists (a pair of the slot's own life), and `c_supersedes_p` a member C whose newer insert
+/// supersedes P.
+struct F4 {
+    a: Writer,
+    c: Writer,
+    floor: Hlc,
+}
+
+fn f4_history(o: &JoinOptions, second_base: bool, c_supersedes_p: bool) -> F4 {
+    let (mut a, mut b, mut c, mut d) =
+        (writer('A', o), writer('B', o), writer('C', o), writer('D', o));
+    a.upsert_inc(&p("c"), 1, 0).unwrap();
+    let u = a.state.clone();
+    d.receive(&u);
+    d.write_inc(&p("c"), 2, 0).unwrap();
+    let inc = d.state.clone();
+    a.receive(&inc);
+    if second_base {
+        a.write_set(&p("c"), i(0), 0).unwrap();
+        a.write_inc(&p("c"), 1, 0).unwrap();
+    }
+    b.insert(&fl(&[("k", i(1))]), 1).unwrap();
+    let pins = b.state.clone();
+    a.receive(&pins);
+    a.write_set(&p("c"), i(0), 0).unwrap();
+    if c_supersedes_p {
+        // C inserts Q, newer than P, and receives A's whole state: P is superseded at C, and its cells and pairs are dropped
+        c.insert(&fl(&[("k", i(2))]), 5).unwrap();
+        let sa = a.state.clone();
+        c.receive(&sa);
+    }
+    let floor = a
+        .state
+        .vv
+        .values()
+        .chain(c.state.vv.values())
+        .chain(d.state.vv.values())
+        .copied()
+        .max()
+        .expect("a version vector");
+    // D, holding only U, adds 1 above the floor
+    d.write_inc(&p("c"), 1, 1_000).unwrap();
+    let after = d.state.clone();
+    a.receive(&after);
+    if c_supersedes_p {
+        c.receive(&after);
+    }
+    F4 { a, c, floor }
+}
+
+/// F4(b): the floor removes the writing life P and keeps the slot of U that D's write after the floor moved, so the pair is RE-HOMED
+/// onto U: the pre-floor `+2` stays absorbed and `c` reads 1 (`+1`, `+2`, set 0, floor, `+1`). Without it the `+2` resurfaces: 3.
+#[test]
+fn the_floor_rehomes_a_pair_whose_writing_life_it_removes_onto_the_slots_own_life() {
+    let o = opts(1_000_000_000);
+    for second_base in [false, true] {
+        let mut f = f4_history(&o, second_base, false);
+        assert!(
+            pairs_of(&f.a.state).iter().any(|(slot, writing, _)| slot != writing),
+            "premise: a pair of a write made in another life than its slot's"
+        );
+        assert_eq!(read(&f.a.state, &o, "c"), Some(i(1)), "before the floor");
+        f.a.state.drop_at_or_below(f.floor);
+        assert!(f.a.state.check_decoded().is_ok());
+        let pairs = pairs_of(&f.a.state);
+        assert_eq!(pairs.len(), 1, "second_base={second_base}: the slot D moved keeps one pair");
+        let (slot_life, writing, pr) = pairs[0];
+        assert_eq!(slot_life, writing, "the pair sits on the slot's own life now");
+        assert_eq!(pr.life, slot_life);
+        assert_eq!(pr.total, Num::from(2), "what D's +2 made of the slot");
+        assert_eq!(read(&f.a.state, &o, "c"), Some(i(1)), "second_base={second_base}");
+        // the rule it replaces (retain by writing life): no pair left, the +2 resurfaces
+        let mut bare = f.a.state.clone();
+        for s in bare.slots.values_mut() {
+            s.absorbed.clear();
+        }
+        assert_eq!(
+            read(&bare, &o, "c"),
+            Some(i(3)),
+            "without the re-home the pre-floor +2 resurfaces"
+        );
+    }
+}
+
+/// The re-home merges with the pair the slot already has on its own life by the higher stamp, whichever way round they come.
+#[test]
+fn a_rehomed_pair_merges_with_the_slots_own_by_the_higher_stamp() {
+    let pair = |life: u64, stamp: u64, total: i128| Pair {
+        life: MStamp { hlc: Hlc::new(life, 0), writer: wid('A', 0) },
+        stamp: MStamp { hlc: Hlc::new(stamp, 0), writer: wid('A', 0) },
+        total: total.into(),
+    };
+    let u = pair(1, 2, 7).life;
+    for (own, moved, want) in
+        [(pair(1, 3, 4), pair(2, 5, 9), 9_i128), (pair(1, 6, 4), pair(2, 5, 9), 4)]
+    {
+        let mut slot = Slot::new(pair(9, 9, 0).stamp, 0.into(), Some(own));
+        slot.rehome(u, moved);
+        assert_eq!(slot.absorbed.len(), 1, "one pair per life");
+        assert_eq!((slot.absorbed[0].life, slot.absorbed[0].total), (u, Num::from(want)));
+    }
+    let mut slot = Slot::new(pair(9, 9, 0).stamp, 0.into(), None);
+    slot.rehome(u, pair(2, 5, 9));
+    assert_eq!(
+        slot.absorbed.iter().map(|x| x.life).collect::<Vec<_>>(),
+        [u],
+        "a pair of another life is re-homed, the life is the slot's"
+    );
+}
+
+/// F5 (`q7-floor-commute.py`): the route case. P is also superseded, at one member, and both lives are at or below the floor. A holds P
+/// alive with the pairs; C holds P superseded and the pairs dropped. Floor each state and then join (every thinning route does): the
+/// re-home happens, reads 1. Join first and floor when the floor is learned: the pair went with P, reads 3. The documented transient. A
+/// repair join of the two results, either way round and each floored again, is ONE canonical state and reads 1: the union keeps the
+/// pair of an alive writing life, and more absorption never raises the count.
+#[test]
+fn floor_then_join_and_join_then_floor_differ_for_a_superseded_writing_life_and_a_repair_settles_them()
+ {
+    let o = opts(1_000_000_000);
+    let f = f4_history(&o, false, true);
+    let (a, b) = (f.a.state.clone(), f.c.state.clone());
+    assert!(!pairs_of(&a).is_empty(), "premise: A holds the pairs of P");
+    assert!(
+        pairs_of(&b).iter().all(|(slot, writing, _)| slot == writing),
+        "premise: C holds none of P (superseded): {:?}",
+        pairs_of(&b)
+    );
+    let floored = |s: &MergeState| {
+        let mut t = s.clone();
+        t.drop_at_or_below(f.floor);
+        t
+    };
+    let x = join(&floored(&a), &floored(&b), &o).0;
+    let y = floored(&join(&a, &b, &o).0);
+    assert_eq!(read(&x, &o, "c"), Some(i(1)), "floor first: the pair is re-homed");
+    assert_eq!(
+        read(&y, &o, "c"),
+        Some(i(3)),
+        "join first: the pair went with P, the pre-floor +2 resurfaces (the documented transient)"
+    );
+    // the repair: each takes the other's state (a snapshot), and both floor again
+    let (xy, yx) = (join(&x, &y, &o).0, join(&y, &x, &o).0);
+    let all = [xy.clone(), yx.clone(), floored(&xy), floored(&yx)];
+    for s in &all {
+        assert_eq!(read(s, &o, "c"), Some(i(1)), "after the repair, everybody reads 1");
+        assert_eq!(s.compact_bytes(), all[0].compact_bytes(), "one canonical state");
+    }
+}

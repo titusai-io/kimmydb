@@ -287,8 +287,8 @@ fn fit_pair(mut sl: Slot, writer: WriterId) -> Slot {
 
 fn put_slot(s: &mut MergeState, l: MStamp, p: &Path, k: u8, generation: Option<MStamp>, sl: Slot) {
     let mut sl = fit_pair(sl, wid(k));
-    // the pair is the slot's own life's (the layout of the pair list holds one pair per life; the rule that keys it by the
-    // writing life is a later change)
+    // the pair is the slot's own life's (the generators build one pair per slot; pairs of other writing lives are built by the
+    // tests that name them)
     for pr in &mut sl.absorbed {
         pr.life = l;
     }

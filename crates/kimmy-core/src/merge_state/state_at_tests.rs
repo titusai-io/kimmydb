@@ -251,3 +251,94 @@ fn the_state_does_not_depend_on_the_order_when_the_history_spreads_past_the_rete
         assert_eq!(at, canonical, "state_at over the entries {name} is the ascending-order fold");
     }
 }
+
+// ---- the absorbed pair belongs to its writing life (q7-absorbed) ------------------------------------------
+
+/// The shape of rich seeds 943, 2570 and 13787 as entries: A upserts `+1` (life U); B inserts P (newer than U); A receives P and unsets
+/// `c`, a base made into P that absorbs U's slot; C inserts Q, newer than P, which supersedes P. Returns the entries and the stamps of the
+/// unset and of Q.
+fn base_into_a_life_that_is_then_superseded() -> (Entries, MStamp, MStamp) {
+    let (mut a, mut b, mut c) = (writer('A'), writer('B'), writer('C'));
+    let mut entries = Entries::new();
+    let w = a.upsert_inc(&p("c"), 1, 0);
+    entry(&mut entries, &a, w);
+    let w = b.insert(&fl(&[("k", i(1))]), 0);
+    entry(&mut entries, &b, w);
+    a.receive(&b.state);
+    let w = a.write_unset(&p("c"), 0);
+    let unset = entry(&mut entries, &a, w);
+    let w = c.insert(&fl(&[("k", i(2))]), 100);
+    let q = entry(&mut entries, &c, w);
+    (entries, unset, q)
+}
+
+/// At the unset P is the newest alive life and the write is into it: `c` is gone. At Q's entry P is superseded and its cells are dropped
+/// with the write: the upsert's increment stands, `c` reads 1 (the old keying read 0, the pair outliving P with U's slot).
+#[test]
+fn a_base_into_a_life_that_is_later_superseded_absorbs_nothing_at_the_later_target() {
+    let (entries, unset, q) = base_into_a_life_that_is_then_superseded();
+    let at_unset = read(&fold(&entries, unset.hlc, None)).unwrap();
+    assert_eq!(at_unset.get(&p("c")), None, "P is alive and the unset is applied");
+    assert_eq!(at_unset.get(&p("k")), Some(&i(1)));
+    let at_q = read(&fold(&entries, q.hlc, None)).unwrap();
+    assert_eq!(
+        at_q.get(&p("c")),
+        Some(&i(1)),
+        "P is superseded: the unset into it is dropped, the increment stands"
+    );
+    assert_eq!(at_q.get(&p("k")), Some(&i(2)));
+    let state = fold(&entries, q.hlc, None);
+    let alive = state.alive(&opts(R));
+    assert!(
+        state.slots.values().all(|s| s.absorbed.iter().all(|pr| alive.contains(&pr.life))),
+        "no pair of the life that is gone"
+    );
+}
+
+/// The F4 history through the fold with the floor argument (`state_at` floors each entry first). The oplog holds a writer's state at its
+/// WRITES only. Where an entry carries both the slot D moved above the floor and the pair of P that absorbed it (A writes after receiving
+/// D's `+1`), the floor re-homes the pair onto U and `c` reads 1. Where no entry does (D's entry holds the slot and no pair; A's entry holds
+/// the pair and a slot the floor drops with it), the fold reads 3: the same transient as a member that met only the thinned states, settled
+/// by a repair that joins a state which holds both (note v2.1 section 3, route dependence). The two histories differ in one write by A.
+fn f4_entries(a_writes_after_d: bool) -> (Entries, Hlc, MStamp) {
+    let (mut a, mut b, mut d) = (writer('A'), writer('B'), writer('D'));
+    let mut entries = Entries::new();
+    let w = a.upsert_inc(&p("c"), 1, 0);
+    entry(&mut entries, &a, w);
+    d.receive(&a.state);
+    let w = d.write_inc(&p("c"), 2, 0);
+    entry(&mut entries, &d, w);
+    a.receive(&d.state);
+    let w = b.insert(&fl(&[("k", i(1))]), 1);
+    entry(&mut entries, &b, w);
+    a.receive(&b.state);
+    let w = a.write_set(&p("c"), i(0), 0);
+    let floor = entry(&mut entries, &a, w);
+    let w = d.write_inc(&p("c"), 1, 1_000);
+    let mut last = entry(&mut entries, &d, w);
+    if a_writes_after_d {
+        a.receive(&d.state);
+        let w = a.write_set(&p("y"), i(1), 2_000);
+        last = entry(&mut entries, &a, w);
+    }
+    (entries, floor.hlc, last)
+}
+
+#[test]
+fn the_fold_with_a_floor_reads_the_counter_after_the_rehome_when_an_entry_carries_the_pair_and_the_slot()
+ {
+    let (entries, floor, last) = f4_entries(true);
+    let got = read(&fold(&entries, last.hlc, Some(floor))).unwrap();
+    assert_eq!(got.get(&p("c")), Some(&i(1)), "+1, +2, set 0, the floor, +1");
+}
+
+#[test]
+fn the_fold_with_a_floor_reads_the_pre_floor_increments_back_when_no_entry_carries_both() {
+    let (entries, floor, last) = f4_entries(false);
+    let got = read(&fold(&entries, last.hlc, Some(floor))).unwrap();
+    assert_eq!(
+        got.get(&p("c")),
+        Some(&i(3)),
+        "the pair is in A's entry with a slot the floor drops, the slot above the floor is in D's entry without it"
+    );
+}

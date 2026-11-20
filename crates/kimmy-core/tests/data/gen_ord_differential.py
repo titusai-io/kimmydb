@@ -1,4 +1,4 @@
-"""Q7 Step 0, Rust item O2: the ORDER differential. Random scripts of local writes AND receives, run on the A2.3 Python model (model6.py 72da18eb); the Rust
+"""Q7 Step 0, Rust item O2: the ORDER differential. Random scripts of local writes AND receives, run on the vendored Python model (model6.py f9702ee2: A2.3, the Step 4 deltas, the loss cap, the absorbed pair keyed by its writing life and the pull-order checks; it was 72da18eb, the A2.3 model, until the absorbed series); the Rust
 test (`tests/merge_state_ord_diff.rs`) replays each script through `Writer`s and compares, after every step, the acting member's
 ordered document and order state, and the result of the step (the stamp it got, or none for a refusal or a no-op).
 

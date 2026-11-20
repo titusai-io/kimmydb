@@ -27,7 +27,7 @@
 //!   narrowest of `Int32` and `Int64` that holds the TOTAL, never narrower than the widest label
 //!   among the base and every slot, a slot's label being the join of the operand types it has added
 //!   SINCE a base write absorbed the slot (the operands no base write absorbed: the pair is the
-//!   maximum over ALL the base writes on the path, the ones that lost included, and everything at or
+//!   maximum over ALL the base writes on the path made in a life that is alive, the ones that lost included (a write into a superseded life is dropped, and what it absorbed with it), and everything at or
 //!   below it is left out of the type as it is of the value; the ones absorbed leave no trace in the type). The slot carries, per width above `Int32`, the stamp of its
 //!   latest operand of that width ([`Slot::wide_at`](super::Slot), [`Slot::decimal_at`](super::Slot)):
 //!   the width of what it gained since an absorb at stamp `a` is the widest of the two whose stamp is

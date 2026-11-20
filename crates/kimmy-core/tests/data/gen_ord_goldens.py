@@ -21,8 +21,8 @@ Usage:   Q7MODEL_DIR=<q7step0-model> python3 -I -B gen_ord_goldens.py <out-dir>
          (-B: the model directory must not get a __pycache__; the script also sets sys.dont_write_bytecode)
 
 The 30 scenarios of O1 give the same expected order, order state, entries and writes under A2.1 as under A2-final (the O2 round
-compared the two fixtures field by field: only `model6_sha256` differs). `model6.py` is NOT in this repository (the reference model
-lives with the Q7 review files); the fixtures record its sha256 and the Rust tests check it. A new scenario here needs a new name in
+compared the two fixtures field by field: only `model6_sha256` differs). `model6.py` is NOT in this repository's fixture tree (the reference model
+lives with the Q7 review files); the fixtures record its sha256 and the Rust tests check it. They were regenerated for the absorbed pair keyed by its writing life from a copy of the model tree with the VENDORED `model6.py` and `pullmodel6.py` (`tests/merge_state_sim/reference_model`, model6 f9702ee2) in place of its own; an absorbed entry carries the writing life as its seventh element. A new scenario here needs a new name in
 `SCENARIOS` of `src/merge_state/ord_tests.rs` and its order pinned there. In the model the root of a replace is keyed by "" (and a
 top-level field named "" by "" too); the Rust keys them OrdAt::Root and OrdAt::Field([""]), told apart by context.
 """
@@ -117,10 +117,11 @@ def j_state(s):
     slots = [[j_stamp(k[0]), k[1].split("."), j_writer(k[2]), j_stamp(k[3]), j_stamp(v[0]), v[1]]
              for k, v in sorted(s.slots.items(), key=lambda kv: (kv[0][0], kv[0][1].split("."), kv[0][2], repr(kv[0][3])))]
     lives = [[j_stamp(L), [j_stamp(d) for d in sorted(v[0])], [p.split(".") for p in v[1]], v[2]] for L, v in sorted(s.lives.items())]
-    # the counter cell: a slot's absorbed pair, from the model's absorbed store (slot key -> the highest (stamp, total) any base
-    # write on the path observed); the registers no longer carry an `obs` map
-    absorbed = [[j_stamp(k[0]), k[1].split("."), j_writer(k[2]), j_stamp(k[3]), j_stamp(v[0]), v[1]]
-                for k, v in sorted(s.absorbed.items(), key=lambda kv: (kv[0][0], kv[0][1].split("."), kv[0][2], repr(kv[0][3])))]
+    # the counter cell: a slot's absorbed pairs, from the model's absorbed store ((writing life, slot key) -> the highest (stamp,
+    # total) a base write made in that life observed); the registers no longer carry an `obs` map
+    # (the key is (writing life, slot key); each entry is the slot's key, the pair, then the WRITING life)
+    absorbed = [[j_stamp(k[1]), k[2].split("."), j_writer(k[3]), j_stamp(k[4]), j_stamp(v[0]), v[1], j_stamp(k[0])]
+                for k, v in sorted(s.absorbed.items(), key=lambda kv: (kv[0][1], kv[0][2].split("."), kv[0][3], repr(kv[0][4]), kv[0][0]))]
     return {"lives": lives, "dead": [j_stamp(L) for L in sorted(s.dead)], "absorbed": absorbed,
             "deletes": [[j_stamp(d), [[j_writer(w), h] for w, h in sorted(vv.items())]] for d, vv in sorted(s.deletes.items())],
             "regs": regs, "slots": slots, "vv": [[j_writer(w), h] for w, h in sorted(s.vv.items())],

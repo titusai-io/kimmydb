@@ -148,8 +148,10 @@
 //!   `(stamp, total)` of that very slot that any base write on the path had held (the ABSORBED pair;
 //!   section 7). A base write folds into the pairs every slot of the path its writer holds in an
 //!   alive life, of any generation. The read side counts only what a slot gained since its pair, and
-//!   the field is present when the slot moved since the pair's stamp (B1). The pair is keyed by the
-//!   slot, joined by the higher absorbed stamp, and dropped with the slot's life. It replaces the
+//!   the field is present when the slot moved since the pair's stamp (B1). The pairs are kept on the
+//!   slot, one per WRITING life (the life the base write was made in), joined by life with the higher
+//!   stamp, and dropped with their writing life and with the life of their slot; the incarnation floor
+//!   re-homes a pair whose writing life it removes onto the slot's own life. They replace the
 //!   per-register `obs` map. A state that has a pair has no version 1 spelling (`V1CannotHold`).
 //!   A decoded pair is refused above its slot (`AbsorbedAboveSlot`), at the slot's own stamp
 //!   with another total (`AbsorbedTotalMismatch`), by another writer than its slot's key

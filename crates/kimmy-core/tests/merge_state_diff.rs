@@ -684,7 +684,13 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// moved and no read did. The scripts did not change and the replay still agrees with the model (0 scripts disagree), the model's
 /// independent encoder spelling the pairs the same way.
 /// 0xba37_4165_957e_7238 to 0x3976_ba05_01b6_3887. With `Q7DIFF_FORCE_K=64` it is 0x383e_4100_dc89_af5e, the pin before the cap, exactly.
-const PINNED_300: u64 = 0x3976_ba05_01b6_3887;
+///
+/// RE-PINNED for the absorbed pair keyed by its WRITING life (model f9702ee2: a base write files its pair under the life it is made in,
+/// the join drops a pair whose life or whose slot's life is gone): the fingerprint folds the compact bytes, and a pair of a write made
+/// into another life than its slot's spells that life now. 0 scripts disagree with the new model; the model's independent encoder
+/// spells the list the same way.
+/// 0x3976_ba05_01b6_3887 to 0xa2ba_6094_db86_1a29. With `Q7DIFF_FORCE_K=64` it is 0x2e5b_76f2_6f2f_b326, the pin before the cap, exactly.
+const PINNED_300: u64 = 0xa2ba_6094_db86_1a29;
 
 #[test]
 fn differential_against_the_python_model() {

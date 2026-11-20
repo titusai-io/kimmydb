@@ -25,7 +25,7 @@ const JOIN_LAWS: &str = include_str!("../../tests/data/ord_join_laws.json");
 const RANDOM_STATES: &str = include_str!("../../tests/data/ord_random_states.json");
 
 /// The `sha256` of `model6.py` (the reviewed A2.3 tree) that the fixtures were made from.
-const MODEL6_SHA256: &str = "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d";
+const MODEL6_SHA256: &str = "f9702ee2c59f9f6a080c11755833079904a5512880c12057558e550aad712b61";
 
 // ---- the fixtures ---------------------------------------------------------------------
 
@@ -145,15 +145,16 @@ pub(super) fn state(j: &J) -> MergeState {
                 .collect(),
         );
     }
-    // The counter cell: the model's absorbed store, keyed by slot, is each slot's absorbed pair.
+    // The counter cell: the model's absorbed store, keyed by (writing life, slot), is each slot's pairs, one per
+    // writing life (the entry is the slot's key, the pair, then the writing life).
     type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
-    let absorbed: BTreeMap<SlotKey, (MStamp, Num)> = j["absorbed"]
+    let absorbed: BTreeMap<(MStamp, SlotKey), (MStamp, Num)> = j["absorbed"]
         .as_array()
         .unwrap()
         .iter()
         .map(|a| {
             (
-                (stamp(&a[0]), path(&a[1]), writer(&a[2]), stamp_opt(&a[3])),
+                (stamp(&a[6]), (stamp(&a[0]), path(&a[1]), writer(&a[2]), stamp_opt(&a[3]))),
                 (stamp(&a[4]), num(&a[5])),
             )
         })
@@ -181,13 +182,17 @@ pub(super) fn state(j: &J) -> MergeState {
     }
     for sl in j["slots"].as_array().unwrap() {
         let key = (stamp(&sl[0]), path(&sl[1]), writer(&sl[2]), stamp_opt(&sl[3]));
-        let absorbed = absorbed.get(&key).copied();
-        let life = key.0;
-        let absorbed = absorbed.map(|(stamp, total)| Pair { life, stamp, total });
-        s.slots.insert(key, Slot::new(stamp(&sl[4]), num(&sl[5]), absorbed));
+        let mut slot = Slot::new(stamp(&sl[4]), num(&sl[5]), None);
+        // the map is ordered by (writing life, slot), so the pairs of a slot come sorted by life
+        slot.absorbed = absorbed
+            .iter()
+            .filter(|((_, k), _)| *k == key)
+            .map(|((life, _), (stamp, total))| Pair { life: *life, stamp: *stamp, total: *total })
+            .collect();
+        s.slots.insert(key, slot);
     }
     assert!(
-        absorbed.keys().all(|k| s.slots.contains_key(k)),
+        absorbed.keys().all(|(_, k)| s.slots.contains_key(k)),
         "the model's absorbed store names a slot the state does not hold"
     );
     s.vv = j["vv"]
