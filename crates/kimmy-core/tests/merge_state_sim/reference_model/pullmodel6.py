@@ -104,8 +104,12 @@ class Node(M.Member):
                 self._append(ent)
         else:
             key, val = ent[2], ent[3]
+            added = False
             if key[2][0] >= self.state.horizon() and key not in self.state.losses:
                 self.state.losses[key] = val
+                self.state.losses = M.cap_losses(self.state.losses)
+                added = key in self.state.losses      # a record the cap refuses is not added
+            if added:
                 self.events.append(key)
                 self._append(ent)
             elif APPEND_ALL_LOSS and okey(st) not in self.oplog:

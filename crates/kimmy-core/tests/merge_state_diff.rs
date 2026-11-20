@@ -214,6 +214,9 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
     let opts = JoinOptions::new(ret, bound).expect("a valid bound");
+    let opts = opts
+        .clone()
+        .with_loss_limits_unchecked(sc["k"].as_u64().map_or(64, |k| k as usize), opts.loss_cut());
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
         .take(nm)
@@ -670,7 +673,11 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// insertLost): the flat generator draws upserts with `$setOnInsert` cells beside explicit inserts, so the states of those scripts hold other
 /// loss records. The scripts did not change. The replay still agrees with the model (0 scripts disagree).
 /// 0xccb0_e0db_c8f1_83b7 to 0x9e33_ca61_f295_c17a.
-const PINNED_300: u64 = 0x9e33_ca61_f295_c17a;
+/// RE-PINNED for the cap of the loss records in the model and the generator drawing `K` per script (see the nested differential's pin: from a stream of its
+/// own, so the scripts of a seed did not change; mostly 64, else 8, 5 or 4): a small `K` caps the records of the scripts that draw one. The replay still
+/// agrees with the model (0 scripts disagree). With `Q7DIFF_FORCE_K=64` the fingerprint is the one before, 0x9e33_ca61_f295_c17a, exactly.
+/// 0x9e33_ca61_f295_c17a to 0xba37_4165_957e_7238.
+const PINNED_300: u64 = 0xba37_4165_957e_7238;
 
 #[test]
 fn differential_against_the_python_model() {
