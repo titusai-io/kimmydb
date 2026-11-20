@@ -260,6 +260,8 @@ pub(super) fn check_laws_on(
 ) {
     let mut assoc_loss_diff = 0;
     let mut assoc_state_diff = 0;
+    // what the cap did to the records of the two routes of every triple: records it refused on arrival, records a newer one displaced
+    let mut refusals = LossCounts::default();
     for (k, (a, b, c)) in triples(ps, count).into_iter().enumerate() {
         let j = |x: &MergeState, y: &MergeState| join(x, y, o).0;
         let ab = j(a, b);
@@ -267,6 +269,14 @@ pub(super) fn check_laws_on(
         assert!(ab == ba, "commutative (state and records), triple {k}");
         let l = j(&ab, c);
         let r = j(a, &j(b, c));
+        for (x, y) in [(a, b), (&ab, c), (b, c)] {
+            let n = join_counted(x, y, o).2;
+            (refusals.refused, refusals.evicted) =
+                (refusals.refused + n.refused, refusals.evicted + n.evicted);
+        }
+        let n = join_counted(a, &j(b, c), o).2;
+        (refusals.refused, refusals.evicted) =
+            (refusals.refused + n.refused, refusals.evicted + n.evicted);
         let assoc_ok = bare(l.clone()) == bare(r.clone());
         assert!(assoc_ok || !exact_assoc, "associative (state), triple {k}");
         assoc_state_diff += usize::from(!assoc_ok);
@@ -278,10 +288,14 @@ pub(super) fn check_laws_on(
         let want: BTreeSet<_> =
             m.losses.keys().filter(|k| !a.losses.contains_key(*k)).cloned().collect();
         assert_eq!(fresh, want);
-        // Monotone: records of `a` survive the join unless the joined horizon passed them.
+        // Monotone: records of `a` survive the join unless the joined horizon passed them, or the cap holds `K` records
+        // that all rank above them.
         let hz = ab.horizon(o);
         assert!(
-            a.losses.keys().all(|k| ab.losses.contains_key(k) || k.stamp.hlc < hz),
+            a.losses.keys().all(|k2| ab.losses.contains_key(k2)
+                || k2.stamp.hlc < hz
+                || (ab.losses.len() == o.loss_cap()
+                    && ab.losses.keys().all(|g| g.rank_cmp(k2) == std::cmp::Ordering::Greater))),
             "monotone, triple {k}"
         );
         // The hash does not depend on the join order (version 1 where it can spell the state).
@@ -298,11 +312,27 @@ pub(super) fn check_laws_on(
     eprintln!(
         "associativity differed: state {assoc_state_diff}, records {assoc_loss_diff} of {count} triples"
     );
+    eprintln!(
+        "cap refusals (K = {}): {} records refused on arrival, {} displaced by a newer one, in the joins of the two routes of {count} triples",
+        o.loss_cap(),
+        refusals.refused,
+        refusals.evicted
+    );
 }
 
 #[test]
 fn join_laws_large_retention() {
     check_laws(&opts(1_000_000_000), true, 60, 24, 300);
+}
+
+/// The laws at the smallest `K` (4): the state laws are exact and the records are a commutative union, monotone but for what the cap displaces;
+/// and the report line above counts the records the cap refuses and displaces in the two routes of every triple. (Required heads crowded
+/// out are counted where the oracle is: the differentials' law check.)
+#[test]
+fn join_laws_at_the_smallest_cap_report_what_it_refuses_and_displaces() {
+    let o = opts(1_000_000_000);
+    let o = o.clone().with_loss_limits_unchecked(4, o.loss_cut());
+    check_laws(&o, true, 60, 24, 300);
 }
 
 #[test]
