@@ -913,7 +913,7 @@ fn rust_mutants_are_caught_by_the_replay() {
     }
 }
 
-/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3 plus the Step 4 delta (a), the marker head as a cover check at a non-marker path below the marker: `covered`, and an implicit marker that is never a head of its own) and of
+/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3 plus the Step 4 deltas: (a), the marker head as a cover check at a non-marker path below the marker: `covered`, and an implicit marker that is never a head of its own; and (c), the suppressed creation cells) and of
 /// `pullmodel6.py` (its missing check takes `covered`), as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
 /// differential's fixture are made from these files; a changed byte fails here before it fails anywhere else.
 #[test]
@@ -922,7 +922,7 @@ fn the_vendored_model_is_the_reviewed_one() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
-        ("model6.py", "9f5bb33b2c6fb8551f63f35770be1bb36fdb6ef94e05d65811ee7e8495f834e2"),
+        ("model6.py", "12a7ddc05845c63429066bd644df1050a5a20b827659fdc37100ed99bffb8bb3"),
         ("pullmodel6.py", "7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"),
     ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
@@ -930,6 +930,6 @@ fn the_vendored_model_is_the_reviewed_one() {
         assert_eq!(got, want, "{file}");
     }
     let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-    assert!(recorded.contains("9f5bb33b2c6fb8551f63f35770be1bb36fdb6ef94e05d65811ee7e8495f834e2"));
+    assert!(recorded.contains("12a7ddc05845c63429066bd644df1050a5a20b827659fdc37100ed99bffb8bb3"));
     assert!(recorded.contains("7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"));
 }

@@ -665,7 +665,12 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// RE-PINNED for Amendment 9: the operand stamps are spelled only when they are not the usual ones, and the fingerprint is the pre-stamp value
 /// again (compared step by step against the series before the stamps: slot-bearing steps identical 18,114 of 18,114, slotless differing 0).
 /// 0x6369_2db0_1289_772a to 0xccb0_e0db_c8f1_83b7.
-const PINNED_300: u64 = 0xccb0_e0db_c8f1_83b7;
+///
+/// RE-PINNED for the Step 4 delta (c) (a creation cell that an insert suppressed is no side of a clash or a typeClash, and is reported as an
+/// insertLost): the flat generator draws upserts with `$setOnInsert` cells beside explicit inserts, so the states of those scripts hold other
+/// loss records. The scripts did not change. The replay still agrees with the model (0 scripts disagree).
+/// 0xccb0_e0db_c8f1_83b7 to 0x9e33_ca61_f295_c17a.
+const PINNED_300: u64 = 0x9e33_ca61_f295_c17a;
 
 #[test]
 fn differential_against_the_python_model() {

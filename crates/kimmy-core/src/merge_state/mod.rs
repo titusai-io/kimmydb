@@ -110,6 +110,8 @@ mod ord_tests;
 mod prop_tests;
 #[cfg(test)]
 mod state_at_tests;
+#[cfg(test)]
+mod suppression_tests;
 
 #[cfg(test)]
 mod stamps_tests;

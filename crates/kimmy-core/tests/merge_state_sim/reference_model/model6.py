@@ -647,11 +647,14 @@ def join(s, t, tag=None):
         superseded, reported = set(), set()
     al = set(out.alive())
     out.dead |= {L for L in out.lives if L not in al}
-    # (1) same-path register clashes: a register of s against a register of t, concurrent by the VVs
+    # (1) same-path register clashes: a register of s against a register of t, concurrent by the VVs.
+    # DELTA (c): a creation cell that an alive explicit insert suppresses (`out.suppressed`, the read side's own predicate)
+    # is not a competitor of the insert's cells: it takes part in no clash and no typeClash, and the V6m2 block below
+    # reports it, at least once, as an insertLost.
     paths = {k[1] for k in list(s.regs) + list(t.regs)}
     for p in paths:
-        rs = [r for k, r in s.regs.items() if k[1] == p and k[0] in al]
-        rt = [r for k, r in t.regs.items() if k[1] == p and k[0] in al]
+        rs = [r for k, r in s.regs.items() if k[1] == p and k[0] in al and not out.suppressed(k, r, al)]
+        rt = [r for k, r in t.regs.items() if k[1] == p and k[0] in al and not out.suppressed(k, r, al)]
         for a in rs:
             for b in rt:
                 if a[0] != b[0] and not cov(t.vv, a[0]) and not cov(s.vv, b[0]):
@@ -667,9 +670,10 @@ def join(s, t, tag=None):
     # hides the descendant; a newer descendant makes p a map and the register at p loses).
     for A, B in ((s, t), (t, s)):
         for k, r in A.regs.items():
-            if k[0] not in al or not is_val(r[1]) or cov(B.vv, r[0]):
+            if k[0] not in al or not is_val(r[1]) or cov(B.vv, r[0]) or out.suppressed(k, r, al):
                 continue
-            cells = [(kb[1], rb[0], rb[1]) for kb, rb in B.regs.items() if kb[0] in al and is_val(rb[1])]
+            cells = [(kb[1], rb[0], rb[1]) for kb, rb in B.regs.items()
+                     if kb[0] in al and is_val(rb[1]) and not out.suppressed(kb, rb, al)]
             cells += [(kb[1], vb[0], vb[1]) for kb, vb in B.slots.items() if kb[0] in al]
             for q, qst, qv in cells:
                 if q.startswith(k[1] + ".") and qst != r[0] and not cov(A.vv, qst):
@@ -702,13 +706,11 @@ def join(s, t, tag=None):
                 new[("insertLost", k[1], v[0])] = v[1]
             elif k[0] not in al and k[0] not in reported and not any(cov(vv, v[0]) for vv in out.deletes.values()):
                 new[("deleteWon", k[1], v[0])] = v[1]
-    # V6m2: creation cells of an upsert life dropped for an alive explicit first insert
-    insert_alive = [L for L in al if out.lives[L][2] == "insert"]
-    if insert_alive:
-        for src in (s, t):
-            for k, r in src.regs.items():
-                if k[0] in out.lives and out.lives[k[0]][2] == "upsert" and len(r) > 4 and r[4] == "soi" and k[0] in al:
-                    new[("insertLost", k[1], r[0])] = r[1]
+    # V6m2: creation cells of an upsert life dropped for an alive explicit first insert: the cells `out.suppressed` names
+    for src in (s, t):
+        for k, r in src.regs.items():
+            if k[0] in al and out.suppressed(k, r, al):
+                new[("insertLost", k[1], r[0])] = r[1]
     # drop cells of dead lives; filter records by the horizon
     for store in (out.regs, out.slots, out.gens, out.ords, out.absorbed):
         for k in [k for k in store if k[0] not in al]:
