@@ -177,22 +177,31 @@ pub struct OverCaps {
     pub counters: BTreeMap<Path, usize>,
 }
 
+/// What a base write absorbed of a slot: the highest `(stamp, total)` of THIS slot that a base write made in the life
+/// `life` had held when it wrote (see [`Slot`]). The pairs of a slot are kept sorted by `life`, one per life.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Pair {
+    /// The life the base write was made in. Today (the layout of the pair list) it is the slot's own life.
+    pub life: MStamp,
+    pub stamp: MStamp,
+    pub total: Num,
+}
+
 /// A counter slot: one writer's running total in one generation.
 ///
-/// `absorbed` is the highest `(stamp, total)` of THIS slot that any base write on the path had
-/// held when it wrote (see [`Writer`](super::Writer): at every base write the writer folds every
-/// slot of the path it holds in an alive life, of any generation). The increments up to that
-/// pair are in a base's value, so the read side counts only what the slot gained since
-/// ([`MergeState::value`]); the stamp tells a slot that has not moved since from one that moved
-/// and came back to the same total (the B1 rule: the field is present when the slot moved). It is
-/// keyed by the slot's own key, joined by the higher absorbed stamp, and dropped with the slot's
-/// life. An honest pair is never above the slot (`absorbed.0 <= stamp`) and equals it in the total
-/// when the stamps are equal.
+/// `absorbed` holds the pairs `(life, stamp, total)`: the highest `(stamp, total)` of THIS slot that any base write
+/// on the path had held when it wrote (see [`Writer`](super::Writer): at every base write the writer folds every
+/// slot of the path it holds in an alive life, of any generation). The increments up to a pair are in a base's value,
+/// so the read side counts only what the slot gained since the highest pair of a live life
+/// ([`Slot::effective_pair`], [`MergeState::value`]); the stamp tells a slot that has not moved since from one that
+/// moved and came back to the same total (the B1 rule: the field is present when the slot moved). The pairs live on
+/// the slot: they are joined by life, the higher stamp per life, and dropped with the slot's life. An honest pair is
+/// never above the slot (`stamp <= slot stamp`) and equals it in the total when the stamps are equal.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
     pub stamp: MStamp,
     pub total: Num,
-    pub absorbed: Option<(MStamp, Num)>,
+    pub absorbed: Vec<Pair>,
     /// The stamp of the latest operand of this writer's slot whose type is `Int64` or wider. Its
     /// writer's own history: an honest value is at most `stamp`, and `None` while every operand was an
     /// `Int32`. With `decimal_at` it tells the width of the operands added AFTER an absorb at stamp
@@ -208,7 +217,8 @@ impl Slot {
     /// A slot whose operands were all of the width of its total, the latest at `stamp`: the
     /// shape of a slot written once, and of every slot a test builds by its total. A slot a writer
     /// grows keeps the stamps of its operands (`Writer::put_slot`).
-    pub fn new(stamp: MStamp, total: Num, absorbed: Option<(MStamp, Num)>) -> Slot {
+    pub fn new(stamp: MStamp, total: Num, absorbed: Option<Pair>) -> Slot {
+        let absorbed: Vec<Pair> = absorbed.into_iter().collect();
         let (wide_at, decimal_at) = match total.label() {
             Kind::Int32 => (None, None),
             Kind::Int64 => (Some(stamp), None),
@@ -222,7 +232,7 @@ impl Slot {
     /// operand of each width above `Int32` (`wide_at`, `decimal_at`) move to `stamp` for the widths the operand
     /// has. The writer stores exactly this (`Writer::put_slot`), and judges an `$inc` by it.
     pub(super) fn grown(held: Option<&Slot>, stamp: MStamp, total: Num, op: Kind) -> Slot {
-        let absorbed = held.and_then(|s| s.absorbed);
+        let absorbed = held.map(|s| s.absorbed.clone()).unwrap_or_default();
         let (mut wide_at, mut decimal_at) =
             held.map_or((None, None), |s| (s.wide_at, s.decimal_at));
         if op >= Kind::Int64 {
@@ -250,11 +260,77 @@ impl Slot {
         *self = Slot::new(self.stamp, self.total, None);
     }
 
+    /// The pair the read counts: the highest `(stamp, life)` among the pairs whose life is in `al`, the alive set. The
+    /// join already drops the pairs of a dead life, so this filter changes nothing on a normalised state; it is kept
+    /// as defence in depth, for a state that is not normalised (one read before a join, or built by hand), so that a
+    /// pair of a life that is gone never hides increments. Equal stamps are broken by life, never by order.
+    pub fn effective_pair(&self, al: &BTreeSet<MStamp>) -> Option<&Pair> {
+        self.absorbed.iter().filter(|p| al.contains(&p.life)).max_by_key(|p| (p.stamp, p.life))
+    }
+
+    /// The one `(stamp, total)` of the slot's pair, for the tests that build and read a slot with a single pair (the first
+    /// by life; `None` when it has none).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub fn pair(&self) -> Option<(MStamp, Num)> {
+        self.absorbed.first().map(|p| (p.stamp, p.total))
+    }
+
+    /// A slot whose one pair is `(pair_stamp, pair_total)` of the life `life` (the tests build their slots by this).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub fn with_pair(
+        stamp: MStamp,
+        total: Num,
+        life: MStamp,
+        pair_stamp: MStamp,
+        pair_total: Num,
+    ) -> Slot {
+        Slot::new(stamp, total, Some(Pair { life, stamp: pair_stamp, total: pair_total }))
+    }
+
+    /// Replace the pairs by the one of `life` with `pair` (`None`: no pair at all).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub fn set_pair(&mut self, life: MStamp, pair: Option<(MStamp, Num)>) {
+        self.absorbed =
+            pair.map(|(stamp, total)| Pair { life, stamp, total }).into_iter().collect();
+    }
+
+    /// A base write made in the life `life` has held this slot: its pair for `life` becomes `(stamp, total)` of the slot, when
+    /// that is above the pair it has (the model's max by stamp). The list stays sorted by life, one pair per life.
+    pub(super) fn absorb_under(&mut self, life: MStamp) {
+        match self.absorbed.binary_search_by(|p| p.life.cmp(&life)) {
+            Ok(i) => {
+                if self.absorbed[i].stamp < self.stamp {
+                    self.absorbed[i] = Pair { life, stamp: self.stamp, total: self.total };
+                }
+            }
+            Err(i) => {
+                self.absorbed.insert(i, Pair { life, stamp: self.stamp, total: self.total });
+            }
+        }
+    }
+
+    /// The union of two pair lists by life, the higher stamp per life (equal stamps: the first, honest states agree in the
+    /// total there), sorted by life.
+    pub(super) fn join_pairs(a: &[Pair], b: &[Pair]) -> Vec<Pair> {
+        let mut out: Vec<Pair> = a.to_vec();
+        for p in b {
+            match out.binary_search_by(|x| x.life.cmp(&p.life)) {
+                Ok(i) => {
+                    if p.stamp > out[i].stamp {
+                        out[i] = *p;
+                    }
+                }
+                Err(i) => out.insert(i, *p),
+            }
+        }
+        out
+    }
+
     /// The width of the operands this slot gained since its absorbed stamp (all of them when it has
     /// none): `Decimal128` if its latest decimal operand is newer than the absorb, `Int64` if its
     /// latest wide operand is, `Int32` otherwise.
-    pub(super) fn width_since(&self) -> Kind {
-        let a = self.absorbed.as_ref().map(|x| x.0);
+    pub(super) fn width_since(&self, al: &BTreeSet<MStamp>) -> Kind {
+        let a = self.effective_pair(al).map(|x| x.stamp);
         let newer = |w: Option<MStamp>| w.is_some_and(|w| a.is_none_or(|a| w > a));
         if newer(self.decimal_at) {
             Kind::Decimal128
@@ -519,6 +595,11 @@ impl MergeState {
     ///     (The reference model has one integer type and no decimal arithmetic, see its
     ///     INTERFACE.md: the relation is the Rust counter's, not the model's.)
     ///
+    /// 30. A slot's absorbed pairs are sorted by life, one per life ([`DecodeError::AbsorbedPairsNotCanonical`]), each names a
+    ///     life the state lists and has not buried ([`DecodeError::AbsorbedLifeNotListed`]: a pair goes with the life it was
+    ///     made in), and clauses 24 to 28 hold of each pair. Two pairs of one slot at one stamp hold one total
+    ///     ([`DecodeError::AbsorbedPairsDisagree`]): one stamp is one write, so honest states cannot differ there.
+    ///
     /// 29. A `Decimal128` total is a word the Writer writes ([`DecodeError::NotCanonicalDecimal`]), for the
     ///     slot, its absorbed pair, a generation's `seen` and a loss total alike (the one compact reader,
     ///     `num_payload`). THE DERIVATION. A decimal enters a typed total in three ways, and each ends in
@@ -591,7 +672,16 @@ impl MergeState {
             if s.stamp.writer != k.2 {
                 return Err(DecodeError::SlotWriterMismatch);
             }
-            if let Some((st, total)) = &s.absorbed {
+            for (n, pr) in s.absorbed.iter().enumerate() {
+                let (st, total) = (&pr.stamp, &pr.total);
+                // the pairs are sorted by life, one per life, and each names a life the state lists and has not
+                // buried (a pair of a dead life goes with it)
+                if n > 0 && s.absorbed[n - 1].life >= pr.life {
+                    return Err(DecodeError::AbsorbedPairsNotCanonical);
+                }
+                if !self.lives.contains_key(&pr.life) || self.dead.contains(&pr.life) {
+                    return Err(DecodeError::AbsorbedLifeNotListed);
+                }
                 if *st > s.stamp {
                     return Err(DecodeError::AbsorbedAboveSlot);
                 }
@@ -604,6 +694,12 @@ impl MergeState {
                 if total.label() > s.total.label() {
                     return Err(DecodeError::AbsorbedWiderThanSlot);
                 }
+            }
+            // one stamp is one write: two pairs of one slot at the same stamp hold the same total
+            if s.absorbed.iter().enumerate().any(|(n, a)| {
+                s.absorbed[..n].iter().any(|b| b.stamp == a.stamp && b.total != a.total)
+            }) {
+                return Err(DecodeError::AbsorbedPairsDisagree);
             }
             // the stamps of the latest wide and decimal operands: this writer's, not above the slot's
             // own, a decimal one also a wide one, and the type they spell is the total's
@@ -630,7 +726,7 @@ impl MergeState {
             .chain(self.lives.values().flat_map(|l| l.seen.iter()))
             .chain(self.regs.values().map(|r| &r.stamp))
             .chain(self.slots.values().map(|s| &s.stamp))
-            .chain(self.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| &a.0)))
+            .chain(self.slots.values().flat_map(|s| s.absorbed.iter().map(|a| &a.stamp)))
             .chain(self.slots.values().flat_map(|s| s.wide_at.iter().chain(&s.decimal_at)))
             .chain(self.slots.keys().filter_map(|k| k.3.as_ref()))
             .chain(gens.clone().map(|g| &g.stamp))
@@ -696,7 +792,7 @@ impl MergeState {
     pub(crate) fn totals(&self) -> impl Iterator<Item = &Num> {
         let regs =
             self.regs.values().flat_map(|r| r.generation.iter().flat_map(|g| g.seen.values()));
-        let absorbed = self.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| &a.1));
+        let absorbed = self.slots.values().flat_map(|s| s.absorbed.iter().map(|a| &a.total));
         let lost = self.losses.values().filter_map(|v| match v {
             LossValue::Total(n) => Some(n),
             _ => None,
@@ -1031,21 +1127,25 @@ impl MergeState {
         let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
         let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
         for (k, s) in counted_among(g, slots) {
-            let ob = s.absorbed.as_ref();
+            let ob = s.effective_pair(al);
             // A slot total is exact (a counter is exact or refused), so with only integer operands since the
             // absorb this difference is the integer sum itself, which a correctly rounded subtraction returns
             let d = ob.map_or(s.total, |x| {
                 if o.no_decimal_saturation() {
-                    s.total.sub(&x.1)
+                    s.total.sub(&x.total)
                 } else {
-                    s.total.sub_sat(&x.1, &mut cut)
+                    s.total.sub_sat(&x.total, &mut cut)
                 }
             });
             // R1: the type of what the slot gained is the width of the operands added since the
             // absorb, not the join of every operand the slot ever took
-            let d =
-                if o.counter_label_survives_absorb() { d } else { d.narrowed_to(s.width_since()) };
-            if !d.is_zero() || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp))
+            let d = if o.counter_label_survives_absorb() {
+                d
+            } else {
+                d.narrowed_to(s.width_since(al))
+            };
+            if !d.is_zero()
+                || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.stamp != s.stamp))
             {
                 terms.push((s.stamp, k, d));
             }

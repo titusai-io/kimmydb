@@ -1021,8 +1021,8 @@ pub(super) fn golden_obs() -> MergeState {
     let st = obs.w.state.clone();
     let xs: Vec<_> = st.slots.iter().filter(|(k, _)| k.1 == p("x")).collect();
     assert_eq!(xs.len(), 1, "x has its one slot");
-    let (_, t) = xs[0].1.absorbed.as_ref().expect("x's base absorbed its one slot");
-    assert_eq!(*t, Num::from(3));
+    let (_, t) = xs[0].1.pair().expect("x's base absorbed its one slot");
+    assert_eq!(t, Num::from(3));
     let gy = st.regs[&(i0, p("y"))].generation.as_ref().unwrap();
     assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![Num::from(2)]);
     assert_eq!(obs.visible(), doc(&[("x", i(20)), ("y", s("t"))]));
@@ -1141,7 +1141,7 @@ fn golden_vectors_obs() {
     // hash f96f244c2b3198f724fcea0eafec32c7 and 1325 bytes, was of the register `obs` map the cell
     // replaced). Its golden is the compact one: `compact_tests` pins it with the others.
     let st = golden_obs();
-    assert!(st.slots.values().any(|s| s.absorbed.is_some()));
+    assert!(st.slots.values().any(|s| !s.absorbed.is_empty()));
     assert!(st.without_ords().v1_refused_only_for_a_pair());
     assert_eq!(st.without_ords().try_canonical_bytes(), Err(V1CannotHold));
     assert_eq!(st.without_ords().try_state_hash(), Err(V1CannotHold));
@@ -1337,10 +1337,10 @@ fn a_slot_keeps_the_stamp_of_its_absorbed_pair() {
     w.write_set(&p("x"), i(20), 0).unwrap();
     let r = w.state.regs.values().find(|r| r.value == i(20)).unwrap();
     assert!(
-        w.state.slots.values().all(|s| s
-            .absorbed
-            .as_ref()
-            .is_some_and(|(st, t)| *t == Num::from(3) && *st < r.stamp))
+        w.state
+            .slots
+            .values()
+            .all(|s| s.pair().is_some_and(|(st, t)| t == Num::from(3) && st < r.stamp))
     );
     w.write_inc(&p("x"), 4, 0).unwrap();
     w.write_inc(&p("x"), -4, 0).unwrap();
@@ -1489,11 +1489,11 @@ fn decode_refuses_totals_past_the_bound() {
     };
     let mut bad = good.clone();
     for s in bad.slots.values_mut() {
-        if let Some(a) = s.absorbed.as_mut() {
-            a.1 = big.into();
+        for a in s.absorbed.iter_mut() {
+            a.total = big.into();
         }
     }
-    assert!(bad.slots.values().any(|s| s.absorbed.is_some()), "the base absorbed the slot");
+    assert!(bad.slots.values().any(|s| !s.absorbed.is_empty()), "the base absorbed the slot");
     try_state(&bad);
     let mut bad = good.clone();
     for r in bad.regs.values_mut() {
@@ -1514,7 +1514,7 @@ fn decode_refuses_totals_past_the_bound() {
     // the generation's `seen` or for a loss cannot slip.
     let mut v1good = good.without_ords();
     for s in v1good.slots.values_mut() {
-        s.absorbed = None;
+        s.absorbed.clear();
     }
     assert!(v1good.v1_can_hold());
     assert_eq!(MergeState::decode(&v1good.encode()).unwrap(), v1good);

@@ -247,11 +247,7 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
             fg(g),
             fs(&sl.stamp),
             total(&sl.total),
-            sl.absorbed.as_ref().map_or("-".to_string(), |(st, n)| format!(
-                "{},{}",
-                fs(st),
-                total(n)
-            ))
+            sl.pair().map_or("-".to_string(), |(st, n)| format!("{},{}", fs(&st), total(&n)))
         ));
     }
     for (w, h) in &s.vv {
@@ -770,13 +766,18 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// agrees with the model (0 scripts disagree); the Rust-side oracle takes the same changes as the model's `loss_oracle` (the
 /// marker head as a cover, an implicit marker never a head of its own).
 /// 0xe9b9_25e7_5146_822c to 0xf7e0_c678_fd6b_24f7.
+///
 /// RE-PINNED for the cap of the loss records in the model (the model keeps the `K` greatest records by the loser's stamp, then the path and the kind, as the
 /// Rust join does) and the generator drawing `K` per script (from a stream of its own, so the scripts of a seed did not change: mostly 64, else 8, 5 or 4). A
 /// small `K` caps the records of the states of the scripts that draw one, so their states differ. The replay still agrees with the model (0 scripts disagree).
 /// With `Q7DIFF_FORCE_K=64` the fingerprint of the 300 scripts is the one before this change, 0xf7e0_c678_fd6b_24f7, exactly: only the scripts of a small `K`
 /// changed (the seed-378 pin test below is the script whose records pass 64).
 /// 0xf7e0_c678_fd6b_24f7 to 0x219a_e1c8_86cc_57a7.
-const PINNED_300: u64 = 0x219a_e1c8_86cc_57a7;
+///
+/// RE-PINNED for the pair list (a slot's absorbed pairs are a count, then each pair's life index, stamp, type byte and payload): the
+/// states' compact bytes moved and no read did; 0 scripts disagree with the model.
+/// 0x219a_e1c8_86cc_57a7 to 0x179f_3394_5810_5e45. With `Q7DIFF_FORCE_K=64` it is 0x8acc_d209_bbe5_f90c, the pin before the cap, exactly.
+const PINNED_300: u64 = 0x179f_3394_5810_5e45;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)

@@ -169,7 +169,7 @@ fn snap(ms: &[Mem]) -> Vec<J> {
             // the model's v1 column is null for exactly those states: the two are compared as part of the
             // snapshot, so `V1CannotHold` happens exactly when the model state has an absorbed store, in both
             // directions. The compact columns are compared for every state.
-            let has_pair = st.slots.values().any(|s| s.absorbed.is_some());
+            let has_pair = st.slots.values().any(|s| !s.absorbed.is_empty());
             let v1 = st.try_canonical_bytes();
             assert_eq!(
                 v1.is_err(),
@@ -673,11 +673,18 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// insertLost): the flat generator draws upserts with `$setOnInsert` cells beside explicit inserts, so the states of those scripts hold other
 /// loss records. The scripts did not change. The replay still agrees with the model (0 scripts disagree).
 /// 0xccb0_e0db_c8f1_83b7 to 0x9e33_ca61_f295_c17a.
+///
 /// RE-PINNED for the cap of the loss records in the model and the generator drawing `K` per script (see the nested differential's pin: from a stream of its
 /// own, so the scripts of a seed did not change; mostly 64, else 8, 5 or 4): a small `K` caps the records of the scripts that draw one. The replay still
 /// agrees with the model (0 scripts disagree). With `Q7DIFF_FORCE_K=64` the fingerprint is the one before, 0x9e33_ca61_f295_c17a, exactly.
 /// 0x9e33_ca61_f295_c17a to 0xba37_4165_957e_7238.
-const PINNED_300: u64 = 0xba37_4165_957e_7238;
+///
+/// RE-PINNED for the pair list (a slot's absorbed pairs are spelled as a count, then each pair's life index, stamp, type byte and
+/// payload): the fingerprint folds the compact bytes of the states, and every state with a counter slot holds a pair, so the bytes
+/// moved and no read did. The scripts did not change and the replay still agrees with the model (0 scripts disagree), the model's
+/// independent encoder spelling the pairs the same way.
+/// 0xba37_4165_957e_7238 to 0x3976_ba05_01b6_3887. With `Q7DIFF_FORCE_K=64` it is 0x383e_4100_dc89_af5e, the pin before the cap, exactly.
+const PINNED_300: u64 = 0x3976_ba05_01b6_3887;
 
 #[test]
 fn differential_against_the_python_model() {
@@ -752,7 +759,8 @@ fn the_typed_golden_vector_matches_the_model() {
     let out = run_python(&["--golden".to_string()]);
     let got: J = serde_json::from_str(out.trim()).expect("json");
     assert_eq!(got["typed"], J::Null, "an absorbed pair: no version 1 spelling");
-    assert_eq!(got["typed-compact"], json!(["d11ec34731c1adb4ec0a0ae4be757d20", 371]));
+    // RE-PINNED for the pair list (d11ec34731c1adb4ec0a0ae4be757d20, 371 B before): the independent encoder spells the pairs as the Rust writer does
+    assert_eq!(got["typed-compact"], json!(["2407d00c60b667ee785efc6e03a593cc", 377]));
 }
 
 /// The golden vectors of `merge_state/tests.rs`, hashed by the model's independent
@@ -773,11 +781,12 @@ fn golden_vectors_match_the_model() {
         "170-compact": ["abedfb140b687b3671abd3023efa93a8", 215],
         "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
         "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
-        "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
+        // RE-PINNED for the pair list (3894def7793a573b2dad9a4de56bf7cc, 252 B before)
+        "obs-compact": ["477814115cd0d7ccb8c6e501c3a49240", 258],
         // the typed state: no version 1 spelling (it holds absorbed pairs); its compact form is pinned by the writer and
         // by the independent encoder alike (`the_typed_golden_vector_matches_the_model`)
         "typed": J::Null,
-        "typed-compact": ["d11ec34731c1adb4ec0a0ae4be757d20", 371],
+        "typed-compact": ["2407d00c60b667ee785efc6e03a593cc", 377],
     });
     assert_eq!(got, want);
 }

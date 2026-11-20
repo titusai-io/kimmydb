@@ -125,7 +125,7 @@ fn marker_over_a_counter(o: &JoinOptions) -> Slot {
     w.insert(&fl(&[("a", i(1))]), 0).unwrap();
     w.write_inc(&a_path, 5, 0).unwrap();
     let before = w.state.slots.values().next().unwrap().clone();
-    assert_eq!(before.absorbed, None, "no base has held the increment yet");
+    assert_eq!(before.pair(), None, "no base has held the increment yet");
     w.write_set(&a_path, Value::Document(vec![("b".to_string(), i(1))]), 0).unwrap();
     assert_eq!(
         w.state.regs.iter().find(|((_, q), _)| *q == a_path).map(|(_, r)| r.value.clone()),
@@ -141,11 +141,11 @@ fn marker_over_a_counter(o: &JoinOptions) -> Slot {
 #[test]
 fn a_map_marker_base_over_a_counter_folds_its_slots() {
     let sl = marker_over_a_counter(&opts());
-    assert_eq!(sl.absorbed, Some((sl.stamp, sl.total)), "the marker write held the increment");
+    assert_eq!(sl.pair(), Some((sl.stamp, sl.total)), "the marker write held the increment");
     assert_eq!(sl.total, Num::Int64(5));
     let mut o = opts();
     o.set_no_fold_marker(true);
-    assert_eq!(marker_over_a_counter(&o).absorbed, None, "the mutant folds nothing at a marker");
+    assert_eq!(marker_over_a_counter(&o).pair(), None, "the mutant folds nothing at a marker");
 }
 
 /// A base write in the NEWEST alive life folds a slot of ANOTHER alive life: the shape of seed 792 of
@@ -176,12 +176,12 @@ fn base_in_the_newest_life(o: &JoinOptions) -> (Slot, bool) {
 fn a_base_write_in_the_newest_alive_life_folds_a_slot_of_another_alive_life() {
     let (sl, other) = base_in_the_newest_life(&opts());
     assert!(other, "the slot is in the older life, the write in the newest");
-    assert_eq!(sl.absorbed, Some((sl.stamp, sl.total)));
+    assert_eq!(sl.pair(), Some((sl.stamp, sl.total)));
     let mut o = opts();
     o.set_fold_life_only(true);
     let (sl, other) = base_in_the_newest_life(&o);
     assert!(other);
-    assert_eq!(sl.absorbed, None, "the mutant folds only the write's own life");
+    assert_eq!(sl.pair(), None, "the mutant folds only the write's own life");
 }
 
 #[test]
@@ -201,16 +201,16 @@ fn a_base_write_folds_every_slot_of_the_path_of_any_generation() {
         let (k, v) = w.state.slots.iter().find(|(k, _)| k.1 == *path).unwrap();
         (v.clone(), k.clone())
     };
-    assert_eq!(slot(&c, &x).0.absorbed, None, "nothing has absorbed it yet");
+    assert_eq!(slot(&c, &x).0.pair(), None, "nothing has absorbed it yet");
     assert!(c.state.counted(&x, &o).is_empty(), "the older-generation slot is not counted");
     c.write_set(&x, i(7), 0).unwrap();
     let (sl, _) = slot(&c, &x);
-    assert_eq!(sl.absorbed, Some((sl.stamp, sl.total)), "folded though not counted");
+    assert_eq!(sl.pair(), Some((sl.stamp, sl.total)), "folded though not counted");
     // a base write on x folds the slots of x only
-    assert_eq!(slot(&c, &p("y")).0.absorbed, None);
+    assert_eq!(slot(&c, &p("y")).0.pair(), None);
     c.write_set(&p("y"), i(9), 0).unwrap();
     let (sy, _) = slot(&c, &p("y"));
-    assert_eq!(sy.absorbed, Some((sy.stamp, sy.total)));
+    assert_eq!(sy.pair(), Some((sy.stamp, sy.total)));
 }
 
 #[test]
@@ -222,12 +222,12 @@ fn a_later_increment_keeps_the_absorbed_pair() {
     w.write_inc(&x, 3, 0).unwrap();
     w.write_set(&x, i(20), 0).unwrap();
     let (_, before) = w.state.slots.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
-    let pair = before.absorbed.unwrap();
+    let pair = before.pair().unwrap();
     assert_eq!(pair.1, Num::from(3));
     w.write_inc(&x, 4, 0).unwrap();
     let after = w.state.slots.values().next().unwrap();
     assert_eq!(after.total, Num::from(7));
-    assert_eq!(after.absorbed, Some(pair), "an increment moves the slot, not what a base absorbed");
+    assert_eq!(after.pair(), Some(pair), "an increment moves the slot, not what a base absorbed");
     assert_eq!(w.state.value(&x, &o), Some(i(24)), "20 + (7 - 3)");
 }
 
@@ -299,7 +299,7 @@ fn a_creation_is_refused_while_any_life_is_alive_and_succeeds_with_dead_lives_on
         };
         assert!(ok, "shape {shape} is accepted when every life is dead");
         assert!(
-            d.state.slots.values().all(|s| s.absorbed.is_none()),
+            d.state.slots.values().all(|s| s.absorbed.is_empty()),
             "shape {shape}: nothing folded"
         );
     }
@@ -321,7 +321,11 @@ fn counter_state(slot: Slot) -> (MergeState, Path) {
 fn b1_the_field_is_present_when_the_slot_moved_since_its_absorbed_stamp() {
     let o = opts();
     let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| {
-        Slot::new(st(stamp, 'A'), total.into(), abs.map(|(sa, t)| (st(sa, 'A'), t.into())))
+        Slot::new(
+            st(stamp, 'A'),
+            total.into(),
+            abs.map(|(sa, t)| Pair { life: st(1, 'A'), stamp: st(sa, 'A'), total: t.into() }),
+        )
     };
     let value = |sl: Slot| {
         let (s, x) = counter_state(sl);
@@ -354,7 +358,11 @@ fn a_slot_joins_by_the_higher_stamp_and_its_pair_by_the_higher_absorbed_stamp() 
     let o = opts();
     let key = (st(1, 'A'), p("x"), wid('A', 0), None::<MStamp>);
     let slot = |stamp: u64, total: i128, abs: Option<(u64, i128)>| {
-        Slot::new(st(stamp, 'A'), total.into(), abs.map(|(sa, t)| (st(sa, 'A'), t.into())))
+        Slot::new(
+            st(stamp, 'A'),
+            total.into(),
+            abs.map(|(sa, t)| Pair { life: st(1, 'A'), stamp: st(sa, 'A'), total: t.into() }),
+        )
     };
     // s holds the newer slot with the older pair; t the older slot with the newer pair
     let s = one_slot(slot(6, 7, Some((3, 3))));
@@ -373,7 +381,7 @@ fn a_slot_joins_by_the_higher_stamp_and_its_pair_by_the_higher_absorbed_stamp() 
     assert_eq!(join(&v, &t, &o).0.slots[&key], slot(8, 9, Some((5, 5))));
     // the same slot stamp, no pair against a pair: the pair is kept
     assert_eq!(
-        join(&v, &one_slot(slot(8, 9, Some((8, 9)))), &o).0.slots[&key].absorbed,
+        join(&v, &one_slot(slot(8, 9, Some((8, 9)))), &o).0.slots[&key].pair(),
         Some((st(8, 'A'), 9.into()))
     );
 }
@@ -385,7 +393,7 @@ fn an_absorbed_pair_goes_with_the_slots_dead_life() {
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     w.write_inc(&p("x"), 2, 0).unwrap();
     w.write_set(&p("x"), i(9), 0).unwrap();
-    assert!(w.state.slots.values().any(|s| s.absorbed.is_some()));
+    assert!(w.state.slots.values().any(|s| !s.absorbed.is_empty()));
     let before = w.state.clone();
     w.write_delete(0).unwrap();
     assert!(w.state.slots.is_empty(), "the slot and its pair are dropped with the life");
@@ -432,12 +440,15 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
     // the slot's bytes: its stamp, the flag byte, the total, the pair (its stamp and total), then the operand
     // stamps (`wide_at`, then `decimal_at`) of the walls `stamps` names, 11 bytes each, spelled only when
     // the flag byte has bit 7 (the stamps the slot has are not the usual ones of its total's type)
-    let tail = |flags: u8, total: &[u8], abs: Option<(u64, &[u8])>, stamps: &[u64]| {
+    let tail = |flags: u8, total: &[u8], abs: Option<(u64, u8, &[u8])>, stamps: &[u64]| {
         let mut t = stamp_bytes(5);
         t.push(flags);
         t.extend_from_slice(total);
-        if let Some((w, a)) = abs {
+        if let Some((w, ty, a)) = abs {
+            // the pairs: a count, then each pair's life index, stamp, type byte and payload
+            t.extend_from_slice(&[1, 0]);
             t.extend(stamp_bytes(w));
+            t.push(ty);
             t.extend_from_slice(a);
         }
         for w in stamps {
@@ -449,7 +460,11 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
     // a Decimal128 total or pair is its 16 bytes and nothing else
     let dfig = |t: &str| dec_bytes(t).to_vec();
     let slot = |total: Num, absorbed: Option<(u64, Num)>| {
-        Slot::new(st(5, 'A'), total, absorbed.map(|(w, n)| (st(w, 'A'), n)))
+        Slot::new(
+            st(5, 'A'),
+            total,
+            absorbed.map(|(w, n)| Pair { life: st(1, 'A'), stamp: st(w, 'A'), total: n }),
+        )
     };
     let cases: Vec<(&str, Slot, Vec<u8>)> = vec![
         // Int64, no pair: flags 0 (its `wide_at` is its own stamp and is not spelled)
@@ -478,25 +493,25 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
         (
             "int64 pair",
             slot(Num::Int64(3), Some((4, Num::Int64(-2)))),
-            tail(1, &[zig(3)], Some((4, &[zig(-2)])), &[]),
+            tail(1, &[zig(3)], Some((4, 0, &[zig(-2)])), &[]),
         ),
-        // Int64 total, Int32 pair: the pair's type in bits 3-4
+        // Int64 total, Int32 pair: the pair's type in its own type byte
         (
             "int64 with int32 pair",
             slot(Num::Int64(3), Some((4, Num::Int32(3)))),
-            tail(1 | 1 << 3, &[zig(3)], Some((4, &[zig(3)])), &[]),
+            tail(1, &[zig(3)], Some((4, 1, &[zig(3)])), &[]),
         ),
         // Int32 total, Decimal128 pair
         (
             "int32 with decimal pair",
             slot(Num::Int32(3), Some((4, dec("0.25")))),
-            tail(1 | 1 << 1 | 2 << 3, &[zig(3)], Some((4, &dfig("0.25"))), &[]),
+            tail(1 | 1 << 1, &[zig(3)], Some((4, 2, &dfig("0.25"))), &[]),
         ),
         // Decimal128 total and pair
         (
             "decimal pair",
             slot(dec("3"), Some((4, dec("2")))),
-            tail(1 | 2 << 1 | 2 << 3, &dfig("3"), Some((4, &dfig("2"))), &[]),
+            tail(1 | 2 << 1, &dfig("3"), Some((4, 2, &dfig("2"))), &[]),
         ),
     ];
     for (name, sl, want_tail) in cases {
@@ -509,7 +524,7 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
         // the form spells a pair wider than its slot (an Int32 slot with a Decimal128 pair), and
         // decode then refuses it by the type clause (item 28 of the inventory): only the bytes
         // are under test here
-        if sl.absorbed.as_ref().is_some_and(|a| a.1.label() > sl.total.label()) {
+        if sl.pair().is_some_and(|a| a.1.label() > sl.total.label()) {
             assert_eq!(
                 MergeState::decode_compact(&want),
                 Err(DecodeError::AbsorbedWiderThanSlot),
@@ -538,12 +553,15 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
         stamps.iter().for_each(|w| r.extend(stamp_bytes(*w)));
         r
     };
-    let pair = |w: u64| {
-        let mut r = vec![zig3];
+    // the slot's total, then one pair: the count, the life index, the stamp, the pair's type byte, its payload
+    let pair_t = |w: u64, ty: u8| {
+        let mut r = vec![zig3, 1, 0];
         r.extend(stamp_bytes(w));
+        r.push(ty);
         r.push(zig3);
         r
     };
+    let pair = |w: u64| pair_t(w, 0);
     let dec3 = "3".parse::<bson::Decimal128>().unwrap().bytes();
     let dec_and = |stamps: &[u64]| {
         let mut r = dec3.to_vec();
@@ -557,7 +575,7 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
     assert_eq!(dec_check(&with(2, &[zig3])), Ok(()));
     assert_eq!(dec_check(&with(0, &[zig3])), Ok(()));
     assert_eq!(dec_check(&with(1, &pair(5))), Ok(()));
-    assert_eq!(dec_check(&with(1 | 1 << 1 | 1 << 3, &pair(5))), Ok(()));
+    assert_eq!(dec_check(&with(1 | 1 << 1, &pair_t(5, 1))), Ok(()));
     assert_eq!(dec_check(&with(4, &dec_and(&[]))), Ok(()));
     assert_eq!(dec_check(&with(0x80 | 0x20, &total_and(&[4]))), Ok(()));
     assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[5, 4]))), Ok(()));
@@ -582,9 +600,19 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
     // `decimal_at` with no `wide_at` (bit 6 alone), and above `wide_at`
     assert_eq!(dec_check(&with(4 | 0x80 | 0x40, &dec_and(&[5]))), inconsistent());
     assert_eq!(dec_check(&with(4 | 0xe0, &dec_and(&[3, 4]))), inconsistent());
-    // type 3 of the total, type 3 of the pair
+    // type 3 of the total, and of the pair (its own type byte)
     assert_eq!(dec_check(&with(3 << 1, &[zig3])), Err(DecodeError::BadTag(6)));
+    assert_eq!(dec_check(&with(1, &pair_t(5, 3))), Err(DecodeError::BadTag(3)));
+    // the old spelling of a single pair is refused by name: with a pair type in bits 3 and 4 of the flag byte, by those bits; with
+    // an Int64 pair (type 0), the stamp read as a count whose first byte is 0, which is no pair at all
     assert_eq!(dec_check(&with(1 | 3 << 3, &pair(5))), Err(DecodeError::BadTag(25)));
+    assert_eq!(dec_check(&with(1 | 1 << 3, &pair(5))), Err(DecodeError::BadTag(9)));
+    let mut old = vec![zig3];
+    old.extend(stamp_bytes(5));
+    old.push(zig3);
+    assert_eq!(dec_check(&with(1, &old)), Err(DecodeError::BadTag(1)));
+    // a pair list of no pairs
+    assert_eq!(dec_check(&with(1, &[zig3, 0])), Err(DecodeError::BadTag(1)));
     // a pair type with no pair
     assert_eq!(dec_check(&with(1 << 3, &[zig3])), Err(DecodeError::BadTag(8)));
     assert_eq!(dec_check(&with(2 << 3, &[zig3])), Err(DecodeError::BadTag(16)));
@@ -644,7 +672,9 @@ fn the_slot_flag_byte_refuses_what_it_does_not_spell() {
     );
     // an absorbed total past the bound
     let mut big = state_with_total(Num::Int64(1));
-    big.slots.values_mut().for_each(|s| s.absorbed = Some((s.stamp, Num::Int64(MAX_TOTAL + 1))));
+    big.slots
+        .values_mut()
+        .for_each(|s| s.set_pair(st(1, 'A'), Some((s.stamp, Num::Int64(MAX_TOTAL + 1)))));
     assert_eq!(
         MergeState::decode_compact(&big.encode_compact()),
         Err(DecodeError::TotalOutOfRange)
@@ -724,11 +754,11 @@ fn typed_slots_read_and_round_trip_through_a_writer() {
     w.write_set(&x, Value::Int32(7), 0).unwrap();
     let sl = w.state.slots.values().next().unwrap().clone();
     assert_eq!(sl.total, dec("2.25"));
-    assert_eq!(sl.absorbed, Some((sl.stamp, dec("2.25"))));
+    assert_eq!(sl.pair(), Some((sl.stamp, dec("2.25"))));
     w.write_inc_value(&x, &dval("1"), 0).unwrap();
     let sl = w.state.slots.values().next().unwrap().clone();
     assert_eq!(sl.total, dec("3.25"));
-    assert_eq!(sl.absorbed.as_ref().unwrap().1, dec("2.25"));
+    assert_eq!(sl.pair().unwrap().1, dec("2.25"));
     // the difference 3.25 - 2.25 = 1.00 on top of the Int32 base 7
     match w.state.value(&x, &o) {
         Some(Value::Decimal128(b)) => {
@@ -745,18 +775,18 @@ fn typed_slots_read_and_round_trip_through_a_writer() {
     w.insert(&fl(&[("x", Value::Int32(1))]), 0).unwrap();
     w.write_inc_value(&x, &Value::Int32(5), 0).unwrap();
     w.write_set(&x, Value::Int32(100), 0).unwrap();
-    assert_eq!(w.state.slots.values().next().unwrap().absorbed.as_ref().unwrap().1, Num::Int32(5));
+    assert_eq!(w.state.slots.values().next().unwrap().pair().unwrap().1, Num::Int32(5));
     w.write_inc_value(&x, &Value::Int32(i32::MAX), 0).unwrap();
     let sl = w.state.slots.values().next().unwrap().clone();
     // R1: the slot keeps the join of the operand types it has added (Int32); the counter's
     // visible type is read from the total, below
     assert_eq!(sl.total, Num::Int32(5 + i128::from(i32::MAX)));
-    assert_eq!(sl.absorbed.as_ref().unwrap().1, Num::Int32(5));
+    assert_eq!(sl.pair().unwrap().1, Num::Int32(5));
     assert_eq!(w.state.value(&x, &o), Some(Value::Int64(100 + i64::from(i32::MAX))));
     let enc = w.state.encode_compact();
     let back = MergeState::decode_compact(&enc).unwrap();
     assert_eq!(back, w.state);
-    assert_eq!(back.slots.values().next().unwrap().absorbed.as_ref().unwrap().1, Num::Int32(5));
+    assert_eq!(back.slots.values().next().unwrap().pair().unwrap().1, Num::Int32(5));
 }
 
 #[test]
@@ -772,7 +802,7 @@ fn a_state_with_an_absorbed_pair_has_no_version_1_spelling() {
     w.write_set(&p("x"), i(5), 0).unwrap();
     let mut bare = w.state.clone();
     bare.ords.clear();
-    assert!(bare.slots.values().any(|s| s.absorbed.is_some()));
+    assert!(bare.slots.values().any(|s| !s.absorbed.is_empty()));
     assert!(!bare.v1_can_hold());
     assert_eq!(bare.try_canonical_bytes(), Err(V1CannotHold));
     assert_eq!(bare.try_state_hash(), Err(V1CannotHold));
@@ -782,7 +812,7 @@ fn a_state_with_an_absorbed_pair_has_no_version_1_spelling() {
     // and v1 decode never produces a pair or an observed total
     let none = {
         let mut x = bare.clone();
-        x.slots.values_mut().for_each(|s| s.absorbed = None);
+        x.slots.values_mut().for_each(|s| s.absorbed.clear());
         x
     };
     assert_eq!(MergeState::decode(&none.try_encode().unwrap()).unwrap(), none);
@@ -797,7 +827,7 @@ fn paired() -> MergeState {
     state.lives.insert(life, upsert_life());
     state.slots.insert(
         (life, p("x"), writer_a(), None),
-        Slot::new(st(5, 'A'), 7.into(), Some((st(3, 'A'), 4.into()))),
+        Slot::with_pair(st(5, 'A'), 7.into(), st(1, 'A'), st(3, 'A'), 4.into()),
     );
     state.vv.insert(writer_a(), h(9));
     state
@@ -806,7 +836,13 @@ fn paired() -> MergeState {
 /// Every slot of the state replaced by the honest one of this total and pair, stamped at its own stamp:
 /// `Slot::new` spells the operand stamps of the total's type, as a writer's slot of that width does.
 fn honest(state: &mut MergeState, total: Num, absorbed: Option<(MStamp, Num)>) {
-    state.slots.values_mut().for_each(|x| *x = Slot::new(x.stamp, total, absorbed));
+    state.slots.values_mut().for_each(|x| {
+        *x = Slot::new(
+            x.stamp,
+            total,
+            absorbed.map(|(ps, pt)| Pair { life: st(1, 'A'), stamp: ps, total: pt }),
+        )
+    });
 }
 
 fn refuses(state: &MergeState, err: DecodeError) {
@@ -821,27 +857,27 @@ fn accepts(state: &MergeState) {
 fn decode_refuses_an_absorbed_stamp_above_its_slot() {
     accepts(&paired());
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(6, 'A'), 4.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(6, 'A'), 4.into()))));
     refuses(&s, DecodeError::AbsorbedAboveSlot);
     // above by the counter, by the writer: the order of stamps is (hlc, node, epoch)
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'B'), 7.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(5, 'B'), 7.into()))));
     s.vv.insert(wid('B', 0), h(5));
     refuses(&s, DecodeError::AbsorbedAboveSlot);
     // at the slot's own stamp or below it is accepted
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'A'), 7.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(5, 'A'), 7.into()))));
     accepts(&s);
 }
 
 #[test]
 fn decode_refuses_an_absorbed_total_that_disagrees_at_the_slots_own_stamp() {
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'A'), 8.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(5, 'A'), 8.into()))));
     refuses(&s, DecodeError::AbsorbedTotalMismatch);
     // the same number in another type is another total
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'A'), Num::Int32(7))));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(5, 'A'), Num::Int32(7)))));
     refuses(&s, DecodeError::AbsorbedTotalMismatch);
     // below the slot's stamp the totals may differ
     accepts(&paired());
@@ -852,7 +888,7 @@ fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
     // the pair is below the slot's stamp, so only the writer is wrong; B's entry in the vector
     // covers it, so the refusal is the writer's and not the vector's
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'B'), 4.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(3, 'B'), 4.into()))));
     s.vv.insert(wid('B', 0), h(3));
     assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedWriterMismatch));
     // it can be encoded (the compact form spells the absorbed stamp in full), and is refused on decode
@@ -860,7 +896,7 @@ fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
     // another epoch of the same node is another writer
     let mut s = paired();
     s.slots.values_mut().for_each(|x| {
-        x.absorbed = Some((MStamp { hlc: h(3), writer: wid('A', 1) }, 4.into()));
+        x.set_pair(st(1, 'A'), Some((MStamp { hlc: h(3), writer: wid('A', 1) }, 4.into())));
     });
     s.vv.insert(wid('A', 1), h(3));
     refuses(&s, DecodeError::AbsorbedWriterMismatch);
@@ -872,9 +908,12 @@ fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
     s.vv.insert(wid('A', 0), h(9));
     s.vv.insert(wid('B', 0), h(9));
     let key = (st(1, 'A'), p("x"), wid('B', 0), None);
-    s.slots.insert(key.clone(), Slot::new(st(5, 'B'), 7.into(), Some((st(3, 'B'), 4.into()))));
+    s.slots.insert(
+        key.clone(),
+        Slot::with_pair(st(5, 'B'), 7.into(), st(1, 'A'), st(3, 'B'), 4.into()),
+    );
     accepts(&s);
-    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'A'), 4.into()));
+    s.slots.get_mut(&key).unwrap().set_pair(key.0, Some((st(3, 'A'), 4.into())));
     refuses(&s, DecodeError::AbsorbedWriterMismatch);
 }
 
@@ -893,16 +932,16 @@ fn decode_refuses_a_slot_stamped_by_another_writer_than_its_key() {
     assert_eq!(s.check_decoded(), Err(DecodeError::SlotWriterMismatch));
     refuses(&s, DecodeError::SlotWriterMismatch);
     // a pair by the key's writer, below the slot
-    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'A'), 1.into()));
+    s.slots.get_mut(&key).unwrap().set_pair(key.0, Some((st(3, 'A'), 1.into())));
     refuses(&s, DecodeError::SlotWriterMismatch);
     // a pair by the slot stamp's writer: the slot's refusal comes first
-    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'B'), 1.into()));
+    s.slots.get_mut(&key).unwrap().set_pair(key.0, Some((st(3, 'B'), 1.into())));
     refuses(&s, DecodeError::SlotWriterMismatch);
     // another epoch of the key's node is another writer
     let mut s = paired();
     s.slots.values_mut().for_each(|x| x.stamp = MStamp { hlc: h(5), writer: wid('A', 1) });
     s.vv.insert(wid('A', 1), h(5));
-    s.slots.values_mut().for_each(|x| x.absorbed = None);
+    s.slots.values_mut().for_each(|x| x.absorbed.clear());
     refuses(&s, DecodeError::SlotWriterMismatch);
     // the slot of a key of B, stamped by B, is accepted (with and without a pair), and by A refused
     let mut s = MergeState::default();
@@ -912,13 +951,13 @@ fn decode_refuses_a_slot_stamped_by_another_writer_than_its_key() {
     let key = (st(1, 'A'), p("x"), wid('B', 0), None);
     s.slots.insert(key.clone(), Slot::new(st(5, 'B'), 7.into(), None));
     accepts(&s);
-    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'B'), 4.into()));
+    s.slots.get_mut(&key).unwrap().set_pair(key.0, Some((st(3, 'B'), 4.into())));
     accepts(&s);
     s.slots.get_mut(&key).unwrap().stamp = st(5, 'A');
     refuses(&s, DecodeError::SlotWriterMismatch);
     // a stamp by the key's writer with the pair by another is still the pair's refusal
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'B'), 4.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(3, 'B'), 4.into()))));
     s.vv.insert(wid('B', 0), h(3));
     refuses(&s, DecodeError::AbsorbedWriterMismatch);
 }
@@ -957,7 +996,7 @@ fn decode_refuses_an_absorbed_total_of_a_wider_type_than_the_slot() {
     refuses(&s, DecodeError::AbsorbedTotalMismatch);
     // the clauses before it keep their verdicts
     let mut s = with(i64n, d);
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(6, 'A'), d)));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(6, 'A'), d))));
     refuses(&s, DecodeError::AbsorbedAboveSlot);
 }
 
@@ -994,7 +1033,7 @@ fn every_state_of_a_typed_history_decodes() {
     let widths: BTreeSet<_> = states
         .iter()
         .flat_map(|s| s.slots.values())
-        .filter_map(|sl| sl.absorbed.as_ref().map(|a| (a.1.label(), sl.total.label())))
+        .filter_map(|sl| sl.pair().map(|a| (a.1.label(), sl.total.label())))
         .collect();
     assert!(
         widths.iter().any(|(a, t)| a < t),
@@ -1010,16 +1049,16 @@ fn every_state_of_a_typed_history_decodes() {
 #[test]
 fn the_new_refusals_are_the_verdicts_of_check_decoded() {
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(6, 'A'), 4.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(6, 'A'), 4.into()))));
     assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedAboveSlot));
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'A'), 8.into())));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(5, 'A'), 8.into()))));
     assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedTotalMismatch));
     let mut s = paired();
     s.slots.values_mut().for_each(|x| x.stamp = st(5, 'B'));
     assert_eq!(s.check_decoded(), Err(DecodeError::SlotWriterMismatch));
     let mut s = paired();
-    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'A'), dec("1"))));
+    s.slots.values_mut().for_each(|x| x.set_pair(st(1, 'A'), Some((st(3, 'A'), dec("1")))));
     assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedWiderThanSlot));
     assert_eq!(paired().check_decoded(), Ok(()));
 }
@@ -1044,11 +1083,11 @@ fn the_version_vector_covers_every_stamp_an_honest_state_covers() {
         ("an absorbed stamp", |state| {
             state.slots.insert(
                 (st(1, 'A'), p("x"), wid('A', 0), None),
-                Slot::new(st(5, 'A'), 1.into(), Some((st(5, 'A'), 1.into()))),
+                Slot::with_pair(st(5, 'A'), 1.into(), st(1, 'A'), st(5, 'A'), 1.into()),
             );
             state.slots.insert(
                 (st(1, 'A'), p("y"), wid('B', 0), None),
-                Slot::new(st(9, 'B'), 1.into(), Some((st(9, 'B'), 1.into()))),
+                Slot::with_pair(st(9, 'B'), 1.into(), st(1, 'A'), st(9, 'B'), 1.into()),
             );
         }),
         ("the generation of a slot key", |state| {
@@ -1266,11 +1305,7 @@ fn a_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot
                     n => panic!("{what}: {n:?}"),
                 };
                 assert_eq!(bytes(&a.total), bytes(&b.total), "{what}");
-                assert_eq!(
-                    a.absorbed.map(|x| bytes(&x.1)),
-                    b.absorbed.map(|x| bytes(&x.1)),
-                    "{what}"
-                );
+                assert_eq!(a.pair().map(|x| bytes(&x.1)), b.pair().map(|x| bytes(&x.1)), "{what}");
             }
             // the reads take the pattern as it is and do not panic
             let _ = back.value(&p("x"), &o);
@@ -1295,7 +1330,7 @@ fn state_with_every_place_of_a_total() -> MergeState {
         LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
         LossValue::Total(dec("3")),
     );
-    assert!(good.slots.values().all(|x| x.absorbed.is_some()));
+    assert!(good.slots.values().all(|x| !x.absorbed.is_empty()));
     assert!(good.regs.values().any(|r| r.generation.as_ref().is_some_and(|g| !g.seen.is_empty())));
     accepts(&good);
     good
@@ -1318,21 +1353,21 @@ fn a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled() {
         let mut st = paired();
         st.slots.values_mut().for_each(|x| {
             x.total = payload;
-            x.absorbed = None;
+            x.absorbed.clear();
         });
         refused(&st, "a slot total");
         // the absorbed total, below a Decimal128 slot
         let mut st = paired();
         st.slots.values_mut().for_each(|x| {
             x.total = dec("7");
-            x.absorbed = Some((st3(), payload));
+            x.set_pair(self::st(1, 'A'), Some((st3(), payload)));
         });
         refused(&st, "an absorbed total");
         // both, at the slot's own stamp
         let mut st = paired();
         st.slots.values_mut().for_each(|x| {
             x.total = payload;
-            x.absorbed = Some((x.stamp, payload));
+            x.set_pair(self::st(1, 'A'), Some((x.stamp, payload)));
         });
         refused(&st, "a slot and its pair");
         // a generation's `seen` total
@@ -1381,7 +1416,7 @@ fn an_honest_total_with_a_positive_exponent_is_accepted_for_the_slot_the_pair_se
     let slot = good.slots.values().next().unwrap().total;
     assert!(exponent(&slot) > 0, "the rounded sum has a positive exponent: {slot:?}");
     assert!(slot.is_canonical());
-    let pair = good.slots.values().next().unwrap().absorbed.unwrap().1;
+    let pair = good.slots.values().next().unwrap().pair().unwrap().1;
     assert_eq!(pair, slot, "the base write folded the rounded total");
     let seen: Vec<Num> = good
         .regs
@@ -1450,12 +1485,8 @@ fn the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands() {
         w.write_set(&x, i(5), 0).unwrap();
         w.write_inc_value(&x, &dval("1"), 0).unwrap();
         let sl = w.state.slots.values().next().unwrap().clone();
-        assert_eq!(
-            bytes(&sl.absorbed.as_ref().unwrap().1),
-            canonical,
-            "{what}: the pair keeps them"
-        );
-        assert!(sl.absorbed.as_ref().unwrap().0 < sl.stamp);
+        assert_eq!(bytes(&sl.pair().unwrap().1), canonical, "{what}: the pair keeps them");
+        assert!(sl.pair().unwrap().0 < sl.stamp);
         assert!(sl.total.is_canonical());
         accepts(&w.state);
     }
@@ -1585,4 +1616,152 @@ fn upsert_inc_on_is_refused_when_the_writer_holds_the_slot() {
     assert!(w.upsert_inc_on(life, &n, 3, 0).is_none());
     assert_eq!(w.state, before, "nothing moved");
     assert_eq!(MergeState::decode_compact(&w.state.encode_compact()).unwrap(), w.state);
+}
+
+// ---- the pair list: several pairs on one slot, one per life -------------------------------------------------------
+
+/// `paired()` with a second life listed, and the slot holding a pair of each life: (life 1, stamp 3, total 4) and (life 2, stamp 4,
+/// total 5). A layout that holds one pair per slot cannot hold this state: it would drop one of the two.
+fn two_pairs() -> MergeState {
+    let mut s = paired();
+    s.lives.insert(st(2, 'A'), upsert_life());
+    s.vv.insert(writer_a(), h(9));
+    for sl in s.slots.values_mut() {
+        sl.absorbed = vec![
+            Pair { life: st(1, 'A'), stamp: st(3, 'A'), total: 4.into() },
+            Pair { life: st(2, 'A'), stamp: st(4, 'A'), total: 5.into() },
+        ];
+    }
+    s
+}
+
+#[test]
+fn a_slot_holds_one_pair_per_life_and_they_round_trip_sorted_by_life() {
+    let s = two_pairs();
+    accepts(&s);
+    let back = MergeState::decode_compact(&s.encode_compact()).unwrap();
+    let sl = back.slots.values().next().unwrap();
+    assert_eq!(sl.absorbed.len(), 2, "both pairs survive the round trip");
+    assert_eq!(
+        sl.absorbed.iter().map(|p| p.life).collect::<Vec<_>>(),
+        vec![st(1, 'A'), st(2, 'A')],
+        "sorted by life"
+    );
+    // the pairs are in the state hash: dropping one changes it
+    let mut one = s.clone();
+    one.slots.values_mut().for_each(|x| x.absorbed.truncate(1));
+    assert_ne!(one.compact_hash(), s.compact_hash());
+}
+
+#[test]
+fn decode_refuses_pairs_that_are_not_sorted_by_life_one_per_life() {
+    // a life twice
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed[1].life = st(1, 'A'));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedPairsNotCanonical));
+    // the lives in descending order
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed.reverse());
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedPairsNotCanonical));
+    refuses(&s, DecodeError::AbsorbedPairsNotCanonical);
+}
+
+#[test]
+fn decode_refuses_a_pair_whose_life_is_not_listed_or_is_dead() {
+    // not listed
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed[1].life = st(7, 'A'));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedLifeNotListed));
+    // listed and dead: a pair goes with the life it was made in
+    let mut s = two_pairs();
+    s.dead.insert(st(2, 'A'));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedLifeNotListed));
+    // the slot's own life is not exempt: a one-pair state whose pair names a dead life is refused too
+    let mut s = paired();
+    s.dead.insert(st(1, 'A'));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedLifeNotListed));
+}
+
+#[test]
+fn decode_refuses_two_pairs_of_one_stamp_and_two_totals() {
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| {
+        x.absorbed[0].stamp = st(3, 'A');
+        x.absorbed[1].stamp = st(3, 'A');
+        x.absorbed[1].total = 9.into();
+    });
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedPairsDisagree));
+    // the same stamp and the same total is two pairs of one write: accepted
+    s.slots.values_mut().for_each(|x| x.absorbed[1].total = 4.into());
+    accepts(&s);
+}
+
+#[test]
+fn every_pair_of_a_slot_answers_to_the_clauses_of_the_pair() {
+    // above the slot's stamp, by another writer than the key's, wider than the slot: the SECOND pair breaks the clause
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed[1].stamp = st(6, 'A'));
+    refuses(&s, DecodeError::AbsorbedAboveSlot);
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed[1].stamp = st(4, 'B'));
+    s.vv.insert(wid('B', 0), h(4));
+    refuses(&s, DecodeError::AbsorbedWriterMismatch);
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| {
+        x.total = Num::Int32(7);
+        x.wide_at = None;
+        x.decimal_at = None;
+        x.absorbed[0].total = Num::Int32(4);
+        x.absorbed[1].total = Num::Int64(5);
+    });
+    refuses(&s, DecodeError::AbsorbedWiderThanSlot);
+    // each pair has its own type: an Int32 pair beside an Int64 one on an Int64 slot
+    let mut s = two_pairs();
+    s.slots.values_mut().for_each(|x| x.absorbed[0].total = Num::Int32(4));
+    accepts(&s);
+}
+
+#[test]
+fn a_state_with_pairs_has_no_version_1_spelling() {
+    assert!(paired().try_encode().is_err() && !paired().v1_can_hold());
+    assert!(!two_pairs().v1_can_hold());
+}
+
+#[test]
+fn the_pair_the_read_counts_is_the_highest_stamp_of_a_live_life_and_ties_break_by_life() {
+    let al = |ls: &[MStamp]| ls.iter().copied().collect::<BTreeSet<MStamp>>();
+    let sl = two_pairs().slots.values().next().unwrap().clone();
+    let (l1, l2) = (st(1, 'A'), st(2, 'A'));
+    assert_eq!(sl.effective_pair(&al(&[l1, l2])).map(|p| p.life), Some(l2), "the higher stamp");
+    assert_eq!(
+        sl.effective_pair(&al(&[l1])).map(|p| p.life),
+        Some(l1),
+        "a pair of a life that is gone does not count"
+    );
+    assert_eq!(sl.effective_pair(&al(&[])), None);
+    // one stamp, two lives (the totals agree): the higher life, never the order of the list
+    let mut tie = sl.clone();
+    tie.absorbed[0].stamp = st(4, 'A');
+    tie.absorbed[0].total = 5.into();
+    tie.absorbed.reverse();
+    assert_eq!(tie.effective_pair(&al(&[l1, l2])).map(|p| p.life), Some(l2));
+}
+
+#[test]
+fn pair_lists_join_by_life_with_the_higher_stamp_per_life() {
+    let p = |life: u64, stamp: u64, total: i128| Pair {
+        life: st(life, 'A'),
+        stamp: st(stamp, 'A'),
+        total: total.into(),
+    };
+    let a = vec![p(1, 3, 4), p(3, 3, 4)];
+    let b = vec![p(1, 5, 9), p(2, 2, 2)];
+    let joined = Slot::join_pairs(&a, &b);
+    assert_eq!(
+        joined,
+        vec![p(1, 5, 9), p(2, 2, 2), p(3, 3, 4)],
+        "the higher stamp of life 1, every other life kept, sorted"
+    );
+    assert_eq!(Slot::join_pairs(&b, &a), joined, "commutative");
+    assert_eq!(Slot::join_pairs(&joined, &joined), joined, "idempotent");
 }

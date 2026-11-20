@@ -109,7 +109,11 @@ fn the_compact_golden_hashes_agree_with_the_reference_model() {
         ("170", golden_170(), ("abedfb140b687b3671abd3023efa93a8", 215)),
         ("mixed", golden_mixed(), ("d368f0edd26e1ed5e300dd97df80065e", 338)),
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235)),
-        ("obs", golden_obs(), ("3894def7793a573b2dad9a4de56bf7cc", 252)),
+        // RE-PINNED for the pair list (a slot's absorbed pairs are spelled as a count, then each pair's life index, stamp, type
+        // byte and payload, where the single pair had its type in the flag byte and no life): the one golden of these that holds
+        // pairs moves, 3894def7793a573b2dad9a4de56bf7cc, 252 B to 477814115cd0d7ccb8c6e501c3a49240, 258 B (a count, a life
+        // index and a type byte for each pair); the model's independent Python encoder (`q7diff_gen.py --golden`) gives the same.
+        ("obs", golden_obs(), ("477814115cd0d7ccb8c6e501c3a49240", 258)),
     ] {
         // NAMED RESTRICTION: the goldens are the stage-A reference model's, which has no order state
         let st = st.without_ords();
@@ -131,10 +135,12 @@ fn the_compact_golden_hashes_with_the_order_state_are_pinned() {
         ("170", golden_170(), ("79f811df1f679ba13896538b36c9e324", 273, 1)),
         ("mixed", golden_mixed(), ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5)),
         ("delete", golden_delete(), ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0)),
-        ("obs", golden_obs(), ("1714242f8331d6b9ca194c73191730ed", 329, 2)),
+        // RE-PINNED for the pair list (see the golden hashes above): 1714242f8331d6b9ca194c73191730ed, 329 B
+        ("obs", golden_obs(), ("b4ceeedc2e8df22c2fe2e13bdded4dab", 335, 2)),
         ("small", golden_small(), ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2)),
         // a NEW key: the typed golden, whose section 10 the independent Python checker also writes and hashes
-        ("typed", golden_typed(), ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4)),
+        // RE-PINNED for the pair list: 4c12bd2f978ca7ff1322b6ff3f7f8e1d, 499 B
+        ("typed", golden_typed(), ("50565aaae3ff175d67e2d239b9508bd4", 505, 4)),
     ] {
         assert_eq!(
             (hex(st.compact_hash()).as_str(), st.compact_bytes().len(), st.ords.len()),
@@ -173,15 +179,15 @@ fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
         (Kind::Decimal128, true, b.wide_at)
     );
     assert_eq!(c.total.label(), Kind::Decimal128);
-    let (wide, dec, at) = (c.wide_at.unwrap(), c.decimal_at.unwrap(), c.absorbed.unwrap().0);
+    let (wide, dec, at) = (c.wide_at.unwrap(), c.decimal_at.unwrap(), c.pair().unwrap().0);
     assert!(dec < wide && wide < c.stamp, "decimal_at < wide_at < stamp");
     assert_eq!(at, wide, "the absorbed pair is at the last wide operand");
     assert_eq!(st.value(&p("c"), &o), Some(Value::Int32(12)));
-    assert_eq!(c.width_since(), Kind::Int32);
+    assert_eq!(c.width_since(&c.absorbed.iter().map(|p| p.life).collect()), Kind::Int32);
     // d, Amendment 9: the gain is the exact integer 1, a Decimal128 slot whose total is exact
     let d = slot("d");
     assert_eq!(st.value(&p("d"), &o), Some(Value::Int32(6)));
-    assert_eq!(d.width_since(), Kind::Int32);
+    assert_eq!(d.width_since(&d.absorbed.iter().map(|p| p.life).collect()), Kind::Int32);
     // and as the compact bytes say it
     let back = MergeState::decode_compact(&st.encode_compact()).unwrap();
     assert_eq!(back.value(&p("c"), &o), Some(Value::Int32(12)));
@@ -190,7 +196,8 @@ fn the_typed_golden_reads_the_counter_of_amendment_6_as_an_int32() {
     let hex16 = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     assert_eq!(
         (hex16(bare.compact_hash()).as_str(), bare.compact_bytes().len()),
-        ("d11ec34731c1adb4ec0a0ae4be757d20", 371)
+        // RE-PINNED for the pair list: d11ec34731c1adb4ec0a0ae4be757d20, 371 B (the independent encoder gives the same)
+        ("2407d00c60b667ee785efc6e03a593cc", 377)
     );
 }
 

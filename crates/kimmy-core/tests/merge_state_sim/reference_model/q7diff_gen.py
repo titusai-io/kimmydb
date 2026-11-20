@@ -506,8 +506,9 @@ class EncCompact:
             self.wid(k[2])
             self.opt_stamp(k[3])
             self.stamp(sl[0])
-            # the flag byte: bit 0 an absorbed pair follows; bits 1-2 the total's type and bits 3-4 the pair's (0 Int64,
-            # 1 Int32, 2 Decimal128); bit 7: the operand stamps are spelled, then bit 5 says the stamp of the slot's
+            # the flag byte: bit 0 the absorbed pairs follow (a count, then each pair's life index, stamp, type byte (0 Int64,
+            # 1 Int32, 2 Decimal128) and payload; this model keeps one pair per slot, of the slot's own life); bits 1-2 the
+            # total's type and bits 3-4 are 0; bit 7: the operand stamps are spelled, then bit 5 says the stamp of the slot's
             # latest Int64-or-wider operand (`wide_at`) follows and bit 6 that of its latest Decimal128 operand
             # (`decimal_at`). The usual stamps of a slot whose operands were all of its total's width, the latest at its
             # own stamp (none for an Int32 total, the slot's own for an Int64 one, twice for a Decimal128 one), are not
@@ -521,11 +522,14 @@ class EncCompact:
             wide = ty["wide"] if "wide" in ty else usual[0]
             dec = ty["dec"] if "dec" in ty else usual[1]
             spelled = (wide, dec) != usual
-            self.u8((1 if pair is not None else 0) | tl << 1 | pl << 3
+            self.u8((1 if pair is not None else 0) | tl << 1
                     | ((0x80 | (0x20 if wide is not None else 0) | (0x40 if dec is not None else 0)) if spelled else 0))
             self.slot_payload(tl, ty.get("total_raw", sl[1]))
             if pair is not None:
+                self.vi(1)
+                self.life(k[0])
                 self.stamp(pair[0])
+                self.u8(pl)
                 self.slot_payload(pl, ty.get("pair_raw", pair[1]))
             if spelled:
                 if wide is not None:

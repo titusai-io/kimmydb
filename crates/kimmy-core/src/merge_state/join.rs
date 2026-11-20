@@ -817,11 +817,7 @@ pub(super) fn join_into_counted(
                 out.slots.insert(k.clone(), v.clone());
             }
             Some(x) => {
-                let absorbed = match (x.absorbed, v.absorbed) {
-                    (Some(a), Some(b)) if b.0 > a.0 => Some(b),
-                    (None, b) => b,
-                    (a, _) => a,
-                };
+                let absorbed = Slot::join_pairs(&x.absorbed, &v.absorbed);
                 // the stamps of the latest wide and decimal operands: the slot is one writer's
                 // history, so the later of two states of it holds the later stamps, and the join
                 // takes the later of each (the same answer for honest states, a join for any)

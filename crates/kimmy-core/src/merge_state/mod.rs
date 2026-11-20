@@ -137,7 +137,7 @@ pub use ord::{
 };
 pub use state::{
     Excess, Gen, Life, LifeKind, LossReceive, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState,
-    ObsKey, OverCaps, Reg, Slot, Vv,
+    ObsKey, OverCaps, Pair, Reg, Slot, Vv,
 };
 pub use state_at::state_at;
 pub use types::{
