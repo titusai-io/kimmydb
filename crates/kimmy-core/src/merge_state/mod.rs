@@ -93,6 +93,8 @@ mod floor_tests;
 #[cfg(test)]
 mod hand_built;
 #[cfg(test)]
+mod loss_contract_tests;
+#[cfg(test)]
 mod loss_free_hash_tests;
 #[cfg(test)]
 mod loss_receive_tests;
