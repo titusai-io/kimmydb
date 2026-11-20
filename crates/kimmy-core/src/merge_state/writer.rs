@@ -508,13 +508,11 @@ impl Writer {
     }
 
     /// Fold the slots at `keys`: each takes its own `(stamp, total)` as its absorbed pair, when
-    /// that is above the pair it has (the model's max by stamp).
+    /// that is above the pair it has (the model's max by stamp). The pair is the slot's own life's.
     fn fold(&mut self, keys: Vec<(MStamp, Path, WriterId, Option<MStamp>)>) {
         for k in keys {
-            if let Some(s) = self.state.slots.get_mut(&k)
-                && s.absorbed.as_ref().is_none_or(|a| a.0 < s.stamp)
-            {
-                s.absorbed = Some((s.stamp, s.total));
+            if let Some(s) = self.state.slots.get_mut(&k) {
+                s.absorb_under(k.0);
             }
         }
     }

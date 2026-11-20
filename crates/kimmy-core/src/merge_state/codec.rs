@@ -105,6 +105,14 @@ pub enum DecodeError {
     VersionVectorBehind,
     #[error("merge state: a slot's absorbed stamp is above the slot's own")]
     AbsorbedAboveSlot,
+    #[error("merge state: a slot's absorbed pairs are not sorted by life, one per life")]
+    AbsorbedPairsNotCanonical,
+    #[error(
+        "merge state: a slot's absorbed pair names a life the state does not list, or has buried"
+    )]
+    AbsorbedLifeNotListed,
+    #[error("merge state: two absorbed pairs of one slot hold one stamp and two totals")]
+    AbsorbedPairsDisagree,
     #[error("merge state: a slot's absorbed total differs from the slot's at the same stamp")]
     AbsorbedTotalMismatch,
     #[error("merge state: a slot's absorbed stamp is not by the writer of the slot's key")]
@@ -396,7 +404,7 @@ impl MergeState {
     /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
         self.ords.is_empty()
-            && self.slots.values().all(|s| s.absorbed.is_none() && s.v1_widths())
+            && self.slots.values().all(|s| s.absorbed.is_empty() && s.v1_widths())
             && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
@@ -557,7 +565,7 @@ impl MergeState {
     /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
     pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
         let mut bare = self.without_ords();
-        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some() || !s.v1_widths());
+        let had_pair = bare.slots.values().any(|s| !s.absorbed.is_empty() || !s.v1_widths());
         bare.slots.values_mut().for_each(Slot::for_v1);
         had_pair && bare.v1_can_hold()
     }

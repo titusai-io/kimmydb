@@ -586,10 +586,10 @@ impl MergeState {
             let win = self.winner_in(q, al, o);
             let mut out = Vec::new();
             for (_, s) in self.counted_in(q, al, win, o) {
-                let moved = match &s.absorbed {
+                let moved = match s.effective_pair(al) {
                     None => true,
-                    Some((st, total)) => {
-                        !s.total.sub_sat(total, &mut None).is_zero() || *st != s.stamp
+                    Some(pr) => {
+                        !s.total.sub_sat(&pr.total, &mut None).is_zero() || pr.stamp != s.stamp
                     }
                 };
                 if s.stamp < floor && moved {

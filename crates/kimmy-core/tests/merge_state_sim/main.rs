@@ -479,14 +479,24 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   horizon 0xe89b742957e0c7f0 -> 0x50b53c2af7019e1c
     //   bounded 0x83e73911c4ed16af -> 0x6da0bc5de4bfe6ed
     //   bounded nested 0x633b0e853e0a1cd0 (unchanged)
+    // RE-PINNED for the pair list (a slot's absorbed pairs are a count, then each pair's life index, stamp, type byte and payload):
+    // the fingerprints fold the compact bytes of the states, so every run that holds a counter slot with a pair moved, and no read did
+    // (all seven runs hold one).
+    //   restore 0xef061166e78cce22 -> 0x2cfc35dfd93dc82e
+    //   no restore 0x135909c1f3ed3659 -> 0xe4d0d012e879dfd2
+    //   bound 1000 0xa1fa6f923996f7a6 -> 0x9f7c2b8a9911faea
+    //   sequential 0xbb67e71425fc62ec -> 0x3cdd2f55580ef9e2
+    //   horizon 0x50b53c2af7019e1c -> 0x57c404a3301caca5
+    //   bounded 0x6da0bc5de4bfe6ed -> 0xa326f2cc0700a136
+    //   bounded nested 0x633b0e853e0a1cd0 -> 0x243523d5c46867cb
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0xef061166e78cce22),
-        ("no restore", 0x135909c1f3ed3659),
-        ("bound 1000", 0xa1fa6f923996f7a6),
-        ("sequential", 0xbb67e71425fc62ec),
-        ("horizon", 0x50b53c2af7019e1c),
-        ("bounded", 0x6da0bc5de4bfe6ed),
-        ("bounded nested", 0x633b0e853e0a1cd0),
+        ("restore", 0x2cfc35dfd93dc82e),
+        ("no restore", 0xe4d0d012e879dfd2),
+        ("bound 1000", 0x9f7c2b8a9911faea),
+        ("sequential", 0x3cdd2f55580ef9e2),
+        ("horizon", 0x57c404a3301caca5),
+        ("bounded", 0xa326f2cc0700a136),
+        ("bounded nested", 0x243523d5c46867cb),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }

@@ -421,7 +421,7 @@ pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
         ms[0].set("a", Value::Document(vec![("b".to_string(), Value::Int64(1))]), &mut log, 0);
         let slots: Vec<_> = ms[0].state().slots.values().collect();
         let problems = match slots.as_slice() {
-            [sl] if sl.absorbed.as_ref() == Some(&(sl.stamp, sl.total)) => Vec::new(),
+            [sl] if sl.pair() == Some((sl.stamp, sl.total)) => Vec::new(),
             [sl] => vec![format!("the marker write left the slot's pair at {:?}", sl.absorbed)],
             _ => vec![format!("{} slots, not one", slots.len())],
         };
@@ -447,7 +447,7 @@ pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
             [(k, _)] if Some(&k.0) == alive.last() => {
                 vec!["the slot is in the write's own life, not in another".to_string()]
             }
-            [(_, sl)] if sl.absorbed.as_ref() == Some(&(sl.stamp, sl.total)) => Vec::new(),
+            [(_, sl)] if sl.pair() == Some((sl.stamp, sl.total)) => Vec::new(),
             [(_, sl)] => vec![format!("the base left the other life's slot at {:?}", sl.absorbed)],
             _ => vec![format!("{} slots at c, not one", slots.len())],
         };

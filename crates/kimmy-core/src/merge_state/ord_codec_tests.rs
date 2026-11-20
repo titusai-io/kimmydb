@@ -611,7 +611,10 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // RE-PINNED for Amendment 9 (the operand stamps are spelled only when they are not the usual ones): the corpus is again 243 states of
     // 72,990 B, the seeded damage is the damage of before the stamps, and so are the figures: accepted 10,453 -> 10,601; the laws over the
     // accepted damaged entries triples 131,748 -> 140,112, agreeing 106,374 -> 110,634, not associative 456 -> 444.
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_283));
+    // RE-PINNED for the pair list (a slot's pairs are a count, then each pair's life index, stamp, type byte and payload): the corpus
+    // states that hold a pair are a few bytes larger, so the seeded damage is other input in places, and the new clauses (a pair names a
+    // life the state lists and has not buried, pairs sorted by life, equal stamps equal totals) refuse more of it: accepted 10,283 -> 10,268.
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_268));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
@@ -620,7 +623,9 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // RE-PINNED for the version byte that says a state holds loss records (C3b): the corpus states that hold records now
     // spell a 16-byte hash after the version byte, so the seeded damage lands on other bytes, and a damaged hash is
     // refused: accepted 10,601 -> 10,283; triples 140,112 -> 140,106, agreeing 110,634 -> 110,628, not associative 444 -> 444.
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_106, 110_628, 444));
+    // RE-PINNED for the pair list (see the accepted count above): accepted 10,283 -> 10,268; triples 140,106 -> 139,170, agreeing
+    // 110,628 -> 110,526, not associative 444 -> 448 (the laws over the accepted damaged entries moved with the accepted set).
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (139_170, 110_526, 448));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }

@@ -566,7 +566,7 @@ fn rn_a_numeric_set_over_an_incremented_field_does_not_free_it() {
     w.insert(&fl(&[("a", i(1))]), 0).unwrap();
     w.write_inc(&np("a"), 1, 0).unwrap();
     w.write_set(&np("a"), i(100), 0).unwrap();
-    assert!(w.state.slots.values().all(|s| s.absorbed.is_some()), "the set absorbed the slot");
+    assert!(w.state.slots.values().all(|s| !s.absorbed.is_empty()), "the set absorbed the slot");
     assert_eq!(rename(&mut w, "a", "b", i(100)), refusal("a"));
 }
 

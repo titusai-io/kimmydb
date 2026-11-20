@@ -182,6 +182,8 @@ pub(super) fn state(j: &J) -> MergeState {
     for sl in j["slots"].as_array().unwrap() {
         let key = (stamp(&sl[0]), path(&sl[1]), writer(&sl[2]), stamp_opt(&sl[3]));
         let absorbed = absorbed.get(&key).copied();
+        let life = key.0;
+        let absorbed = absorbed.map(|(stamp, total)| Pair { life, stamp, total });
         s.slots.insert(key, Slot::new(stamp(&sl[4]), num(&sl[5]), absorbed));
     }
     assert!(
@@ -1931,7 +1933,7 @@ fn the_read_equals_the_model_with_absorbed_on() {
     for (k, e) in j["absorbed"].as_array().unwrap().iter().enumerate() {
         let s = state(&e["state"]);
         assert!(
-            s.slots.values().any(|x| x.absorbed.is_some()),
+            s.slots.values().any(|x| !x.absorbed.is_empty()),
             "kept state {k}: the case is about the absorbed store"
         );
         let got = flatten(&s.ordered_document(&o).unwrap());

@@ -62,12 +62,14 @@
 //!    bit 2 is `soi`, bit 3 says the register stamp is the life's, and the other bits are 0;
 //! 7. `slots`: a count; each a life index, a path, a writer index, a generation byte (0 none,
 //!    1 and then its stamp), the stamp, a FLAG BYTE, the total's payload and, when bit 0 of the flag
-//!    byte is set, the ABSORBED pair: a stamp and the absorbed total's payload, then, when bit 7 is
-//!    set, the OPERAND STAMPS: when bit 5 is set the stamp of the slot's latest operand of type `Int64`
+//!    byte is set, the ABSORBED PAIRS: a count (at least 1), then each pair's life index, stamp, TYPE BYTE
+//!    (0 `Int64`, 1 `Int32`, 2 `Decimal128`) and total payload, the pairs in the order of their life index
+//!    with no life twice, then, when bit 7 is set, the OPERAND STAMPS: when bit 5 is set the stamp of the slot's latest operand of type `Int64`
 //!    or wider (`wide_at`), when bit 6 is set the stamp of its latest `Decimal128` operand
 //!    (`decimal_at`), in that order. The flag byte: bit 0
-//!    an absorbed pair is present; bits 1 and 2 the type of the total (0 `Int64`, 1 `Int32`,
-//!    2 `Decimal128`); bits 3 and 4 the type of the absorbed total (0 when there is no pair);
+//!    absorbed pairs follow the total; bits 1 and 2 the type of the total (0 `Int64`, 1 `Int32`,
+//!    2 `Decimal128`); bits 3 and 4 are 0 (the type of a pair is its own type byte; the old spelling of
+//!    a single pair, its type in these bits, is refused as `BadTag`);
 //!    bit 7 the operand stamps are SPELLED, and then bit 5 `wide_at` is present and bit 6 `decimal_at`
 //!    is present. When bit 7 is clear (bits 5 and 6 are then 0) the stamps are the usual ones of a slot
 //!    whose operands were all of its total's width and the latest at its own stamp (`Slot::new`): `None`
@@ -174,7 +176,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
 use super::counter::Num;
 use super::ord::{Cand, FieldOrd, Floor, OrdAt};
-use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
+use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Pair, Reg, Slot, Vv};
 use super::types::{
     Epoch, LossAt, LossKey, LossKind, LossValue, MAX_LOSS_CAP, MStamp, Path, Value, WriterId,
 };
@@ -208,9 +210,9 @@ fn num_type(n: &Num) -> u8 {
     }
 }
 
-/// The flag byte of a counter slot (section 7): bit 0 an absorbed pair follows the total, bits 1
-/// and 2 the type of the total, bits 3 and 4 the type of the absorbed total (0 when there is no
-/// pair), bit 7 the operand stamps are spelled (they are not the usual ones of `Slot::new`), and then
+/// The flag byte of a counter slot (section 7): bit 0 the absorbed pairs follow the total (a count, then
+/// each pair's life index, stamp, type byte and payload), bits 1 and 2 the type of the total, bits 3 and 4 are 0
+/// (the type of a pair rides in its own type byte), bit 7 the operand stamps are spelled (they are not the usual ones of `Slot::new`), and then
 /// bit 5 the stamp of the latest `Int64`-or-wider operand follows and bit 6 the stamp of the latest
 /// `Decimal128` operand follows; bits 5 and 6 are 0 when bit 7 is.
 const SLOT_ABSORBED: u8 = 1;
@@ -218,7 +220,8 @@ const SLOT_STAMPS: u8 = 0x80;
 const SLOT_WIDE: u8 = 0x20;
 const SLOT_DECIMAL: u8 = 0x40;
 const SLOT_TOTAL_TYPE_SHIFT: u8 = 1;
-const SLOT_ABSORBED_TYPE_SHIFT: u8 = 3;
+/// Bits 3 and 4 of the slot flag byte: the type of the single absorbed pair of the old spelling. Always 0 now.
+const SLOT_ABSORBED_TYPE_BITS: u8 = 0x18;
 
 // ---- writing ---------------------------------------------------------------
 
@@ -577,8 +580,8 @@ impl MergeState {
             w.opt_stamp(g);
             w.stamp(&s.stamp);
             let mut flags = num_type(&s.total) << SLOT_TOTAL_TYPE_SHIFT;
-            if let Some((_, a)) = &s.absorbed {
-                flags |= SLOT_ABSORBED | num_type(a) << SLOT_ABSORBED_TYPE_SHIFT;
+            if !s.absorbed.is_empty() {
+                flags |= SLOT_ABSORBED;
             }
             // the usual stamps of the total's type cost nothing; any other shape spells its own
             let usual = Slot::new(s.stamp, s.total, None);
@@ -594,9 +597,16 @@ impl MergeState {
             }
             w.u8(flags);
             w.num_payload(&s.total);
-            if let Some((st, a)) = &s.absorbed {
-                w.stamp(st);
-                w.num_payload(a);
+            if !s.absorbed.is_empty() {
+                // the pairs, sorted by life (the life table is in life order, so the indexes ascend): a count, then each
+                // pair's life index, stamp, type byte and payload
+                w.len(s.absorbed.len());
+                for pr in &s.absorbed {
+                    w.life(&pr.life);
+                    w.stamp(&pr.stamp);
+                    w.u8(num_type(&pr.total));
+                    w.num_payload(&pr.total);
+                }
             }
             if spelled {
                 if let Some(st) = &s.wide_at {
@@ -833,23 +843,32 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let flags = r.u8()?;
-            let (ty, aty) =
-                ((flags >> SLOT_TOTAL_TYPE_SHIFT) & 3, (flags >> SLOT_ABSORBED_TYPE_SHIFT) & 3);
-            // no operand-stamp bit without bit 7, no type 3, and no absorbed type without an absorbed pair
+            let ty = (flags >> SLOT_TOTAL_TYPE_SHIFT) & 3;
+            // no operand-stamp bit without bit 7, no type 3, and bits 3 and 4 are 0: the type of an absorbed total rides
+            // in its pair's own type byte (the old spelling of a single pair, with the type in the flag byte, is refused)
             if (flags & SLOT_STAMPS == 0 && flags & (SLOT_WIDE | SLOT_DECIMAL) != 0)
                 || ty == 3
-                || aty == 3
-                || (flags & SLOT_ABSORBED == 0 && aty != 0)
+                || flags & SLOT_ABSORBED_TYPE_BITS != 0
             {
                 return Err(DecodeError::BadTag(flags));
             }
             let total = r.num_payload(ty)?;
-            let absorbed = if flags & SLOT_ABSORBED != 0 {
-                let st = r.stamp()?;
-                Some((st, r.num_payload(aty)?))
-            } else {
-                None
-            };
+            let mut absorbed = Vec::new();
+            if flags & SLOT_ABSORBED != 0 {
+                let n = r.len()?;
+                if n == 0 {
+                    return Err(DecodeError::BadTag(flags));
+                }
+                for _ in 0..n {
+                    let life = r.life()?;
+                    let stamp = r.stamp()?;
+                    let aty = r.u8()?;
+                    if aty > 2 {
+                        return Err(DecodeError::BadTag(aty));
+                    }
+                    absorbed.push(Pair { life, stamp, total: r.num_payload(aty)? });
+                }
+            }
             let usual = Slot::new(stamp, total, None);
             let (wide_at, decimal_at) = if flags & SLOT_STAMPS == 0 {
                 (usual.wide_at, usual.decimal_at)

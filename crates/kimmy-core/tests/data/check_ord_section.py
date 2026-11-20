@@ -27,10 +27,10 @@ PINS = {
     "170": ("79f811df1f679ba13896538b36c9e324", 273, 1),
     "mixed": ("329d92bb79aa4174a995b5ef401fb8a1", 509, 5),
     "delete": ("e695a485390d23417c6a5fd1d8f9ca41", 235, 0),
-    "obs": ("1714242f8331d6b9ca194c73191730ed", 329, 2),
+    "obs": ("b4ceeedc2e8df22c2fe2e13bdded4dab", 335, 2),
     "small": ("f41c2e8e7d18f3b932ed6a99aa0aa9fb", 163, 2),
     # NEW pin: the typed golden (an Int32 slot, a Decimal128 slot, the counter of Amendment 6), by the Rust writer
-    "typed": ("4c12bd2f978ca7ff1322b6ff3f7f8e1d", 499, 4),
+    "typed": ("50565aaae3ff175d67e2d239b9508bd4", 505, 4),
     # NEW pins (`the_order_section_corpus_is_pinned`): states a Rust Writer builds, with every floor kind, a level mark,
     # the root key, several writers' firsts and positions of 128 and up (see `ord_section_states`).
     "floors_u": ("a9a3d1f267ae32cd8a3de81f1297f4af", 666, 9),
@@ -295,9 +295,12 @@ def section10_start(buf):
         w.stamp()
         flags = w.u8()
         w.payload((flags >> 1) & 3)
-        if flags & 1:
-            w.stamp()
-            w.payload((flags >> 3) & 3)
+        assert flags & 0x18 == 0, "bits 3 and 4 of a slot flag byte are 0: the pair's type is its own byte"
+        if flags & 1:                   # the pairs: a count, then each pair's life index, stamp, type byte and payload
+            for _ in range(w.var()):
+                w.var()
+                w.stamp()
+                w.payload(w.u8())
         if flags & 0x80:                # the operand stamps are spelled (not the usual ones of the total's type)
             if flags & 0x20:            # wide_at: the latest Int64-or-wider operand
                 w.stamp()

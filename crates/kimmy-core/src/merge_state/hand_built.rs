@@ -242,7 +242,7 @@ impl Cx<'_> {
             // (the pair at the slot's own stamp is the slot, so it has the slot's type: it is not
             // the case that gets here)
         }
-        Slot::new(stamp, total, absorbed)
+        Slot::new(stamp, total, absorbed.map(|(ps, pt)| Pair { life: la(), stamp: ps, total: pt }))
     }
 }
 
@@ -266,19 +266,32 @@ fn put_reg(s: &mut MergeState, l: MStamp, p: &Path, r: Reg) {
 /// that [`Mode::Any`] and the builders with a pair of their own (`near_max_total`) give, whose totals
 /// are functions of the HLC alone, so that the moved stamp still fixes its total.
 fn fit_pair(mut sl: Slot, writer: WriterId) -> Slot {
-    sl.absorbed = sl.absorbed.and_then(|(a, total)| {
-        let a = MStamp { hlc: a.hlc, writer };
-        match a.cmp(&sl.stamp) {
-            std::cmp::Ordering::Greater => None,
-            std::cmp::Ordering::Equal => Some((a, sl.total)),
-            std::cmp::Ordering::Less => Some((a, total)),
-        }
-    });
+    sl.absorbed = sl
+        .absorbed
+        .first()
+        .copied()
+        .and_then(|pr| {
+            let a = MStamp { hlc: pr.stamp.hlc, writer };
+            match a.cmp(&sl.stamp) {
+                std::cmp::Ordering::Greater => None,
+                std::cmp::Ordering::Equal => {
+                    Some(Pair { life: pr.life, stamp: a, total: sl.total })
+                }
+                std::cmp::Ordering::Less => Some(Pair { life: pr.life, stamp: a, total: pr.total }),
+            }
+        })
+        .into_iter()
+        .collect();
     sl
 }
 
 fn put_slot(s: &mut MergeState, l: MStamp, p: &Path, k: u8, generation: Option<MStamp>, sl: Slot) {
-    let sl = fit_pair(sl, wid(k));
+    let mut sl = fit_pair(sl, wid(k));
+    // the pair is the slot's own life's (the layout of the pair list holds one pair per life; the rule that keys it by the
+    // writing life is a later change)
+    for pr in &mut sl.absorbed {
+        pr.life = l;
+    }
     s.slots.insert((l, p.clone(), wid(k), generation), sl);
 }
 
@@ -614,7 +627,7 @@ fn near_max_total(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
             let total = Num::Int64(cx.draw(("total", slot_at), |r| *r.pick(&big)));
             let generation = if k % 5 == 4 { Some(g) } else { None };
             // the pair an earlier base write absorbed: the write `at`, below the slot's stamp
-            let absorbed = Some((at, Num::Int64(-n)));
+            let absorbed = Some(Pair { life: la(), stamp: at, total: Num::Int64(-n) });
             put_slot(st, la(), &p, k, generation, Slot::new(slot_stamp(slot_at), total, absorbed));
             seen.insert((la(), wid(k), generation), Num::Int64(n));
         }
@@ -903,11 +916,16 @@ fn close(cx: &mut Cx, x: &mut MergeState) {
     // an order entry belongs to a listed life: the others go (a life is not invented here, since
     // another state may list it as another kind); an entry that says nothing is no entry
     x.ords.retain(|(l, _), e| x.lives.contains_key(l) && !e.is_empty());
+    // a pair names a life the state lists and has not buried (decode refuses the others): a slot of an absent or dead life
+    // keeps no pair
+    for s in x.slots.values_mut() {
+        s.absorbed.retain(|p| x.lives.contains_key(&p.life) && !x.dead.contains(&p.life));
+    }
     let mut stamps: Vec<MStamp> = x.lives.keys().copied().collect();
     stamps.extend(x.deletes.keys());
     stamps.extend(x.regs.values().map(|r| r.stamp));
     stamps.extend(x.slots.values().map(|s| s.stamp));
-    stamps.extend(x.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| a.0)));
+    stamps.extend(x.slots.values().flat_map(|s| s.absorbed.iter().map(|a| a.stamp)));
     stamps.extend(x.slots.keys().filter_map(|k| k.3));
     stamps.extend(x.lives.values().flat_map(|l| l.seen.iter().copied()));
     for g in x.regs.values().filter_map(|r| r.generation.as_ref()) {
@@ -1127,7 +1145,7 @@ fn a_coherent_slot_is_the_key_writers_and_a_function_of_its_stamp_and_path() {
                         vv(&mut s, k, 1000, 0);
                     }
                     assert_eq!(s.check_decoded(), Ok(()), "{sl:?}");
-                    if let Some((_, a)) = &sl.absorbed {
+                    if let Some((_, a)) = sl.pair() {
                         pairs += 1;
                         wider += usize::from(a.label() < sl.total.label());
                     }
