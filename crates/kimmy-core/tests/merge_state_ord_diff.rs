@@ -1,5 +1,5 @@
-//! The ORDER differential: random scripts of local writes and receives, run on the A2.1 Python model
-//! (`tests/data/gen_ord_differential.py`, model6.py 72da18ebbf3bb383, ABSORBED on, implicit markers on,
+//! The ORDER differential: random scripts of local writes and receives, run on the Python model
+//! (`tests/data/gen_ord_differential.py`, the vendored model6.py, ABSORBED on, implicit markers on,
 //! retention 10^9), replayed here through `Writer`s. After EVERY step the acting member's ordered document
 //! and order state must be the model's, and the step must give the stamp the model gave, or none: a
 //! refusal or a no-op is part of what is compared.
@@ -114,4 +114,71 @@ fn every_switch_of_the_order_state_is_caught_by_the_random_scripts() {
         assert!(!f.bad.is_empty(), "{name} is not caught by the random scripts");
     }
     println!("{}", report.join("\n"));
+}
+
+/// The DELIVERY scripts: 200 scripts (100 flat, 100 nested, 36 steps) in which, besides the writes, a member takes the peer's current state
+/// (a snapshot, no oplog entry), pulls a window of the peer's oplog entries (each skipped when the receiver's vector covers the entry's
+/// state and joined otherwise, the window cut short when more entries follow), backs itself up, and goes back to the backup under the next
+/// epoch (a new writer identity, the clock kept). After every step the acting member's ordered document and order state must be the model's,
+/// the skip and the append of every entry must be the model's, and the stamps the member gives after a restore carry its new epoch.
+///
+/// The counts are what the replay really did (not what the generator drew), and they are pinned: a delivery script that never restored, or
+/// whose windows were never cut, would pass without testing what it claims.
+#[test]
+fn the_delivery_scripts_give_the_models_orders_after_a_snapshot_a_covered_skip_a_cut_window_and_a_restore()
+ {
+    use ord_replay::{Delivery, replay_delivery};
+    let f = replay_delivery(&JoinOptions::default());
+    for b in f.bad.iter().take(3) {
+        eprintln!("{b}");
+    }
+    assert!(
+        f.bad.is_empty(),
+        "{} scripts disagree: {:?}",
+        f.bad.len(),
+        f.bad.iter().map(|b| b.lines().next().unwrap()).collect::<Vec<_>>()
+    );
+    println!("delivery differential: {} scripts, {} steps, {:?}", f.scripts, f.steps, f.delivery);
+    assert_eq!((f.scripts, f.steps), (200, 7200));
+    assert_eq!(
+        f.delivery,
+        Delivery {
+            snaps: 566,
+            backups: 270,
+            restores: 52,
+            scripts_with_a_restore: 41,
+            pulls: 1921,
+            truncated: 839,
+            skipped: 1573,
+            applied: 1592,
+            writes_after_a_restore: 88,
+            restore_then_a_pull_that_joined: 17,
+            restore_then_a_snapshot: 13,
+        }
+    );
+}
+
+/// The two mutants of the absorbed pair (the old keying by the slot's life; one pair per slot) and the fold mutant that folds only the write's
+/// own life, run over both groups of scripts. The random sim does not draw the shapes of the first two, the differential does: the old keying
+/// disagrees in 3 of the 300 plain scripts (flat 138, nested 1083 and 1141, the same three that the ABSORBED-off model no longer differs on)
+/// and in 1 of the 200 delivery scripts; one pair per slot in 1 of the plain scripts. The numbers are pinned so that a change of a draw, of the
+/// model or of the replay that makes a group blind to them is noticed.
+#[test]
+fn the_absorbed_pair_mutants_are_caught_by_the_ord_differential() {
+    use ord_replay::{replay, replay_delivery};
+    type Set = fn(&mut JoinOptions);
+    let mutants: [(&str, Set, usize, usize); 3] = [
+        ("absorb_by_slot_life", |o| o.set_absorb_by_slot_life(true), 3, 1),
+        ("single_pair", |o| o.set_single_pair(true), 1, 0),
+        ("fold_life_only", |o| o.set_fold_life_only(true), 31, 25),
+    ];
+    for (name, set, plain, delivery) in mutants {
+        let mut o = JoinOptions::default();
+        set(&mut o);
+        assert_eq!(
+            (replay(&o).bad.len(), replay_delivery(&o).bad.len()),
+            (plain, delivery),
+            "{name}: scripts that disagree (plain, delivery)"
+        );
+    }
 }

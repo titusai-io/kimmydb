@@ -22,6 +22,16 @@ text) of the acting member's ordered document and of its order state AFTER joini
 normalised; the model's is not until the next join): the text is defined below and written by the Rust test in the same words. A
 disagreement is a finding: re-run with a seed to print the model's text for every step.
 
+THE DELIVERY SCRIPTS (200 more, `"delivery": true`, flat seeds 2001..2100 and nested seeds 3001..3100, 36 steps; the 300 above are unchanged by them):
+the same writes, and, in 40 percent of the steps, one of the other ways a state reaches a member, as the product delivers it: `snap` (the
+peer's current state joined, no oplog entry: a snapshot page), `pull` (a window of the peer's oplog entries in stamp order from a start the
+draw picks, at most 1 to 4 of them, each SKIPPED when the receiver's vector already covers the entry's state (the covered-entry skip) and joined
+otherwise, and appended to the receiver's oplog when it changed the state and the entry is not held; the step says which entries were skipped
+and appended, and whether more entries followed the window, a TRUNCATED window), `backup` and `restore` (the member goes back to its backup
+under the next epoch: a new writer identity, its clock kept). A script of the plain kind never has them. The generator prints how many of
+each the 200 scripts hold; the Rust test pins what its replay did (`merge_state_ord_diff.rs`) and compares, besides the digests, the skip and
+the append of every entry.
+
 THE FLIP'S EVIDENCE. Every script is also run with ABSORBED = False. A script whose steps (an operation's result, or a member's digest)
 differ between the two settings carries an `off` record: the index of the first step that differs and that step as the ABSORBED-off
 model made it (and the final digest). The Rust test pins the seeds of these scripts: its writers equal the ABSORBED-on digests (the
@@ -178,7 +188,53 @@ def disjoint(paths):
     return all(not (a == b or a.startswith(b + ".") or b.startswith(a + ".")) for i, a in enumerate(paths) for b in paths[i + 1:])
 
 
-def script(kind, seed, steps=30):
+def covered(m, ent):
+    """The covered-entry skip of the product (`Node::covers`): an entry whose state's version vector the receiver's vector already covers
+    in every writer is not joined."""
+    return all(m.state.vv.get(w, 0) >= h for w, h in M.unwire(ent[2]).vv.items())
+
+
+def deliver(rnd, ms, names, who):
+    """One delivery step of a DELIVERY script (the ways a state really reaches a member, besides its own writes), by the member `who`:
+      snap     the peer's current state joined, no oplog entry (a snapshot page);
+      pull     a window of the peer's oplog entries, in stamp order from a start the draw picks, at most `limit` of them (a TRUNCATED window
+               when more entries follow it); each entry is skipped when the receiver's vector covers it (the covered skip) and joined
+               otherwise, and appended to the receiver's oplog when it changed the state and the entry is not held;
+      backup   the member saves its state and oplog;
+      restore  the member goes back to its backup under the next epoch (a new writer identity), its clock kept.
+    Returns the step (the caller adds the member and the digest) and its text."""
+    m = ms[who]
+    q = rnd.random()
+    if q < 0.20:
+        frm = rnd.choice([n for n in names if n != who])
+        m.receive_snapshot(ms[frm].state)
+        return {"k": "snap", "from": frm}, "snap " + frm
+    if q < 0.30:
+        m.saved = [(m.state.copy(), dict(m.oplog))]
+        return {"k": "backup"}, "backup"
+    if q < 0.42 and m.saved:
+        m.restore()
+        return {"k": "restore", "epoch": m.epoch}, "restore"
+    frm = rnd.choice([n for n in names if n != who])
+    ents = sorted((key[1], ent) for key, ent in ms[frm].oplog.items() if key[0] == "w" and isinstance(key[1], tuple) and len(key[1]) == 2 and isinstance(key[1][1], tuple))
+    start = rnd.choice([0, 0, rnd.randint(0, len(ents))])
+    limit = rnd.randint(1, 4)
+    window = ents[start:start + limit]
+    truncated = start + limit < len(ents)
+    stamps, skipped, appended = [], [], []
+    for st, ent in window:
+        skip = covered(m, ent)
+        held = ("w", st) in m.oplog
+        if not skip:
+            m.receive_entry(ent)
+        stamps.append(j_stamp(st))
+        skipped.append(skip)
+        appended.append(not skip and not held and ("w", st) in m.oplog)
+    return ({"k": "pull", "from": frm, "stamps": stamps, "skipped": skipped, "appended": appended, "truncated": truncated},
+            "pull %s %d entries%s" % (frm, len(window), " (truncated)" if truncated else ""))
+
+
+def script(kind, seed, steps=30, delivery=False):
     rnd = random.Random(seed)
     nested = kind == "nested"
     pool = NPATHS if nested else FIELDS
@@ -193,7 +249,14 @@ def script(kind, seed, steps=30):
         m = ms[who]
         alive = bool(m.state.alive())
         r = rnd.random()
-        if i > 0 and r < 0.33:
+        if delivery and i > 0 and r < 0.40:
+            step, text = deliver(rnd, ms, names, who)
+            d, dt, ot = member_digest(m)
+            step.update({"m": who, "d": d})
+            out.append(step)
+            shown.append((who, text, dt, ot))
+            continue
+        if i > 0 and r < 0.33 and not delivery:
             frm = rnd.choice([n for n in names if n != who])
             m.receive_entry(("w", ("snap", seed, i), M.wire(ms[frm].state)))
             d, dt, ot = member_digest(m)
@@ -299,7 +362,10 @@ def script(kind, seed, steps=30):
                     ms[a].receive_entry(("w", ("sync", seed), M.wire(ms[b].state)))
     final = {n: member_digest(ms[n])[0] for n in names}
     assert len(set(final.values())) == 1, ("the model's members disagree after a full sync", kind, seed, final)
-    return {"kind": kind, "seed": seed, "members": nm, "steps": out, "final": final[names[0]]}, shown
+    sc = {"kind": kind, "seed": seed, "members": nm, "steps": out, "final": final[names[0]]}
+    if delivery:
+        sc["delivery"] = True
+    return sc, shown
 
 
 def with_absorbed(on_flag, kind, seed):
@@ -347,6 +413,39 @@ def main(outdir, show=None):
                         isn = any("." in q or len(s["path"]) > 1 for q in paths)
                         stats["nested upserts"] += isn
                         stats["nested upserts applied"] += isn and s["res"] is not None
+    # the DELIVERY scripts: the same writes, with the ways a state reaches a member besides its own writes (see `deliver`); no `off` record
+    hits = {"scripts": 0, "steps": 0, "snap": 0, "backup": 0, "restore": 0, "scripts with a restore": 0, "pull": 0, "truncated pull": 0,
+            "entries applied": 0, "entries skipped (covered)": 0, "entries appended": 0, "writes after a restore": 0,
+            "restore, then a pull that applied an entry": 0, "restore, then a snapshot": 0}
+    for kind, seeds in (("flat", range(2001, 2101)), ("nested", range(3001, 3101))):
+        for seed in seeds:
+            sc, shown = script(kind, seed, steps=36, delivery=True)
+            scripts.append(sc)
+            hits["scripts"] += 1
+            restored = set()
+            after_restore_pull = after_restore_snap = False
+            for stp in sc["steps"]:
+                hits["steps"] += 1
+                k = stp["k"]
+                if k in ("snap", "backup", "restore", "pull"):
+                    hits[k] += 1
+                if k == "restore":
+                    restored.add(stp["m"])
+                if k == "snap" and stp["m"] in restored:
+                    after_restore_snap = True
+                if k == "pull":
+                    hits["truncated pull"] += stp["truncated"]
+                    hits["entries applied"] += sum(not x for x in stp["skipped"])
+                    hits["entries skipped (covered)"] += sum(stp["skipped"])
+                    hits["entries appended"] += sum(stp["appended"])
+                    if stp["m"] in restored and not all(stp["skipped"]):
+                        after_restore_pull = True
+                if k == "op" and stp["m"] in restored and stp["res"] is not None and stp["res"][2] > 0:
+                    hits["writes after a restore"] += 1
+            hits["scripts with a restore"] += bool(restored)
+            hits["restore, then a pull that applied an entry"] += after_restore_pull
+            hits["restore, then a snapshot"] += after_restore_snap
+    print("delivery scripts:", hits)
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "ord_diff_scripts.json"), "w") as f:
         json.dump({"model6_sha256": sha, "scripts": scripts}, f, separators=(",", ":"), sort_keys=True)
