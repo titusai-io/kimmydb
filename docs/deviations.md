@@ -431,6 +431,17 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 
 ---
 
+## 🟡 A loss record can name a write that is alive, and `retiredWriter` is reserved
+
+**Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).**
+
+- **A record can name a write that is alive.** A converged field state can hold a live register and an `insertLost` record that names it (a join made before the collection's floor was known, then the filter). The record is kept: dropping it would make the record set shrink other than from the oldest end, which the horizon and the cap on a document's records rely on, and hiding it at delivery needs a rule about when the loser's cell is alive that the merge does not have. A `conflictResolved` event can therefore name a write whose value is in the document. A consumer that needs to know reads the document.
+- **`retiredWriter` is reserved and never reported in this release.** Its kind tag (3) is kept, since kinds are append-only; nothing emits it.
+
+**To close:** none planned.
+
+---
+
 ## 🟡 A map marker is not reported beside its own children, and an implicit map is never reported as a loser
 
 **Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).** The merge state keeps a marker for every map (an explicit `a: {…}`, or the implicit one a write to `a.y` makes where `a` is absent).
