@@ -193,6 +193,10 @@ Per-field LWW or a CRDT would preserve both. The tradeoff was made explicitly â€
 see [Decisions](decisions.md) â€” and `merge_policy` is the intended extension
 point if the semantics need to change later.
 
+### Granularity: field
+
+A `field` collection merges per field. Merging states is commutative, associative and idempotent; the loss records it reports are at least once ([Deviations](deviations.md)).
+
 ---
 
 ## Tombstones
