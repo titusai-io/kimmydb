@@ -386,7 +386,8 @@ def grade(ms, log):
         errs.append(("record-names-surviving-increment",))
     if any(not (grp & {(k[1], k[2]) for k in have}) for grp in M.killed_superseded_any(log)):
         errs.append(("record-missing-killed-superseded",))
-    if must - {(k[1], k[2]) for k in have}:
+    haveh = {(k[1], k[2]) for k in have}
+    if any(not M.covered(h, haveh, log) for h in must):      # DELTA (a), as a cover (model6.covered)
         errs.append(("record-missing",))
     if any(not M.sound_record(k, log, alive, dels) for k in have):
         errs.append(("record-unsound",))

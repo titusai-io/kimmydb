@@ -432,6 +432,29 @@ struct Side<'a> {
     vv: &'a Vv,
 }
 
+/// The delta (a): a marker cell whose own write also left a cell below it in the same life is not
+/// reported beside that cell (the child carries the loss, with its value); a marker that is the
+/// only head of its write (`a = {}`) is. A child is a register with a value that is not a marker
+/// (an unset counts) or a counter slot, of the marker's own stamp, on either side. The registers of
+/// a life are ordered by `(life, path)`, so the paths below one are a single run.
+fn marker_with_child(sides: &[&Side<'_>; 2], k: &(MStamp, Path), r: &Reg) -> bool {
+    if !r.value.is_marker() {
+        return false;
+    }
+    sides.iter().any(|side| {
+        side.regs
+            .range((k.0, k.1.clone())..)
+            .skip_while(|((_, q), _)| *q == k.1)
+            .take_while(|((l, q), _)| *l == k.0 && q.is_below(&k.1))
+            .any(|(_, c)| c.stamp == r.stamp && !c.value.is_marker())
+            || side
+                .slots
+                .range((k.0, k.1.clone(), WriterId::from_bytes([0; WriterId::LEN]), None)..)
+                .take_while(|((l, q, _, _), _)| *l == k.0 && (*q == k.1 || q.is_below(&k.1)))
+                .any(|((_, q, _, _), v)| *q != k.1 && v.stamp == r.stamp)
+    })
+}
+
 /// A cell below a path, for the `typeClash` search: the value or total it would report.
 enum Held<'a> {
     Value(&'a Value),
@@ -567,6 +590,9 @@ pub(super) fn join_into(
                         if lo.value == Value::ImplicitMap {
                             continue;
                         }
+                        // An explicit map that loses to a concurrent map IS a clash: its cell is gone after
+                        // this join, so a later delete or supersession could otherwise leave its write with
+                        // no record (the covered-entry skip never joins its entry again).
                         let arrays =
                             matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
                         let kind = if arrays && !o.array_clash_as_clash() {
@@ -640,11 +666,16 @@ pub(super) fn join_into(
             for (k, r) in src.regs {
                 if o.cells_reported() && reported.contains(&k.0) && r.stamp != k.0 {
                     // V6M1: a write made into the losing life.
-                    new.insert(
-                        key(LossKind::InsertLost, &k.1, r.stamp),
-                        LossValue::Value(r.value.clone()),
-                    );
-                } else if !alive.has(&k.0) && !reported.contains(&k.0) && !seen_by_delete(&r.stamp)
+                    if !marker_with_child(&[&s, &t_side], k, r) {
+                        new.insert(
+                            key(LossKind::InsertLost, &k.1, r.stamp),
+                            LossValue::Value(r.value.clone()),
+                        );
+                    }
+                } else if !alive.has(&k.0)
+                    && !reported.contains(&k.0)
+                    && !seen_by_delete(&r.stamp)
+                    && !marker_with_child(&[&s, &t_side], k, r)
                 {
                     new.insert(
                         key(LossKind::DeleteWon, &k.1, r.stamp),

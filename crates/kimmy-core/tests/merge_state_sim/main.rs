@@ -272,12 +272,24 @@ fn named_probes(rep: &mut Report) {
     }
 }
 
+/// Under the covered-entry skip (the product's delivery), a write lost to a delete keeps a record at or below each of its
+/// heads, in the five schedules of `probes::s1_scenarios_with` (a map or an implicit marker that loses a cell, then a delete
+/// that wins). Needs a clash for an explicit map that loses to a map in the join, and an implicit marker that is never a head
+/// of its own in the oracle.
+#[test]
+fn s1_a_lost_write_keeps_a_record_under_the_covered_entry_skip() {
+    for (name, problems) in probes::s1_scenarios_with(&Cfg::default_ret()) {
+        assert!(problems.is_empty(), "{name}: {problems:?}");
+    }
+}
+
 /// B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
 /// graded against the oracle, and the fold scenarios of the counter cell (the four-step case and EG2),
 /// read by value.
 fn scenario_probes(rep: &mut Report) {
     let fold = probes::fold_scenarios_with(&Cfg::default_ret());
-    for (name, problems) in probes::scenarios().into_iter().chain(fold) {
+    let s1 = probes::s1_scenarios_with(&Cfg::default_ret());
+    for (name, problems) in probes::scenarios().into_iter().chain(fold).chain(s1) {
         println!(
             "[scenario {name}]: {}",
             if problems.is_empty() { "ok".to_string() } else { format!("{problems:?}") }
@@ -446,14 +458,25 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   horizon 0xd40a73c20627234b -> 0xa3c93e720200ee58
     //   bounded 0x0ddcbb0a2eb7ebf0 -> 0x83e73911c4ed16af
     //   bounded nested 0x0ae6e20a9e5c4125 -> 0xdba30f39f2adb4df
+    // RE-PINNED for the Step 4 delta (a) (Q7 Step 4, C5b): a marker is not reported beside a child cell of its own write, so the
+    // states of the runs that write below a map hold other loss records, and the fingerprints fold the states and the events
+    // (what each member emitted). `sequential` and `bounded` did not move. The fingerprints fold no oracle: they were the same
+    // before and after the oracle copies took the cover.
+    //   restore 0xaf155a3830061b55 -> 0x6441e0101b32f979
+    //   no restore 0x8706e1e410ebdb07 -> 0xefc216dd0dfe3e52
+    //   bound 1000 0x837adb767df6d405 -> 0x251c0e78a7a72923
+    //   sequential 0xbb67e71425fc62ec (unchanged)
+    //   horizon 0xa3c93e720200ee58 -> 0xe89b742957e0c7f0
+    //   bounded 0x83e73911c4ed16af (unchanged)
+    //   bounded nested 0xdba30f39f2adb4df -> 0x633b0e853e0a1cd0
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0xaf155a3830061b55),
-        ("no restore", 0x8706e1e410ebdb07),
-        ("bound 1000", 0x837adb767df6d405),
+        ("restore", 0x6441e0101b32f979),
+        ("no restore", 0xefc216dd0dfe3e52),
+        ("bound 1000", 0x251c0e78a7a72923),
         ("sequential", 0xbb67e71425fc62ec),
-        ("horizon", 0xa3c93e720200ee58),
+        ("horizon", 0xe89b742957e0c7f0),
         ("bounded", 0x83e73911c4ed16af),
-        ("bounded nested", 0xdba30f39f2adb4df),
+        ("bounded nested", 0x633b0e853e0a1cd0),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }

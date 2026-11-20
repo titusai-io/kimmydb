@@ -431,6 +431,18 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 
 ---
 
+## 🟡 A map marker is not reported beside its own children, and an implicit map is never reported as a loser
+
+**Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).** The merge state keeps a marker for every map (an explicit `a: {…}`, or the implicit one a write to `a.y` makes where `a` is absent).
+
+- **An explicit map that loses to a concurrent write is reported as a `clash` at the map's path, even when the winner is also a map whose children merge.** The map's cell does not survive the merge, so this is the only record of that write's map if a later delete wins. An implicit map (one a write to `a.y` creates) is never reported as a loser; its write is reported through the field it wrote. Which of two racing maps is reported depends on which stamp is older (an older explicit map against a newer implicit one is reported, an older implicit one against a newer explicit one is not).
+- **A write that is lost whole is reported through its own child records, and its marker is not reported beside them.** `$set a.y 2` or `$set a {x: 1}` lost to a delete or to a newer insert is recorded at `a.y` (or `a.x`) with its value, and not also at `a`. The record that reports the write can be the removal of a field the write cleared (a `$set a {}` over a visible `{x: 1}` is recorded only as the loss of `a.x`, with no value), or a counter of the write that a later `$unset` did not see (recorded although the field was unset in sequence; a write superseded in sequence may be reported). A marker that is the only thing the write left (`$set a {}` over an absent or empty map) is recorded, since otherwise that write would leave no record.
+- **A marker can still be reported beside a child of another write**: a child overwritten in sequence by a newer write of the same life leaves the older marker reported. Such a record is sound (a write superseded in sequence may be reported) and is not suppressed.
+
+**To close:** none planned. The report follows what a person would call a lost write.
+
+---
+
 ## 🟡 A collection validator is enforced by the member that accepts the write, so a non-conforming document can be stored and kept
 
 **Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:
