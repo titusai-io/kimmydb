@@ -43,8 +43,8 @@ pub use conflict::{UniqueViolationDetail, UnkeyedDocumentDetail};
 pub use cursor::Cursor;
 pub use ddl::{
     CollectionCreate, CollectionRef, DATABASE_DROP_NAME, FIELD_POLICY_BYTES_PER_FIELD,
-    FIELD_POLICY_STEERING_FIELDS, IndexCreate, IndexDrop, MergePolicy, ValidatorSet, VectorSet,
-    database_drop_id, merge_policy_steering,
+    FIELD_POLICY_STEERING_FIELDS, IndexCreate, IndexDrop, LossLimits, MergePolicy, ValidatorSet,
+    VectorSet, database_drop_id, merge_policy_steering,
 };
 pub use doc_version::{DocVersion, StateHash};
 pub use error::{Error, Result};

@@ -1558,6 +1558,7 @@ mod tests {
             merge_policy: kimmy_core::MergePolicy::Document,
             merge_policy_at: None,
             join_retention_ms: None,
+            loss_limits: None,
         };
         let mut written = Vec::new();
         write_frame(

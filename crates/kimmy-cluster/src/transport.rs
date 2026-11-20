@@ -8610,6 +8610,7 @@ mod tests {
                     merge_policy: kimmy_core::MergePolicy::Document,
                     validator: None,
                     join_retention_ms: None,
+                    loss_limits: None,
                 })
                 .unwrap(),
             ),
@@ -8982,6 +8983,7 @@ mod tests {
                 merge_policy: kimmy_core::MergePolicy::Document,
                 merge_policy_at: None,
                 join_retention_ms: None,
+                loss_limits: None,
             }]
         } else {
             Vec::new()
@@ -13338,6 +13340,7 @@ mod tests {
                     merge_policy: kimmy_core::MergePolicy::Document,
                     validator: None,
                     join_retention_ms: None,
+                    loss_limits: None,
                 })
                 .unwrap(),
             ),

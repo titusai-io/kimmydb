@@ -5124,6 +5124,50 @@ async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_stand
     assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
 }
 
+/// `describe` of a `field` collection names what it keeps of the conflicts its merge settled (Step 4): `R`, `K` and the cut,
+/// the creator's, fixed at creation; a `document` collection names none.
+#[tokio::test]
+async fn describe_names_the_conflict_limits_of_a_field_collection_and_none_for_a_document_one() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"f","mergePolicy":"field"}))
+        .await;
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"d","mergePolicy":"document"}))
+        .await;
+    let field = server.get("/v1/db/shop/coll/f/describe", Some(&token)).await;
+    assert_eq!(
+        field.body["conflicts"],
+        json!({
+            "retentionMs": server.state.engine.default_join_retention_ms(),
+            "recordsPerDocument": 4,
+            "valueCutBytes": 64,
+        }),
+        "{:?}",
+        field.body
+    );
+    // a collection created after the default moved keeps the creator's value from then on, and the old one its own
+    server
+        .state
+        .engine
+        .set_default_loss_limits(kimmy_core::LossLimits { cap: 9, cut_bytes: 300 })
+        .unwrap();
+    server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name":"g","mergePolicy":"field"}))
+        .await;
+    let later = server.get("/v1/db/shop/coll/g/describe", Some(&token)).await;
+    assert_eq!(later.body["conflicts"]["recordsPerDocument"], 9);
+    assert_eq!(later.body["conflicts"]["valueCutBytes"], 300);
+    let first = server.get("/v1/db/shop/coll/f/describe", Some(&token)).await;
+    assert_eq!(
+        first.body["conflicts"]["recordsPerDocument"], 4,
+        "the one created before keeps its own"
+    );
+    let document = server.get("/v1/db/shop/coll/d/describe", Some(&token)).await;
+    assert!(document.body.get("conflicts").is_none(), "{:?}", document.body);
+}
+
 /// `describe` carries the node's durability class, as `/v1/version` does
 /// (ADR-088, amended): the same value from the same source, named for what it
 /// is — a fact about the node, not the collection.
@@ -11914,6 +11958,12 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_databases",
         "kimmy_collections",
         "kimmy_unique_violations",
+        "kimmy_loss_records_refused_total",
+        "kimmy_loss_records_refused_total",
+        "kimmy_loss_records_refused_total",
+        "kimmy_loss_records_refused_total",
+        "kimmy_loss_records_refused_total",
+        "kimmy_loss_records_refused_total",
         "kimmy_commits",
         "kimmy_fsyncs",
         "kimmy_commits_grouped_total",

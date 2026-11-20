@@ -12,7 +12,9 @@
 //! the replicated state, the digest and the etag, and a backup does not carry it.
 
 use kimmy_core::Hlc;
-use kimmy_core::merge_state::{JoinOptions, LossKey, LossValue, MergeState};
+use kimmy_core::merge_state::{
+    JoinOptions, LossCounts, LossKey, LossReceive, LossValue, MergeState,
+};
 use redb::ReadableTable;
 
 use crate::error::{Result, StorageError};
@@ -74,9 +76,87 @@ pub(crate) fn any(txn: &redb::WriteTransaction, collection: u64, key: &[u8]) -> 
         .is_some())
 }
 
+/// Why a loss record was not kept, for `kimmy_loss_records_refused_total{reason}`: refused on arrival (`Cap`: `K` greater
+/// records are held; `Floor`: at or below the collection's floor; `Horizon`: older than the state's horizon; `Oversize`: a
+/// value over the collection's cut; `Invalid`: a total past the bound), or `Evicted`: a record the state held that a newer one
+/// displaced (counted, but not as refused on arrival).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossRefusal {
+    Cap,
+    Evicted,
+    Floor,
+    Horizon,
+    Oversize,
+    Invalid,
+}
+
+impl LossRefusal {
+    /// Every reason, in the order the metric lists them.
+    pub const ALL: [LossRefusal; 6] = [
+        LossRefusal::Cap,
+        LossRefusal::Evicted,
+        LossRefusal::Floor,
+        LossRefusal::Horizon,
+        LossRefusal::Oversize,
+        LossRefusal::Invalid,
+    ];
+
+    /// The label value of the metric.
+    pub fn label(self) -> &'static str {
+        match self {
+            LossRefusal::Cap => "cap",
+            LossRefusal::Evicted => "evicted",
+            LossRefusal::Floor => "floor",
+            LossRefusal::Horizon => "horizon",
+            LossRefusal::Oversize => "oversize",
+            LossRefusal::Invalid => "invalid",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Refusals counted while a transaction runs, added to the engine's counters by the caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Refusals([u64; 6]);
+
+impl Refusals {
+    pub(crate) fn add(&mut self, reason: LossRefusal, n: usize) {
+        self.0[reason.index()] += n as u64;
+    }
+
+    /// What a join's cap and cut did.
+    pub(crate) fn of_join(counts: &LossCounts) -> Self {
+        let mut r = Self::default();
+        r.add(LossRefusal::Cap, counts.refused);
+        r.add(LossRefusal::Evicted, counts.evicted);
+        r.add(LossRefusal::Oversize, counts.oversize);
+        r
+    }
+
+    /// What `receive_loss_counted` said about one record.
+    pub(crate) fn note_receive(&mut self, outcome: LossReceive, evicted: usize) {
+        match outcome {
+            LossReceive::Added | LossReceive::Known => {}
+            LossReceive::Cap => self.add(LossRefusal::Cap, 1),
+            LossReceive::Horizon => self.add(LossRefusal::Horizon, 1),
+            LossReceive::Oversize => self.add(LossRefusal::Oversize, 1),
+            LossReceive::Invalid => self.add(LossRefusal::Invalid, 1),
+        }
+        self.add(LossRefusal::Evicted, evicted);
+    }
+
+    pub(crate) fn get(&self, reason: LossRefusal) -> u64 {
+        self.0[reason.index()]
+    }
+}
+
 /// Fold what is parked for the document into `state` and delete it all: each record that is still in the window
 /// at `now_ms` goes through [`MergeState::receive_loss`] (the horizon, the floor, the known key). Returns the
 /// records that entered the state, with their values. The caller writes the state, in this same transaction.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_into(
     txn: &redb::WriteTransaction,
     collection: u64,
@@ -85,6 +165,7 @@ pub(crate) fn fold_into(
     options: &JoinOptions,
     floor: Option<Hlc>,
     now_ms: u64,
+    refused: &mut Refusals,
 ) -> Result<Vec<(LossKey, LossValue)>> {
     let mut table = txn.open_table(tables::LOSS_PENDING)?;
     let mut rows: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
@@ -102,9 +183,12 @@ pub(crate) fn fold_into(
         let (record, value) = MergeState::decode_loss_record(&body)
             .map_err(|e| StorageError::Corrupt(format!("a parked loss record: {e:?}")))?;
         if floor.is_some_and(|floor| record.stamp.hlc <= floor) {
+            refused.add(LossRefusal::Floor, 1);
             continue;
         }
-        if state.receive_loss(record.clone(), value.clone(), options) {
+        let (outcome, evicted) = state.receive_loss_counted(record.clone(), value.clone(), options);
+        refused.note_receive(outcome, evicted);
+        if outcome == LossReceive::Added {
             entered.push((record, value));
         }
     }

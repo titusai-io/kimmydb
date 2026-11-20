@@ -248,6 +248,7 @@ pub use hold_meter::{
 pub use index::{
     CandidateOrder, Dropped, IndexScan, IndexScanOutcome, KeyHold, ScanExtras, UnkeyedPage,
 };
+pub use loss_pending::LossRefusal;
 pub use merge::{SinkCounts, SinkMode, SinkOutcome, WhenMatched};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{
@@ -282,5 +283,7 @@ mod loss_entry_tests;
 mod loss_free_digest_tests;
 #[cfg(test)]
 mod loss_lifecycle_tests;
+#[cfg(test)]
+mod loss_limits_tests;
 #[cfg(test)]
 mod tombstone_id_tests;

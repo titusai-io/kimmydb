@@ -569,6 +569,14 @@ pub struct StorageConfig {
     /// setting, not replicated. It also bounds the clock skew the tombstone retention is
     /// expected to absorb. Collections with merge policy `document` are not affected.
     pub max_clock_skew_secs: u64,
+    /// How many loss records (the conflicts the merge settled, for a `field` collection) a document keeps: the newest
+    /// ones, by the stamp of the write that lost. At least 4 and at most 64. **Per collection and fixed at its
+    /// creation**: a collection created here takes this value, carries it in its creation entry, and every member uses
+    /// the creator's; changing it changes only the collections created afterwards.
+    pub loss_records_per_document: u32,
+    /// How many bytes of its compact encoding a loss record keeps of a lost value; a longer value is kept cut, and
+    /// flagged. At least 64 and at most 4096. Per collection, fixed at its creation, like `loss_records_per_document`.
+    pub loss_value_cut_bytes: u32,
     /// Bound on the storage engine's page cache, in bytes.
     ///
     /// This is most of a node's resident memory. redb keeps up to this many
@@ -1376,6 +1384,8 @@ impl Default for StorageConfig {
             tombstone_retention_secs: DEFAULT_TOMBSTONE_RETENTION_SECS,
             oplog_retention_secs: DEFAULT_OPLOG_RETENTION_SECS,
             max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
+            loss_records_per_document: u32::from(kimmy_core::LossLimits::DEFAULT.cap),
+            loss_value_cut_bytes: kimmy_core::LossLimits::DEFAULT.cut_bytes,
             cache_bytes: 256 * 1024 * 1024,
             // Frequent enough that disk use tracks retention rather than
             // sawtoothing, rare enough that the scan is not a background load.
@@ -1721,6 +1731,30 @@ impl Config {
             anyhow::bail!(
                 "storage.max_clock_skew_secs must be greater than zero; a bound of nothing \
                  would refuse every entry from a member whose clock is a tick ahead of this one"
+            );
+        }
+
+        // The limits of the loss records a new collection takes (Step 4): inside the bounds the codecs refuse past.
+        if !(kimmy_core::merge_state::MIN_LOSS_CAP..=kimmy_core::merge_state::MAX_LOSS_CAP)
+            .contains(&(self.storage.loss_records_per_document as usize))
+        {
+            anyhow::bail!(
+                "storage.loss_records_per_document ({}) must be between {} and {}: fewer would keep less than the \
+                 contract promises, and more than {} is what a state is allowed to carry",
+                self.storage.loss_records_per_document,
+                kimmy_core::merge_state::MIN_LOSS_CAP,
+                kimmy_core::merge_state::MAX_LOSS_CAP,
+                kimmy_core::merge_state::MAX_LOSS_CAP,
+            );
+        }
+        if !(kimmy_core::merge_state::MIN_LOSS_CUT..=kimmy_core::merge_state::MAX_LOSS_CUT)
+            .contains(&(self.storage.loss_value_cut_bytes as usize))
+        {
+            anyhow::bail!(
+                "storage.loss_value_cut_bytes ({}) must be between {} and {}",
+                self.storage.loss_value_cut_bytes,
+                kimmy_core::merge_state::MIN_LOSS_CUT,
+                kimmy_core::merge_state::MAX_LOSS_CUT,
             );
         }
 
@@ -2442,6 +2476,37 @@ mod tests {
         assert!(err.contains("max_clock_skew_secs"), "zero is refused by name: {err}");
         cfg.storage.max_clock_skew_secs = 1;
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The loss limits a new `field` collection takes (Step 4): defaults the minima, raisable to the maxima, refused by
+    /// name outside them, and a config that names a key it does not know (a typo) is still refused.
+    #[test]
+    fn the_loss_limits_default_to_the_minima_and_are_refused_outside_their_bounds() {
+        let ok = valid();
+        assert_eq!(
+            (ok.storage.loss_records_per_document, ok.storage.loss_value_cut_bytes),
+            (4, 64)
+        );
+        for (records, cut, bad) in [
+            (4, 64, None),
+            (64, 4096, None),
+            (10, 1000, None),
+            (3, 64, Some("loss_records_per_document")),
+            (65, 64, Some("loss_records_per_document")),
+            (4, 63, Some("loss_value_cut_bytes")),
+            (4, 4097, Some("loss_value_cut_bytes")),
+        ] {
+            let mut cfg = valid();
+            cfg.storage.loss_records_per_document = records;
+            cfg.storage.loss_value_cut_bytes = cut;
+            match (cfg.validate(), bad) {
+                (Ok(()), None) => {}
+                (Err(e), Some(name)) => {
+                    assert!(e.to_string().contains(name), "{records}/{cut} is refused by name: {e}")
+                }
+                (other, want) => panic!("{records}/{cut}: {other:?}, wanted {want:?}"),
+            }
+        }
     }
 
     #[test]

@@ -170,6 +170,9 @@ pub struct StorageReadings {
     /// What U1 has refused since start, by the origin's node id in hex: at most 64 named and the
     /// rest summed under `other` (`Engine::clock_refusals`). Not a level: a monotonic count.
     pub clock_refusals: Vec<(String, u64)>,
+    /// Loss records not kept since start, by reason (`Engine::loss_records_refused`): refused on arrival (`cap`, `floor`,
+    /// `horizon`, `oversize`, `invalid`) and `evicted` (held ones a newer record displaced). A monotonic count.
+    pub loss_records_refused: Vec<(&'static str, u64)>,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -373,6 +376,9 @@ pub struct MetricsSnapshot {
     pub databases: u64,
     pub collections: u64,
     pub unique_violations: u64,
+    /// Loss records not kept, in the order of `kimmy_storage::LossRefusal::ALL` (cap, evicted, floor, horizon, oversize,
+    /// invalid): the series `kimmy_loss_records_refused_total{reason}`.
+    pub loss_records_refused: [u64; 6],
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1463,6 +1469,17 @@ impl Metrics {
             databases: readings.databases,
             collections: readings.collections,
             unique_violations: readings.unique_violations,
+            loss_records_refused: {
+                let mut refused = [0u64; 6];
+                for (label, n) in &readings.loss_records_refused {
+                    if let Some(i) =
+                        kimmy_storage::LossRefusal::ALL.iter().position(|r| r.label() == *label)
+                    {
+                        refused[i] = *n;
+                    }
+                }
+                refused
+            },
             commits: readings.commits,
             fsyncs: readings.fsyncs,
             commits_grouped: readings.commits_grouped,
@@ -1781,6 +1798,9 @@ impl Metrics {
              # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
              # TYPE kimmy_unique_violations counter\n\
              kimmy_unique_violations {violations}\n\
+             # HELP kimmy_loss_records_refused_total Loss records this member did not keep, by reason: `cap` (refused on arrival: the document already held K greater ones), `evicted` (a record it held that a newer one displaced), `floor` and `horizon` (a single record older than the collection's floor or the state's horizon), `oversize` (a value over the collection's cut) and `invalid`. Each count is an event on this member, not a count of distinct records: a record refused again by another route counts again. Records that age out of a state with the retention window are not refusals. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_loss_records_refused_total counter\n\
+             {loss_refused_lines}\
              # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
              # TYPE kimmy_commits counter\n\
              kimmy_commits {commits}\n\
@@ -2268,6 +2288,18 @@ impl Metrics {
                     })
                     .collect::<String>()
             },
+            // Every reason always has its sample, at zero before anything was dropped, so a rate over it is defined.
+            loss_refused_lines = kimmy_storage::LossRefusal::ALL
+                .iter()
+                .map(|reason| {
+                    let n = readings
+                        .loss_records_refused
+                        .iter()
+                        .find(|(label, _)| *label == reason.label())
+                        .map_or(0, |(_, n)| *n);
+                    format!("kimmy_loss_records_refused_total{{reason=\"{}\"}} {n}\n", reason.label())
+                })
+                .collect::<String>(),
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
@@ -3274,6 +3306,14 @@ mod tests {
                 ("01010101010101010101010101010101".to_string(), 94),
                 ("other".to_string(), 95),
             ],
+            loss_records_refused: vec![
+                ("cap", 7_201),
+                ("evicted", 7_202),
+                ("floor", 7_203),
+                ("horizon", 7_204),
+                ("oversize", 7_205),
+                ("invalid", 7_206),
+            ],
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3361,6 +3401,14 @@ kimmy_collections 42
 # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.
 # TYPE kimmy_unique_violations counter
 kimmy_unique_violations 43
+# HELP kimmy_loss_records_refused_total Loss records this member did not keep, by reason: `cap` (refused on arrival: the document already held K greater ones), `evicted` (a record it held that a newer one displaced), `floor` and `horizon` (a single record older than the collection's floor or the state's horizon), `oversize` (a value over the collection's cut) and `invalid`. Each count is an event on this member, not a count of distinct records: a record refused again by another route counts again. Records that age out of a state with the retention window are not refusals. Not part of any state, and not replicated.
+# TYPE kimmy_loss_records_refused_total counter
+kimmy_loss_records_refused_total{reason=\"cap\"} 7201
+kimmy_loss_records_refused_total{reason=\"evicted\"} 7202
+kimmy_loss_records_refused_total{reason=\"floor\"} 7203
+kimmy_loss_records_refused_total{reason=\"horizon\"} 7204
+kimmy_loss_records_refused_total{reason=\"oversize\"} 7205
+kimmy_loss_records_refused_total{reason=\"invalid\"} 7206
 # HELP kimmy_commits Durable write transactions committed by the storage engine.
 # TYPE kimmy_commits counter
 kimmy_commits 44
@@ -5053,6 +5101,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // Since U1, the skipped-entries series for `clock_refused` and the one `origin="other"`
             // sample of `kimmy_sync_clock_refused_total` that exists before any origin is named.
             2
+            // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
+            + 6
             // Since Q7 Step 1, `kimmy_epoch_origins`.
             + 1 + 108 + 6 + 17
                 + 3 * 19

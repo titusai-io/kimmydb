@@ -169,12 +169,12 @@ fn a_restored_store_parks_again_what_its_backup_carries_as_entries() {
     crate::backup::restore(&path, &mut backup.as_slice()).unwrap();
     let restored = Engine::open(&path).unwrap();
 
-    assert!(marker(&restored), "the first open built the table and marked it");
     assert_eq!(
         parked_rows(&restored),
         2,
-        "from the entries the backup carried, though the marker it carried said built, and not for the document that has a row"
+        "the first open built the table from the entries the backup carried, though the marker it carried said built, and not for the document that has a row"
     );
+    assert!(marker(&restored), "the first open marked the table built");
 
     // `restore --until`: the rewind then discards the entries above the target and what was parked from them.
     restored.rewind_to(early.stamp.hlc).unwrap();

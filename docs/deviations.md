@@ -450,6 +450,19 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 
 ---
 
+## 🟡 A document keeps at most K loss records, each value cut, and a loss beyond them may go unreported
+
+**Raised 2026-11-20, with the cap and the cut of the loss records of the field-level merge (Q7 Step 4).**
+
+- **A `field` collection keeps, for each document, the `K` loss records whose loser's stamp is newest.** `K` is `storage.loss_records_per_document` (`4` to `64`, default `4`) when the collection is created, fixed for its life and replicated with its definition, so every member keeps the same `K` greatest. A document that lost more than `K` writes reports at most `K` of them: a record refused because `K` greater ones are held, or displaced by a newer one, is not in the state and is never reported, which is what "every losing head is reported, up to `K`" means. `kimmy_loss_records_refused_total{reason}` counts them, as events on a member and not as distinct records.
+- **A lost value is cut at `storage.loss_value_cut_bytes`** (`64` to `4096`, default `64`, fixed at creation like `K`): a string at a character boundary, binary data and an array at a whole element, a list of paths to its leading paths; a number, a date, an id and a marker are never cut. A cut value is flagged as cut, so a client can tell it from a whole one. A record that arrives with a value over the collection's cut is refused (`oversize`), never cut again, so two members never hold one key with two values.
+- **The settings apply to collections created afterwards.** A collection keeps the `K` and the cut it was created with; changing the setting changes no collection that exists.
+- **Records that age out of a state with the retention window are not refusals** and are not counted.
+
+**To close:** none planned. The bound is what keeps a document's state and a replicated entry small; raise `K` for the collections that need more.
+
+---
+
 ## 🟡 A map marker is not reported beside its own children, and an implicit map is never reported as a loser
 
 **Raised 2026-11-19, with the loss records of the field-level merge (Q7 Step 4).** The merge state keeps a marker for every map (an explicit `a: {…}`, or the implicit one a write to `a.y` makes where `a` is absent).

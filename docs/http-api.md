@@ -573,6 +573,8 @@ curl "localhost:7878/v1/db/shop/coll/orders/describe?sample=200&examples=true" -
 The answer also carries the collection's `validator` (`null` when it has none) and,
 with one, its `validationAction` and `validationLevel`.
 
+A `field` collection's answer carries `conflicts`: `{"retentionMs": R, "recordsPerDocument": K, "valueCutBytes": cut}`, what it keeps of the conflicts its merge settled. `retentionMs` is how long after the losing write a loss is still reported (`R`, the join retention), `recordsPerDocument` how many loss records one document keeps (the `K` newest by the loser's stamp), and `valueCutBytes` how many bytes of a lost value a record keeps. All three are fixed when the collection is created and are the same on every member. A `document` collection has no `conflicts`.
+
 Array elements are reported under `path[]`, matching how a query on the field
 matches an *element*. `presence` is a fraction of the **sample**, counting
 documents — it is inference, not a schema, and a field missing from the sample
