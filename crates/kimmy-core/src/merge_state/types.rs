@@ -447,7 +447,25 @@ pub struct LossKey {
     pub stamp: MStamp,
 }
 
+/// The fewest records a document keeps, the most (also the bound a decode refuses past), and the same for the cut of a
+/// record's value in bytes of its compact encoding (Step 4, design 3.1 and 3.3). `K` and the cut are per collection,
+/// fixed at its creation; the defaults of a new collection are the minima, raisable to the maxima.
+pub const MIN_LOSS_CAP: usize = 4;
+pub const MAX_LOSS_CAP: usize = 64;
+pub const MIN_LOSS_CUT: usize = 64;
+pub const MAX_LOSS_CUT: usize = 4096;
+
 impl LossKey {
+    /// The order the cap keeps the greatest of: the loser's stamp first (all members share it, detection time they
+    /// do not), then what the record is about and its kind, so that records of one losing write are cut
+    /// deterministically. A different total order from the derived one, which is the map's.
+    pub fn rank_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.stamp
+            .cmp(&other.stamp)
+            .then_with(|| self.at.cmp(&other.at))
+            .then_with(|| self.kind.cmp(&other.kind))
+    }
+
     /// A record about the field `path`.
     pub fn field(kind: LossKind, path: Path, stamp: MStamp) -> Self {
         Self { kind, at: LossAt::Field(path), stamp }
@@ -468,4 +486,10 @@ pub enum LossValue {
     Total(super::Num),
     /// The field order of a lost whole document (`insertLost` on `"_"`).
     Fields(Vec<Path>),
+    /// A lost register value cut to the collection's cut: what is kept is the part of the value that fit
+    /// (a prefix of a string, of binary data, or the leading whole elements of an array). The flag is part of the
+    /// value, so two members that cut one value to equal bytes hold one value for one key.
+    CutValue(Value),
+    /// The leading paths of a lost document's field order that fit the cut.
+    CutFields(Vec<Path>),
 }

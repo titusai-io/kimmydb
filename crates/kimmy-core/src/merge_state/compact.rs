@@ -175,7 +175,9 @@ use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
 use super::counter::Num;
 use super::ord::{Cand, FieldOrd, Floor, OrdAt};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{
+    Epoch, LossAt, LossKey, LossKind, LossValue, MAX_LOSS_CAP, MStamp, Path, Value, WriterId,
+};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -485,8 +487,26 @@ impl W {
                     self.path(p);
                 }
             }
+            LossValue::CutValue(v) => {
+                self.u8(3);
+                self.value(v);
+            }
+            LossValue::CutFields(f) => {
+                self.u8(4);
+                self.len(f.len());
+                for p in f {
+                    self.path(p);
+                }
+            }
         }
     }
+}
+
+/// The length of the compact encoding of a loss value (its tag byte included): what the cut of a record counts.
+pub(super) fn loss_value_len(v: &LossValue) -> usize {
+    let mut w = W::scanning();
+    w.loss_value(v);
+    w.out.len()
 }
 
 /// The flags byte of a register: see the module documentation.
@@ -845,7 +865,11 @@ impl MergeState {
             put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed, wide_at, decimal_at })?;
         }
         s.vv = r.vv()?;
-        for _ in 0..r.len()? {
+        let losses = r.len()?;
+        if losses > MAX_LOSS_CAP {
+            return Err(DecodeError::TooManyLossRecords);
+        }
+        for _ in 0..losses {
             let k = r.loss_key()?;
             let v = r.loss_value()?;
             put(&mut s.losses, k, v)?;
@@ -1198,6 +1222,14 @@ impl R<'_> {
                     f.push(self.path()?);
                 }
                 Ok(LossValue::Fields(f))
+            }
+            3 => Ok(LossValue::CutValue(self.value()?)),
+            4 => {
+                let mut f = Vec::new();
+                for _ in 0..self.len()? {
+                    f.push(self.path()?);
+                }
+                Ok(LossValue::CutFields(f))
             }
             t => Err(DecodeError::BadTag(t)),
         }

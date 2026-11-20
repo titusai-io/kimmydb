@@ -745,3 +745,57 @@ history_seed!(a_field_created_again_keeps_its_place_nested_seed_1815, true, 1815
 history_seed!(a_field_created_again_keeps_its_place_nested_seed_1840, true, 1840);
 history_seed!(a_field_created_again_keeps_its_place_nested_seed_2663, true, 2663);
 history_seed!(a_field_created_again_keeps_its_place_nested_seed_2979, true, 2979);
+
+/// Step 4, the cap (claims 1 to 3 of the design note, section 4): runs capped at `K` = 2, 3 and 4, each judged by itself.
+/// `U` is every record any member's join produced or any state received in THIS run, before any cap (the test-only sink of
+/// `loss_cut`); the horizon is out of reach, so `F_H` is the identity here. (1) Every member ends with the same records;
+/// (2) they are `cap_K(U)`: the `K` greatest by rank. A run whose capped states carried a record away that another member
+/// still needed would fail (2), and is reported, never left out. Not judged here: claim 4 (every member holds an entry of
+/// its own for each record of the set): the sim has no loss entries and no emission, those are the storage's (C5a's tests).
+/// Restores are left out (a restore is exempt from the record guarantee). `Q7_K_SEEDS` (default 200) seeds per `K`.
+#[test]
+fn a_run_capped_at_k_ends_with_the_k_greatest_records_of_everything_the_run_produced() {
+    use kimmy_core::merge_state::loss_cut::{sink_begin, sink_take};
+    use kimmy_core::merge_state::{LossKey, LossValue};
+    use std::collections::BTreeMap;
+
+    let n = env_u64("Q7_K_SEEDS", 200);
+    let rc = sim::RunConfig { restore: false, ..sim::RunConfig::default() };
+    let (mut judged, mut cap_bit, mut failures) = (0usize, 0usize, Vec::new());
+    for k in [2usize, 3, 4] {
+        let mut cfg = Cfg::default_ret();
+        cfg.opts = cfg.opts.clone().with_loss_limits_unchecked(k, 4096);
+        for seed in 0..n {
+            sink_begin();
+            let out = run(seed, &rc, &cfg);
+            let produced = sink_take();
+            if !out.settled {
+                failures.push(format!("K={k} seed {seed}: not settled"));
+                continue;
+            }
+            let mut ranked: Vec<(&LossKey, &LossValue)> = produced.iter().collect();
+            ranked.sort_by(|x, y| x.0.rank_cmp(y.0));
+            let expected: BTreeMap<LossKey, LossValue> =
+                ranked.into_iter().rev().take(k).map(|(key, v)| (key.clone(), v.clone())).collect();
+            let first = &out.nodes[0].state().losses;
+            if out.nodes.iter().any(|m| &m.state().losses != first) {
+                failures.push(format!("K={k} seed {seed}: members hold different records"));
+            } else if *first != expected {
+                failures.push(format!(
+                    "K={k} seed {seed}: the members' records are not cap_K(U) (U has {}, they hold {}, cap_K(U) has {})",
+                    produced.len(),
+                    first.len(),
+                    expected.len()
+                ));
+            }
+            judged += 1;
+            cap_bit += usize::from(produced.len() > k);
+        }
+    }
+    println!(
+        "capped runs: {judged} judged, {cap_bit} where U held more than K records, {} failing",
+        failures.len()
+    );
+    assert!(cap_bit > 30, "the cap bit in {cap_bit} of {judged} runs: not enough to mean anything");
+    assert!(failures.is_empty(), "{failures:#?}");
+}

@@ -266,6 +266,14 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
                 v.sort();
                 format!("f[{}]", v.join(","))
             }
+            // The model has no cut: a cut value must never compare equal to a whole one (the default options cut
+            // nothing the generators write, so this arm is a guard and not a spelling the model has).
+            LossValue::CutValue(v) => format!("cut:{}", fv(v)),
+            LossValue::CutFields(ps) => {
+                let mut v: Vec<String> = ps.iter().map(|p| p.to_string()).collect();
+                v.sort();
+                format!("cutf[{}]", v.join(","))
+            }
         };
         out.push(format!("loss {} {} {} {vs}", kind_s(k.kind), k.at, fs(&k.stamp)));
     }

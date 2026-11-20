@@ -92,7 +92,9 @@ fn the_clash_search_of_a_join_is_linear_in_the_cells() {
             a.write_set(&p(&format!("f{k:03}")), s("from a"), 0).unwrap();
             b.write_set(&p(&format!("f{k:03}")), s("from b"), 0).unwrap();
         }
-        let ((j, fresh), c) = count(|| a.state.join(&b.state, &opts()));
+        // a cap above the hundreds of clashes this makes: the test counts the search, not the cap
+        let o = opts().with_loss_limits_unchecked(1_000, 4_096);
+        let ((j, fresh), c) = count(|| a.state.join(&b.state, &o));
         assert_eq!(fresh.len(), n, "a clash for every field");
         assert_eq!(j.regs.len(), regs);
         c.visits
