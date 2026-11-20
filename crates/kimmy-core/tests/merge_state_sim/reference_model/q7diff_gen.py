@@ -101,7 +101,8 @@ class D(M.Member):
         if key[2][0] < self.state.horizon() or key in self.state.losses:
             return False
         self.state.losses[key] = val
-        return True
+        self.state.losses = M.cap_losses(self.state.losses)
+        return key in self.state.losses      # a record the cap refuses is not added
 
 
 # ---------------------------------------------------------------------------------------------
@@ -670,6 +671,15 @@ def pools(bound):
     return ints, incs, vals
 
 
+def draw_k(seed):
+    """The cap of loss records per document for this script, drawn from a stream of its own so that the scripts
+    of a seed are what they were before K: mostly the default 64, and in a share of the scripts a small K, so
+    that the cap is exercised far more often than the 64 records a script rarely reaches."""
+    if os.environ.get("Q7DIFF_FORCE_K"):
+        return int(os.environ["Q7DIFF_FORCE_K"])
+    return random.Random(seed * 7919 + 64).choice([64, 64, 64, 64, 64, 8, 5, 4])
+
+
 def gen_script(seed):
     rnd = random.Random(seed)
     ret = rnd.choice([10 ** 9, 10 ** 9, 10 ** 9, 3, 5, 8, 12])
@@ -737,7 +747,7 @@ def gen_script(seed):
             ops.append(["unset", m, p, sk])
         else:
             ops.append(["delete", m, sk])
-    return {"seed": seed, "ret": ret, "bound": bound, "members": nm, "ops": ops}
+    return {"seed": seed, "ret": ret, "bound": bound, "k": draw_k(seed), "members": nm, "ops": ops}
 
 
 def unjv(v):
@@ -771,6 +781,7 @@ def snap(ms, log):
 def run_script(sc, dump_canon=False):
     M.RET = sc["ret"]
     M.BOUND = sc["bound"]
+    M.K = sc.get("k", 64)
     ms = [D(NAMES[i]) for i in range(sc["members"])]
     saved = [None] * len(ms)
     log = {}

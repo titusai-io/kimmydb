@@ -392,6 +392,9 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
     let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
+    opts = opts
+        .clone()
+        .with_loss_limits_unchecked(sc["k"].as_u64().map_or(64, |k| k as usize), opts.loss_cut());
     tweak(&mut opts);
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
@@ -767,7 +770,13 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// agrees with the model (0 scripts disagree); the Rust-side oracle takes the same changes as the model's `loss_oracle` (the
 /// marker head as a cover, an implicit marker never a head of its own).
 /// 0xe9b9_25e7_5146_822c to 0xf7e0_c678_fd6b_24f7.
-const PINNED_300: u64 = 0xf7e0_c678_fd6b_24f7;
+/// RE-PINNED for the cap of the loss records in the model (the model keeps the `K` greatest records by the loser's stamp, then the path and the kind, as the
+/// Rust join does) and the generator drawing `K` per script (from a stream of its own, so the scripts of a seed did not change: mostly 64, else 8, 5 or 4). A
+/// small `K` caps the records of the states of the scripts that draw one, so their states differ. The replay still agrees with the model (0 scripts disagree).
+/// With `Q7DIFF_FORCE_K=64` the fingerprint of the 300 scripts is the one before this change, 0xf7e0_c678_fd6b_24f7, exactly: only the scripts of a small `K`
+/// changed (the seed-378 pin test below is the script whose records pass 64).
+/// 0xf7e0_c678_fd6b_24f7 to 0x219a_e1c8_86cc_57a7.
+const PINNED_300: u64 = 0x219a_e1c8_86cc_57a7;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -921,8 +930,8 @@ fn rust_mutants_are_caught_by_the_replay() {
     }
 }
 
-/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3 plus the Step 4 deltas: (a), the marker head as a cover check at a non-marker path below the marker: `covered`, and an implicit marker that is never a head of its own; and (c), the suppressed creation cells) and of
-/// `pullmodel6.py` (its missing check takes `covered`), as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
+/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3 plus the Step 4 deltas: (a), the marker head as a cover check at a non-marker path below the marker: `covered`, and an implicit marker that is never a head of its own; (c), the suppressed creation cells; and the cap of the loss records, `K` and `loss_rank`) and of
+/// `pullmodel6.py` (its missing check takes `covered`, and its loss receive the cap), as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
 /// differential's fixture are made from these files; a changed byte fails here before it fails anywhere else.
 #[test]
 fn the_vendored_model_is_the_reviewed_one() {
@@ -930,14 +939,69 @@ fn the_vendored_model_is_the_reviewed_one() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
-        ("model6.py", "12a7ddc05845c63429066bd644df1050a5a20b827659fdc37100ed99bffb8bb3"),
-        ("pullmodel6.py", "7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"),
+        ("model6.py", "76dedeaaab9fd6b8534739c852fc7be2b426215b7eb923ae8c3406b69797da4f"),
+        ("pullmodel6.py", "6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"),
     ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "{file}");
     }
     let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-    assert!(recorded.contains("12a7ddc05845c63429066bd644df1050a5a20b827659fdc37100ed99bffb8bb3"));
-    assert!(recorded.contains("7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"));
+    assert!(recorded.contains("76dedeaaab9fd6b8534739c852fc7be2b426215b7eb923ae8c3406b69797da4f"));
+    assert!(recorded.contains("6eaadc74705feb3176fb242951ee0e6c2507aad03d344263ff22276a0c8a357d"));
+}
+
+/// The generator for one seed with `K` forced (`Q7DIFF_FORCE_K`), its script read back.
+fn script_with_k(seed: u64, k: u64) -> J {
+    let scratch = Scratch::new(&format!("seed{seed}k{k}"));
+    let args = vec![scratch.0.display().to_string(), "1".to_string(), seed.to_string()];
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(generator())
+        .args(&args)
+        .env("Q7DIFF_FORCE_K", k.to_string())
+        .output()
+        .expect("python3 ran");
+    assert!(
+        out.status.success(),
+        "q7diff_gen6.py {args:?} (K {k}) failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = scratch.0.join(format!("s{seed:06}.json"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// SEED 378, pinned, at the default `K` = 64. Its four members hold 20, 44, 44 and 0 loss records before the final sync, and the model holds 73 once they
+/// have met: more than the cap keeps. With the cap, every member keeps the 64 greatest records by the loser's stamp and the 9 lowest are gone: the Rust
+/// replay agrees with the model on every step and on the final sync, and the records the cap dropped are all at or below the stamp of every record it kept.
+/// Without the cap (`K` forced past the count) the same script keeps all 73 and agrees as well. This is the script the cap was found by: the first of the
+/// 2000 nested seeds whose records pass 64.
+#[test]
+fn seed_378_at_k_64_keeps_the_64_greatest_loss_records() {
+    let capped = script_with_k(378, 64);
+    let open = script_with_k(378, 1_000_000_000);
+    for (name, sc) in [("K 64", &capped), ("uncapped", &open)] {
+        let rep = run_script(sc, &|_| {});
+        assert!(rep.bad.is_empty(), "{name}: the replay disagrees with the model: {:?}", rep.bad);
+    }
+    let have =
+        |sc: &J| -> Vec<J> { sc["expect"]["final"]["oracle"]["have"].as_array().unwrap().clone() };
+    let (kept, all) = (have(&capped), have(&open));
+    assert_eq!(all.len(), 73, "the uncapped union of the four members");
+    assert_eq!(kept.len(), 64, "the cap keeps K records");
+    assert!(kept.iter().all(|k| all.contains(k)), "the cap keeps a subset of what the union holds");
+    let dropped: Vec<&J> = all.iter().filter(|k| !kept.contains(k)).collect();
+    assert_eq!(dropped.len(), 9, "the 9 lowest are gone");
+    // a record's stamp is its third element `[hlc, node, epoch]`; the order of a stamp is its tuple's
+    let stamp = |r: &J| -> (u64, String, u64) {
+        let s = &r[2];
+        (s[0].as_u64().unwrap(), s[1].as_str().unwrap().to_string(), s[2].as_u64().unwrap())
+    };
+    let highest_dropped = dropped.iter().map(|r| stamp(r)).max().unwrap();
+    let lowest_kept = kept.iter().map(stamp).min().unwrap();
+    assert!(
+        highest_dropped <= lowest_kept,
+        "every dropped record is at or below every kept one: {highest_dropped:?} against {lowest_kept:?}"
+    );
 }

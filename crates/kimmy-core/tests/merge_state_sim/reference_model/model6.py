@@ -19,7 +19,7 @@ State (v3 rules):
   slots[(L,p,w,gen)] = (stamp, total)                              higher stamp wins; w = (node, epoch)
   gens[(L,p)] = (stamp of the newest non-numeric base, vv of its writer)   higher stamp wins
   vv[w] = hlc                                                      max
-  losses[(kind, path, loser_stamp)] = loser value                  grow-only, filtered by the horizon
+  losses[(kind, path, loser_stamp)] = loser value                  grow-only, filtered by the horizon, and capped: the K greatest by rank stay
 A life is alive iff every delete in the state is in its `seen`. Cells are keyed by (life, path); cells of
 dead lives are dropped. Visible value of p = newest base among alive lives + sum over counted slots
 (gen == newest gen over alive lives) of (total - observed by that base).
@@ -34,6 +34,7 @@ CELLS_REPORTED = True     # V6M1: writes into a superseded first insert are repo
 SUPERSEDE = True          # Q2: concurrent first inserts, newest whole document wins
 BOUND = 2 ** 63 - 1       # Q11: Int64 bound (tests lower it); the lower bound is -BOUND - 1
 RET = 10 ** 9
+K = 64                    # the loss records one document keeps: the K greatest by `loss_rank` (Rust: MAX_LOSS_CAP is the default)
 SNAPS = [0]
 # --- Step 0 (Q7 v6): nested paths of any depth, the map marker, typeClash, arrayClash, field order (option A) -----
 # Paths are dotted strings ("a.b.c"); field names never contain "." or start with "$". The Rust port uses segment
@@ -589,6 +590,25 @@ def _prefilter(st, H):
     return st
 
 
+_LOSS_KIND_ORDER = {"clash": 0, "deleteWon": 1, "insertLost": 2, "retiredWriter": 3, "typeClash": 4, "arrayClash": 5}
+
+
+def loss_rank(key):
+    """The order the cap keeps the greatest of (Rust `LossKey::rank_cmp`): the loser's stamp, then what the record is
+    about (a path compared segment by segment, the whole document `_` first among equals), then the kind in the
+    order of the Rust enum (clash, deleteWon, insertLost, retiredWriter, typeClash, arrayClash)."""
+    kind, path, stamp = key
+    return (stamp, (tuple(path.split(".")), 0 if path == "_" else 1), _LOSS_KIND_ORDER[kind])
+
+
+def cap_losses(losses):
+    """The K greatest records by rank stay (`cap(F_h(S u T))`); the others are dropped, whichever side held them."""
+    if len(losses) <= K:
+        return losses
+    keep = sorted(losses, key=loss_rank)[len(losses) - K:]
+    return {k: losses[k] for k in keep}
+
+
 def join(s, t, tag=None):
     """Join t into s. Returns (new_state, set of new loss keys).
     V3M1: the horizon of the JOINED vv is applied to both sides BEFORE the union and before aliveness."""
@@ -728,6 +748,7 @@ def join(s, t, tag=None):
     for key, val in list(s.losses.items()) + list(t.losses.items()) + list(new.items()):
         if key[2][0] >= H:
             out.losses.setdefault(key, val)
+    out.losses = cap_losses(out.losses)
     fresh = {k for k in out.losses if k not in s.losses}
     return out, fresh
 
@@ -1120,6 +1141,9 @@ class Member:
             if key[2][0] < self.state.horizon() or key in self.state.losses:
                 return
             self.state.losses[key] = val
+            self.state.losses = cap_losses(self.state.losses)
+            if key not in self.state.losses:      # refused by the cap: the K greater records stay
+                return
             self.events.append(key)
             self.oplog.setdefault(("l", key), ent)
 

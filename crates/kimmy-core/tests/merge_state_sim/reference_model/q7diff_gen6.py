@@ -112,7 +112,8 @@ class D(PM.Node):
         if key[2][0] < self.state.horizon() or key in self.state.losses:
             return False
         self.state.losses[key] = val
-        return True
+        self.state.losses = M.cap_losses(self.state.losses)
+        return key in self.state.losses      # a record the cap refuses is not added
 
 
 def light_copy(m):
@@ -482,6 +483,15 @@ def sort_losses(keys):
     return sorted(keys, key=kkey)
 
 
+def draw_k(seed):
+    """The cap of loss records per document for this script, drawn from a stream of its own so that the scripts
+    of a seed are what they were before K: mostly the default 64, and in a share of the scripts a small K, so
+    that the cap is exercised far more often than the 64 records a script rarely reaches."""
+    if os.environ.get("Q7DIFF_FORCE_K"):
+        return int(os.environ["Q7DIFF_FORCE_K"])
+    return random.Random(seed * 7919 + 64).choice([64, 64, 64, 64, 64, 8, 5, 4])
+
+
 def build(seed, plants=(), explain_step=None, explained=None):
     for k in DANGLING:
         DANGLING[k] = 0
@@ -491,7 +501,8 @@ def build(seed, plants=(), explain_step=None, explained=None):
     nm = rnd.choice([2, 3, 3, 4])
     steps = rnd.choice([20, 40, 60])
     ints, incs = pools(bound)
-    M.RET, M.BOUND = ret, bound
+    k = draw_k(seed)
+    M.RET, M.BOUND, M.K = ret, bound, k
     for pl in plants:
         setattr(M, PLANTS[pl][0], PLANTS[pl][1])
     ms = [D(NAMES[i]) for i in range(nm)]
@@ -558,7 +569,7 @@ def build(seed, plants=(), explain_step=None, explained=None):
         "converged": len({repr(exact(mm.state)) for mm in ms}) == 1,
         "log": len(log),
     }
-    return {"seed": seed, "ret": ret, "bound": bound, "members": nm, "ops": ops,
+    return {"seed": seed, "ret": ret, "bound": bound, "k": k, "members": nm, "ops": ops,
             "expect": {"steps": stepsout, "final": fin}}, ms
 
 
