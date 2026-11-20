@@ -45,6 +45,12 @@ pub struct CollectionMeta {
     /// field state is written or joined: 0.61.0 is a wipe release, nothing migrates it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_retention_ms: Option<u64>,
+    /// `K` and the cut of the loss records of a `field` collection's documents (Step 4): per collection, chosen by the
+    /// creating member, fixed at creation, replicated with it and immutable, and it follows the creation whose policy
+    /// this collection holds, as `R` does. `None` for a `document` collection (and on a `field` collection written before
+    /// it was kept: refused as corrupt when a field state is written or joined, a wipe release).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_limits: Option<kimmy_core::LossLimits>,
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///
@@ -168,6 +174,7 @@ impl CollectionMeta {
             merge_policy: MergePolicy::Document,
             merge_policy_at: None,
             join_retention_ms: None,
+            loss_limits: None,
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,

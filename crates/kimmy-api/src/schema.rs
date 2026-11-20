@@ -145,6 +145,16 @@ pub fn describe_collection(
         "mergePolicy": meta.merge_policy.as_str(),
         "mergePolicyGuidance": kimmy_core::merge_policy_steering(),
     });
+    // What a `field` collection keeps of the conflicts its merge settled (Step 4), all fixed at its creation and the same
+    // on every member: how long a loss is reported after the losing write (`R`), how many records a document keeps (the
+    // newest by the loser's stamp), and how many bytes of a lost value a record keeps. A `document` collection has none.
+    if let (Some(retention), Some(limits)) = (meta.join_retention_ms, meta.loss_limits) {
+        body["conflicts"] = json!({
+            "retentionMs": retention,
+            "recordsPerDocument": limits.cap,
+            "valueCutBytes": limits.cut_bytes,
+        });
+    }
     // The validator, and its two policies when there is one (ADR-257).
     if let Value::Object(validator) = crate::validator::describe_json(&meta) {
         body.as_object_mut().expect("an object").extend(validator);

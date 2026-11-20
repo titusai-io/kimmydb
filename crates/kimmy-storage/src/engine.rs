@@ -161,6 +161,10 @@ pub struct Engine {
     /// member's tombstone retention. Local configuration, read at creation only; the collection carries its
     /// own value from then on, which is what every member uses.
     default_join_retention_ms: std::sync::atomic::AtomicU64,
+    /// `K` and the cut a `field` collection created HERE takes at creation (`storage.loss_records_per_document`,
+    /// `storage.loss_value_cut_bytes`): local configuration, read at creation only, like `R`.
+    default_loss_cap: std::sync::atomic::AtomicU32,
+    default_loss_cut: std::sync::atomic::AtomicU32,
     /// What U1 has refused since start, by the origin that sent it (capped, the rest under
     /// `other`).
     clock_refusals: Mutex<crate::clock_bound::RefusalCounts>,
@@ -213,6 +217,9 @@ pub struct Engine {
     /// Commits that skipped their own fsync and were made durable by a
     /// barrier flush shared with others (ADR-088).
     grouped_commits: std::sync::atomic::AtomicU64,
+    /// Loss records not kept, by reason (`kimmy_loss_records_refused_total{reason}`, `LossRefusal`): per member, since
+    /// start, in no state and no digest.
+    loss_refused: [std::sync::atomic::AtomicU64; 6],
     /// The queue for the single writer (ADR-151). Taken before redb's own
     /// writer lock, held for the life of the [`WriteTxn`], and released when
     /// the transaction commits, aborts or is dropped. Two things redb's lock
@@ -1626,6 +1633,12 @@ impl Engine {
             default_join_retention_ms: std::sync::atomic::AtomicU64::new(
                 crate::field_write::DEFAULT_JOIN_RETENTION_MS,
             ),
+            default_loss_cap: std::sync::atomic::AtomicU32::new(
+                kimmy_core::LossLimits::DEFAULT.cap.into(),
+            ),
+            default_loss_cut: std::sync::atomic::AtomicU32::new(
+                kimmy_core::LossLimits::DEFAULT.cut_bytes,
+            ),
             clock_refusals: Mutex::new(Default::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
@@ -1649,6 +1662,7 @@ impl Engine {
             durability_violations: Default::default(),
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
+            loss_refused: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_gate: WriterGate::new(),
             writer_hold: Arc::new(crate::writer_hold::WriterHoldWord::new()),
             writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
@@ -2239,6 +2253,51 @@ impl Engine {
     pub fn set_default_join_retention(&self, retention: std::time::Duration) {
         let ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX).max(1);
         self.default_join_retention_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Loss records not kept since start, by reason, in the order of [`crate::LossRefusal::ALL`]: refused on arrival (`cap`,
+    /// `floor`, `horizon`, `oversize`, `invalid`) and `evicted`, held ones a newer record displaced.
+    pub fn loss_records_refused(&self) -> Vec<(&'static str, u64)> {
+        crate::LossRefusal::ALL
+            .iter()
+            .map(|r| {
+                (r.label(), self.loss_refused[r.index()].load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .collect()
+    }
+
+    pub(crate) fn count_loss_refusals(&self, refused: &crate::loss_pending::Refusals) {
+        for r in crate::LossRefusal::ALL {
+            let n = refused.get(r);
+            if n > 0 {
+                self.loss_refused[r.index()].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The loss limits a `field` collection created on this member takes.
+    pub fn default_loss_limits(&self) -> kimmy_core::LossLimits {
+        use std::sync::atomic::Ordering::Relaxed;
+        kimmy_core::LossLimits {
+            cap: self.default_loss_cap.load(Relaxed) as u16,
+            cut_bytes: self.default_loss_cut.load(Relaxed),
+        }
+    }
+
+    /// Set the loss limits a `field` collection created on this member takes (`4..=64` records, `64..=4096` bytes).
+    /// Read at creation only: a collection carries its own from then on. A value outside the bounds is refused and
+    /// nothing changes.
+    pub fn set_default_loss_limits(&self, limits: kimmy_core::LossLimits) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !limits.is_valid() {
+            return Err(StorageError::Core(CoreError::Unsupported(format!(
+                "loss limits outside their bounds: {} records (4..=64) and a cut of {} bytes (64..=4096)",
+                limits.cap, limits.cut_bytes
+            ))));
+        }
+        self.default_loss_cap.store(limits.cap.into(), Relaxed);
+        self.default_loss_cut.store(limits.cut_bytes, Relaxed);
+        Ok(())
     }
 
     /// The bound U1 holds a replicated `field` entry or state to (`storage.max_clock_skew_secs`).
@@ -4720,6 +4779,8 @@ impl Engine {
                 policy,
                 (policy.fixed_for(name) == kimmy_core::MergePolicy::Field)
                     .then(|| self.default_join_retention_ms()),
+                (policy.fixed_for(name) == kimmy_core::MergePolicy::Field)
+                    .then(|| self.default_loss_limits()),
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -4733,11 +4794,30 @@ impl Engine {
         name: &str,
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
     ) -> Result<()> {
         if policy == kimmy_core::MergePolicy::Field && join_retention_ms.is_none() {
             return Err(StorageError::Corrupt(format!(
                 "the field collection {db}.{name} holds no join retention"
             )));
+        }
+        // The same for the loss limits (Step 4): every creation of a field collection carries them, inside the
+        // bounds, so no collection is held without them and no member caps or cuts differently.
+        if policy == kimmy_core::MergePolicy::Field {
+            match loss_limits {
+                None => {
+                    return Err(StorageError::Corrupt(format!(
+                        "the field collection {db}.{name} holds no loss limits"
+                    )));
+                }
+                Some(limits) if !limits.is_valid() => {
+                    return Err(StorageError::Corrupt(format!(
+                        "the field collection {db}.{name} carries loss limits outside their bounds: {} records, a cut of {} bytes",
+                        limits.cap, limits.cut_bytes
+                    )));
+                }
+                Some(_) => {}
+            }
         }
         Ok(())
     }
@@ -4754,6 +4834,7 @@ impl Engine {
         name: &str,
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
         at: Hlc,
     ) -> Result<CollectionMeta> {
         let policy = policy.fixed_for(name);
@@ -4762,13 +4843,14 @@ impl Engine {
             if !meta.policy_yields_to(at, policy) {
                 return Ok(meta);
             }
-            Self::require_join_retention(db, name, policy, join_retention_ms)?;
+            Self::require_join_retention(db, name, policy, join_retention_ms, loss_limits)?;
             let read = meta.clone();
             meta.merge_policy = policy;
             meta.merge_policy_at = Some(at);
             // R follows the creation that wins, as the policy does: both belong to it.
             meta.join_retention_ms =
                 join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
+            meta.loss_limits = loss_limits.filter(|_| policy == kimmy_core::MergePolicy::Field);
             let txn = self.begin_write(WriterHolder::Ddl)?;
             if !Self::definition_is(&txn, &read)? {
                 txn.abort()?;
@@ -4811,6 +4893,7 @@ impl Engine {
             None,
             kimmy_core::MergePolicy::Document,
             None,
+            None,
         )
     }
 
@@ -4843,6 +4926,7 @@ impl Engine {
                 Some((&validator, None)),
                 kimmy_core::MergePolicy::Document,
                 None,
+                None,
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -4865,6 +4949,7 @@ impl Engine {
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -4896,6 +4981,7 @@ impl Engine {
             validator,
             policy,
             join_retention_ms,
+            loss_limits,
         ) {
             Ok(InTxn::Created(mut meta, logged)) => {
                 let mut changed = false;
@@ -4970,10 +5056,11 @@ impl Engine {
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
     ) -> Result<InTxn> {
         // System collections and vector shadows are `document`, whatever was asked.
         let policy = policy.fixed_for(name);
-        Self::require_join_retention(db, name, policy, join_retention_ms)?;
+        Self::require_join_retention(db, name, policy, join_retention_ms, loss_limits)?;
         let id = CollectionId::derive(db, name);
         let (meta, stamp) = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -5108,6 +5195,7 @@ impl Engine {
             // that came with it, and never this member's own.
             meta.join_retention_ms =
                 join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
+            meta.loss_limits = loss_limits.filter(|_| policy == kimmy_core::MergePolicy::Field);
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.
@@ -5165,6 +5253,7 @@ impl Engine {
                     merge_policy: policy,
                     validator: validator.map(|(spec, _)| spec.clone()),
                     join_retention_ms: meta.join_retention_ms,
+                    loss_limits: meta.loss_limits,
                 },
             )?;
             append_oplog(txn, &entry)?;

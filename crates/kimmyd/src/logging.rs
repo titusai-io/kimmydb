@@ -203,6 +203,49 @@ impl TelemetryGuard {
             "Unique constraints broken by merging replicated writes.",
             unique_violations
         );
+        // `kimmy_loss_records_refused_total{reason}`: one instrument per reason, as the other labelled series are carried.
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.cap",
+            "{record}",
+            "Loss records this member did not keep: refused on arrival because the document already held K greater records. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.evicted",
+            "{record}",
+            "Loss records this member did not keep: held by the member and displaced by a newer record. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.floor",
+            "{record}",
+            "Loss records this member did not keep: at or below the collection's floor. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.horizon",
+            "{record}",
+            "Loss records this member did not keep: older than the state's horizon when they arrived singly. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.oversize",
+            "{record}",
+            "Loss records this member did not keep: over the collection's cut. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[4]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.loss_records_refused.invalid",
+            "{record}",
+            "Loss records this member did not keep: with a total past the bound or a decimal no writer produces. An event on this member, not a count of distinct records.",
+            |s| s.loss_records_refused[5]
+        );
         observe!(
             u64_observable_counter,
             "kimmy.commits",

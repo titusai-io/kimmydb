@@ -111,6 +111,32 @@ impl std::fmt::Display for MergePolicy {
     }
 }
 
+/// The loss-record limits of a `field` collection (Step 4): `K` records kept per document and the cut of a record's value
+/// in bytes of its compact encoding. Chosen by the creating member, fixed at creation, replicated with it and immutable,
+/// exactly as the join retention `R` is, so every member caps and cuts alike; bounds as
+/// [`crate::merge_state::JoinOptions::with_loss_limits`] (`4..=64` records, `64..=4096` bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossLimits {
+    pub cap: u16,
+    pub cut_bytes: u32,
+}
+
+impl LossLimits {
+    /// The defaults of a new collection: the smallest `K` and cut (raisable by configuration, never below).
+    pub const DEFAULT: LossLimits = LossLimits {
+        cap: crate::merge_state::MIN_LOSS_CAP as u16,
+        cut_bytes: crate::merge_state::MIN_LOSS_CUT as u32,
+    };
+
+    /// Whether the limits are inside the bounds a collection may be created with.
+    pub fn is_valid(&self) -> bool {
+        (crate::merge_state::MIN_LOSS_CAP..=crate::merge_state::MAX_LOSS_CAP)
+            .contains(&usize::from(self.cap))
+            && (crate::merge_state::MIN_LOSS_CUT..=crate::merge_state::MAX_LOSS_CUT)
+                .contains(&(self.cut_bytes as usize))
+    }
+}
+
 /// A collection being created: the body of a `CreateCollection` entry.
 ///
 /// It is a [`CollectionRef`] and, when the collection is created with a validator,
@@ -132,6 +158,11 @@ pub struct CollectionCreate {
     /// computes the same horizon. `None` for a `document` collection, which has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_retention_ms: Option<u64>,
+    /// `K` and the cut of the loss records of a `field` collection's documents, with the same rules as `R`: chosen by the
+    /// creating member, fixed for the life of the creation, replicated with it, `None` for a `document` collection, and
+    /// absent from a received `field` creation is a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_limits: Option<LossLimits>,
 }
 
 /// The reserved collection name a database's drop is filed under (ADR-229).
@@ -210,6 +241,7 @@ mod tests {
             merge_policy: MergePolicy::Field,
             validator: None,
             join_retention_ms: Some(86_400_000),
+            loss_limits: Some(LossLimits::DEFAULT),
         };
         let bytes = bson::serialize_to_vec(&with).unwrap();
         assert_eq!(bson::deserialize_from_slice::<CollectionCreate>(&bytes).unwrap(), with);

@@ -281,6 +281,14 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
 /// the creator's.
 fn apply_join_retention(engine: &Engine, storage: &crate::config::StorageConfig) {
     engine.set_default_join_retention(Duration::from_secs(storage.tombstone_retention_secs));
+    // And the loss limits a `field` collection created here takes, from the same place and for the same reason: read
+    // at creation only, then the creator's. Validation already refused any value outside the bounds.
+    engine
+        .set_default_loss_limits(kimmy_core::LossLimits {
+            cap: u16::try_from(storage.loss_records_per_document).unwrap_or(u16::MAX),
+            cut_bytes: storage.loss_value_cut_bytes,
+        })
+        .expect("the loss limits were validated when the configuration was loaded");
 }
 
 /// Hand the engine the clock skew bound (U1) from the configuration. Called once, right after the
@@ -3486,6 +3494,42 @@ mod tests {
             7_200_000,
             "the configured tombstone retention reached the engine's default join retention"
         );
+    }
+
+    /// The loss limits a `field` collection created here takes come from the configuration, and a collection carries them
+    /// from then on: a collection created before the setting changes keeps what it was created with.
+    #[test]
+    fn the_configured_loss_limits_reach_the_engine_and_a_collection_keeps_the_ones_it_was_created_with()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join(DATABASE_FILE)).unwrap();
+        let first = engine
+            .create_collection_with_policy("shop", "before", kimmy_core::MergePolicy::Field, None)
+            .unwrap();
+        assert_eq!(
+            first.loss_limits,
+            Some(kimmy_core::LossLimits { cap: 4, cut_bytes: 64 }),
+            "the default"
+        );
+        let storage = crate::config::StorageConfig {
+            loss_records_per_document: 12,
+            loss_value_cut_bytes: 500,
+            ..Default::default()
+        };
+        super::apply_join_retention(&engine, &storage);
+        let second = engine
+            .create_collection_with_policy("shop", "after", kimmy_core::MergePolicy::Field, None)
+            .unwrap();
+        assert_eq!(second.loss_limits, Some(kimmy_core::LossLimits { cap: 12, cut_bytes: 500 }));
+        assert_eq!(
+            engine.get_collection("shop", "before").unwrap().loss_limits,
+            Some(kimmy_core::LossLimits { cap: 4, cut_bytes: 64 }),
+            "the one created before keeps its own"
+        );
+        let document = engine
+            .create_collection_with_policy("shop", "plain", kimmy_core::MergePolicy::Document, None)
+            .unwrap();
+        assert_eq!(document.loss_limits, None, "a document collection has none");
     }
 
     /// The open that returns says the rebuild completed, so an exit of this

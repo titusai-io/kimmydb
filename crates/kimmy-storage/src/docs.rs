@@ -335,7 +335,13 @@ impl Engine {
                 coll.db, coll.name
             ))
         })?;
-        Ok(crate::field_write::FieldWriter { writer: self.field_writer_id(), retention_ms })
+        let loss = coll.loss_limits.ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "the field collection {}.{} holds no loss limits",
+                coll.db, coll.name
+            ))
+        })?;
+        Ok(crate::field_write::FieldWriter { writer: self.field_writer_id(), retention_ms, loss })
     }
 
     // -----------------------------------------------------------------------
@@ -1838,6 +1844,7 @@ impl Engine {
         let mut state = field_write::load(Some(&meta))?;
         let options = self.field_writer(coll)?.options();
         let floor = Self::floor_of(txn, coll)?;
+        let mut refused = crate::loss_pending::Refusals::default();
         let entered = crate::loss_pending::fold_into(
             txn,
             coll.id.0,
@@ -1846,7 +1853,9 @@ impl Engine {
             &options,
             floor,
             self.clock_bound_now_ms(),
+            &mut refused,
         )?;
+        self.count_loss_refusals(&refused);
         if let Some(id) = emit {
             self.append_own_loss_entries(txn, coll, id, entered)?;
         }
@@ -1964,9 +1973,17 @@ impl Engine {
             return Ok(kept);
         };
         let floor = Self::floor_of(txn, coll)?;
-        if floor.is_some_and(|floor| record.stamp.hlc <= floor)
-            || !state.receive_loss(record.clone(), value.clone(), &options)
-        {
+        let mut refused = crate::loss_pending::Refusals::default();
+        if floor.is_some_and(|floor| record.stamp.hlc <= floor) {
+            refused.add(crate::LossRefusal::Floor, 1);
+            self.count_loss_refusals(&refused);
+            return Ok(kept);
+        }
+        let (outcome, evicted) =
+            state.receive_loss_counted(record.clone(), value.clone(), &options);
+        refused.note_receive(outcome, evicted);
+        self.count_loss_refusals(&refused);
+        if outcome != kimmy_core::merge_state::LossReceive::Added {
             return Ok(kept);
         }
         self.append_own_loss_entries(txn, coll, id, vec![(record, value)])?;
@@ -2094,6 +2111,7 @@ impl Engine {
         // carries it and the row is written when it moves the state.
         if !other.is_bare() && crate::loss_pending::any(txn, coll.id.0, &key)? {
             let options = self.field_writer(coll)?.options();
+            let mut refused = crate::loss_pending::Refusals::default();
             crate::loss_pending::fold_into(
                 txn,
                 coll.id.0,
@@ -2102,7 +2120,9 @@ impl Engine {
                 &options,
                 floor,
                 self.clock_bound_now_ms(),
+                &mut refused,
             )?;
+            self.count_loss_refusals(&refused);
         }
         // A state applied as state has no entry behind it: what it holds of every writer is a hole in
         // what this member can serve, recorded in the transaction that applies it (a page that is rolled
@@ -2140,6 +2160,7 @@ impl Engine {
                 _ => false,
             };
             let joined = field_write::join(self.field_writer(coll)?, prior, &other)?;
+            self.count_loss_refusals(&crate::loss_pending::Refusals::of_join(&joined.loss_counts));
             if !joined.changed && !prior_thinned && existing.is_some() {
                 drop(docs);
                 return self.field_entry_kept(txn, entry, position, false);

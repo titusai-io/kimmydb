@@ -399,7 +399,7 @@ impl Node {
         self.w.clock = merged.vv.values().copied().chain([self.w.clock]).max().unwrap_or(Hlc::ZERO);
         let changed = merged.compact_bytes() != self.w.state.compact_bytes();
         self.w.state = merged;
-        Received { changed, fresh: fresh.into_iter().collect() }
+        Received { changed, fresh: fresh.into_iter().collect(), counts: Default::default() }
     }
 
     fn absorb(

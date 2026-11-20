@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::{self, Inc, Kind, Num};
-use super::join::{JoinOptions, join, join_into};
+#[cfg(test)]
+use super::join::join;
+use super::join::{JoinOptions, LossCounts, join_counted, join_into};
 use super::ord::{OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
@@ -279,6 +281,9 @@ pub struct Received {
     pub changed: bool,
     /// Loss records that are new to this writer, in key order.
     pub fresh: Vec<LossKey>,
+    /// What the cap and the cut did to the records of this join (records refused on arrival, held ones displaced,
+    /// values over the cut).
+    pub counts: LossCounts,
 }
 
 /// One writer incarnation. Restoring a node is modelled by building a new
@@ -1674,11 +1679,11 @@ impl Writer {
     /// Absorb another state (the model's `_absorb`): join, move the clock to the
     /// max of the joined version vector, report the new loss records.
     pub fn receive_report(&mut self, other: &MergeState) -> Received {
-        let (merged, fresh) = join(&self.state, other, &self.opts);
+        let (merged, fresh, counts) = join_counted(&self.state, other, &self.opts);
         self.clock = merged.vv.values().copied().chain([self.clock]).max().unwrap_or(Hlc::ZERO);
         let changed = merged != self.state;
         self.state = merged;
-        Received { changed, fresh: fresh.into_iter().collect() }
+        Received { changed, fresh: fresh.into_iter().collect(), counts }
     }
 
     /// [`Writer::receive_report`] returning only the fresh loss keys.

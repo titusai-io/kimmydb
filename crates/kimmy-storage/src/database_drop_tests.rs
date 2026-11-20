@@ -562,6 +562,7 @@ fn create_entry(db: &str, name: &str, at: Stamp) -> kimmy_core::OplogEntry {
             merge_policy: kimmy_core::MergePolicy::Document,
             validator: None,
             join_retention_ms: None,
+            loss_limits: None,
         },
     )
     .unwrap()

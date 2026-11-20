@@ -2517,15 +2517,18 @@ impl Engine {
                         // creation and immutable, so every member computes the same horizon.
                         if held.merge_policy_at == Some(entry.stamp.hlc)
                             && held.merge_policy == target.merge_policy.fixed_for(&target.name)
-                            && held.join_retention_ms != target.join_retention_ms
+                            && (held.join_retention_ms != target.join_retention_ms
+                                || held.loss_limits != target.loss_limits)
                         {
                             warn!(
                                 db = %target.db,
                                 collection = %target.name,
                                 held = ?held.join_retention_ms,
                                 entry = ?target.join_retention_ms,
-                                "a creation carries another join retention than the one held for the same \
-                                 creation; refused: a creation cannot have two Rs"
+                                held_loss_limits = ?held.loss_limits,
+                                entry_loss_limits = ?target.loss_limits,
+                                "a creation carries another join retention or other loss limits than the ones held for the same \
+                                 creation; refused: a creation cannot have two Rs or two sets of limits"
                             );
                             return Ok(DdlOutcome::Refused);
                         }
@@ -2536,12 +2539,14 @@ impl Engine {
                         // under the same policy and different `R` settle on the later one too.
                         if held.merge_policy != target.merge_policy.fixed_for(&target.name)
                             || held.join_retention_ms != target.join_retention_ms
+                            || held.loss_limits != target.loss_limits
                         {
                             let kept = self.adopt_creation_policy(
                                 &target.db,
                                 &target.name,
                                 target.merge_policy,
                                 target.join_retention_ms,
+                                target.loss_limits,
                                 entry.stamp.hlc,
                             )?;
                             warn!(
@@ -2576,6 +2581,7 @@ impl Engine {
                             target.validator.as_ref().map(|spec| (spec, Some(entry.stamp))),
                             target.merge_policy,
                             target.join_retention_ms,
+                            target.loss_limits,
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");

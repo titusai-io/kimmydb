@@ -337,6 +337,8 @@ snapshot page, and holds it for its whole life (it does not change, as the merge
 meets the collection holds the creator's value and never its own setting. A creation of a `field` collection that
 carries none, whether an entry or a snapshot page, is not a valid creation and is refused as corrupt.
 
+**Loss limits (`K` and the cut).** A `field` collection also fixes, at creation, how many loss records one document keeps (`K`, `storage.loss_records_per_document`, 4 to 64) and how many bytes of a lost value a record keeps (the cut, `storage.loss_value_cut_bytes`, 64 to 4096). They are carried exactly as `R` is: in the creation entry and in a snapshot page, held for the collection's whole life, the creator's values and never the meeting member's setting; a creation that carries none, or any outside the bounds, is refused as corrupt, and a page whose collection holds other limits is refused as a mismatch. Every route that joins a state or receives a record (a write, a replicated entry, a snapshot page, a loss entry, the parked records, the update pipeline, the rewind and the late drop) builds its options from them, so every member keeps the `K` greatest records by the loser's stamp and cuts a value at the same byte. The cap and the cut never change what a document reads as; a loss beyond `K` may go unreported, and `kimmy_loss_records_refused_total` counts what was not kept.
+
 **Deletes in a snapshot.** A document of a `field` collection that was deleted keeps its merged state in its
 tombstone (the delete and its context), and a snapshot page carries that state with the delete. The receiver
 joins it into what it holds under the key, so the delete kills the life it killed on the sender whatever the

@@ -379,6 +379,9 @@ pub struct CollectionState {
     /// value and never its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_retention_ms: Option<u64>,
+    /// The collection's loss limits (`CollectionMeta::loss_limits`), carried with the creation as `R` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_limits: Option<kimmy_core::LossLimits>,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -398,6 +401,7 @@ impl From<CollectionMeta> for CollectionState {
             merge_policy: meta.merge_policy,
             merge_policy_at: meta.merge_policy_at,
             join_retention_ms: meta.join_retention_ms,
+            loss_limits: meta.loss_limits,
         }
     }
 }
@@ -3009,6 +3013,7 @@ impl Engine {
                 None,
                 state.merge_policy,
                 state.join_retention_ms,
+                state.loss_limits,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -3041,12 +3046,18 @@ impl Engine {
             let held = self.get_collection(&state.db, &state.name)?;
             if held.merge_policy_at.unwrap_or(held.created) == policy_at
                 && held.merge_policy == state.merge_policy.fixed_for(&state.name)
-                && held.join_retention_ms != state.join_retention_ms
+                && (held.join_retention_ms != state.join_retention_ms
+                    || held.loss_limits != state.loss_limits)
             {
                 return Err(crate::StorageError::Core(kimmy_core::Error::Unsupported(format!(
-                    "a creation cannot have two join retentions: {}.{} holds {:?} for the creation at \
-                     {policy_at:?} and the page carries {:?}",
-                    state.db, state.name, held.join_retention_ms, state.join_retention_ms
+                    "a creation cannot have two join retentions or two sets of loss limits: {}.{} holds {:?} and {:?} \
+                     for the creation at {policy_at:?} and the page carries {:?} and {:?}",
+                    state.db,
+                    state.name,
+                    held.join_retention_ms,
+                    held.loss_limits,
+                    state.join_retention_ms,
+                    state.loss_limits
                 ))));
             }
         }
@@ -3056,6 +3067,7 @@ impl Engine {
                 &state.name,
                 state.merge_policy,
                 state.join_retention_ms,
+                state.loss_limits,
                 policy_at,
             )?;
         }

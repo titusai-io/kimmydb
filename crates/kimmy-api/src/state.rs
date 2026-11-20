@@ -284,6 +284,8 @@ impl AppState {
             held_marks: self.engine.held_marks()?,
             // What U1 refused, by origin (a monotonic count the engine keeps, capped at 64 labels).
             clock_refusals: self.engine.clock_refusals(),
+            // What the cap and the limits of the loss records dropped, by reason (a counter the engine keeps).
+            loss_records_refused: self.engine.loss_records_refused(),
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.

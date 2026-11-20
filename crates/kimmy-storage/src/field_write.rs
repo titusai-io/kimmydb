@@ -55,12 +55,19 @@ pub(crate) const DEFAULT_JOIN_RETENTION_MS: u64 =
 pub(crate) struct FieldWriter {
     pub writer: WriterId,
     pub retention_ms: u64,
+    /// `K` and the cut of the collection's loss records, carried from its creation like `R`.
+    pub loss: kimmy_core::LossLimits,
 }
 
 impl FieldWriter {
-    /// The join options of the collection's documents: the library's, with the collection's `R`.
+    /// The join options of the collection's documents: the library's, with the collection's `R` and its loss limits.
+    /// The one place the storage builds them, so every route (an apply, a relayed loss entry, the fold of what was
+    /// parked, the rewind, a snapshot page) caps and cuts alike.
     pub(crate) fn options(&self) -> JoinOptions {
-        JoinOptions::default().with_retention(self.retention_ms)
+        JoinOptions::default()
+            .with_retention(self.retention_ms)
+            .with_loss_limits(usize::from(self.loss.cap), self.loss.cut_bytes as usize)
+            .expect("the limits of a collection are validated where it is created or taken")
     }
 }
 
@@ -69,7 +76,11 @@ impl FieldWriter {
 #[cfg(test)]
 impl From<WriterId> for FieldWriter {
     fn from(writer: WriterId) -> Self {
-        Self { writer, retention_ms: JoinOptions::default().retention }
+        Self {
+            writer,
+            retention_ms: JoinOptions::default().retention,
+            loss: kimmy_core::LossLimits::DEFAULT,
+        }
     }
 }
 
@@ -177,6 +188,8 @@ pub(crate) struct Joined {
     /// The loss records the join put into the state that it did not hold: each enters the state here, so the member
     /// appends an entry of its own for it (V6M2).
     pub fresh: Vec<(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)>,
+    /// What the cap and the cut did to the records of the join, for the refused-records metric.
+    pub loss_counts: kimmy_core::merge_state::LossCounts,
 }
 
 /// The apply of one replicated entry of a `field` collection: the join of the state it carries
@@ -205,7 +218,14 @@ pub(crate) fn join(
         .into_iter()
         .filter_map(|key| w.state.losses.get(&key).cloned().map(|value| (key, value)))
         .collect();
-    Ok(Joined { meta: w.state.encode_compact(), body, alive, changed: received.changed, fresh })
+    Ok(Joined {
+        meta: w.state.encode_compact(),
+        body,
+        alive,
+        changed: received.changed,
+        fresh,
+        loss_counts: received.counts,
+    })
 }
 
 /// A stamp for a dry run: strictly above everything `prior` has seen, so the writer accepts it,
