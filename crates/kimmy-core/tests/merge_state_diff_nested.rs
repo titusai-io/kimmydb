@@ -415,6 +415,19 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
 
 /// [`run_script`] with a plant in the pre-sync law check (`common/loss_law.rs`): the test of the test.
 fn run_script_planted(sc: &J, tweak: &dyn Fn(&mut JoinOptions), plant: loss_law::Plant) -> Replay {
+    run_script_hooked(sc, tweak, plant, None)
+}
+
+/// What a test may do with a script's members as they stand before the final sync.
+type PreSync<'a> = &'a mut dyn FnMut(&[loss_law::Member], &oracle::Log, &JoinOptions);
+
+/// [`run_script_planted`], handing the members, the log and the options to `hook` before the final sync.
+fn run_script_hooked(
+    sc: &J,
+    tweak: &dyn Fn(&mut JoinOptions),
+    plant: loss_law::Plant,
+    hook: Option<PreSync>,
+) -> Replay {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
@@ -543,6 +556,9 @@ fn run_script_planted(sc: &J, tweak: &dyn Fn(&mut JoinOptions), plant: loss_law:
         .iter()
         .map(|m| loss_law::Member { state: &m.w.state, contained: &m.contained })
         .collect();
+    if let Some(hook) = hook {
+        hook(&members, &log, &opts);
+    }
     let (bad, counts) = loss_law::check(
         &members,
         &log,
@@ -1131,5 +1147,145 @@ fn seed_378_at_k_64_keeps_the_64_greatest_loss_records() {
     assert!(
         highest_dropped <= lowest_kept,
         "every dropped record is at or below every kept one: {highest_dropped:?} against {lowest_kept:?}"
+    );
+}
+
+/// An ordered triple of members, the records only `(a + b) + c` holds and the records only `a + (b + c)` holds (`kind path stamp`).
+type RouteDiff = ((usize, usize, usize), Vec<String>, Vec<String>);
+/// [`RouteDiff`] as a test spells it.
+type PinnedDiff<'a> = ((usize, usize, usize), &'a [&'a str], &'a [&'a str]);
+
+/// The ordered triples of a script's pre-sync members whose two routes hold different records, as
+/// `(triple, left only, right only)` (`kind path stamp`), with the state without records equal and both routes within
+/// `must <= have <= allowed` asserted for every triple of the script; and the script's records after the final sync.
+fn route_dependent_records(seed: u64) -> (Vec<RouteDiff>, Vec<String>) {
+    let sc = script_with_k(seed, 1_000_000_000);
+    let (ret, bound) = (sc["ret"].as_u64().unwrap(), sc["bound"].as_i64().unwrap());
+    let mut found = Vec::new();
+    let mut hook = |ms: &[loss_law::Member], log: &oracle::Log, o: &JoinOptions| {
+        let name =
+            |k: &LossKey| format!("{} {} {}", kind_s(k.kind), oracle::at_path(&k.at), fs(&k.stamp));
+        for i in 0..ms.len() {
+            for j in 0..ms.len() {
+                for k in 0..ms.len() {
+                    let r = loss_law::routes(ms, log, o, ret, bound, (i, j, k));
+                    assert!(
+                        r.bare_equal,
+                        "seed {seed} triple {i}{j}{k}: the state without records differs"
+                    );
+                    assert!(
+                        r.left_fails.is_empty() && r.right_fails.is_empty(),
+                        "seed {seed} triple {i}{j}{k}: a route breaks must <= have <= allowed: {:?} {:?}",
+                        r.left_fails,
+                        r.right_fails
+                    );
+                    if !r.only_left.is_empty() || !r.only_right.is_empty() {
+                        found.push((
+                            (i, j, k),
+                            r.only_left.iter().map(name).collect(),
+                            r.only_right.iter().map(name).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    let rep = run_script_hooked(&sc, &|_| {}, loss_law::Plant::None, Some(&mut hook));
+    assert!(rep.bad.is_empty(), "seed {seed}: the replay disagrees: {:?}", rep.bad);
+    let have = sc["expect"]["final"]["oracle"]["have"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}:{}:{}",
+                r[0].as_str().unwrap(),
+                r[1].as_str().unwrap(),
+                r[2][0],
+                r[2][1].as_str().unwrap(),
+                r[2][2]
+            )
+        })
+        .collect();
+    (found, have)
+}
+
+fn pinned(triples: &[PinnedDiff]) -> Vec<RouteDiff> {
+    let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    triples.iter().map(|(t, l, r)| (*t, own(l), own(r))).collect()
+}
+
+/// SEED 378, pinned: the at-least-once outcome (`K` forced past the count). A (member 0) overwrote its own write `acct 13:A:0` with 26 after
+/// seeing it, and D's delete had not seen the life. In 8 of the 64 ordered triples of the four pre-sync members the two routes hold different
+/// records and the same state without records: the route that joins B and D before A reports `deleteWon acct 13:A:0` (the dominated cell meets the
+/// death), the route that joins A first does not, for the join of A and B replaces the cell 13 by 26 first. Every route is within
+/// `must <= have <= allowed` (the oracle asks for the head 26 only, and 13 is allowed), and the members that have exchanged everything hold the record:
+/// a record of a dominated write is not retracted.
+#[test]
+fn seed_378_a_dominated_cell_keeps_its_delete_won_in_one_route_and_the_converged_members_hold_it() {
+    let (found, have) = route_dependent_records(378);
+    let dw = "deleteWon acct 13:A:0";
+    assert_eq!(
+        found,
+        pinned(&[
+            ((0, 1, 3), &[], &[dw]),
+            ((0, 2, 3), &[], &[dw]),
+            ((1, 0, 3), &[], &[dw]),
+            ((2, 0, 3), &[], &[dw]),
+            ((3, 0, 1), &[dw], &[]),
+            ((3, 0, 2), &[dw], &[]),
+            ((3, 1, 0), &[dw], &[]),
+            ((3, 2, 0), &[dw], &[]),
+        ])
+    );
+    assert!(have.contains(&dw.to_string()), "after the exchange the record is held");
+}
+
+/// SEED 380, pinned: a `clash` is decided from the two operand states' version vectors, not from the two cells. 27:A and 27:B are
+/// concurrent writes of `y`, and 28:C saw 27:A; (a+b)+c holds `clash y 27:A`, a+(b+c) does not (it clashes 27:B with 28:C, and a then
+/// meets a state whose version vector covers 27:A). The same shape for `n`. 6 of 64 triples differ, the state without records never, every route
+/// is within `must <= have <= allowed`. The members that have exchanged everything hold `clash y 27:A:0` and not `clash n 27:A:0`: which of the
+/// two a converged member holds is the order of the exchange, and neither is required.
+#[test]
+fn seed_380_a_clash_is_held_by_one_route_only_and_the_converged_members_hold_y_and_not_n() {
+    let (found, have) = route_dependent_records(380);
+    let (cy, cn) = ("clash y 27:A:0", "clash n 27:A:0");
+    assert_eq!(
+        found,
+        pinned(&[
+            ((0, 1, 2), &[cy], &[cn]),
+            ((0, 2, 1), &[], &[cn]),
+            ((1, 0, 2), &[cy], &[]),
+            ((1, 2, 0), &[cn], &[]),
+            ((2, 0, 1), &[], &[cy]),
+            ((2, 1, 0), &[cn], &[cy]),
+        ])
+    );
+    assert!(
+        have.contains(&cy.to_string()) && !have.contains(&cn.to_string()),
+        "after the exchange: y held, n not"
+    );
+}
+
+/// SEED 232, pinned: one write, two kinds. `a.b 3:A:0` is a `clash` in the route that met its concurrent winner first and an
+/// `insertLost` in the route that met the news of the life's supersession first. 4 of 27 triples of the three pre-sync members differ,
+/// the state without records never, every route is within `must <= have <= allowed`. The members that have exchanged everything hold the
+/// `insertLost` and not the `clash`: a write holds one kind there, and which kind is the order of the exchange.
+#[test]
+fn seed_232_one_write_is_a_clash_in_one_route_and_an_insert_lost_in_the_other() {
+    let (found, have) = route_dependent_records(232);
+    let (c, il) = ("clash a.b 3:A:0", "insertLost a.b 3:A:0");
+    assert_eq!(
+        found,
+        pinned(&[
+            ((0, 2, 1), &[c], &[il]),
+            ((1, 0, 2), &[il], &[c]),
+            ((1, 2, 0), &[il], &[c]),
+            ((2, 0, 1), &[c], &[il]),
+        ])
+    );
+    assert!(
+        have.contains(&il.to_string()) && !have.contains(&c.to_string()),
+        "after the exchange: the insertLost held, the clash not"
     );
 }

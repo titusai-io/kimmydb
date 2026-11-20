@@ -608,3 +608,44 @@ pub fn check(
     counts.micros = started.elapsed().as_micros();
     (bad, counts)
 }
+
+/// The two routes of one ordered triple, for a test that pins what they hold.
+pub struct Routes {
+    /// The state without its records is the same in both routes.
+    pub bare_equal: bool,
+    /// The records only `(a + b) + c` holds, and only `a + (b + c)` holds.
+    pub only_left: Vec<LossKey>,
+    pub only_right: Vec<LossKey>,
+    /// The tags (`LAW-MUST`, `LAW-ALLOWED`) each route fails; empty when it holds `must <= have <= allowed`.
+    pub left_fails: Vec<&'static str>,
+    pub right_fails: Vec<&'static str>,
+}
+
+/// Join the triple `(i, j, k)` of `members` both ways and judge each result.
+pub fn routes(
+    members: &[Member],
+    log: &oracle::Log,
+    o: &JoinOptions,
+    ret: u64,
+    bound: i64,
+    (i, j, k): (usize, usize, usize),
+) -> Routes {
+    let jn = |a: &Res, b: &Res| Res {
+        state: a.state.join(&b.state, o).0,
+        contained: a.contained.union(&b.contained).copied().collect(),
+    };
+    let m =
+        |x: usize| Res { state: members[x].state.clone(), contained: members[x].contained.clone() };
+    let l = jn(&jn(&m(i), &m(j)), &m(k));
+    let r = jn(&m(i), &jn(&m(j), &m(k)));
+    let (hl, hr): (BTreeSet<&LossKey>, BTreeSet<&LossKey>) =
+        (l.state.losses.keys().collect(), r.state.losses.keys().collect());
+    let mut judge = Judge::new(log, ret, bound);
+    Routes {
+        bare_equal: bare(&l.state) == bare(&r.state),
+        only_left: hl.difference(&hr).map(|k| (*k).clone()).collect(),
+        only_right: hr.difference(&hl).map(|k| (*k).clone()).collect(),
+        left_fails: judge.judge(&l, o).tags,
+        right_fails: judge.judge(&r, o).tags,
+    }
+}
