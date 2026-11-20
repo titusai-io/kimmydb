@@ -481,6 +481,10 @@ pub fn loss_oracle(
             && Some(*st) != m.life
         {
             for p in touched(m) {
+                // an implicit marker is never a head of its own: its write's leaves are (model6.py, V6M1)
+                if m.vals.get(p) == Some(&Value::ImplicitMap) {
+                    continue;
+                }
                 let later = log.values().any(|(c2, m2)| {
                     c2.contains(st) && touched(m2).contains(p) && m2.life == m.life
                 });
@@ -519,7 +523,7 @@ pub fn loss_oracle(
             regs.iter().filter(|r| !regs.iter().any(|r2| r2.1.contains(&r.0))).collect();
         if let Some(top) = heads.iter().max_by_key(|r| r.0) {
             for h in &heads {
-                // an implicit marker carries no user value: never a reported loser (model6.py line 1472)
+                // an implicit marker carries no user value: never a reported loser (model6.py line 1489)
                 if h.0 != top.0 && h.2.vals[&p] != Value::ImplicitMap {
                     must.insert((p.clone(), h.0));
                 }
@@ -536,8 +540,10 @@ pub fn loss_oracle(
             .map(|(st, (ctx, m))| (*st, ctx, m))
             .collect();
         // a superseded life's own fields: order-dependent (excluded above)
-        for (st, _, _) in &dead_regs {
-            if !dels.iter().any(|d| log[d].0.contains(st))
+        for (st, _, m) in &dead_regs {
+            // an implicit marker is never a head of its own, as in the head loop above
+            if m.vals[&p] != Value::ImplicitMap
+                && !dels.iter().any(|d| log[d].0.contains(st))
                 && !dead_regs.iter().any(|(_, c2, _)| c2.contains(st))
             {
                 must.insert((p.clone(), *st));
@@ -565,7 +571,24 @@ pub fn loss_oracle(
             }
         }
     }
+    // DELTA (a), as a cover: a marker head stays required; `covered` accepts any record of the same write at or below it
     must
+}
+
+/// A required head that is a map marker of its write (explicit or implicit): model6.py's `marker_head`.
+fn marker_head(log: &Log, p: &Path, st: &MStamp) -> bool {
+    log.get(st).and_then(|(_, m)| m.vals.get(p)).is_some_and(Value::is_marker)
+}
+
+/// DELTA (a): a head is reported by its own record; a MARKER head also by a record of the same write at a NON-MARKER path
+/// strictly below it (the join reports a marker's lost write through the write's own child cells, wherever those survive; a
+/// child is a register with a value that is not a marker, or a counter slot: the join's `_marker_with_child`). A slot path is
+/// not in `vals`, so a slot counts as a child. model6.py's `covered`; `have` is the set of heads of the records a member holds.
+pub fn covered(head: &Head, have: &BTreeSet<Head>, log: &Log) -> bool {
+    let (p, st) = head;
+    have.contains(head)
+        || (marker_head(log, p, st)
+            && have.iter().any(|(q, s2)| s2 == st && q.is_below(p) && !marker_head(log, q, st)))
 }
 
 /// V4M1: from D5's words. For each path with a winning numeric or non-numeric

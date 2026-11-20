@@ -142,7 +142,7 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     if oracle::killed_superseded_any(log, ret).iter().any(|grp| grp.is_disjoint(&hv)) {
         errs.push("record-missing-killed-superseded".into());
     }
-    if !must.is_subset(&hv) {
+    if !must.iter().all(|h| oracle::covered(h, &hv, log)) {
         errs.push("record-missing".into());
     }
     if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels, ret)) {
@@ -182,7 +182,8 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
         .filter(|(_, st): &(Path, MStamp)| st.hlc >= h)
         .collect();
     let have: BTreeSet<LossKey> = ms[0].state().losses.keys().cloned().collect();
-    if !must.is_subset(&heads(&have)) {
+    let hv = heads(&have);
+    if !must.iter().all(|h| oracle::covered(h, &hv, log)) {
         bad.push("record-missing".into());
     }
     if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels, ret)) {

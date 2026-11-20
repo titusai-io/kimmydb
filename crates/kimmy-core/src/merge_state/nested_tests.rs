@@ -892,7 +892,7 @@ fn an_update_marks_the_absent_ancestors_of_all_its_operators_once() {
 }
 
 /// The join's rules for an implicit marker, checked against the model (`model6.py` join, line
-/// 659): a marker is never a reported loser, but it beats an older register and reports it.
+/// 662): an implicit marker is never a reported loser, but it beats an older register and reports it.
 #[test]
 fn an_implicit_marker_is_never_a_loser_but_makes_one() {
     let o = opts();
@@ -1008,4 +1008,203 @@ fn the_cost_of_an_implicit_marker_is_pinned() {
     // two markers (`a`, `a.b`): 161 bytes each in the version 1 form, 19 in the compact form, on
     // average; the generation's version vector is not encoded, so the writers do not add to it
     assert_eq!(((v1, v2), (w1, w2)), ((322, 38), (322, 38)));
+}
+
+// ---- the delta (a), a marker beside its own child (q7-step4-model-delta-ab.md) ----------------------------
+
+/// `I` creates `{k: 0}`; `A` writes with `a_op` and `B` deletes the document, concurrently (A's stamp
+/// first). Every delivery order reads the deleted document (`None`) and, once the observers have
+/// pulled each other's entries, all hold exactly `records`: the kind, the dotted path, A's stamp.
+fn written_into_a_deleted_document(a_op: Op, records: &[(LossKind, &str)]) -> Result<(), String> {
+    let o = opts();
+    let (mut mi, mut ma, mut mb) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));
+    let i0 = mi.ins(&[("k", i(0))], 0).unwrap();
+    ma.receive_entry(&mi.ent(i0));
+    mb.receive_entry(&mi.ent(i0));
+    let sa = a_op(&mut ma, 0).ok_or("A's write was refused")?;
+    let sb = mb.del().ok_or("B's delete was refused")?;
+    let ents = [ma.ent(sa), mb.ent(sb)];
+    let mut obs = Vec::new();
+    for (ord, m) in all_orders(&o, &ents, &[mi.ent(i0)]) {
+        if m.visible().is_some() {
+            return Err(format!(
+                "delivery {ord:?}: read {:?}, want the document deleted",
+                m.visible()
+            ));
+        }
+        obs.push(m);
+    }
+    pull_all(&mut obs);
+    pull_all(&mut obs);
+    let sets: BTreeSet<_> = obs.iter().map(Mem::loss_set).collect();
+    let wanted: BTreeSet<_> =
+        records.iter().map(|(k, path)| (*k, LossAt::Field(np(path)), sa)).collect();
+    if sets.len() != 1 || sets.iter().next() != Some(&wanted) {
+        return Err(format!("records {sets:?}, want {wanted:?}"));
+    }
+    Ok(())
+}
+
+use LossKind::DeleteWon;
+
+/// Two explicit maps, `a = {x:1}` against `a = {y:2}`: the children merge and the older map's cell is gone after the join, so the
+/// older map is a `clash` (the only record of its write if a later delete wins), whichever stamp is newer.
+#[test]
+fn an_explicit_map_that_loses_to_a_map_is_a_clash_whichever_is_newer() {
+    let both = [("a", M), ("a.x", i(1)), ("a.y", i(2)), ("k", i(0))];
+    for (sk, loser) in [((0, 9), 'a'), ((9, 0), 'b')] {
+        ok(two(
+            &opts(),
+            &[("k", i(0))],
+            &set("a", sub(&[("x", i(1))])),
+            &set("a", sub(&[("y", i(2))])),
+            sk,
+            &both,
+            &[(Clash, "a", loser)],
+        ));
+    }
+}
+
+/// An older explicit map against a newer implicit marker is reported; an older implicit marker against a newer explicit
+/// map is not (an implicit marker carries no user value, so it is never a reported loser).
+#[test]
+fn an_older_explicit_map_is_reported_against_an_implicit_marker_and_an_older_implicit_one_is_not() {
+    let both = [("a", M), ("a.x", i(1)), ("a.y", i(2)), ("k", i(0))];
+    // (explicit write first?, skews (A, B), the records)
+    type Case<'a> = (bool, (u64, u64), &'a [(LossKind, &'a str, char)]);
+    let cases: [Case; 4] = [
+        (true, (0, 9), &[(Clash, "a", 'a')]),
+        (true, (9, 0), &[]),
+        (false, (9, 0), &[(Clash, "a", 'b')]),
+        (false, (0, 9), &[]),
+    ];
+    for (explicit_first, sk, records) in cases {
+        let (explicit, implicit) = (set("a", sub(&[("x", i(1))])), set("a.y", i(2)));
+        let (a, b): (Op, Op) =
+            if explicit_first { (&explicit, &implicit) } else { (&implicit, &explicit) };
+        ok(two(&opts(), &[("k", i(0))], a, b, sk, &both, records));
+    }
+}
+
+/// A map against a scalar or an array is a conflict too (a `clash`, and a `typeClash` for what the scalar hides).
+#[test]
+fn a_map_against_a_scalar_is_still_a_clash_or_a_type_clash() {
+    // B's newer `a = 5` hides A's older `a = {x:1}`: A's explicit marker loses to a scalar (a
+    // `clash`), and its child below the scalar is hidden by it (a `typeClash`).
+    ok(two(
+        &opts(),
+        &[("k", i(0))],
+        &set("a", sub(&[("x", i(1))])),
+        &set("a", i(5)),
+        (0, 9),
+        &[("a", i(5)), ("k", i(0))],
+        &[(Clash, "a", 'a'), (TypeClash, "a.x", 'a')],
+    ));
+}
+
+/// (a) a1: an implicit marker and a leaf written into a document a delete won: the leaf is
+/// reported with its value, the marker is not reported beside it.
+#[test]
+fn the_implicit_marker_of_a_lost_write_is_not_reported_beside_its_leaf() {
+    ok(written_into_a_deleted_document(&set("a.y", i(2)), &[(DeleteWon, "a.y")]));
+}
+
+/// (a) a2: the same for an explicit map with a child.
+#[test]
+fn the_explicit_marker_of_a_lost_write_is_not_reported_beside_its_child() {
+    ok(written_into_a_deleted_document(&set("a", sub(&[("x", i(1))])), &[(DeleteWon, "a.x")]));
+}
+
+/// (a) a3: the marker that is the only head of its write (`a = {}`) is kept: the write is lost
+/// and has no other record.
+#[test]
+fn a_marker_that_is_the_only_head_of_a_lost_write_is_reported() {
+    ok(written_into_a_deleted_document(&set("a", sub(&[])), &[(DeleteWon, "a")]));
+}
+
+/// (a) a4, the control: a leaf only.
+#[test]
+fn a_lost_leaf_is_reported() {
+    ok(written_into_a_deleted_document(&set("k", i(5)), &[(DeleteWon, "k")]));
+}
+
+/// (a) a counter below the marker is a cell below it as a register is: the marker is not reported beside
+/// the slot, which is reported with its total.
+#[test]
+fn the_implicit_marker_of_a_lost_counter_write_is_not_reported_beside_its_slot() {
+    ok(written_into_a_deleted_document(&inc("a.n", 1), &[(DeleteWon, "a.n")]));
+}
+
+/// (a) a child that is itself only a marker does not stand for the marker above it: both are heads of
+/// the lost write, and both are reported (`a = {b: {}}`).
+#[test]
+fn a_marker_over_a_marker_only_is_reported_at_both_levels() {
+    ok(written_into_a_deleted_document(
+        &set("a", sub(&[("b", sub(&[]))])),
+        &[(DeleteWon, "a"), (DeleteWon, "a.b")],
+    ));
+}
+
+/// (a) the same for a write made into the losing life of two concurrent first inserts (an
+/// `insertLost`, not a `deleteWon`): A inserts `{k: 1}` and then writes `a.y`; B inserts `{k: 2}`
+/// concurrently and is newer. A's life is superseded and reported, and so is A's leaf, without its marker.
+#[test]
+fn the_implicit_marker_of_a_write_into_a_superseded_life_is_not_reported_beside_its_leaf() {
+    let o = opts();
+    let (mut ma, mut mb) = (Mem::new('A', &o), Mem::new('B', &o));
+    mb.w.clock = crate::hlc::Hlc::new(9, 0);
+    let a0 = ma.ins(&[("k", i(1))], 0).unwrap();
+    let a1 = ma.set_at(&np("a.y"), i(2), 0).unwrap();
+    let b0 = mb.ins(&[("k", i(2))], 0).unwrap();
+    let ents = [ma.ent(a0), ma.ent(a1), mb.ent(b0)];
+    let records: BTreeSet<_> = [
+        (LossKind::InsertLost, LossAt::Document, a0),
+        (LossKind::InsertLost, LossAt::Field(np("a.y")), a1),
+    ]
+    .into_iter()
+    .collect();
+    for (ord, m) in all_orders(&o, &ents, &[]) {
+        assert_eq!(m.visible(), want(&[("k", i(2))]), "{ord:?}");
+        assert_eq!(m.loss_set(), records, "{ord:?}");
+    }
+}
+
+/// The review of option C (S2): a marker can still be reported beside a child of ANOTHER write (docs/deviations.md: the join
+/// suppresses a marker only beside a child cell of its own write, the same stamp). A inserts `{k: 0, a: {}}`, then `$set a
+/// {x: 1}` (the marker and `a.x`, one write); B, newer and concurrent, sets `a.x` to 2, which A merges (a clash at `a.x` for
+/// A's write); A then sets `a.x` to 3, and C deletes the document without having seen any of it. A's `$set a {x: 1}` left the
+/// marker at `a` and its child `a.x` as cells of its own write, but the child cell at `a.x` now belongs to A's newer write: the
+/// marker of the older write is not beside a child of its own any more, and is reported (a `deleteWon` at `a`) as well as
+/// the records at `a.x`. The model's probe is `q7-step4-s2-probe.py`; no grader checks this since the cover of delta (a)
+/// accepts any record of the write below the marker.
+#[test]
+fn a_marker_is_reported_beside_a_child_of_another_write() {
+    let o = opts();
+    let (mut ma, mut mb, mut mc) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let i0 = ma.ins(&[("k", i(0)), ("a", sub(&[]))], 0).unwrap();
+    mb.receive_entry(&ma.ent(i0));
+    mc.receive_entry(&ma.ent(i0));
+    let sa = ma.set("a", sub(&[("x", i(1))]), 0).unwrap();
+    mb.w.clock = crate::hlc::Hlc::new(9, 0);
+    let sb = mb.set_at(&np("a.x"), i(2), 0).unwrap();
+    ma.receive_entry(&mb.ent(sb));
+    let sa3 = ma.set_at(&np("a.x"), i(3), 0).unwrap();
+    mc.del().unwrap();
+    let mut obs = [ma, mb, mc];
+    pull_all(&mut obs);
+    pull_all(&mut obs);
+    let at = |kind, path: &str, st| (kind, LossAt::Field(np(path)), st);
+    let wanted: BTreeSet<_> = [
+        at(Clash, "a.x", sa),
+        at(DeleteWon, "a", sa),
+        at(DeleteWon, "a.x", sa),
+        at(DeleteWon, "a.x", sb),
+        at(DeleteWon, "a.x", sa3),
+    ]
+    .into_iter()
+    .collect();
+    for m in &obs {
+        assert_eq!(m.visible(), None, "member {}: the delete won", m.name);
+        assert_eq!(m.loss_set(), wanted, "member {}", m.name);
+    }
 }

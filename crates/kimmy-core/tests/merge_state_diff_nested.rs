@@ -752,7 +752,14 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 /// RE-PINNED for Amendment 9: the operand stamps are spelled only when they are not the usual ones, and the fingerprint is the pre-stamp value
 /// again (compared step by step against the series before the stamps: slot-bearing steps identical 23,365 of 23,365, slotless differing 0).
 /// 0xdc0d_b553_2c31_01ac to 0xe9b9_25e7_5146_822c.
-const PINNED_300: u64 = 0xe9b9_25e7_5146_822c;
+///
+/// RE-PINNED for the Step 4 delta (a) (the model's `join` and the Rust join stop reporting a marker beside a child cell of its own
+/// write): the states hold those records no longer, and the fingerprint hashes the `{:?}` text of the states. The scripts did not
+/// change. A map that loses to a map is still a clash (an explicit one; an implicit marker is never a reported loser). The replay
+/// agrees with the model (0 scripts disagree); the Rust-side oracle takes the same changes as the model's `loss_oracle` (the
+/// marker head as a cover, an implicit marker never a head of its own).
+/// 0xe9b9_25e7_5146_822c to 0xf7e0_c678_fd6b_24f7.
+const PINNED_300: u64 = 0xf7e0_c678_fd6b_24f7;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -906,8 +913,8 @@ fn rust_mutants_are_caught_by_the_replay() {
     }
 }
 
-/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3) and of
-/// `pullmodel6.py`, as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
+/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3 plus the Step 4 delta (a), the marker head as a cover check at a non-marker path below the marker: `covered`, and an implicit marker that is never a head of its own) and of
+/// `pullmodel6.py` (its missing check takes `covered`), as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
 /// differential's fixture are made from these files; a changed byte fails here before it fails anywhere else.
 #[test]
 fn the_vendored_model_is_the_reviewed_one() {
@@ -915,14 +922,14 @@ fn the_vendored_model_is_the_reviewed_one() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
     for (file, want) in [
-        ("model6.py", "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"),
-        ("pullmodel6.py", "e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"),
+        ("model6.py", "9f5bb33b2c6fb8551f63f35770be1bb36fdb6ef94e05d65811ee7e8495f834e2"),
+        ("pullmodel6.py", "7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"),
     ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "{file}");
     }
     let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-    assert!(recorded.contains("72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"));
-    assert!(recorded.contains("e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"));
+    assert!(recorded.contains("9f5bb33b2c6fb8551f63f35770be1bb36fdb6ef94e05d65811ee7e8495f834e2"));
+    assert!(recorded.contains("7b529ddc8c0459e67e6a47b185b58619cf487d89c2df25bc98d824926d10c2d8"));
 }

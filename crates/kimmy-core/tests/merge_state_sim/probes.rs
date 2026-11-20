@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use kimmy_core::hlc::Hlc;
-use kimmy_core::merge_state::Value;
+use kimmy_core::merge_state::{MStamp, Path, Value};
 
 use crate::grade::grade;
 use crate::oracle::Log;
@@ -259,6 +259,93 @@ pub fn scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
                 ms[2].set("n", Value::Int64(7), log, 0);
             }),
         ));
+    }
+    out
+}
+
+// ---- a write lost with no record under the covered-entry skip ---------------------------------------------------------
+
+/// A lost write must not be left with no record when its map cell is dropped by a join that reports nothing for it (a map that
+/// loses to a map, or an implicit marker that loses, each dropped without a record) and a later delete then wins over the
+/// write: under the covered-entry skip nobody joins the write's own entry again, so no record would be made at all. The
+/// model's `sync` hides it (it re-joins covered entries); the product's skip does not. Each scenario is the same schedule
+/// (the review's `s1_repro.py`):
+/// A inserts `{k: 0}`; C deletes, concurrently with everything below; A writes `a1`; B, concurrent and newer (skew 4),
+/// writes `b`; A and B take each other's entry; A writes `a2` in sequence after `a1` (`a2_before_b`: right after `a1`, and
+/// then `k = 1` is A's last write); C takes A's last entry; B takes it too (`b_sees_last`: so that no member still holds A's
+/// first write below `a` when the delete reaches it); A and B take the delete; then every member takes every entry of every
+/// member, three times. The skip is ON (the design). Graded against the oracle: the problems found; none is the answer.
+///
+/// The design (an explicit map that loses to a map is a clash; an implicit marker is never a head of its own) leaves every
+/// head with a record at or below it. A join that drops the clash of a map that loses to a map fails the first of the five.
+pub fn s1_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
+    let mut cfg = cfg.clone();
+    cfg.flags.covered_skip = true;
+    let int = Value::Int64;
+    let map = |f: &[(&str, Value)]| {
+        Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+    };
+    // the sim's `set(path)` takes ONE field name (a name may hold a dot): these writes go to nested paths
+    let np = |dotted: &str| Path::new(dotted.split('.')).unwrap();
+    type W = (&'static str, Value);
+    // (name, a1, b, a2, a2 before b)
+    let cases: Vec<(&str, W, W, W, bool)> = vec![
+        ("S1b'", ("a", map(&[])), ("a.c", int(2)), ("k", int(1)), false),
+        ("S1c'", ("a", map(&[("x", int(1))])), ("a.c", int(2)), ("a.x", int(3)), false),
+        (
+            "S1e'",
+            ("a", map(&[("x", int(1))])),
+            ("a", map(&[("y", int(2))])),
+            ("a.x", int(3)),
+            false,
+        ),
+        ("S1m'", ("a.x", int(1)), ("a", map(&[])), ("a.x", int(3)), false),
+        ("S1s", ("a.x", int(1)), ("a", int(7)), ("a.x", int(3)), true),
+    ];
+    let mut out = Vec::new();
+    for (name, a1, b, a2, a2_before_b) in cases {
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+        let ent = |n: &Node, st: Option<MStamp>| {
+            std::rc::Rc::clone(&n.oplog[&st.expect("the write was accepted")])
+        };
+        let i0 = ms[0].insert(&[("k", int(0))], &mut log, 0);
+        let e0 = ent(&ms[0], i0);
+        ms[1].receive_entry(&e0);
+        ms[2].receive_entry(&e0);
+        let dc = ms[2].delete(&mut log, 0);
+        let ec = ent(&ms[2], dc);
+        let s_a1 = ms[0].set_at(&np(a1.0), a1.1.clone(), &mut log, 0);
+        let mut ea = ent(&ms[0], s_a1);
+        if a2_before_b {
+            let s_a2 = ms[0].set_at(&np(a2.0), a2.1.clone(), &mut log, 0);
+            ea = ent(&ms[0], s_a2);
+        }
+        let s_b = ms[1].set_at(&np(b.0), b.1.clone(), &mut log, 4);
+        let eb = ent(&ms[1], s_b);
+        ms[0].receive_entry(&eb);
+        ms[1].receive_entry(&ea);
+        let last = if a2_before_b {
+            ms[0].set("k", int(1), &mut log, 0)
+        } else {
+            ms[0].set_at(&np(a2.0), a2.1.clone(), &mut log, 0)
+        };
+        let el = ent(&ms[0], last);
+        ms[2].receive_entry(&el);
+        ms[1].receive_entry(&el);
+        ms[0].receive_entry(&ec);
+        ms[1].receive_entry(&ec);
+        for _ in 0..3 {
+            for p in 0..ms.len() {
+                for r in 0..ms.len() {
+                    let es: Vec<std::rc::Rc<Ent>> = ms[r].oplog.values().cloned().collect();
+                    for e in &es {
+                        ms[p].receive_entry(e);
+                    }
+                }
+            }
+        }
+        out.push((format!("S1 {name} under the covered-entry skip"), grade(&ms, &log)));
     }
     out
 }

@@ -658,6 +658,8 @@ def join(s, t, tag=None):
                     lo = a if a[0] < b[0] else b
                     if lo[1] == MAPI:        # an implicit marker carries no user value: it is never a loser to report
                         continue
+                    # S1: an explicit map that loses to a concurrent map IS a clash: its cell is gone after this join, so a later
+                    # delete or supersession could otherwise leave its write with no record (delta (b) withdrawn)
                     kind = "arrayClash" if isinstance(a[1], tuple) and isinstance(b[1], tuple) else "clash"
                     new[(kind, p, lo[0])] = lo[1]
     # (1b) typeClash: a scalar/array register at p against a descendant cell (register with a value, or counter slot) at
@@ -676,12 +678,25 @@ def join(s, t, tag=None):
                     else:
                         new[("typeClash", k[1], r[0])] = r[1]
     # (2) a cell in a dead life that no known delete saw
+    def _marker_with_child(k, r):     # DELTA (a): a marker cell whose own write also left a cell below it in the same life
+        if r[1] not in MARKERS:
+            return False
+        for src2 in (s, t):
+            for k2, r2 in src2.regs.items():
+                if k2[0] == k[0] and r2[0] == r[0] and k2[1].startswith(k[1] + ".") and r2[1] not in MARKERS:
+                    return True
+            for k2, v2 in src2.slots.items():
+                if k2[0] == k[0] and v2[0] == r[0] and k2[1].startswith(k[1] + "."):
+                    return True
+        return False
     for src in (s, t):
         for k, r in src.regs.items():
             if CELLS_REPORTED and k[0] in reported and r[0] != k[0]:       # V6M1: a write made into the losing life
-                new[("insertLost", k[1], r[0])] = r[1]
+                if not _marker_with_child(k, r):
+                    new[("insertLost", k[1], r[0])] = r[1]
             elif k[0] not in al and k[0] not in reported and not any(cov(vv, r[0]) for vv in out.deletes.values()):
-                new[("deleteWon", k[1], r[0])] = r[1]
+                if not _marker_with_child(k, r):
+                    new[("deleteWon", k[1], r[0])] = r[1]
         for k, v in src.slots.items():
             if CELLS_REPORTED and k[0] in reported:
                 new[("insertLost", k[1], v[0])] = v[1]
@@ -1449,6 +1464,8 @@ def loss_oracle(log, alive, dels):
     for st, (ctx, m) in log.items():      # V6M1: every head written into a losing first insert is reported
         if m.get("life") in sup - killed and m["kind"] in ("reg", "inc") and st != m.get("life"):
             for p in touched(m):
+                if m.get("vals", {}).get(p) == MAPI:      # an implicit marker is never a head of its own: its write's leaves are
+                    continue
                 later = [w for w, (c2, m2) in log.items() if st in c2 and p in touched(m2)
                          and m2.get("life") == m["life"]]
                 if not later:
@@ -1469,14 +1486,14 @@ def loss_oracle(log, alive, dels):
         if heads:
             top = max(heads, key=lambda r: r[0])
             for h in heads:
-                if h is not top and h[2]["vals"][p] != MAPI:      # an implicit marker is never a reported loser
+                if h is not top and h[2]["vals"][p] != MAPI:      # an implicit marker is never a reported loser (delta (b) withdrawn)
                     must.add((p, h[0]))
         dead_regs = [(st, ctx, m) for st, (ctx, m) in log.items()
                      if m["kind"] in ("insert", "reg") and p in m["paths"] and m["life"] not in alive and m["life"] not in (sup - killed)
                      and not (m["life"] in sup and st == m["life"])]    # a superseded life's own fields: order-dependent
         for st, ctx, m in dead_regs:
-            if not any(st in log[d][0] for d in dels) and not any(st in c2 for s2, c2, m2 in dead_regs):
-                must.add((p, st))
+            if m["vals"][p] != MAPI and not any(st in log[d][0] for d in dels) and not any(st in c2 for s2, c2, m2 in dead_regs):
+                must.add((p, st))      # an implicit marker is never a head of its own, as in the head loop above
         dead_incs = [(st, ctx, m) for st, (ctx, m) in log.items()
                      if p in incs_of(m) and m["life"] not in alive and m["life"] not in (sup - killed)]
         by_slot = {}
@@ -1488,7 +1505,23 @@ def loss_oracle(log, alive, dels):
                 must.add((p, head))
     flat = _flat_oracle(log)[0] or {}
     must |= _type_must(log, alive, flat, oracle(log)[0])
+    # DELTA (a), as a cover: a marker head stays required; `covered` accepts any record of the same write at or below it
     return must
+
+
+def marker_head(log, p, st):
+    """A required head that is a map marker of its write (explicit or implicit)."""
+    return st in log and log[st][1].get("vals", {}).get(p) in MARKERS
+
+
+def covered(head, have, log):
+    """DELTA (a): a head is reported by its own record; a MARKER head also by a record of the same write at a NON-MARKER path
+    strictly below it (the join reports a marker's lost write through the write's own child cells, wherever those survive; a
+    child is a register with a value that is not a marker, or a counter slot: `_marker_with_child`)."""
+    p, st = head
+    if head in have:
+        return True
+    return marker_head(log, p, st) and any(s2 == st and q.startswith(p + ".") and not marker_head(log, q, st) for (q, s2) in have)
 
 
 def hidden_oracle(log):
@@ -1932,7 +1965,8 @@ def check(ms, log, strict_records=True):
     if strict_records:
         must = loss_oracle(log, alive, dels)
         have = set(ms[0].state.losses)
-        missing = must - {(k[1], k[2]) for k in have}
+        haveh = {(k[1], k[2]) for k in have}
+        missing = {h for h in must if not covered(h, haveh, log)}
         if missing:
             errs.append(("record-missing", sorted(missing, key=repr)[:2]))
         for k in have:
