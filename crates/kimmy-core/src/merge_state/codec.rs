@@ -95,6 +95,10 @@ pub enum DecodeError {
         "merge state: the loss-free hash in the header is not the hash of the state without its records"
     )]
     LossFreeHashMismatch,
+    #[error("merge state: more loss records than a document keeps at most")]
+    TooManyLossRecords,
+    #[error("merge state: a loss record's value is longer than a cut can leave")]
+    LossValueTooLarge,
     #[error("merge state: a dead life is not listed in `lives`")]
     DeadLifeNotListed,
     #[error("merge state: the version vector does not cover a stamp the state holds")]
@@ -311,6 +315,17 @@ impl W {
                     self.path(p);
                 }
             }
+            LossValue::CutValue(v) => {
+                self.u8(3);
+                self.value(v);
+            }
+            LossValue::CutFields(f) => {
+                self.u8(4);
+                self.len(f.len());
+                for p in f {
+                    self.path(p);
+                }
+            }
         }
     }
 }
@@ -387,7 +402,7 @@ impl MergeState {
             && !self
                 .losses
                 .values()
-                .any(|v| matches!(v, LossValue::Value(x) if x.contains_document()))
+                .any(|v| matches!(v, LossValue::Value(x) | LossValue::CutValue(x) if x.contains_document()))
     }
 
     /// The deterministic encoding of the state: the model's `canon()` made
@@ -487,11 +502,16 @@ impl MergeState {
             put(&mut s.slots, (l, p, wr, g), Slot::new(stamp, total, None))?;
         }
         s.vv = r.vv()?;
-        for _ in 0..r.len()? {
+        let losses = r.len()?;
+        if losses > super::types::MAX_LOSS_CAP {
+            return Err(DecodeError::TooManyLossRecords);
+        }
+        for _ in 0..losses {
             let (kind, path, stamp) = r.loss_key()?;
             let v = r.loss_value()?;
             // The one segment `_` with a field list is the whole document; with anything else, a field.
-            let whole = matches!(v, LossValue::Fields(_)) && path.segments() == ["_"];
+            let whole = matches!(v, LossValue::Fields(_) | LossValue::CutFields(_))
+                && path.segments() == ["_"];
             let k = if whole {
                 LossKey::document(kind, stamp)
             } else {
@@ -778,6 +798,14 @@ impl R<'_> {
                     f.push(self.path()?);
                 }
                 Ok(LossValue::Fields(f))
+            }
+            3 => Ok(LossValue::CutValue(self.value()?)),
+            4 => {
+                let mut f = Vec::new();
+                for _ in 0..self.len()? {
+                    f.push(self.path()?);
+                }
+                Ok(LossValue::CutFields(f))
             }
             t => Err(DecodeError::BadTag(t)),
         }

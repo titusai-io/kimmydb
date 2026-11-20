@@ -69,6 +69,7 @@ mod compact;
 mod counter;
 mod floor;
 mod join;
+pub mod loss_cut;
 mod ord;
 mod stamps;
 mod state;
@@ -92,6 +93,8 @@ mod depth_tests;
 mod floor_tests;
 #[cfg(test)]
 mod hand_built;
+#[cfg(test)]
+mod loss_cap_tests;
 #[cfg(test)]
 mod loss_contract_tests;
 #[cfg(test)]
@@ -128,18 +131,18 @@ mod work_tests;
 
 pub use codec::{DecodeError, V1CannotHold};
 pub use counter::Num;
-pub use join::{InvalidIntBound, JoinOptions, join};
+pub use join::{InvalidIntBound, InvalidLossLimits, JoinOptions, LossCounts, join, join_counted};
 pub use ord::{
     Cand, FieldOrd, Floor, OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events, ord_join,
 };
 pub use state::{
-    Excess, Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey,
-    OverCaps, Reg, Slot, Vv,
+    Excess, Gen, Life, LifeKind, LossReceive, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState,
+    ObsKey, OverCaps, Reg, Slot, Vv,
 };
 pub use state_at::state_at;
 pub use types::{
-    Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
-    WriterId,
+    Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MAX_LOSS_CAP,
+    MAX_LOSS_CUT, MIN_LOSS_CAP, MIN_LOSS_CUT, MStamp, Path, Value, WriterId,
 };
 pub use writer::{
     Received, StampError, UpdateError, UpdateOp, UpdateRefused, WriteKind, WriteRecord, Writer,

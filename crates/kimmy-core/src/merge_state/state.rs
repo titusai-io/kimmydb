@@ -266,6 +266,23 @@ impl Slot {
     }
 }
 
+/// Why a loss record that reached [`MergeState::receive_loss_counted`] was or was not added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossReceive {
+    /// In the state now.
+    Added,
+    /// The state already held this key (the first to name a key keeps it).
+    Known,
+    /// Older than the state's horizon.
+    Horizon,
+    /// `K` greater records are held: the record would be the one the cap drops.
+    Cap,
+    /// A value over the collection's cut; refused, never cut again.
+    Oversize,
+    /// A total past the bound, or a decimal no writer produces.
+    Invalid,
+}
+
 /// The replicated merge state. Grow-only components are joined by union, cells
 /// by the higher stamp, the version vector by max; see [`super::join()`].
 #[derive(Clone, Debug, Default)]
@@ -560,6 +577,13 @@ impl MergeState {
     ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
+        if self.losses.len() > super::types::MAX_LOSS_CAP {
+            return Err(DecodeError::TooManyLossRecords);
+        }
+        if self.losses.values().any(|v| !super::loss_cut::within_cut(v, super::types::MAX_LOSS_CUT))
+        {
+            return Err(DecodeError::LossValueTooLarge);
+        }
         if self.dead.iter().any(|l| !self.lives.contains_key(l)) {
             return Err(DecodeError::DeadLifeNotListed);
         }
@@ -695,17 +719,42 @@ impl MergeState {
     /// function of the state and the options, so a fold of entries (the rewind's) can apply it as the live apply
     /// does ([`super::Writer::receive_loss`] calls it).
     pub fn receive_loss(&mut self, key: LossKey, val: LossValue, o: &JoinOptions) -> bool {
-        if key.stamp.hlc < self.horizon(o) || self.losses.contains_key(&key) {
-            return false;
+        self.receive_loss_counted(key, val, o).0 == LossReceive::Added
+    }
+
+    /// [`MergeState::receive_loss`] with the reason a record was not added, and the number of records the state
+    /// already held that it displaced (the cap: `K` greater ones stay). A record under the horizon, one already held,
+    /// one that is not a number a writer produces, one over the cut (refused, never cut again) and one the cap
+    /// refuses leave the state as it was; `Added` means the record is in the state.
+    pub fn receive_loss_counted(
+        &mut self,
+        key: LossKey,
+        val: LossValue,
+        o: &JoinOptions,
+    ) -> (LossReceive, usize) {
+        super::loss_cut::sink_note(&key, &val);
+        if key.stamp.hlc < self.horizon(o) {
+            return (LossReceive::Horizon, 0);
+        }
+        if self.losses.contains_key(&key) {
+            return (LossReceive::Known, 0);
         }
         // A total past `MAX_TOTAL`, or a decimal no writer produces, is one `decode` refuses: never store a state that
         // cannot be read back.
         if matches!(&val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) || !t.is_canonical())
         {
-            return false;
+            return (LossReceive::Invalid, 0);
         }
-        self.losses.insert(key, val);
-        true
+        if !super::loss_cut::within_cut(&val, o.loss_cut()) {
+            return (LossReceive::Oversize, 0);
+        }
+        self.losses.insert(key.clone(), val);
+        let dropped = super::loss_cut::cap_losses(&mut self.losses, o.loss_cap());
+        if dropped.contains(&key) {
+            (LossReceive::Cap, dropped.len() - 1)
+        } else {
+            (LossReceive::Added, dropped.len())
+        }
     }
 
     pub(crate) fn alive_set(&self, ret: u64) -> BTreeSet<MStamp> {

@@ -4,15 +4,30 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::Num;
+use super::loss_cut::{cap_losses, cut_fields, cut_value, within_cut};
 use super::ord::ord_join;
 use super::state::{LifeKind, MergeState, Reg, Slot, Vv, cov, sub_ret};
-use super::types::{LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{
+    LossKey, LossKind, LossValue, MAX_LOSS_CAP, MAX_LOSS_CUT, MIN_LOSS_CAP, MIN_LOSS_CUT, MStamp,
+    Path, Value, WriterId,
+};
 use crate::hlc::Hlc;
 
 /// A refused integer bound: it must not be negative.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("merge state: the integer bound {0} is negative")]
 pub struct InvalidIntBound(pub i64);
+
+/// Refused limits of the loss records of a document: `K` must be in `[MIN_LOSS_CAP, MAX_LOSS_CAP]` and the cut in
+/// `[MIN_LOSS_CUT, MAX_LOSS_CUT]`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "merge state: loss limits (records {cap}, cut {cut} bytes) are outside {MIN_LOSS_CAP}..={MAX_LOSS_CAP} records and {MIN_LOSS_CUT}..={MAX_LOSS_CUT} bytes"
+)]
+pub struct InvalidLossLimits {
+    pub cap: usize,
+    pub cut: usize,
+}
 
 /// Parameters of the join and of the read side.
 ///
@@ -38,6 +53,11 @@ pub struct JoinOptions {
     pub retention: u64,
     /// `BOUND` (Q11): an integer total saturates to `[-bound - 1, bound]`. Never negative.
     int_bound: i64,
+    /// `K`: a document keeps at most this many loss records, the greatest by rank (the cap). Per collection, fixed at
+    /// its creation. [`JoinOptions::default`] is the widest the codecs allow; a collection's options carry its own.
+    loss_cap: usize,
+    /// The cut: the most bytes of its compact encoding that a record's value keeps (see [`super::loss_cut`]).
+    loss_cut: usize,
     /// V3M1: filter by the JOINED horizon before the union.
     #[cfg(any(test, feature = "merge-mutants"))]
     horizon_first: bool,
@@ -203,6 +223,8 @@ impl Default for JoinOptions {
             // The model's default (10^9), far beyond any test horizon.
             retention: 1_000_000_000,
             int_bound: i64::MAX,
+            loss_cap: MAX_LOSS_CAP,
+            loss_cut: MAX_LOSS_CUT,
             #[cfg(any(test, feature = "merge-mutants"))]
             horizon_first: true,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -328,6 +350,34 @@ impl JoinOptions {
     #[must_use]
     pub fn with_retention(self, retention: u64) -> Self {
         Self { retention, ..self }
+    }
+
+    /// These options with the loss limits of a collection: `K` records per document, each value cut to `cut` bytes.
+    /// Refused outside the bounds (`4..=64` records, `64..=4096` bytes).
+    pub fn with_loss_limits(self, cap: usize, cut: usize) -> Result<Self, InvalidLossLimits> {
+        if !(MIN_LOSS_CAP..=MAX_LOSS_CAP).contains(&cap)
+            || !(MIN_LOSS_CUT..=MAX_LOSS_CUT).contains(&cut)
+        {
+            return Err(InvalidLossLimits { cap, cut });
+        }
+        Ok(Self { loss_cap: cap, loss_cut: cut, ..self })
+    }
+
+    /// The same without the bounds, for the tests that need a cap of one or a cut of a few bytes. Not in a release build.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    #[must_use]
+    pub fn with_loss_limits_unchecked(self, cap: usize, cut: usize) -> Self {
+        Self { loss_cap: cap, loss_cut: cut, ..self }
+    }
+
+    /// `K`, the most loss records a document keeps.
+    pub fn loss_cap(&self) -> usize {
+        self.loss_cap
+    }
+
+    /// The most bytes of compact encoding a record's value keeps.
+    pub fn loss_cut(&self) -> usize {
+        self.loss_cut
     }
 
     /// The integer bound: totals saturate to `[-bound - 1, bound]`.
@@ -470,6 +520,25 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     join_into(s.clone(), t, o)
 }
 
+/// What the cap and the cut did to the loss records of one join: records that came in and were refused by the cap
+/// (`K` greater ones are held), records the state already held that a newer one displaced (`evicted`), and records
+/// that came in with a value over the cut (`oversize`, refused, never cut again).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossCounts {
+    pub refused: usize,
+    pub evicted: usize,
+    pub oversize: usize,
+}
+
+/// [`join()`], and what the cap and the cut did to the records.
+pub fn join_counted(
+    s: &MergeState,
+    t: &MergeState,
+    o: &JoinOptions,
+) -> (MergeState, BTreeSet<LossKey>, LossCounts) {
+    join_into_counted(s.clone(), t, o)
+}
+
 /// [`join()`] with the first state handed over: the result is built in it, so a caller that does
 /// not need the old state (a writer normalising its own state against the empty one) pays no
 /// copy of it.
@@ -478,10 +547,19 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
 /// and the version vector of `out` are changed last; what it reads of `out` before that is the
 /// lives, the dead lives and the deletes, which are joined first.
 pub(super) fn join_into(
-    mut out: MergeState,
+    out: MergeState,
     t: &MergeState,
     o: &JoinOptions,
 ) -> (MergeState, BTreeSet<LossKey>) {
+    let (out, fresh, _) = join_into_counted(out, t, o);
+    (out, fresh)
+}
+
+pub(super) fn join_into_counted(
+    mut out: MergeState,
+    t: &MergeState,
+    o: &JoinOptions,
+) -> (MergeState, BTreeSet<LossKey>, LossCounts) {
     let ret = o.retention;
     let h0 = sub_ret(out.max_vv().max(t.max_vv()), ret);
     let hf = o.horizon_first();
@@ -799,16 +877,46 @@ pub(super) fn join_into(
     }
     out.dead.retain(|l| l.hlc >= h);
     // The records: those of `s` (which `out` still holds) and then `t`'s and the new ones, newest
-    // horizon only; the first to name a key keeps it. What `s` did not have is `fresh`.
+    // horizon only; the first to name a key keeps it. A record the join makes is cut to the collection's cut as it is
+    // made; one that comes in from `t` must already fit it (it is refused, not cut again). Then the cap: the `K`
+    // greatest by rank stay, `cap(F_h(S ∪ T))`, and what `s` did not have and the cap kept is `fresh`.
     out.losses.retain(|k, _| k.stamp.hlc >= h);
-    let mut fresh = BTreeSet::new();
-    for (k, v) in t.losses.iter().chain(new.iter()) {
-        if k.stamp.hlc >= h && !out.losses.contains_key(k) {
-            out.losses.insert(k.clone(), v.clone());
-            fresh.insert(k.clone());
+    let mut counts = LossCounts::default();
+    let mut incoming = BTreeSet::new();
+    let cut = o.loss_cut();
+    let mut consider = |k: LossKey, v: LossValue, out: &mut MergeState| {
+        if k.stamp.hlc < h || out.losses.contains_key(&k) {
+            return;
+        }
+        if !within_cut(&v, cut) {
+            counts.oversize += 1;
+            return;
+        }
+        out.losses.insert(k.clone(), v);
+        incoming.insert(k);
+    };
+    for (k, v) in &t.losses {
+        if !out.losses.contains_key(k) {
+            consider(k.clone(), v.clone(), &mut out);
         }
     }
-    (out, fresh)
+    for (k, v) in new {
+        let v = match v {
+            LossValue::Value(x) => cut_value(&x, cut),
+            LossValue::Fields(f) => cut_fields(&f, cut),
+            other => other,
+        };
+        super::loss_cut::sink_note(&k, &v);
+        consider(k, v, &mut out);
+    }
+    for dropped in cap_losses(&mut out.losses, o.loss_cap()) {
+        if incoming.remove(&dropped) {
+            counts.refused += 1;
+        } else {
+            counts.evicted += 1;
+        }
+    }
+    (out, incoming, counts)
 }
 
 impl MergeState {
