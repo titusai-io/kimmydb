@@ -62,9 +62,14 @@ fn an_id_pinned_filter_waiting_in_the_pool_does_not_hold_an_async_worker() {
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
     let started = Instant::now();
-    // The wait ends at this deadline at the latest, so a worker held by it fails the test
-    // rather than hanging it.
-    let deadline = Duration::from_secs(20);
+    // The search's own request deadline, and what every wait of the test below is bounded by.
+    // Reading its first 10,001 ids is the slow part: 19 to 28 seconds in the gates' debug build, and
+    // more when other work is on the machine. A search that reaches a shorter deadline first ends
+    // before it holds the pool, which is not what this test is about, so the deadline is far
+    // past that and the wait for the pool below notices a search that ended early, whatever
+    // the deadline. A worker held by the pool's wait still fails the test: the probe task
+    // below does not run, however long the deadline is.
+    let deadline = Duration::from_secs(300);
     let search = {
         let state = Arc::clone(&state);
         runtime.spawn(async move {
@@ -87,7 +92,22 @@ fn an_id_pinned_filter_waiting_in_the_pool_does_not_hold_an_async_worker() {
     // The search holds more than its free ids: it has a lease, and is not about to end.
     let past_the_window = 10_001 * kimmy_query::budget::held_doc_id(&DocId::Int64(1));
     while pool.used() < past_the_window {
-        assert!(started.elapsed() < Duration::from_secs(120), "the search never held the pool");
+        if search.is_finished() {
+            let ended = match runtime.block_on(search) {
+                Ok(Ok(_)) => "it answered".to_string(),
+                Ok(Err(e)) => format!("it ended with {e:?}"),
+                Err(e) => format!("its task failed: {e}"),
+            };
+            panic!(
+                "the search ended before it held the pool ({} of the {past_the_window} bytes of its ids after {:?}): {ended}",
+                pool.used(),
+                started.elapsed()
+            );
+        }
+        assert!(
+            started.elapsed() < deadline + Duration::from_secs(30),
+            "the search neither held the pool nor ended within its deadline of {deadline:?}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // A younger request takes the rest of the pool: retried if the search grew in between.
