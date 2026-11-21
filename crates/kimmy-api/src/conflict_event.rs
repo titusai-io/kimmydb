@@ -111,6 +111,18 @@ fn loser_value_json(value: &LossValue) -> Value {
     }
 }
 
+/// The winner with its value left out: its stamp stays, so a receiver still knows which write won.
+fn winner_json_without_value(winner: Option<ConflictWinner>) -> Value {
+    match winner {
+        None => Value::Null,
+        Some(winner) => json!({
+            "stamp": stamp_text(&winner.stamp),
+            "valueOmitted": true,
+            "omittedReason": "value exceeds webhooks.max_payload_bytes; read the cell from the collection",
+        }),
+    }
+}
+
 fn winner_json(winner: Option<ConflictWinner>) -> Value {
     match winner {
         None => Value::Null,
@@ -124,19 +136,39 @@ fn winner_json(winner: Option<ConflictWinner>) -> Value {
 /// The event for `entry`, a loss entry, or `None` when it is not one this member can tell: its body or its document is missing or does
 /// not decode. The winner is read now.
 pub fn render(engine: &Engine, entry: &OplogEntry, token: &ResumeToken) -> Option<Value> {
-    if !entry.kind.is_loss_record() {
+    if !is_renderable(entry) {
+        return None;
+    }
+    let id = entry.doc_id.as_ref()?;
+    let (key, _) =
+        kimmy_core::merge_state::MergeState::decode_loss_record(entry.body.as_deref()?).ok()?;
+    let winner = kimmy_storage::blocking(|| engine.conflict_winner(entry.collection, id, &key.at))
+        .ok()
+        .flatten();
+    let mut event = body(entry, winner, false)?;
+    event["resumeToken"] = json!(token.encode());
+    Some(event)
+}
+
+/// What a loss entry tells, without a resume token: the fields a change stream and a webhook share. `winner` is what the caller read at its
+/// delivery. With `omit_winner_value` the winner's value is left out and says so (a webhook event that would not fit its payload cap,
+/// where an event is never dropped for its size): `{"stamp": …, "valueOmitted": true, "omittedReason": …}`.
+pub fn body(
+    entry: &OplogEntry,
+    winner: Option<ConflictWinner>,
+    omit_winner_value: bool,
+) -> Option<Value> {
+    if !is_renderable(entry) {
         return None;
     }
     let id = entry.doc_id.as_ref()?;
     let (key, value) =
         kimmy_core::merge_state::MergeState::decode_loss_record(entry.body.as_deref()?).ok()?;
-    let winner = kimmy_storage::blocking(|| engine.conflict_winner(entry.collection, id, &key.at))
-        .ok()
-        .flatten();
+    let winner =
+        if omit_winner_value { winner_json_without_value(winner) } else { winner_json(winner) };
     Some(json!({
         "operationType": "conflictResolved",
         "eventId": conflict_event_id(entry.collection, id, &key),
-        "resumeToken": token.encode(),
         "clusterTime": entry.stamp.hlc.to_string(),
         "documentKey": { "_id": crate::json::bson_to_json(&id.to_bson()) },
         "path": path_text(&key.at),
@@ -146,8 +178,18 @@ pub fn render(engine: &Engine, entry: &OplogEntry, token: &ResumeToken) -> Optio
             "value": loser_value_json(&value),
             "truncated": value.is_cut(),
         },
-        "winner": winner_json(winner),
+        "winner": winner,
     }))
+}
+
+/// Whether `entry` is a loss entry [`body`] can render: a document key and a body that decodes.
+pub fn is_renderable(entry: &OplogEntry) -> bool {
+    entry.kind.is_loss_record()
+        && entry.doc_id.is_some()
+        && entry
+            .body
+            .as_deref()
+            .is_some_and(|b| kimmy_core::merge_state::MergeState::decode_loss_record(b).is_ok())
 }
 
 #[cfg(test)]
