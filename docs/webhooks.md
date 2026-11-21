@@ -16,6 +16,9 @@ curl -X POST https://node:7878/v1/db/shop/coll/orders/webhooks \
  "note":"the secret is shown once and cannot be retrieved later"}
 ```
 
+`operations` is optional: absent or empty is `insert`, `update`, `replace` and `delete`. `conflictResolved` is the one operation that is
+never implied: name it to be told of [lost writes](#lost-writes-conflictresolved).
+
 Registering requires the **`webhook`** action on the collection. It is separate
 from `watch` on purpose: a change stream ends when the client disconnects and
 dies with its token, while a webhook keeps sending to an address the grant never
@@ -237,7 +240,7 @@ invalidation exists rather than silently resuming.
 | Series | |
 |---|---|
 | `kimmy_webhook_deliveries_total{outcome}` | `delivered` / `failed` batches |
-| `kimmy_webhook_events_total` | Events pushed |
+| `kimmy_webhook_events_total` | Events pushed. A `conflictResolved` event counts each time it is sent, and one lost write can be sent more than once |
 | `kimmy_webhook_subscriptions{state}` | `active` / `invalidated`, as this node sees the registry |
 | `kimmy_webhook_backlog_seconds` | Age of the oldest undelivered event |
 
@@ -254,6 +257,65 @@ replicates; take the max across nodes rather than the sum.
 Registering and removing a subscription, and any invalidation, are recorded on
 the `kimmy::audit` target — registering one grants ongoing egress, so it belongs
 in the same stream as authorization decisions.
+
+---
+
+## Lost writes: `conflictResolved`
+
+A `field` collection merges two writes to different fields of one document instead of keeping only the newer document. When the merge
+has to choose (two writes to one field, a delete against a write, an insert against another insert) it keeps one and records what it
+dropped. A subscription that **lists** `conflictResolved` is sent that record as an event:
+
+```bash
+curl -X POST https://node:7878/v1/db/shop/coll/orders/webhooks \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://example.com/hook","operations":["conflictResolved"]}'
+```
+
+It is **opt-in**. An absent or empty `operations` is `insert`, `update`, `replace` and `delete`, and never this one, so a subscription
+registered before the event existed does not start receiving a new kind of event. Only a collection created with `"mergePolicy":
+"field"` can be subscribed to it: the policy cannot change, a `document` collection never loses a write to a merge, and registering is
+refused with `400` rather than accepted and left silent.
+
+```json
+{ "subscription": "wh_…",
+  "events": [ { "eventId": "cr1-77950a6b…", "operationType": "conflictResolved",
+                "database": "shop", "collection": "orders", "clusterTime": "1795…",
+                "documentKey": {"_id": 1}, "path": "x", "kind": "clash",
+                "loser":  {"stamp": "1795…-1a2b…-0000…", "value": 1, "truncated": false},
+                "winner": {"stamp": "1795…-9f3c…-0000…", "value": 2} } ] }
+```
+
+The fields are the ones a [change stream](change-streams.md#conflictresolved) carries, without the resume token. `loser` names the write
+that was dropped (its stamp, its value, cut to `storage.loss_value_cut_bytes` (64 by default) and marked `truncated` when longer). `winner` is what stands **at the moment of
+delivery**, read by the node that delivers: the stamp and value of the cell now at `path`, or `null` when the document is gone.
+
+### What to do with it
+
+**Deduplicate on `eventId`, and never compare bodies.** The `eventId` is `cr1-` and a SHA-256 of the collection, the document key, the
+kind, the path and the lost write's stamp. It is the same on every node and in every redelivery, and it never looks like the stamp
+`eventId` of a document event. Two deliveries of one `eventId` carry the same `loser` and may carry a different `winner`, because
+each is read when it is sent and a write may have landed in between. The `X-Kimmy-Event-Id` header of a batch is the `eventId` of its
+first event, so a batch that opens with a lost write has a `cr1-` id there.
+
+**Expect a lost write more than once, up to once per member.** Every member that takes the record into its state keeps an entry of its
+own for it, and the node that delivers a subscription sends every such entry it holds, its own and the ones it was sent by other
+members, so that a record is not lost when the delivering node never held it itself. In a cluster of *M* members one lost write can
+therefore arrive up to *M* times under one `eventId`, and more after the delivering node changes. That is the at-least-once contract
+above, and the reason for the id. Each carries the `clusterTime` of the entry that carried it, so that is the one field of copies that differs. A delivery's order is, as for every event, per subscription per origin node.
+
+**A lost write the cluster dropped never arrives.** A member keeps at most `storage.loss_records_per_document` records for a document
+(4 by default) and cuts the values it keeps; a record past that is not kept, so no event is made of it.
+
+### When the winner is too large
+
+The loser's value is cut, but the winner can be a whole subdocument or array. An event that alone exceeds
+`webhooks.max_payload_bytes` is sent with the winner's value left out, and says so, never dropped:
+
+```json
+"winner": { "stamp": "1795…-9f3c…-0000…", "valueOmitted": true,
+            "omittedReason": "value exceeds webhooks.max_payload_bytes; read the cell from the collection" }
+```
 
 ---
 

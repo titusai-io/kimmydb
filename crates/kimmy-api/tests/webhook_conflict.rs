@@ -584,3 +584,44 @@ async fn a_batch_of_document_events_has_the_stamp_id_of_its_first_event_in_the_h
     let parts: Vec<&str> = id.splitn(3, '-').collect();
     assert_eq!(parts.len(), 3, "{{hlc}}-{{node}}-{{epoch}}: {id}");
 }
+
+/// The winner can be a whole subdocument or array: an event that alone exceeds the payload cap is delivered with the winner's value
+/// left out, and says so, rather than dropped (an event is never dropped for its size).
+#[tokio::test]
+async fn a_conflict_event_whose_winner_exceeds_the_cap_is_delivered_without_its_value() {
+    let (state, _d, _other, _od, addr, seen) = an_owner_with_a_clash().await;
+    let coll: CollectionMeta = state.engine.get_collection("shop", "orders").unwrap();
+    later();
+    state
+        .engine
+        .replace(&coll, &DocId::Int64(1), doc! { "_id": 1, "x": "w".repeat(6_000) }, false)
+        .unwrap();
+    subscribe(&state, &format!("http://{addr}/hook"), &["conflictResolved"]);
+    let limits = dispatch::Limits { max_payload_bytes: 2_000, ..Default::default() };
+    let mut backoff = dispatch::Backoff::default();
+
+    // One event a batch: each alone does not fit with the winner's value in it.
+    pass_under(&state, &mut backoff, limits).await;
+    pass_under(&state, &mut backoff, limits).await;
+
+    let told = conflict_events(&seen);
+    assert_eq!(told.len(), 2, "both entries are delivered, not dropped: {told:#?}");
+    for event in &told {
+        assert_eq!(
+            event["winner"]["valueOmitted"],
+            json!(true),
+            "the winner's value is left out: {event}"
+        );
+        assert!(event["winner"]["value"].is_null(), "and is not there: {event}");
+        assert!(event["winner"]["stamp"].is_string(), "the winner's stamp stays: {event}");
+        assert!(event["eventId"].as_str().unwrap().starts_with("cr1-"), "{event}");
+        assert_eq!(event["kind"], "clash", "{event}");
+        assert!(event["loser"]["stamp"].is_string(), "the loser is whole: {event}");
+    }
+    assert!(
+        !seen.lock().iter().any(|d| d.body.contains("wwwwwwwwww")),
+        "no part of the winner's value leaks through"
+    );
+    // And the subscription advances rather than wedging on the event.
+    assert_eq!(pass_under(&state, &mut backoff, limits).await.delivered, 0);
+}
