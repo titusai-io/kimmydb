@@ -522,10 +522,21 @@ fn wanted(entry: &OplogEntry, collection_id: u64, operations: &[String]) -> bool
         OpKind::Update => "update",
         OpKind::Replace => "replace",
         OpKind::Delete => "delete",
+        // A loss record is told only to a subscription that NAMES `conflictResolved`: an empty list is the
+        // document operations, never the new one. An entry that cannot be rendered (no document key, a
+        // body that does not decode) is not wanted, so progress steps over it like any other entry that is
+        // not the subscription's.
+        OpKind::LossRecord => {
+            return crate::conflict_event::is_renderable(entry)
+                && operations.iter().any(|o| o == CONFLICT_RESOLVED);
+        }
         _ => return false,
     };
     operations.is_empty() || operations.iter().any(|o| o == name)
 }
+
+/// The operation name a subscription lists to be told of lost writes.
+const CONFLICT_RESOLVED: &str = "conflictResolved";
 
 /// The event body a receiver gets, in the change-stream shape.
 ///
@@ -596,7 +607,12 @@ fn envelope_overhead(subscription: &str) -> usize {
 /// 3. That lone event goes out even if it still does not fit, which can only
 ///    happen with an enormous `_id`. A subscription that refused to send it
 ///    would never advance past it.
-fn assemble(job: &Job, entries: &[OplogEntry], max_payload_bytes: usize) -> Delivery {
+fn assemble(
+    engine: &kimmy_storage::Engine,
+    job: &Job,
+    entries: &[OplogEntry],
+    max_payload_bytes: usize,
+) -> Delivery {
     let subscription = job.id.as_str();
     let mut events: Vec<Value> = Vec::new();
     let mut stamps: Vec<Stamp> = Vec::new();
@@ -607,7 +623,11 @@ fn assemble(job: &Job, entries: &[OplogEntry], max_payload_bytes: usize) -> Deli
     let mut used = envelope_overhead(subscription);
 
     for entry in entries.iter().take(BATCH) {
-        let candidate = render(entry, &job.database, &job.collection);
+        // A loss entry is told by the owner whatever its origin (V6M2), as the event of its record: the same
+        // `eventId` for every entry that carries it. Its winner is read here, at the delivery being planned.
+        let Some(candidate) = render_entry(engine, entry, &job.database, &job.collection) else {
+            continue;
+        };
         let cost = candidate.to_string().len() + usize::from(!events.is_empty());
         if used + cost <= max_payload_bytes {
             used += cost;
@@ -617,6 +637,12 @@ fn assemble(job: &Job, entries: &[OplogEntry], max_payload_bytes: usize) -> Deli
         }
 
         if events.is_empty() {
+            if entry.kind.is_loss_record() {
+                // Rule 3 for now: the lone event goes out as it is.
+                events.push(candidate);
+                stamps.push(entry.stamp);
+                break;
+            }
             // Rule 2: too large on its own, so the document comes off rather
             // than the event being skipped.
             let mut stripped = render_without_document(entry, &job.database, &job.collection);
@@ -636,13 +662,38 @@ fn assemble(job: &Job, entries: &[OplogEntry], max_payload_bytes: usize) -> Deli
         break;
     }
 
-    Delivery { body: envelope(subscription, &events), stamps }
+    let first_event_id = first_event_id(&events);
+    Delivery { body: envelope(subscription, &events), stamps, first_event_id }
+}
+
+/// One entry as the event a receiver gets: a document change in the change-stream shape, or a loss entry as `conflictResolved`.
+/// `None` for a loss entry that cannot be told (`wanted` keeps those out of a batch).
+fn render_entry(
+    engine: &kimmy_storage::Engine,
+    entry: &OplogEntry,
+    database: &str,
+    collection: &str,
+) -> Option<Value> {
+    if !entry.kind.is_loss_record() {
+        return Some(render(entry, database, collection));
+    }
+    let id = entry.doc_id.as_ref()?;
+    let (key, _) =
+        kimmy_core::merge_state::MergeState::decode_loss_record(entry.body.as_deref()?).ok()?;
+    // The cell now at the path, read where the pass plans: inside the blocking hand-off that reads the oplog.
+    let winner = engine.conflict_winner(entry.collection, id, &key.at).ok().flatten();
+    let mut event = crate::conflict_event::body(entry, winner, false)?;
+    event["database"] = json!(database);
+    event["collection"] = json!(collection);
+    Some(event)
 }
 
 /// One batch, rendered and ready to send.
 struct Delivery {
     body: String,
     stamps: Vec<Stamp>,
+    /// The `eventId` of the first event in the batch: what `X-Kimmy-Event-Id` carries.
+    first_event_id: String,
 }
 
 /// A globally unique id for one change.
@@ -660,9 +711,10 @@ fn stamp_event_id(stamp: &Stamp) -> String {
     format!("{}-{}-{}", stamp.hlc, stamp.node, stamp.epoch.to_hex())
 }
 
-/// The `X-Kimmy-Event-Id` of a batch: the id of its first event, empty for none.
-fn first_event_id(stamps: &[Stamp]) -> String {
-    stamps.first().map(stamp_event_id).unwrap_or_default()
+/// The `X-Kimmy-Event-Id` of a batch: the `eventId` of its first event, empty for none. A document event's is its stamp's; a
+/// `conflictResolved` event's is the id of its record, the same whichever member's entry carried it.
+fn first_event_id(events: &[Value]) -> String {
+    events.first().and_then(|e| e["eventId"].as_str()).unwrap_or_default().to_string()
 }
 
 /// `HMAC-SHA256(secret, timestamp || "." || body)`, hex.
@@ -1142,7 +1194,7 @@ pub async fn dispatch_once_owned(
                 backlog_ms = backlog_ms.max(now_ms.saturating_sub(oldest.stamp.hlc.wall_ms));
             }
 
-            let delivery = assemble(&job, &batch, limits.max_payload_bytes);
+            let delivery = assemble(&state.engine, &job, &batch, limits.max_payload_bytes);
             let events = delivery.stamps.len();
             // Through the whole window when this batch takes every wanted entry in it;
             // otherwise (the batch cap, the payload cap) only through the last entry
@@ -1360,7 +1412,7 @@ async fn deliver_within(
     // so the timestamp a receiver checks against replay is the send time.
     let timestamp = kimmy_storage::physical_now_ms();
     let signature = sign(&job.secret, timestamp, &delivery.body);
-    let first = first_event_id(&delivery.stamps);
+    let first = delivery.first_event_id.clone();
 
     let mut request = client
         .post(&job.url)
@@ -1781,7 +1833,7 @@ pub(crate) mod tests {
             operations: Vec::new(),
             invalidated: false,
         };
-        (job, Delivery { body: "{}".into(), stamps: Vec::new() })
+        (job, Delivery { body: "{}".into(), stamps: Vec::new(), first_event_id: String::new() })
     }
 
     /// **A resolver that does not answer fails the delivery at its deadline,
@@ -2407,9 +2459,51 @@ pub(crate) mod tests {
         let mut new = old.clone();
         new.stamp.epoch = Epoch::new(old.stamp.hlc, [1; 8]);
         assert_ne!(event_id(&old), event_id(&new));
-        let header = |e: &OplogEntry| super::first_event_id(&[e.stamp]);
+        let header = |e: &OplogEntry| super::first_event_id(&[super::render(e, "d", "c")]);
         assert_ne!(header(&old), header(&new), "nor the X-Kimmy-Event-Id header");
         assert_eq!(header(&new), event_id(&new), "the header is the first event's id");
+    }
+
+    /// A loss entry of collection `collection` whose body decodes.
+    fn a_loss_entry(collection: u64) -> OplogEntry {
+        use kimmy_core::merge_state::{
+            LossKey, LossKind, LossValue, MStamp, MergeState, Path, Value, WriterId,
+        };
+        let writer = WriterId { node: NodeId::from_bytes([3; 16]), epoch: Epoch::ZERO };
+        let key = LossKey::field(
+            LossKind::Clash,
+            Path::flat("x").unwrap(),
+            MStamp { hlc: Hlc::new(5, 0), writer },
+        );
+        OplogEntry {
+            body: Some(MergeState::encode_loss_record(&key, &LossValue::Value(Value::Int64(1)))),
+            ..entry(OpKind::LossRecord, collection, 9)
+        }
+    }
+
+    /// `conflictResolved` is opt-in: only a subscription that lists it is told a loss entry, on its own collection, and one that
+    /// cannot be rendered is told to no one.
+    #[test]
+    fn a_loss_entry_is_wanted_only_by_a_subscription_that_lists_conflict_resolved() {
+        let loss = a_loss_entry(7);
+        let listed = vec!["conflictResolved".to_string()];
+        assert!(wanted(&loss, 7, &listed), "a subscription that lists it is told");
+        assert!(wanted(&loss, 7, &["insert".to_string(), "conflictResolved".to_string()]));
+        assert!(!wanted(&loss, 7, &[]), "an empty list is the document operations, not this one");
+        assert!(!wanted(&loss, 7, &["insert".to_string()]), "nor is a list that does not name it");
+        assert!(!wanted(&loss, 8, &listed), "another collection's record is not its");
+        let mut no_key = a_loss_entry(7);
+        no_key.doc_id = None;
+        assert!(!wanted(&no_key, 7, &listed), "a loss entry without a document key cannot be told");
+        let mut garbled = a_loss_entry(7);
+        garbled.body = Some(vec![0xff, 0xff]);
+        assert!(!wanted(&garbled, 7, &listed), "nor one whose body does not decode");
+        // A document event is wanted by a list that does not name `conflictResolved`, as it always was.
+        assert!(wanted(&entry(OpKind::Insert, 7, 1), 7, &["insert".to_string()]));
+        assert!(
+            !wanted(&entry(OpKind::Insert, 7, 1), 7, &listed),
+            "and a list of only it asks for no document change"
+        );
     }
 
     #[test]
