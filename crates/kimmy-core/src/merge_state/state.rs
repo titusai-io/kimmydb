@@ -375,6 +375,8 @@ pub enum LossReceive {
     Oversize,
     /// A total past the bound, or a decimal no writer produces.
     Invalid,
+    /// The record's lost write is at or below the collection's incarnation floor (a life a drop ended).
+    Floor,
 }
 
 /// The replicated merge state. Grow-only components are joined by union, cells
@@ -869,6 +871,23 @@ impl MergeState {
         } else {
             (LossReceive::Added, dropped.len())
         }
+    }
+
+    /// [`MergeState::receive_loss_counted`] behind the collection's incarnation floor: a record whose lost write is at or
+    /// below `floor` is refused ([`LossReceive::Floor`]) and the state is left as it was. The one rule of a loss entry
+    /// reaching a state, shared by the live apply, the fold of the records parked for a document and the rewind's
+    /// [`super::state_at`], so that the state at a target is what the live apply of the same entries gives.
+    pub fn receive_loss_floored(
+        &mut self,
+        key: LossKey,
+        val: LossValue,
+        floor: Option<Hlc>,
+        o: &JoinOptions,
+    ) -> (LossReceive, usize) {
+        if floor.is_some_and(|floor| key.stamp.hlc <= floor) {
+            return (LossReceive::Floor, 0);
+        }
+        self.receive_loss_counted(key, val, o)
     }
 
     pub(crate) fn alive_set(&self, ret: u64) -> BTreeSet<MStamp> {

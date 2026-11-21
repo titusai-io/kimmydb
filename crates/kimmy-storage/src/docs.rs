@@ -1974,13 +1974,8 @@ impl Engine {
         };
         let floor = Self::floor_of(txn, coll)?;
         let mut refused = crate::loss_pending::Refusals::default();
-        if floor.is_some_and(|floor| record.stamp.hlc <= floor) {
-            refused.add(crate::LossRefusal::Floor, 1);
-            self.count_loss_refusals(&refused);
-            return Ok(kept);
-        }
         let (outcome, evicted) =
-            state.receive_loss_counted(record.clone(), value.clone(), &options);
+            state.receive_loss_floored(record.clone(), value.clone(), floor, &options);
         refused.note_receive(outcome, evicted);
         self.count_loss_refusals(&refused);
         if outcome != kimmy_core::merge_state::LossReceive::Added {

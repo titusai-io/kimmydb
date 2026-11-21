@@ -139,7 +139,7 @@ pub use state::{
     Excess, Gen, Life, LifeKind, LossReceive, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState,
     ObsKey, OverCaps, Pair, Reg, Slot, Vv,
 };
-pub use state_at::state_at;
+pub use state_at::{StateAtEntry, state_at};
 pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MAX_LOSS_CAP,
     MAX_LOSS_CUT, MIN_LOSS_CAP, MIN_LOSS_CUT, MStamp, Path, Value, WriterId,
