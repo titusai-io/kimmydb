@@ -26,6 +26,7 @@ mod oracle_tests;
 mod ord_replay;
 mod order_oracle;
 mod probes;
+mod rewind_probe;
 mod rng;
 mod sim;
 
@@ -71,9 +72,13 @@ fn random_runs(rep: &mut Report, n: u64, label: &str, restore: bool, bound: Opti
     let mut c = BTreeMap::new();
     let (mut snaps, mut rest, mut records) = (0, 0, 0);
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rewound = rewind_probe::Tally::default();
     for seed in 0..n {
         let rc = RunConfig { restore, int_bound: bound, ..RunConfig::default() };
         let o = run(seed, &rc, &cfg);
+        if !restore {
+            rewind_probe::probe(&o, seed, &mut rewound);
+        }
         snaps += usize::from(o.nodes.iter().any(|m| m.snaps > 0));
         rest += usize::from(o.nodes.iter().any(|m| m.restored));
         if !o.settled {
@@ -87,11 +92,17 @@ fn random_runs(rep: &mut Report, n: u64, label: &str, restore: bool, bound: Opti
             *kinds.entry(format!("{:?}", k.kind)).or_default() += 1;
         }
     }
+    for (tag, (count, seed)) in &rewound.failures {
+        c.entry(format!("rewind {tag}")).or_insert((0, *seed)).0 += *count;
+    }
     println!(
         "[{label}] {n} runs ({snaps} snapshot, {rest} restore, {records} with a record): problems {}; kinds {kinds:?}; {:.2?}",
         fmt_problems(&c),
         t0.elapsed()
     );
+    if !restore {
+        println!("[{label}] rewind folds: {}", rewound.line());
+    }
     rep.check(label, &c);
 }
 
@@ -318,6 +329,63 @@ fn q3_probes(rep: &mut Report) {
     );
     for b in bad {
         rep.failures.push(format!("Q3: {b}"));
+    }
+}
+
+/// 5.2(iii) alone, as C7 asks: the state at a target, folded from a member's retained history (a collected prefix of
+/// it included), is graded as design 17 grades a finished run. `runner` runs the same probe inside `random_runs`.
+#[test]
+fn the_state_at_a_target_is_graded_as_design_17_grades_a_run_whatever_prefix_retention_collected() {
+    let n = env_u64("Q7_RUNS", 300);
+    let mut rep = Report::default();
+    random_runs(&mut rep, n, "no restore", false, None);
+    assert!(rep.failures.is_empty(), "{:#?}", rep.failures);
+}
+
+/// The same probe with the cap in reach: every member keeps `K = 4` loss records, and a required head without a record is
+/// exempt only where the cap explains it (the fold holds `K` records and the head ranks at or below the lowest held), the
+/// exemption of the law check. `Q7_RUNS` (default 300) runs.
+#[test]
+fn the_state_at_a_target_under_k_4_is_graded_with_the_cap_aware_exemption() {
+    let n = env_u64("Q7_RUNS", 300);
+    let mut cfg = Cfg::default_ret();
+    cfg.opts = cfg.opts.clone().with_loss_limits_unchecked(4, 4096);
+    let rc = RunConfig { restore: false, ..RunConfig::default() };
+    let mut tally = rewind_probe::Tally::default();
+    for seed in 0..n {
+        let out = run(seed, &rc, &cfg);
+        rewind_probe::probe(&out, seed, &mut tally);
+    }
+    println!("[K=4] {n} runs, rewind folds: {}", tally.line());
+    assert!(tally.failures.is_empty(), "{:?}", tally.failures);
+    assert!(tally.graded > 0 && tally.refused > 0, "the probe grades some folds and refuses some");
+}
+
+/// C7M9, argued by measurement: a rewind that folded with `JoinOptions::default()` instead of the collection's options still joins
+/// the fold through the collection's own (`field_write::join` in the plan), so the state it stores is the one the right options give.
+/// Checked with the cap in reach (K = 4), with a retention the history spreads past (R = 4), and with both.
+#[test]
+fn a_fold_with_the_default_options_joined_through_the_members_own_is_the_fold_with_the_members_own()
+{
+    use kimmy_core::merge_state::JoinOptions;
+    let n = env_u64("Q7_RUNS", 300);
+    for (label, k4, ret) in
+        [("K=4", true, None), ("R=4", false, Some(4u64)), ("K=4, R=4", true, Some(4))]
+    {
+        let mut cfg = Cfg::default_ret();
+        if k4 {
+            cfg.opts = cfg.opts.clone().with_loss_limits_unchecked(4, 4096);
+        }
+        let rc = RunConfig { steps: 24, retention: ret, restore: false, ..RunConfig::default() };
+        let mut tally = rewind_probe::Compose::default();
+        for seed in 0..n {
+            let out = run(seed, &rc, &cfg);
+            rewind_probe::options_compose(&out, seed, &JoinOptions::default(), &mut tally);
+        }
+        println!(
+            "[compose {label}] {n} runs: {} folds, {} differ (first seed {:?})",
+            tally.folds, tally.differs, tally.first_seed
+        );
     }
 }
 
