@@ -65,6 +65,9 @@ struct Opened {
     /// Entries at or below this, per origin, are passed over for the life of
     /// the stream: the client was already sent them (ADR-173).
     skip: Option<VersionVector>,
+    /// The token that set `skip` was issued by ANOTHER member (`issued.by != this origin`), whose vector says nothing about what
+    /// this member's own loss entries were rendered as: see `ChangeStream::accept`.
+    foreign: bool,
 }
 
 fn expired() -> StorageError {
@@ -178,6 +181,7 @@ impl Engine {
             delivered: opened.delivered,
             pending: None,
             skip: opened.skip,
+            foreign_resume: opened.foreign,
             incarnation_floor,
             passes_drops_below,
             db_of_collection: HashMap::new(),
@@ -220,6 +224,7 @@ impl Engine {
                     start: self.first_arrival_at_or_after(at, walked)?,
                     delivered: VersionVector::new(),
                     skip: None,
+                    foreign: false,
                 }
             }
             // No resume point: start live, skipping all history.
@@ -504,6 +509,7 @@ impl Engine {
                     start: seq + 1,
                     delivered: issued.delivered.clone(),
                     skip: Some(issued.delivered.clone()),
+                    foreign: false,
                 }),
                 // This member held every entry its streams delivered, until
                 // retention collected it. Whatever came between is gone.
@@ -538,6 +544,7 @@ impl Engine {
                     start: self.first_arrival_beyond(&issued.delivered, walked)?,
                     delivered: issued.delivered.clone(),
                     skip: Some(issued.delivered.clone()),
+                    foreign: true,
                 })
             }
             None => {
@@ -552,7 +559,7 @@ impl Engine {
                     None if self.stamp_collected(&stamp)? => return Err(expired()),
                     None => self.first_arrival_stamped_after(0, stamp, walked)?,
                 };
-                Ok(Opened { start, delivered: VersionVector::new(), skip: None })
+                Ok(Opened { start, delivered: VersionVector::new(), skip: None, foreign: false })
             }
         }
     }
@@ -570,7 +577,7 @@ impl Engine {
             arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1)
         };
         let delivered = Engine::read_versions_in(&txn, tables::OPLOG_WITNESSED)?;
-        Ok(Opened { start, delivered, skip: None })
+        Ok(Opened { start, delivered, skip: None, foreign: false })
     }
 
     /// The first arrival position holding an entry above `delivered` for its
@@ -1453,6 +1460,8 @@ pub struct ChangeStream {
     /// Entries at or below this are never delivered: the token the stream
     /// resumed from says the client already has them.
     skip: Option<VersionVector>,
+    /// `skip` came from another member's token (see [`Opened::foreign`]).
+    foreign_resume: bool,
     /// For a collection stream resumed from another member's token, the drop
     /// its incarnation began after: entries of the collection stamped at or
     /// before it belong to the previous one.
@@ -1645,6 +1654,14 @@ impl ChangeStream {
             return None;
         }
 
+        // A loss record is told to a client by the member that minted it, once: the entry of its OWN, appended in the transaction
+        // in which the record entered its state (`conflictResolved`). A loss entry of another member's is that member's report, kept
+        // here to be served onward; telling it too would repeat the own entry of a record that entered, and tell records that
+        // were refused or parked here.
+        if entry.kind.is_loss_record() && entry.stamp.node != engine.node_id() {
+            return None;
+        }
+
         // The previous incarnation's history, older drops included.
         if let Some((collection, floor)) = self.incarnation_floor
             && entry.collection == collection
@@ -1663,8 +1680,13 @@ impl ChangeStream {
         // this member's report without the issuing member ever having held it
         // (ADR-173). Delivering it can only repeat a report of the same
         // event.
+        //
+        // Nor is an own loss entry when the token is another member's: that vector counts what the issuer's stream sent, and the
+        // issuer sends only ITS OWN loss entries, so it can cover this member's stamps without the client ever having been told
+        // this member's records. A token this member issued itself (`issued.by == origin`) skips them as it skips any entry.
         if let Some(skip) = &self.skip
             && !entry.kind.is_local_observation()
+            && !(self.foreign_resume && entry.kind.is_loss_record())
             && entry.stamp.hlc <= skip.get(entry.stamp.origin())
         {
             return None;

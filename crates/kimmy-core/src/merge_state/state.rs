@@ -981,6 +981,12 @@ impl MergeState {
         out
     }
 
+    /// The stamp of the newest life that is alive: the life a read of the document stands in, `None` when none is (the
+    /// document is deleted or was never written).
+    pub fn standing_life(&self, o: &JoinOptions) -> Option<MStamp> {
+        self.alive_set(o.retention).iter().next_back().copied()
+    }
+
     /// The winning register of `p` among the alive lives.
     pub fn winner(&self, p: &Path, o: &JoinOptions) -> Option<&Reg> {
         self.winner_in(p, &self.alive_set(o.retention), o)

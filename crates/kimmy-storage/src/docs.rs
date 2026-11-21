@@ -1907,6 +1907,7 @@ impl Engine {
             if !within_the_emission_window(record.stamp.hlc, retention, now_ms) {
                 continue;
             }
+            txn.note_loss_minted(record.kind);
             let entry = OplogEntry {
                 stamp: self.next_stamp(),
                 kind: OpKind::LossRecord,
