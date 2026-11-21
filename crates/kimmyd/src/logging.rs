@@ -246,6 +246,50 @@ impl TelemetryGuard {
             "Loss records this member did not keep: with a total past the bound or a decimal no writer produces. An event on this member, not a count of distinct records.",
             |s| s.loss_records_refused[5]
         );
+        // `kimmy_conflicts_resolved_total{kind}` (Q7 Step 4, C8): one instrument per kind, in the order of `LossKind::ALL` (the order
+        // the snapshot's array is filled in), spelled in snake case as `kimmy.catching_up.*` is.
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.clash",
+            "{event}",
+            "`conflictResolved` events this member made for a `clash` loss record. Per member: two members count one lost write separately.",
+            |s| s.conflicts_resolved[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.delete_won",
+            "{event}",
+            "`conflictResolved` events this member made for a `deleteWon` loss record. Per member: two members count one lost write separately.",
+            |s| s.conflicts_resolved[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.insert_lost",
+            "{event}",
+            "`conflictResolved` events this member made for an `insertLost` loss record. Per member: two members count one lost write separately.",
+            |s| s.conflicts_resolved[2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.retired_writer",
+            "{event}",
+            "`conflictResolved` events this member made for a `retiredWriter` loss record. The kind is reserved and stays 0.",
+            |s| s.conflicts_resolved[3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.type_clash",
+            "{event}",
+            "`conflictResolved` events this member made for a `typeClash` loss record. Per member: two members count one lost write separately.",
+            |s| s.conflicts_resolved[4]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.conflicts_resolved.array_clash",
+            "{event}",
+            "`conflictResolved` events this member made for an `arrayClash` loss record. Per member: two members count one lost write separately.",
+            |s| s.conflicts_resolved[5]
+        );
         observe!(
             u64_observable_counter,
             "kimmy.commits",
@@ -3213,6 +3257,68 @@ mod tests {
             assert!(
                 call.contains(&format!("slot_of(\"{state}\")")),
                 "{name} does not read the slot of `{state}`: {call}"
+            );
+        }
+    }
+
+    /// The call of the one instrument of this name on the bridge, whitespace removed: from its name to the end of its `observe!`.
+    fn instrument_call(name: &str) -> String {
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
+        let quoted = format!("\"{name}\"");
+        assert_eq!(source.matches(&quoted).count(), 1, "{quoted}: one instrument");
+        let at = source.find(&quoted).unwrap();
+        let call = &source[at..at + source[at..].find(");").expect("the call ends")];
+        call.split_whitespace().collect()
+    }
+
+    #[test]
+    fn each_conflicts_resolved_instrument_reads_the_slot_of_its_own_kind() {
+        // The six instruments of `kimmy_conflicts_resolved_total{kind}` each read one slot of
+        // `MetricsSnapshot::conflicts_resolved`, which is filled in the order of `LossKind::ALL`.
+        // The slot is written beside the name, so a swap or a copy would publish one kind's
+        // count under another's name and pass the coverage test, which reads names only. The
+        // names are spelled here from the kinds' own labels (`deleteWon` as `delete_won`), so a
+        // misspelt instrument is not found and fails too.
+        fn snake(label: &str) -> String {
+            label.chars().fold(String::new(), |mut out, c| {
+                if c.is_ascii_uppercase() {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+                out
+            })
+        }
+        assert_eq!(
+            snake("retiredWriter") + &snake("typeClash") + &snake("arrayClash"),
+            "retired_writertype_clasharray_clash",
+            "the spelling the instruments use"
+        );
+        for (slot, kind) in kimmy_core::merge_state::LossKind::ALL.iter().enumerate() {
+            let name = format!("kimmy.conflicts_resolved.{}", snake(kind.as_str()));
+            let call = instrument_call(&name);
+            let want = format!("|s|s.conflicts_resolved[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{}`: {call}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn each_loss_records_refused_instrument_reads_the_slot_of_its_own_reason() {
+        // As for the kinds of `kimmy_conflicts_resolved_total`: the six instruments of
+        // `kimmy_loss_records_refused_total{reason}` read `MetricsSnapshot::loss_records_refused`
+        // by an index written beside the name, in the order of `LossRefusal::ALL`.
+        for (slot, reason) in kimmy_storage::LossRefusal::ALL.iter().enumerate() {
+            let name = format!("kimmy.loss_records_refused.{}", reason.label());
+            let call = instrument_call(&name);
+            let want = format!("|s|s.loss_records_refused[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{}`: {call}",
+                reason.label()
             );
         }
     }

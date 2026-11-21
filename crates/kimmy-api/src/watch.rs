@@ -108,7 +108,14 @@ async fn pump(
             }
             event = stream.next(&state.engine) => {
                 let Some(event) = event else { break };
-                let payload = match render(&event, full_document) {
+                // A loss entry of this member's own is an event of its own kind, whose winner is read now; `render` has no engine.
+                let rendered = match &event {
+                    ChangeEvent::Change { entry, token } if entry.kind.is_loss_record() => {
+                        crate::conflict_event::render(&state.engine, entry, token)
+                    }
+                    _ => render(&event, full_document),
+                };
+                let payload = match rendered {
                     Some(p) => p,
                     None => continue,
                 };

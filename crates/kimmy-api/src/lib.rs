@@ -22,6 +22,7 @@ pub mod egress {
     /// The wording of a refused webhook destination.
     pub const WEBHOOKS: Purpose = Purpose::new("webhooks", "webhooks.allowed_hosts");
 }
+pub mod conflict_event;
 pub mod error;
 pub mod exec;
 pub mod expiry;

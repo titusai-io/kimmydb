@@ -38,7 +38,7 @@ Each event is one JSON text frame:
 | `full_document=true` | Include the post-image on every event |
 
 `operationType` is `insert`, `update`, `replace`, `delete`, `uniqueViolation`,
-`unkeyedDocument`, or `invalidate`. Requires the `watch` action on the collection — which is
+`unkeyedDocument`, `conflictResolved`, or `invalidate`. Requires the `watch` action on the collection — which is
 **not** implied by `read`. See [Security](security.md).
 
 **An event is a change.** An update, replace or `find_and_modify` that leaves
@@ -99,6 +99,53 @@ not announced again, and neither is a re-delivery of an entry already applied. T
 document is stored and every query still finds it. `GET
 …/indexes/{name}/unkeyed` lists what stands. See [ADR-139](decisions.md) and
 [ADR-258](decisions.md).
+
+### `conflictResolved`
+
+A `conflictResolved` event reports a **lost write** of a `field` collection: two writes met and one did not survive (a `clash` of two
+values at a field, a `deleteWon`, an `insertLost`, a `typeClash`, an `arrayClash`). It names the document, the place, the kind, the
+write that lost and what stands there now:
+
+```json
+{
+  "operationType": "conflictResolved",
+  "eventId": "cr1-7df2d7135d7d8698fe8b2c57609cac761da42af817fd440c72a08c11610fe812",
+  "documentKey": { "_id": 1 },
+  "path": "a.b",
+  "kind": "clash",
+  "loser":  { "stamp": "…", "value": 3, "truncated": false },
+  "winner": { "stamp": "…", "value": 4 },
+  "resumeToken": "…",
+  "clusterTime": "…"
+}
+```
+
+- **`path`** is `null` for `insertLost` of a whole document, and then `winner` is `{ "stamp": <the standing life>, "value": null }`:
+  read the document. `loser.value` is the lost value as the record kept it: `truncated: true` says it was cut to the collection's cut
+  (`storage.loss_value_cut_bytes`, [Storage](storage.md)). A counter's lost value is its total.
+- **`winner` is the winner at delivery.** A loss record names the write that lost, never the one that won, so the winner is the cell
+  now at the path, read from the stored document when the event is sent. A replayed event can therefore show another winner than its
+  first delivery; a deleted document has `"winner": null`; and a record can name a write that is alive (a record kept beside a live
+  register: [Deviations](deviations.md)), so `winner.stamp` can equal `loser.stamp`. The event is not withdrawn then. Read the document
+  for the state of record.
+- **It is per member and at least once.** A member reports a loss **when the loss reaches it**: it makes the event for each loss
+  record that enters its own state, by any route (a write it applies, a snapshot or Converge page, a loss record sent to it), within the
+  retention time of the lost write by its own clock, and for no other. Over the **union of the members' streams** every loss that
+  entered any member's state inside that time is reported at least once. **A consumer of one member's stream can miss a record that
+  member never held**: the member reports what entered its state, and two members' states differ in which records they hold (the
+  records are a union, not a join: [Deviations](deviations.md)). Not reported: a rewind's (it reports none, and the records of the rewound
+  state are not announced), a record older than the retention time by the member's clock, and a record the cap refused on arrival.
+- **Deduplicate on `eventId`.** It is the same on every member and in every process and build (a SHA-256 over the collection, the document
+  key, the path, the kind and the loser's stamp, behind `cr1-`; it is not the stamp-shaped `eventId` of a webhook). The server does not
+  deduplicate. The same `eventId` can come **from each member's stream**, and **twice from one member**: a rewind discards the member's
+  own record of a loss, and the record can enter its state again by a later pull and be reported again. The lost write is
+  `(documentKey, path, loser.stamp)`; one write can carry **two kinds** (a `clash` where the other write met it first, an `insertLost`
+  where the news of its life's supersession did: the same write has a different kind on another member), and so has two `eventId`s.
+- **Order and resume.** The event comes after the change that caused it, in the order of the member's own log, and its `resumeToken`
+  resumes like any other: a token this member issued skips what it already sent, and a token another member issued resumes here without
+  skipping this member's own events that the other stream never sent.
+
+The `kimmy_conflicts_resolved_total{kind}` counter on `/metrics` counts the events a member has made ([Operations](operations.md)).
 
 ---
 
