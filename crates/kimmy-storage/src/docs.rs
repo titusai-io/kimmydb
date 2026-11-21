@@ -924,12 +924,12 @@ impl Engine {
             Some(image) => image.stamp.expect("an insert mints a stamp"),
             None => self.next_stamp(),
         };
-        let (body, meta) = match field {
+        let (body, meta, entered) = match field {
             Some(image) => {
-                let meta = self.with_parked_records(txn, coll, &key, image.meta, Some(&id))?;
-                (image.body, Some(meta))
+                let (meta, entered) = self.fold_parked_records(txn, coll, &key, image.meta)?;
+                (image.body, Some(meta), entered)
             }
-            None => (body, None),
+            None => (body, None, Vec::new()),
         };
         {
             let mut docs = txn.open_table(tables::DOCS)?;
@@ -953,6 +953,8 @@ impl Engine {
             meta,
         };
         append_oplog(txn, &entry)?;
+        // After the entry of the write that stored the state: a stream reads the change before the news of the loss.
+        self.append_own_loss_entries(txn, coll, &id, entered)?;
 
         Ok((id, entry))
     }
@@ -1064,7 +1066,7 @@ impl Engine {
         let key = doc_key(id)?;
 
         let field = coll.merge_policy == MergePolicy::Field;
-        let (existed, stamp, body, meta) = {
+        let (existed, stamp, body, meta, entered) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The id is part of the document's identity, not its content: a
             // replace must not be able to move a document to a different
@@ -1168,7 +1170,7 @@ impl Engine {
 
             // Minted only once there is something to write, and still under
             // the writer (ADR-148).
-            let (stamp, meta) = if field {
+            let (stamp, meta, entered) = if field {
                 let writer = self.field_writer(coll)?;
                 let image = match (existed, prior) {
                     (true, Some(state)) => {
@@ -1186,10 +1188,10 @@ impl Engine {
                         "the stored image differs from the image of the dry run".into(),
                     ));
                 }
-                let meta = self.with_parked_records(txn, coll, &key, image.meta, Some(id))?;
-                (image.stamp.expect("a write that changes mints a stamp"), Some(meta))
+                let (meta, entered) = self.fold_parked_records(txn, coll, &key, image.meta)?;
+                (image.stamp.expect("a write that changes mints a stamp"), Some(meta), entered)
             } else {
-                (self.next_stamp(), None)
+                (self.next_stamp(), None, Vec::new())
             };
             let mut record = DocRecord::live(stamp, body.clone());
             record.meta = meta.clone();
@@ -1201,7 +1203,7 @@ impl Engine {
                 &codec::encode_doc_record(&record),
             )?;
             drop(docs);
-            (existed, stamp, body, meta)
+            (existed, stamp, body, meta, entered)
         };
 
         let entry = OplogEntry {
@@ -1215,6 +1217,8 @@ impl Engine {
             meta,
         };
         append_oplog(txn, &entry)?;
+        // After the entry of the write that stored the state: a stream reads the change before the news of the loss.
+        self.append_own_loss_entries(txn, coll, id, entered)?;
 
         let outcome = WriteOutcome {
             matched: existed,
@@ -1829,7 +1833,9 @@ impl Engine {
     /// parked, which is every write but the first after a loss entry arrived ahead of its document).
     ///
     /// `emit` names the document when each folded record that enters the state also gets an entry of this member's own
-    /// (V6M2): a local write does; the rewind, which produces no loss entry, passes `None`.
+    /// (V6M2) here, before anything else is appended; the rewind, which produces no loss entry, passes `None`. A local
+    /// write uses [`Self::fold_parked_records`] instead and mints after its own entry, so a stream reads the change
+    /// before the news of the loss.
     pub(crate) fn with_parked_records(
         &self,
         txn: &WriteTxn<'_>,
@@ -1838,8 +1844,24 @@ impl Engine {
         meta: Vec<u8>,
         emit: Option<&DocId>,
     ) -> Result<Vec<u8>> {
+        let (meta, entered) = self.fold_parked_records(txn, coll, key, meta)?;
+        if let Some(id) = emit {
+            self.append_own_loss_entries(txn, coll, id, entered)?;
+        }
+        Ok(meta)
+    }
+
+    /// [`Self::with_parked_records`] without the minting: the state with what was parked folded in, and the records that
+    /// entered it, for the caller to mint after the entry of the write that stores the state.
+    pub(crate) fn fold_parked_records(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        key: &[u8],
+        meta: Vec<u8>,
+    ) -> Result<(Vec<u8>, ParkedEntered)> {
         if !crate::loss_pending::any(txn, coll.id.0, key)? {
-            return Ok(meta);
+            return Ok((meta, Vec::new()));
         }
         let mut state = field_write::load(Some(&meta))?;
         let options = self.field_writer(coll)?.options();
@@ -1856,10 +1878,7 @@ impl Engine {
             &mut refused,
         )?;
         self.count_loss_refusals(&refused);
-        if let Some(id) = emit {
-            self.append_own_loss_entries(txn, coll, id, entered)?;
-        }
-        Ok(state.encode_compact())
+        Ok((state.encode_compact(), entered))
     }
 
     /// V6M2: a member appends an entry of its own, and only one, for each loss record that **enters its state**,
@@ -2193,20 +2212,28 @@ impl Engine {
         // A record the join put into the state, by a writer's entry, a snapshot page or a repair (and the fold above,
         // which went through the incoming state): an entry of this member's own for it. A snapshot document is state
         // and not history, but the member's own loss entry is its own, so it is appended whatever the position.
-        if !joined.fresh.is_empty() {
-            let named = kept_id.as_ref().ok_or_else(|| {
+        // Minted AFTER the entry that brought it is appended (below), so a stream reads the change before the news of the loss and a
+        // token resumed at the change replays the loss; a state applied as state has no entry to follow, so it is minted after the row.
+        let to_mint = if joined.fresh.is_empty() {
+            None
+        } else {
+            let named = kept_id.clone().ok_or_else(|| {
                 StorageError::Corrupt(
                     "a loss record entered a state with no _id to name its document by".into(),
                 )
             })?;
-            self.append_own_loss_entries(txn, coll, named, joined.fresh.clone())?;
-        }
+            Some((named, joined.fresh.clone()))
+        };
         let next: Option<Document> =
             if joined.alive { Some(bson::deserialize_from_slice(&joined.body)?) } else { None };
         if previous == next {
             // The merged state moved and the document did not: the row is written (above), so the outcome
             // says so, and a page that commits only on a write commits it.
-            return self.field_entry_kept(txn, entry, position, true);
+            let kept = self.field_entry_kept(txn, entry, position, true)?;
+            if let Some((named, fresh)) = to_mint {
+                self.append_own_loss_entries(txn, coll, &named, fresh)?;
+            }
+            return Ok(kept);
         }
         let id = id.ok_or_else(|| {
             StorageError::Corrupt("a field document moved with no _id to name it by".into())
@@ -2221,6 +2248,9 @@ impl Engine {
             crate::engine::append_oplog_at(txn, entry, position)?
         };
         self.witness(&entry.stamp);
+        if let Some((named, fresh)) = to_mint {
+            self.append_own_loss_entries(txn, coll, &named, fresh)?;
+        }
         let unkeyed = self.append_unkeyed(txn, unkeyed_details(coll.id, &id, &filings))?;
         Ok(RemoteApplied::Applied { id, violations, unkeyed, released })
     }
@@ -2905,6 +2935,10 @@ pub(crate) fn version_of_entry(entry: &OplogEntry) -> kimmy_core::DocVersion {
         _ => kimmy_core::DocVersion::Stamp(entry.stamp),
     }
 }
+
+/// The loss records that entered a state, with their values.
+pub(crate) type ParkedEntered =
+    Vec<(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)>;
 
 /// Whether a record whose loser was stamped at `loser` is inside the emission window at `now_ms`: `R` after the
 /// loser's own wall time, by the member's clock.

@@ -42,6 +42,8 @@ mod late_drop;
 mod live_count;
 pub mod live_digest;
 mod live_walk;
+#[cfg(test)]
+mod loss_order_tests;
 mod loss_pending;
 pub mod merge;
 pub mod meta;
