@@ -2792,7 +2792,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.60.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.61.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2812,7 +2812,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.60.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.61.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2839,11 +2839,11 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
 data. The on-disk **storage schema** is checked on open, and 0.61.0 and later open only
-schema **8** (0.58.0 to 0.60.x open only schema 7):
+schema **11** (0.58.0 to 0.60.x open only schema 7):
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.58.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.61.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 
@@ -2929,7 +2929,7 @@ stop every member, then start 0.59.0 on the same data directories.
 **Upgrading from 0.60.x to 0.61.0: stop all, wipe, start all, reseed.** 0.61.0 keys every
 stamp, oplog row, version vector and resume token by an origin, a node and an epoch
 ([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)),
-and a stamp is 44 bytes where it was 26. **The storage schema is 8 and the cluster protocol is
+and a stamp is 44 bytes where it was 26. **The storage schema is 11 and the cluster protocol is
 3, so 0.61.0 refuses a 0.60 store and a 0.60 backup by name, and writes nothing to them: wipe
 first.** There is no migration code, and (ADR-127) no mixed-version cluster: stop every member
 before starting any on 0.61.0.
