@@ -549,6 +549,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
     let readings = StorageReadings {
         clock_refusals: Vec::new(),
         loss_records_refused: Vec::new(),
+        conflicts_resolved: Vec::new(),
         databases: 1,
         collections: 2,
         unique_violations: 3,

@@ -11964,6 +11964,12 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_loss_records_refused_total",
         "kimmy_loss_records_refused_total",
         "kimmy_loss_records_refused_total",
+        "kimmy_conflicts_resolved_total",
+        "kimmy_conflicts_resolved_total",
+        "kimmy_conflicts_resolved_total",
+        "kimmy_conflicts_resolved_total",
+        "kimmy_conflicts_resolved_total",
+        "kimmy_conflicts_resolved_total",
         "kimmy_commits",
         "kimmy_fsyncs",
         "kimmy_commits_grouped_total",
@@ -23515,4 +23521,74 @@ async fn covers_on_find_and_on_a_read_by_id_agree_for_the_same_document() {
             .await;
         assert_eq!(bad.status, 400, "{name}: {:?}", bad.body);
     }
+}
+
+/// A loss record that enters the member's state is a `conflictResolved` event on its change stream (and counts in the metric), the event
+/// names the lost write and the winner now, and the entry of ANOTHER member's that the first one relays is not told.
+#[tokio::test]
+async fn a_change_stream_tells_a_loss_that_entered_the_members_state_once() {
+    use kimmy_storage::{Engine, WalkScope};
+
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server
+        .post("/v1/db/shop/collections", Some(&token), json!({"name": "c", "mergePolicy": "field"}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let engine = &server.state.engine;
+    let coll = engine.get_collection("shop", "c").unwrap();
+    let everything = |e: &Engine| {
+        e.entries_for_peer(kimmy_core::Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries
+    };
+    engine.insert(&coll, bson::doc! { "_id": 1, "x": 0 }).unwrap();
+    // A second member takes the document, and both write field `x` at once.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = Engine::open(&other_dir.path().join("other.redb")).unwrap();
+    other.apply_batch(&everything(engine)).unwrap();
+    let other_coll = other.get_collection("shop", "c").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    engine
+        .replace(&coll, &kimmy_core::DocId::Int64(1), bson::doc! { "_id": 1, "x": 1 }, false)
+        .unwrap();
+    other
+        .replace(&other_coll, &kimmy_core::DocId::Int64(1), bson::doc! { "_id": 1, "x": 2 }, false)
+        .unwrap();
+    let mut socket =
+        open_watch(&server.base, "/v1/db/shop/coll/c/watch?from_start=true", &token).await;
+
+    // The member takes the other's write, a record enters its state, and it makes one event of its own for it.
+    engine.apply_batch(&everything(&other)).unwrap();
+    // And takes the entry the other member minted for the same loss when it met this member's write: relayed, never told.
+    other.apply_batch(&everything(engine)).unwrap();
+    engine.apply_batch(&everything(&other)).unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(frame) =
+        tokio::time::timeout(std::time::Duration::from_millis(1500), read_text_frame(&mut socket))
+            .await
+    {
+        events.push(serde_json::from_str::<Value>(&frame).expect("a JSON event"));
+    }
+    let told: Vec<&Value> =
+        events.iter().filter(|e| e["operationType"] == "conflictResolved").collect();
+    assert_eq!(told.len(), 1, "one event for the one record that entered: {events:#?}");
+    let event = told[0];
+    assert!(event["eventId"].as_str().unwrap().starts_with("cr1-"), "{event}");
+    assert_eq!(event["documentKey"]["_id"], 1, "{event}");
+    assert_eq!(event["path"], "x", "{event}");
+    assert_eq!(event["kind"], "clash", "{event}");
+    let (loser, winner) =
+        (event["loser"]["value"].as_i64().unwrap(), event["winner"]["value"].as_i64().unwrap());
+    assert_eq!([loser, winner].iter().copied().min(), Some(1), "one write each: {event}");
+    assert_eq!([loser, winner].iter().copied().max(), Some(2), "one write each: {event}");
+    assert!(
+        events.iter().position(|e| e["operationType"] == "replace").unwrap()
+            < events.iter().position(|e| e["operationType"] == "conflictResolved").unwrap(),
+        "the change, then the news of the loss: {events:#?}"
+    );
+    let page = metrics_text(&server).await;
+    assert!(
+        page.contains("kimmy_conflicts_resolved_total{kind=\"clash\"} 1"),
+        "the metric counts it:\n{page}"
+    );
 }

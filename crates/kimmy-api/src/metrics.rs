@@ -173,6 +173,9 @@ pub struct StorageReadings {
     /// Loss records not kept since start, by reason (`Engine::loss_records_refused`): refused on arrival (`cap`, `floor`,
     /// `horizon`, `oversize`, `invalid`) and `evicted` (held ones a newer record displaced). A monotonic count.
     pub loss_records_refused: Vec<(&'static str, u64)>,
+    /// `conflictResolved` events this member has made since start, by kind (`Engine::conflicts_resolved`): one for each loss entry of its
+    /// own that a committed transaction stored. A monotonic count.
+    pub conflicts_resolved: Vec<(&'static str, u64)>,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -379,6 +382,8 @@ pub struct MetricsSnapshot {
     /// Loss records not kept, in the order of `kimmy_storage::LossRefusal::ALL` (cap, evicted, floor, horizon, oversize,
     /// invalid): the series `kimmy_loss_records_refused_total{reason}`.
     pub loss_records_refused: [u64; 6],
+    /// `conflictResolved` events made, in the order of `LossKind::ALL`: the series `kimmy_conflicts_resolved_total{kind}`.
+    pub conflicts_resolved: [u64; 6],
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1480,6 +1485,18 @@ impl Metrics {
                 }
                 refused
             },
+            conflicts_resolved: {
+                let mut made = [0u64; 6];
+                for (label, n) in &readings.conflicts_resolved {
+                    if let Some(i) = kimmy_core::merge_state::LossKind::ALL
+                        .iter()
+                        .position(|k| k.as_str() == *label)
+                    {
+                        made[i] = *n;
+                    }
+                }
+                made
+            },
             commits: readings.commits,
             fsyncs: readings.fsyncs,
             commits_grouped: readings.commits_grouped,
@@ -1801,6 +1818,9 @@ impl Metrics {
              # HELP kimmy_loss_records_refused_total Loss records this member did not keep, by reason: `cap` (refused on arrival: the document already held K greater ones), `evicted` (a record it held that a newer one displaced), `floor` and `horizon` (a single record older than the collection's floor or the state's horizon), `oversize` (a value over the collection's cut) and `invalid`. Each count is an event on this member, not a count of distinct records: a record refused again by another route counts again. Records that age out of a state with the retention window are not refusals. Not part of any state, and not replicated.\n\
              # TYPE kimmy_loss_records_refused_total counter\n\
              {loss_refused_lines}\
+             # HELP kimmy_conflicts_resolved_total `conflictResolved` events this member has made, by the kind of the loss: one for each loss record that entered its state and that it reported (a record older than the retention time by this member's clock is not reported). Per member: two members count one lost write separately, and a write that carries a second kind counts again. `retiredWriter` is reserved and stays 0.\n\
+             # TYPE kimmy_conflicts_resolved_total counter\n\
+             {conflicts_resolved_lines}\
              # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
              # TYPE kimmy_commits counter\n\
              kimmy_commits {commits}\n\
@@ -2288,6 +2308,18 @@ impl Metrics {
                     })
                     .collect::<String>()
             },
+            // Every kind always has its sample, at zero before anything was reported, so a rate over it is defined.
+            conflicts_resolved_lines = kimmy_core::merge_state::LossKind::ALL
+                .iter()
+                .map(|kind| {
+                    let n = readings
+                        .conflicts_resolved
+                        .iter()
+                        .find(|(label, _)| *label == kind.as_str())
+                        .map_or(0, |(_, n)| *n);
+                    format!("kimmy_conflicts_resolved_total{{kind=\"{}\"}} {n}\n", kind.as_str())
+                })
+                .collect::<String>(),
             // Every reason always has its sample, at zero before anything was dropped, so a rate over it is defined.
             loss_refused_lines = kimmy_storage::LossRefusal::ALL
                 .iter()
@@ -3314,6 +3346,14 @@ mod tests {
                 ("oversize", 7_205),
                 ("invalid", 7_206),
             ],
+            conflicts_resolved: vec![
+                ("clash", 8_101),
+                ("deleteWon", 8_102),
+                ("insertLost", 8_103),
+                ("retiredWriter", 8_104),
+                ("typeClash", 8_105),
+                ("arrayClash", 8_106),
+            ],
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3409,6 +3449,14 @@ kimmy_loss_records_refused_total{reason=\"floor\"} 7203
 kimmy_loss_records_refused_total{reason=\"horizon\"} 7204
 kimmy_loss_records_refused_total{reason=\"oversize\"} 7205
 kimmy_loss_records_refused_total{reason=\"invalid\"} 7206
+# HELP kimmy_conflicts_resolved_total `conflictResolved` events this member has made, by the kind of the loss: one for each loss record that entered its state and that it reported (a record older than the retention time by this member's clock is not reported). Per member: two members count one lost write separately, and a write that carries a second kind counts again. `retiredWriter` is reserved and stays 0.
+# TYPE kimmy_conflicts_resolved_total counter
+kimmy_conflicts_resolved_total{kind=\"clash\"} 8101
+kimmy_conflicts_resolved_total{kind=\"deleteWon\"} 8102
+kimmy_conflicts_resolved_total{kind=\"insertLost\"} 8103
+kimmy_conflicts_resolved_total{kind=\"retiredWriter\"} 8104
+kimmy_conflicts_resolved_total{kind=\"typeClash\"} 8105
+kimmy_conflicts_resolved_total{kind=\"arrayClash\"} 8106
 # HELP kimmy_commits Durable write transactions committed by the storage engine.
 # TYPE kimmy_commits counter
 kimmy_commits 44
@@ -5102,6 +5150,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // sample of `kimmy_sync_clock_refused_total` that exists before any origin is named.
             2
             // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
+            + 6
+            // Since Q7 Step 4 (C8), `kimmy_conflicts_resolved_total` and its six kinds.
             + 6
             // Since Q7 Step 1, `kimmy_epoch_origins`.
             + 1 + 108 + 6 + 17

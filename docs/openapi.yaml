@@ -4959,6 +4959,66 @@ components:
                 document under it.
               enum: [parallel_arrays, too_many_keys, ambiguous_position, unencodable]
         - type: object
+          title: conflictResolved
+          description: |
+            A lost write of a `field` collection: two writes met and one did not
+            survive. Made by the member that holds the loss record, once, for each
+            record that entered its state (by a write it applied, a snapshot or
+            Converge page, or a loss record sent to it) within the retention time
+            of the lost write; a consumer of one member's stream can miss a record
+            that member never held. At least once over the members' streams:
+            deduplicate on `eventId`, which is the same on every member and can
+            repeat from one member after a rewind. The lost write is
+            `(documentKey, path, loser.stamp)`; one write can carry two kinds and
+            so two ids. Not a document change; the document is unchanged.
+          required: [operationType, eventId, resumeToken, clusterTime, documentKey, path, kind, loser, winner]
+          properties:
+            operationType:
+              const: conflictResolved
+            eventId:
+              type: string
+              description: |
+                `cr1-` and 64 hex digits: a SHA-256 over the collection, the document
+                key, the path, the kind and the loser's stamp. Not the stamp-shaped
+                `eventId` of a webhook.
+            resumeToken: { type: string }
+            clusterTime: { type: string }
+            documentKey:
+              type: object
+              properties:
+                _id: {}
+            path:
+              type: [string, "null"]
+              description: The dotted path of the field, `null` for a record about the whole document.
+            kind:
+              type: string
+              enum: [clash, deleteWon, insertLost, retiredWriter, typeClash, arrayClash]
+              description: "`retiredWriter` is reserved."
+            loser:
+              type: object
+              required: [stamp, value, truncated]
+              properties:
+                stamp: { type: string }
+                value:
+                  description: The lost value as the record kept it (a counter's total, or the paths of a whole document's field order).
+                truncated:
+                  type: boolean
+                  description: The value was cut to the collection's cut.
+            winner:
+              description: |
+                The winner at delivery: the cell now at the path, read from the stored
+                document when the event is sent, so a replayed event can show another
+                winner, and a record kept beside a live register can show the loser
+                itself. `null` when the document or the cell is gone. For a record about
+                the whole document, the stamp of the standing life and `value: null`.
+              oneOf:
+                - type: "null"
+                - type: object
+                  required: [stamp, value]
+                  properties:
+                    stamp: { type: string }
+                    value: {}
+        - type: object
           title: invalidate
           description: |
             The stream is over. The server closes the socket after this frame.
