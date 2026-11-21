@@ -67,7 +67,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kimmy_core::merge_state::{MergeState, state_at};
+use kimmy_core::merge_state::{LossKey, LossValue, MergeState, StateAtEntry, state_at};
 use kimmy_core::{DocId, DocRecord, Hlc, MergePolicy, OpKind, OplogEntry, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::info;
@@ -116,11 +116,27 @@ enum FieldTarget {
 
 type PlannedChange = (DocKey, Planned);
 
+/// The kinds of entry the fold of a `field` document reads: the writes (each carries the writer's state) and the loss records.
+fn is_read_by_the_fold(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete | OpKind::LossRecord
+    )
+}
+
+/// An entry of a `field` document at or below the target, as the fold reads it.
+enum Held {
+    Meta(MergeState),
+    Loss(LossKey, LossValue),
+}
+
 /// One document's history either side of the target.
 #[derive(Default)]
 struct History {
     latest_at_or_before: Option<OplogEntry>,
     earliest_after: Option<OplogEntry>,
+    /// The earliest loss entry above the target: no write to take back, but a record the state at the target lacks.
+    loss_after: Option<OplogEntry>,
 }
 
 impl Engine {
@@ -198,10 +214,6 @@ impl Engine {
                 match entry.kind {
                     // Not a mutation, and not something a rewind has to undo.
                     OpKind::UniqueViolation | OpKind::UnkeyedDocument => continue,
-                    // A loss record is no mutation of a document and no write to take back. The rewind
-                    // learns to collect the ones at or below the target when it folds them in (the commit
-                    // that extends `state_at`); until then it leaves them, as it leaves the entries above.
-                    OpKind::LossRecord => continue,
                     OpKind::CreateCollection
                     | OpKind::DropCollection
                     | OpKind::CreateIndex
@@ -214,7 +226,13 @@ impl Engine {
                         }
                         continue;
                     }
-                    OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete => {}
+                    OpKind::Insert
+                    | OpKind::Update
+                    | OpKind::Replace
+                    | OpKind::Delete
+                    // No write to take back, but part of the state a document had at the target: noted for the
+                    // documents it changes after the target, and collected below it by the plan.
+                    | OpKind::LossRecord => {}
                 }
 
                 let Some(id) = entry.doc_id.clone() else {
@@ -237,6 +255,12 @@ impl Engine {
                     continue;
                 };
                 let slot = histories.entry((entry.collection.0, key)).or_default();
+                if entry.kind == OpKind::LossRecord {
+                    if after && slot.loss_after.is_none() {
+                        slot.loss_after = Some(entry);
+                    }
+                    continue;
+                }
 
                 if after {
                     // The oplog iterates in stamp order, so the first one seen
@@ -265,18 +289,26 @@ impl Engine {
         }
 
         // Only documents that actually changed after the target need touching.
-        let changed: Vec<_> =
-            histories.into_iter().filter(|(_, h)| h.earliest_after.is_some()).collect();
+        let changed: Vec<_> = histories
+            .into_iter()
+            .filter(|(_, h)| h.earliest_after.is_some() || h.loss_after.is_some())
+            .collect();
 
         let mut plan: Vec<PlannedChange> = Vec::new();
         let mut unrecoverable: Vec<(u64, String)> = Vec::new();
-        let mut field_changed: Vec<(DocKey, OplogEntry)> = Vec::new();
+        let mut field_changed: Vec<(DocKey, OplogEntry, bool)> = Vec::new();
 
         for (key, history) in changed {
             // A `field` collection's document is the fold of the states its entries carry, not the
             // post-image of one of them: planned below, from every entry at or below the target.
             if collections.get(&key.0).is_some_and(|meta| meta.merge_policy == MergePolicy::Field) {
-                field_changed.push((key, history.earliest_after.expect("filtered above")));
+                // `true`: changed after the target by a loss entry alone, no write.
+                let loss_only = history.earliest_after.is_none();
+                let carrier = history.earliest_after.or(history.loss_after);
+                field_changed.push((key, carrier.expect("filtered above"), loss_only));
+                continue;
+            }
+            if history.earliest_after.is_none() {
                 continue;
             }
             match history.latest_at_or_before {
@@ -681,16 +713,16 @@ impl Engine {
         &self,
         until: Hlc,
         collections: &HashMap<u64, crate::CollectionMeta>,
-        changed: Vec<(DocKey, OplogEntry)>,
+        changed: Vec<(DocKey, OplogEntry, bool)>,
         memo: &mut crate::sync::Memo,
         plan: &mut Vec<PlannedChange>,
         unrecoverable: &mut Vec<(u64, String)>,
     ) -> Result<()> {
-        let wanted: HashSet<DocKey> = changed.iter().map(|(key, _)| key.clone()).collect();
+        let wanted: HashSet<DocKey> = changed.iter().map(|(key, _, _)| key.clone()).collect();
         let txn = self.db().begin_read()?;
 
         // The entries at or below the target of the documents that changed after it, in stamp order.
-        let mut held: HashMap<DocKey, Vec<(Stamp, MergeState)>> = HashMap::new();
+        let mut held: HashMap<DocKey, Vec<(Stamp, Held)>> = HashMap::new();
         if !wanted.is_empty() {
             let oplog = txn.open_table(tables::OPLOG)?;
             for row in oplog.iter()? {
@@ -699,10 +731,7 @@ impl Engine {
                 if entry.stamp.hlc > until {
                     break;
                 }
-                if !matches!(
-                    entry.kind,
-                    OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete
-                ) {
+                if !is_read_by_the_fold(entry.kind) {
                     continue;
                 }
                 let Some(id) = &entry.doc_id else { continue };
@@ -719,8 +748,18 @@ impl Engine {
                 )? {
                     continue;
                 }
-                let state = crate::field_write::load(entry.meta.as_deref())?;
-                held.entry(doc_key).or_default().push((entry.stamp, state));
+                let item = if entry.kind == OpKind::LossRecord {
+                    let body = entry.body.as_deref().ok_or_else(|| {
+                        StorageError::Corrupt("a loss record carries no body".into())
+                    })?;
+                    let (record, value) = MergeState::decode_loss_record(body).map_err(|e| {
+                        StorageError::Corrupt(format!("the body of a loss record: {e:?}"))
+                    })?;
+                    Held::Loss(record, value)
+                } else {
+                    Held::Meta(crate::field_write::load(entry.meta.as_deref())?)
+                };
+                held.entry(doc_key).or_default().push((entry.stamp, item));
             }
         }
 
@@ -740,19 +779,30 @@ impl Engine {
             }
         };
 
-        for (key, earliest_after) in changed {
+        for (key, earliest_after, loss_only) in changed {
             let Some(meta) = collections.get(&key.0) else { continue };
             let name =
                 earliest_after.doc_id.as_ref().map_or_else(String::new, |id| format!("{id:?}"));
             let writer = self.field_writer(meta)?;
             let floor = Self::floor_in(&dropped, meta)?;
             let entries = held.remove(&key).unwrap_or_default();
+            // The collection's own options, the ones the live apply folds with: the loss cap and cut change which
+            // records a state holds.
             let state = state_at(
-                entries.iter().map(|(stamp, state)| (crate::field_write::m_stamp(*stamp), state)),
+                entries.iter().map(|(stamp, item)| {
+                    let entry = match item {
+                        Held::Meta(state) => StateAtEntry::Meta(state),
+                        Held::Loss(key, value) => StateAtEntry::Loss(key.clone(), value.clone()),
+                    };
+                    (crate::field_write::m_stamp(*stamp), entry)
+                }),
                 until,
                 floor,
                 &writer.options(),
             );
+            // Loss entries alone are no state: a document none of whose writes is held here is judged as one
+            // with no entry at all.
+            let holds_a_state = entries.iter().any(|(_, item)| matches!(item, Held::Meta(_)));
             let missing = crate::missing::read(&missing_rows, key.0, &key.1)?;
             // A write of a writer at or below the target that the fold may lack: collected, or held only as a
             // state, and above everything the fold saw of that writer (a later entry's state covers it).
@@ -760,10 +810,17 @@ impl Engine {
                 at <= until && at > state.vv.get(&origin).copied().unwrap_or(Hlc::ZERO)
             });
             if incomplete {
-                unrecoverable.push((key.0, name));
+                // A document that changed after the target only by a loss entry was no document to take back: it
+                // is left as it is, as it was before loss entries were read, not newly refused.
+                if !loss_only {
+                    unrecoverable.push((key.0, name));
+                }
                 continue;
             }
-            if entries.is_empty() {
+            if loss_only && (!holds_a_state || state.is_bare()) {
+                continue;
+            }
+            if !holds_a_state {
                 // Nothing at or below the target to fold. It did not exist then only if the stored state holds no
                 // write at or below the target either (it existed with a state no entry here carries
                 // otherwise) and its earliest entry above the target starts it.

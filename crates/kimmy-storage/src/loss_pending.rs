@@ -144,6 +144,7 @@ impl Refusals {
             LossReceive::Horizon => self.add(LossRefusal::Horizon, 1),
             LossReceive::Oversize => self.add(LossRefusal::Oversize, 1),
             LossReceive::Invalid => self.add(LossRefusal::Invalid, 1),
+            LossReceive::Floor => self.add(LossRefusal::Floor, 1),
         }
         self.add(LossRefusal::Evicted, evicted);
     }
@@ -182,11 +183,8 @@ pub(crate) fn fold_into(
         }
         let (record, value) = MergeState::decode_loss_record(&body)
             .map_err(|e| StorageError::Corrupt(format!("a parked loss record: {e:?}")))?;
-        if floor.is_some_and(|floor| record.stamp.hlc <= floor) {
-            refused.add(LossRefusal::Floor, 1);
-            continue;
-        }
-        let (outcome, evicted) = state.receive_loss_counted(record.clone(), value.clone(), options);
+        let (outcome, evicted) =
+            state.receive_loss_floored(record.clone(), value.clone(), floor, options);
         refused.note_receive(outcome, evicted);
         if outcome == LossReceive::Added {
             entered.push((record, value));

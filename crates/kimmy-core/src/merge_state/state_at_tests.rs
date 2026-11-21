@@ -24,7 +24,7 @@ fn entry(entries: &mut Entries, w: &Writer, written: Option<Written>) -> MStamp 
 }
 
 fn fold(entries: &Entries, target: Hlc, floor: Option<Hlc>) -> MergeState {
-    state_at(entries.iter().map(|(stamp, meta)| (*stamp, meta)), target, floor, &opts(R))
+    state_at(entries.iter().map(|(stamp, meta)| (*stamp, meta.into())), target, floor, &opts(R))
 }
 
 fn read(state: &MergeState) -> Option<std::collections::BTreeMap<Path, Value>> {
@@ -247,7 +247,8 @@ fn the_state_does_not_depend_on_the_order_when_the_history_spreads_past_the_rete
             "the control: the life of `x` returns when it is joined {name}"
         );
 
-        let at = state_at(given.iter().map(|(stamp, state)| (*stamp, state)), last, None, &o);
+        let at =
+            state_at(given.iter().map(|(stamp, state)| (*stamp, state.into())), last, None, &o);
         assert_eq!(at, canonical, "state_at over the entries {name} is the ascending-order fold");
     }
 }
@@ -340,5 +341,226 @@ fn the_fold_with_a_floor_reads_the_pre_floor_increments_back_when_no_entry_carri
         got.get(&p("c")),
         Some(&i(3)),
         "the pair is in A's entry with a slot the floor drops, the slot above the floor is in D's entry without it"
+    );
+}
+
+// ---- loss entries (C7: the rewind side of loss records) ------------------------------------------------------
+
+/// The record of a clash at `field`, lost by a write of `A` stamped at `wall`.
+fn lkey(field: &str, wall: u64) -> LossKey {
+    LossKey::field(
+        LossKind::Clash,
+        p(field),
+        MStamp { hlc: Hlc::new(wall, 0), writer: wid('A', 0) },
+    )
+}
+
+fn lval(n: i64) -> LossValue {
+    LossValue::Value(i(n))
+}
+
+/// What the oplog holds of one document: states and loss records, each at its own stamp.
+type Items = Vec<(MStamp, Item)>;
+
+#[derive(Clone)]
+enum Item {
+    Meta(MergeState),
+    Loss(LossKey, LossValue),
+}
+
+fn items_of(entries: &Entries) -> Items {
+    entries.iter().map(|(stamp, meta)| (*stamp, Item::Meta(meta.clone()))).collect()
+}
+
+/// A loss entry stamped just above `after` (by a member `L`, whose own writes are in no entry here).
+fn loss_after(after: MStamp, key: LossKey, val: LossValue) -> (MStamp, Item) {
+    let hlc = Hlc::new(after.hlc.wall_ms, after.hlc.counter + 1);
+    (MStamp { hlc, writer: wid('L', 0) }, Item::Loss(key, val))
+}
+
+fn fold_items(items: &Items, target: Hlc, floor: Option<Hlc>, o: &JoinOptions) -> MergeState {
+    state_at(
+        items.iter().map(|(stamp, item)| {
+            let entry = match item {
+                Item::Meta(meta) => StateAtEntry::Meta(meta),
+                Item::Loss(key, val) => StateAtEntry::Loss(key.clone(), val.clone()),
+            };
+            (*stamp, entry)
+        }),
+        target,
+        floor,
+        o,
+    )
+}
+
+/// The live apply of the same entries in key order: a member that receives each state with `Writer::receive` and
+/// each record with `Writer::receive_loss`, the member's own rules, with no knowledge of `state_at`.
+fn live_apply(items: &Items, target: Hlc, o: &JoinOptions) -> MergeState {
+    let mut sorted: Vec<&(MStamp, Item)> = items.iter().filter(|(s, _)| s.hlc <= target).collect();
+    sorted.sort_by_key(|(stamp, item)| (*stamp, matches!(item, Item::Loss(..))));
+    let mut member = Writer::new(wid('M', 0), o.clone());
+    for (_, item) in sorted {
+        match item {
+            Item::Meta(meta) => {
+                member.receive(meta);
+            }
+            Item::Loss(key, val) => {
+                member.receive_loss(key.clone(), val.clone());
+            }
+        }
+    }
+    member.state
+}
+
+#[test]
+fn a_loss_entry_is_applied_at_its_key_position_and_equals_the_live_apply_at_every_target() {
+    let entries = two_writers();
+    let mut items = items_of(&entries);
+    // Records stamped between, at the end of and before the writes of the history.
+    let stamps: Vec<MStamp> = entries.iter().map(|(s, _)| *s).collect();
+    items.push(loss_after(stamps[1], lkey("x", 5), lval(1)));
+    items.push(loss_after(stamps[3], lkey("n", 6), lval(2)));
+    items.push(loss_after(*stamps.last().unwrap(), lkey("z", 7), lval(3)));
+    let last = stamps.iter().map(|s| s.hlc).max().unwrap();
+    let o = opts(R);
+    let mut seen_a_record = false;
+    for (stamp, _) in &items {
+        for target in
+            [Hlc::new(stamp.hlc.wall_ms, stamp.hlc.counter.saturating_sub(1)), stamp.hlc, last]
+        {
+            let folded = fold_items(&items, target, None, &o);
+            assert_eq!(
+                folded,
+                live_apply(&items, target, &o),
+                "state_at is the live apply, at {target:?}"
+            );
+            seen_a_record |= !folded.losses.is_empty();
+        }
+    }
+    assert!(seen_a_record, "the premise: a record is in a state at some target");
+    // The record of an entry above the target is not read, and the one at it is.
+    let at_first = fold_items(&items, items[1].0.hlc, None, &o);
+    assert!(at_first.losses.is_empty(), "no record entry is stamped at or below the second write");
+    let (loss_stamp, _) = items.iter().find(|(_, item)| matches!(item, Item::Loss(..))).unwrap();
+    let at_loss = fold_items(&items, loss_stamp.hlc, None, &o);
+    assert_eq!(
+        at_loss.losses.get(&lkey("x", 5)),
+        Some(&lval(1)),
+        "a record entry at the target is read"
+    );
+    assert!(!at_loss.losses.contains_key(&lkey("n", 6)), "and the one above it is not");
+}
+
+#[test]
+fn a_state_and_a_loss_entry_that_share_a_stamp_are_both_read_whatever_order_they_are_given_in() {
+    let entries = two_writers();
+    let shared = entries[2].0;
+    let o = opts(R);
+    let mut items = items_of(&entries[..3].to_vec());
+    items.push((shared, Item::Loss(lkey("x", 5), lval(9))));
+    let forward = fold_items(&items, shared.hlc, None, &o);
+    items.reverse();
+    let backward = fold_items(&items, shared.hlc, None, &o);
+    assert_eq!(forward, backward, "the order given does not matter");
+    assert_eq!(
+        forward.losses.get(&lkey("x", 5)),
+        Some(&lval(9)),
+        "the record is read beside the state of its stamp"
+    );
+    assert_eq!(
+        forward.vv,
+        fold(&entries[..3].to_vec(), shared.hlc, None).vv,
+        "and so is the state"
+    );
+}
+
+#[test]
+fn a_record_relayed_by_several_members_is_applied_once() {
+    let entries = two_writers();
+    let o = opts(R);
+    let stamps: Vec<MStamp> = entries.iter().map(|(s, _)| *s).collect();
+    let mut once = items_of(&entries);
+    once.push(loss_after(stamps[2], lkey("x", 5), lval(1)));
+    // The same record under the stamp of a second member's entry, and the first entry listed twice.
+    let mut thrice = once.clone();
+    let (second, item) = loss_after(stamps[3], lkey("x", 5), lval(1));
+    thrice.push((MStamp { writer: wid('K', 0), ..second }, item));
+    thrice.push(once.last().unwrap().clone());
+    let last = stamps.last().unwrap().hlc;
+    assert_eq!(fold_items(&thrice, last, None, &o), fold_items(&once, last, None, &o));
+    let derived = fold(&entries, last, None).losses.len();
+    assert_eq!(
+        fold_items(&once, last, None, &o).losses.len(),
+        derived + 1,
+        "the joins' own record, and the relayed one once"
+    );
+}
+
+#[test]
+fn a_record_at_or_below_the_floor_is_refused_as_the_live_apply_refuses_it() {
+    let entries = two_writers();
+    let o = opts(R);
+    let mut items = items_of(&entries);
+    items.push(loss_after(entries[1].0, lkey("x", 5), lval(1)));
+    let last = entries.iter().map(|(s, _)| s.hlc).max().unwrap();
+    assert!(fold_items(&items, last, Some(Hlc::new(4, 0)), &o).losses.contains_key(&lkey("x", 5)));
+    assert!(
+        fold_items(&items, last, Some(Hlc::new(5, 0)), &o).losses.is_empty(),
+        "a record of a life the floor ended"
+    );
+    let mut state = MergeState::default();
+    assert_eq!(
+        state.receive_loss_floored(lkey("x", 5), lval(1), Some(Hlc::new(5, 0)), &o).0,
+        LossReceive::Floor
+    );
+    assert!(state.losses.is_empty());
+}
+
+#[test]
+fn a_record_that_meets_no_row_is_parked_and_applied_after_the_next_state_gives_one() {
+    let entries = two_writers();
+    let o = opts(R);
+    let first = entries[0].0;
+    // A record stamped below the first write of the document: no life and no delete to hold it yet.
+    let early =
+        MStamp { hlc: Hlc::new(first.hlc.wall_ms.saturating_sub(1), 0), writer: wid('L', 0) };
+    let mut items = items_of(&entries);
+    items.push((early, Item::Loss(lkey("x", 5), lval(1))));
+    let last = entries.iter().map(|(s, _)| s.hlc).max().unwrap();
+    let folded = fold_items(&items, last, None, &o);
+    assert_eq!(folded.losses.get(&lkey("x", 5)), Some(&lval(1)), "applied once a row exists");
+    assert_eq!(folded, live_apply(&items, last, &o), "as the live apply parks and folds it");
+    // With no state at all, nothing is built from a record alone.
+    let only = vec![(early, Item::Loss(lkey("x", 5), lval(1)))];
+    assert_eq!(fold_items(&only, last, None, &o), MergeState::default());
+}
+
+#[test]
+fn the_fold_keeps_the_greatest_k_records_of_the_options_it_is_given_and_not_of_the_defaults() {
+    let entries = two_writers();
+    let capped = opts(R).with_loss_limits(4, 64).unwrap();
+    let default = opts(R);
+    assert!(
+        capped.loss_cap() < default.loss_cap(),
+        "premise: the collection's K is below the join's default"
+    );
+    let mut items = items_of(&entries);
+    let anchor = entries.last().unwrap().0;
+    for n in 0..6u64 {
+        let (stamp, item) = loss_after(anchor, lkey("x", 10 + n), lval(n as i64));
+        items.push((
+            MStamp { hlc: Hlc::new(stamp.hlc.wall_ms, stamp.hlc.counter + n as u16), ..stamp },
+            item,
+        ));
+    }
+    let last = items.iter().map(|(s, _)| s.hlc).max().unwrap();
+    let with_cap = fold_items(&items, last, None, &capped);
+    assert_eq!(with_cap.losses.len(), 4, "K greatest by rank stay");
+    assert_eq!(with_cap, live_apply(&items, last, &capped));
+    let derived = fold(&entries, last, None).losses.len();
+    assert_eq!(
+        fold_items(&items, last, None, &default).losses.len(),
+        derived + 6,
+        "the default K would keep the joins' own record and all six"
     );
 }

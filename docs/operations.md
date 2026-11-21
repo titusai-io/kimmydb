@@ -2542,6 +2542,16 @@ and now are deleted again by the next TTL pass, and every rewind starts a new wr
 a fresh epoch), which uses one more counter slot per counter and per document for good. Members agree on the state
 at the target when they hold the same entries at or below it; an entry stamped at or below the target that reaches
 a member after its rewind is joined by the ordinary apply, and the cluster converges on the state of all of them.
+A rewound document holds the loss records its retained history derives: the records the joins of the entries at or below the target
+derive, and the loss entries at or below it, each applied at its own place in the stamp order by the rule the live apply uses
+(the collection's own `K` and cut, and its incarnation floor). A loss entry above the target is discarded with the rest of the
+future, and a document that only a late loss entry changed after the target is rewritten without that record (one that cannot be
+rebuilt from the retained entries is left as it is, not refused). The rewind reads no clock, so it can keep a record the live member had
+expired by its wall clock while the record was parked; that is an allowed extra. A record whose entries retention has collected, and
+that no retained state entry carries, may be dropped: a loss entry collected leaves no trace for the check above. That drop is only ever of
+an extra, because a required head is either re-derived by a retained state that saw both writes or refused by that check. The records
+are at least once ([Deviations](deviations.md)); a rewind keeps them between "every lost write has one, up to `K`" and "none names a write
+that did not lose".
 Across a collection's incarnation floor, a counter whose increments a write before the floor had hidden can read those increments
 again in the rewound state when no single entry carried both the slot those increments made and the write that hid them; a later
 repair against a member that held both settles it.
