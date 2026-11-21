@@ -38,8 +38,10 @@ pub const WEBHOOKS_COLLECTION: &str = "__webhooks";
 
 /// Which operations a subscription wants.
 ///
-/// Absent means "all of them", which is what a caller who did not think about
-/// it almost certainly wants.
+/// Absent means every *document* operation (`insert`, `update`, `replace`, `delete`), which is what a
+/// caller who did not think about it almost certainly wants. `conflictResolved` is never in that
+/// default: a subscription that does not name it is not sent it, so a new event type cannot arrive at
+/// a receiver that was registered before it existed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookOperation {
@@ -47,6 +49,9 @@ pub enum WebhookOperation {
     Update,
     Replace,
     Delete,
+    /// A write the merge of a `field` collection lost (Q7). Opt-in only.
+    #[serde(rename = "conflictResolved")]
+    ConflictResolved,
 }
 
 impl WebhookOperation {
@@ -56,8 +61,9 @@ impl WebhookOperation {
             "update" => Ok(Self::Update),
             "replace" => Ok(Self::Replace),
             "delete" => Ok(Self::Delete),
+            "conflictResolved" => Ok(Self::ConflictResolved),
             other => Err(ApiError::bad_request(format!(
-                "unknown operation {other:?}; expected insert, update, replace or delete"
+                "unknown operation {other:?}; expected insert, update, replace, delete or conflictResolved"
             ))),
         }
     }
@@ -68,6 +74,7 @@ impl WebhookOperation {
             Self::Update => "update",
             Self::Replace => "replace",
             Self::Delete => "delete",
+            Self::ConflictResolved => "conflictResolved",
         }
     }
 }
@@ -171,7 +178,7 @@ pub async fn register(
     auth.require(Action::Webhook, db, Some(coll))?;
     // The collection has to exist. Registering against a name that does not
     // would otherwise sit silently, delivering nothing, until someone noticed.
-    let _ = crate::exec::collection(state, db, coll)?;
+    let collection = crate::exec::collection(state, db, coll)?;
 
     // Checked here so a bad URL fails while the person who typed it is
     // watching. It is checked again before every delivery, because a name that
@@ -186,6 +193,17 @@ pub async fn register(
         }
         None => Vec::new(),
     };
+    // `mergePolicy` is fixed at creation, so a `document` collection can never lose a write to a
+    // field-level merge and a subscription to the event could only sit silent: refused, as every
+    // request the node cannot honour is.
+    if operations.contains(&WebhookOperation::ConflictResolved)
+        && collection.merge_policy != kimmy_core::MergePolicy::Field
+    {
+        return Err(ApiError::bad_request(format!(
+            "conflictResolved needs a collection whose mergePolicy is \"field\"; \"{db}\".\"{coll}\" \
+             is \"document\", so it never loses a write to a merge and the subscription could not deliver"
+        )));
+    }
 
     let subscription = Subscription {
         id: new_id(),
@@ -438,5 +456,11 @@ mod tests {
         let err = WebhookOperation::parse("upsert").unwrap_err();
         assert!(err.message.contains("upsert"), "{}", err.message);
         assert!(err.message.contains("insert"), "should list valid ones: {}", err.message);
+        assert!(err.message.contains("conflictResolved"), "and the opt-in one: {}", err.message);
+        assert_eq!(WebhookOperation::parse("conflictResolved").unwrap().name(), "conflictResolved");
+        assert!(
+            WebhookOperation::parse("conflictresolved").is_err(),
+            "the name is exact, like the others"
+        );
     }
 }

@@ -3288,10 +3288,15 @@ paths:
                     resolve inward later.
                 operations:
                   type: array
-                  description: Absent means every operation.
+                  description: |
+                    Absent means every document operation: `insert`, `update`,
+                    `replace` and `delete`. `conflictResolved` is never in that
+                    default; a subscription is sent it only if it lists it, and
+                    only a collection whose `mergePolicy` is `field` can be
+                    subscribed to it (`400` otherwise).
                   items:
                     type: string
-                    enum: [insert, update, replace, delete]
+                    enum: [insert, update, replace, delete, conflictResolved]
       responses:
         "200":
           description: Registered. The secret appears here and nowhere else.
@@ -4867,10 +4872,10 @@ components:
         url: { type: string }
         operations:
           type: array
-          description: Empty means every operation.
+          description: Empty means every document operation; `conflictResolved` only if listed.
           items:
             type: string
-            enum: [insert, update, replace, delete]
+            enum: [insert, update, replace, delete, conflictResolved]
         createdBy:
           type: string
           description: |
