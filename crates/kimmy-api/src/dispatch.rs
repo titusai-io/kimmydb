@@ -625,7 +625,8 @@ fn assemble(
     for entry in entries.iter().take(BATCH) {
         // A loss entry is told by the owner whatever its origin (V6M2), as the event of its record: the same
         // `eventId` for every entry that carries it. Its winner is read here, at the delivery being planned.
-        let Some(candidate) = render_entry(engine, entry, &job.database, &job.collection) else {
+        let Some(candidate) = render_entry(engine, entry, &job.database, &job.collection, false)
+        else {
             continue;
         };
         let cost = candidate.to_string().len() + usize::from(!events.is_empty());
@@ -638,9 +639,17 @@ fn assemble(
 
         if events.is_empty() {
             if entry.kind.is_loss_record() {
-                // Rule 3 for now: the lone event goes out as it is.
-                events.push(candidate);
+                // Rule 2 for a lost write: the winner can be a whole subdocument or array (the loser's value is
+                // cut at the collection's cut), so the winner's value comes off, and says so, rather than the
+                // event being skipped. Its `eventId`, kind, path, loser and the winner's stamp stay.
+                let trimmed = render_entry(engine, entry, &job.database, &job.collection, true)
+                    .unwrap_or(candidate);
+                events.push(trimmed);
                 stamps.push(entry.stamp);
+                warn!(
+                    subscription,
+                    "webhook event exceeds the payload cap; delivering it without the winner's value"
+                );
                 break;
             }
             // Rule 2: too large on its own, so the document comes off rather
@@ -673,6 +682,7 @@ fn render_entry(
     entry: &OplogEntry,
     database: &str,
     collection: &str,
+    omit_winner_value: bool,
 ) -> Option<Value> {
     if !entry.kind.is_loss_record() {
         return Some(render(entry, database, collection));
@@ -682,7 +692,7 @@ fn render_entry(
         kimmy_core::merge_state::MergeState::decode_loss_record(entry.body.as_deref()?).ok()?;
     // The cell now at the path, read where the pass plans: inside the blocking hand-off that reads the oplog.
     let winner = engine.conflict_winner(entry.collection, id, &key.at).ok().flatten();
-    let mut event = crate::conflict_event::body(entry, winner, false)?;
+    let mut event = crate::conflict_event::body(entry, winner, omit_winner_value)?;
     event["database"] = json!(database);
     event["collection"] = json!(collection);
     Some(event)

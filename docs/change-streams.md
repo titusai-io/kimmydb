@@ -147,6 +147,9 @@ write that lost and what stands there now:
 
 The `kimmy_conflicts_resolved_total{kind}` counter on `/metrics` counts the events a member has made ([Operations](operations.md)).
 
+A [webhook](webhooks.md#lost-writes-conflictresolved) subscription that lists `conflictResolved` in its `operations` is sent the same
+event too, without the resume token and with `database` and `collection`. Its delivery is cluster-wide and at least once, so one lost write can arrive up to once per member under one `eventId`: deduplicate on it.
+
 ---
 
 ## Why they work on one node
