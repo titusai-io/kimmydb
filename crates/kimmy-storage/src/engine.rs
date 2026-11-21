@@ -220,6 +220,10 @@ pub struct Engine {
     /// Loss records not kept, by reason (`kimmy_loss_records_refused_total{reason}`, `LossRefusal`): per member, since
     /// start, in no state and no digest.
     loss_refused: [std::sync::atomic::AtomicU64; 6],
+    /// `conflictResolved` events this member has made, by kind (`kimmy_conflicts_resolved_total{kind}`, `LossKind::ALL`): one for each
+    /// loss entry of its own it minted, added by the commit that stored it, so a transaction that did not commit adds none. Per member,
+    /// since start, in no state and no digest.
+    conflicts_resolved: [std::sync::atomic::AtomicU64; 6],
     /// The queue for the single writer (ADR-151). Taken before redb's own
     /// writer lock, held for the life of the [`WriteTxn`], and released when
     /// the transaction commits, aborts or is dropped. Two things redb's lock
@@ -970,6 +974,9 @@ pub(crate) struct WriteTxn<'a> {
     /// shared reference to the transaction, not an exclusive one; it is never
     /// contended, since the writer gate means one thread owns this.
     live_counts: parking_lot::Mutex<crate::live_count::Pending>,
+    /// The loss entries of its own this transaction minted, by kind (`LossKind::index`): added to the engine's counters by
+    /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
+    loss_minted: parking_lot::Mutex<[u64; 6]>,
 }
 
 impl WriteTxn<'_> {
@@ -996,6 +1003,11 @@ impl WriteTxn<'_> {
     /// to add to as they go.
     pub(crate) fn live_counts(&self) -> &parking_lot::Mutex<crate::live_count::Pending> {
         &self.live_counts
+    }
+
+    /// Note a loss entry of this member's own of `kind`, minted in this transaction.
+    pub(crate) fn note_loss_minted(&self, kind: kimmy_core::merge_state::LossKind) {
+        self.loss_minted.lock()[kind.index()] += 1;
     }
 
     pub(crate) fn commit(mut self) -> Result<()> {
@@ -1047,6 +1059,13 @@ impl WriteTxn<'_> {
                 });
             }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The inner commit landed: the loss entries this transaction minted are events this member has made.
+            for (kind, minted) in self.loss_minted.lock().iter().enumerate() {
+                if *minted > 0 {
+                    engine.conflicts_resolved[kind]
+                        .fetch_add(*minted, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if changes_collections {
                 engine.collections_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1663,6 +1682,7 @@ impl Engine {
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
             loss_refused: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            conflicts_resolved: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_gate: WriterGate::new(),
             writer_hold: Arc::new(crate::writer_hold::WriterHoldWord::new()),
             writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
@@ -2262,6 +2282,20 @@ impl Engine {
             .iter()
             .map(|r| {
                 (r.label(), self.loss_refused[r.index()].load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .collect()
+    }
+
+    /// `conflictResolved` events this member has made since start, by kind, in the order of [`kimmy_core::merge_state::LossKind::ALL`]
+    /// (`retiredWriter` is reserved and stays 0). One for each loss entry of its own that a committed transaction stored.
+    pub fn conflicts_resolved(&self) -> Vec<(&'static str, u64)> {
+        kimmy_core::merge_state::LossKind::ALL
+            .iter()
+            .map(|k| {
+                (
+                    k.as_str(),
+                    self.conflicts_resolved[k.index()].load(std::sync::atomic::Ordering::Relaxed),
+                )
             })
             .collect()
     }
@@ -4277,6 +4311,7 @@ impl Engine {
             counted_at: None,
             holder,
             live_counts: Default::default(),
+            loss_minted: Default::default(),
         })
     }
 

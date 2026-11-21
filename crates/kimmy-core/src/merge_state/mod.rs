@@ -70,6 +70,7 @@ mod counter;
 mod floor;
 mod join;
 pub mod loss_cut;
+mod loss_event;
 mod ord;
 mod stamps;
 mod state;
@@ -97,6 +98,8 @@ mod hand_built;
 mod loss_cap_tests;
 #[cfg(test)]
 mod loss_contract_tests;
+#[cfg(test)]
+mod loss_event_tests;
 #[cfg(test)]
 mod loss_free_hash_tests;
 #[cfg(test)]

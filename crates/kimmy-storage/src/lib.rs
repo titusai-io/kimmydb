@@ -32,6 +32,9 @@ pub mod faults;
 pub mod format;
 pub mod gc;
 // The field path of a write (insert, replace, delete) over a record's merge state.
+#[cfg(test)]
+mod conflict_event_tests;
+mod conflict_winner;
 mod field_write;
 pub mod health;
 pub mod hold_meter;
@@ -45,6 +48,8 @@ mod live_walk;
 #[cfg(test)]
 mod loss_order_tests;
 mod loss_pending;
+#[cfg(test)]
+mod loss_stream_tests;
 pub mod merge;
 pub mod meta;
 pub mod migrate;
@@ -217,6 +222,7 @@ mod log_capture;
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use clock_bound::{ClockBound, ClockRefusal, ClockStop, DEFAULT_MAX_CLOCK_SKEW_MS};
+pub use conflict_winner::ConflictWinner;
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
 pub use definition_digest::{DefinitionKey, DefinitionKind};
 pub use definition_probe::{
