@@ -488,5 +488,10 @@ fn the_loss_records_the_cap_refuses_or_evicts_are_counted() {
     // The document keeps K records; every record made beyond K was refused or evicted, whichever way it arrived, and the
     // counter adds both (the records the cap refused and the records it evicted).
     assert_eq!(kept, 4, "the cap keeps K records");
-    assert_eq!(capped, made - 4, "every record beyond K was counted, refused or evicted");
+    // (a record the cap evicts can be counted again when a later join re-sends it, so this is a lower bound: at least one count
+    // for each record beyond K)
+    assert!(
+        capped >= made - 4,
+        "every record beyond K was counted, refused or evicted: {capped} for {made} made"
+    );
 }
