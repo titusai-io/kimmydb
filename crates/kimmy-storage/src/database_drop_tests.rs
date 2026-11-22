@@ -184,7 +184,8 @@ fn a_life_created_over_its_databases_tombstone_takes_its_own_and_its_shadows() {
 #[test]
 fn a_local_creation_whose_next_tick_is_its_floors_hlc_is_minted_above_it() {
     let (e, _d) = engine();
-    let ahead = crate::physical_now_ms() + 3_600_000;
+    // ahead of the clock, and inside the bound: a member whose clock leads by more than it refuses schema changes (U1)
+    let ahead = crate::physical_now_ms() + 100_000;
     let floor = Stamp::new(Hlc::new(ahead, 1), NodeId::from_bytes([7; 16]), Epoch::ZERO);
     e.record_collection_drop(CollectionId::derive("shop", "orders"), floor).unwrap();
     e.witness_processed(&Stamp::new(Hlc::new(ahead, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO))

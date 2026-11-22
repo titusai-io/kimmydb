@@ -112,6 +112,13 @@ pub enum StorageError {
     )]
     ClockRefused(Box<crate::clock_bound::ClockStop>),
 
+    /// A schema change this member would make was refused before anything was written, because the stamps it
+    /// would carry would be refused by the rest of the cluster until they are due (U1, [`crate::own_clock`]):
+    /// this member's logical clock leads its physical clock by more than the allowed skew, or a peer has said it
+    /// is refusing this member's entries for their clock. Retryable on another member.
+    #[error("{0}")]
+    OwnStampsRefused(crate::own_clock::OwnStampRefusal),
+
     /// The store was refused before anything opened it for writing, and
     /// nothing in it was changed (ADR-190): a newer build wrote it, its
     /// sidecar is unreadable, or it could not be read. `kind` says which of

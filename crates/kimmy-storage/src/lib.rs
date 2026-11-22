@@ -31,6 +31,7 @@ pub mod expiry;
 pub mod faults;
 pub mod format;
 pub mod gc;
+pub mod own_clock;
 // The field path of a write (insert, replace, delete) over a record's merge state.
 #[cfg(test)]
 mod conflict_event_tests;
@@ -118,6 +119,9 @@ mod clock_bound_entry_tests;
 
 #[cfg(test)]
 mod clock_bound_document_tests;
+
+#[cfg(test)]
+mod own_clock_tests;
 
 #[cfg(test)]
 mod clock_bound_state_tests;
@@ -268,6 +272,7 @@ pub use modify::{
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,
 };
+pub use own_clock::OwnStampRefusal;
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{

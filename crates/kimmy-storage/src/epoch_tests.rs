@@ -70,7 +70,8 @@ fn an_open_on_a_clock_behind_its_epochs_start_stamps_every_write_at_or_above_it(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kimmy.redb");
     drop(open(&path));
-    let start = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+    // a clock behind the epoch's start by less than the bound: a member that leads by more refuses schema changes (U1)
+    let start = Hlc::new(crate::engine::physical_now_ms() + 100_000, 0);
     let epoch = Epoch::new(start, [7; 8]);
     {
         let db = redb::Database::open(&path).unwrap();

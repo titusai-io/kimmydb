@@ -979,6 +979,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::UnparseablePartialFilter { .. }
         | E::Stale { .. }
         | E::CollectionPurging { .. }
+        // A user's schema change refused before it was written because this member's own stamps would be refused:
+        // nobody's failure, and never an apply's.
+        | E::OwnStampsRefused(_)
         // Placed, but never asked: a clock refusal is answered as `ProtocolError::ClockStop` by the
         // callers (`from_storage`, the push receiver) before this is, and it is nobody's failure.
         | E::ClockRefused(_) => false,

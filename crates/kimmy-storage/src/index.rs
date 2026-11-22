@@ -1211,6 +1211,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
     ) -> Result<IndexMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(collection))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         let (created, violations) = self.create_index_inner(
             db,
             collection,
@@ -1974,6 +1975,7 @@ impl crate::Engine {
     /// a caller confirming the drop on its peers looks the entry up by
     /// (ADR-140) — beside whether this member held the index.
     pub fn drop_index_stamped(&self, db: &str, collection: &str, name: &str) -> Result<Dropped> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(collection))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         self.drop_index_inner(db, collection, name, None)
     }
 

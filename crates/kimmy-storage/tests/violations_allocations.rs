@@ -77,12 +77,17 @@ const PINNED: Hlc = Hlc::new(1 << 44, 0);
 /// `violations` unique violations spread evenly among them, closed.
 fn build(path: &std::path::Path, documents: usize, violations: usize) {
     let engine = Engine::open(path).unwrap();
-    engine
-        .witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]), Epoch::MAX))
-        .unwrap();
+    // The schema first, from the wall clock: a member refuses its own schema
+    // changes while its stamps lead the wall clock by more than the clock bound
+    // (ADR-272), and the pin below is far beyond it. The three schema entries
+    // are the only stamps that follow the wall clock; every document of the run
+    // is stamped from the pin, as before.
     engine.create_collection("app", "docs").unwrap();
     let field = IndexField { path: "email".into(), descending: false };
     engine.create_index("app", "docs", vec![field], true, None).unwrap();
+    engine
+        .witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]), Epoch::MAX))
+        .unwrap();
     let coll = engine.get_collection("app", "docs").unwrap();
     let payload = "x".repeat(DOC_BYTES);
     let every = documents.checked_div(violations).unwrap_or(usize::MAX).max(1);

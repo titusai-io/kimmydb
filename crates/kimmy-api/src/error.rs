@@ -92,6 +92,10 @@ pub enum ErrorCode {
     /// A collection cannot be created under this name yet: what a drop of an
     /// earlier collection of the name held is still being removed (ADR-189).
     CollectionPurging,
+    /// A schema change was refused before anything was written because this member's own stamps would be refused by the
+    /// rest of the cluster until they are due: its clock is ahead of its own physical clock by more than the allowed
+    /// skew, or a peer is refusing its entries for their clock (U1).
+    ClockAhead,
     /// A write reached the storage engine's durability step and then failed:
     /// it may or may not have been applied, and if it was it replicates.
     OutcomeUnknown,
@@ -206,7 +210,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 30] = [
+    pub const ALL: [ErrorCode; 31] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
@@ -231,6 +235,7 @@ impl ErrorCode {
         Self::Stale,
         Self::Timeout,
         Self::CollectionPurging,
+        Self::ClockAhead,
         Self::OutcomeUnknown,
         Self::PartiallyApplied,
         Self::NodeStopping,
@@ -266,6 +271,7 @@ impl ErrorCode {
             Self::Stale => "stale",
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
+            Self::ClockAhead => "clock_ahead",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::PartiallyApplied => "partially_applied",
             Self::NodeStopping => "node_stopping",
@@ -328,6 +334,9 @@ impl ErrorCode {
             // succeeds here; another member may still be removing its own copy
             // of the same drop, so moving does not help.
             Self::CollectionPurging => Retry::Wait,
+            // This member's own clock, or a peer's view of it, is what is wrong, and another member's is not: the
+            // change is worth sending there.
+            Self::ClockAhead => Retry::Elsewhere,
             // `wait`, not `elsewhere`: the slots are this node's, but what
             // fills them is a resolver that does not answer, and the members
             // of a cluster usually share their resolver. A failed lookup is
@@ -431,6 +440,10 @@ impl ErrorCode {
             // quota, a revoked key, or a provider that is down, and those are
             // all the operator's. `WARN` is the level that says exactly that.
             Self::ProviderError => Some(LogLevel::Warn),
+
+            // This member's own clock, and the operator's to fix: a rise is a member whose changes the cluster would
+            // hold back. `WARN`, as for the other 503s that name a member's state.
+            Self::ClockAhead => Some(LogLevel::Warn),
 
             // `WARN`, uniformly, and deliberately not split by cause. The
             // deadline is reached while the request is *waiting* — for the
@@ -606,6 +619,12 @@ impl ApiError {
     /// logged. The instance's own answer wins over its code's default.
     pub fn log_level(&self) -> Option<LogLevel> {
         self.level_override.or_else(|| self.code.log_level())
+    }
+
+    /// A schema change refused before anything was written because this member's own stamps would be refused by the
+    /// rest of the cluster (U1): `503 clock_ahead`, retried on another member.
+    pub fn clock_ahead(refusal: &kimmy_storage::OwnStampRefusal) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::ClockAhead, refusal.to_string())
     }
 
     /// A creation refused while a drop of the same name is still being purged
@@ -1142,6 +1161,9 @@ impl From<StorageError> for ApiError {
             StorageError::CollectionPurging { db, name, .. } => {
                 ApiError::collection_purging(&db, &name)
             }
+            // This member's own stamps would be refused by every other member until due: nothing was written, and
+            // another member's clock is the one to use.
+            StorageError::OwnStampsRefused(refusal) => ApiError::clock_ahead(&refusal),
             // Its durability step began and failed: the write may have
             // happened, and if it did it replicates. Never "it failed". The
             // cause names on-disk internals, so it is logged, not returned.
@@ -1392,7 +1414,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 30] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 31] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1412,6 +1434,7 @@ mod tests {
             (RateLimited, None),
             (Stale, None),
             (CollectionPurging, None),
+            (ClockAhead, Some(LogLevel::Warn)),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
             (NotImplemented, Some(LogLevel::Info)),

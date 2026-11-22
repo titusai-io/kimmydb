@@ -168,6 +168,9 @@ pub struct Engine {
     /// What U1 has refused since start, by the origin that sent it (capped, the rest under
     /// `other`).
     clock_refusals: Mutex<crate::clock_bound::RefusalCounts>,
+    /// The peers that said they are refusing this origin's entries for their clock, with the time, on this member's
+    /// clock, at which each says they are due (b2, [`crate::own_clock`]).
+    pub(crate) own_refusals: Mutex<crate::own_clock::PeerRefusals>,
     /// Milliseconds added to this engine's physical clock for the U1 check, so a test can make
     /// a stamp far-future or due without waiting. Per engine: no other engine and no other test
     /// sees it. Exists only in test builds and under `test-hooks`.
@@ -1659,6 +1662,7 @@ impl Engine {
                 kimmy_core::LossLimits::DEFAULT.cut_bytes,
             ),
             clock_refusals: Mutex::new(Default::default()),
+            own_refusals: Mutex::new(Default::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
             validators: Default::default(),
@@ -4175,6 +4179,12 @@ impl Engine {
         Stamp::new(hlc, self.node_id, self.epoch)
     }
 
+    /// The wall component of the last time the clock handed out or witnessed: how far this member's logical clock has
+    /// gone ([`Engine::clock_lead_ms`]).
+    pub(crate) fn logical_clock_wall_ms(&self) -> u64 {
+        self.clock.lock().last().wall_ms
+    }
+
     /// The last time the clock handed out, for a test that a path mints
     /// nothing.
     #[cfg(test)]
@@ -4542,6 +4552,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     pub fn create_database(&self, name: &str) -> Result<DatabaseMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(name, None)?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(name)?;
         let txn = self.begin_write(WriterHolder::Ddl)?;
         {
@@ -4592,6 +4603,7 @@ impl Engine {
     /// the parent's transaction; a shadow with no parent (ADR-138) is dropped
     /// on its own afterwards, so nothing in the database survives the answer.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(name, None)?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         // Answer "did it exist" up front: dropping the last collection removes
         // the row, so the removal below finds nothing on the common path.
         let existed = self.database_exists(name)?;
@@ -4714,6 +4726,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     pub fn create_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         // The informational run of the whole suite with the helper creating `field` collections
@@ -4796,6 +4809,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         validator: Option<kimmy_core::ValidatorSpec>,
     ) -> Result<CollectionMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         if let Some(spec) = &validator {
@@ -4946,6 +4960,7 @@ impl Engine {
         name: &str,
         validator: kimmy_core::ValidatorSpec,
     ) -> Result<CollectionMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         crate::validator::check_validator_spec(&validator)?;
@@ -5389,6 +5404,7 @@ impl Engine {
 
     /// Drop a collection along with all its documents and index entries.
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
+        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         self.drop_collection_inner(db, name, None)
     }
 
