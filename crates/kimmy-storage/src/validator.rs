@@ -157,7 +157,7 @@ impl crate::Engine {
         collection: &str,
         validator: Option<ValidatorSpec>,
     ) -> Result<CollectionMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(collection))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         if let Some(spec) = &validator {
             check_validator_spec(spec)?;
         }

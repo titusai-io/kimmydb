@@ -14,8 +14,8 @@
 //!   its clock is past the bound ([`Engine::note_own_stamps_refused`], fed by the pusher), and has not yet said that a
 //!   later push went through, or come due.
 //!
-//! Ordinary writes are not refused, and neither is anything the node creates for itself (a name that starts with `__`:
-//! the system collections and their indexes, which a member with a leading clock must still make at start).
+//! Ordinary writes are not refused, and neither is anything the node creates for itself: the system collections come
+//! through a path that is not guarded, so a member with a leading clock still makes them at start.
 
 use std::fmt;
 
@@ -107,17 +107,15 @@ impl Engine {
             .map(|(peer, due_in_ms)| OwnStampRefusal::PeerRefused { peer, due_in_ms })
     }
 
-    /// The guard of every schema change a user can make: an error, with nothing written, when this member's own stamps
-    /// would be refused. Called first by each of them. A database or collection whose name starts with `__` is the
-    /// node's own (system collections, their indexes) and is not guarded.
-    pub fn refuse_ddl_if_own_stamps_would_be_refused(
-        &self,
-        db: &str,
-        collection: Option<&str>,
-    ) -> Result<()> {
-        if db.starts_with("__") || collection.is_some_and(|name| name.starts_with("__")) {
-            return Ok(());
-        }
+    /// The guard of every schema change a client can make: an error, with nothing written, when this member's own stamps
+    /// would be refused. Called first by each of them.
+    ///
+    /// It is keyed on the call path and not on a name. The node's own system collections are made by
+    /// [`Engine::create_system_collection`], which does not come through any guarded function, so a member with a leading
+    /// clock still makes them at start; every guarded function is one a client's request reaches (the HTTP and MCP routes
+    /// and the `$out` and `$merge` targets), and a client with the rights to change a `__` name is refused here like any
+    /// other.
+    pub fn refuse_ddl_if_own_stamps_would_be_refused(&self) -> Result<()> {
         match self.own_stamps_refusal() {
             Some(refusal) => Err(StorageError::OwnStampsRefused(refusal)),
             None => Ok(()),

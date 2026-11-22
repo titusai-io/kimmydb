@@ -145,7 +145,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(collection))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| Ok(false))
     }
 
@@ -397,7 +397,7 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
     ) -> Result<VectorsOff> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(collection))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         let off =
             self.disable_vectors_inner(db, collection, drop_vectors, Configured::Locally, &|_| {
                 Ok(false)

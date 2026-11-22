@@ -4552,7 +4552,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     pub fn create_database(&self, name: &str) -> Result<DatabaseMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(name, None)?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(name)?;
         let txn = self.begin_write(WriterHolder::Ddl)?;
         {
@@ -4603,7 +4603,7 @@ impl Engine {
     /// the parent's transaction; a shadow with no parent (ADR-138) is dropped
     /// on its own afterwards, so nothing in the database survives the answer.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(name, None)?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         // Answer "did it exist" up front: dropping the last collection removes
         // the row, so the removal below finds nothing on the common path.
         let existed = self.database_exists(name)?;
@@ -4726,7 +4726,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     pub fn create_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         // The informational run of the whole suite with the helper creating `field` collections
@@ -4809,7 +4809,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         validator: Option<kimmy_core::ValidatorSpec>,
     ) -> Result<CollectionMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         if let Some(spec) = &validator {
@@ -4960,7 +4960,7 @@ impl Engine {
         name: &str,
         validator: kimmy_core::ValidatorSpec,
     ) -> Result<CollectionMeta> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
         crate::validator::check_validator_spec(&validator)?;
@@ -5404,7 +5404,7 @@ impl Engine {
 
     /// Drop a collection along with all its documents and index entries.
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
-        self.refuse_ddl_if_own_stamps_would_be_refused(db, Some(name))?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         self.drop_collection_inner(db, name, None)
     }
 

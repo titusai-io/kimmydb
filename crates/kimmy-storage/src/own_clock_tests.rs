@@ -6,7 +6,7 @@
 //! makes the logical clock, which follows the real one, lead it.
 
 use bson::doc;
-use kimmy_core::{IndexField, NodeId};
+use kimmy_core::{IndexField, NodeId, ProviderConfig, VectorConfig};
 
 use crate::{Engine, OwnStampRefusal, StorageError};
 
@@ -26,6 +26,18 @@ fn is_refused(result: crate::error::Result<()>) -> Option<OwnStampRefusal> {
     match result {
         Err(StorageError::OwnStampsRefused(refusal)) => Some(refusal),
         _ => None,
+    }
+}
+
+fn a_vector_config() -> VectorConfig {
+    VectorConfig {
+        fields: vec!["body".into()],
+        provider: ProviderConfig::Byo {},
+        dim: 8,
+        metric: Default::default(),
+        document_prefix: None,
+        query_prefix: None,
+        chunk: Default::default(),
     }
 }
 
@@ -66,6 +78,12 @@ fn every_user_schema_change(engine: &Engine) -> Vec<(&'static str, Change<'_>)> 
         (
             "set_validator",
             Box::new(move || engine.set_validator("shop", "orders", None).map(|_| ())),
+        ),
+        (
+            "configure_vectors",
+            Box::new(move || {
+                engine.configure_vectors("shop", "orders", a_vector_config()).map(|_| ())
+            }),
         ),
         (
             "disable_vectors",
@@ -126,16 +144,37 @@ fn the_message_of_a_leading_clock_names_how_far_and_says_to_retry_elsewhere() {
 }
 
 #[test]
-fn the_node_still_makes_its_own_system_collections_and_their_indexes_when_its_clock_leads() {
+fn the_node_still_makes_its_own_system_collections_when_its_clock_leads() {
     let (e, _d) = engine();
     leading(&e, SKEW_MS + 10_000);
-    let system = e
-        .create_system_collection("__kimmy", "__settings")
+    e.create_system_collection("__kimmy", "__settings")
         .expect("a member with a leading clock still creates its system collections at start");
-    e.create_index("__kimmy", "__settings", vec![IndexField::ascending("k")], false, None)
-        .expect("and their indexes");
     assert!(e.get_collection("__kimmy", "__settings").is_ok());
-    let _ = system;
+}
+
+/// The guard is keyed on the call path, not on a name: a client that can change a `__` name (an administrator can change
+/// the system database) is refused like any other, and the node's own creations do not come through the guarded functions.
+#[test]
+fn a_client_schema_change_on_a_system_name_is_refused_when_the_clock_leads() {
+    let (e, _d) = engine();
+    e.create_system_collection("__kimmy", "__settings").unwrap();
+    leading(&e, SKEW_MS + 10_000);
+    for (name, change) in [
+        ("create_collection", e.create_collection("__kimmy", "__more").map(|_| ())),
+        ("drop_collection", e.drop_collection("__kimmy", "__settings").map(|_| ())),
+        (
+            "create_index",
+            e.create_index("__kimmy", "__settings", vec![IndexField::ascending("k")], false, None)
+                .map(|_| ()),
+        ),
+        ("drop_database", e.drop_database("__kimmy").map(|_| ())),
+    ] {
+        assert!(
+            is_refused(change).is_some(),
+            "{name} on a system name must be refused by the guard when the clock leads"
+        );
+    }
+    assert!(e.get_collection("__kimmy", "__settings").is_ok(), "nothing was dropped");
 }
 
 #[test]
