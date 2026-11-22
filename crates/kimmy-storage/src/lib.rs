@@ -247,12 +247,12 @@ pub use divergence::{
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
 };
 pub use docs::{BulkInsertError, ID_FIELD, Seen, WriteOutcome, WriteScope};
-pub use engine::physical_now_ms;
 pub use engine::{
     CacheReading, DurabilityClass, Engine, NotClosed, OpenOptions, RepairsAtOpen,
     WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot,
     WriterHolder, WriterWaitSnapshot, blocking, metered_writer_wait, with_write_wait_budget,
 };
+pub use engine::{parse_test_clock_offset_secs, physical_now_ms, set_test_clock_offset_secs};
 pub use error::{Applied, RefusedKind, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};

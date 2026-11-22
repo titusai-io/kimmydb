@@ -99,6 +99,7 @@ const CERT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// `main` can prove: the close must run on its own thread, after the runtime
 /// has shut down, when nothing else holds the engine.
 pub async fn run(config: Config) -> RunEnd {
+    apply_test_clock_offset();
     let data_dir = config.storage.data_dir.clone();
     let mut end = RunEnd {
         outcome: Ok(()),
@@ -453,6 +454,23 @@ impl Stop {
         // finds the stop already begun, and ends rather than retries.
         self.shutdown.begin();
         self.engine.stop_walks();
+    }
+}
+
+/// `KIMMY_TEST_CLOCK_OFFSET_SECS`: a signed number of seconds added to the physical clock the HLC and the clock bound read
+/// (log timestamps do not), so that a lab can give one member of a throwaway cluster a wrong clock. Read once, before the store
+/// is opened, so the epoch and every stamp are minted on the shifted clock. Inert unless set; says so at every start where it is.
+fn apply_test_clock_offset() {
+    let Ok(value) = std::env::var("KIMMY_TEST_CLOCK_OFFSET_SECS") else { return };
+    let secs = kimmy_storage::parse_test_clock_offset_secs(&value);
+    warn!(
+        KIMMY_TEST_CLOCK_OFFSET_SECS = %value,
+        recognised = secs.is_some(),
+        "a test switch is set that shifts this node's physical clock on purpose, so its stamps and its clock bound are \
+         off; unset KIMMY_TEST_CLOCK_OFFSET_SECS outside a test"
+    );
+    if let Some(secs) = secs {
+        kimmy_storage::set_test_clock_offset_secs(secs);
     }
 }
 

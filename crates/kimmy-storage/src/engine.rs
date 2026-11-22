@@ -6588,7 +6588,26 @@ pub(crate) fn epoch_start_gap_ms(start: Hlc, now_ms: u64) -> Option<u64> {
 /// Public so that tests elsewhere in the workspace can express "far in the
 /// future" against the same clock retention uses.
 pub fn physical_now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    let real =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    real.saturating_add_signed(TEST_CLOCK_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Milliseconds added to the physical clock this layer reads ([`physical_now_ms`]), for the whole process: what the
+/// HLC mints from and what the clock bound is judged against. 0 unless `KIMMY_TEST_CLOCK_OFFSET_SECS` is set (see
+/// `docs/testing.md`); log timestamps do not read it.
+static TEST_CLOCK_OFFSET_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Set the process-wide offset of the physical clock, in seconds (signed). The `KIMMY_TEST_CLOCK_OFFSET_SECS` test switch
+/// calls this once at start, before the store is opened, so that the epoch and every stamp are minted on the shifted clock;
+/// a lab that needs one member's clock wrong sets it for that member's process. Not a configuration knob.
+pub fn set_test_clock_offset_secs(secs: i64) {
+    TEST_CLOCK_OFFSET_MS.store(secs.saturating_mul(1000), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value of `KIMMY_TEST_CLOCK_OFFSET_SECS` as seconds: a signed whole number, `None` if it is not one.
+pub fn parse_test_clock_offset_secs(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
 }
 
 #[cfg(test)]
