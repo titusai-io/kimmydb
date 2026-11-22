@@ -481,8 +481,11 @@ fn the_loss_records_the_cap_refuses_or_evicts_are_counted() {
     };
     assert_eq!(capped_by(&opts()), 0, "control: the default limits hold all of them");
     let tight = opts().with_loss_limits(4, 4096).unwrap();
-    assert!(
-        capped_by(&tight) > 0,
-        "six lost inserts against K = 4: the cap refuses or evicts some"
+    // six lost inserts make six records and K = 4 keeps four: two are refused or evicted, whichever way they arrive, and the
+    // counter adds both (the records the cap refused and the records it evicted)
+    assert_eq!(
+        capped_by(&tight),
+        2,
+        "six lost inserts against K = 4: the cap refuses or evicts two"
     );
 }
