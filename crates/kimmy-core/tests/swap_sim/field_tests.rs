@@ -459,8 +459,9 @@ fn the_mutant_that_renders_a_cut_value_as_the_whole_is_killed() {
 /// takes more lost writes than K.
 #[test]
 fn the_loss_records_the_cap_refuses_or_evicts_are_counted() {
-    let capped_by = |o: &kimmy_core::merge_state::JoinOptions| -> usize {
-        // seven writers' concurrent first inserts: one life survives and the others are lost, one record each
+    // (the records the cap refused or evicted, the records the document holds at the end)
+    let run = |o: &kimmy_core::merge_state::JoinOptions| -> (usize, usize) {
+        // seven writers' concurrent first inserts: one life survives and the others are lost
         let states: Vec<_> = (0..7)
             .map(|i| {
                 local_write(i, None, DocOp::Insert, 10 + i as i64, &format!("m{i}"), o, false)
@@ -477,15 +478,15 @@ fn the_loss_records_the_cap_refuses_or_evicts_are_counted() {
             capped += applied.loss_capped;
             cur = Some(applied.ver);
         }
-        capped
+        (capped, cur.unwrap().state.unwrap().losses.len())
     };
-    assert_eq!(capped_by(&opts()), 0, "control: the default limits hold all of them");
+    let (none_capped, made) = run(&opts());
+    assert_eq!(none_capped, 0, "control: the default limits hold all of them");
+    assert!(made > 4, "premise: the writers make more than K = 4 records: {made}");
     let tight = opts().with_loss_limits(4, 4096).unwrap();
-    // six lost inserts make six records and K = 4 keeps four: two are refused or evicted, whichever way they arrive, and the
-    // counter adds both (the records the cap refused and the records it evicted)
-    assert_eq!(
-        capped_by(&tight),
-        2,
-        "six lost inserts against K = 4: the cap refuses or evicts two"
-    );
+    let (capped, kept) = run(&tight);
+    // The document keeps K records; every record made beyond K was refused or evicted, whichever way it arrived, and the
+    // counter adds both (the records the cap refused and the records it evicted).
+    assert_eq!(kept, 4, "the cap keeps K records");
+    assert_eq!(capped, made - 4, "every record beyond K was counted, refused or evicted");
 }
