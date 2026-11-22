@@ -284,6 +284,10 @@ impl AppState {
             held_marks: self.engine.held_marks()?,
             // What U1 refused, by origin (a monotonic count the engine keeps, capped at 64 labels).
             clock_refusals: self.engine.clock_refusals(),
+            // How far this member's own clock leads its physical clock, and how long a peer still refuses its entries for
+            // theirs, in whole seconds rounded up (U1's guard on schema changes reads the same two).
+            clock_hlc_lead_seconds: self.engine.clock_lead_ms().div_ceil(1000),
+            own_stamps_refused_seconds: self.engine.own_stamps_refused_for_ms().div_ceil(1000),
             // What the cap and the limits of the loss records dropped, by reason (a counter the engine keeps).
             loss_records_refused: self.engine.loss_records_refused(),
             conflicts_resolved: self.engine.conflicts_resolved(),

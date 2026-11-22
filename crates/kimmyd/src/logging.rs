@@ -2333,6 +2333,22 @@ impl TelemetryGuard {
             "Entries this node holds as state rather than history, waiting to arrive in a sync window contiguous from its position; read at export.",
             sync_held_marks
         );
+        // U1's guard on schema changes reads these two (a member that leads its own clock, or that a peer refuses for
+        // its clock, refuses schema changes with 503 clock_ahead).
+        observe!(
+            u64_observable_gauge,
+            "kimmy.clock.hlc_lead",
+            "s",
+            "How far this member's logical clock leads its own physical clock, in whole seconds; 0 when it does not. Above max_clock_skew_secs, every other member holds back this member's entries and its schema changes are refused with 503 clock_ahead.",
+            clock_hlc_lead_seconds
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.clock.own_stamps_refused",
+            "s",
+            "How long, in whole seconds, a live peer is still known to refuse this member's entries for their clock; 0 when none does. While above 0, this member's schema changes are refused with 503 clock_ahead.",
+            own_stamps_refused_seconds
+        );
         observe!(
             u64_observable_counter,
             "kimmy.sync.repair_rounds",

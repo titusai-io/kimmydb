@@ -592,6 +592,8 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         aggregate_pool_used_bytes: 0,
         held_marks_released: 14,
         held_marks: 15,
+        clock_hlc_lead_seconds: 0,
+        own_stamps_refused_seconds: 0,
         webhook_active: 18,
         webhook_invalidated: 19,
         webhook_unreadable: 21,

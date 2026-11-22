@@ -810,6 +810,7 @@ impl Confirmer {
                 #[cfg(test)]
                 self.answered.fetch_add(1, Ordering::SeqCst);
                 queue.backoff = None;
+                note_peer_clock_answer(&self.engine, &answer);
                 for mut waiter in waiting {
                     if waiter.node != answer.their_node {
                         waiter.resolve(other_member(addr));
@@ -921,6 +922,19 @@ fn other_member(addr: SocketAddr) -> Resolution {
 
 /// What an answered window decides for one waiter: `None` to carry it to the
 /// next push (ADR-191, §4.2 of its design).
+/// What a member's answer to a push says about this origin's stamps (U1, signal b2 of the guard on schema changes): that
+/// it stopped at an entry of this origin because the entry's clock is past its bound, and for how long, which
+/// [`Engine::note_own_stamps_refused`] records; or that the window went through, which ends what it recorded for that
+/// member. A stop at an entry of another origin says nothing about this one and changes nothing.
+fn note_peer_clock_answer(engine: &Engine, answer: &Answer) {
+    let reply = &answer.reply;
+    if reply.clock_refused == 0 {
+        engine.note_own_stamps_not_refused(answer.their_node);
+    } else if reply.stopped_at.is_some_and(|at| at.origin() == engine.origin()) {
+        engine.note_own_stamps_refused(answer.their_node, reply.clock_due_in_ms);
+    }
+}
+
 fn resolve_answered(waiter: &Waiter, answer: &Answer) -> Option<Resolution> {
     let stamp = waiter.entry.stamp;
     let reply = &answer.reply;
@@ -1370,6 +1384,45 @@ mod tests {
             versions: vector,
             reply,
         }
+    }
+
+    /// The pusher's side of U1's guard on schema changes: a member's answer that it stopped at an entry of this origin
+    /// for its clock is recorded with how long it says it will refuse; an answer that carried no refusal ends it; a stop
+    /// at another origin's entry changes nothing.
+    #[test]
+    fn a_members_clock_refusal_of_this_origin_is_recorded_and_a_later_clean_answer_ends_it() {
+        let (engine, _dir) = engine();
+        let mine = Stamp::new(Hlc::new(5, 0), engine.node_id(), engine.origin().epoch);
+        let theirs = stamp(5, 7);
+        let refused = |at: Stamp, due: u64| {
+            answered(
+                &[at],
+                &[],
+                Reply {
+                    clock_refused: 1,
+                    clock_due_in_ms: due,
+                    stopped_at: Some(at),
+                    ..Reply::default()
+                },
+            )
+        };
+
+        // A stop at another origin's entry: nothing is recorded.
+        note_peer_clock_answer(&engine, &refused(theirs, 60_000));
+        assert_eq!(engine.own_stamps_refused_for_ms(), 0, "not this origin's entry");
+
+        // A stop at this origin's entry: recorded, with the member's own due time.
+        note_peer_clock_answer(&engine, &refused(mine, 60_000));
+        let held = engine.own_stamps_refused_for_ms();
+        assert!((55_000..=60_000).contains(&held), "about the member's 60 s: {held}");
+
+        // A stop at another origin's entry does not end it either.
+        note_peer_clock_answer(&engine, &refused(theirs, 1_000));
+        assert!(engine.own_stamps_refused_for_ms() > 50_000, "still recorded");
+
+        // A later answer that carried no clock refusal ends it.
+        note_peer_clock_answer(&engine, &answered(&[mine], &[mine], Reply::default()));
+        assert_eq!(engine.own_stamps_refused_for_ms(), 0, "the window went through");
     }
 
     /// T3: an entry in the window but above the vector it was introduced with

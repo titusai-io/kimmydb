@@ -170,6 +170,11 @@ pub struct StorageReadings {
     /// What U1 has refused since start, by the origin's node id in hex: at most 64 named and the
     /// rest summed under `other` (`Engine::clock_refusals`). Not a level: a monotonic count.
     pub clock_refusals: Vec<(String, u64)>,
+    /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
+    pub clock_hlc_lead_seconds: u64,
+    /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
+    /// (`Engine::own_stamps_refused_for_ms`): 0 when none does.
+    pub own_stamps_refused_seconds: u64,
     /// Loss records not kept since start, by reason (`Engine::loss_records_refused`): refused on arrival (`cap`, `floor`,
     /// `horizon`, `oversize`, `invalid`) and `evicted` (held ones a newer record displaced). A monotonic count.
     pub loss_records_refused: Vec<(&'static str, u64)>,
@@ -598,6 +603,10 @@ pub struct MetricsSnapshot {
     pub sync_held_marks_released: u64,
     /// Entries held as state right now (ADR-160): an engine reading.
     pub sync_held_marks: u64,
+    /// How far this member's logical clock leads its physical clock (an engine reading), in seconds.
+    pub clock_hlc_lead_seconds: u64,
+    /// How long a live peer is still known to refuse this member's entries for their clock (an engine reading), in seconds.
+    pub own_stamps_refused_seconds: u64,
     /// Rounds spent repairing against a peer (ADR-148): re-serving its
     /// oplog from below this node's position or pulling its snapshot, on
     /// the strength of a confirmed divergence or a stopped batch.
@@ -1621,6 +1630,8 @@ impl Metrics {
             sync_entries_skipped_clock_refused: self.get(&self.sync_entries_skipped_clock_refused),
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
+            clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
+            own_stamps_refused_seconds: readings.own_stamps_refused_seconds,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
             sync_reset_ticks: self.get(&self.sync_reset_ticks),
             sync_pulls: *self.sync_pulls.lock(),
@@ -2066,6 +2077,12 @@ impl Metrics {
              # HELP kimmy_sync_clock_refused_total Replicated entries and snapshot documents of any collection this node refused until due because their clock is more than max_clock_skew_secs ahead of its own (U1), by the origin (node id) that sent them. One per stopped batch or page, counted once its commit is final; at most 64 origins are named and the rest are summed under origin=\"other\", because the label comes from a peer's stamp. A refused entry is neither applied nor witnessed and applies once it is due: a rising value names a member whose clock is ahead of this one by more than the bound, or a write from the future.\n\
              # TYPE kimmy_sync_clock_refused_total counter\n\
              {sync_clock_refused_lines}\
+             # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.\n\
+             # TYPE kimmy_clock_hlc_lead_seconds gauge\n\
+             kimmy_clock_hlc_lead_seconds {clock_hlc_lead_seconds}\n\
+             # HELP kimmy_clock_own_stamps_refused_seconds How long, in whole seconds rounded up, a live peer is still known to refuse this member's entries because their clock is past that peer's max_clock_skew_secs, on this member's clock; 0 when none does. A gauge, read at scrape. It is set when a peer's answer to a push says it stopped at an entry of this member for its clock, and ends when a later push to that peer went through or the time passes. While it is above 0 this member's schema changes and replacing $out requests are refused with 503 clock_ahead. A peer whose clock is behind is the usual cause: check the clocks.\n\
+             # TYPE kimmy_clock_own_stamps_refused_seconds gauge\n\
+             kimmy_clock_own_stamps_refused_seconds {own_stamps_refused_seconds}\n\
              # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.\n\
              # TYPE kimmy_sync_held_marks_released_total counter\n\
              kimmy_sync_held_marks_released_total {sync_held_released}\n\
@@ -2334,6 +2351,8 @@ impl Metrics {
                 .collect::<String>(),
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
+            clock_hlc_lead_seconds = readings.clock_hlc_lead_seconds,
+            own_stamps_refused_seconds = readings.own_stamps_refused_seconds,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
             sync_reset_ticks = self.get(&self.sync_reset_ticks),
             sync_pulled_entries = pulls.entries,
@@ -3338,6 +3357,8 @@ mod tests {
                 ("01010101010101010101010101010101".to_string(), 94),
                 ("other".to_string(), 95),
             ],
+            clock_hlc_lead_seconds: 7_001,
+            own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
                 ("cap", 7_201),
                 ("evicted", 7_202),
@@ -4131,6 +4152,12 @@ kimmy_sync_entries_skipped_total{reason=\"clock_refused\"} 82
 # TYPE kimmy_sync_clock_refused_total counter
 kimmy_sync_clock_refused_total{origin=\"01010101010101010101010101010101\"} 94
 kimmy_sync_clock_refused_total{origin=\"other\"} 95
+# HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.
+# TYPE kimmy_clock_hlc_lead_seconds gauge
+kimmy_clock_hlc_lead_seconds 7001
+# HELP kimmy_clock_own_stamps_refused_seconds How long, in whole seconds rounded up, a live peer is still known to refuse this member's entries because their clock is past that peer's max_clock_skew_secs, on this member's clock; 0 when none does. A gauge, read at scrape. It is set when a peer's answer to a push says it stopped at an entry of this member for its clock, and ends when a later push to that peer went through or the time passes. While it is above 0 this member's schema changes and replacing $out requests are refused with 503 clock_ahead. A peer whose clock is behind is the usual cause: check the clocks.
+# TYPE kimmy_clock_own_stamps_refused_seconds gauge
+kimmy_clock_own_stamps_refused_seconds 7002
 # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.
 # TYPE kimmy_sync_held_marks_released_total counter
 kimmy_sync_held_marks_released_total 53
@@ -4814,6 +4841,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         ));
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
         expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
+        expect(&format!("kimmy_clock_hlc_lead_seconds {}\n", s.clock_hlc_lead_seconds));
+        expect(&format!(
+            "kimmy_clock_own_stamps_refused_seconds {}\n",
+            s.own_stamps_refused_seconds
+        ));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
         expect(&format!("kimmy_sync_reset_ticks_total {}\n", s.sync_reset_ticks));
         expect(&format!("kimmy_sync_pulled_entries_total {}\n", s.sync_pulls.entries));
@@ -5153,6 +5185,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             + 6
             // Since Q7 Step 4 (C8), `kimmy_conflicts_resolved_total` and its six kinds.
             + 6
+            // Since U1's guard on schema changes, `kimmy_clock_hlc_lead_seconds` and
+            // `kimmy_clock_own_stamps_refused_seconds`.
+            + 2
             // Since Q7 Step 1, `kimmy_epoch_origins`.
             + 1 + 108 + 6 + 17
                 + 3 * 19

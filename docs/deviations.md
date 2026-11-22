@@ -4255,6 +4255,20 @@ When members write one document concurrently, every member serves the same order
 
 **Workaround.** None needed for values. Do not rely on the order of two counters under a field that another member replaces.
 
+<a id="own-clock-ahead-u1"></a>
+
+## 🟡 A member whose clock is far ahead still makes one change before a peer's refusal reaches it
+
+**What you will see.** Every replicated stamp is held to `storage.max_clock_skew_secs` before it is witnessed, so a member whose own clock runs ahead cannot drag the others' clocks forward, and a schema change (or a replacing `$out`) made on a member whose logical clock leads its own clock by more than the bound, or that a live peer says it is refusing for its clock, is refused with `503 clock_ahead` and nothing is written. A member that is far ahead and has not yet heard a peer's refusal does not know: its first schema change is accepted, and the rest of the cluster holds it back until it is due. Within the bound this is the existing skew contract.
+
+**Why.** The refusal is decided on two local signals (the member's own clock lead, and a peer's answer to a push), and neither exists before the member has pushed something to a peer and been answered.
+
+**Workaround.** Fix the member's clock. `kimmy_clock_hlc_lead_seconds` and `kimmy_clock_own_stamps_refused_seconds` say which signal a member has.
+
+**To close:** none planned.
+
+---
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —

@@ -6576,7 +6576,7 @@ pub(crate) fn index_range(
 /// (`storage.max_clock_skew_secs`): `None` when it is within it. The mint stays at the clock resumed from the
 /// store's highest stamp, never lowered to the physical clock: an epoch must order above every epoch this node has
 /// had, which a start below a stamp or an epoch the store holds would break. A start this far ahead can come only of
-/// a stamp the bound does not hold (a document collection's entry, or a clock that ran ahead), and is said at the
+/// a clock that ran ahead (every replicated stamp is held to the bound), and is said at the
 /// mint, since peers hold the origin until it is due.
 pub(crate) fn epoch_start_gap_ms(start: Hlc, now_ms: u64) -> Option<u64> {
     start

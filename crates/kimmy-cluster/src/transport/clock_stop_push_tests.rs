@@ -40,12 +40,16 @@ async fn a_push_whose_apply_returns_the_clock_refusal_is_answered_pushed_and_not
     };
     let (served, reply) = tokio::join!(serving, pushing);
     match reply {
-        Message::Pushed { clock_refused, stopped_at, .. } => {
+        Message::Pushed { clock_refused, clock_due_in_ms, stopped_at, .. } => {
             assert_eq!(
                 clock_refused, 1,
                 "the reply is a Pushed frame, not a Fault: it says the stop"
             );
             assert!(stopped_at.is_some(), "and names the entry it stopped at");
+            assert_eq!(
+                clock_due_in_ms, 1,
+                "and how long, on the receiver's clock, until that entry is due (the hook's stop is due in 1 ms)"
+            );
         }
         other => panic!("the reply is a Pushed frame, not a Fault: {other:?}"),
     }

@@ -12,6 +12,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **A schema change is refused with `503 clock_ahead` when this member's own changes would be held back by the rest of the cluster.** Creating or dropping a database, a collection or an index, setting a validator and configuring vectors (and, when it ships, a replacing `$out`) now ask first: if this member's logical clock leads its own physical clock by more than `storage.max_clock_skew_secs`, or a live peer has said it is refusing this member's entries for their clock, nothing is written and the answer names the cause and says to retry on another member. Ordinary writes are not refused. New gauges, also on OTLP: `kimmy_clock_hlc_lead_seconds` and `kimmy_clock_own_stamps_refused_seconds`. The `Pushed` reply of the cluster protocol carries how long a peer will refuse an entry, so **the cluster protocol is 4**. See [operations](docs/operations.md).
+
 ### Fixed
 
 - **A far-future entry of a `document` collection no longer drags every member's clock forward.** An entry stamped more than `storage.max_clock_skew_secs` (300 s by default) ahead of a member's clock was refused until due when it was a `field` entry, a schema change or a loss record, and applied as before when it was an entry of a `document` collection. Applying it witnessed its stamp, the logical clock has no clamp, and so one such entry (a mis-set clock is enough) moved the member's clock to it; everything that member minted afterwards sat at or above it, and every other member refused its `field` writes and schema changes until due, with every client still answered `200`. System collections are `document` collections, so the entry reached every member. Every replicated stamp is now bounded before it is witnessed, whatever its kind and the collection's merge policy, so an honest member's logical clock never leads its own physical clock by more than the bound through replication. `kimmy_sync_clock_refused_total` counts every kind. See [storage](docs/storage.md).
