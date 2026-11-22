@@ -393,6 +393,12 @@ impl Member {
         }
         if !a.fresh.is_empty() {
             w.stats.add("q7_records_fresh", a.fresh.len() as i64);
+            // main's cap and cut (b41380f1): a record whose value the cut shortened. The harness runs the default limits (64
+            // records, 4096 bytes); this counter says whether a grid ever reached them.
+            w.stats.add(
+                "loss_cut",
+                a.fresh.iter().filter(|(_, lv)| crate::field::is_cut(lv)).count() as i64,
+            );
             self.mint_q7(w, &e.phys, e.key, &a.fresh);
         }
         if !e.staging {

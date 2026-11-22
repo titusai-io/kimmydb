@@ -1189,6 +1189,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "refusal_open_at_run_end",
         "refusal_open_at_run_end_info",
         "q7_records_fresh",
+        "loss_cut",
         "same_write_held",
     ] {
         res.insert(format!("cnt_{kk}"), st.get(kk));

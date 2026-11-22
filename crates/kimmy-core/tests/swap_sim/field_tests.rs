@@ -405,3 +405,51 @@ fn seed_406_passes_because_the_whole_insert_record_covers_the_insert() {
             .any(|k| k.key == 3 && k.path.is_none() && k.stamp.is_some_and(|s| hlc_of(&s) == 28))
     }));
 }
+
+/// Main's cut keeps the part of a lost value that fit (`CutValue`, `CutFields`). The oracle compares a loss value by its
+/// rendering, and the model's rendering is of the value "not yet cut": a cut value that rendered as the whole value would
+/// compare equal to it, and a truncated value would pass for the lost one.
+fn the_cut_variants_and_their_uncut_forms() -> Vec<(LossValue, LossValue)> {
+    use kimmy_core::merge_state::Value;
+    let value = Value::String("a lost value".to_string());
+    let paths = vec![p("a"), p("b")];
+    vec![
+        (LossValue::CutValue(value.clone()), LossValue::Value(value)),
+        (LossValue::CutFields(paths.clone()), LossValue::Fields(paths)),
+    ]
+}
+
+use kimmy_core::merge_state::LossValue;
+
+#[test]
+fn a_cut_loss_value_never_renders_as_its_uncut_form() {
+    for (cut_form, whole) in the_cut_variants_and_their_uncut_forms() {
+        assert!(is_cut(&cut_form) && !is_cut(&whole));
+        assert_ne!(
+            rendered_loss(&cut_form),
+            rendered_loss(&whole),
+            "{cut_form:?} must render apart from {whole:?}"
+        );
+    }
+    let [(cv, _), (cf, _)] =
+        <[_; 2]>::try_from(the_cut_variants_and_their_uncut_forms()).expect("two");
+    assert!(rendered_loss(&cv).starts_with("cut("), "named: {}", rendered_loss(&cv));
+    assert!(rendered_loss(&cf).starts_with("cutFields"), "named: {}", rendered_loss(&cf));
+}
+
+/// The mutant `m-render-cut-as-uncut` maps the two cut arms onto the uncut ones: the test above must fail under it.
+#[test]
+fn the_mutant_that_renders_a_cut_value_as_the_whole_is_killed() {
+    let apart = |on: bool| {
+        with_render_cut_as_uncut(on, || {
+            the_cut_variants_and_their_uncut_forms()
+                .iter()
+                .all(|(c, w)| rendered_loss(c) != rendered_loss(w))
+        })
+    };
+    assert!(apart(false), "control: the real rendering keeps them apart");
+    assert!(
+        !apart(true),
+        "the mutant renders both cut forms as the uncut ones and the check sees it"
+    );
+}

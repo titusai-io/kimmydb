@@ -22,7 +22,8 @@ use crate::trace::{all_diffs, entry_v, member_view};
 use crate::world::Policy;
 
 /// Counters only the `field` policy has.
-const FIELD_ONLY: [&str; 3] = ["cnt_covered_skips", "cnt_q7_records_fresh", "cnt_same_write_held"];
+const FIELD_ONLY: [&str; 4] =
+    ["cnt_covered_skips", "cnt_q7_records_fresh", "cnt_same_write_held", "cnt_loss_cut"];
 
 /// A workload shape: a name and the configurations it runs.
 pub struct Shape {

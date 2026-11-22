@@ -214,12 +214,44 @@ fn is_marker(v: &Value) -> bool {
     matches!(v, Value::Map | Value::ImplicitMap)
 }
 
+/// A loss record's value as the oracle compares it. A value that main's cut kept only a part of (`CutValue`,
+/// `CutFields`) renders as itself, apart from the uncut form: the model's rendering of a lost value is "not yet cut", so
+/// a cut value must never compare equal to one, or a truncated value would pass as the whole (`is_cut` counts them).
 fn render_loss(v: &LossValue) -> String {
+    let as_uncut = RENDER_CUT_AS_UNCUT.with(std::cell::Cell::get);
     match v {
         LossValue::Value(x) => render(x),
         LossValue::Total(n) => format!("{n:?}"),
         LossValue::Fields(f) => format!("{f:?}"),
+        LossValue::CutValue(x) if as_uncut => render(x),
+        LossValue::CutValue(x) => format!("cut({})", render(x)),
+        LossValue::CutFields(f) if as_uncut => format!("{f:?}"),
+        LossValue::CutFields(f) => format!("cutFields{f:?}"),
     }
+}
+
+/// Whether main's cut kept only a part of a loss record's value (`LossValue::CutValue`, `LossValue::CutFields`).
+pub fn is_cut(v: &LossValue) -> bool {
+    matches!(v, LossValue::CutValue(_) | LossValue::CutFields(_))
+}
+
+thread_local! {
+    /// MUTANT `m-render-cut-as-uncut` (test-only, a runtime switch like the `Flags`): the two cut arms of `render_loss`
+    /// render as the uncut forms. Killed by `a_cut_loss_value_never_renders_as_its_uncut_form`.
+    static RENDER_CUT_AS_UNCUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the `m-render-cut-as-uncut` mutant on or off on this thread, and put the switch back.
+pub fn with_render_cut_as_uncut<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let before = RENDER_CUT_AS_UNCUT.with(|c| c.replace(on));
+    let out = f();
+    RENDER_CUT_AS_UNCUT.with(|c| c.set(before));
+    out
+}
+
+/// How a loss value renders (the oracle's comparison form), for the tests that pin it.
+pub fn rendered_loss(v: &LossValue) -> String {
+    render_loss(v)
 }
 
 /// The writes of a state that are after `after` (the earliest superseding event): its registers, its counter slots, its
