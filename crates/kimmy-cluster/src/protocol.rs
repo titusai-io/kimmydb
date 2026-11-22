@@ -53,7 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The cluster protocol this build speaks. Every member must run one
 /// release: a `Hello` or `Welcome` that does not name this protocol is refused
 /// ([`release_fault`]).
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// What a member says to a peer whose handshake named `theirs` instead of
 /// [`PROTOCOL`], naming both.
@@ -64,7 +64,7 @@ pub fn release_fault(theirs: Option<u32>) -> String {
     };
     format!(
         "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}); the peer speaks {peer}; every member must run one release",
-        kimmy_core::build::SCHEMA_8_RELEASE
+        kimmy_core::build::PROTOCOL_4_RELEASE
     )
 }
 
@@ -592,6 +592,12 @@ pub enum Message {
         /// stamped after it left. `stopped_at` names the entry. Not a refusal of the change: the
         /// pusher's confirmation waits for it, and never counts it confirmed or refused.
         clock_refused: usize,
+        /// With `clock_refused`: how many milliseconds past the allowed skew, on the receiver's clock,
+        /// the entry the batch stopped at is, which is how long until it is due. 0 when the batch did
+        /// not stop at a clock refusal. A pusher cannot compute it, because the receiver's clock is
+        /// the one that is behind: it is what lets a member say how long its own stamps will be
+        /// refused (U1).
+        clock_due_in_ms: u64,
         /// The entries in the window the receiver refused or declined, by
         /// stamp (ADR-191): what lets a pusher whose window carried several
         /// changes say which of them a member could not take.
@@ -1167,7 +1173,8 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
-                clock_refused: 0,
+                clock_refused: 1,
+                clock_due_in_ms: 12_345,
                 refused: vec![kimmy_core::Stamp::new(
                     Hlc::new(3, 1),
                     NodeId::from_bytes([7; 16]),
@@ -1274,11 +1281,12 @@ mod tests {
                     deferred: 1,
                     purge_pending: 1,
                     clock_refused: 0,
+                    clock_due_in_ms: 0,
                     refused: Vec::new(),
                     stopped_at: None,
                 },
                 "Pushed",
-                vec!["ddl_held", "deferred", "purge_pending", "refused"],
+                vec!["ddl_held", "deferred", "purge_pending", "clock_due_in_ms", "refused"],
             ),
             (
                 Message::Divergence {
@@ -1330,6 +1338,34 @@ mod tests {
                 "incarnations": [[1i64, { "wall_ms": 9i64, "counter": 2i32 }]],
             } }
         );
+    }
+
+    /// The wire shape of the `Pushed` reply's clock fields (cluster protocol 4): the number of batches stopped at a clock
+    /// refusal and how long, on the receiver's clock, until the entry it stopped at is due, in milliseconds.
+    #[tokio::test]
+    async fn the_pushed_reply_writes_how_long_until_a_clock_refused_entry_is_due() {
+        let stopped_at =
+            kimmy_core::Stamp::new(Hlc::new(4, 0), NodeId::from_bytes([8; 16]), Epoch::ZERO);
+        let pushed = Message::Pushed {
+            applied: 0,
+            ddl: 0,
+            ddl_held: 0,
+            ddl_refused: 0,
+            unknown_collection: 0,
+            ddl_declined: 0,
+            deferred: 0,
+            purge_pending: 0,
+            clock_refused: 1,
+            clock_due_in_ms: 86_400_000,
+            refused: Vec::new(),
+            stopped_at: Some(stopped_at),
+        };
+        let written = written_document(&pushed).await;
+        let body = written.get_document("Pushed").expect("a Pushed frame");
+        assert_eq!(body.get_i64("clock_refused").unwrap(), 1);
+        assert_eq!(body.get_i64("clock_due_in_ms").unwrap(), 86_400_000, "{body:?}");
+        let stream = framed(&written);
+        assert_eq!(read_frame(&mut stream.as_slice()).await.unwrap(), pushed, "it round-trips");
     }
 
     /// Another task decoding an undecodable block on the same thread while this

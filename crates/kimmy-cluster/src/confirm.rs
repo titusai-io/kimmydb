@@ -267,6 +267,8 @@ struct Reply {
     unknown_collection: usize,
     purge_pending: usize,
     clock_refused: usize,
+    /// With `clock_refused`: how long until the entry the receiver stopped at is due, on the receiver's clock.
+    clock_due_in_ms: u64,
     refused: Vec<Stamp>,
     stopped_at: Option<Stamp>,
 }
@@ -770,6 +772,7 @@ impl Confirmer {
                 ddl_declined,
                 purge_pending,
                 clock_refused,
+                clock_due_in_ms,
                 refused,
                 stopped_at,
                 ..
@@ -783,6 +786,7 @@ impl Confirmer {
                     unknown_collection,
                     purge_pending,
                     clock_refused,
+                    clock_due_in_ms,
                     refused,
                     stopped_at,
                 },

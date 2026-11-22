@@ -32,6 +32,11 @@ pub const SCHEMA_7_RELEASE: &str = "0.58.0";
 /// refused, by this name.
 pub const SCHEMA_8_RELEASE: &str = "0.61.0";
 
+/// The release that introduced cluster protocol 4: the `Pushed` reply says how long until the entry a push was
+/// stopped at is due, so that a member whose own stamps a peer refuses for their clock can say for how long. A
+/// peer of an earlier release is refused at the handshake, by this name.
+pub const PROTOCOL_4_RELEASE: &str = "0.62.0";
+
 /// The release that introduced storage schema 10, and with it the refusal of a
 /// store or backup an older build wrote. Schema 10 changes how an index keys a
 /// path through arrays (a missing field, a scalar element and an empty array
