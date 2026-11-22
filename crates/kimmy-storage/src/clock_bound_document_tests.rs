@@ -9,7 +9,7 @@
 //! reached every member.
 
 use bson::doc;
-use kimmy_core::{DocId, Hlc, IndexField, MergePolicy, NodeId, OplogEntry, Stamp};
+use kimmy_core::{DocId, Hlc, IndexField, MergePolicy, NodeId, OpKind, OplogEntry, Stamp};
 
 use crate::{ClockRefusal, Engine, WalkScope, physical_now_ms};
 
@@ -113,4 +113,49 @@ fn a_field_write_and_a_schema_change_between_two_honest_members_replicate_after_
     let orders_b = c.b.get_collection("shop", "orders").unwrap();
     assert!(c.b.get(&orders_b, &DocId::Int64(7)).unwrap().is_some(), "the field write replicated");
     assert_eq!(c.b.list_indexes("shop", "orders").unwrap().len(), 1, "the createIndex replicated");
+}
+
+/// An entry that names no document is a collection-level operation: it merges nothing, and it used to be witnessed
+/// whatever its stamp.
+#[test]
+fn a_far_future_entry_with_no_document_is_refused_and_not_witnessed() {
+    let c = cluster();
+    let mut entry = c.far_entry.clone();
+    entry.doc_id = None;
+    entry.body = None;
+    for member in [&c.a, &c.b] {
+        let outcome = member.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!((outcome.applied, outcome.clock_refused), (0, 1), "{outcome:?}");
+        assert_eq!(member.witnessed_vector().unwrap().get(entry.stamp.origin()), Hlc::ZERO);
+        let lead = member.clock_last().wall_ms.saturating_sub(physical_now_ms());
+        assert!(lead <= SKEW_MS, "the logical clock followed the stamp: {lead} ms ahead");
+    }
+}
+
+/// A loss record addressed to a `document` collection is ignored, and used to be witnessed before the bound was read.
+#[test]
+fn a_far_future_loss_record_for_a_document_collection_is_refused_and_not_witnessed() {
+    let c = cluster();
+    let mut entry = c.far_entry.clone();
+    entry.kind = OpKind::LossRecord;
+    for member in [&c.a, &c.b] {
+        let outcome = member.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!((outcome.applied, outcome.clock_refused), (0, 1), "{outcome:?}");
+        let lead = member.clock_last().wall_ms.saturating_sub(physical_now_ms());
+        assert!(lead <= SKEW_MS, "the logical clock followed the stamp: {lead} ms ahead");
+    }
+}
+
+/// The single-entry form (`apply_remote`, the snapshot restore's and the tests') of an entry with no document.
+#[test]
+fn the_single_entry_form_refuses_a_far_future_entry_with_no_document() {
+    let c = cluster();
+    let mut entry = c.far_entry.clone();
+    entry.doc_id = None;
+    entry.body = None;
+    let notes = c.a.get_collection("shop", "notes").unwrap();
+    let err = c.a.apply_remote(&notes, &entry).expect_err("refused by name");
+    assert!(matches!(err, crate::StorageError::ClockRefused(_)), "{err:?}");
+    let lead = c.a.clock_last().wall_ms.saturating_sub(physical_now_ms());
+    assert!(lead <= SKEW_MS, "the logical clock followed the stamp: {lead} ms ahead");
 }

@@ -2131,7 +2131,9 @@ mod tests {
         body.insert("_id", chunk_id.to_bson());
         let entry = OplogEntry {
             stamp: Stamp::new(
-                Hlc::new(9_000_000_000_000, 0),
+                // The stamp is arbitrary here (a fresh chunk id, so no last-writer-wins
+                // contest); it is inside the clock bound (ADR-272).
+                Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0),
                 NodeId::from_bytes([9; 16]),
                 Epoch::ZERO,
             ),

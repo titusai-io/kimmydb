@@ -630,7 +630,7 @@ mod tests {
             engine.insert(&orders, doc! { "_id": 100, "u": 1 }).unwrap();
             let clash = kimmy_core::OplogEntry {
                 stamp: kimmy_core::Stamp::new(
-                    Hlc::new(u64::MAX >> 20, 0),
+                    Hlc::new(crate::physical_now_ms() + 100_000, 0),
                     kimmy_core::NodeId::from_bytes([9; 16]),
                     Epoch::ZERO,
                 ),

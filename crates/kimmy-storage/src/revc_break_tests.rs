@@ -425,7 +425,7 @@ fn delete_entry(collection: CollectionId, id: i64, at: Stamp) -> OplogEntry {
     }
 }
 
-/// Clock skew both ways: the sender's clock is an hour fast when it writes `x`, the
+/// Clock skew both ways: the sender's clock is two minutes fast when it writes `x`, the
 /// requester deletes `x` an hour of its own clock later than that, and collects when its
 /// slow clock finally passes the delete. Every comparison is between stamps, so the skew
 /// moves when things happen and never the order of `s` and the cutoff.
@@ -436,7 +436,8 @@ fn revc_clock_skew_cannot_make_a_collected_delete_young() {
     s.create_collection("shop", "orders").unwrap();
     pull(&r, &s);
     let hour = 3_600_000;
-    let fast = Stamp::new(Hlc::new(now() + hour, 0), s.node_id(), s.epoch());
+    // two minutes fast: inside the clock bound, which holds every replicated stamp, a `document` entry included
+    let fast = Stamp::new(Hlc::new(now() + 120_000, 0), s.node_id(), s.epoch());
     s.apply_batch(&[insert_entry(orders(), 7, fast)]).unwrap();
     pull(&r, &s);
     assert!(live(&r, 7), "premise");

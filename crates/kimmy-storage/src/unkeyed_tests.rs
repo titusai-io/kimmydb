@@ -414,7 +414,8 @@ impl Replays {
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
-        Self { base: now + 1_000_000 }
+        // ahead of every local stamp, and inside the clock bound (U1 bounds every replicated stamp)
+        Self { base: now + 100_000 }
     }
 
     fn put(&self, e: &Engine, c: &CollectionMeta, offset: u64, body: Document) {

@@ -3686,7 +3686,8 @@ mod tests {
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
-        let wall = now + 10_000_000 + WALL.fetch_add(1, Ordering::Relaxed);
+        // ahead of every local stamp, and inside the clock bound (U1 bounds every replicated stamp)
+        let wall = now + 100_000 + WALL.fetch_add(1, Ordering::Relaxed);
         let entry = kimmy_core::OplogEntry {
             stamp: Stamp::new(
                 kimmy_core::Hlc::new(wall, 0),

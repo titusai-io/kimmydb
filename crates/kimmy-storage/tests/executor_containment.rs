@@ -237,7 +237,12 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                 // replicated one never is (ADR-139).
                 let entry = kimmy_core::OplogEntry {
                     stamp: kimmy_core::Stamp::new(
-                        kimmy_core::Hlc::new(u64::MAX >> 20, extra as u16),
+                        // The stamp is arbitrary here (a fresh id, so no last-writer-wins
+                        // contest); it is inside the clock bound (ADR-272).
+                        kimmy_core::Hlc::new(
+                            kimmy_storage::physical_now_ms() + 60_000,
+                            extra as u16,
+                        ),
                         kimmy_core::NodeId::generate(),
                         Epoch::ZERO,
                     ),

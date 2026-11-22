@@ -1634,6 +1634,15 @@ fn entry_stamped(collection: kimmy_core::CollectionId, wall_ms: u64) -> kimmy_co
 
 /// Run a retention pass on every node as though it were `now_ms`, with the
 /// default day of retention for both the oplog and tombstones.
+/// Thirty-six hours pass for these members: their clocks, as the clock bound reads them, are where a write stamped 36 hours
+/// ahead is, so it is inside the bound and applies. (A peer far ahead of a member is what the bound refuses, and is not what
+/// these tests are about.)
+fn move_clocks_36_hours(nodes: &[&Node]) {
+    for node in nodes {
+        node.engine.set_clock_offset_for_tests((37 * HOUR_MS) as i64);
+    }
+}
+
 fn age_out(nodes: [&Node; 3], now_ms: u64) {
     for node in nodes {
         node.engine
@@ -1671,6 +1680,7 @@ async fn converged_after_a_long_silence() -> (Node, Node, Node, kimmy_core::Hlc)
     // 36 hours pass. Every member's clock moves, and the entry that moved it
     // becomes the tail each of them keeps through collection.
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    move_clocks_36_hours(&[&a, &b, &c]);
     b.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
     converge(&a, &b, &c).await;
     age_out([&a, &b, &c], later + HOUR_MS);
@@ -2560,6 +2570,7 @@ async fn a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapsh
     // retention.
     let (a, r, ca, s) = a_member_holding_a_repaired_entry_below_its_position().await;
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    move_clocks_36_hours(&[&a, &r]);
     a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
     a.engine
         .collect_garbage_at(
@@ -5563,6 +5574,7 @@ async fn a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_docum
     // Retention keeps an origin's newest entry, so a later write stands in
     // front of the delete before A collects a day behind it.
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    move_clocks_36_hours(&[&a, &c]);
     a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
     a.engine
         .collect_garbage_at(
@@ -5616,6 +5628,7 @@ async fn a_delete_reaches_a_member_through_one_that_never_held_the_document() {
 
     b.engine.insert(&cb, doc! { "_id": 3 }).unwrap();
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    move_clocks_36_hours(&[&a, &b, &c]);
     b.engine.apply_batch(&[entry_stamped(cb.id, later)]).unwrap();
     b.engine
         .collect_garbage_at(
@@ -9169,7 +9182,8 @@ const HOUR_AHEAD_MS: i64 = 3_660_000;
 #[tokio::test]
 async fn a_write_on_a_clock_behind_its_epochs_start_is_pulled_and_confirmed_only_once_held() {
     let writer = node().await;
-    let start = Hlc::new(kimmy_storage::engine::physical_now_ms() + 3_600_000, 0);
+    // behind the epoch's start by less than the clock bound: a member that leads by more refuses schema changes
+    let start = Hlc::new(kimmy_storage::engine::physical_now_ms() + 100_000, 0);
     let epoch = Epoch::new(start, [7; 8]);
     writer.engine.set_epoch_row_for_test(epoch);
     let writer = writer.restart().await;
@@ -9432,8 +9446,8 @@ async fn the_replay_moves_the_clock_past_the_lost_writes() {
     let mut backup = Vec::new();
     writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
     sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
-    // A write this member made an hour ahead of the clock it will restart with.
-    let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    // A write this member made ahead of the clock it will restart with (inside the clock bound, which holds every replicated stamp).
+    let ahead = kimmy_storage::physical_now_ms() + 100_000;
     let lost = kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(
             Hlc::new(ahead, 0),
@@ -10029,7 +10043,8 @@ async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
     let scenario = lost_tail(2, 0, true).await;
     let peer_only = scenario.peer.engine.create_collection("shop", "peer_only").unwrap();
     let me = scenario.restored.engine.origin();
-    let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    // ahead of the clock, inside the clock bound (which holds every replicated stamp)
+    let ahead = kimmy_storage::physical_now_ms() + 100_000;
     // A write the member made and lost sits in the epoch it was made under: the old one.
     let lost = kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), scenario.old.node, scenario.old.epoch),

@@ -1,7 +1,8 @@
 //! Step 3, package 3.0 (U1): a snapshot page that carries a document of a `field` collection whose clock is
 //! past the bound stops the snapshot at that page, never skips the document. The page is one transaction, so
 //! it is rolled back whole; nothing on it is applied, the snapshot does not move and no coverage is granted;
-//! the answer is `Ok` (the peer is not at fault), and the same page applies once the document is due.
+//! the answer is `Ok` (the peer is not at fault), and the same page applies once the document is due. The same
+//! holds for a document of a `document` collection: the bound covers every replicated stamp.
 
 use bson::doc;
 use kimmy_core::{DocId, MergePolicy};
@@ -148,4 +149,38 @@ fn every_file_that_writes_a_document_record_is_a_route_the_audit_names() {
         "a file that writes a document record is not in the audit of U1's routes: place it in \
          q7-step3-u1-plan.md and here"
     );
+}
+
+/// A snapshot page's documents of a `document` collection are bounded like a field collection's: the page stops, is
+/// rolled back whole, and applies once the document is due. Before, they were applied and their stamps witnessed.
+#[test]
+fn a_far_future_document_of_a_document_collection_by_snapshot_is_refused_and_the_page_rolls_back() {
+    let (a, _da) = engine();
+    let ca = a.create_collection_with_policy("shop", "notes", MergePolicy::Document, None).unwrap();
+    for i in 0..3i64 {
+        a.insert(&ca, doc! { "_id": i, "n": i }).unwrap();
+    }
+    let page = with_honest_definitions(a.snapshot_page(None, None).unwrap());
+    assert_eq!(page.documents.len(), 3, "premise: the page carries the three documents");
+
+    let (b, _db) = engine();
+    b.set_clock_offset_for_tests(-(SKEW_MS + 10_000));
+    let mut progress = SnapshotProgress::whole_database();
+    let applied = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+    let stop = applied.clock_refused.as_ref().expect("a document past the bound is refused");
+    assert_eq!(stop.reason, ClockRefusal::Stamp);
+    assert!(!progress.is_complete(), "a stop, not a skip");
+    let cb = b.get_collection("shop", "notes").expect("the definitions are applied first");
+    assert_eq!(b.count(&cb, WalkScope::Request).unwrap(), 0, "the page rolled back whole");
+    assert_eq!(
+        b.witnessed_vector().unwrap().get(a.origin()),
+        kimmy_core::Hlc::ZERO,
+        "nothing the page carried was witnessed"
+    );
+
+    b.set_clock_offset_for_tests(0);
+    let applied = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    assert!(applied.clock_refused.is_none(), "{applied:?}");
+    assert_eq!(b.count(&cb, WalkScope::Request).unwrap(), 3, "applied once due");
 }

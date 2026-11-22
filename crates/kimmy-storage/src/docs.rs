@@ -1581,7 +1581,9 @@ impl Engine {
     pub fn apply_remote(&self, coll: &CollectionMeta, entry: &OplogEntry) -> Result<bool> {
         if entry.doc_id.is_none() {
             // Collection-level operations carry no document to merge, and
-            // nothing to write: decided before the writer is taken.
+            // nothing to write: decided before the writer is taken. The stamp
+            // is bounded first (U1): a witnessed stamp moves the clock.
+            self.refuse_replicated_stamp(coll, entry)?; // U1: the single-entry form, before its witness
             self.witness(&entry.stamp);
             return Ok(false);
         }
@@ -1651,6 +1653,13 @@ impl Engine {
         entry: &OplogEntry,
         position: Position,
     ) -> Result<RemoteApplied> {
+        // U1: the one place every replicated entry and state passes, whatever brought it (a pull, a push, a replay, a
+        // snapshot page), whatever its kind and whatever the collection's merge policy, and in whatever position. Before
+        // anything is written and before anything is witnessed: the logical clock has no clamp, so a witnessed far-future
+        // stamp would be every later stamp this member mints, and every other member would refuse them until due. A field
+        // entry is also bounded by the state it carries; every other entry, a `document` entry and a loss record included,
+        // by its stamp.
+        self.refuse_replicated_stamp(coll, entry)?; // U1: the choke point, before the first witness
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
             self.witness(&entry.stamp);
@@ -1660,9 +1669,6 @@ impl Engine {
             return self.relay_loss_record(txn, coll, entry, position);
         }
         if coll.merge_policy == MergePolicy::Field {
-            // U1: the one place every field entry and state passes, whatever brought it (a pull, a
-            // push, a replay, a snapshot page) and in whatever position. Before anything is written.
-            self.refuse_if_far_future(entry)?;
             // A snapshot document of a field collection is state without an entry: it joins, and
             // no oplog entry or held mark is written for it (it is not history). One that carries
             // no merge state has nothing to join: a malformed page, refused by name rather than
@@ -2036,6 +2042,21 @@ impl Engine {
             None => None,
         };
         self.refuse_if_past_the_bound(&entry.stamp, vv_max_wall_ms)
+    }
+
+    /// U1 for a replicated entry addressed to `coll`, whatever its kind and whatever the collection's merge policy: a
+    /// `field` entry is bounded by the state it carries as well as by its stamp, every other entry (a `document` entry, a
+    /// loss record, an entry with no document) by its stamp. Called before the entry is witnessed or anything is written.
+    pub(crate) fn refuse_replicated_stamp(
+        &self,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+    ) -> Result<()> {
+        if coll.merge_policy == MergePolicy::Field && !entry.kind.is_loss_record() {
+            self.refuse_if_far_future(entry)
+        } else {
+            self.refuse_if_past_the_bound(&entry.stamp, None)
+        }
     }
 
     pub(crate) fn refuse_if_past_the_bound(
@@ -3687,7 +3708,8 @@ mod tests {
     fn applying_a_remote_write_advances_the_local_clock() {
         let (engine, coll, _dir) = engine();
         let id = DocId::Int64(1);
-        let far_future = 9_000_000_000_000;
+        // Ahead of this member's clock, and inside the bound: a stamp past it is refused and never witnessed.
+        let far_future = crate::physical_now_ms() + 120_000;
         let entry = remote_entry(&coll, &id, far_future, 9, Some(doc! { "_id": 1 }));
         engine.apply_remote(&coll, &entry).unwrap();
 

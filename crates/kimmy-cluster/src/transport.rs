@@ -13611,12 +13611,12 @@ mod tests {
         let mut backup = Vec::new();
         writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
 
-        // The peer holds a write stamped an hour ahead with this member's origin, in
-        // a collection this member has never heard of.
+        // The peer holds a write stamped ahead (inside the clock bound, which holds every replicated
+        // stamp) with this member's origin, in a collection this member has never heard of.
         let peer_dir = tempfile::tempdir().unwrap();
         let peer = Engine::open(&peer_dir.path().join("kimmy.redb")).unwrap();
         let elsewhere = peer.create_collection("shop", "peer_only").unwrap();
-        let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+        let ahead = kimmy_storage::physical_now_ms() + 100_000;
         let lost = kimmy_core::OplogEntry {
             stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id(), writer.epoch()),
             kind: kimmy_core::OpKind::Insert,

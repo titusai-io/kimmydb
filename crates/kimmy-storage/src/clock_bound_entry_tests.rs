@@ -305,9 +305,10 @@ fn the_refusal_is_counted_per_origin_and_capped_at_64() {
     assert_eq!(counts.last().unwrap().0, "other");
 }
 
-/// Not failing-first: it is green over the parent too. The guard that U1 bounds `field` collections only.
+/// The bound covers a `document` collection like any other (it used to carve it out, "applied as before"): an entry
+/// an hour ahead is refused by name and not witnessed, and one inside the bound applies.
 #[test]
-fn a_document_collection_is_not_bounded() {
+fn a_document_collection_is_bounded_like_any_other() {
     let f = fixture(MergePolicy::Document);
     let mut insert = f.write(1);
     insert.stamp = far(physical_now_ms() + 3_600_000, &insert.stamp);
@@ -316,7 +317,12 @@ fn a_document_collection_is_not_bounded() {
 
     assert_eq!(
         (outcome.applied, outcome.clock_refused),
-        (1, 0),
-        "a document collection is not bounded by U1"
+        (0, 1),
+        "a document collection's entry an hour ahead is refused"
     );
+    assert_eq!(outcome.clock_refused_at.as_ref().map(|s| s.reason), Some(ClockRefusal::Stamp));
+    let mut inside = f.write(2);
+    inside.stamp = far(physical_now_ms() + 100_000, &inside.stamp);
+    let outcome = f.b.apply_batch(std::slice::from_ref(&inside)).unwrap();
+    assert_eq!((outcome.applied, outcome.clock_refused), (1, 0), "inside the bound it applies");
 }

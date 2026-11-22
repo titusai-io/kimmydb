@@ -61,7 +61,9 @@ fn setup() -> (Engine, Engine, std::path::PathBuf, tempfile::TempDir) {
     let b = Engine::open(&dir.path().join("b.redb")).unwrap();
     let d_path = member_dir(&dir, "d");
     let d = Engine::open(&d_path).unwrap();
-    let t = (kimmy_storage::physical_now_ms() / 1000 + 3_600) * 1000;
+    // B's rows lie above anything D's own clock can reach while the test runs (a few
+    // seconds), and inside the clock bound (ADR-272, 300 s), so D does not refuse them.
+    let t = (kimmy_storage::physical_now_ms() / 1000 + 240) * 1000;
     let orders = b.create_collection("shop", "orders").unwrap();
     let items = b.create_collection("shop", "items").unwrap();
     b.insert(&orders, doc! { "_id": 0i64, "n": 0i64 }).unwrap();
@@ -332,7 +334,9 @@ fn a_restore_judges_each_entry_against_its_own_origins_position() {
     let c = Engine::open(&dir.path().join("c.redb")).unwrap();
     let d_path = member_dir(&dir, "d");
     let d = Engine::open(&d_path).unwrap();
-    let t = (kimmy_storage::physical_now_ms() / 1000 + 3_600) * 1000;
+    // B's rows lie above anything D's own clock can reach while the test runs (a few
+    // seconds), and inside the clock bound (ADR-272, 300 s), so D does not refuse them.
+    let t = (kimmy_storage::physical_now_ms() / 1000 + 240) * 1000;
     let orders = c.create_collection("shop", "orders").unwrap();
     let items = c.create_collection("shop", "items").unwrap();
     c.insert(&orders, doc! { "_id": 0i64 }).unwrap();

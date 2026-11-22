@@ -2587,7 +2587,7 @@ mod tests {
             let body = doc! {"_id": -1 - i, "a": [1, 2], "b": [3, 4], "status": "pending"};
             let entry = OplogEntry {
                 stamp: Stamp::new(
-                    kimmy_core::Hlc::new(u64::MAX >> 20, i as u16),
+                    kimmy_core::Hlc::new(crate::physical_now_ms() + 100_000, i as u16),
                     kimmy_core::NodeId::from_bytes([9; 16]),
                     Epoch::ZERO,
                 ),
