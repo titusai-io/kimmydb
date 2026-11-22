@@ -274,13 +274,19 @@ async fn a_batch_that_rolls_back_counts_nothing_and_leaves_no_entry_of_its_own()
     assert!(!own_loss_entries(&a).is_empty(), "control: and leave an entry of the member's own");
 }
 
-/// The emission window: a record older than the retention time by this member's clock is in the state, is not reported, and so is neither
-/// told nor counted. The event, the entry and the counter are one decision.
-#[tokio::test]
-async fn a_record_older_than_the_retention_time_enters_the_state_but_is_neither_told_nor_counted() {
+/// `a` and `b` write field `x` of one document in turn, and then `a` takes `b`'s entries with its clock `ahead_ms` ahead of the real one. The
+/// record of the write that lost enters `a`'s state either way.
+///
+/// The join retention is ten seconds, so the record cannot be refused as below the state's horizon (the retention under the newest version
+/// the state has seen) unless ten seconds of a loaded machine pass between the two writes. Whether the record is inside the emission window
+/// (the retention after the lost write's own time, by this member's clock) is set by moving the clock and not by waiting for it, so what the
+/// machine's load does to the gap between the two writes cannot move the answer.
+fn clash_met_with_the_clock_ahead_by(
+    ahead_ms: i64,
+) -> (Engine, CollectionMeta, [tempfile::TempDir; 2]) {
     let (a, da) = engine();
     let (b, db) = engine();
-    a.set_default_join_retention(Duration::from_millis(60));
+    a.set_default_join_retention(Duration::from_secs(10));
     let ca = a.create_collection_with_policy("shop", "orders", MergePolicy::Field, None).unwrap();
     b.apply_batch(&everything(&a)).unwrap();
     let cb = b.get_collection("shop", "orders").unwrap();
@@ -289,21 +295,39 @@ async fn a_record_older_than_the_retention_time_enters_the_state_but_is_neither_
     later();
     a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "x": 1 }, false).unwrap();
     b.replace(&cb, &DocId::Int64(1), doc! { "_id": 1, "x": 2 }, false).unwrap();
-    // Longer than the retention time passes before `a` meets `b`'s write: the lost write is old by `a`'s clock when the record enters.
-    std::thread::sleep(Duration::from_millis(200));
+    a.set_clock_offset_for_tests(ahead_ms);
 
     a.apply_batch(&everything(&b)).unwrap();
+    (a, ca, [da, db])
+}
 
-    let state = crate::field_write::load(
-        a.snapshot_page(None, Some(ca.id)).unwrap().documents[0].meta.as_deref(),
+fn losses_in_the_state_of(a: &Engine, coll: &CollectionMeta) -> usize {
+    crate::field_write::load(
+        a.snapshot_page(None, Some(coll.id)).unwrap().documents[0].meta.as_deref(),
     )
-    .unwrap();
-    assert!(!state.losses.is_empty(), "premise: the record is in the state");
+    .unwrap()
+    .losses
+    .len()
+}
+
+/// The emission window: a record older than the retention time by this member's clock is in the state, is not reported, and so is neither
+/// told nor counted. The event, the entry and the counter are one decision.
+#[tokio::test]
+async fn a_record_older_than_the_retention_time_enters_the_state_but_is_neither_told_nor_counted() {
+    // The control: with the clock as it is, the lost write is young and the record is reported. The same scenario, so the clock is the only
+    // difference between the two halves of the test.
+    let (a, ca, _dirs) = clash_met_with_the_clock_ahead_by(0);
+    assert!(losses_in_the_state_of(&a, &ca) > 0, "control premise: the record is in the state");
+    assert!(!own_loss_entries(&a).is_empty(), "control: a young lost write is told by an entry");
+    assert!(total(&a) > 0, "control: and counted");
+
+    // A clock a minute ahead of the lost write, which the retention (ten seconds) has long passed by it.
+    let (a, ca, _dirs) = clash_met_with_the_clock_ahead_by(60_000);
+    assert!(losses_in_the_state_of(&a, &ca) > 0, "premise: the record is in the state");
     assert!(own_loss_entries(&a).is_empty(), "no entry of its own for a record past the window");
     assert_eq!(total(&a), 0, "and no count");
     let mut stream = from_start(&a, &ca);
     assert!(loss_events(&drain(&a, &mut stream).await).is_empty(), "and no event");
-    drop((da, db));
 }
 
 /// The member whose own write wins: the record enters its state and the document does not change, which is another branch of the apply
