@@ -310,14 +310,18 @@ data, however old — and the index entries were already removed when the delete
 was applied, so nothing is left referring to the collected key.
 
 **Clock skew bound.** `storage.max_clock_skew_secs` (default 300 s) is how far ahead of
-this member's own clock an entry or snapshot document of a collection with merge policy
-`field` may be stamped. A write from the far future would move the horizon that prunes delete
-records on every member that joined it, and a pruned delete cannot be brought back, so such an
-entry, or a state that holds one, is refused until it is due: it is not applied or witnessed, the
-window or snapshot page stops at it and is asked for again, and it applies once this member's clock
-has caught up to within the bound. The setting is local to the member and is not replicated.
+this member's own clock any replicated entry or snapshot document may be stamped, whatever its
+kind and whatever the collection's merge policy. In a collection with merge policy `field`, a write
+from the far future would move the horizon that prunes delete records on every member that joined it,
+and a pruned delete cannot be brought back. In every collection, a stamp that this member witnessed
+would move its logical clock there, since the clock has no clamp, and everything the member minted
+afterwards would sit at or above it and be refused by every other member until due. So such an entry,
+or a state that holds one, is refused until it is due: it is not applied or witnessed, the window or
+snapshot page stops at it and is asked for again, and it applies once this member's clock has caught up
+to within the bound. An honest member's logical clock therefore never leads its own physical clock by
+more than the bound through replication. The setting is local to the member and is not replicated.
 
-The same bound covers what a peer says about its clock, whatever the merge policy. A schema change (a
+The same bound covers what a peer says about its clock. A schema change (a
 drop, a creation, a definition) stamped past the bound is refused until due as an entry is, before anything
 is written, and so is a snapshot page that carries one; a drop stamped far ahead would be the floor of the
 collection on every member that took it and would move this member's own clock to it. What a peer says it has
@@ -327,7 +331,8 @@ starts past it is left out, so a claim of far-future coverage cannot mark real e
 never asked for. A tombstone horizon a snapshot page carries is adopted only up to this member's own clock,
 since an honest horizon is the sender's clock minus the join retention and never ahead of it; and a replay
 position past the bound is not served. All of it is counted in `kimmy_sync_clock_refused_total{origin}`, once
-for a frame. The entries and documents of a `document` collection are applied as before. `Hello`, `Welcome`
+for a frame. The entries and documents of a `document` collection are bounded like any other (until 0.62.0
+they were applied as before). `Hello`, `Welcome`
 and `Confirm` carry no time and are not checked.
 
 **Join retention (`R`).** The horizon below which a `field` collection's deletes and dead lives are pruned is

@@ -10,6 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A far-future entry of a `document` collection no longer drags every member's clock forward.** An entry stamped more than `storage.max_clock_skew_secs` (300 s by default) ahead of a member's clock was refused until due when it was a `field` entry, a schema change or a loss record, and applied as before when it was an entry of a `document` collection. Applying it witnessed its stamp, the logical clock has no clamp, and so one such entry (a mis-set clock is enough) moved the member's clock to it; everything that member minted afterwards sat at or above it, and every other member refused its `field` writes and schema changes until due, with every client still answered `200`. System collections are `document` collections, so the entry reached every member. Every replicated stamp is now bounded before it is witnessed, whatever its kind and the collection's merge policy, so an honest member's logical clock never leads its own physical clock by more than the bound through replication. `kimmy_sync_clock_refused_total` counts every kind. See [storage](docs/storage.md).
+
 ## 0.61.0 - 2026-11-21
 
 0.61.0 makes field-level merge the default: a collection merges concurrent writes field by field, keeps and reports what a merge lost, and tells a change stream and a webhook about it. It also gives a path through arrays one rule and a document value one order, and it lengthens every stamp, resume token and webhook event id, so it is a `0.MINOR` bump and a wipe release.
