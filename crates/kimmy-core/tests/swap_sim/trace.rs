@@ -20,8 +20,8 @@ use crate::world::{Policy, World};
 
 /// Counters only the `field` policy keeps (the covered-entry skip, the loss records its joins produce); not in the model, so
 /// excluded from the counter comparison of a `field` replay and from nothing else.
-pub const FIELD_ONLY_STATS: [&str; 4] =
-    ["covered_skips", "q7_records_fresh", "same_write_held", "loss_cut"];
+pub const FIELD_ONLY_STATS: [&str; 5] =
+    ["covered_skips", "q7_records_fresh", "same_write_held", "loss_cut", "loss_capped"];
 
 /// The counters of the Rust-only emulations (the route tests' live page read, `Repair::Replay`, the push, the product routes' held
 /// entries and DF-1's marker): the model has none of them, so they are left out of the counter comparison (they count, they decide

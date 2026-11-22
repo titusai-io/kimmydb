@@ -453,3 +453,36 @@ fn the_mutant_that_renders_a_cut_value_as_the_whole_is_killed() {
         "the mutant renders both cut forms as the uncut ones and the check sees it"
     );
 }
+
+/// Main's cap keeps at most K loss records per document. A join that refuses or evicts a record because of it says so
+/// (`join_counted`), and the harness counts those (`cnt_loss_capped`): 0 under the default 64 records, above 0 once a document
+/// takes more lost writes than K.
+#[test]
+fn the_loss_records_the_cap_refuses_or_evicts_are_counted() {
+    let capped_by = |o: &kimmy_core::merge_state::JoinOptions| -> usize {
+        // seven writers' concurrent first inserts: one life survives and the others are lost, one record each
+        let states: Vec<_> = (0..7)
+            .map(|i| {
+                local_write(i, None, DocOp::Insert, 10 + i as i64, &format!("m{i}"), o, false)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let mut cur = Some(ver_of(states[0].clone(), stamp(10, 0), o));
+        let mut capped = 0;
+        for (i, state) in states.iter().enumerate().skip(1) {
+            let mut e = Entry::new(i, 10 + i as i64, Kind::Doc);
+            e.fstate = Some(state.clone());
+            let applied = apply_entry(cur.as_ref(), &e, o, false, false);
+            capped += applied.loss_capped;
+            cur = Some(applied.ver);
+        }
+        capped
+    };
+    assert_eq!(capped_by(&opts()), 0, "control: the default limits hold all of them");
+    let tight = opts().with_loss_limits(4, 4096).unwrap();
+    assert!(
+        capped_by(&tight) > 0,
+        "six lost inserts against K = 4: the cap refuses or evicts some"
+    );
+}

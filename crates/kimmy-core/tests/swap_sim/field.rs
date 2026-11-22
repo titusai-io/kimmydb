@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use kimmy_core::merge_state::{
-    JoinOptions, LossAt, LossValue, MStamp, MergeState, Path, Value, Writer, join,
+    JoinOptions, LossAt, LossValue, MStamp, MergeState, Path, Value, Writer, join, join_counted,
 };
 
 use crate::entry::*;
@@ -83,6 +83,9 @@ pub struct Applied {
     pub skipped: bool,
     /// the records the join detected that were new to the joined state (Q7's family)
     pub fresh: Vec<(kimmy_core::merge_state::LossKey, LossValue)>,
+    /// the loss records main's cap (K per document) refused or evicted in this join (`LossCounts::refused` and
+    /// `evicted`): 0 under the default limits (64 records), which a harness run rarely reaches
+    pub loss_capped: usize,
 }
 
 /// Apply the entry `e` to the version `cur` (`None`: the document is unknown here). `missing`: the physical is a
@@ -103,6 +106,7 @@ pub fn apply_entry(
             same_write: false,
             skipped: false,
             fresh: es.losses.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            loss_capped: 0,
         };
     };
     let base = cur.state.as_ref().expect("a field version carries its state");
@@ -123,9 +127,10 @@ pub fn apply_entry(
             same_write: cur.stamp == e.stamp,
             skipped: true,
             fresh: Vec::new(),
+            loss_capped: 0,
         };
     }
-    let (merged, fresh) = join(base, es, o);
+    let (merged, fresh, counts) = join_counted(base, es, o);
     let changed = merged != **base;
     let (applied, held_state) = match &cur.applied {
         Some(a) => {
@@ -149,6 +154,7 @@ pub fn apply_entry(
         same_write: cur.stamp == e.stamp,
         skipped: false,
         fresh: new_fresh,
+        loss_capped: counts.refused + counts.evicted,
     }
 }
 
