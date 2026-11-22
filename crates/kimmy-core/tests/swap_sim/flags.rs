@@ -74,6 +74,12 @@ pub struct Flags {
     /// Rust-only mutant `m-window-noncontiguous` (H-Q6-R2): a window delivers the HIGHEST-stamp entry the source appended and the
     /// receiver lacks, not the lowest, so the receiver's coverage is raised past entries not sent
     pub fm_window_noncontiguous: bool,
+    /// Rust-only mutant `m-no-clock-bound` (U1, every replicated stamp): a window delivers an entry stamped past the receiver's clock
+    /// plus the bound, which the receiver then witnesses (only meaningful when `World::clock_bound` is set)
+    pub fm_no_clock_bound: bool,
+    /// Rust-only mutant `m-no-own-guard` (U1 (b)): the coordinator of a replacing `$out` binds although a peer has refused its entries
+    /// for their clock (the guard on a `$out` and on schema changes is off)
+    pub fm_no_own_guard: bool,
     /// Rust-only mutant `m-release-unconditional` (the release condition): a held entry is released at once, without waiting for
     /// every earlier entry of its origin to be held
     pub fm_release_unconditional: bool,
@@ -339,6 +345,8 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-d10-ignores-info" => f.fm_d10_ignores_info = true,
         "m-release-behind-held" => f.fm_release_behind_held = true,
         "m-window-noncontiguous" => f.fm_window_noncontiguous = true,
+        "m-no-clock-bound" => f.fm_no_clock_bound = true,
+        "m-no-own-guard" => f.fm_no_own_guard = true,
         "m-release-unconditional" => f.fm_release_unconditional = true,
         "m-release-without-effect" => f.fm_release_without_effect = true,
         "m-stale-src" => f.stale_src_bug = true,

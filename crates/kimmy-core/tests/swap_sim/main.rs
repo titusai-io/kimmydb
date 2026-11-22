@@ -18,6 +18,7 @@
 
 mod apply;
 mod classes;
+mod clockbound;
 mod coverage;
 mod entry;
 mod field;

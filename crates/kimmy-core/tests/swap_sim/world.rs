@@ -60,6 +60,9 @@ pub struct World {
     pub trace: bool,
     /// the run has no route step (register events travel only in position): the open-refusal-at-end check applies
     pub in_order: bool,
+    /// U1: how far past its own clock (world clock plus skew) a member accepts a replicated entry's stamp, in clock units; `None`: no
+    /// bound (every grid; only the far-future scenarios set it)
+    pub clock_bound: Option<i64>,
     /// the run's steps are over and the end-of-run delivery is running (`swapmodel6a.py` `w.quiescing`)
     pub quiescing: bool,
     /// a register event taken out of position is an invariant violation (set by the random run when it has no model route; the
@@ -141,6 +144,7 @@ impl World {
             d,
             trace,
             in_order: true,
+            clock_bound: None,
             quiescing: false,
             reg_in_position_check: false,
             held_uncovered: false,

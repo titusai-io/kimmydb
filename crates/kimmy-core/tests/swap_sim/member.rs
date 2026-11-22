@@ -120,6 +120,9 @@ pub struct Member {
     pub ever_served: BTreeSet<String>,
     /// entries of the scoped repair in progress whose versions are to be applied under Hold when it ends (`write_repair_marks`)
     pub repair_marks_pending: Vec<EntryId>,
+    /// U1 (b2): a live peer refused this member's entries for their clock, until this member's own clock (world clock plus skew)
+    /// reaches this value: set by the scenario layer when a window is refused, as the pusher does on a `Pushed` reply
+    pub own_refused_until: Option<i64>,
 }
 
 impl Member {
@@ -179,6 +182,7 @@ impl Member {
             last_served: L.to_string(),
             ever_served: BTreeSet::from([L.to_string()]),
             repair_marks_pending: Vec::new(),
+            own_refused_until: None,
         }
     }
 

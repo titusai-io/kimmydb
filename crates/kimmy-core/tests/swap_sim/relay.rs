@@ -23,6 +23,8 @@ pub enum Delivery {
 pub enum Taken {
     Received,
     RefusedStateHeld,
+    /// U1: the entry's stamp is past this member's clock plus the bound: not applied, not witnessed, applies once due
+    RefusedClock,
     AlreadyHeld,
 }
 
@@ -79,6 +81,14 @@ impl Member {
         let release = w.held_uncovered && self.held_oop.contains(&e.idx);
         if self.cv.has(e.idx) && !release {
             return Taken::AlreadyHeld;
+        }
+        // U1: every replicated stamp is bounded before anything is witnessed or applied, whatever its kind
+        if let Some(bound) = w.clock_bound
+            && !w.f.fm_no_clock_bound
+            && e.hlc > w.clock + self.skew + bound
+        {
+            w.stats.bump("clock_refused");
+            return Taken::RefusedClock;
         }
         if !quiesce
             && let Some(&row) = src.state_held.get(&e.origin)

@@ -5,7 +5,7 @@ use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::flags::flags_for;
 use crate::member::Member;
-use crate::relay::{pair, take_quiesce};
+use crate::relay::{Taken, pair, take_quiesce};
 use crate::rng::Rng;
 use crate::snapshot::{land_page_in, snapshot_begin_in};
 use crate::world::World;
@@ -46,17 +46,47 @@ impl Sc {
         self.w.step += 1;
     }
     /// The product's window: the lowest-stamp entry `src` appended and `dst` lacks, until none (or a refusal).
+    ///
+    /// A clock refusal (U1) is what a pusher reads in the `Pushed` reply: `src` notes that `dst` refuses its entries until `dst`'s
+    /// clock has caught up, on `src`'s own clock (b2).
     pub fn pull(&mut self, dst: &str, src: &str) {
         let (d, s) = (self.idx(dst), self.idx(src));
         loop {
             let (dm, sm) = pair(&mut self.ms, d, s);
             let Some(e) = dm.next_window_entry(&self.w, sm) else { return };
             let n = dm.cv.count();
-            dm.take_from(&mut self.w, sm, &e, false);
+            let taken = dm.take_from(&mut self.w, sm, &e, false);
+            if taken == Taken::RefusedClock {
+                let bound = self.w.clock_bound.expect("a clock refusal needs the bound");
+                let due_in = e.hlc - (self.w.clock + self.ms[d].skew + bound);
+                let until = self.w.clock + self.ms[s].skew + due_in;
+                let src_m = &mut self.ms[s];
+                src_m.own_refused_until =
+                    Some(src_m.own_refused_until.map_or(until, |u| u.max(until)));
+                return;
+            }
             if dm.cv.count() == n {
                 return; // refused (ADR-224)
             }
         }
+    }
+    /// U1 (b): whether this member's own stamps would be refused by the rest of the cluster: its logical clock is past its own clock
+    /// plus the bound (b1), or a peer refused its entries and that has not come due on its own clock (b2).
+    pub fn own_stamps_refused(&self, member: &str) -> bool {
+        let m = &self.ms[self.idx(member)];
+        let Some(bound) = self.w.clock_bound else { return false };
+        let own_now = self.w.clock + m.skew;
+        m.hlc > own_now + bound || m.own_refused_until.is_some_and(|until| until > own_now)
+    }
+    /// The coordinator's bind with the guard (b): refused, nothing minted, when its own stamps would be refused. `m-no-own-guard` turns the
+    /// guard off.
+    pub fn guarded_bind(&mut self, member: &str, job: &mut Job, live: usize) -> Option<EntryRef> {
+        if !self.w.f.fm_no_own_guard && self.own_stamps_refused(member) {
+            self.w.stats.bump("bind_refused_by_guard");
+            return None;
+        }
+        let i = self.idx(member);
+        self.ms[i].do_bind(&mut self.w, job, live)
     }
     /// `dst` takes entry `e` in a window from `src`.
     pub fn window(&mut self, dst: &str, src: &str, e: &EntryRef) {
