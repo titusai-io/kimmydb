@@ -400,6 +400,60 @@ mod tests {
         assert!(!found.is_empty(), "no killing seed found");
     }
 
+    /// The firing counters of the product's mark mechanism (item Q), by the `cnt_` stat that counts each.
+    const FIRING: [&str; 5] = [
+        "marks_dropped_superseded",
+        "marks_dropped_late",
+        "release_raised_over_hold",
+        "repair_marks_written",
+        "held_released_in_window",
+    ];
+
+    /// ITEM Q's firing acceptance, per row (the manager's ruling of 2026-11-22, the reviewer's reading: the mechanism fired in the row, which is
+    /// the row's firing counters summed above 0, and not each counter on its own: the sub-mechanisms rest on pooled evidence). This asserts that
+    /// and, beyond it, the two counters that are structural to every row (`repair_marks_written`, `held_released_in_window`) each in at
+    /// least one ON run. `fired` maps a counter to (ON runs where it was above 0, its total over the ON runs).
+    fn assert_mechanism_fired(fired: &std::collections::BTreeMap<&str, (usize, i64)>, row: &str) {
+        let total: i64 = FIRING.iter().map(|k| fired.get(k).map_or(0, |e| e.1)).sum();
+        assert!(
+            total > 0,
+            "item Q grid: the mechanism did not fire in the row {row}: every firing counter is 0"
+        );
+        for fk in ["repair_marks_written", "held_released_in_window"] {
+            assert!(
+                fired.get(fk).map_or(0, |e| e.0) > 0,
+                "item Q grid: {fk} fired in no ON run at {row}"
+            );
+        }
+    }
+
+    /// The firing assertion can fire: counters that are all zero (the mutant that zeroes them, or a row where the mechanism never ran) fail it,
+    /// and so do sub-mechanism counters alone without the two structural ones; the structural pair passes.
+    #[test]
+    #[should_panic(expected = "every firing counter is 0")]
+    fn the_firing_assertion_fails_when_every_counter_is_zero() {
+        let zeroed: std::collections::BTreeMap<&str, (usize, i64)> =
+            FIRING.iter().map(|k| (*k, (0, 0))).collect();
+        assert_mechanism_fired(&zeroed, "a row with the counters zeroed");
+    }
+
+    #[test]
+    #[should_panic(expected = "fired in no ON run")]
+    fn the_firing_assertion_fails_when_a_structural_counter_never_fired() {
+        let mut fired: std::collections::BTreeMap<&str, (usize, i64)> = Default::default();
+        fired.insert("marks_dropped_late", (4, 4));
+        fired.insert("repair_marks_written", (3000, 90_000));
+        assert_mechanism_fired(&fired, "a row without held_released_in_window");
+    }
+
+    #[test]
+    fn the_firing_assertion_passes_when_the_structural_pair_fired() {
+        let mut fired: std::collections::BTreeMap<&str, (usize, i64)> = Default::default();
+        fired.insert("repair_marks_written", (3082, 99_000));
+        fired.insert("held_released_in_window", (49, 120));
+        assert_mechanism_fired(&fired, "a row of the pair only");
+    }
+
     /// ITEM Q on the GRID (not on exported traces): the product-route rows at gate size, each run twice with the same seed, once with
     /// the model's bookkeeping (`product_marks` off) and once with the product's mark mechanism (on): in-window entries never held
     /// for a held predecessor, the vector raised at release, covered superseded marks dropped after each window. Every key of the
@@ -449,13 +503,6 @@ mod tests {
         let mut on_unclassified: Vec<String> = Vec::new();
         let mut class_diffs: Vec<String> = Vec::new();
         let mut book: std::collections::BTreeMap<String, (usize, i64)> = Default::default();
-        const FIRING: [&str; 5] = [
-            "marks_dropped_superseded",
-            "marks_dropped_late",
-            "release_raised_over_hold",
-            "repair_marks_written",
-            "held_released_in_window",
-        ];
         let mut fired: std::collections::BTreeMap<&str, (usize, i64)> = Default::default();
         for m in [2usize, 3, 4, 5] {
             for o in [1usize, 2, 3] {
@@ -593,13 +640,7 @@ mod tests {
         // diverge): per-seed identity no longer applies there. ACCEPTANCE (the manager's ruling): per row ON has 0 unclassified failures and no
         // failure CLASS above OFF's by count (an excess is traced and ruled), and the mechanism fired (the firing counters, printed above).
         assert!(on_unclassified.is_empty(), "item Q grid: ON has unclassified failures");
-        // the mechanism fired in this row: the two counters that are structural to every row (the others rest on pooled evidence and may be 0)
-        for fk in ["repair_marks_written", "held_released_in_window"] {
-            assert!(
-                fired.get(fk).map_or(0, |e| e.0) > 0,
-                "item Q grid: {fk} fired in no ON run at dh={dh} dr={dr} f={f} seeds from {from}"
-            );
-        }
+        assert_mechanism_fired(&fired, &format!("dh={dh} dr={dr} f={f} seeds from {from}"));
         for (c, n) in &class_on {
             assert!(
                 *n <= class_off.get(c).copied().unwrap_or(0),
