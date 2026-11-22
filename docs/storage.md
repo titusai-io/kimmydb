@@ -318,8 +318,10 @@ would move its logical clock there, since the clock has no clamp, and everything
 afterwards would sit at or above it and be refused by every other member until due. So such an entry,
 or a state that holds one, is refused until it is due: it is not applied or witnessed, the window or
 snapshot page stops at it and is asked for again, and it applies once this member's clock has caught up
-to within the bound. An honest member's logical clock therefore never leads its own physical clock by
-more than the bound through replication. The setting is local to the member and is not replicated.
+to within the bound. A snapshot page that carries one such document is rolled back whole and asked for again
+once it is due: under this rule only a member with a bad clock can write such a stamp, so stalling its pages
+until its clock is right is the isolation the bound is for. An honest member's logical clock therefore never
+leads its own physical clock by more than the bound through replication. The setting is local to the member and is not replicated.
 
 The same bound covers what a peer says about its clock. A schema change (a
 drop, a creation, a definition) stamped past the bound is refused until due as an entry is, before anything

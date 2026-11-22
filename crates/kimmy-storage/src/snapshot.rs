@@ -2444,6 +2444,9 @@ impl Engine {
         collection: &CollectionMeta,
         tombstone: &CarriedDelete,
     ) -> Result<()> {
+        // No clock-bound check here, on purpose: this is reached only for a tombstone that the sender's coverage names
+        // (`apply_carried_document_deletes`), and the page's coverage was clamped to the bound on arrival, so its stamp is
+        // within the bound already. A check here would be unreachable.
         let record = kimmy_core::DocRecord::tombstone(tombstone.stamp);
         let mut docs = txn.open_table(tables::DOCS)?;
         crate::live_count::put_bare_tombstone(
