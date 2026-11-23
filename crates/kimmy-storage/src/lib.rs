@@ -137,6 +137,9 @@ mod release_effect_tests;
 mod rule_s_tests;
 
 #[cfg(test)]
+mod ldrop_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]

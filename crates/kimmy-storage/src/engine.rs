@@ -6621,6 +6621,13 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
     Ok(drop_keys.len())
 }
 
+/// Whether the physical collection `id` is alive on this member: the ONE predicate of L-DROP (ADR-272 decision 4, ADR-169 widened), asked by
+/// the receiver of a covered held mark and by the sender that omits an entry from a window. A stub: every physical is alive.
+pub(crate) fn physical_is_alive(txn: &redb::WriteTransaction, id: CollectionId) -> Result<bool> {
+    let _ = (txn, id);
+    Ok(true)
+}
+
 /// Whether a live collection stands under `id`.
 ///
 /// The question [`Engine::collection_by_id`] answers, asked against a table the
