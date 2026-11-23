@@ -189,13 +189,59 @@ pub(crate) fn release(
     put(txn, db, logical, *stamp, event).map(Some)
 }
 
-/// Build item (a), FIX-4: after the mark of the entry at `stamp` is released, no register event of that stamp is still only
-/// information. (A stub: it checks nothing yet.)
+/// The stamps of the information rows (events known ahead of their position) that are among `stamps`.
+fn parked_among(txn: &redb::WriteTransaction, stamps: &[Stamp]) -> Result<Vec<Stamp>> {
+    let info = txn.open_table(tables::REGISTER_INFO)?;
+    let mut found = Vec::new();
+    for row in info.iter()? {
+        let (key, _) = row?;
+        let stamp = crate::codec::decode_oplog_key(&key.value()[8..])?;
+        if stamps.contains(&stamp) {
+            found.push(stamp);
+        }
+    }
+    Ok(found)
+}
+
+/// Marks of held entries were just released at `released` (a grant covered them): every binding among them that was only
+/// information takes effect now, in the same transaction (build item (a)). The table holds only the events ahead of their
+/// position, so with none parked this reads one empty table. Returns how many took effect.
+pub(crate) fn release_covered(txn: &redb::WriteTransaction, released: &[Stamp]) -> Result<usize> {
+    if released.is_empty() {
+        return Ok(0);
+    }
+    let waiting = parked_among(txn, released)?;
+    for stamp in &waiting {
+        let key = crate::codec::oplog_key(stamp);
+        let entry = {
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let Some(raw) = oplog.get(key.as_slice())? else {
+                return Err(corrupt(
+                    "an event known ahead of its position whose entry is not held",
+                ));
+            };
+            crate::codec::decode_oplog_entry(key.as_slice(), raw.value())?
+        };
+        let Some(body) = &entry.body else {
+            return Err(corrupt("a register entry without a body"));
+        };
+        let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+        release(txn, &bind.db, &bind.name, stamp)?;
+    }
+    Ok(waiting.len())
+}
+
+/// Build item (a), FIX-4: once the mark of the entry at `stamp` is released, no register event of that stamp is still only
+/// information. A release that raised the coverage and left the event parked would serve a window the member does not act on.
 pub(crate) fn check_released_took_effect(
-    _txn: &redb::WriteTransaction,
-    _stamp: &Stamp,
+    txn: &redb::WriteTransaction,
+    stamp: &Stamp,
 ) -> Result<()> {
-    Ok(())
+    if parked_among(txn, std::slice::from_ref(stamp))?.is_empty() {
+        Ok(())
+    } else {
+        Err(corrupt("a released register event is still only information"))
+    }
 }
 
 /// Why a member serving `served` refuses writes to `logical` (decision 7): an event in effect supersedes it or, failing

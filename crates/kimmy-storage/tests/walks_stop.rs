@@ -92,6 +92,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "register::parked_among",
+        "the information table of the register: the events known ahead of their position, which a window or a grant puts in effect and removes, so it is empty or a handful of rows; read inside the write transaction of the release (ADR-272)",
+    ),
+    (
         "register::timeline_of",
         "one logical name's rows of the register, a prefix range of the 8-byte id: the swap events of one name inside tombstone retention, read inside the write transaction of the entry that carries one of them (ADR-272)",
     ),

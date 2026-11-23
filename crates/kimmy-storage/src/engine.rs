@@ -3857,6 +3857,10 @@ impl Engine {
             for key in &covered {
                 held.remove(key.as_slice())?;
             }
+            // A binding among them that was only information takes effect in this transaction (build item (a)).
+            let stamps: Vec<Stamp> =
+                covered.iter().filter_map(|key| codec::decode_oplog_key(key).ok()).collect();
+            crate::register::release_covered(txn, &stamps)?;
             released |= !covered.is_empty();
             if exhausted {
                 return Ok(released);

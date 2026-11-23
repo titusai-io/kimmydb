@@ -3371,6 +3371,7 @@ impl Engine {
             {
                 let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
                 crate::register::release(&txn, &bind.db, &bind.name, &entry.stamp)?;
+                crate::register::check_released_took_effect(&txn, &entry.stamp)?;
             }
             txn.commit()?;
         } else {
