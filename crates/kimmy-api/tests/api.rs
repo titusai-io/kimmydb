@@ -23729,3 +23729,62 @@ async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_
     let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
     assert_eq!((count.status, &count.body["count"]), (200, &json!(0)), "{:?}", count.body);
 }
+
+/// The sink door: a `$merge` (or an insert-only `$out`) whose TARGET is a name the member knows has been superseded is a write to that
+/// name, and is refused the same way, with nothing written (ADR-272, decision 7; D10).
+#[tokio::test]
+async fn a_merge_into_a_name_whose_replacement_the_member_knows_of_is_refused_503_swap_in_progress()
+{
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "src"})).await;
+    server.post("/v1/db/shop/coll/src/docs", Some(&token), json!({"_id": 1, "v": "x"})).await;
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
+    engine
+        .create_stage("shop", "orders.__stg.real", kimmy_core::MergePolicy::Document, deadline)
+        .unwrap();
+    let creation = engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| {
+            e.kind == kimmy_core::OpKind::CreateCollection
+                && e.collection == kimmy_core::CollectionId::derive("shop", "orders.__stg.real")
+        })
+        .unwrap();
+    let bind = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            kimmy_core::Epoch::ZERO,
+        ),
+        kind: kimmy_core::OpKind::BindCollection,
+        collection: kimmy_core::CollectionId::derive("shop", "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                db: "shop".into(),
+                name: "orders".into(),
+                physical: "orders.__stg.real".into(),
+            })
+            .unwrap(),
+        ),
+        meta: None,
+    };
+    engine.apply_batch(std::slice::from_ref(&bind)).unwrap();
+
+    let refused = server
+        .post(
+            "/v1/db/shop/coll/src/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$merge": { "into": "orders" } }] }),
+        )
+        .await;
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "swap_in_progress", "{:?}", refused.body);
+    let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
+    assert_eq!((count.status, &count.body["count"]), (200, &json!(0)), "{:?}", count.body);
+}
