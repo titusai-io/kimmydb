@@ -3742,6 +3742,56 @@ mod tests {
         (engine, dir)
     }
 
+    /// The race route of the release (mutant B11): a window and a bare batch apply one binding at once; both look before the writer and
+    /// find it missing. The bare batch takes the writer first and parks it (information, its entry held out of position); the window
+    /// then finds the entry held under the writer, aborts, and releases the mark: the binding takes effect in that release.
+    #[test]
+    fn a_window_that_finds_its_binding_held_by_a_competing_apply_releases_it_with_its_effect() {
+        use kimmy_core::{CollectionBind, MergePolicy, OpKind};
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        let deadline = Hlc::new(crate::physical_now_ms() + 60_000, 0);
+        a.create_stage("app", "orders.__stg.a1", MergePolicy::Document, deadline).unwrap();
+        let creation = a
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap();
+        b.apply_batch(std::slice::from_ref(&creation)).unwrap();
+        let bind = OplogEntry {
+            stamp: Stamp::new(Hlc::new(creation.stamp.hlc.wall_ms + 1, 0), a.node_id(), a.epoch()),
+            kind: OpKind::BindCollection,
+            collection: CollectionId::derive("app", "orders"),
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&CollectionBind {
+                    db: "app".into(),
+                    name: "orders".into(),
+                    physical: "orders.__stg.a1".into(),
+                })
+                .unwrap(),
+            ),
+            meta: None,
+        };
+        let competing = (Arc::clone(&b), bind.clone());
+        let (outer, competitor) = race_hooks::race(
+            race_hooks::Race::DdlAppend,
+            move || competing.0.apply_ddl(&competing.1, crate::engine::Position::Raise).unwrap(),
+            || b.apply_ddl(&bind, crate::engine::Position::InWindow).unwrap(),
+        );
+        assert!(matches!(competitor, DdlOutcome::Parked), "{competitor:?}");
+        assert!(matches!(outer, DdlOutcome::Held), "{outer:?}");
+        assert_eq!(b.held_marks().unwrap(), 0, "released: the hold is gone");
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        let in_effect = crate::register::timeline(&txn, "app", "orders").unwrap().events().len();
+        let parked = crate::register::parked(&txn, "app", "orders").unwrap().events().len();
+        txn.abort().unwrap();
+        assert_eq!((in_effect, parked), (1, 0), "released: in effect, and no longer information");
+        race_hooks::assert_absorbed(race_hooks::Race::DdlAppend);
+    }
+
     /// A register event never arrives as a held entry (ADR-272, decision 13): under `Position::Hold` it is refused by name, and
     /// nothing is appended, stored or witnessed.
     #[test]
