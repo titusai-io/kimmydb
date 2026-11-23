@@ -2717,6 +2717,35 @@ impl Engine {
                     // learn of it from this one learn it from the entry.
                     return self.append_replicated_ddl(entry, position);
                 }
+                // The drop of a name that was swapped is a register event, a logical drop (decision 6; Q6.4 item 1b): in a
+                // window it takes effect and buries what the name serves, whichever physical that is, in the same
+                // transaction; ahead of its position it is information, and a held entry is refused by name, as a binding
+                // is. Judged by the old rule (the identity is already buried, so the drop finds no collection of that name)
+                // the bound successor would survive the drop on a member that made the binding visible and the identity
+                // would go on one that did not.
+                if self.drop_is_a_logical_drop(&target, entry)? {
+                    let mode = match position {
+                        crate::engine::Position::InWindow => RegisterMode::Effect,
+                        crate::engine::Position::Raise => RegisterMode::Park,
+                        crate::engine::Position::Hold => {
+                            return Err(crate::StorageError::Corrupt(
+                                "a swapped name's drop reached a route that holds its entry out of position".into(),
+                            ));
+                        }
+                    };
+                    let apply = RegisterApply {
+                        db: target.db,
+                        logical: target.name,
+                        event: kimmy_core::RegisterEvent::LogicalDrop,
+                        mode,
+                    };
+                    return self.append_replicated_ddl_recording(
+                        entry,
+                        &[],
+                        position,
+                        Some(&apply),
+                    );
+                }
                 // A drop is the one arm that destroys state, so it is the one
                 // arm that has to know *which* incarnation it was aimed at. A
                 // recreated collection derives the same id as the one that was
@@ -3156,6 +3185,32 @@ impl Engine {
         )
     }
 
+    /// Whether the replicated drop `entry` of `target` is a logical drop: the name has been swapped here (a register event of
+    /// it, in effect or known ahead of its position, or a stage of it held), except that a name with no event of its own,
+    /// whose identity stands and was created above the drop, is a drop aimed at a life that ended before it, which the
+    /// incarnation rule judges as it always did (ADR-148).
+    fn drop_is_a_logical_drop(
+        &self,
+        target: &kimmy_core::CollectionRef,
+        entry: &OplogEntry,
+    ) -> Result<bool> {
+        let txn = self.db().begin_read()?;
+        if crate::register::has_events(&txn, &target.db, &target.name)? {
+            return Ok(true);
+        }
+        if !crate::register::stage_is_held(&txn, &target.db, &target.name)? {
+            return Ok(false);
+        }
+        drop(txn);
+        match self.get_collection(&target.db, &target.name) {
+            Ok(current) => Ok(!aims_at_a_previous_incarnation(&current, entry.stamp.hlc)),
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Append a replicated schema change's originating entry, unless this
     /// node already holds it as sent. -> `Applied` when it committed the
     /// entry, `Held` when there was nothing to commit.
@@ -3372,14 +3427,15 @@ impl Engine {
     fn release_ddl_mark_with_effect(&self, entry: &OplogEntry) -> Result<()> {
         let txn = self.begin_write(WriterHolder::Replication)?;
         if crate::engine::release_held_in_position(&txn, &entry.stamp)? {
-            if entry.kind == OpKind::BindCollection
+            if matches!(entry.kind, OpKind::BindCollection | OpKind::DropCollection)
                 && let Some(body) = &entry.body
+                && let Some((db, logical)) =
+                    crate::register::parked_target(&txn, &entry.stamp, &entry.kind, body)?
             {
-                let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
-                crate::register::release(&txn, &bind.db, &bind.name, &entry.stamp)?;
+                crate::register::release(&txn, &db, &logical, &entry.stamp)?;
                 crate::register::check_released_took_effect(&txn, &entry.stamp)?;
-                // ... and it buries the physicals it binds out, in the same transaction (Q6.4 item 1)
-                Engine::settle_register_in_txn(&txn, &bind.db, &bind.name)?;
+                // ... and it buries the physicals it names out, in the same transaction (Q6.4 item 1)
+                Engine::settle_register_in_txn(&txn, &db, &logical)?;
             }
             txn.commit()?;
         } else {

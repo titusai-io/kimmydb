@@ -5446,28 +5446,92 @@ impl Engine {
     /// leaves a zombie physical named exactly like the logical name) and only when the visible physical is alive here
     /// ([`kimmy_core::register_state::Timeline::burials`]). It is every member's own judgement of the same events, so it mints no
     /// drop entry; the burial is finished (the rows handed to the purger) when the transaction commits.
+    /// The register events of `logical` in effect, and the readiness of the identity and of every physical they name, as the
+    /// writer sees them.
+    fn register_view_in_txn(
+        txn: &WriteTxn<'_>,
+        db: &str,
+        logical: &str,
+    ) -> Result<(
+        kimmy_core::register_state::Timeline,
+        std::collections::HashMap<String, kimmy_core::register_state::Ready>,
+    )> {
+        use kimmy_core::register_state::Ready;
+        let timeline = crate::register::timeline(txn, db, logical)?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        let mut ready: std::collections::HashMap<String, Ready> = Default::default();
+        for physical in std::iter::once(logical)
+            .chain(timeline.events().iter().filter_map(|(_, event)| event.physical()))
+        {
+            let alive = collections.get((db, physical))?.is_some();
+            ready.insert(physical.to_string(), if alive { Ready::Alive } else { Ready::Buried });
+        }
+        Ok((timeline, ready))
+    }
+
+    /// The local drop of a name that was swapped (decision 6; Q6.4 item 1b): ONE `DropCollection` entry addressed to the
+    /// logical name, a logical drop put in effect through the register's one door and settled in the same commit, so the
+    /// physical the name serves goes, whichever it is, and the entry says so on every other member. `None`, having written
+    /// nothing, when the name was never swapped here (the ordinary drop is the caller's); `Some(false)` when the name serves
+    /// nothing.
+    fn drop_swapped_name(&self, db: &str, name: &str) -> Result<Option<bool>> {
+        {
+            let txn = self.db.begin_read()?;
+            if !crate::register::is_swapped(&txn, db, name)? {
+                return Ok(None);
+            }
+        }
+        use kimmy_core::register_state::{Ready, Visible};
+        let txn = self.begin_write_as(WriterHolder::Ddl, Continuing::No)?;
+        if !crate::register::is_swapped_in(&txn, db, name)? {
+            txn.abort()?;
+            return Ok(None);
+        }
+        let (timeline, ready) = Self::register_view_in_txn(&txn, db, name)?;
+        let visible = timeline.visible(|p| ready.get(p).copied().unwrap_or(Ready::Buried));
+        if matches!(visible, Visible::Dropped { .. })
+            || visible.physical(name).is_none_or(|p| ready.get(p) != Some(&Ready::Alive))
+        {
+            txn.abort()?;
+            return Ok(Some(false));
+        }
+        // above everything the name's register holds and above the life it ends (ADR-226, ADR-236)
+        let created = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let served = visible.physical(name).unwrap_or(name);
+            match collections.get((db, served))? {
+                Some(v) => {
+                    let meta: CollectionMeta = serde_json::from_slice(v.value())?;
+                    Some(Stamp::new(meta.created, self.node_id, self.epoch))
+                }
+                None => None,
+            }
+        };
+        let floor =
+            timeline.events().last().map(|(stamp, _)| *stamp).into_iter().chain(created).max();
+        let stamp = self.next_stamp_above(floor);
+        crate::register::put(&txn, db, name, stamp, kimmy_core::RegisterEvent::LogicalDrop)?;
+        Self::settle_register_in_txn(&txn, db, name)?;
+        let entry = ddl_entry(
+            stamp,
+            OpKind::DropCollection,
+            CollectionId::derive(db, name),
+            &kimmy_core::CollectionRef::new(db, name),
+        )?;
+        append_oplog(&txn, &entry)?;
+        txn.commit()?;
+        self.publish(vec![entry]);
+        info!(db, collection = name, "dropped the swapped name");
+        Ok(Some(true))
+    }
+
     pub(crate) fn settle_register_in_txn(
         txn: &WriteTxn<'_>,
         db: &str,
         logical: &str,
     ) -> Result<()> {
         use kimmy_core::register_state::Ready;
-        let timeline = crate::register::timeline(txn, db, logical)?;
-        // The readiness of every physical the register names, and the identity
-        let alive = |physical: &str| -> Result<Ready> {
-            let collections = txn.open_table(tables::COLLECTIONS)?;
-            Ok(if collections.get((db, physical))?.is_some() {
-                Ready::Alive
-            } else {
-                Ready::Buried
-            })
-        };
-        let mut ready: std::collections::HashMap<String, Ready> = Default::default();
-        for physical in std::iter::once(logical)
-            .chain(timeline.events().iter().filter_map(|(_, event)| event.physical()))
-        {
-            ready.insert(physical.to_string(), alive(physical)?);
-        }
+        let (timeline, ready) = Self::register_view_in_txn(txn, db, logical)?;
         let lookup = |p: &str| ready.get(p).copied().unwrap_or(Ready::Buried);
         let visible = timeline.visible(lookup);
         let burials = timeline.burials(&visible, lookup);
@@ -5628,6 +5692,10 @@ impl Engine {
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
         CoreError::refuse_stage_name(name)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        // A swapped name's drop is a logical drop (decision 6; Q6.4 item 1b): the name is not the collection that carries it
+        if let Some(dropped) = self.drop_swapped_name(db, name)? {
+            return Ok(dropped);
+        }
         self.drop_collection_inner(db, name, None)
     }
 

@@ -171,6 +171,7 @@ pub(crate) fn put(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
+    seed_from_the_tombstone(txn, db, logical)?;
     store(txn, tables::REGISTER, db, logical, stamp, event)
 }
 
@@ -183,6 +184,7 @@ pub(crate) fn park(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
+    seed_from_the_tombstone(txn, db, logical)?;
     if timeline(txn, db, logical)?.events().iter().any(|(held, _)| *held == stamp) {
         return Ok(Put::Duplicate);
     }
@@ -222,7 +224,8 @@ pub(crate) fn release(
         let Some(raw) = removed else { return Ok(None) };
         RegisterEvent::decode(raw.value()).map_err(|e| corrupt(&e.to_string()))?
     };
-    put(txn, db, logical, *stamp, event).map(Some)
+    // not `put`: the name is known already (this event was), so there is nothing left to seed
+    store(txn, tables::REGISTER, db, logical, *stamp, event).map(Some)
 }
 
 /// The stamps of the information rows (events known ahead of their position) that are among `stamps`.
@@ -266,9 +269,9 @@ pub(crate) fn release_covered(
         let Some(body) = &entry.body else {
             return Err(corrupt("a register entry without a body"));
         };
-        let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
-        release(txn, &bind.db, &bind.name, stamp)?;
-        took_effect.push((bind.db, bind.name));
+        let (db, logical) = event_target(&entry.kind, body)?;
+        release(txn, &db, &logical, stamp)?;
+        took_effect.push((db, logical));
     }
     Ok(took_effect)
 }
@@ -323,4 +326,105 @@ pub(crate) fn refusal(
     let in_effect = timeline(txn, db, logical)?;
     let ahead = parked(txn, db, logical)?;
     Ok(in_effect.refusal(&ahead, served))
+}
+
+/// The name a register entry is addressed to: a binding's `(db, logical)`, or the drop's.
+pub(crate) fn event_target(kind: &kimmy_core::OpKind, body: &[u8]) -> Result<(String, String)> {
+    match kind {
+        kimmy_core::OpKind::BindCollection => {
+            let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+            Ok((bind.db, bind.name))
+        }
+        kimmy_core::OpKind::DropCollection => {
+            let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+            Ok((target.db, target.name))
+        }
+        other => Err(corrupt(&format!("a {other:?} entry is not a register event"))),
+    }
+}
+
+/// The first event of a name seeds the register from the identity's drop (Q6.4 item 1b): a member that applied a drop of the
+/// name before it knew of any swap holds that drop only as the identity's tombstone, and the binding that arrives afterwards
+/// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name
+/// known, in effect or ahead, and the identity not standing, a tombstone is a logical drop at its stamp. A binding stamped
+/// above it is not touched by it, and one below it is buried by it, as on every other member.
+fn seed_from_the_tombstone(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<()> {
+    let id = CollectionId::derive(db, logical);
+    if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
+        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()
+    {
+        return Ok(());
+    }
+    if txn.open_table(tables::COLLECTIONS)?.get((db, logical))?.is_some() {
+        return Ok(());
+    }
+    let dropped = {
+        let table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        match table.get(id.0)? {
+            Some(raw) => crate::codec::decode_oplog_key(raw.value())?,
+            None => return Ok(()),
+        }
+    };
+    store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?;
+    Ok(())
+}
+
+/// Whether the name has a register event on this member, in effect or ahead of its position.
+pub(crate) fn has_events(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
+    let id = CollectionId::derive(db, logical);
+    Ok(!rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
+        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty())
+}
+
+/// Whether this member holds a stage of the name.
+pub(crate) fn stage_is_held(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
+    stage_of_the_name_is_held(&txn.open_table(tables::COLLECTIONS)?, db, logical)
+}
+
+/// Whether the name has been swapped as far as this member can tell: it has a register event, in effect or ahead of its
+/// position, or it holds a stage of the name (Q6.4 item 1b). The drop of such a name is a logical drop.
+pub(crate) fn is_swapped(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
+    Ok(has_events(txn, db, logical)? || stage_is_held(txn, db, logical)?)
+}
+
+/// [`is_swapped`] under the writer.
+pub(crate) fn is_swapped_in(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<bool> {
+    let id = CollectionId::derive(db, logical);
+    if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
+        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()
+    {
+        return Ok(true);
+    }
+    stage_of_the_name_is_held(&txn.open_table(tables::COLLECTIONS)?, db, logical)
+}
+
+fn stage_of_the_name_is_held(
+    collections: &impl ReadableTable<(&'static str, &'static str), &'static [u8]>,
+    db: &str,
+    logical: &str,
+) -> Result<bool> {
+    let prefix = format!("{logical}{}", kimmy_core::swap::STAGE_NAME_MARK);
+    let mut rows = collections.range((db, prefix.as_str())..=(db, "\u{10FFFF}"))?;
+    Ok(match rows.next() {
+        Some(row) => row?.0.value().1.starts_with(&prefix),
+        None => false,
+    })
+}
+
+/// The name of a register entry that is held ahead of its position here (its event is only information), or `None`: a drop
+/// entry that is held for any other reason, and the old rule's, is not a register event.
+pub(crate) fn parked_target(
+    txn: &redb::WriteTransaction,
+    stamp: &Stamp,
+    kind: &kimmy_core::OpKind,
+    body: &[u8],
+) -> Result<Option<(String, String)>> {
+    let (db, logical) = event_target(kind, body)?;
+    // A bind is always a register event; a drop is one only if its event is parked
+    if *kind == kimmy_core::OpKind::DropCollection
+        && parked_among(txn, std::slice::from_ref(stamp))?.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some((db, logical)))
 }
