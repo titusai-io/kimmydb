@@ -1958,7 +1958,9 @@ impl<T> Ddl<T> {
 struct RegisterApply {
     db: String,
     logical: String,
-    event: kimmy_core::RegisterEvent,
+    /// The event the entry is, or `None` for an entry that is no event but changes what the register decides: the creation of a stage,
+    /// after which the burial by a later event is judged for the name (decision 5), in the transaction of the append.
+    event: Option<kimmy_core::RegisterEvent>,
     mode: RegisterMode,
 }
 
@@ -2732,8 +2734,21 @@ impl Engine {
                     register = Some(RegisterApply {
                         db: target.db.clone(),
                         logical: logical.to_string(),
-                        event: kimmy_core::RegisterEvent::Create { physical: target.name.clone() },
+                        event: Some(kimmy_core::RegisterEvent::Create {
+                            physical: target.name.clone(),
+                        }),
                         mode,
+                    });
+                } else if target.stage.is_some()
+                    && let Some(logical) = kimmy_core::swap::logical_of_stage(&target.name)
+                {
+                    // The creation of a stage that arrives behind an event already above its deadline is judged at once: the stage is
+                    // doomed (decision 5), in the transaction of this append
+                    register = Some(RegisterApply {
+                        db: target.db.clone(),
+                        logical: logical.to_string(),
+                        event: None,
+                        mode: RegisterMode::Effect,
                     });
                 }
             }
@@ -2769,7 +2784,7 @@ impl Engine {
                     let apply = RegisterApply {
                         db: target.db,
                         logical: target.name,
-                        event: kimmy_core::RegisterEvent::LogicalDrop,
+                        event: Some(kimmy_core::RegisterEvent::LogicalDrop),
                         mode,
                     };
                     return self.append_replicated_ddl_recording(
@@ -3195,7 +3210,7 @@ impl Engine {
                 register = Some(RegisterApply {
                     db: bind.db,
                     logical: bind.name,
-                    event: kimmy_core::RegisterEvent::Bind { physical: bind.physical },
+                    event: Some(kimmy_core::RegisterEvent::Bind { physical: bind.physical }),
                     mode,
                 });
             }
@@ -3382,25 +3397,31 @@ impl Engine {
                 // without what it did, or what it did without the entry (decision 3).
                 let mut append_at = position;
                 if let Some(apply) = register {
-                    let put = match apply.mode {
-                        RegisterMode::Effect => crate::register::put(
+                    let put = match (&apply.event, apply.mode) {
+                        // no event: the entry only changes what the register decides (a stage's creation)
+                        (None, _) => kimmy_core::register_state::Put::Stored,
+                        (Some(event), RegisterMode::Effect) => crate::register::put(
                             &txn,
                             &apply.db,
                             &apply.logical,
                             entry.stamp,
-                            apply.event.clone(),
+                            event.clone(),
                         )?,
-                        RegisterMode::Park => crate::register::park(
+                        (Some(event), RegisterMode::Park) => crate::register::park(
                             &txn,
                             &apply.db,
                             &apply.logical,
                             entry.stamp,
-                            apply.event.clone(),
+                            event.clone(),
                         )?,
                     };
                     if put == kimmy_core::register_state::Put::UnknownStage {
                         txn.abort()?;
-                        let physical = apply.event.physical().unwrap_or_default();
+                        let physical = apply
+                            .event
+                            .as_ref()
+                            .and_then(|event| event.physical())
+                            .unwrap_or_default();
                         return Ok(DdlOutcome::UnknownStage(format!("{}.{physical}", apply.db)));
                     }
                     if apply.mode == RegisterMode::Park {

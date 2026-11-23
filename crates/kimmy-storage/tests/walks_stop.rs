@@ -96,6 +96,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the information table of the register: the events known ahead of their position, which a window or a grant puts in effect and removes, so it is empty or a handful of rows; read inside the write transaction of the release (ADR-272)",
     ),
     (
+        "engine::Engine::held_stages_in_txn",
+        "a prefix range of the collections table that reads the stages of ONE logical name, a handful, under the writer of the transaction that settles the register for that name (ADR-272, decision 5)",
+    ),
+    (
         "register::stage_of_the_name_is_held",
         "a prefix range of the collections table that reads at most its first row: the first collection whose name begins with the stage mark of one logical name, asked inside the transaction of a drop (ADR-272, decision 6)",
     ),

@@ -5670,17 +5670,58 @@ impl Engine {
         Ok(Some(true))
     }
 
+    /// The stages of the logical name `logical` this member holds alive, each with the deadline its creation reads as
+    /// ([`kimmy_core::StageInfo::effective_deadline`]): a prefix range of the collections table, the handful of stages a name has.
+    fn held_stages_in_txn(
+        txn: &WriteTxn<'_>,
+        db: &str,
+        logical: &str,
+    ) -> Result<Vec<(String, Hlc)>> {
+        let prefix = format!("{logical}{}", kimmy_core::swap::STAGE_NAME_MARK);
+        let names: Vec<String> = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let mut names = Vec::new();
+            for row in collections.range((db, prefix.as_str())..=(db, "\u{10FFFF}"))? {
+                let (key, _) = row?;
+                let name = key.value().1;
+                if !name.starts_with(&prefix) {
+                    break;
+                }
+                names.push(name.to_string());
+            }
+            names
+        };
+        let mut held = Vec::new();
+        for name in names {
+            if let Some(stage) = crate::register::stage_row(txn, CollectionId::derive(db, &name))? {
+                held.push((name, stage.info.effective_deadline(&stage.created)));
+            }
+        }
+        Ok(held)
+    }
+
     pub(crate) fn settle_register_in_txn(
         txn: &WriteTxn<'_>,
         db: &str,
         logical: &str,
     ) -> Result<()> {
         use kimmy_core::register_state::Ready;
-        let (timeline, ready) = Self::register_view_in_txn(txn, db, logical)?;
+        let (timeline, mut ready) = Self::register_view_in_txn(txn, db, logical)?;
+        // The stages of this name this member holds, with the deadline each creation reads as: what burial by a later event judges
+        // (decision 5). A stage has no event of the register until it is bound, so the view above does not name it.
+        let stages = Self::held_stages_in_txn(txn, db, logical)?;
+        for (physical, _) in &stages {
+            ready.entry(physical.clone()).or_insert(Ready::Alive);
+        }
         let lookup = |p: &str| ready.get(p).copied().unwrap_or(Ready::Buried);
         let visible = timeline.visible(lookup);
         let burials = timeline.burials(&visible, lookup);
-        for burial in burials {
+        // Burial by a later event: a stage with no binding in effect whose deadline is strictly below the visible event can never be
+        // the visible physical (every valid binding of it is at or below its deadline), so it goes with the event, stamped by it
+        let stage_deadlines: Vec<(&str, Hlc)> =
+            stages.iter().map(|(physical, deadline)| (physical.as_str(), *deadline)).collect();
+        let doomed = timeline.doomed(&visible, lookup, &stage_deadlines);
+        for burial in burials.into_iter().chain(doomed) {
             let meta = {
                 let collections = txn.open_table(tables::COLLECTIONS)?;
                 match collections.get((db, burial.physical.as_str()))? {
