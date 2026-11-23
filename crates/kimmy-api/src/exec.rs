@@ -172,12 +172,13 @@ pub fn list_collections(state: &SharedState, auth: &Auth, db: &str) -> Result<Va
     if !state.engine.database_exists(db)? {
         return Err(kimmy_core::Error::DatabaseNotFound(db.to_string()).into());
     }
-    let all = state.engine.list_collections(db)?;
-    // A stage is never listed (ADR-272, decision 15), under a wildcard grant or any other
+    // The names clients use (ADR-272, decision 15): a stage or a recreation is never listed as itself, under a wildcard grant or any
+    // other, and the name it answers to is listed once the register makes it visible
+    let all = state.engine.list_logical_collections(db)?;
     let names: Vec<&str> = auth.principal().visible(
         Action::Read,
         db,
-        all.iter().map(|c| c.name.as_str()).filter(|name| !kimmy_core::is_stage_name(name)),
+        all.iter().map(|c| c.name.as_str()).filter(|name| !kimmy_core::is_hidden_name(name)),
     );
     Ok(json!({ "collections": names }))
 }

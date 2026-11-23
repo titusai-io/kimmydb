@@ -89,7 +89,7 @@ impl ServerHandler for KimmyMcp {
             let collections = self
                 .state
                 .engine
-                .list_collections(&database.name)
+                .list_logical_collections(&database.name)
                 .map_err(|e| crate::tools::error(e.into()))?;
 
             for collection in collections {

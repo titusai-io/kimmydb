@@ -5507,7 +5507,29 @@ impl Engine {
     /// visible, under that name. A stage that is not the visible physical of its name, and one that has been buried out, are not
     /// listed. Each is the collection's own metadata, named by the logical name.
     pub fn list_logical_collections(&self, db: &str) -> Result<Vec<CollectionMeta>> {
-        self.list_collections(db)
+        let mut out = Vec::new();
+        for collection in self.list_collections(db)? {
+            if !kimmy_core::is_hidden_name(&collection.name) {
+                out.push(collection);
+                continue;
+            }
+            let logical = kimmy_core::swap::logical_of_stage(&collection.name)
+                .or_else(|| kimmy_core::logical_of_recreation(&collection.name))
+                .map(str::to_string);
+            let Some(logical) = logical else { continue };
+            let logical = logical.as_str();
+            // listed only if the register makes it the physical the name answers from
+            match self.resolve(db, logical) {
+                Ok(resolved) if resolved.physical == collection.name => {
+                    let mut meta = collection;
+                    meta.name = logical.to_string();
+                    out.push(meta);
+                }
+                Ok(_) | Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 
     /// The local create of a name that has register events, under the writer `txn` holds (decision 6; Q6.4 item 1c): refused as
