@@ -172,6 +172,9 @@ mod d10_tests;
 mod purge_defer_tests;
 
 #[cfg(test)]
+mod doomed_call_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
