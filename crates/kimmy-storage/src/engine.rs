@@ -4782,6 +4782,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     pub fn create_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
+        CoreError::refuse_stage_name(name)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
@@ -4865,6 +4866,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         validator: Option<kimmy_core::ValidatorSpec>,
     ) -> Result<CollectionMeta> {
+        CoreError::refuse_stage_name(name)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
@@ -5060,6 +5062,7 @@ impl Engine {
         name: &str,
         validator: kimmy_core::ValidatorSpec,
     ) -> Result<CollectionMeta> {
+        CoreError::refuse_stage_name(name)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         CoreError::validate_name(db)?;
         CoreError::validate_name(name)?;
@@ -5518,6 +5521,7 @@ impl Engine {
 
     /// Drop a collection along with all its documents and index entries.
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
+        CoreError::refuse_stage_name(name)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
         self.drop_collection_inner(db, name, None)
     }

@@ -91,7 +91,8 @@ fn the_row_outlives_the_stage_physical() {
         in_txn(&e, |txn| crate::register::stage_row(txn, CollectionId::derive(DB, STAGE)).unwrap())
             .is_some()
     );
-    e.drop_collection(DB, STAGE).unwrap();
+    // the system path that buries a stage: a client's drop of a stage name is refused on the mark (ADR-272, decision 15)
+    e.drop_collection_inner(DB, STAGE, None).unwrap();
     assert!(e.get_collection(DB, STAGE).is_err(), "premise: the stage's collection is gone");
     assert!(
         in_txn(&e, |txn| crate::register::stage_row(txn, CollectionId::derive(DB, STAGE)).unwrap())

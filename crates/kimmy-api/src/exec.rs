@@ -121,6 +121,15 @@ pub fn authorize(
 /// the honest hint is `elsewhere`: another member has it, and this one will
 /// shortly. A node with no peers keeps `no` — there is nowhere else.
 pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<CollectionMeta, ApiError> {
+    // A stage of a replacing `$out` is never served (ADR-272, decision 15): its name carries the reserved mark, so no collection a client
+    // can name is one, and it is answered as an absent collection, whether or not the stage is held on this member.
+    if kimmy_core::is_stage_name(coll) {
+        return Err(kimmy_core::Error::CollectionNotFound {
+            db: db.to_string(),
+            collection: coll.to_string(),
+        }
+        .into());
+    }
     match state.engine.get_collection(db, coll) {
         Ok(meta) => Ok(meta),
         Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
@@ -163,8 +172,12 @@ pub fn list_collections(state: &SharedState, auth: &Auth, db: &str) -> Result<Va
         return Err(kimmy_core::Error::DatabaseNotFound(db.to_string()).into());
     }
     let all = state.engine.list_collections(db)?;
-    let names: Vec<&str> =
-        auth.principal().visible(Action::Read, db, all.iter().map(|c| c.name.as_str()));
+    // A stage is never listed (ADR-272, decision 15), under a wildcard grant or any other
+    let names: Vec<&str> = auth.principal().visible(
+        Action::Read,
+        db,
+        all.iter().map(|c| c.name.as_str()).filter(|name| !kimmy_core::is_stage_name(name)),
+    );
     Ok(json!({ "collections": names }))
 }
 
@@ -3419,6 +3432,8 @@ pub(crate) fn plan_sink(
     let (target_db, target_coll) = (target.db.as_deref().unwrap_or(db), target.coll.as_str());
     kimmy_core::Error::validate_name(target_db)?;
     kimmy_core::Error::validate_name(target_coll)?;
+    // An `$out` or `$merge` cannot name a stage as its target (ADR-272, decision 15)
+    kimmy_core::Error::refuse_stage_name(target_coll)?;
     let reads_it = target_db == db
         && (target_coll == coll || aggregate::foreign_collections(stages).contains(&target_coll));
     if reads_it {

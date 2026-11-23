@@ -51,9 +51,15 @@ pub enum Error {
     InvalidName { name: String, reason: &'static str },
 
     /// A schema change addressed to a stage physical of a replacing `$out` (ADR-272, decision 15): refused on the name mark alone,
-    /// before any lookup, so the answer is the same on every member whether or not the stage exists there. A stub: the message
-    /// is the final one in the implementation commit.
-    #[error("stage collection {name:?}")]
+    /// before any lookup, so the answer is the same on every member whether or not the stage exists there. The message is
+    /// pinned by a test: decision 15's wording, the three removals, "after the stage's deadline".
+    #[error(
+        "`{name}` is a hidden staging copy of the collection `{logical}` made by a replacing `$out`; \
+         no schema change can be addressed to it. It is removed by the next `$out` or drop of `{logical}` made \
+         after the stage's deadline: run the `$out` again; or drop `{logical}`, which removes the stage only if \
+         the drop is stamped after the stage's deadline (a drop within that window leaves it until a later \
+         replace or drop); or `$out` `{logical}` onto itself to keep its content."
+    )]
     StageCollection { name: String, logical: String },
 
     #[error("invalid query: {0}")]
@@ -333,10 +339,14 @@ impl Error {
 
     /// Refuse a schema change addressed to a stage physical of a replacing `$out` (ADR-272, decision 15), by the name mark alone:
     /// the mark is reserved, so a client can never legitimately make such a name, and an answer that depended on the stage being
-    /// held here would differ between members. A stub: it refuses nothing yet.
+    /// held here would differ between members.
     pub fn refuse_stage_name(name: &str) -> Result<()> {
-        let _ = name;
-        Ok(())
+        match crate::swap::logical_of_stage(name) {
+            Some(logical) => {
+                Err(Error::StageCollection { name: name.to_string(), logical: logical.to_string() })
+            }
+            None => Ok(()),
+        }
     }
 }
 
