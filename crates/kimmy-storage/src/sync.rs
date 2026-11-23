@@ -2489,7 +2489,7 @@ impl Engine {
     ) -> Result<Step> {
         if staging {
             let txn = self.run_txn(run)?;
-            if self.staging_write_is_owed(txn, entry, position)? {
+            if self.staging_write_is_owed(txn, entry, position, None)? {
                 let released = crate::engine::append_oplog_at(txn, entry, position)?;
                 run.released += u64::from(released);
                 self.witness(&entry.stamp);

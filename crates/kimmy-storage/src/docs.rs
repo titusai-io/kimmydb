@@ -1629,14 +1629,29 @@ impl Engine {
     /// that is not. Nothing wider: an ordinary write of another origin to a physical that was a stage, or one above the binding (a
     /// late write), is witnessed away as ever. Never for a snapshot document (`Hold`): that is state, not history
     /// ([`crate::register::StageRow::staging_logical`] holds the one test).
+    ///
+    /// `held` is the collection when this member holds one: a restore carries the collection's own meta, which names the stage, and not the
+    /// register's creation row (`REGISTER_STAGES` is not carried), so a held stage whose row is missing is still read from its collection
+    /// (review of items 6 and 6b, F3).
     pub(crate) fn staging_write_is_owed(
         &self,
         txn: &WriteTxn<'_>,
         entry: &OplogEntry,
         position: Position,
+        held: Option<&CollectionMeta>,
     ) -> Result<bool> {
-        let Some(row) = crate::register::stage_row_named(txn, entry.collection)? else {
-            return Ok(false);
+        let row = match crate::register::stage_row_named(txn, entry.collection)? {
+            Some(row) => row,
+            None => match held.and_then(|coll| {
+                coll.stage.map(|meta| crate::register::StageRow {
+                    meta,
+                    db: coll.db.clone(),
+                    physical: coll.name.clone(),
+                })
+            }) {
+                Some(row) => row,
+                None => return Ok(false),
+            },
         };
         let Some(logical) = row.staging_logical(entry, position) else { return Ok(false) };
         let bound = crate::register::binding_stamp_of(txn, &row.db, logical, &row.physical)?;
@@ -1760,7 +1775,7 @@ impl Engine {
                     && existing.as_ref().is_some_and(|c| !c.is_live() && c.stamp == entry.stamp);
                 drop(docs);
                 // Rule S (ADR-272, decision 4): a staged row of the creator's, superseded here, is still appended.
-                if !owed && self.staging_write_is_owed(txn, entry, position)? {
+                if !owed && self.staging_write_is_owed(txn, entry, position, Some(coll))? {
                     // No document, index or count write: the document stands, the entry joins this member's oplog so that it
                     // can serve it onward, and nothing is published.
                     let released = crate::engine::append_oplog_at(txn, entry, position)?;

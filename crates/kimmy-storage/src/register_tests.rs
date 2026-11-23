@@ -268,11 +268,11 @@ fn a_staging_write_is_never_owed_under_hold_and_is_owed_in_a_window() {
     m.apply_batch(&[creation]).unwrap();
     let txn = m.begin_write(WriterHolder::Replication).unwrap();
     assert!(
-        !m.staging_write_is_owed(&txn, &row, Position::Hold).unwrap(),
+        !m.staging_write_is_owed(&txn, &row, Position::Hold, None).unwrap(),
         "under Hold a staging write is never owed: a snapshot document is state, with no entry to serve"
     );
     assert!(
-        m.staging_write_is_owed(&txn, &row, Position::InWindow).unwrap(),
+        m.staging_write_is_owed(&txn, &row, Position::InWindow, None).unwrap(),
         "in a window the author's write, below any binding and not in the oplog, is owed"
     );
     let other = kimmy_core::OplogEntry {
@@ -280,7 +280,7 @@ fn a_staging_write_is_never_owed_under_hold_and_is_owed_in_a_window() {
         ..row.clone()
     };
     assert!(
-        !m.staging_write_is_owed(&txn, &other, Position::InWindow).unwrap(),
+        !m.staging_write_is_owed(&txn, &other, Position::InWindow, None).unwrap(),
         "a write of another origin is not a staging write"
     );
     txn.abort().unwrap();
