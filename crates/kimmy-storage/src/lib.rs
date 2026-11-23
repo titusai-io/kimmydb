@@ -134,6 +134,9 @@ mod rule_b_tests;
 mod release_effect_tests;
 
 #[cfg(test)]
+mod rule_s_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
