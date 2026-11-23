@@ -2975,6 +2975,8 @@ impl kimmy_storage::MatchHold for IndexKeys<'_> {
     }
 }
 
+mod resolve_memo;
+
 /// Test-only: what the thread runs after each key its `IndexKeys` holds, with the bytes
 /// held then. A test that needs a read to be at a known place (holding some of the pool, and
 /// not yet done) stops it here.
@@ -6016,6 +6018,9 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod resolve_memo_tests;
 
 #[cfg(test)]
 mod memory_tests;

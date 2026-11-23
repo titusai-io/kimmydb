@@ -23788,3 +23788,30 @@ async fn a_merge_into_a_name_whose_replacement_the_member_knows_of_is_refused_50
     let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
     assert_eq!((count.status, &count.body["count"]), (200, &json!(0)), "{:?}", count.body);
 }
+
+/// ADR-272, decision 11: the self-read refusal of ADR-255 is lifted for a REPLACING `$out` (it reads the bound physical and writes only
+/// the hidden stage) and stays for `$merge` and the insert-only `$out`. The replacing `$out` is the Q6.7 executor and is not built:
+/// until then a `$out` whose pipeline reads its own, populated target is the 400 it always was. Q6.7's failing-first commit flips
+/// this test to "it succeeds and keeps its content" (the self-`$out` row, H-Q6-D1).
+#[tokio::test]
+async fn an_out_that_reads_its_own_populated_target_is_still_refused_400_until_q6_7() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "src"})).await;
+    server.post("/v1/db/shop/coll/src/docs", Some(&token), json!({"_id": 1, "v": "x"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/src/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$out": "src" }] }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("the pipeline reads it"),
+        "{:?}",
+        res.body
+    );
+    let count = server.post("/v1/db/shop/coll/src/count", Some(&token), json!({})).await;
+    assert_eq!(count.body["count"], 1, "and nothing was written: {:?}", count.body);
+}
