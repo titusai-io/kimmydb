@@ -815,6 +815,13 @@ jobs:
           hooks=$(strings target/x86_64-unknown-linux-musl/dist/kimmyd | grep -c DROP_APPLY || true)
           test "$hooks" = 0 || { echo "the release binary names DROP_APPLY $hooks times"; exit 1; }
 
+      # The test hooks of the storage crate (`test-hooks`, which only dev-dependencies enable) are not in what ships:
+      # `freeze_clock_bound_for_tests` holds the clock the bound reads still, and names itself in its log line.
+      - name: The shipped server carries no test hook
+        run: |
+          hooks=$(strings target/x86_64-unknown-linux-musl/dist/kimmyd | grep -c freeze_clock_bound_for_tests || true)
+          test "$hooks" = 0 || { echo "the release binary names freeze_clock_bound_for_tests $hooks times"; exit 1; }
+
       # One file, so the artifact unpacks as `kimmyd` alone.
       - uses: actions/upload-artifact@v7
         with:

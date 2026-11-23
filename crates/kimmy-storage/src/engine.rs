@@ -2385,6 +2385,13 @@ impl Engine {
     /// Test builds and `test-hooks` only.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn freeze_clock_bound_for_tests(&self, ms: Option<u64>) {
+        // The name is in the message so that a binary that carries the hook says so in its strings: CI checks that the
+        // shipped server does not (as it does for the lab hook's switch).
+        tracing::debug!(
+            hook = "freeze_clock_bound_for_tests",
+            ?ms,
+            "the clock bound is held still"
+        );
         self.clock_frozen_ms.store(ms.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
