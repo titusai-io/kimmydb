@@ -176,3 +176,15 @@ fn the_memo_is_begun_in_both_entries_and_the_sink_checks_before_it_writes() {
     let write = sink.find("deadline::check()?").expect("the writer's last look at the deadline");
     assert!(check < write, "the end check comes before anything is created or written");
 }
+
+/// The memo is the thread's: its guard must not be holdable across an await (see [`Scope`]). `Scope: Send` would make this ambiguous
+/// and fail to compile.
+#[test]
+fn the_scope_cannot_be_held_across_an_await() {
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    <Scope as AmbiguousIfSend<_>>::check();
+}

@@ -2765,6 +2765,9 @@ async fn aggregate_run_held(
         // The first stage charges what it is given as its own input, so the read gives its
         // bytes back as the documents are handed over.
         limits.buffer.lease("the source read").charge_docs(&docs)?;
+        // This request's resolutions, from its source on (ADR-272, decision 11). Begun here, after the last await, and dropped with the
+        // synchronous call below: the memo is the thread's, and a future may move threads at an await.
+        let _memo = resolve_memo::Scope::begin(db, coll, &meta);
         // The rest is synchronous: its own function, so that the guard of the request's
         // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
         // a future may leave on one thread and resume on another.
@@ -2784,7 +2787,8 @@ async fn aggregate_run_held(
         None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
     };
     // The scan is in the synchronous function with the rest, under the one guard of the
-    // request's deadline.
+    // request's deadline, and under the request's resolutions (ADR-272, decision 11): no await from here on.
+    let _memo = resolve_memo::Scope::begin(db, coll, &meta);
     scan_pipeline(
         state,
         auth,
@@ -3536,6 +3540,9 @@ fn write_sink(
     if let (true, Some(meta)) = (is_out, &existing) {
         not_empty(meta)?;
     }
+    // After the last read and before the first write: nothing this request read has been buried since it was resolved, or nothing is
+    // written and the request is told to retry (ADR-272, decision 11)
+    resolve_memo::end_check(state)?;
     // The last look at the request's deadline: from here the target is created and
     // written, and a write that has begun goes to its end (ADR-192, ADR-266), so a
     // request cut by the deadline has created nothing and written nothing.
@@ -3612,9 +3619,17 @@ fn foreign_collection(
     name: &str,
 ) -> Result<Option<CollectionMeta>, ApiError> {
     auth.require(Action::Read, db, Some(name))?;
+    // Resolved once per request (ADR-272, decision 11): a name this request already resolved answers from the memo, so a source and a
+    // `$lookup` of it, or two sub-pipelines, read one physical across a swap
+    if let Some(meta) = resolve_memo::recall(db, name) {
+        return Ok(Some(meta));
+    }
     let has_peers = state.members().is_some_and(|m| !m.is_empty());
     match collection(state, db, name) {
-        Ok(meta) => Ok(Some(meta)),
+        Ok(meta) => {
+            resolve_memo::remember(db, name, &meta);
+            Ok(Some(meta))
+        }
         Err(e) if !has_peers && e.status == axum::http::StatusCode::NOT_FOUND => Ok(None),
         Err(e) => Err(e),
     }
