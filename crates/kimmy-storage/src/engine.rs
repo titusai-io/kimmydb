@@ -287,6 +287,9 @@ pub struct Engine {
     /// Entries held as state that a window released, since start (ADR-169's
     /// addendum). Added only after the run that released them commits.
     held_marks_released: std::sync::atomic::AtomicU64,
+    /// Snapshot drops of a swapped name (or of a stage) this member did not apply, waiting for the register events that carry
+    /// them (`kimmy_register_carried_drop_deferred_total`, ADR-272, Q6.4 item 1b).
+    register_carried_drops_deferred: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
     /// How long the writer was held, as a histogram over
@@ -1724,6 +1727,7 @@ impl Engine {
             #[cfg(any(test, feature = "test-hooks"))]
             replay_read_hook: parking_lot::Mutex::new(None),
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
+            register_carried_drops_deferred: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
@@ -1781,6 +1785,17 @@ impl Engine {
     /// released them commits, so a rolled-back release is not counted.
     pub fn held_marks_released(&self) -> u64 {
         self.held_marks_released.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot drops of a swapped name this member has not applied, since start (`kimmy_register_carried_drop_deferred_total`).
+    /// Zero on every member once the snapshot carries the register's events (Q6.6): each one is a carried drop waiting for them.
+    pub fn register_carried_drops_deferred(&self) -> u64 {
+        self.register_carried_drops_deferred.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one carried drop that was deferred ([`Self::register_carried_drops_deferred`]).
+    pub fn count_register_carried_drop_deferred(&self) {
+        self.register_carried_drops_deferred.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Add `n` committed releases to [`Self::held_marks_released`].

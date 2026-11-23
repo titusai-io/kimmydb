@@ -286,6 +286,8 @@ impl AppState {
             clock_refusals: self.engine.clock_refusals(),
             // The bindings that stopped a batch for the want of their stage's creation, by origin (ADR-272).
             register_waiting: self.engine.register_waiting_for_stage(),
+            // The snapshot drops of a swapped name deferred for the register's events (ADR-272).
+            register_carried_drops_deferred: self.engine.register_carried_drops_deferred(),
             // How far this member's own clock leads its physical clock, and how long a peer still refuses its entries for
             // theirs, in whole seconds rounded up (U1's guard on schema changes reads the same two).
             clock_hlc_lead_seconds: self.engine.clock_lead_ms().div_ceil(1000),
@@ -781,6 +783,20 @@ pub(crate) mod tests {
             "the scrape names the origin: {out}"
         );
         assert_eq!(state.metrics.snapshot_with(&readings).register_waiting_for_stage, 2);
+    }
+
+    /// The engine's count of deferred snapshot drops reaches the scrape and the snapshot the OTLP bridge reads.
+    #[test]
+    fn the_engines_deferred_carried_drops_reach_the_readings_and_the_scrape() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
+        state.engine.count_register_carried_drop_deferred();
+        state.engine.count_register_carried_drop_deferred();
+        let readings = state.storage_readings().unwrap();
+        assert_eq!(readings.register_carried_drops_deferred, 2);
+        let out = state.metrics.render_with(&readings);
+        assert!(out.contains("kimmy_register_carried_drop_deferred_total 2\n"), "{out}");
+        assert_eq!(state.metrics.snapshot_with(&readings).register_carried_drop_deferred, 2);
     }
 
     /// `kimmy_epoch_origins` is the length of the member's own version vector at

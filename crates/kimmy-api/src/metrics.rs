@@ -173,6 +173,9 @@ pub struct StorageReadings {
     /// The batches a binding stopped because its stage's creation is not held here (ADR-272), by the origin that sent the
     /// binding: at most 64 named and the rest summed under `other` (`Engine::register_waiting_for_stage`). A monotonic count.
     pub register_waiting: Vec<(String, u64)>,
+    /// Snapshot drops of a swapped name or of a stage that this member deferred (`Engine::register_carried_drops_deferred`,
+    /// ADR-272): a monotonic count, 0 once the snapshot carries the register.
+    pub register_carried_drops_deferred: u64,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -603,6 +606,8 @@ pub struct MetricsSnapshot {
     /// Batches a binding stopped for the want of its stage's creation, all origins summed (ADR-272): the one scalar the OTLP
     /// bridge carries of `kimmy_register_waiting_for_stage{origin}`.
     pub register_waiting_for_stage: u64,
+    /// `kimmy_register_carried_drop_deferred_total`: snapshot drops of a swapped name deferred (ADR-272).
+    pub register_carried_drop_deferred: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1635,6 +1640,7 @@ impl Metrics {
             sync_entries_skipped_purge_pending: self.get(&self.sync_entries_skipped_purge_pending),
             sync_entries_skipped_clock_refused: self.get(&self.sync_entries_skipped_clock_refused),
             register_waiting_for_stage: readings.register_waiting.iter().map(|(_, n)| *n).sum(),
+            register_carried_drop_deferred: readings.register_carried_drops_deferred,
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -2087,6 +2093,9 @@ impl Metrics {
              # HELP kimmy_register_waiting_for_stage Replicated bindings of a swap's stage (`$out`, ADR-272) that stopped a sync batch because the stage's creation is not held here, by the origin (node id) that sent the binding. One per stopped batch, counted once its transaction aborted; at most 64 origins are named and the rest are summed under origin=\"other\". Nothing is lost: the batch stops at the binding, is asked for again from the same place, and goes on once the creation arrives, in the same round. A value that keeps rising for one origin names a member whose stage creation never reaches this node.\n\
              # TYPE kimmy_register_waiting_for_stage counter\n\
              {register_waiting_lines}\
+             # HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.\n\
+             # TYPE kimmy_register_carried_drop_deferred_total counter\n\
+             kimmy_register_carried_drop_deferred_total {register_carried_drop_deferred}\n\
              # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.\n\
              # TYPE kimmy_clock_hlc_lead_seconds gauge\n\
              kimmy_clock_hlc_lead_seconds {clock_hlc_lead_seconds}\n\
@@ -2335,6 +2344,7 @@ impl Metrics {
                     })
                     .collect::<String>()
             },
+            register_carried_drop_deferred = readings.register_carried_drops_deferred,
             register_waiting_lines = if readings.register_waiting.is_empty() {
                 "kimmy_register_waiting_for_stage{origin=\"other\"} 0\n".to_string()
             } else {
@@ -3382,6 +3392,7 @@ mod tests {
                 ("02020202020202020202020202020202".to_string(), 96),
                 ("other".to_string(), 97),
             ],
+            register_carried_drops_deferred: 98,
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4181,6 +4192,9 @@ kimmy_sync_clock_refused_total{origin=\"other\"} 95
 # TYPE kimmy_register_waiting_for_stage counter
 kimmy_register_waiting_for_stage{origin=\"02020202020202020202020202020202\"} 96
 kimmy_register_waiting_for_stage{origin=\"other\"} 97
+# HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.
+# TYPE kimmy_register_carried_drop_deferred_total counter
+kimmy_register_carried_drop_deferred_total 98
 # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.
 # TYPE kimmy_clock_hlc_lead_seconds gauge
 kimmy_clock_hlc_lead_seconds 7001
@@ -5210,7 +5224,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // Since U1, the skipped-entries series for `clock_refused` and the one `origin="other"`
             // sample of `kimmy_sync_clock_refused_total` that exists before any origin is named.
             2
-            // Since ADR-272, the one `origin="other"` sample of `kimmy_register_waiting_for_stage`.
+            // Since ADR-272, the one `origin="other"` sample of `kimmy_register_waiting_for_stage`, and the scalar
+            // `kimmy_register_carried_drop_deferred_total`.
+            + 1
             + 1
             // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
             + 6
@@ -5522,6 +5538,21 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             10,
             "the bridge reads the sum"
         );
+    }
+
+    /// ADR-272: the snapshot drops of a swapped name that were deferred render as a plain counter, present at 0, and reach the
+    /// snapshot the OTLP bridge reads.
+    #[test]
+    fn deferred_carried_drops_are_a_plain_counter_present_at_zero() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(empty.contains("# TYPE kimmy_register_carried_drop_deferred_total counter\n"));
+        assert!(empty.contains("kimmy_register_carried_drop_deferred_total 0\n"));
+        let readings = StorageReadings { register_carried_drops_deferred: 3, ..Default::default() };
+        assert!(
+            m.render_with(&readings).contains("kimmy_register_carried_drop_deferred_total 3\n")
+        );
+        assert_eq!(m.snapshot_with(&readings).register_carried_drop_deferred, 3);
     }
 
     #[test]

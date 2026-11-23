@@ -2324,6 +2324,14 @@ impl TelemetryGuard {
             "Sync batches stopped at a binding of a swap's stage whose creation is not held here; re-served from the same place and taken once the creation arrives.",
             register_waiting_for_stage
         );
+        // Snapshot drops of a swapped name deferred until the snapshot carries the register's events (ADR-272, Q6.4 item 1b).
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.carried_drop_deferred",
+            "{drop}",
+            "Snapshot drops of a swapped name, or of one of its stages, that this member did not apply for want of the register's events; 0 once the snapshot carries them.",
+            register_carried_drop_deferred
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
