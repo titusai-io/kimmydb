@@ -152,6 +152,9 @@ mod burial_tests;
 mod logical_drop_tests;
 
 #[cfg(test)]
+mod carried_drop_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
