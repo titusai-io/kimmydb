@@ -29,6 +29,7 @@ pub mod partial;
 pub mod path;
 pub mod record;
 pub mod regex;
+pub mod register_state;
 pub mod swap;
 pub mod type_names;
 pub mod validator;
