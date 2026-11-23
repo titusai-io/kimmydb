@@ -725,7 +725,11 @@ impl Engine {
             return Ok(Dropped::Buried(false));
         };
         let mut shadow = read_collection(&txn, db, &shadow_name)?;
-        if self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+        // A stage never takes the survivors path (ADR-272, decision 9; ruled by Chris, 2026-11-23): a row stamped after the drop kept the
+        // stage and its stage meta, the author's valid binding then made a partial output visible, and divergence repair spread it.
+        // It is buried whole at the drop, whatever it holds. This is the one place every route to a drop passes: the sweep of a
+        // database's drop, the replicated collection drop and the snapshot route.
+        if meta.stage.is_some() || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
             txn.commit()?;
             let ids = self.finish_burial(db, name, burial);
