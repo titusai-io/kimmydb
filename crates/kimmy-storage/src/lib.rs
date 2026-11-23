@@ -120,6 +120,8 @@ mod clock_bound_entry_tests;
 
 #[cfg(test)]
 mod clock_bound_document_tests;
+#[cfg(test)]
+mod clock_bound_tombstone_tests;
 
 #[cfg(test)]
 mod swap_kind_tests;
