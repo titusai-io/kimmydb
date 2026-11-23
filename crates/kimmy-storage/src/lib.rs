@@ -146,6 +146,9 @@ mod stage_name_tests;
 mod resolve_tests;
 
 #[cfg(test)]
+mod burial_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
