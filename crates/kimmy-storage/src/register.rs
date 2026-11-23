@@ -577,3 +577,18 @@ pub(crate) fn remove_stage_row_for_test(engine: &crate::Engine, physical: Collec
         .unwrap();
     txn.commit().unwrap();
 }
+
+/// Test only: write a stage row in the form before the row named its stage (the creation's stamp key and the deadline only), as a development store of
+/// schema 12 written by an earlier build holds it.
+#[cfg(test)]
+pub(crate) fn write_old_form_stage_row_for_test(engine: &crate::Engine, physical: CollectionId) {
+    let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(tables::REGISTER_STAGES)
+        .unwrap()
+        .insert(
+            physical.0.to_be_bytes().as_slice(),
+            [0u8; Stamp::KEY_LEN + HLC_ENCODED_LEN].as_slice(),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+}

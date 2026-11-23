@@ -285,3 +285,19 @@ fn a_staging_write_is_never_owed_under_hold_and_is_owed_in_a_window() {
     );
     txn.abort().unwrap();
 }
+
+/// F6 of the review of items 6 and 6b: a stage row of the form before it named its stage is a development store of schema 12 written by an earlier build.
+/// It is refused by name, with the wipe, and not read as corruption of unknown cause.
+#[test]
+fn a_stage_row_of_the_form_before_it_named_its_stage_is_refused_with_the_wipe() {
+    let (e, _d) = engine();
+    let id = CollectionId::derive(DB, STAGE);
+    crate::register::write_old_form_stage_row_for_test(&e, id);
+    let txn = e.begin_write(WriterHolder::Ddl).unwrap();
+    let refused = crate::register::stage_row(&txn, id).unwrap_err().to_string();
+    txn.abort().unwrap();
+    assert!(
+        refused.contains("wipe this data directory") && refused.contains("stage"),
+        "the refusal names what it is and the wipe: {refused}"
+    );
+}
