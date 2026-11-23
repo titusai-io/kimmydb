@@ -287,6 +287,85 @@ fn a_logical_drop_buries_the_identity_and_every_older_physical() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// burial by a later event (decision 5, cause `doomed`): a stage with no binding in effect whose deadline lies strictly below the
+// visible event
+
+/// Bindings `a` at 10 and `b` at 20 are in effect; the stages `s` (deadline 15) and `t` (deadline 20) have no binding.
+fn doom_case() -> (Timeline, Visible) {
+    let t = timeline(&[(10, 0, bind("a")), (20, 0, bind("b"))]);
+    let held = [("orders", Ready::Alive), ("a", Ready::Alive), ("b", Ready::Alive)];
+    let visible = t.visible(ready(&held));
+    (t, visible)
+}
+
+#[test]
+fn a_stage_with_no_binding_whose_deadline_is_strictly_below_the_visible_event_is_doomed() {
+    let (t, visible) = doom_case();
+    let held = [("b", Ready::Alive), ("s", Ready::Alive), ("t", Ready::Alive)];
+    let stages = [("s", Hlc::new(15, 0)), ("t", Hlc::new(20, 0))];
+    let doomed = t.doomed(&visible, ready(&held), &stages);
+    assert_eq!(
+        doomed,
+        [Burial { physical: "s".into(), at: st(20, 0) }],
+        "s (deadline 15) is doomed by the event at 20, stamped by it; t (deadline 20) is not: a binding at the deadline is valid"
+    );
+}
+
+#[test]
+fn a_stage_that_has_a_binding_in_effect_is_buried_by_the_loser_rule_and_never_doomed() {
+    let (t, visible) = doom_case();
+    let held = [("orders", Ready::Alive), ("a", Ready::Alive), ("b", Ready::Alive)];
+    // `a` is a stage too, with a deadline far below the visible event: its binding is in effect, so decision 5's loser rule buries it
+    let stages = [("a", Hlc::new(12, 0)), ("b", Hlc::new(12, 0))];
+    assert!(
+        t.doomed(&visible, ready(&held), &stages).is_empty(),
+        "D4 before DOOM: neither a bound stage nor the served one"
+    );
+    let buried = t.burials(&visible, ready(&held));
+    assert!(buried.iter().any(|b| b.physical == "a"), "the loser rule buries it: {buried:?}");
+}
+
+#[test]
+fn a_doomed_stage_is_one_held_here_alive_or_missing_and_never_the_served_physical() {
+    let (t, visible) = doom_case();
+    let stages = [("s", Hlc::new(15, 0)), ("m", Hlc::new(15, 0)), ("gone", Hlc::new(15, 0))];
+    let held = [("b", Ready::Alive), ("s", Ready::Alive), ("m", Ready::Missing)];
+    let mut doomed = t.doomed(&visible, ready(&held), &stages);
+    doomed.sort_by(|x, y| x.physical.cmp(&y.physical));
+    assert_eq!(
+        doomed,
+        [
+            Burial { physical: "m".into(), at: st(20, 0) },
+            Burial { physical: "s".into(), at: st(20, 0) }
+        ],
+        "a missing stage is buried too; one not held here (buried or never held) is not buried again"
+    );
+    // the served physical is never doomed, whatever its deadline
+    let served = [("b", Hlc::new(1, 0))];
+    assert!(t.doomed(&visible, ready(&held), &served).is_empty());
+}
+
+#[test]
+fn nothing_is_doomed_while_the_identity_is_served() {
+    let t = timeline(&[]);
+    let held = [("orders", Ready::Alive), ("s", Ready::Alive)];
+    let visible = t.visible(ready(&held));
+    assert_eq!(visible, Visible::Identity);
+    assert!(t.doomed(&visible, ready(&held), &[("s", Hlc::new(1, 0))]).is_empty());
+}
+
+#[test]
+fn a_logical_drop_and_a_recreation_doom_a_stage_below_them_as_a_binding_does() {
+    for event in [RegisterEvent::LogicalDrop, create("r")] {
+        let t = timeline(&[(20, 0, event.clone())]);
+        let held = [("orders", Ready::Alive), ("r", Ready::Alive), ("s", Ready::Alive)];
+        let visible = t.visible(ready(&held));
+        let doomed = t.doomed(&visible, ready(&held), &[("s", Hlc::new(19, 0))]);
+        assert_eq!(doomed, [Burial { physical: "s".into(), at: st(20, 0) }], "{event:?}");
+    }
+}
+
 #[test]
 fn a_stage_born_after_the_visible_event_is_not_buried() {
     // b was bound at 30; a drop at 20 is visible only if b is not ready: b stays (born after the drop)
@@ -500,6 +579,25 @@ fn the_pure_function_answers_every_case_of_the_model_table_as_the_model_does() {
             case.burials.iter().map(|&(p, h, o)| (p.to_string(), h, o)).collect();
         want.sort();
         assert_eq!(buried, want, "case {i}: burials");
+        // the stages the burial by a later event buries: every stage of the case is one this member knows the creation of
+        let stages: Vec<(&str, Hlc)> = case
+            .stages
+            .iter()
+            .map(|&(s, created, deadline)| {
+                let info = StageInfo { deadline: Hlc::new(deadline, 0) };
+                (s, info.effective_deadline(&st(created, 0)))
+            })
+            .collect();
+        let mut doomed: Vec<(String, u64, usize)> = t
+            .doomed(&visible, ready(&held), &stages)
+            .into_iter()
+            .map(|b| (b.physical, b.at.hlc.wall_ms, b.at.node.to_bytes()[0] as usize))
+            .collect();
+        doomed.sort();
+        let mut want: Vec<(String, u64, usize)> =
+            case.doomed.iter().map(|&(p, h, o)| (p.to_string(), h, o)).collect();
+        want.sort();
+        assert_eq!(doomed, want, "case {i}: doomed");
         for &(physical, superseded) in case.superseded {
             let got =
                 t.superseded_at(physical).map(|s| (s.hlc.wall_ms, s.node.to_bytes()[0] as usize));
@@ -516,6 +614,11 @@ fn the_table_exercises_every_branch_it_is_meant_to() {
     assert!(count(&|c| matches!(c.visible, Vis::Create(..))) >= 40, "a recreation visible");
     assert!(count(&|c| matches!(c.visible, Vis::Drop(..))) >= 40, "a logical drop visible");
     assert!(count(&|c| !c.burials.is_empty()) >= 150, "a burial");
+    assert!(count(&|c| !c.doomed.is_empty()) >= 100, "a burial by a later event");
+    assert!(
+        count(&|c| !c.doomed.is_empty() && !c.burials.is_empty()) >= 20,
+        "both causes in one case"
+    );
     assert!(
         count(&|c| c.superseded.iter().any(|(_, s)| s.is_some())) >= 100,
         "a superseded physical"

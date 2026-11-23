@@ -264,6 +264,17 @@ impl Timeline {
             .collect()
     }
 
+    /// The stages `visible` buries by a later event (decision 5, "burial by a later event"; cause `doomed`). A stub: it buries
+    /// nothing yet.
+    pub fn doomed(
+        &self,
+        _visible: &Visible,
+        _held: impl Fn(&str) -> Ready,
+        _stages: &[(&str, Hlc)],
+    ) -> Vec<Burial> {
+        Vec::new()
+    }
+
     /// The stamp of the earliest event in effect that supersedes `physical`: above its birth, and a logical drop or
     /// naming another physical (decision 8). `None` if there is none or the physical's birth is unknown.
     pub fn superseded_at(&self, physical: &str) -> Option<Stamp> {

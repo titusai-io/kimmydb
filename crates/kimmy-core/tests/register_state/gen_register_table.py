@@ -1,14 +1,15 @@
 """gen_register_table.py (NEW, Q6.2): the differential table of the product's pure register function (`kimmy-core::register_state`, ADR-272 decisions 3, 5, 8) against the model.
 Each case is a small scenario of one logical name's register events plus the readiness of the physicals they name; the expected answers are what swapmodel6g.py's `Member` makes of it:
   visible  = the member's `cur` after `settle` (`newest_applicable` and `enter`),
-  burials  = the physicals `sweep` buried (D4, bound out; DOOM off) with the stamp of the visible event,
+  burials  = the physicals `sweep` buried by D4 (bound out) with the stamp of the visible event,
+  doomed   = the stages `sweep` buried by DOOM (no binding in effect here, the visible event strictly above the stage's deadline: ADR-272 decision 5, "burial by a later event") with the stamp of the visible event,
   superseded = `first_superseding` of each physical (D11/D10: the earliest valid event above the physical's birth that is a logical drop or names another physical).
-Rule B is off here (every event given is in effect: coverage is the caller's input in the product), DOOM is off (the DOOM commit regenerates its own rows). The events reach the model in a shuffled order and in the given order, and the two answers must agree
+Rule B is off here (every event given is in effect: coverage is the caller's input in the product), DOOM is ON (the DOOM commit's rows; the Q6.2 table at 669c6edb was generated with it off: gen_register_table.nodoom.py). The events reach the model in a shuffled order and in the given order, and the two answers must agree
 (the monotone claim of decision 5), or the generator stops.
-usage: gen_register_table.py [cases] > crates/kimmy-core/tests/register_state/table.rs   (run from the directory that holds swapmodel6g.py; the generator imports it from its own directory)     (the header names the model's sha256[:16])"""
+usage: gen_register_table.py [cases] > ../../wt-q6p/crates/kimmy-core/tests/register_state_table.rs     (the header names the model's sha256[:16])"""
 import hashlib, os, random, sys
 sys.dont_write_bytecode = True
-os.environ.update(Q6_RULE_B="0", Q6_DOOM="0")
+os.environ.update(Q6_RULE_B="0", Q6_DOOM="1")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import swapmodel6g as M
 
@@ -66,6 +67,10 @@ def run(case, order):
         if p == "L":
             continue
         m.phys[p] = M.Phys("stage" if p.startswith("S") else "rc")
+        if p.startswith("S"):
+            ce = M.Entry("A", creation[p], "create", p, dl=deadline[p])  # the stage's creation entry, so the member knows its deadline (DOOM reads it)
+            ce.idx = len(w.all); w.all.append(ce)
+            m.creates[p] = ce
     for p, r in ready.items():
         ph = m.phys[p]
         ph.alive = r == "alive" or r == "missing"
@@ -84,12 +89,13 @@ def run(case, order):
             m.add_event(e)
     m.settle()
     cur = None if m.cur is None else (m.cur.kind, m.cur.phys, m.cur.hlc, m.cur.origin)
-    burials = sorted((p, ph.kill) for p, ph in m.phys.items() if p in initially_alive and not ph.alive)
+    burials = sorted((p, ph.kill) for p, ph in m.phys.items() if p in initially_alive and not ph.alive and not ph.doomed)
+    doomed = sorted((p, ph.kill) for p, ph in m.phys.items() if p in initially_alive and not ph.alive and ph.doomed)
     sup = {}
     for p in physicals:
         ev = m.first_superseding(p)
         sup[p] = None if ev is None else (ev.hlc, ev.origin)
-    return cur, burials, sup
+    return cur, burials, doomed, sup
 
 
 def rs_str(s):
@@ -104,7 +110,7 @@ for i in range(N):
     if a != b:
         sys.exit(f"case {i}: the model answers differ by arrival order: {a} vs {b} for {case}")
     physicals, ready, stages, creation, deadline, events = case
-    cur, burials, sup = a
+    cur, burials, doomed, sup = a
     vis = "Vis::Identity" if cur is None else (f'Vis::Drop({cur[2]}, {ORIGINS.index(cur[3])})' if cur[0] == "ldrop" else f'Vis::{"Bind" if cur[0] == "bind" else "Create"}({rs_str(cur[1])}, {cur[2]}, {ORIGINS.index(cur[3])})')
     out.append(f"""    Case {{
         physicals: &[{", ".join(f'({rs_str(p)}, Ready::{ready[p].capitalize()})' for p in physicals)}],
@@ -112,6 +118,7 @@ for i in range(N):
         events: &[{", ".join(f'({rs_str(k)}, {ORIGINS.index(o)}, {h}, {rs_str(p)})' for k, o, h, p in events)}],
         visible: {vis},
         burials: &[{", ".join(f'({rs_str(p)}, {k[0]}, {ORIGINS.index(k[1])})' for p, k in burials)}],
+        doomed: &[{", ".join(f'({rs_str(p)}, {k[0]}, {ORIGINS.index(k[1])})' for p, k in doomed)}],
         superseded: &[{", ".join(f'({rs_str(p)}, {"None" if sup[p] is None else f"Some(({sup[p][0]}, {ORIGINS.index(sup[p][1])}))"})' for p in physicals)}],
     }},""")
 print(f"""//! The model's answers for the pure register function (generated; do not edit by hand).
@@ -119,7 +126,8 @@ print(f"""//! The model's answers for the pure register function (generated; do 
 //! Generated by `kimmydb-reviews-0470-0480/q6v2-model/gen_register_table.py {N}` from `swapmodel6g.py`, sha256[:16] {SHA}.
 //! Each case: the physicals of one logical name and their readiness here, the stages (name, creation hlc, deadline), the register
 //! events (kind, origin index, hlc, physical), and what the model's `Member` makes of them: the visible event, the physicals the
-//! bound-out burial buries (with the visible event's stamp) and, for every physical, the earliest valid event that supersedes it.
+//! bound-out burial buries (with the visible event's stamp), the stages the burial by a later event (DOOM) buries (the same stamp) and, for every
+//! physical, the earliest valid event that supersedes it.
 //! The model answered every case identically for the given order of the events and for a shuffled one.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +151,7 @@ pub struct Case {{
     pub events: &'static [(&'static str, usize, u64, &'static str)],
     pub visible: Vis,
     pub burials: &'static [(&'static str, u64, usize)],
+    pub doomed: &'static [(&'static str, u64, usize)],
     pub superseded: &'static [(&'static str, Option<(u64, usize)>)],
 }}
 
