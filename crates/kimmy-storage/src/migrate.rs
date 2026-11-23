@@ -52,14 +52,20 @@ use crate::tables;
 /// (and a key that holds one, an array of them included, and a JavaScript value with a scope)
 /// written under schema 10 orders otherwise; this build refuses a schema-10 store and backup by
 /// name. The commits of the series between schema 10 and 11 are not deployable.
-pub const SCHEMA_VERSION: u8 = 11;
+///
+/// **12 (ADR-272) adds the atomic `$out` swap's stored forms**: the oplog kinds `BindCollection` (15),
+/// `AbandonStage` (16) and `OutLossRecord` (17), the stage's deadline in a collection's definition, and the register of
+/// a logical name and what hangs on it (the bound-out list, the retained late entries, the snapshot deletes that carry
+/// their `_id`), which later commits of the same release add under this number. An older store holds none of them, and
+/// nothing builds them from it: this build refuses a schema-11 store and backup by name. 0.62.0 is a wipe release.
+pub const SCHEMA_VERSION: u8 = 12;
 
 /// What a refusal of a store or backup of an older schema tells the operator.
 pub(crate) fn no_upgrade() -> String {
     format!(
         "{} does not upgrade stores; stop every member, wipe this data directory, start on an \
          empty one and reseed.",
-        kimmy_core::build::SCHEMA_11_RELEASE
+        kimmy_core::build::SCHEMA_12_RELEASE
     )
 }
 
@@ -331,7 +337,7 @@ mod tests {
             Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                 assert!(why.contains("0.57.0"), "{why}");
                 assert!(why.contains("storage schema 6"), "{why}");
-                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
+                assert!(why.contains("0.62.0 does not upgrade stores"), "{why}");
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a schema 6 store"),
@@ -357,7 +363,7 @@ mod tests {
             Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                 assert!(why.contains("0.60.0"), "{why}");
                 assert!(why.contains("storage schema 7"), "{why}");
-                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
+                assert!(why.contains("0.62.0 does not upgrade stores"), "{why}");
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a schema 7 store"),
@@ -383,7 +389,7 @@ mod tests {
             Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                 assert!(why.contains("0.61.0"), "{why}");
                 assert!(why.contains(&format!("storage schema {n}")), "{why}");
-                assert!(why.contains("0.61.0 does not upgrade stores"), "{why}");
+                assert!(why.contains("0.62.0 does not upgrade stores"), "{why}");
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a schema {n} store"),
@@ -409,6 +415,13 @@ mod tests {
     #[test]
     fn a_schema_10_store_is_refused_by_name_and_nothing_is_written() {
         assert_a_release_build_schema_is_refused(10);
+    }
+
+    /// Schema 11 is 0.61.0's: it holds none of the swap's stored forms (ADR-272), and nothing builds them
+    /// from it, so this build refuses it by name and the upgrade is a wipe.
+    #[test]
+    fn a_schema_11_store_is_refused_by_name_and_nothing_is_written() {
+        assert_a_release_build_schema_is_refused(11);
     }
 
     /// With no sidecar the read-only fallback reads META: the same refusal.
@@ -454,7 +467,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         drop(Engine::open(&path).unwrap());
-        assert_eq!(SCHEMA_VERSION, 11);
+        assert_eq!(SCHEMA_VERSION, 12);
         let db = Database::create(&path).unwrap();
         assert_eq!(stored_version(&db).unwrap(), Some(SCHEMA_VERSION));
     }

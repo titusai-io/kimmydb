@@ -2841,12 +2841,12 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 ## Upgrades
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
-data. The on-disk **storage schema** is checked on open, and 0.61.0 and later open only
-schema **11** (0.58.0 to 0.60.x open only schema 7):
+data. The on-disk **storage schema** is checked on open, and 0.62.0 and later open only
+schema **12** (0.61.x opens only schema 11; 0.58.0 to 0.60.x open only schema 7):
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.61.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.62.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 

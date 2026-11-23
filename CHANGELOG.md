@@ -12,6 +12,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Read before upgrading**
+
+- **0.62.0 is a wipe release.** The stored format and the replication wire change once for the atomic `$out` swap ([ADR-272](docs/decisions.md#adr-272--an-out-that-replaces-a-populated-collection-is-atomic-on-each-member-and-a-write-that-races-it-is-lost-and-reported)): storage schema 11 to 12 and cluster protocol 3 to 4. 0.62.0 refuses, by name, a data directory or a backup written by 0.61 or older, and a peer that speaks protocol 3. Stop every member, wipe each member's data directory (move it aside), start every member on 0.62.0 on an empty one, then reseed from your source of truth. There is no mixed-version cluster. Rolling back is one step: restore an older backup on the older binary (or start it on the data directories you moved aside).
+
 ### Added
 
 - **A schema change is refused with `503 clock_ahead` when this member's own changes would be held back by the rest of the cluster.** Creating or dropping a database, a collection or an index, setting a validator and configuring vectors (and, when it ships, a replacing `$out`) now ask first: if this member's logical clock leads its own physical clock by more than `storage.max_clock_skew_secs`, or a live peer has said it is refusing this member's entries for their clock, nothing is written and the answer names the cause and says to retry on another member. Ordinary writes are not refused. New gauges, also on OTLP: `kimmy_clock_hlc_lead_seconds` and `kimmy_clock_own_stamps_refused_seconds`. The `Pushed` reply of the cluster protocol carries how long a peer will refuse an entry, so **the cluster protocol is 4**. See [operations](docs/operations.md).

@@ -51,6 +51,13 @@ pub const SCHEMA_10_RELEASE: &str = "0.61.0";
 /// too. The one place the storage refusals name it.
 pub const SCHEMA_11_RELEASE: &str = "0.61.0";
 
+/// The release that introduced storage schema 12 and its wipe: the atomic `$out` swap (ADR-272) adds three oplog
+/// kinds (a bind, an abandon and a swap's loss record), the register of a logical name, a stage's deadline in a
+/// collection's definition, and the stored forms behind them. A store or backup of an older schema holds none of it
+/// and is refused, by this name, with the upgrade stop all, wipe, start all, reseed. The one place the storage
+/// refusals name it.
+pub const SCHEMA_12_RELEASE: &str = "0.62.0";
+
 /// Short commit hash, with no decoration; `unknown` without git.
 pub const COMMIT: &str = env!("KIMMY_BUILD_COMMIT");
 
