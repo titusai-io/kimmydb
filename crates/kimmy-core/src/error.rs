@@ -55,10 +55,11 @@ pub enum Error {
     /// pinned by a test: decision 15's wording, the three removals, "after the stage's deadline".
     #[error(
         "`{name}` is a hidden staging copy of the collection `{logical}` made by a replacing `$out`; \
-         no schema change can be addressed to it. It is removed by the next `$out` or drop of `{logical}` made \
-         after the stage's deadline: run the `$out` again; or drop `{logical}`, which removes the stage only if \
-         the drop is stamped after the stage's deadline (a drop within that window leaves it until a later \
-         replace or drop); or `$out` `{logical}` onto itself to keep its content."
+         no schema change can be addressed to it. It is removed by the next `$out`, drop or creation of `{logical}` \
+         made after the stage's deadline: run the `$out` again; or drop `{logical}`, which removes the stage only if \
+         the drop is stamped after the stage's deadline (a drop within that window leaves it, and a second drop \
+         of a name that is already dropped changes nothing, so then create `{logical}` again or run the `$out` \
+         again); or `$out` `{logical}` onto itself to keep its content."
     )]
     StageCollection { name: String, logical: String },
 
