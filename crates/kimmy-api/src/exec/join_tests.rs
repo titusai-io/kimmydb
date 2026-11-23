@@ -873,6 +873,7 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::Unsupported(_)
         | E::InvalidDocumentId { .. }
         | E::InvalidName { .. }
+        | E::StageCollection { .. }
         | E::InvalidUpdate(_)
         | E::DocumentTooLarge { .. }
         | E::DocumentInvalid { .. }

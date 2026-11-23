@@ -23597,3 +23597,75 @@ async fn a_change_stream_tells_a_loss_that_entered_the_members_state_once() {
         "the metric counts it:\n{page}"
     );
 }
+
+/// A stage physical of a replacing `$out` (ADR-272, decision 15): never listed, never served, and no schema change can be addressed
+/// to it, whether or not it exists on this member.
+async fn a_server_holding_a_stage() -> (Server, String) {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .state
+        .engine
+        .create_stage(
+            "shop",
+            "orders.__stg.real",
+            kimmy_core::MergePolicy::Document,
+            kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0),
+        )
+        .unwrap();
+    (server, token)
+}
+
+#[tokio::test]
+async fn a_stage_is_never_listed() {
+    let (server, token) = a_server_holding_a_stage().await;
+    let res = server.get("/v1/db/shop/collections", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let names: Vec<&str> =
+        res.body["collections"].as_array().unwrap().iter().filter_map(|n| n.as_str()).collect();
+    assert_eq!(names, ["orders"], "the stage is held here and is not in the listing");
+}
+
+#[tokio::test]
+async fn a_stage_is_never_served() {
+    let (server, token) = a_server_holding_a_stage().await;
+    for path in
+        ["/v1/db/shop/coll/orders.__stg.real/docs", "/v1/db/shop/coll/orders.__stg.madeup/docs"]
+    {
+        let res = server.get(path, Some(&token)).await;
+        assert_eq!(res.status, 404, "{path}: {:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_schema_change_addressed_to_a_stage_is_refused_400_stage_collection_whether_or_not_it_exists()
+ {
+    let (server, token) = a_server_holding_a_stage().await;
+    let mut texts = Vec::new();
+    for name in ["orders.__stg.real", "orders.__stg.madeup"] {
+        let res =
+            server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+        assert_eq!(
+            (res.status, res.body["error"].as_str()),
+            (400, Some("stage_collection")),
+            "create {name}: {:?}",
+            res.body
+        );
+        let created = res.body["message"].as_str().unwrap_or_default().to_string();
+        let res = server.delete(&format!("/v1/db/shop/coll/{name}"), Some(&token)).await;
+        assert_eq!(
+            (res.status, res.body["error"].as_str()),
+            (400, Some("stage_collection")),
+            "drop {name}: {:?}",
+            res.body
+        );
+        assert_eq!(
+            res.body["message"].as_str().unwrap_or_default().replace(name, "<name>"),
+            created.replace(name, "<name>")
+        );
+        texts.push(created.replace(name, "<name>"));
+    }
+    assert_eq!(texts[0], texts[1], "the same refusal and text for a real and a made-up stage");
+    assert!(texts[0].contains("after the stage's deadline"), "{}", texts[0]);
+}

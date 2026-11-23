@@ -202,6 +202,14 @@ fn parse_uri(uri: &str) -> Result<(&str, &str), ErrorData> {
 
 #[cfg(test)]
 mod tests {
+    /// A hidden staging copy of a replacing `$out` is machinery, not data (ADR-272, decision 15): its `__stg` segment starts with the
+    /// reserved `__`, so the resource listing and the listing tools leave it out like any internal collection.
+    #[test]
+    fn a_stage_is_an_internal_collection_and_is_never_offered() {
+        assert!(super::is_internal_collection("orders.__stg.a1b2"));
+        assert!(!super::is_internal_collection("orders"));
+    }
+
     use super::*;
 
     #[test]

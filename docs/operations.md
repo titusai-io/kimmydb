@@ -756,7 +756,7 @@ log of nothing but the failures — half a record, and one this server has never
 kept. They are `bad_request`, `payload_too_large`, `document_too_large`,
 `answer_too_large`, `id_too_large`, `validation_failed`, `unsupported_media_type`,
 `unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
-`unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited`,
+`unique_violation`, `stage_collection`, `no_vectors`, `resume_token_expired`, `rate_limited`,
 `stale` and `collection_purging`. Count them with `kimmy_responses_total{class="4xx"}`,
 except `collection_purging`, a `503` the drop purger's own log lines already
 account for; read the authorization decisions among them in

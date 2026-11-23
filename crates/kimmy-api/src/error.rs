@@ -92,6 +92,9 @@ pub enum ErrorCode {
     /// A collection cannot be created under this name yet: what a drop of an
     /// earlier collection of the name held is still being removed (ADR-189).
     CollectionPurging,
+    /// A schema change was addressed to a hidden staging copy of a replacing `$out` (ADR-272, decision 15): `400`, refused on the
+    /// name mark before any lookup. Nothing was written, and no retry changes the answer.
+    StageCollection,
     /// A schema change was refused before anything was written because this member's own stamps would be refused by the
     /// rest of the cluster until they are due: its clock is ahead of its own physical clock by more than the allowed
     /// skew, or a peer is refusing its entries for their clock (U1).
@@ -210,7 +213,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 31] = [
+    pub const ALL: [ErrorCode; 32] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
@@ -236,6 +239,7 @@ impl ErrorCode {
         Self::Timeout,
         Self::CollectionPurging,
         Self::ClockAhead,
+        Self::StageCollection,
         Self::OutcomeUnknown,
         Self::PartiallyApplied,
         Self::NodeStopping,
@@ -272,6 +276,7 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
             Self::ClockAhead => "clock_ahead",
+            Self::StageCollection => "stage_collection",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::PartiallyApplied => "partially_applied",
             Self::NodeStopping => "node_stopping",
@@ -299,6 +304,8 @@ impl ErrorCode {
             | Self::Conflict
             | Self::DuplicateKey
             | Self::UniqueViolation
+            // The name is reserved for a hidden staging copy: sending the same schema change again can only fail the same way.
+            | Self::StageCollection
             // Ingest vectors, or configure a provider that produces them.
             | Self::NoVectors
             // The resume point is collected. Resubscribing is a new request,
@@ -408,6 +415,7 @@ impl ErrorCode {
             | Self::Conflict
             | Self::DuplicateKey
             | Self::UniqueViolation
+            | Self::StageCollection
             | Self::NoVectors
             | Self::ResumeTokenExpired
             | Self::RateLimited
@@ -1111,6 +1119,10 @@ impl From<CoreError> for ApiError {
                 ErrorCode::ValidationFailed,
                 e.to_string(),
             ),
+            // A schema change addressed to a stage: its own code, so a client can tell it from a malformed name (ADR-272, decision 15).
+            CoreError::StageCollection { .. } => {
+                ApiError::new(StatusCode::BAD_REQUEST, ErrorCode::StageCollection, e.to_string())
+            }
             CoreError::InvalidName { .. }
             | CoreError::InvalidQuery(_)
             | CoreError::Limit(_)
@@ -1414,7 +1426,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 31] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 32] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1434,6 +1446,7 @@ mod tests {
             (RateLimited, None),
             (Stale, None),
             (CollectionPurging, None),
+            (StageCollection, None),
             (ClockAhead, Some(LogLevel::Warn)),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.

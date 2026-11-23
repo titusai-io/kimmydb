@@ -3749,6 +3749,7 @@ components:
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
+        | `stage_collection` | 400 | no | A schema change (creating or dropping a collection, creating or dropping an index, setting a validator, configuring vectors) addressed to a hidden staging copy of a replacing `$out`, whose name carries the reserved mark `.__stg.`. Refused on the name alone, before any lookup, so the answer is the same on every member whether or not the stage exists there. Nothing was written; the message names the collection and the three ways the stage is removed |
         | `clock_ahead` | 503 | elsewhere | A schema change was refused before anything was written because this member's own changes would be held back by the rest of the cluster until they are due: its clock is ahead of its own physical clock by more than `storage.max_clock_skew_secs`, or a peer is refusing its entries for their clock. The message names which. Retry on another member and fix this member's clock. Ordinary writes are not refused |
         | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, when the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, derived from the container's memory by default) and cannot cover an aggregation, the index-range keys a `find` holds past its window, the keys and documents an indexed write holds (which never waits for the pool, and is refused at once), or the ids a filtered vector search holds (ADR-269, ADR-270): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
@@ -3782,6 +3783,7 @@ components:
         - stale
         - timeout
         - collection_purging
+        - stage_collection
         - clock_ahead
         - outcome_unknown
         - partially_applied

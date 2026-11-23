@@ -50,6 +50,12 @@ pub enum Error {
     #[error("invalid name {name:?}: {reason}")]
     InvalidName { name: String, reason: &'static str },
 
+    /// A schema change addressed to a stage physical of a replacing `$out` (ADR-272, decision 15): refused on the name mark alone,
+    /// before any lookup, so the answer is the same on every member whether or not the stage exists there. A stub: the message
+    /// is the final one in the implementation commit.
+    #[error("stage collection {name:?}")]
+    StageCollection { name: String, logical: String },
+
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
@@ -220,6 +226,7 @@ impl Error {
             // it ever does.
             Error::InvalidDocumentId { .. }
             | Error::InvalidName { .. }
+            | Error::StageCollection { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
             | Error::DocumentInvalid { .. }
@@ -281,6 +288,7 @@ impl Error {
             | Error::Unsupported(_)
             | Error::InvalidDocumentId { .. }
             | Error::InvalidName { .. }
+            | Error::StageCollection { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
             | Error::DocumentInvalid { .. }
@@ -322,6 +330,14 @@ impl Error {
             None => Ok(()),
         }
     }
+
+    /// Refuse a schema change addressed to a stage physical of a replacing `$out` (ADR-272, decision 15), by the name mark alone:
+    /// the mark is reserved, so a client can never legitimately make such a name, and an answer that depended on the stage being
+    /// held here would differ between members. A stub: it refuses nothing yet.
+    pub fn refuse_stage_name(name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
 }
 
 impl From<bson::error::Error> for Error {
@@ -339,6 +355,34 @@ impl From<serde_json::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stage_name_is_refused_by_its_mark_whether_or_not_the_stage_exists() {
+        match Error::refuse_stage_name("orders.__stg.zz") {
+            Err(Error::StageCollection { name, logical }) => {
+                assert_eq!((name.as_str(), logical.as_str()), ("orders.__stg.zz", "orders"));
+            }
+            other => panic!("a marked name is refused: {other:?}"),
+        }
+        for fine in ["orders", "orders.stg.zz", "orders__stg", "stg", "orders.__stg"] {
+            assert!(Error::refuse_stage_name(fine).is_ok(), "{fine} carries no stage mark");
+        }
+    }
+
+    #[test]
+    fn the_stage_refusal_message_is_pinned_verbatim() {
+        // ADR-272 decision 15's wording: the three removals, and "after the stage's deadline".
+        let error =
+            Error::StageCollection { name: "orders.__stg.x1".into(), logical: "orders".into() };
+        assert_eq!(
+            error.to_string(),
+            "`orders.__stg.x1` is a hidden staging copy of the collection `orders` made by a replacing `$out`; \
+             no schema change can be addressed to it. It is removed by the next `$out` or drop of `orders` made \
+             after the stage's deadline: run the `$out` again; or drop `orders`, which removes the stage only if \
+             the drop is stamped after the stage's deadline (a drop within that window leaves it until a later \
+             replace or drop); or `$out` `orders` onto itself to keep its content."
+        );
+    }
 
     #[test]
     fn only_a_value_error_may_wait_for_another_argument_to_decide() {

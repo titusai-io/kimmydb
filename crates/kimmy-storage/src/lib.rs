@@ -140,6 +140,9 @@ mod rule_s_tests;
 mod ldrop_tests;
 
 #[cfg(test)]
+mod stage_name_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
