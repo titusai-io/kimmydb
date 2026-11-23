@@ -10,9 +10,6 @@
 //! stage whose creation is not known, is never stored, so no route can make one visible by forgetting the check. This
 //! module is the only code that opens the three tables (`only_this_module_opens_the_register_tables`).
 
-// The stubs of the failing-first commit: nothing calls them yet except the tests, which must fail. Removed with the implementation.
-#![allow(dead_code, unused_imports)]
-
 use kimmy_core::register_state::{Put, Refusal, Timeline};
 use kimmy_core::{CollectionId, HLC_ENCODED_LEN, Hlc, RegisterEvent, StageMeta, Stamp};
 use redb::ReadableTable;
@@ -36,8 +33,10 @@ fn corrupt(what: &str) -> StorageError {
 
 /// Create the three tables, so a read of them never meets a missing table.
 pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
-    let _ = (txn,);
-    unimplemented!("Q6.3: open_tables")
+    let _ = txn.open_table(tables::REGISTER)?;
+    let _ = txn.open_table(tables::REGISTER_INFO)?;
+    let _ = txn.open_table(tables::REGISTER_STAGES)?;
+    Ok(())
 }
 
 /// Keep a stage's creation. Written in the transaction of the creation itself and never removed.
@@ -46,8 +45,12 @@ pub(crate) fn write_stage_row(
     physical: CollectionId,
     stage: &StageMeta,
 ) -> Result<()> {
-    let _ = (txn, physical, stage);
-    unimplemented!("Q6.3: write_stage_row")
+    let mut value = Vec::with_capacity(Stamp::KEY_LEN + HLC_ENCODED_LEN);
+    value.extend_from_slice(&stage.created.to_key_bytes());
+    value.extend_from_slice(&stage.info.deadline.to_bytes());
+    txn.open_table(tables::REGISTER_STAGES)?
+        .insert(physical.0.to_be_bytes().as_slice(), value.as_slice())?;
+    Ok(())
 }
 
 /// What the register keeps of the creation of the stage `physical`, if it ever held one.
@@ -55,8 +58,21 @@ pub(crate) fn stage_row(
     txn: &redb::WriteTransaction,
     physical: CollectionId,
 ) -> Result<Option<StageMeta>> {
-    let _ = (txn, physical);
-    unimplemented!("Q6.3: stage_row")
+    let table = txn.open_table(tables::REGISTER_STAGES)?;
+    let Some(raw) = table.get(physical.0.to_be_bytes().as_slice())? else {
+        return Ok(None);
+    };
+    let bytes = raw.value();
+    if bytes.len() != Stamp::KEY_LEN + HLC_ENCODED_LEN {
+        return Err(corrupt("a stage row of the wrong length"));
+    }
+    let created: [u8; Stamp::KEY_LEN] = bytes[..Stamp::KEY_LEN].try_into().expect("checked length");
+    let deadline: [u8; HLC_ENCODED_LEN] =
+        bytes[Stamp::KEY_LEN..].try_into().expect("checked length");
+    Ok(Some(StageMeta {
+        created: Stamp::from_key_bytes(created),
+        info: kimmy_core::StageInfo { deadline: Hlc::from_bytes(deadline) },
+    }))
 }
 
 /// The events of `logical` held in `table`, as a [`Timeline`]. Each stored binding is judged again by the same door; one that
@@ -67,8 +83,27 @@ fn timeline_of(
     db: &str,
     logical: &str,
 ) -> Result<Timeline> {
-    let _ = (txn, table, db, logical);
-    unimplemented!("Q6.3: timeline_of")
+    let id = CollectionId::derive(db, logical);
+    let mut timeline = Timeline::new(logical);
+    let rows = txn.open_table(table)?;
+    let lo = row_key(id, &Stamp::from_key_bytes([0; Stamp::KEY_LEN]));
+    let hi = row_key(id, &Stamp::from_key_bytes([0xFF; Stamp::KEY_LEN]));
+    let mut held = Vec::new();
+    for row in rows.range(lo.as_slice()..=hi.as_slice())? {
+        let (key, value) = row?;
+        let stamp = crate::codec::decode_oplog_key(&key.value()[8..])?;
+        let event = RegisterEvent::decode(value.value()).map_err(|e| corrupt(&e.to_string()))?;
+        held.push((stamp, event));
+    }
+    drop(rows);
+    for (stamp, event) in held {
+        let stage = stage_of(txn, db, &event)?;
+        match timeline.insert(stamp, event, stage.as_ref().map(|s| (&s.created, &s.info))) {
+            Put::Stored => {}
+            other => return Err(corrupt(&format!("a stored event is now {other:?}"))),
+        }
+    }
+    Ok(timeline)
 }
 
 fn stage_of(
@@ -76,20 +111,20 @@ fn stage_of(
     db: &str,
     event: &RegisterEvent,
 ) -> Result<Option<StageMeta>> {
-    let _ = (txn, db, event);
-    unimplemented!("Q6.3: stage_of")
+    match event {
+        RegisterEvent::Bind { physical } => stage_row(txn, CollectionId::derive(db, physical)),
+        RegisterEvent::Create { .. } | RegisterEvent::LogicalDrop => Ok(None),
+    }
 }
 
 /// The register events of `logical` in effect on this member.
 pub(crate) fn timeline(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<Timeline> {
-    let _ = (txn, db, logical);
-    unimplemented!("Q6.3: timeline")
+    timeline_of(txn, tables::REGISTER, db, logical)
 }
 
 /// The register events of `logical` this member knows and that are not yet in effect (ahead of their position).
 pub(crate) fn parked(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<Timeline> {
-    let _ = (txn, db, logical);
-    unimplemented!("Q6.3: parked")
+    timeline_of(txn, tables::REGISTER_INFO, db, logical)
 }
 
 /// Put an event in effect, through the one door: [`Timeline::insert`] with the stage the event names.
@@ -100,8 +135,7 @@ pub(crate) fn put(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
-    let _ = (txn, db, logical, stamp, event);
-    unimplemented!("Q6.3: put")
+    store(txn, tables::REGISTER, db, logical, stamp, event)
 }
 
 /// Record an event that arrived ahead of its position: known, not in effect. The same door, so a binding that could never
@@ -113,8 +147,10 @@ pub(crate) fn park(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
-    let _ = (txn, db, logical, stamp, event);
-    unimplemented!("Q6.3: park")
+    if timeline(txn, db, logical)?.events().iter().any(|(held, _)| *held == stamp) {
+        return Ok(Put::Duplicate);
+    }
+    store(txn, tables::REGISTER_INFO, db, logical, stamp, event)
 }
 
 fn store(
@@ -125,8 +161,14 @@ fn store(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
-    let _ = (txn, table, db, logical, stamp, event);
-    unimplemented!("Q6.3: store")
+    let mut timeline = timeline_of(txn, table, db, logical)?;
+    let stage = stage_of(txn, db, &event)?;
+    let put = timeline.insert(stamp, event.clone(), stage.as_ref().map(|s| (&s.created, &s.info)));
+    if put == Put::Stored {
+        let key = row_key(CollectionId::derive(db, logical), &stamp);
+        txn.open_table(table)?.insert(key.as_slice(), event.encode().as_slice())?;
+    }
+    Ok(put)
 }
 
 /// An event ahead of its position is now covered: it leaves the information table and takes effect. `None` if no such
@@ -137,8 +179,14 @@ pub(crate) fn release(
     logical: &str,
     stamp: &Stamp,
 ) -> Result<Option<Put>> {
-    let _ = (txn, db, logical, stamp);
-    unimplemented!("Q6.3: release")
+    let key = row_key(CollectionId::derive(db, logical), stamp);
+    let event = {
+        let mut info = txn.open_table(tables::REGISTER_INFO)?;
+        let removed = info.remove(key.as_slice())?;
+        let Some(raw) = removed else { return Ok(None) };
+        RegisterEvent::decode(raw.value()).map_err(|e| corrupt(&e.to_string()))?
+    };
+    put(txn, db, logical, *stamp, event).map(Some)
 }
 
 /// Why a member serving `served` refuses writes to `logical` (decision 7): an event in effect supersedes it or, failing
@@ -149,6 +197,7 @@ pub(crate) fn refusal(
     logical: &str,
     served: &str,
 ) -> Result<Option<Refusal>> {
-    let _ = (txn, db, logical, served);
-    unimplemented!("Q6.3: refusal")
+    let in_effect = timeline(txn, db, logical)?;
+    let ahead = parked(txn, db, logical)?;
+    Ok(in_effect.refusal(&ahead, served))
 }

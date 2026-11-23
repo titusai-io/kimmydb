@@ -92,6 +92,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "register::timeline_of",
+        "one logical name's rows of the register, a prefix range of the 8-byte id: the swap events of one name inside tombstone retention, read inside the write transaction of the entry that carries one of them (ADR-272)",
+    ),
+    (
         "engine::drop_superseded_covered_marks",
         "inside a replicated window's write transaction, which does not stop (ADR-192): one row per held mark, the table `held_marks_covered_by` already reads whole on every pull (ADR-172); drops a mark only where the servable vector already covers it",
     ),

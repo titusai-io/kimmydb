@@ -1510,6 +1510,7 @@ impl Engine {
             let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
             let _ = txn.open_table(tables::MISSING_THROUGH)?;
             let _ = txn.open_table(tables::LOSS_PENDING)?;
+            crate::register::open_tables(&txn)?;
             // The first write of a start that decided the rebuild is forced:
             // from here the store says "rebuild required" whatever any exit
             // marker says (B3 design 2.1, layer 2).
@@ -5336,6 +5337,9 @@ impl Engine {
                 created: arg.created.unwrap_or(stamp),
                 info: arg.info,
             });
+            if let Some(kept) = &meta.stage {
+                crate::register::write_stage_row(txn, id, kept)?;
+            }
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.

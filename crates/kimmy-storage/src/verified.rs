@@ -955,7 +955,7 @@ mod tests {
     /// its tests read, so all three are exempt as files.
     const AUDITED_FILES: [&str; 3] =
         ["faults.rs", "key_walk_tests.rs", "violations_table_tests.rs"];
-    const AUDITED_FNS: [(&str, &str); 16] = [
+    const AUDITED_FNS: [(&str, &str); 17] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "decide_violations_ready"),
         ("violations_table.rs", "record_violations_backfill"),
@@ -973,6 +973,9 @@ mod tests {
         ("rewind.rs", "rewind_to"),
         ("backup.rs", "restore_with"),
         ("migrate.rs", "rewrite_oplog"),
+        // the register's one door (ADR-272): `store` writes a row of REGISTER or REGISTER_INFO, the table passed in as a parameter;
+        // neither is the oplog, a version vector or a held mark, and the entry that carries a swap's event is appended by `append_oplog_at`
+        ("register.rs", "store"),
     ];
 
     /// `body` with its `#[cfg(test)]` modules blanked, line for line, so the
