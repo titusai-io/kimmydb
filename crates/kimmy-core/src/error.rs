@@ -414,10 +414,11 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "`orders.__stg.x1` is a hidden staging copy of the collection `orders` made by a replacing `$out`; \
-             no schema change can be addressed to it. It is removed by the next `$out` or drop of `orders` made \
-             after the stage's deadline: run the `$out` again; or drop `orders`, which removes the stage only if \
-             the drop is stamped after the stage's deadline (a drop within that window leaves it until a later \
-             replace or drop); or `$out` `orders` onto itself to keep its content."
+             no schema change can be addressed to it. It is removed by the next `$out`, drop or creation of `orders` \
+             made after the stage's deadline: run the `$out` again; or drop `orders`, which removes the stage only if \
+             the drop is stamped after the stage's deadline (a drop within that window leaves it, and a second drop \
+             of a name that is already dropped changes nothing, so then create `orders` again or run the `$out` \
+             again); or `$out` `orders` onto itself to keep its content."
         );
     }
 
