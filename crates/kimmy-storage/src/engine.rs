@@ -5434,10 +5434,45 @@ impl Engine {
     /// The physical collection the logical name `name` resolves to on this member: the register's visible physical, or the
     /// identity (the collection of that name) when no event is in effect (ADR-272, decisions 5 and 7; Q6.4 item 0). The ONE door
     /// from a logical name to a collection that the API and the MCP use; [`Self::get_collection`] stays for physicals and for
-    /// the storage's own paths. A stub: it resolves every name to the collection of that name.
+    /// the storage's own paths. An event whose physical is not alive here is skipped for the next older visible one
+    /// ([`kimmy_core::register_state::Timeline::visible`]), a logical drop in effect makes the name absent, and a name with no
+    /// event is `get_collection` exactly.
     pub fn resolve(&self, db: &str, name: &str) -> Result<Resolved> {
-        let meta = self.get_collection(db, name)?;
-        Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
+        use kimmy_core::register_state::{Ready, Visible};
+        let txn = self.db.begin_read()?;
+        let timeline = crate::register::timeline_read(&txn, db, name)?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        let meta_of = |physical: &str| -> Result<Option<CollectionMeta>> {
+            match collections.get((db, physical))? {
+                Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+                None => Ok(None),
+            }
+        };
+        // Readiness is read once per physical the register names, so a read error is an error and not a silent "buried"
+        let mut ready: std::collections::HashMap<String, Ready> = Default::default();
+        for (_, event) in timeline.events() {
+            if let Some(physical) = event.physical() {
+                let alive = collections.get((db, physical))?.is_some();
+                ready
+                    .insert(physical.to_string(), if alive { Ready::Alive } else { Ready::Buried });
+            }
+        }
+        let visible = timeline.visible(|p| ready.get(p).copied().unwrap_or(Ready::Buried));
+        let not_found = || -> StorageError {
+            CoreError::CollectionNotFound { db: db.to_string(), collection: name.to_string() }
+                .into()
+        };
+        match &visible {
+            Visible::Identity => {
+                let meta = meta_of(name)?.ok_or_else(not_found)?;
+                Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
+            }
+            Visible::Bound { physical, stamp } | Visible::Created { physical, stamp } => {
+                let meta = meta_of(physical)?.ok_or_else(not_found)?;
+                Ok(Resolved { physical: physical.clone(), meta, visible: Some(*stamp) })
+            }
+            Visible::Dropped { .. } => Err(not_found()),
+        }
     }
 
     pub fn get_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {

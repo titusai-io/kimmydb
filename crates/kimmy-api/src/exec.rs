@@ -130,7 +130,8 @@ pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<Collectio
         }
         .into());
     }
-    match state.engine.get_collection(db, coll) {
+    // Through the register (ADR-272, Q6.4 item 0): a name that a swap rebound resolves to the bound physical
+    match state.engine.resolve(db, coll).map(|resolved| resolved.meta) {
         Ok(meta) => Ok(meta),
         Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
             ..

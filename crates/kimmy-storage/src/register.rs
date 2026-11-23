@@ -58,7 +58,14 @@ pub(crate) fn stage_row(
     txn: &redb::WriteTransaction,
     physical: CollectionId,
 ) -> Result<Option<StageMeta>> {
-    let table = txn.open_table(tables::REGISTER_STAGES)?;
+    stage_in(&txn.open_table(tables::REGISTER_STAGES)?, physical)
+}
+
+/// [`stage_row`] over any readable table (a write or a read transaction's).
+fn stage_in(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    physical: CollectionId,
+) -> Result<Option<StageMeta>> {
     let Some(raw) = table.get(physical.0.to_be_bytes().as_slice())? else {
         return Ok(None);
     };
@@ -83,9 +90,15 @@ fn timeline_of(
     db: &str,
     logical: &str,
 ) -> Result<Timeline> {
-    let id = CollectionId::derive(db, logical);
-    let mut timeline = Timeline::new(logical);
-    let rows = txn.open_table(table)?;
+    let held = rows_in(&txn.open_table(table)?, CollectionId::derive(db, logical))?;
+    timeline_from(held, logical, |event| stage_of(txn, db, event))
+}
+
+/// The events of one name held in a register table, oldest first.
+fn rows_in(
+    rows: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: CollectionId,
+) -> Result<Vec<(Stamp, RegisterEvent)>> {
     let lo = row_key(id, &Stamp::from_key_bytes([0; Stamp::KEY_LEN]));
     let hi = row_key(id, &Stamp::from_key_bytes([0xFF; Stamp::KEY_LEN]));
     let mut held = Vec::new();
@@ -95,15 +108,38 @@ fn timeline_of(
         let event = RegisterEvent::decode(value.value()).map_err(|e| corrupt(&e.to_string()))?;
         held.push((stamp, event));
     }
-    drop(rows);
+    Ok(held)
+}
+
+/// The timeline of `held`, each stored binding judged again by the one door with the stage `stage_for` finds for it.
+fn timeline_from(
+    held: Vec<(Stamp, RegisterEvent)>,
+    logical: &str,
+    stage_for: impl Fn(&RegisterEvent) -> Result<Option<StageMeta>>,
+) -> Result<Timeline> {
+    let mut timeline = Timeline::new(logical);
     for (stamp, event) in held {
-        let stage = stage_of(txn, db, &event)?;
+        let stage = stage_for(&event)?;
         match timeline.insert(stamp, event, stage.as_ref().map(|s| (&s.created, &s.info))) {
             Put::Stored => {}
             other => return Err(corrupt(&format!("a stored event is now {other:?}"))),
         }
     }
     Ok(timeline)
+}
+
+/// The register events of `logical` in effect on this member, read in a read transaction (the resolution of a name, Q6.4 item 0).
+pub(crate) fn timeline_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Timeline> {
+    let held = rows_in(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))?;
+    let stages = txn.open_table(tables::REGISTER_STAGES)?;
+    timeline_from(held, logical, |event| match event {
+        RegisterEvent::Bind { physical } => stage_in(&stages, CollectionId::derive(db, physical)),
+        RegisterEvent::Create { .. } | RegisterEvent::LogicalDrop => Ok(None),
+    })
 }
 
 fn stage_of(
