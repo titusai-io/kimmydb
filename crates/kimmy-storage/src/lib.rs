@@ -131,6 +131,9 @@ mod register_tests;
 mod rule_b_tests;
 
 #[cfg(test)]
+mod release_effect_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]

@@ -189,6 +189,15 @@ pub(crate) fn release(
     put(txn, db, logical, *stamp, event).map(Some)
 }
 
+/// Build item (a), FIX-4: after the mark of the entry at `stamp` is released, no register event of that stamp is still only
+/// information. (A stub: it checks nothing yet.)
+pub(crate) fn check_released_took_effect(
+    _txn: &redb::WriteTransaction,
+    _stamp: &Stamp,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Why a member serving `served` refuses writes to `logical` (decision 7): an event in effect supersedes it or, failing
 /// that, one known ahead of its position would.
 pub(crate) fn refusal(
