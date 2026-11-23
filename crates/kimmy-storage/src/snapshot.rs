@@ -3017,6 +3017,7 @@ impl Engine {
                 state.merge_policy,
                 state.join_retention_ms,
                 state.loss_limits,
+                None,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {

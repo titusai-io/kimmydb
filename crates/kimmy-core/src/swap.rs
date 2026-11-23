@@ -24,6 +24,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::hlc::{Hlc, Stamp};
 
+/// What a stage's physical name contains: `{name}.__stg.{node}{epoch}{hlc}` (ADR-272). A name that contains it is hidden:
+/// not addressable through the API and left out of listings, MCP, database-scoped streams and wildcard grants. The epoch
+/// is part of the name because two epochs of one node can resume an HLC. The name can exceed the 120-byte limit a client's
+/// name has, which is allowed because the system path skips `validate_name` and a replicated creation does not validate.
+pub const STAGE_NAME_MARK: &str = ".__stg.";
+
+/// Whether `name` is a stage's physical name.
+pub fn is_stage_name(name: &str) -> bool {
+    name.contains(STAGE_NAME_MARK)
+}
+
 /// A logical collection name being bound to a physical collection: the body of a
 /// `BindCollection` entry.
 ///
@@ -290,6 +301,15 @@ mod tests {
         ] {
             assert!(RegisterEvent::decode(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_stage_is_named_by_its_mark() {
+        assert!(is_stage_name("orders.__stg.0a1b"));
+        assert!(!is_stage_name("orders"));
+        assert!(!is_stage_name("orders.__vectors"));
+        assert!(!is_stage_name("__stg.orders"), "the mark is a suffix of a name, with its dot");
+        assert_eq!(STAGE_NAME_MARK, ".__stg.");
     }
 
     #[test]

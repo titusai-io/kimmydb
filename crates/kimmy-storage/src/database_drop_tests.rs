@@ -564,6 +564,7 @@ fn create_entry(db: &str, name: &str, at: Stamp) -> kimmy_core::OplogEntry {
             validator: None,
             join_retention_ms: None,
             loss_limits: None,
+            stage: None,
         },
     )
     .unwrap()

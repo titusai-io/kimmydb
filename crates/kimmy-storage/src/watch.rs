@@ -4316,6 +4316,7 @@ mod tests {
                 validator: None,
                 join_retention_ms: None,
                 loss_limits: None,
+                stage: None,
             },
         )
         .unwrap();

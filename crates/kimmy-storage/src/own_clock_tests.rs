@@ -65,6 +65,19 @@ fn every_user_schema_change(engine: &Engine) -> Vec<(&'static str, Change<'_>)> 
                     .map(|_| ())
             }),
         ),
+        (
+            "create_stage",
+            Box::new(move || {
+                engine
+                    .create_stage(
+                        "shop",
+                        "orders.__stg.a",
+                        kimmy_core::MergePolicy::Document,
+                        kimmy_core::Hlc::new(1, 0),
+                    )
+                    .map(|_| ())
+            }),
+        ),
         ("drop_collection", Box::new(move || engine.drop_collection("shop", "orders").map(|_| ()))),
         (
             "create_index",
@@ -111,6 +124,7 @@ fn a_member_whose_clock_leads_by_more_than_the_bound_refuses_every_schema_change
     }
     assert!(e.get_collection("shop", "more").is_err(), "nothing was written");
     assert!(e.get_collection("shop", "policy").is_err(), "nothing was written");
+    assert!(e.get_collection("shop", "orders.__stg.a").is_err(), "no stage was made");
     assert_eq!(e.list_indexes("shop", "orders").unwrap().len(), 0, "no index was made");
     e.get_collection("shop", "orders").expect("the collection is still here: the drop was refused");
 

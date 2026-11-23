@@ -51,6 +51,10 @@ pub struct CollectionMeta {
     /// it was kept: refused as corrupt when a field state is written or joined, a wipe release).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_limits: Option<kimmy_core::LossLimits>,
+    /// Present on a swap's stage (ADR-272): the deadline its creation carried, which no binding of the stage may
+    /// pass. Fixed at creation, replicated with it and immutable, like `R` and `K`. `None` on every other collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<kimmy_core::StageInfo>,
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///
@@ -175,6 +179,7 @@ impl CollectionMeta {
             merge_policy_at: None,
             join_retention_ms: None,
             loss_limits: None,
+            stage: None,
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,

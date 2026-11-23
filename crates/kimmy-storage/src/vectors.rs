@@ -281,6 +281,7 @@ impl crate::Engine {
                     kimmy_core::MergePolicy::Document,
                     None,
                     None,
+                    None,
                 )),
                 Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
                     &txn,
@@ -292,6 +293,7 @@ impl crate::Engine {
                     || stamp,
                     None,
                     kimmy_core::MergePolicy::Document,
+                    None,
                     None,
                     None,
                 )),

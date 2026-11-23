@@ -4830,6 +4830,49 @@ impl Engine {
                     .then(|| self.default_join_retention_ms()),
                 (policy.fixed_for(name) == kimmy_core::MergePolicy::Field)
                     .then(|| self.default_loss_limits()),
+                None,
+            )?
+            .expect("a creation that judges nothing history always creates"))
+    }
+
+    /// Create a swap's stage (ADR-272): the hidden physical collection a replacing `$out` writes into before it binds
+    /// the logical name to it. It is an ordinary `CreateCollection` entry whose body also carries the stage's deadline
+    /// (`stage`), made and replicated as a collection is; the stage inherits the target's merge policy, which the
+    /// caller passes. `physical` must be a stage's name ([`kimmy_core::is_stage_name`]), which the system path does not
+    /// validate (it can exceed a client's 120 bytes) and no client can reach.
+    ///
+    /// Like every schema change this fails closed (`503`) while this member's own stamps would be refused.
+    pub fn create_stage(
+        &self,
+        db: &str,
+        physical: &str,
+        policy: kimmy_core::MergePolicy,
+        deadline: Hlc,
+    ) -> Result<CollectionMeta> {
+        self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        CoreError::validate_name(db)?;
+        if !kimmy_core::is_stage_name(physical) {
+            return Err(CoreError::Unsupported(format!(
+                "{physical} is not a stage's name (it carries {})",
+                kimmy_core::STAGE_NAME_MARK
+            ))
+            .into());
+        }
+        let field = policy.fixed_for(physical) == kimmy_core::MergePolicy::Field;
+        Ok(self
+            .create_collection_marked(
+                db,
+                physical,
+                true,
+                None,
+                &|_| false,
+                None,
+                None,
+                None,
+                policy,
+                field.then(|| self.default_join_retention_ms()),
+                field.then(|| self.default_loss_limits()),
+                Some(kimmy_core::StageInfo { deadline }),
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -4943,6 +4986,7 @@ impl Engine {
             kimmy_core::MergePolicy::Document,
             None,
             None,
+            None,
         )
     }
 
@@ -4977,6 +5021,7 @@ impl Engine {
                 kimmy_core::MergePolicy::Document,
                 None,
                 None,
+                None,
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -5000,6 +5045,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
         loss_limits: Option<kimmy_core::LossLimits>,
+        stage: Option<kimmy_core::StageInfo>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -5032,6 +5078,7 @@ impl Engine {
             policy,
             join_retention_ms,
             loss_limits,
+            stage,
         ) {
             Ok(InTxn::Created(mut meta, logged)) => {
                 let mut changed = false;
@@ -5107,6 +5154,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
         loss_limits: Option<kimmy_core::LossLimits>,
+        stage: Option<kimmy_core::StageInfo>,
     ) -> Result<InTxn> {
         // System collections and vector shadows are `document`, whatever was asked.
         let policy = policy.fixed_for(name);
@@ -5246,6 +5294,8 @@ impl Engine {
             meta.join_retention_ms =
                 join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
             meta.loss_limits = loss_limits.filter(|_| policy == kimmy_core::MergePolicy::Field);
+            // A stage's deadline is the creation's, fixed for the life (ADR-272).
+            meta.stage = stage;
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.
@@ -5304,6 +5354,7 @@ impl Engine {
                     validator: validator.map(|(spec, _)| spec.clone()),
                     join_retention_ms: meta.join_retention_ms,
                     loss_limits: meta.loss_limits,
+                    stage: meta.stage,
                 },
             )?;
             append_oplog(txn, &entry)?;

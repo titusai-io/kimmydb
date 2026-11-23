@@ -163,6 +163,13 @@ pub struct CollectionCreate {
     /// absent from a received `field` creation is a refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_limits: Option<LossLimits>,
+    /// Present when this creation is a swap's stage (ADR-272): a hidden physical collection, created by a
+    /// replacing `$out` before it binds the logical name to it. It carries the deadline a binding of the stage may
+    /// not pass; the creation's own `merge_policy` is the target's, which the stage inherits. A stage is no kind of
+    /// its own: it is created, applied and replicated as a collection is. Absent from every ordinary creation, so the
+    /// bytes of an ordinary creation are what they always were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<crate::swap::StageInfo>,
 }
 
 /// The reserved collection name a database's drop is filed under (ADR-229).
@@ -234,6 +241,32 @@ mod tests {
     use crate::Epoch;
 
     #[test]
+    fn a_stage_is_a_creation_with_one_more_key_and_an_ordinary_creation_has_none() {
+        let ordinary = CollectionCreate {
+            db: "shop".into(),
+            name: "orders".into(),
+            merge_policy: MergePolicy::Document,
+            validator: None,
+            join_retention_ms: None,
+            loss_limits: None,
+            stage: None,
+        };
+        let doc: bson::Document =
+            bson::deserialize_from_slice(&bson::serialize_to_vec(&ordinary).unwrap()).unwrap();
+        assert_eq!(doc.keys().collect::<Vec<_>>(), ["db", "name", "merge_policy"]);
+
+        let stage = CollectionCreate {
+            name: "orders.__stg.x".into(),
+            stage: Some(crate::StageInfo { deadline: crate::Hlc::new(1_700_000_000_000, 7) }),
+            ..ordinary
+        };
+        let bytes = bson::serialize_to_vec(&stage).unwrap();
+        let doc: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(doc.keys().collect::<Vec<_>>(), ["db", "name", "merge_policy", "stage"]);
+        assert_eq!(bson::deserialize_from_slice::<CollectionCreate>(&bytes).unwrap(), stage);
+    }
+
+    #[test]
     fn a_creation_without_a_policy_does_not_decode() {
         let with = CollectionCreate {
             db: "shop".into(),
@@ -242,6 +275,7 @@ mod tests {
             validator: None,
             join_retention_ms: Some(86_400_000),
             loss_limits: Some(LossLimits::DEFAULT),
+            stage: None,
         };
         let bytes = bson::serialize_to_vec(&with).unwrap();
         assert_eq!(bson::deserialize_from_slice::<CollectionCreate>(&bytes).unwrap(), with);

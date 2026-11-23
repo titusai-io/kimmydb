@@ -296,6 +296,9 @@ so a rename, a reorder or a renumbering is a format change (storage schema 12), 
 | `AbandonStage` (16) | `{ db, physical }`: the writer gives up a stage it never bound | the schema-change dispatch, as a schema change |
 | `OutLossRecord` (17) | `{ db, name, loser, image, cut }`: a write the swap made late is lost and reported; `image` is the lost post-image cut at the collection's cut (absent for a lost delete) and `cut` says whether it was cut; the entry's `collection` is the logical name's id and its `doc_id` the document's `_id` | its own arm of the batch step: not a schema change, not a document write, and not a `LossRecord` |
 
+A stage is created by an ordinary `CreateCollection` whose body also carries `stage: { deadline }`: the hidden
+physical's creation, with the target's merge policy, and the deadline a binding of it may not pass. No new kind.
+
 What a member keeps of a name's timeline is a register: each event is a stamp and one of a binding (`1`, the physical),
 a logical drop (`2`) or a recreation (`3`, the new physical), stored as `tag ‖ [length (u16 big endian) ‖ name]`.
 
