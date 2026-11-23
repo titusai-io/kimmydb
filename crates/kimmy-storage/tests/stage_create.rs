@@ -72,7 +72,7 @@ fn a_stage_is_logged_as_one_creation_that_carries_its_deadline_and_the_targets_p
         "the id is derived from the physical name"
     );
     assert_eq!(meta.merge_policy, MergePolicy::Field, "the stage inherits the target's policy");
-    assert_eq!(meta.stage.map(|s| s.deadline), Some(deadline));
+    assert_eq!(meta.stage.map(|s| s.info.deadline), Some(deadline));
     assert!(
         meta.join_retention_ms.is_some() && meta.loss_limits.is_some(),
         "a field stage holds R and K"
@@ -104,7 +104,7 @@ fn a_member_that_takes_the_creation_makes_the_same_hidden_collection() {
     );
     assert_eq!(held.merge_policy, MergePolicy::Document);
     assert_eq!(
-        held.stage.map(|s| s.deadline),
+        held.stage.map(|s| s.info.deadline),
         Some(deadline),
         "the deadline travelled with the creation"
     );

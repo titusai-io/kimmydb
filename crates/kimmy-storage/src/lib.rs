@@ -59,6 +59,7 @@ pub mod modify;
 pub mod open_progress;
 pub mod purge;
 pub mod refusal_hint;
+mod register;
 pub mod rewind;
 pub mod snapshot;
 mod store_lock;
@@ -122,6 +123,9 @@ mod clock_bound_document_tests;
 
 #[cfg(test)]
 mod swap_kind_tests;
+
+#[cfg(test)]
+mod register_tests;
 
 #[cfg(test)]
 mod own_clock_tests;

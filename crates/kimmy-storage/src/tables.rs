@@ -411,3 +411,20 @@ pub const META_REWOUND: &str = "rewound";
 /// that build removed, so `Engine::open` seeds every origin it holds with the
 /// coarse horizon: coarse below that point, exact above it (ADR-097).
 pub const OPLOG_COLLECTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_collected");
+
+/// `logical collection id (8) || stamp key (44) -> RegisterEvent` (`kimmy_core::RegisterEvent::encode`): the register
+/// events of a logical name that are IN EFFECT on this member (ADR-272, decision 3), each under the stamp of the entry that
+/// made it. Written only by `crate::register`, through `kimmy_core::register_state::Timeline::insert`, which refuses a
+/// binding above its stage's deadline and one of a stage whose creation is not known. Durable state; a restore rebuilds it
+/// from the oplog (the restore commit of the swap's series).
+pub const REGISTER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register");
+
+/// The same key and value as [`REGISTER`]: the register events this member KNOWS and that are not yet in effect, because they
+/// arrived ahead of their position (rule B). They count only for a D10 refusal. Written only by `crate::register`.
+pub const REGISTER_INFO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_info");
+
+/// `stage physical collection id (8) -> creation stamp key (44) || deadline (10)`: what the register keeps of every stage's
+/// creation, from the creation's own transaction. It **outlives the stage's physical collection** and is never pruned
+/// with the oplog: a later binding's validity and the burial of a stage by a later event read it. Written only by
+/// `crate::register`.
+pub const REGISTER_STAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_stages");

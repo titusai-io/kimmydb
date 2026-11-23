@@ -2598,7 +2598,10 @@ impl Engine {
                             target.merge_policy,
                             target.join_retention_ms,
                             target.loss_limits,
-                            target.stage,
+                            target.stage.map(|info| crate::engine::StageArg {
+                                info,
+                                created: Some(entry.stamp),
+                            }),
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");

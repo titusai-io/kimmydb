@@ -51,10 +51,11 @@ pub struct CollectionMeta {
     /// it was kept: refused as corrupt when a field state is written or joined, a wipe release).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_limits: Option<kimmy_core::LossLimits>,
-    /// Present on a swap's stage (ADR-272): the deadline its creation carried, which no binding of the stage may
-    /// pass. Fixed at creation, replicated with it and immutable, like `R` and `K`. `None` on every other collection.
+    /// Present on a swap's stage (ADR-272): the stamp of its creation and the deadline the creation carried, which no
+    /// binding of the stage may pass. Fixed at creation, replicated with it and immutable, like `R` and `K`. `None` on every
+    /// other collection. The register keeps the same pair in `REGISTER_STAGES`, which outlives the collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stage: Option<kimmy_core::StageInfo>,
+    pub stage: Option<kimmy_core::StageMeta>,
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///

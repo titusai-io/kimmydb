@@ -661,6 +661,15 @@ mod tests {
         ),
         ("UNIQUE_VIOLATIONS", "derived from the oplog"),
         (
+            "REGISTER",
+            "the swap's register events in effect: re-derived from the oplog by the restore commit of the swap's series",
+        ),
+        ("REGISTER_INFO", "the swap's register events ahead of their position: as REGISTER"),
+        (
+            "REGISTER_STAGES",
+            "the swap's stage creations: as REGISTER (they are the creations in the oplog)",
+        ),
+        (
             "VECTOR_VERIFIED",
             "the record that the vector covers the oplog, which a restore can break",
         ),

@@ -59,7 +59,7 @@ pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;
 pub use swap::{
     CollectionBind, MAX_PHYSICAL_NAME_LEN, OutLoss, RegisterDecodeError, RegisterEvent,
-    STAGE_NAME_MARK, StageAbandon, StageInfo, is_stage_name,
+    STAGE_NAME_MARK, StageAbandon, StageInfo, StageMeta, is_stage_name,
 };
 pub use validator::{ValidationAction, ValidationLevel, ValidatorSpec};
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};

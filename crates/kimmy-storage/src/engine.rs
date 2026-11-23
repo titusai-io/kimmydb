@@ -4908,7 +4908,7 @@ impl Engine {
                 policy,
                 field.then(|| self.default_join_retention_ms()),
                 field.then(|| self.default_loss_limits()),
-                Some(kimmy_core::StageInfo { deadline }),
+                Some(StageArg { info: kimmy_core::StageInfo { deadline }, created: None }),
             )?
             .expect("a creation that judges nothing history always creates"))
     }
@@ -5081,7 +5081,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
         loss_limits: Option<kimmy_core::LossLimits>,
-        stage: Option<kimmy_core::StageInfo>,
+        stage: Option<StageArg>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -5190,7 +5190,7 @@ impl Engine {
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
         loss_limits: Option<kimmy_core::LossLimits>,
-        stage: Option<kimmy_core::StageInfo>,
+        stage: Option<StageArg>,
     ) -> Result<InTxn> {
         // System collections and vector shadows are `document`, whatever was asked.
         let policy = policy.fixed_for(name);
@@ -5330,8 +5330,12 @@ impl Engine {
             meta.join_retention_ms =
                 join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
             meta.loss_limits = loss_limits.filter(|_| policy == kimmy_core::MergePolicy::Field);
-            // A stage's deadline is the creation's, fixed for the life (ADR-272).
-            meta.stage = stage;
+            // A stage's creation (its stamp and deadline) is fixed for the life (ADR-272), and the register keeps it for longer
+            // than the collection lives.
+            meta.stage = stage.map(|arg| kimmy_core::StageMeta {
+                created: arg.created.unwrap_or(stamp),
+                info: arg.info,
+            });
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this
             // creation's own here), so no state holds the collection without it.
@@ -5390,7 +5394,7 @@ impl Engine {
                     validator: validator.map(|(spec, _)| spec.clone()),
                     join_retention_ms: meta.join_retention_ms,
                     loss_limits: meta.loss_limits,
-                    stage: meta.stage,
+                    stage: meta.stage.map(|kept| kept.info),
                 },
             )?;
             append_oplog(txn, &entry)?;
@@ -6121,6 +6125,14 @@ impl Engine {
             .insert((meta.db.as_str(), meta.name.as_str()), serde_json::to_vec(meta)?.as_slice())?;
         Ok(())
     }
+}
+
+/// A stage's creation, as the creating route knows it: what the entry carries, and the creation's own stamp when the route
+/// has the entry (a replicated creation); a local creation takes the stamp it mints.
+#[derive(Clone, Copy)]
+pub(crate) struct StageArg {
+    pub(crate) info: kimmy_core::StageInfo,
+    pub(crate) created: Option<Stamp>,
 }
 
 /// What creating a collection inside a caller's transaction found.

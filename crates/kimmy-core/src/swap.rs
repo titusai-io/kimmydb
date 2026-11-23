@@ -75,6 +75,16 @@ pub struct StageInfo {
     pub deadline: Hlc,
 }
 
+/// What a member keeps of a stage's creation: the stamp of the creation entry (the origin of the stage's own job, and
+/// the base its deadline is clamped from) and the [`StageInfo`] the entry carried. The register keeps it for as long as
+/// any register event refers to the stage, which is longer than the stage's physical collection lives
+/// (`REGISTER_STAGES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageMeta {
+    pub created: Stamp,
+    pub info: StageInfo,
+}
+
 /// A write the swap made late, lost and reported: the body of an `OutLossRecord` entry.
 ///
 /// The record is keyed `(logical name, _id, loser stamp)`; the entry's `collection` is the logical
