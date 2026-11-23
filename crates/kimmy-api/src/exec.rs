@@ -108,7 +108,9 @@ pub fn authorize(
     coll: &str,
 ) -> Result<CollectionMeta, ApiError> {
     auth.require(action, db, Some(coll))?;
-    collection(state, db, coll)
+    // A write is refused while this member knows of a register event that supersedes what the name answers from and has not made
+    // a newer one visible (ADR-272, decision 7; D10); a read is not
+    collection_via(state, db, coll, action == Action::Write)
 }
 
 /// Resolve a collection, with a retry hint that is true for a cluster.
@@ -121,6 +123,16 @@ pub fn authorize(
 /// the honest hint is `elsewhere`: another member has it, and this one will
 /// shortly. A node with no peers keeps `no` — there is nowhere else.
 pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<CollectionMeta, ApiError> {
+    collection_via(state, db, coll, false)
+}
+
+/// [`collection`], resolved for a write when `write` (ADR-272, decision 7; D10).
+fn collection_via(
+    state: &SharedState,
+    db: &str,
+    coll: &str,
+    write: bool,
+) -> Result<CollectionMeta, ApiError> {
     // A stage of a replacing `$out` is never served (ADR-272, decision 15): its name carries the reserved mark, so no collection a client
     // can name is one, and it is answered as an absent collection, whether or not the stage is held on this member.
     if kimmy_core::is_hidden_name(coll) {
@@ -131,7 +143,12 @@ pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<Collectio
         .into());
     }
     // Through the register (ADR-272, Q6.4 item 0): a name that a swap rebound resolves to the bound physical
-    match state.engine.resolve(db, coll).map(|resolved| resolved.meta) {
+    let resolved = if write {
+        state.engine.resolve_for_write(db, coll)
+    } else {
+        state.engine.resolve(db, coll)
+    };
+    match resolved.map(|resolved| resolved.meta) {
         Ok(meta) => Ok(meta),
         Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
             ..

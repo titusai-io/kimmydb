@@ -5702,7 +5702,16 @@ impl Engine {
     /// from and has not made a newer one visible. A name that is absent answers as an absent collection, as it does for a read.
     /// One read transaction, so the refusal is judged against the state the resolution saw.
     pub fn resolve_for_write(&self, db: &str, name: &str) -> Result<Resolved> {
-        self.resolve(db, name)
+        let txn = self.db.begin_read()?;
+        let resolved = Self::resolve_in(&txn, db, name)?;
+        match crate::register::refusal_read(&txn, db, name, &resolved.physical)? {
+            Some(refusal) => Err(StorageError::NameSuperseded {
+                logical: name.to_string(),
+                event: refusal.event,
+                parked: refusal.parked,
+            }),
+            None => Ok(resolved),
+        }
     }
 
     fn resolve_in(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
