@@ -168,6 +168,8 @@ pub struct Engine {
     /// What U1 has refused since start, by the origin that sent it (capped, the rest under
     /// `other`).
     clock_refusals: Mutex<crate::clock_bound::RefusalCounts>,
+    /// Bindings that waited for their stage's creation, by the origin that sent them (ADR-272).
+    register_waiting: Mutex<crate::clock_bound::RefusalCounts>,
     /// The peers that said they are refusing this origin's entries for their clock, with the time, on this member's
     /// clock, at which each says they are due (b2, [`crate::own_clock`]).
     pub(crate) own_refusals: Mutex<crate::own_clock::PeerRefusals>,
@@ -1665,6 +1667,7 @@ impl Engine {
                 kimmy_core::LossLimits::DEFAULT.cut_bytes,
             ),
             clock_refusals: Mutex::new(Default::default()),
+            register_waiting: Mutex::new(Default::default()),
             own_refusals: Mutex::new(Default::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
@@ -2425,6 +2428,12 @@ impl Engine {
     /// rest summed under `other`: `kimmy_sync_clock_refused_total{origin}`.
     pub fn clock_refusals(&self) -> Vec<(String, u64)> {
         self.clock_refusals.lock().snapshot()
+    }
+
+    /// How many bindings stopped a window waiting for their stage's creation, by origin
+    /// (`kimmy_register_waiting_for_stage`).
+    pub fn register_waiting_for_stage(&self) -> Vec<(String, u64)> {
+        self.register_waiting.lock().snapshot()
     }
 
     /// A peer's vector as this member may believe it: [`crate::ClockBound::clamp_vector`] at this
