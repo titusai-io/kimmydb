@@ -87,7 +87,7 @@ async-trait = "0.1"
 jiff = { version = "0.2", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 # The same bundle jiff reads, named only to report which tz database version is
 # compiled in (`VERSION`), so the docs and a test can state it. Raw data, no code.
-jiff-tzdb = "0.1"
+jiff-tzdb = "1.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
