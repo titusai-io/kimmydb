@@ -2699,6 +2699,23 @@ impl Engine {
     /// that took it as an entry end with the same table.
     fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
+            // The burial of a swapped name, or of one of its stages, is the register's to judge (ADR-272, decisions 5 and 6; Q6.4
+            // item 1b-2). A bare tombstone cannot say whether the burial of the identity is a drop of the name or the loser of
+            // a swap, nor whether the burial of a stage is the drop or a later binding's; applied by the stamp rule it takes
+            // the collection this member serves, and the binding that would put the name right is covered by the grant and
+            // never served. So it is not applied, no tombstone is recorded for it, and the deferral is counted: the register's
+            // events travel with the snapshot (Q6.6) and the counter reads 0 once they do.
+            if self.carried_burial_is_the_registers(&current)? {
+                self.count_register_carried_drop_deferred();
+                warn!(
+                    db = %current.db,
+                    collection = %current.name,
+                    stamp = ?dropped,
+                    "a snapshot carried the burial of a swapped name, or of one of its stages, and it was not \
+                     applied: the register decides it (kimmy_register_carried_drop_deferred_total)"
+                );
+                return Ok(());
+            }
             if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
                 debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored, its tombstone recorded");
                 // Recorded first, as the entries arm does, so a straggler that
@@ -2761,6 +2778,19 @@ impl Engine {
         // held the collection still needs one. The pair `sync::apply_ddl`'s
         // drop arm writes, for its reasons.
         self.record_collection_drop(id, dropped)
+    }
+
+    /// Whether the burial of `current` that a snapshot carries is the register's to judge: `current` is a stage of a swap, or a
+    /// name that was swapped (it has register events, in effect or ahead of their position, or a stage of it is held).
+    fn carried_burial_is_the_registers(
+        &self,
+        current: &crate::meta::CollectionMeta,
+    ) -> Result<bool> {
+        if kimmy_core::is_stage_name(&current.name) {
+            return Ok(true);
+        }
+        let txn = self.db().begin_read()?;
+        crate::register::is_swapped(&txn, &current.db, &current.name)
     }
 
     /// Move this node's clock past a stamp a page carries, **once the sender's own
