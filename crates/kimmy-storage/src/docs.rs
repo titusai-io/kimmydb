@@ -2078,6 +2078,18 @@ impl Engine {
     /// U1: refuse, by name and until due, an entry or state of a `field` collection whose clock is
     /// more than `max_clock_skew_secs` ahead of this member's physical clock. Nothing has been written
     /// when this returns the error, and the entry is not witnessed: it applies once it is due.
+    /// U1 for a replicated document entry before the collection it is addressed to is consulted (ADR-272, decision 14, ruling (c)): the
+    /// bound `refuse_replicated_stamp` applies once the collection is held, with the state a `field` entry carries (the collection's
+    /// merge policy is not known here, and an entry of a `document` collection carries none), and a loss record by its stamp. Read by
+    /// `apply_one` before the entry is judged history, whose answers return `Taken` and are witnessed into the batch's vector.
+    pub(crate) fn refuse_entry_past_the_bound(&self, entry: &OplogEntry) -> Result<()> {
+        if entry.kind.is_loss_record() {
+            self.refuse_if_past_the_bound(&entry.stamp, None)
+        } else {
+            self.refuse_if_far_future(entry)
+        }
+    }
+
     fn refuse_if_far_future(&self, entry: &OplogEntry) -> Result<()> {
         let vv_max_wall_ms = match entry.meta.as_deref() {
             Some(meta) => field_write::vv_max_wall_ms(meta)?,

@@ -2351,6 +2351,12 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
+        // U1 (decision 14, ruling (c)): the bound is read for every document entry BEFORE it is judged. The two history answers of
+        // `judge_document` (superseded by a drop, gone with its collection) return `Taken` with nothing written, and a taken entry is
+        // witnessed into the batch's vector: the logical clock has no clamp, so an entry a day ahead for a collection this member
+        // holds only a tombstone for was witnessed durably and dragged the clock at the next open. The bound inside
+        // `apply_remote_in_txn` is never reached on those paths.
+        self.refuse_entry_past_the_bound(entry)?;
         let collection = match self.judge_document(memo, entry, outcome)? {
             Judged::Decided(step) => return Ok(step),
             Judged::Apply(collection) => collection,
