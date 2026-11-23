@@ -263,3 +263,20 @@ fn an_ordinary_collection_of_the_same_origin_is_untouched() {
     window(&b, std::slice::from_ref(&e1));
     assert!(!held(&b, &e1), "not a stage: no rule S");
 }
+
+/// F3 of the review of items 6 and 6b: a stage this member HOLDS but whose creation row it lacks (a restore does not carry the register's tables, and the
+/// collection's own meta, which names the stage, is carried) still gets rule S, from the collection.
+#[test]
+fn a_held_stage_with_no_stage_row_still_gets_rule_s_from_its_collection() {
+    let s = staged(MergePolicy::Document);
+    let e1 = write(&s, "v", 1);
+    let e2 = write(&s, "v", 2);
+    let (b, _db) = receiver(&s);
+    window(&b, std::slice::from_ref(&e2));
+    crate::register::remove_stage_row_for_test(&b, CollectionId::derive(DB, STAGE));
+    window(&b, std::slice::from_ref(&e1));
+    assert!(
+        held(&b, &e1),
+        "the superseded staged row is appended from the collection's own stage meta when the register's row is missing"
+    );
+}

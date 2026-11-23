@@ -566,3 +566,14 @@ pub(crate) fn has_events_in(txn: &redb::WriteTransaction, db: &str, logical: &st
     Ok(!rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
         || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty())
 }
+
+/// Test only: remove a stage's creation row, as a restore leaves a member (`REGISTER_STAGES` is not carried by a backup).
+#[cfg(test)]
+pub(crate) fn remove_stage_row_for_test(engine: &crate::Engine, physical: CollectionId) {
+    let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(tables::REGISTER_STAGES)
+        .unwrap()
+        .remove(physical.0.to_be_bytes().as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+}
