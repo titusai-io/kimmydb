@@ -4267,6 +4267,22 @@ When members write one document concurrently, every member serves the same order
 
 **To close:** none planned.
 
+<a id="out-races-a-database-drop-q6"></a>
+
+## 🟡 A replacing `$out` that races a drop of its database can report success and leave the name absent
+
+**What you will see.** A replacing `$out` ([ADR-272](decisions.md)) builds its output in a hidden stage and then binds the target's name to it. If the database is dropped on another member while the `$out` runs (the drop stamped after the stage's creation, the binding made before the drop reached its author), every member ends with the name absent, and the `$out` that its author saw succeed has produced nothing that lasts. No partial output is ever visible: a member that holds the stage and a row of it stamped after the drop buries the stage whole when the drop reaches it, and the binding that follows makes nothing visible. The drop wins over the output.
+
+**Example.** Member A runs `$out` into `orders` and binds it. Member B drops the database `app` before it hears of the stage. Member C hears the drop first and the creation, a staging row and the binding after it. A, B and C all end with `orders` absent.
+
+**Contrast.** A drop of a *collection* in the same race, where a write stamped after the drop is kept (decision 15), leaves the output: the drop takes what it saw and the later write stands. A database's drop does not do that for a stage, because a stage's rows are not a client's writes and a stage that kept some of them would make a partial output visible on the members that held them.
+
+**Why.** A stage is built to be bound as a whole or not at all. Keeping the rows stamped after the drop while the rest was buried would make the name answer from half of what the `$out` wrote, and divergence repair would spread it (Chris, 2026-11-23).
+
+**Workaround.** Do not drop a database while a replacing `$out` into it is running. A client that needs the output reruns the `$out` after the drop.
+
+**To close:** none planned.
+
 ---
 
 ## How to use this document
