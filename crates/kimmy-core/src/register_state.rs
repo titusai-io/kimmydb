@@ -38,16 +38,24 @@ impl StageInfo {
     /// [`OUT_DEADLINE_SKEW_MS`] reads as that. A clamp and never a refusal: a replicated entry that is refused
     /// stalls the batch, and the clamp is a pure function of the entry, so every member computes the same value.
     pub fn effective_deadline(&self, creation: &Stamp) -> Hlc {
-        let _ = (creation,);
-        unimplemented!("Q6.2: effective_deadline")
+        let cap = Hlc::new(
+            creation.hlc.wall_ms.saturating_add(MAX_OUT_DEADLINE_MS + OUT_DEADLINE_SKEW_MS),
+            0,
+        );
+        if self.deadline < creation.hlc {
+            creation.hlc
+        } else if self.deadline > cap {
+            cap
+        } else {
+            self.deadline
+        }
     }
 }
 
 /// Whether a binding stamped `bind` of the stage created by `creation` is valid: stamped at or below the stage's
 /// effective deadline. A binding above it is invalid, history on every member, by a pure function of the stamps.
 pub fn valid_binding(bind: &Stamp, creation: &Stamp, stage: &StageInfo) -> bool {
-    let _ = (bind, creation, stage);
-    unimplemented!("Q6.2: valid_binding")
+    bind.hlc <= stage.effective_deadline(creation)
 }
 
 /// Whether a member that has witnessed `witnessed` covers the entry stamped `stamp`: it has witnessed its origin
@@ -55,8 +63,7 @@ pub fn valid_binding(bind: &Stamp, creation: &Stamp, stage: &StageInfo) -> bool 
 /// witnessed through a sender's skip rule, and the entries a completed snapshot's grant covers; the predicate
 /// reads it and nothing else. A register event takes effect on a member only once the member covers it.
 pub fn covers_in_position(witnessed: &VersionVector, stamp: &Stamp) -> bool {
-    let _ = (witnessed, stamp);
-    unimplemented!("Q6.2: covers_in_position")
+    witnessed.get(stamp.origin()) >= stamp.hlc
 }
 
 /// What a physical collection is on this member.
@@ -177,8 +184,22 @@ impl Timeline {
         event: RegisterEvent,
         stage: Option<(&Stamp, &StageInfo)>,
     ) -> Put {
-        let _ = (stamp, event, stage);
-        unimplemented!("Q6.2: insert")
+        if let RegisterEvent::Bind { .. } = &event {
+            match stage {
+                None => return Put::UnknownStage,
+                Some((creation, info)) if !valid_binding(&stamp, creation, info) => {
+                    return Put::InvalidBinding;
+                }
+                Some(_) => {}
+            }
+        }
+        match self.events.binary_search_by(|(held, _)| held.cmp(&stamp)) {
+            Ok(_) => Put::Duplicate,
+            Err(at) => {
+                self.events.insert(at, (stamp, event));
+                Put::Stored
+            }
+        }
     }
 
     /// The events, oldest first.
@@ -188,44 +209,95 @@ impl Timeline {
 
     /// When `physical` was born.
     pub fn birth(&self, physical: &str) -> Birth {
-        let _ = (physical,);
-        unimplemented!("Q6.2: birth")
+        if physical == self.identity {
+            return Birth::Identity;
+        }
+        self.events
+            .iter()
+            .find(|(_, event)| event.physical() == Some(physical))
+            .map_or(Birth::Unknown, |(stamp, _)| Birth::At(*stamp))
     }
 
     /// What the name serves: the newest event in effect whose physical is ready here (decision 5). A binding or
     /// a recreation whose physical is missing or buried is skipped, never made visible; a logical drop is always
     /// applicable. With no such event, the identity.
     pub fn visible(&self, ready: impl Fn(&str) -> Ready) -> Visible {
-        let _ = (ready,);
-        unimplemented!("Q6.2: visible")
+        for (stamp, event) in self.events.iter().rev() {
+            match event {
+                RegisterEvent::LogicalDrop => return Visible::Dropped { stamp: *stamp },
+                RegisterEvent::Bind { physical } if ready(physical) == Ready::Alive => {
+                    return Visible::Bound { physical: physical.clone(), stamp: *stamp };
+                }
+                RegisterEvent::Create { physical } if ready(physical) == Ready::Alive => {
+                    return Visible::Created { physical: physical.clone(), stamp: *stamp };
+                }
+                RegisterEvent::Bind { .. } | RegisterEvent::Create { .. } => {}
+            }
+        }
+        Visible::Identity
     }
 
     /// The physicals `visible` buries (decision 5): each one held here (alive or missing), not the one served, born
     /// before the visible event, the identity counting as born at minus infinity. A physical no event names is
     /// never buried by this rule (a second writer's stage in flight). A visible identity buries nothing.
     pub fn burials(&self, visible: &Visible, held: impl Fn(&str) -> Ready) -> Vec<Burial> {
-        let _ = (visible, held);
-        unimplemented!("Q6.2: burials")
+        let Some(at) = visible.stamp() else { return Vec::new() };
+        let served = visible.physical(&self.identity);
+        let mut candidates: Vec<&str> = vec![&self.identity];
+        for (_, event) in &self.events {
+            if let Some(physical) = event.physical()
+                && !candidates.contains(&physical)
+            {
+                candidates.push(physical);
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|physical| Some(*physical) != served)
+            .filter(|physical| matches!(held(physical), Ready::Alive | Ready::Missing))
+            .filter(|physical| match self.birth(physical) {
+                Birth::Identity => true,
+                Birth::At(born) => born < *at,
+                Birth::Unknown => false,
+            })
+            .map(|physical| Burial { physical: physical.to_string(), at: *at })
+            .collect()
     }
 
     /// The stamp of the earliest event in effect that supersedes `physical`: above its birth, and a logical drop or
     /// naming another physical (decision 8). `None` if there is none or the physical's birth is unknown.
     pub fn superseded_at(&self, physical: &str) -> Option<Stamp> {
-        let _ = (physical,);
-        unimplemented!("Q6.2: superseded_at")
+        self.supersedes(&self.events, physical)
     }
 
     /// Whether a write stamped `write` addressed to `physical` is late (decision 8): some event in effect supersedes
     /// the physical between its birth and the write.
     pub fn is_late(&self, physical: &str, write: &Stamp) -> bool {
-        let _ = (physical, write);
-        unimplemented!("Q6.2: is_late")
+        self.superseded_at(physical).is_some_and(|event| *write > event)
     }
 
     /// Why a member serving `served` refuses writes (decision 7): an event in effect supersedes it, or, failing
     /// that, the earliest event of `parked` (known, ahead of its position) that would.
     pub fn refusal(&self, parked: &Timeline, served: &str) -> Option<Refusal> {
-        let _ = (parked, served);
-        unimplemented!("Q6.2: refusal")
+        if let Some(event) = self.superseded_at(served) {
+            return Some(Refusal { event, parked: false });
+        }
+        self.supersedes(&parked.events, served).map(|event| Refusal { event, parked: true })
+    }
+
+    /// The earliest of `events` above `physical`'s birth that is a logical drop or names another physical.
+    fn supersedes(&self, events: &[(Stamp, RegisterEvent)], physical: &str) -> Option<Stamp> {
+        let birth = self.birth(physical);
+        events
+            .iter()
+            .find(|(stamp, event)| {
+                let above = match birth {
+                    Birth::Unknown => return false,
+                    Birth::Identity => true,
+                    Birth::At(born) => *stamp > born,
+                };
+                above && event.physical() != Some(physical)
+            })
+            .map(|(stamp, _)| *stamp)
     }
 }
