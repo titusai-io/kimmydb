@@ -984,6 +984,9 @@ pub(crate) struct WriteTxn<'a> {
     /// The loss entries of its own this transaction minted, by kind (`LossKind::index`): added to the engine's counters by
     /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
     loss_minted: parking_lot::Mutex<[u64; 6]>,
+    /// The bound-out burials the register made in this transaction (ADR-272, decision 5): finished by [`Self::commit`] once the
+    /// inner commit has succeeded (their entry, if any, published; the rows handed to the purger), and by nothing else.
+    burials: parking_lot::Mutex<Vec<(String, String, Burial)>>,
 }
 
 impl WriteTxn<'_> {
@@ -1047,7 +1050,9 @@ impl WriteTxn<'_> {
         let engine = self.engine;
         let coalesced = self.coalesced;
         let is_write = self.holder == WriterHolder::Write;
-        let changes_collections = self.holder == WriterHolder::Ddl;
+        // A burial by the register changes the catalogue from a window or a grant, which are not DDL transactions
+        let changes_collections =
+            self.holder == WriterHolder::Ddl || !self.burials.lock().is_empty();
         // The fsync (or the wait at the barrier) is the blocking part; see
         // [`blocking`] for why it must not happen on an async worker.
         blocking(move || {
@@ -1066,6 +1071,10 @@ impl WriteTxn<'_> {
                 });
             }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The inner commit landed: the burials the register made are finished (published, handed to the purger)
+            for (db, name, burial) in std::mem::take(&mut *self.burials.lock()) {
+                engine.finish_burial(&db, &name, burial);
+            }
             // The inner commit landed: the loss entries this transaction minted are events this member has made.
             for (kind, minted) in self.loss_minted.lock().iter().enumerate() {
                 if *minted > 0 {
@@ -3566,7 +3575,7 @@ impl Engine {
     /// Returns whether anything moved, so a caller can let a transaction go
     /// rather than commit one that wrote nothing.
     pub(crate) fn absorb_version_vector_in_txn(
-        txn: &redb::WriteTransaction,
+        txn: &WriteTxn<'_>,
         granted: &kimmy_core::VersionVector,
     ) -> Result<bool> {
         let mut raised = false;
@@ -3813,10 +3822,7 @@ impl Engine {
     /// page releasing 19,968 marks it grew the file from 17 to 145 MiB inside
     /// the transaction, while every page before it grew nothing. See
     /// `index::clear_index_entries` for what `retain` costs.
-    fn release_held_under(
-        txn: &redb::WriteTransaction,
-        granted: &kimmy_core::VersionVector,
-    ) -> Result<bool> {
+    fn release_held_under(txn: &WriteTxn<'_>, granted: &kimmy_core::VersionVector) -> Result<bool> {
         use std::ops::Bound;
         let mut held = txn.open_table(tables::OPLOG_HELD)?;
         let mut released = false;
@@ -3860,7 +3866,10 @@ impl Engine {
             // A binding among them that was only information takes effect in this transaction (build item (a)).
             let stamps: Vec<Stamp> =
                 covered.iter().filter_map(|key| codec::decode_oplog_key(key).ok()).collect();
-            crate::register::release_covered(txn, &stamps)?;
+            // A binding among them that was only information took effect: the physicals it binds out are buried with it
+            for (db, logical) in crate::register::release_covered(txn, &stamps)? {
+                Self::settle_register_in_txn(txn, &db, &logical)?;
+            }
             released |= !covered.is_empty();
             if exhausted {
                 return Ok(released);
@@ -4378,6 +4387,7 @@ impl Engine {
             holder,
             live_counts: Default::default(),
             loss_minted: Default::default(),
+            burials: Default::default(),
         })
     }
 
@@ -5429,6 +5439,57 @@ impl Engine {
             None
         };
         Ok(InTxn::Created(Box::new(meta), logged))
+    }
+
+    /// The bound-out burial (ADR-272, decision 5; Q6.4 item 1), in the transaction in which a register event of `logical` took
+    /// effect: the physicals the visible event leaves behind are buried, unconditionally (never `drop_keeping_later_writes`, which
+    /// leaves a zombie physical named exactly like the logical name) and only when the visible physical is alive here
+    /// ([`kimmy_core::register_state::Timeline::burials`]). It is every member's own judgement of the same events, so it mints no
+    /// drop entry; the burial is finished (the rows handed to the purger) when the transaction commits.
+    pub(crate) fn settle_register_in_txn(
+        txn: &WriteTxn<'_>,
+        db: &str,
+        logical: &str,
+    ) -> Result<()> {
+        use kimmy_core::register_state::Ready;
+        let timeline = crate::register::timeline(txn, db, logical)?;
+        // The readiness of every physical the register names, and the identity
+        let alive = |physical: &str| -> Result<Ready> {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            Ok(if collections.get((db, physical))?.is_some() {
+                Ready::Alive
+            } else {
+                Ready::Buried
+            })
+        };
+        let mut ready: std::collections::HashMap<String, Ready> = Default::default();
+        for physical in std::iter::once(logical)
+            .chain(timeline.events().iter().filter_map(|(_, event)| event.physical()))
+        {
+            ready.insert(physical.to_string(), alive(physical)?);
+        }
+        let lookup = |p: &str| ready.get(p).copied().unwrap_or(Ready::Buried);
+        let visible = timeline.visible(lookup);
+        let burials = timeline.burials(&visible, lookup);
+        for burial in burials {
+            let meta = {
+                let collections = txn.open_table(tables::COLLECTIONS)?;
+                match collections.get((db, burial.physical.as_str()))? {
+                    Some(v) => serde_json::from_slice::<CollectionMeta>(v.value())?,
+                    None => continue,
+                }
+            };
+            let buried = txn.engine.bury_standing_in_txn(
+                txn,
+                db,
+                &burial.physical,
+                meta,
+                None,
+                Some(burial.at),
+            )?;
+            txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried));
+        }
+        Ok(())
     }
 
     /// The physical collection the logical name `name` resolves to on this member: the register's visible physical, or the

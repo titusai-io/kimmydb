@@ -241,12 +241,17 @@ fn parked_among(txn: &redb::WriteTransaction, stamps: &[Stamp]) -> Result<Vec<St
 
 /// Marks of held entries were just released at `released` (a grant covered them): every binding among them that was only
 /// information takes effect now, in the same transaction (build item (a)). The table holds only the events ahead of their
-/// position, so with none parked this reads one empty table. Returns how many took effect.
-pub(crate) fn release_covered(txn: &redb::WriteTransaction, released: &[Stamp]) -> Result<usize> {
+/// position, so with none parked this reads one empty table. Returns the `(db, logical)` of each that took effect, for the caller
+/// to settle (the bound-out burial, Q6.4 item 1).
+pub(crate) fn release_covered(
+    txn: &redb::WriteTransaction,
+    released: &[Stamp],
+) -> Result<Vec<(String, String)>> {
     if released.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let waiting = parked_among(txn, released)?;
+    let mut took_effect = Vec::new();
     for stamp in &waiting {
         let key = crate::codec::oplog_key(stamp);
         let entry = {
@@ -263,8 +268,9 @@ pub(crate) fn release_covered(txn: &redb::WriteTransaction, released: &[Stamp]) 
         };
         let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
         release(txn, &bind.db, &bind.name, stamp)?;
+        took_effect.push((bind.db, bind.name));
     }
-    Ok(waiting.len())
+    Ok(took_effect)
 }
 
 /// Build item (a), FIX-4: once the mark of the entry at `stamp` is released, no register event of that stamp is still only

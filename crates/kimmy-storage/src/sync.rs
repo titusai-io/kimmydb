@@ -3302,6 +3302,12 @@ impl Engine {
                     if apply.mode == RegisterMode::Park {
                         append_at = crate::engine::Position::Hold;
                     }
+                    // A binding that took effect buries the physicals it binds out, in this transaction (Q6.4 item 1)
+                    if put == kimmy_core::register_state::Put::Stored
+                        && apply.mode == RegisterMode::Effect
+                    {
+                        Engine::settle_register_in_txn(&txn, &apply.db, &apply.logical)?;
+                    }
                 }
                 // Over an existing key, in position, this also releases a mark
                 // (`append_oplog_at`); a new key is raised and unmarked either way.
@@ -3372,6 +3378,8 @@ impl Engine {
                 let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
                 crate::register::release(&txn, &bind.db, &bind.name, &entry.stamp)?;
                 crate::register::check_released_took_effect(&txn, &entry.stamp)?;
+                // ... and it buries the physicals it binds out, in the same transaction (Q6.4 item 1)
+                Engine::settle_register_in_txn(&txn, &bind.db, &bind.name)?;
             }
             txn.commit()?;
         } else {
