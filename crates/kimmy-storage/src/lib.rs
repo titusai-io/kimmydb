@@ -155,6 +155,9 @@ mod logical_drop_tests;
 mod carried_drop_tests;
 
 #[cfg(test)]
+mod swap_routes_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
