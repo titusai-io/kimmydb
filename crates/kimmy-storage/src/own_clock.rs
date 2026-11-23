@@ -38,7 +38,7 @@ impl fmt::Display for OwnStampRefusal {
         match self {
             Self::ClockAhead { lead_ms, bound_ms } => write!(
                 f,
-                "this member's clock is ahead of its own clock by {} s, more than the {} s the cluster allows, \
+                "this member's logical clock is {} s ahead of its system clock, more than the {} s the cluster allows, \
                  so every other member would hold back this change until it is due; retry on another member, \
                  and fix this member's clock",
                 lead_ms.div_ceil(1000),
@@ -46,9 +46,9 @@ impl fmt::Display for OwnStampRefusal {
             ),
             Self::PeerRefused { peer, due_in_ms } => write!(
                 f,
-                "member {peer} is refusing this member's changes because their clock is ahead of its own, for \
-                 about {} s more, so it would not take this change; retry on another member, and check the \
-                 clocks",
+                "member {peer} is refusing this member's changes because this member's logical clock is ahead of \
+                 member {peer}'s system clock, for about {} s more, so it would not take this change; retry on \
+                 another member, and check the clocks",
                 due_in_ms.div_ceil(1000)
             ),
         }

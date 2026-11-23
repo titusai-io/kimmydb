@@ -103,8 +103,8 @@ pub enum ErrorCode {
     /// name mark before any lookup. Nothing was written, and no retry changes the answer.
     StageCollection,
     /// A schema change was refused before anything was written because this member's own stamps would be refused by the
-    /// rest of the cluster until they are due: its clock is ahead of its own physical clock by more than the allowed
-    /// skew, or a peer is refusing its entries for their clock (U1).
+    /// rest of the cluster until they are due: its logical clock is ahead of its system clock by more than the allowed
+    /// skew, or a peer is refusing its entries because this member's logical clock is ahead of the peer's system clock (U1).
     ClockAhead,
     /// A write reached the storage engine's durability step and then failed:
     /// it may or may not have been applied, and if it was it replicates.
