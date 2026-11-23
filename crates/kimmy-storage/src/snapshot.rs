@@ -2786,7 +2786,7 @@ impl Engine {
         &self,
         current: &crate::meta::CollectionMeta,
     ) -> Result<bool> {
-        if kimmy_core::is_stage_name(&current.name) {
+        if kimmy_core::is_hidden_name(&current.name) {
             return Ok(true);
         }
         let txn = self.db().begin_read()?;

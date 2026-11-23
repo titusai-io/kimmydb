@@ -5135,6 +5135,24 @@ impl Engine {
         // transaction, below: see `create_collection_in_txn` (ADR-189).
 
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // A client's creation of a name that has register events is a recreate (decision 6; Q6.4 item 1c): a new physical collection
+        // named by its own event and a `Create` event of the logical name, in this one transaction
+        if log
+            && origin.is_none()
+            && stage.is_none()
+            && redated_from.is_none()
+            && crate::register::has_events_in(&txn, db, name)?
+        {
+            return self.recreate_swapped_name(
+                txn,
+                db,
+                name,
+                validator,
+                policy,
+                join_retention_ms,
+                loss_limits,
+            );
+        }
         // The stamp is minted *after* the writer is held, never before
         // (ADR-148), and after the checks that can end the creation without
         // one: `create_collection_in_txn` calls the closure once the collection
@@ -5482,6 +5500,73 @@ impl Engine {
             ready.insert(physical.to_string(), if alive { Ready::Alive } else { Ready::Buried });
         }
         Ok((timeline, ready))
+    }
+
+    /// The local create of a name that has register events, under the writer `txn` holds (decision 6; Q6.4 item 1c): refused as
+    /// any create of a name that answers is; otherwise a NEW physical collection named by its own event
+    /// ([`kimmy_core::recreation_name`]), born at its stamp, ONE `CreateCollection` entry for it, and the `Create` event of the
+    /// logical name put in effect and settled, in one commit. The stamp is minted above everything the register holds.
+    #[allow(clippy::too_many_arguments)]
+    fn recreate_swapped_name(
+        &self,
+        txn: WriteTxn<'_>,
+        db: &str,
+        name: &str,
+        validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
+        policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
+    ) -> Result<Option<CollectionMeta>> {
+        use kimmy_core::register_state::Ready;
+        let (timeline, ready) = Self::register_view_in_txn(&txn, db, name)?;
+        let visible = timeline.visible(|p| ready.get(p).copied().unwrap_or(Ready::Buried));
+        if visible.physical(name).is_some_and(|p| ready.get(p) == Some(&Ready::Alive)) {
+            txn.abort()?;
+            return Err(CoreError::CollectionExists {
+                db: db.to_string(),
+                collection: name.to_string(),
+            }
+            .into());
+        }
+        let stamp = self.next_stamp_above(timeline.events().last().map(|(stamp, _)| *stamp));
+        let physical = kimmy_core::recreation_name(name, &stamp);
+        match self.create_collection_in_txn(
+            &txn,
+            db,
+            &physical,
+            true,
+            None,
+            &|_| false,
+            || stamp,
+            validator,
+            policy,
+            join_retention_ms,
+            loss_limits,
+            None,
+        )? {
+            InTxn::Created(meta, logged) => {
+                crate::register::put(
+                    &txn,
+                    db,
+                    name,
+                    stamp,
+                    kimmy_core::RegisterEvent::Create { physical },
+                )?;
+                Self::settle_register_in_txn(&txn, db, name)?;
+                txn.commit()?;
+                if let Some(entry) = logged {
+                    self.publish(vec![entry]);
+                }
+                info!(db, collection = name, id = %meta.id, "recreated collection");
+                Ok(Some(*meta))
+            }
+            InTxn::Exists | InTxn::History => {
+                txn.abort()?;
+                Err(StorageError::Corrupt(format!(
+                    "the physical {physical} of a recreate of {db}.{name} was found, or judged history, at its own stamp"
+                )))
+            }
+        }
     }
 
     /// The local drop of a name that was swapped (decision 6; Q6.4 item 1b): ONE `DropCollection` entry addressed to the

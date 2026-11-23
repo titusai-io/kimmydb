@@ -2703,6 +2703,27 @@ impl Engine {
                     }
                     Err(e) => return Err(e),
                 }
+                // The creation of a recreation's physical is a register event too, a `Create` of the logical name it was made from
+                // (decision 6; Q6.4 item 1c): in a window it takes effect and settles, with no window behind it it is information,
+                // and the physical it made stays hidden until it is visible. The creation itself is applied as any is.
+                if let Some(logical) = kimmy_core::logical_of_recreation(&target.name) {
+                    let mode = match position {
+                        crate::engine::Position::InWindow => RegisterMode::Effect,
+                        crate::engine::Position::Raise => RegisterMode::Park,
+                        crate::engine::Position::Hold => {
+                            return Err(crate::StorageError::Corrupt(
+                                "a recreate reached a route that holds its entry out of position"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    register = Some(RegisterApply {
+                        db: target.db.clone(),
+                        logical: logical.to_string(),
+                        event: kimmy_core::RegisterEvent::Create { physical: target.name.clone() },
+                        mode,
+                    });
+                }
             }
             OpKind::DropCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
@@ -3427,8 +3448,10 @@ impl Engine {
     fn release_ddl_mark_with_effect(&self, entry: &OplogEntry) -> Result<()> {
         let txn = self.begin_write(WriterHolder::Replication)?;
         if crate::engine::release_held_in_position(&txn, &entry.stamp)? {
-            if matches!(entry.kind, OpKind::BindCollection | OpKind::DropCollection)
-                && let Some(body) = &entry.body
+            if matches!(
+                entry.kind,
+                OpKind::BindCollection | OpKind::DropCollection | OpKind::CreateCollection
+            ) && let Some(body) = &entry.body
                 && let Some((db, logical)) =
                     crate::register::parked_target(&txn, &entry.stamp, &entry.kind, body)?
             {

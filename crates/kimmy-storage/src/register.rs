@@ -269,7 +269,11 @@ pub(crate) fn release_covered(
         let Some(body) = &entry.body else {
             return Err(corrupt("a register entry without a body"));
         };
-        let (db, logical) = event_target(&entry.kind, body)?;
+        let Some((db, logical)) = event_target(&entry.kind, body)? else {
+            return Err(corrupt(
+                "an event known ahead of its position whose entry is no register event",
+            ));
+        };
         release(txn, &db, &logical, stamp)?;
         took_effect.push((db, logical));
     }
@@ -328,16 +332,26 @@ pub(crate) fn refusal(
     Ok(in_effect.refusal(&ahead, served))
 }
 
-/// The name a register entry is addressed to: a binding's `(db, logical)`, or the drop's.
-pub(crate) fn event_target(kind: &kimmy_core::OpKind, body: &[u8]) -> Result<(String, String)> {
+/// The name a register entry is addressed to: a binding's `(db, logical)`, a drop's, or the logical name a recreation's physical
+/// was made from. `None` for a creation that is not a recreate (an ordinary creation is no register event).
+pub(crate) fn event_target(
+    kind: &kimmy_core::OpKind,
+    body: &[u8],
+) -> Result<Option<(String, String)>> {
     match kind {
         kimmy_core::OpKind::BindCollection => {
             let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
-            Ok((bind.db, bind.name))
+            Ok(Some((bind.db, bind.name)))
         }
         kimmy_core::OpKind::DropCollection => {
             let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
-            Ok((target.db, target.name))
+            Ok(Some((target.db, target.name)))
+        }
+        kimmy_core::OpKind::CreateCollection => {
+            // a recreate: the creation of a physical named by its own event, addressed to the logical name it was made from
+            let target: kimmy_core::CollectionCreate = bson::deserialize_from_slice(body)?;
+            Ok(kimmy_core::logical_of_recreation(&target.name)
+                .map(|logical| (target.db.clone(), logical.to_string())))
         }
         other => Err(corrupt(&format!("a {other:?} entry is not a register event"))),
     }
@@ -419,12 +433,19 @@ pub(crate) fn parked_target(
     kind: &kimmy_core::OpKind,
     body: &[u8],
 ) -> Result<Option<(String, String)>> {
-    let (db, logical) = event_target(kind, body)?;
-    // A bind is always a register event; a drop is one only if its event is parked
-    if *kind == kimmy_core::OpKind::DropCollection
+    let Some((db, logical)) = event_target(kind, body)? else { return Ok(None) };
+    // A bind is always a register event; a drop or a recreate is one only if its event is parked
+    if *kind != kimmy_core::OpKind::BindCollection
         && parked_among(txn, std::slice::from_ref(stamp))?.is_empty()
     {
         return Ok(None);
     }
     Ok(Some((db, logical)))
+}
+
+/// [`has_events`] under the writer.
+pub(crate) fn has_events_in(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<bool> {
+    let id = CollectionId::derive(db, logical);
+    Ok(!rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
+        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty())
 }

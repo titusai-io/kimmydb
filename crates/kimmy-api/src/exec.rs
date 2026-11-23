@@ -123,7 +123,7 @@ pub fn authorize(
 pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<CollectionMeta, ApiError> {
     // A stage of a replacing `$out` is never served (ADR-272, decision 15): its name carries the reserved mark, so no collection a client
     // can name is one, and it is answered as an absent collection, whether or not the stage is held on this member.
-    if kimmy_core::is_stage_name(coll) {
+    if kimmy_core::is_hidden_name(coll) {
         return Err(kimmy_core::Error::CollectionNotFound {
             db: db.to_string(),
             collection: coll.to_string(),
@@ -217,7 +217,8 @@ pub fn create_collection_validated(
     let meta = kimmy_storage::blocking(|| {
         state.engine.create_collection_with_policy(db, name, policy, validator)
     })?;
-    Ok(json!({ "created": meta.name, "id": meta.id.0, "mergePolicy": meta.merge_policy.as_str() }))
+    // The name the client asked for: a recreate of a swapped name made a physical collection of another name, which no client sees
+    Ok(json!({ "created": name, "id": meta.id.0, "mergePolicy": meta.merge_policy.as_str() }))
 }
 
 /// The id a drop of `db.coll` strands a vector index under.
