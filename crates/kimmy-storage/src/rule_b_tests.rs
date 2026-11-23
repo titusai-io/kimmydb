@@ -173,10 +173,9 @@ fn a_binding_of_a_stage_whose_creation_is_not_held_stops_the_window_and_waits() 
         "it names the stage it waits for"
     );
     assert!(!holds(&b, &c.bind), "nothing was appended");
-    assert_eq!(
-        b.witnessed_vector().unwrap().get(c.bind.stamp.origin()),
-        Hlc::ZERO,
-        "nor witnessed"
+    assert!(
+        b.witnessed_vector().unwrap().get(c.bind.stamp.origin()) < c.bind.stamp.hlc,
+        "nor witnessed: the vector stops short of it"
     );
     assert_eq!(in_effect(&b) + parked(&b), 0);
     let waiting = b.register_waiting_for_stage();

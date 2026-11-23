@@ -2430,6 +2430,12 @@ impl Engine {
         self.clock_refusals.lock().snapshot()
     }
 
+    /// Count one binding that stopped a window because its stage's creation is not held here (ADR-272), under the origin that
+    /// sent it.
+    pub(crate) fn count_register_waiting(&self, origin: &kimmy_core::Origin) {
+        self.register_waiting.lock().add(origin, 1);
+    }
+
     /// How many bindings stopped a window waiting for their stage's creation, by origin
     /// (`kimmy_register_waiting_for_stage`).
     pub fn register_waiting_for_stage(&self) -> Vec<(String, u64)> {

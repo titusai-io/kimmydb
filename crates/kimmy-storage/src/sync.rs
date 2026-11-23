@@ -1374,6 +1374,7 @@ impl Engine {
             };
             match step {
                 Step::Taken => witnessed.observe(entry.stamp),
+                Step::Held => {}
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
                     outcome.unknown =
@@ -1953,6 +1954,23 @@ impl<T> Ddl<T> {
     }
 }
 
+/// What the batch step does with a register event beside the append of its entry, in the append's own transaction.
+struct RegisterApply {
+    db: String,
+    logical: String,
+    event: kimmy_core::RegisterEvent,
+    mode: RegisterMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegisterMode {
+    /// In position: the event takes effect.
+    Effect,
+    /// Ahead of its position (no window behind it): known, not in effect, and its entry held out of position until it arrives
+    /// in one.
+    Park,
+}
+
 /// What a batch counts a schema change as, once [`Engine::apply_ddl`] has
 /// dealt with it.
 #[derive(Debug)]
@@ -1997,6 +2015,14 @@ enum DdlOutcome {
     /// The batch stops at it, and the next window takes it once the drop
     /// purger has removed them.
     PurgePending(String),
+    /// A binding of a stage whose creation this node does not hold (ADR-272): `db.physical`. The batch stops at it, as it does at
+    /// a creation that cannot be made yet, and nothing is appended or witnessed; the stage's creation comes before the binding
+    /// that names it on every route, so the next window, or the scoped page for the stage, ends the wait.
+    UnknownStage(String),
+    /// Appended, and held out of position: a register event that arrived with no window behind it (ADR-272, rule B). Counted as a
+    /// schema change taken; the batch does not witness its stamp, because a witnessed entry is one a peer's skip rule omits, and
+    /// this one must still arrive in position to take effect.
+    Parked,
 }
 
 /// Sort a schema change's result into applied, gone, or refused, leaving
@@ -2112,6 +2138,9 @@ enum Step {
     /// Left, because it creates a collection whose drop is still being
     /// purged here (ADR-189); `db.name`.
     PurgePending(String),
+    /// Taken, and held out of position (a parked register event): not witnessed by the batch, so that it is served again in
+    /// position.
+    Held,
 }
 
 /// What judging a replicated document against its collection decided.
@@ -2285,6 +2314,16 @@ impl Engine {
                 // Deliberately uncounted: see `DdlOutcome::DeclinedReplay`.
                 DdlOutcome::DeclinedReplay => {}
                 DdlOutcome::PurgePending(name) => return Ok(Step::PurgePending(name)),
+                DdlOutcome::Parked => {
+                    outcome.ddl += 1;
+                    return Ok(Step::Held);
+                }
+                DdlOutcome::UnknownStage(name) => {
+                    // The wait is counted by origin (`kimmy_register_waiting_for_stage`): the stage's creation comes first on
+                    // every route, so it ends with the next window that carries the creation.
+                    self.count_register_waiting(&entry.stamp.origin());
+                    return Ok(Step::Unknown(Some(name)));
+                }
             }
             return Ok(Step::Taken);
         }
@@ -2466,6 +2505,8 @@ impl Engine {
 
         // Tombstones the entry's own append writes in its commit (the drop arm's).
         let mut recorded_with_the_append: Vec<(CollectionId, Stamp)> = Vec::new();
+        // What a register event does in the transaction of its own append.
+        let mut register: Option<RegisterApply> = None;
         match entry.kind {
             OpKind::CreateCollection => {
                 let target: kimmy_core::CollectionCreate = bson::deserialize_from_slice(body)?;
@@ -3077,7 +3118,24 @@ impl Engine {
             // register, the burial of a stage) is not in this commit: the entry is appended and served onward, as an
             // entry that takes no effect is (ADR-236).
             OpKind::BindCollection => {
-                let _: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+                let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+                // Rule B (decision 3): a register event takes effect only in position. In a window it does; with no window behind
+                // it, it is information until it arrives in one; as a held entry it never arrives (decision 13): refused by name.
+                let mode = match position {
+                    crate::engine::Position::InWindow => RegisterMode::Effect,
+                    crate::engine::Position::Raise => RegisterMode::Park,
+                    crate::engine::Position::Hold => {
+                        return Err(crate::StorageError::Corrupt(
+                            "a swap's register event reached a route that holds its entry out of position".into(),
+                        ));
+                    }
+                };
+                register = Some(RegisterApply {
+                    db: bind.db,
+                    logical: bind.name,
+                    event: kimmy_core::RegisterEvent::Bind { physical: bind.physical },
+                    mode,
+                });
             }
             OpKind::AbandonStage => {
                 let _: kimmy_core::StageAbandon = bson::deserialize_from_slice(body)?;
@@ -3090,7 +3148,12 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        self.append_replicated_ddl_recording(entry, &recorded_with_the_append, position)
+        self.append_replicated_ddl_recording(
+            entry,
+            &recorded_with_the_append,
+            position,
+            register.as_ref(),
+        )
     }
 
     /// Append a replicated schema change's originating entry, unless this
@@ -3146,7 +3209,7 @@ impl Engine {
         entry: &OplogEntry,
         position: crate::engine::Position,
     ) -> Result<DdlOutcome> {
-        self.append_replicated_ddl_recording(entry, &[], position)
+        self.append_replicated_ddl_recording(entry, &[], position, None)
     }
 
     /// [`Self::append_replicated_ddl`], also writing `tombstones` (each only if
@@ -3159,6 +3222,7 @@ impl Engine {
         entry: &OplogEntry,
         tombstones: &[(CollectionId, Stamp)],
         position: crate::engine::Position,
+        register: Option<&RegisterApply>,
     ) -> Result<DdlOutcome> {
         let mut owed = Vec::new();
         for (id, stamp) in tombstones {
@@ -3180,7 +3244,7 @@ impl Engine {
         let outcome = if held {
             self.record_collection_drops(&owed)?;
             if marked {
-                self.release_ddl_mark(&entry.stamp)?;
+                self.release_ddl_mark_with_effect(entry)?;
             }
             DdlOutcome::Held
         } else {
@@ -3193,7 +3257,7 @@ impl Engine {
                 race_hooks::absorbed(race_hooks::Race::DdlAppend);
                 self.record_collection_drops(&owed)?;
                 if position == crate::engine::Position::InWindow {
-                    self.release_ddl_mark(&entry.stamp)?;
+                    self.release_ddl_mark_with_effect(entry)?;
                 }
                 DdlOutcome::Held
             } else {
@@ -3210,11 +3274,44 @@ impl Engine {
                         }
                     }
                 }
+                // A register event is decided in the transaction of its own append, so that a member never holds the entry
+                // without what it did, or what it did without the entry (decision 3).
+                let mut append_at = position;
+                if let Some(apply) = register {
+                    let put = match apply.mode {
+                        RegisterMode::Effect => crate::register::put(
+                            &txn,
+                            &apply.db,
+                            &apply.logical,
+                            entry.stamp,
+                            apply.event.clone(),
+                        )?,
+                        RegisterMode::Park => crate::register::park(
+                            &txn,
+                            &apply.db,
+                            &apply.logical,
+                            entry.stamp,
+                            apply.event.clone(),
+                        )?,
+                    };
+                    if put == kimmy_core::register_state::Put::UnknownStage {
+                        txn.abort()?;
+                        let physical = apply.event.physical().unwrap_or_default();
+                        return Ok(DdlOutcome::UnknownStage(format!("{}.{physical}", apply.db)));
+                    }
+                    if apply.mode == RegisterMode::Park {
+                        append_at = crate::engine::Position::Hold;
+                    }
+                }
                 // Over an existing key, in position, this also releases a mark
                 // (`append_oplog_at`); a new key is raised and unmarked either way.
-                crate::engine::append_oplog_at(&txn, entry, position)?;
+                crate::engine::append_oplog_at(&txn, entry, append_at)?;
                 txn.commit()?;
-                DdlOutcome::Applied
+                if append_at == crate::engine::Position::Hold && position != append_at {
+                    DdlOutcome::Parked
+                } else {
+                    DdlOutcome::Applied
+                }
             }
         };
         self.witness(&entry.stamp);
@@ -3256,6 +3353,25 @@ impl Engine {
     fn release_ddl_mark(&self, stamp: &Stamp) -> Result<()> {
         let txn = self.begin_write(WriterHolder::Replication)?;
         if crate::engine::release_held_in_position(&txn, stamp)? {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::release_ddl_mark`] for an entry that arrived in position and may be a register event: if its mark is released and
+    /// it was parked ahead of its position, it takes effect IN THE SAME TRANSACTION (build item (a): releasing the mark alone
+    /// would serve a coverage the register does not yet act on).
+    fn release_ddl_mark_with_effect(&self, entry: &OplogEntry) -> Result<()> {
+        let txn = self.begin_write(WriterHolder::Replication)?;
+        if crate::engine::release_held_in_position(&txn, &entry.stamp)? {
+            if entry.kind == OpKind::BindCollection
+                && let Some(body) = &entry.body
+            {
+                let bind: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+                crate::register::release(&txn, &bind.db, &bind.name, &entry.stamp)?;
+            }
             txn.commit()?;
         } else {
             txn.abort()?;
@@ -3623,6 +3739,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         (engine, dir)
+    }
+
+    /// A register event never arrives as a held entry (ADR-272, decision 13): under `Position::Hold` it is refused by name, and
+    /// nothing is appended, stored or witnessed.
+    #[test]
+    fn a_binding_under_hold_is_refused_by_name_and_nothing_is_written() {
+        use kimmy_core::{CollectionBind, MergePolicy, OpKind};
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let deadline = Hlc::new(crate::physical_now_ms() + 60_000, 0);
+        a.create_stage("app", "orders.__stg.a1", MergePolicy::Document, deadline).unwrap();
+        let creation = a
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap();
+        b.apply_batch(std::slice::from_ref(&creation)).unwrap();
+        let bind = OplogEntry {
+            stamp: Stamp::new(Hlc::new(creation.stamp.hlc.wall_ms + 1, 0), a.node_id(), a.epoch()),
+            kind: OpKind::BindCollection,
+            collection: CollectionId::derive("app", "orders"),
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&CollectionBind {
+                    db: "app".into(),
+                    name: "orders".into(),
+                    physical: "orders.__stg.a1".into(),
+                })
+                .unwrap(),
+            ),
+            meta: None,
+        };
+        let refused = b.apply_ddl(&bind, crate::engine::Position::Hold);
+        match refused {
+            Err(crate::StorageError::Corrupt(why)) => {
+                assert!(why.contains("holds its entry out of position"), "{why}")
+            }
+            other => panic!("expected a refusal by name, got {other:?}"),
+        }
+        let held =
+            b.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+        assert!(held.iter().all(|e| e.kind != OpKind::BindCollection), "nothing was appended");
+        assert_eq!(b.held_marks().unwrap(), 0);
     }
 
     /// One direction of an anti-entropy round: pull into `into` from `from`.
