@@ -264,15 +264,31 @@ impl Timeline {
             .collect()
     }
 
-    /// The stages `visible` buries by a later event (decision 5, "burial by a later event"; cause `doomed`). A stub: it buries
-    /// nothing yet.
+    /// The stages `visible` buries by a later event (decision 5, "burial by a later event"; cause `doomed`): a stage this member
+    /// holds (alive or missing), that is not the one served, with **no binding in effect here**, whose effective deadline lies
+    /// **strictly below** the visible event's `hlc`. Every valid binding of the stage is stamped at or below the deadline, so in
+    /// every order of arrival a binding of it is older than the visible event and the stage can never be, or again be, the
+    /// visible physical: the burial waits for nothing. `stages` is each stage this member knows the creation of, with its
+    /// effective deadline ([`StageInfo::effective_deadline`]). A stage with a binding in effect is the loser rule's
+    /// ([`Self::burials`], D4 before DOOM), and a binding of a doomed stage that arrives later still takes effect as an event
+    /// (it sets the stage's birth and makes writes late) and is never visible. The burial is stamped by the visible event,
+    /// as the loser rule's is. A pure function of the events in effect, the stages' deadlines and what is held.
     pub fn doomed(
         &self,
-        _visible: &Visible,
-        _held: impl Fn(&str) -> Ready,
-        _stages: &[(&str, Hlc)],
+        visible: &Visible,
+        held: impl Fn(&str) -> Ready,
+        stages: &[(&str, Hlc)],
     ) -> Vec<Burial> {
-        Vec::new()
+        let Some(at) = visible.stamp() else { return Vec::new() };
+        let served = visible.physical(&self.identity);
+        stages
+            .iter()
+            .filter(|(physical, _)| Some(*physical) != served)
+            .filter(|(physical, _)| matches!(held(physical), Ready::Alive | Ready::Missing))
+            .filter(|(physical, _)| self.birth(physical) == Birth::Unknown)
+            .filter(|(_, deadline)| at.hlc > *deadline)
+            .map(|(physical, _)| Burial { physical: physical.to_string(), at: *at })
+            .collect()
     }
 
     /// The stamp of the earliest event in effect that supersedes `physical`: above its birth, and a logical drop or
