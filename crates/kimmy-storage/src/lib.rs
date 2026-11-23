@@ -164,6 +164,9 @@ mod recreate_tests;
 mod d10_tests;
 
 #[cfg(test)]
+mod purge_defer_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]

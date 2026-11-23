@@ -157,6 +157,10 @@ pub struct Engine {
     /// collection may be, in milliseconds (U1, `storage.max_clock_skew_secs`). Set from
     /// configuration at startup; a local setting, not replicated.
     max_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// How long after a burial by the register the purger leaves the buried physical's rows alone, in milliseconds
+    /// (`server.request_timeout_secs`, ADR-272 decision 5): what a request that resolved the name before the burial may still read.
+    /// Local to this member, never replicated. Zero removes nothing from the purger's schedule.
+    purge_deferral_ms: std::sync::atomic::AtomicU64,
     /// The join retention `R`, in milliseconds, a `field` collection created HERE takes at creation: this
     /// member's tombstone retention. Local configuration, read at creation only; the collection carries its
     /// own value from then on, which is what every member uses.
@@ -1666,6 +1670,7 @@ impl Engine {
             definition_fail_in: std::sync::atomic::AtomicU32::new(0),
             hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
+            purge_deferral_ms: std::sync::atomic::AtomicU64::new(0),
             max_clock_skew_ms: std::sync::atomic::AtomicU64::new(
                 crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS,
             ),
@@ -2374,6 +2379,15 @@ impl Engine {
         crate::clock_bound::ClockBound {
             skew_ms: self.max_clock_skew_ms.load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Leave the rows of a physical the register buried alone for `deferral` after the burial (`server.request_timeout_secs`): a
+    /// request that resolved the name before the burial finishes reading what it resolved (ADR-272, decision 5). Set from
+    /// configuration at startup; zero (the engine's default) does not defer. The instant is this member's own wall clock plus
+    /// the deferral, recorded locally, and is never a protocol constant: no other member reads it.
+    pub fn set_purge_deferral(&self, deferral: std::time::Duration) {
+        let ms = u64::try_from(deferral.as_millis()).unwrap_or(u64::MAX);
+        self.purge_deferral_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the bound U1 holds a replicated `field` entry or state to. Set from configuration at
