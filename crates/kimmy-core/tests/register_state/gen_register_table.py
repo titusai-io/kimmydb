@@ -6,7 +6,7 @@ Each case is a small scenario of one logical name's register events plus the rea
   superseded = `first_superseding` of each physical (D11/D10: the earliest valid event above the physical's birth that is a logical drop or names another physical).
 Rule B is off here (every event given is in effect: coverage is the caller's input in the product), DOOM is ON (the DOOM commit's rows; the Q6.2 table at 669c6edb was generated with it off: gen_register_table.nodoom.py). The events reach the model in a shuffled order and in the given order, and the two answers must agree
 (the monotone claim of decision 5), or the generator stops.
-usage: gen_register_table.py [cases] > ../../wt-q6p/crates/kimmy-core/tests/register_state_table.rs     (the header names the model's sha256[:16])"""
+usage: python3 gen_register_table.py [cases] > ../register_state_table.rs (run from crates/kimmy-core/tests/register_state/)     (the header names the model's sha256[:16])"""
 import hashlib, os, random, sys
 sys.dont_write_bytecode = True
 os.environ.update(Q6_RULE_B="0", Q6_DOOM="1")
