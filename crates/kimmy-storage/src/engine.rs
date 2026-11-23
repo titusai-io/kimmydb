@@ -5431,6 +5431,15 @@ impl Engine {
         Ok(InTxn::Created(Box::new(meta), logged))
     }
 
+    /// The physical collection the logical name `name` resolves to on this member: the register's visible physical, or the
+    /// identity (the collection of that name) when no event is in effect (ADR-272, decisions 5 and 7; Q6.4 item 0). The ONE door
+    /// from a logical name to a collection that the API and the MCP use; [`Self::get_collection`] stays for physicals and for
+    /// the storage's own paths. A stub: it resolves every name to the collection of that name.
+    pub fn resolve(&self, db: &str, name: &str) -> Result<Resolved> {
+        let meta = self.get_collection(db, name)?;
+        Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
+    }
+
     pub fn get_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
         let txn = self.db.begin_read()?;
         let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -6152,6 +6161,15 @@ impl Engine {
             .insert((meta.db.as_str(), meta.name.as_str()), serde_json::to_vec(meta)?.as_slice())?;
         Ok(())
     }
+}
+
+/// What a logical name resolves to on a member (ADR-272, Q6.4 item 0): the collection to read or write, its physical name, and the
+/// stamp of the register event that made it visible (`None` for the identity: no event in effect).
+#[derive(Clone, Debug)]
+pub struct Resolved {
+    pub meta: CollectionMeta,
+    pub physical: String,
+    pub visible: Option<Stamp>,
 }
 
 /// A stage's creation, as the creating route knows it: what the entry carries, and the creation's own stamp when the route

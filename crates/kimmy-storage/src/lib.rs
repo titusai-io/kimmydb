@@ -143,6 +143,9 @@ mod ldrop_tests;
 mod stage_name_tests;
 
 #[cfg(test)]
+mod resolve_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
@@ -270,7 +273,7 @@ pub use divergence::{
 };
 pub use docs::{BulkInsertError, ID_FIELD, Seen, WriteOutcome, WriteScope};
 pub use engine::{
-    CacheReading, DurabilityClass, Engine, NotClosed, OpenOptions, RepairsAtOpen,
+    CacheReading, DurabilityClass, Engine, NotClosed, OpenOptions, RepairsAtOpen, Resolved,
     WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot,
     WriterHolder, WriterWaitSnapshot, blocking, metered_writer_wait, with_write_wait_budget,
 };
