@@ -475,7 +475,11 @@ pub(crate) fn event_target(
 /// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name
 /// known, in effect or ahead, and the identity not standing, a tombstone is a logical drop at its stamp. A binding stamped
 /// above it is not touched by it, and one below it is buried by it, as on every other member.
-fn seed_from_the_tombstone(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<()> {
+pub(crate) fn seed_from_the_tombstone(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<()> {
     let id = CollectionId::derive(db, logical);
     if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
         || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()

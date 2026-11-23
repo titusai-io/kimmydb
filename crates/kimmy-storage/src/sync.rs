@@ -3467,8 +3467,18 @@ impl Engine {
                 let mut append_at = position;
                 if let Some(apply) = register {
                     let put = match (&apply.event, apply.mode) {
-                        // no event: the entry only changes what the register decides (a stage's creation)
-                        (None, _) => kimmy_core::register_state::Put::Stored,
+                        // no event: the entry only changes what the register decides (a stage's creation). The first thing a name's register
+                        // learns may be this creation, with the name's drop already held as the identity's tombstone: the drop is a logical
+                        // drop at its stamp, as it is when a binding is the first event, so a stage created below it is judged against it
+                        // (and doomed) here as it is on a member that met the creation first (review of items 6 and 6b, F1)
+                        (None, _) => {
+                            crate::register::seed_from_the_tombstone(
+                                &txn,
+                                &apply.db,
+                                &apply.logical,
+                            )?;
+                            kimmy_core::register_state::Put::Stored
+                        }
                         (Some(event), RegisterMode::Effect) => crate::register::put(
                             &txn,
                             &apply.db,
