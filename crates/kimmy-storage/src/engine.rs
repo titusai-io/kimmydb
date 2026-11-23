@@ -5693,9 +5693,21 @@ impl Engine {
     /// ([`kimmy_core::register_state::Timeline::visible`]), a logical drop in effect makes the name absent, and a name with no
     /// event is `get_collection` exactly.
     pub fn resolve(&self, db: &str, name: &str) -> Result<Resolved> {
-        use kimmy_core::register_state::{Ready, Visible};
         let txn = self.db.begin_read()?;
-        let timeline = crate::register::timeline_read(&txn, db, name)?;
+        Self::resolve_in(&txn, db, name)
+    }
+
+    /// [`Self::resolve`] for a WRITE (ADR-272, decision 7; D10): the same resolution, refused with
+    /// [`StorageError::NameSuperseded`] when this member knows of a register event that supersedes the physical the name answers
+    /// from and has not made a newer one visible. A name that is absent answers as an absent collection, as it does for a read.
+    /// One read transaction, so the refusal is judged against the state the resolution saw.
+    pub fn resolve_for_write(&self, db: &str, name: &str) -> Result<Resolved> {
+        self.resolve(db, name)
+    }
+
+    fn resolve_in(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
+        use kimmy_core::register_state::{Ready, Visible};
+        let timeline = crate::register::timeline_read(txn, db, name)?;
         let collections = txn.open_table(tables::COLLECTIONS)?;
         let meta_of = |physical: &str| -> Result<Option<CollectionMeta>> {
             match collections.get((db, physical))? {

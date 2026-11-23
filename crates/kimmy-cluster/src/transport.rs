@@ -979,6 +979,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::UnparseablePartialFilter { .. }
         | E::Stale { .. }
         | E::CollectionPurging { .. }
+        // A client's write refused because this member has not made a newer register event visible (D10): nobody's failure,
+        // and never an apply's.
+        | E::NameSuperseded { .. }
         // A user's schema change refused before it was written because this member's own stamps would be refused:
         // nobody's failure, and never an apply's.
         | E::OwnStampsRefused(_)

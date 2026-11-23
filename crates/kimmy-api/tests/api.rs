@@ -23671,3 +23671,61 @@ async fn a_schema_change_addressed_to_a_stage_is_refused_400_stage_collection_wh
     assert_eq!(texts[0], texts[1], "the same refusal and text for a real and a made-up stage");
     assert!(texts[0].contains("after the stage's deadline"), "{}", texts[0]);
 }
+
+/// D10 (ADR-272, decision 7): a member that knows of a binding it has not made visible refuses a WRITE to the name with
+/// `503 swap_in_progress`, `retry: wait` and a `Retry-After`, writes nothing, and goes on answering reads.
+#[tokio::test]
+async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_swap_in_progress() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
+    engine
+        .create_stage("shop", "orders.__stg.real", kimmy_core::MergePolicy::Document, deadline)
+        .unwrap();
+    let creation = engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| {
+            e.kind == kimmy_core::OpKind::CreateCollection
+                && e.collection == kimmy_core::CollectionId::derive("shop", "orders.__stg.real")
+        })
+        .unwrap();
+    // a binding from another member, known ahead of its position (no window behind it)
+    let bind = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            kimmy_core::Epoch::ZERO,
+        ),
+        kind: kimmy_core::OpKind::BindCollection,
+        collection: kimmy_core::CollectionId::derive("shop", "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                db: "shop".into(),
+                name: "orders".into(),
+                physical: "orders.__stg.real".into(),
+            })
+            .unwrap(),
+        ),
+        meta: None,
+    };
+    engine.apply_batch(std::slice::from_ref(&bind)).unwrap();
+
+    let refused =
+        server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 7})).await;
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "swap_in_progress", "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "wait", "{:?}", refused.body);
+    let retry = refused.header("retry-after").expect("swap_in_progress carries Retry-After");
+    assert!(retry.parse::<u64>().is_ok_and(|s| s > 0), "Retry-After in seconds: {retry}");
+    let text = refused.body["message"].as_str().unwrap_or_default();
+    assert!(text.contains("writes to orders are refused on this member"), "{text}");
+    // nothing landed, and a read is answered
+    let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
+    assert_eq!((count.status, &count.body["count"]), (200, &json!(0)), "{:?}", count.body);
+}

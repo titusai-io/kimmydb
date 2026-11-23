@@ -134,7 +134,38 @@ pub(crate) fn timeline_read(
     db: &str,
     logical: &str,
 ) -> Result<Timeline> {
-    let held = rows_in(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))?;
+    timeline_read_of(txn, tables::REGISTER, db, logical)
+}
+
+/// The register events of `logical` known ahead of their position, read in a read transaction.
+pub(crate) fn parked_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Timeline> {
+    timeline_read_of(txn, tables::REGISTER_INFO, db, logical)
+}
+
+/// Why a member serving `served` refuses writes to `logical` (decision 7), read in a read transaction: the in-effect events,
+/// then those known ahead of their position, exactly as [`refusal`] judges them under the writer.
+pub(crate) fn refusal_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+    served: &str,
+) -> Result<Option<Refusal>> {
+    let in_effect = timeline_read(txn, db, logical)?;
+    let ahead = parked_read(txn, db, logical)?;
+    Ok(in_effect.refusal(&ahead, served))
+}
+
+fn timeline_read_of(
+    txn: &redb::ReadTransaction,
+    table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    db: &str,
+    logical: &str,
+) -> Result<Timeline> {
+    let held = rows_in(&txn.open_table(table)?, CollectionId::derive(db, logical))?;
     let stages = txn.open_table(tables::REGISTER_STAGES)?;
     timeline_from(held, logical, |event| match event {
         RegisterEvent::Bind { physical } => stage_in(&stages, CollectionId::derive(db, physical)),

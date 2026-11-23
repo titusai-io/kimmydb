@@ -32,6 +32,10 @@ use tracing::{Level, error, info, warn};
 /// The `Retry-After` a `collection_purging` refusal carries, in seconds.
 pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 
+/// `Retry-After` on a `503 swap_in_progress` (ADR-272, decision 7): a hint. The refusal lasts until this member makes the newer
+/// register event visible, which a join or the next sync round does.
+pub const SWAP_IN_PROGRESS_RETRY_AFTER_SECS: u64 = 2;
+
 /// The `Retry-After` an aggregation refused by the node's memory pool carries, in seconds.
 pub const AGGREGATE_POOL_RETRY_AFTER_SECS: u64 = 1;
 
@@ -92,6 +96,9 @@ pub enum ErrorCode {
     /// A collection cannot be created under this name yet: what a drop of an
     /// earlier collection of the name held is still being removed (ADR-189).
     CollectionPurging,
+    /// A write to a name this member knows has been superseded by a register event it cannot yet make visible (ADR-272, decision 7;
+    /// D10): `503`, nothing written, retry. The refusal ends when the member makes the newer event visible.
+    SwapInProgress,
     /// A schema change was addressed to a hidden staging copy of a replacing `$out` (ADR-272, decision 15): `400`, refused on the
     /// name mark before any lookup. Nothing was written, and no retry changes the answer.
     StageCollection,
@@ -213,7 +220,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 32] = [
+    pub const ALL: [ErrorCode; 33] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
@@ -238,6 +245,7 @@ impl ErrorCode {
         Self::Stale,
         Self::Timeout,
         Self::CollectionPurging,
+        Self::SwapInProgress,
         Self::ClockAhead,
         Self::StageCollection,
         Self::OutcomeUnknown,
@@ -275,6 +283,7 @@ impl ErrorCode {
             Self::Stale => "stale",
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
+            Self::SwapInProgress => "swap_in_progress",
             Self::ClockAhead => "clock_ahead",
             Self::StageCollection => "stage_collection",
             Self::OutcomeUnknown => "outcome_unknown",
@@ -341,6 +350,9 @@ impl ErrorCode {
             // succeeds here; another member may still be removing its own copy
             // of the same drop, so moving does not help.
             Self::CollectionPurging => Retry::Wait,
+            // The member that refuses is the one that has not yet made the newer event visible, and it does so by itself when the
+            // event arrives in position; another member may already have, and a retry here finds it too. Wait.
+            Self::SwapInProgress => Retry::Wait,
             // This member's own clock, or a peer's view of it, is what is wrong, and another member's is not: the
             // change is worth sending there.
             Self::ClockAhead => Retry::Elsewhere,
@@ -422,7 +434,9 @@ impl ErrorCode {
             | Self::Stale
             // Expected, bounded and explained by the response itself; the
             // drop purger's own log lines are the operator's record.
-            | Self::CollectionPurging => None,
+            | Self::CollectionPurging
+            // Expected while a member holds a swap's binding it cannot yet make visible; the refusal explains itself.
+            | Self::SwapInProgress => None,
 
             // Reserved and unbuilt, by default. The reference says this will
             // be refused, the caller asked for it anyway, and there is no
@@ -633,6 +647,15 @@ impl ApiError {
     /// rest of the cluster (U1): `503 clock_ahead`, retried on another member.
     pub fn clock_ahead(refusal: &kimmy_storage::OwnStampRefusal) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::ClockAhead, refusal.to_string())
+    }
+
+    /// A write refused because this member knows of a register event that supersedes what the name answers from here
+    /// (ADR-272, decision 7; D10). Nothing was written.
+    pub fn swap_in_progress(message: String) -> Self {
+        Self {
+            retry_after_secs: Some(SWAP_IN_PROGRESS_RETRY_AFTER_SECS),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::SwapInProgress, message)
+        }
     }
 
     /// A creation refused while a drop of the same name is still being purged
@@ -1173,6 +1196,8 @@ impl From<StorageError> for ApiError {
             StorageError::CollectionPurging { db, name, .. } => {
                 ApiError::collection_purging(&db, &name)
             }
+            // A write to a name whose replacement this member knows of and cannot yet make visible (D10): nothing was written.
+            e @ StorageError::NameSuperseded { .. } => ApiError::swap_in_progress(e.to_string()),
             // This member's own stamps would be refused by every other member until due: nothing was written, and
             // another member's clock is the one to use.
             StorageError::OwnStampsRefused(refusal) => ApiError::clock_ahead(&refusal),
@@ -1426,7 +1451,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 32] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 33] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1446,6 +1471,7 @@ mod tests {
             (RateLimited, None),
             (Stale, None),
             (CollectionPurging, None),
+            (SwapInProgress, None),
             (StageCollection, None),
             (ClockAhead, Some(LogLevel::Warn)),
             // Refused on purpose, with no operator action to take. The

@@ -757,9 +757,11 @@ kept. They are `bad_request`, `payload_too_large`, `document_too_large`,
 `answer_too_large`, `id_too_large`, `validation_failed`, `unsupported_media_type`,
 `unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
 `unique_violation`, `stage_collection`, `no_vectors`, `resume_token_expired`, `rate_limited`,
-`stale` and `collection_purging`. Count them with `kimmy_responses_total{class="4xx"}`,
+`stale`, `collection_purging` and `swap_in_progress`. Count them with `kimmy_responses_total{class="4xx"}`,
 except `collection_purging`, a `503` the drop purger's own log lines already
-account for; read the authorization decisions among them in
+account for, and `swap_in_progress`, a `503` a member answers while it holds a swap's
+binding it cannot yet make visible (`kimmy_register_waiting_for_stage` and its
+sync logs say why); read the authorization decisions among them in
 [the audit log](#the-audit-log), and see [HTTP API](http-api.md#errors) for what
 each one means to the client.
 

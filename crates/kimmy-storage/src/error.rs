@@ -98,6 +98,18 @@ pub enum StorageError {
     )]
     CollectionPurging { db: String, name: String, id: kimmy_core::CollectionId },
 
+    /// A write to a name was refused because this member knows of a register event that supersedes the physical the name answers
+    /// from here, and has not made a newer event visible (ADR-272, decision 7; D10): a binding it holds in effect whose stage it
+    /// cannot serve, or one it knows ahead of its position (`parked`), a logical drop or a recreate. Nothing was written, and the
+    /// caller may retry: the refusal ends when the member makes the newer event visible.
+    #[error(
+        "writes to {logical} are refused on this member until it has made the newer replacement of the collection visible (a \
+         `$out`, a drop or a recreate, stamped {event}, {known}); retry",
+        event = event.hlc.wall_ms,
+        known = if *parked { "learned ahead of its position" } else { "known" }
+    )]
+    NameSuperseded { logical: String, event: kimmy_core::Stamp, parked: bool },
+
     /// A replicated entry or state of a `field` collection whose clock is more than the allowed
     /// skew ahead of this member's physical clock (U1). Nothing was written and nothing was
     /// witnessed: it applies once it is due. Not a fault of the peer or of this node, and never
