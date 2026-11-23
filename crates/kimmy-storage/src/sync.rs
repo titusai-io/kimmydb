@@ -2540,6 +2540,12 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop that removed it"
                     );
+                    // A stage's creation is also what the register keeps its row from, and what the author's binding is judged by:
+                    // met and ignored, it is still held and served onward, so the binding that follows is a binding of a stage
+                    // this member knows (decisions 4 and 9). Any other creation is history, as before.
+                    if target.stage.is_some() {
+                        return self.append_replicated_ddl(entry, position);
+                    }
                     return Ok(DdlOutcome::Applied);
                 }
                 // And older than the drop of its database (ADR-229): the
@@ -3355,6 +3361,22 @@ impl Engine {
                             dropped.insert(id.0, crate::codec::oplog_key(stamp).as_slice())?;
                         }
                     }
+                }
+                // A stage's creation writes its creation row whenever it is taken, in the transaction of its own append and whether
+                // or not it makes the collection: the register judges every binding of the stage by this row, and a creation that a
+                // database's drop or the stage's own tombstone refuses is still met, so a binding after it is not an unknown stage
+                // for good (decisions 4 and 9). The same row the creation's own transaction writes, so a repeat is no change.
+                if entry.kind == OpKind::CreateCollection
+                    && let Some(body) = &entry.body
+                    && let Ok(target) =
+                        bson::deserialize_from_slice::<kimmy_core::CollectionCreate>(body)
+                    && let Some(info) = target.stage
+                {
+                    crate::register::write_stage_row(
+                        &txn,
+                        CollectionId::derive(&target.db, &target.name),
+                        &kimmy_core::StageMeta { created: entry.stamp, info },
+                    )?;
                 }
                 // A register event is decided in the transaction of its own append, so that a member never holds the entry
                 // without what it did, or what it did without the entry (decision 3).
