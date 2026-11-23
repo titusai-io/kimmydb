@@ -6575,6 +6575,8 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
         let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
         let oplog = txn.open_table(tables::OPLOG)?;
         let docs = txn.open_table(tables::DOCS)?;
+        // L-DROP: whether the physical an entry is addressed to is alive here, asked once per collection in this sweep
+        let mut alive: std::collections::HashMap<CollectionId, bool> = Default::default();
         for row in held.iter()? {
             let (key, _) = row?;
             let Ok(stamp) = codec::decode_oplog_key(key.value()) else {
@@ -6594,6 +6596,22 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
             let Some(id) = entry.doc_id.as_ref() else {
                 continue;
             };
+            // L-DROP (ADR-272 decision 4, ADR-169 widened): a document entry addressed to a physical that is not alive on this
+            // member is history here, whatever its kind of collection and whether or not it is superseded at its key
+            if entry.kind.is_document() {
+                let stands = match alive.get(&entry.collection) {
+                    Some(stands) => *stands,
+                    None => {
+                        let stands = physical_is_alive(txn, entry.collection)?;
+                        alive.insert(entry.collection, stands);
+                        stands
+                    }
+                };
+                if !stands {
+                    drop_keys.push(key.value().to_vec());
+                    continue;
+                }
+            }
             // An entry of a `field` collection carries a merge state: the stamp of the record
             // that stands says nothing about whether the entry's own writes are in it, so its
             // mark is never dropped by the stamp test (Step 3: the entry is asked for until
@@ -6622,10 +6640,12 @@ pub(crate) fn drop_superseded_covered_marks(txn: &redb::WriteTransaction) -> Res
 }
 
 /// Whether the physical collection `id` is alive on this member: the ONE predicate of L-DROP (ADR-272 decision 4, ADR-169 widened), asked by
-/// the receiver of a covered held mark and by the sender that omits an entry from a window. A stub: every physical is alive.
+/// the receiver of a covered held mark and, in the text of the amendment, by a sender that omits an entry from a window (the
+/// product's sender omits nothing more than before, so only the receiver calls it). Today: a live collection stands under `id`
+/// ([`collection_stands_under`]); from the swap on, one that is not buried joins the question here and nowhere else.
 pub(crate) fn physical_is_alive(txn: &redb::WriteTransaction, id: CollectionId) -> Result<bool> {
-    let _ = (txn, id);
-    Ok(true)
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    collection_stands_under(&collections, id)
 }
 
 /// Whether a live collection stands under `id`.
