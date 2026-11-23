@@ -350,3 +350,90 @@ fn a_grant_that_covers_a_parked_recreate_puts_it_in_effect_and_settles_in_the_sa
         "the grant released the recreate and the name answers from it"
     );
 }
+
+// ---- Item 1d: what a client can list is the names it uses ----
+
+fn listed(e: &Engine) -> Vec<String> {
+    let mut names: Vec<String> =
+        e.list_logical_collections(DB).unwrap().into_iter().map(|c| c.name).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_name_bound_to_a_stage_is_listed_under_its_own_name_and_the_stage_is_not() {
+    // Before the flip: the identity stands, a stage of it is held and is not listed.
+    let (m, _d) = with_orders();
+    let (a, _da) = engine();
+    a.create_stage(DB, STAGE, MergePolicy::Document, Hlc::new(physical_now_ms() + 60_000, 0))
+        .unwrap();
+    let creation = everything(&a)
+        .into_iter()
+        .find(|e| {
+            e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive(DB, STAGE)
+        })
+        .unwrap();
+    m.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    assert_eq!(listed(&m), vec!["orders".to_string()], "premise: the stage is held and hidden");
+    // After the flip the identity is buried and the stage serves: the name is listed, the stage is not.
+    let wall = physical_now_ms().max(creation.stamp.hlc.wall_ms) + 1;
+    let bind = bind_of(&a, wall);
+    window(&m, std::slice::from_ref(&bind));
+    assert_eq!(m.resolve(DB, "orders").unwrap().physical, STAGE, "premise: the flip is visible");
+    assert_eq!(
+        listed(&m),
+        vec!["orders".to_string()],
+        "the name that answers is listed, under its own name"
+    );
+    // After the drop of the name: nothing.
+    assert!(m.drop_collection(DB, "orders").unwrap());
+    assert!(listed(&m).is_empty(), "a dropped name is not listed: {:?}", listed(&m));
+}
+
+#[test]
+fn a_recreated_name_is_listed_under_its_own_name_and_its_physical_is_not() {
+    let w = author(&[]);
+    assert_eq!(listed(&w.a), vec!["orders".to_string()], "{:?}", listed(&w.a));
+}
+
+#[test]
+fn a_definition_addressed_to_a_swapped_name_finds_nothing_until_q6_5() {
+    // A PIN of today's behaviour, not of the intended one. Decision 6 says an index, a validator, a vector configuration and a TTL
+    // address the LOGICAL name and are stamped registers joined across the physicals of the chain; that is Q6.5 ("definition
+    // registers"). Until then these entry points look the name up with `get_collection`, which finds a physical by its own name,
+    // so after a flip (the identity buried, the stage serving) they answer CollectionNotFound. Nothing is lost and nothing
+    // diverges. Q6.5's failing-first commit flips this test to "the definition lands on the physical the name answers from".
+    let (m, _d) = with_orders();
+    let (a, _da) = engine();
+    a.create_stage(DB, STAGE, MergePolicy::Document, Hlc::new(physical_now_ms() + 60_000, 0))
+        .unwrap();
+    let creation = everything(&a)
+        .into_iter()
+        .find(|e| {
+            e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive(DB, STAGE)
+        })
+        .unwrap();
+    m.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    window(
+        &m,
+        std::slice::from_ref(&bind_of(&a, physical_now_ms().max(creation.stamp.hlc.wall_ms) + 1)),
+    );
+    assert_eq!(m.resolve(DB, "orders").unwrap().physical, STAGE, "premise: the flip is visible");
+    let created =
+        m.create_index(DB, "orders", vec![kimmy_core::IndexField::ascending("v")], false, None);
+    assert!(
+        matches!(
+            created,
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+        ),
+        "an index on a swapped name: {created:?}"
+    );
+    let validator = m.set_validator(DB, "orders", None);
+    assert!(
+        matches!(
+            validator,
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+        ),
+        "a validator on a swapped name: {validator:?}"
+    );
+}

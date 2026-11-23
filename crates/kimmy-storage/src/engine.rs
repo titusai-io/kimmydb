@@ -5502,6 +5502,14 @@ impl Engine {
         Ok((timeline, ready))
     }
 
+    /// The collections a client can name in `db`, as the names clients use (decision 15; Q6.4 item 1d): every collection that is not
+    /// hidden, and for each hidden physical (a stage, a recreation) the logical name it answers to, once the register makes it
+    /// visible, under that name. A stage that is not the visible physical of its name, and one that has been buried out, are not
+    /// listed. Each is the collection's own metadata, named by the logical name.
+    pub fn list_logical_collections(&self, db: &str) -> Result<Vec<CollectionMeta>> {
+        self.list_collections(db)
+    }
+
     /// The local create of a name that has register events, under the writer `txn` holds (decision 6; Q6.4 item 1c): refused as
     /// any create of a name that answers is; otherwise a NEW physical collection named by its own event
     /// ([`kimmy_core::recreation_name`]), born at its stamp, ONE `CreateCollection` entry for it, and the `Create` event of the
