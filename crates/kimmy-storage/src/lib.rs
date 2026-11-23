@@ -158,6 +158,9 @@ mod carried_drop_tests;
 mod swap_routes_tests;
 
 #[cfg(test)]
+mod recreate_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
