@@ -472,12 +472,13 @@ pub(crate) fn redb_no_upgrade(build: &BuildVersions) -> String {
 }
 
 /// Who the older-schema refusal says wrote the store: a build that left no
-/// sidecar, or the one whose sidecar records no schema yet.
+/// sidecar, or the one whose sidecar records no schema yet. The refusal goes on
+/// with " with storage schema N", so neither ends in "with" itself.
 fn who_wrote(zero_sidecar: bool) -> &'static str {
     if zero_sidecar {
-        "its kimmy.format records no storage schema, and the store was written by a build with"
+        "its kimmy.format records no storage schema, and the store was written by a build"
     } else {
-        "it was written by a build that left no kimmy.format, with"
+        "it was written by a build that left no kimmy.format,"
     }
 }
 
