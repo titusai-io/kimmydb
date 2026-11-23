@@ -184,6 +184,15 @@ impl Engine {
         Ok(!self.collection_range_is_empty(id)?)
     }
 
+    /// The instant (this member's wall clock, ms) before which the purger leaves `id`'s rows alone, if that is still ahead: the
+    /// register's burial recorded it (ADR-272, decision 5). `None` for a physical with no row, or whose instant has passed.
+    pub(crate) fn purge_deferred_until(&self, id: CollectionId) -> Result<Option<u64>> {
+        let txn = self.db().begin_read()?;
+        let rows = txn.open_table(tables::PURGE_NOT_BEFORE)?;
+        let until = rows.get(id.0)?.map(|row| row.value());
+        Ok(until.filter(|until| *until > self.clock_bound_now_ms()))
+    }
+
     /// Every id a drop left rows under: a tombstone with no collection
     /// standing over it, and something still filed beneath. Found, not
     /// counted: two seeks per dropped id, one read transaction.
@@ -250,18 +259,42 @@ impl Engine {
             }
 
             let mut purged_any = false;
+            // The physicals the register buried that are still inside their deferral (decision 5): left for now, taken again at
+            // their instant, and not counted as work the purger is failing at
+            let mut held_back: Vec<CollectionId> = Vec::new();
+            let mut due: Option<u64> = None;
             while let Some(id) = self.next_purge() {
+                if let Some(until) = crate::blocking(|| self.purge_deferred_until(id))? {
+                    held_back.push(id);
+                    due = Some(due.map_or(until, |earliest| earliest.min(until)));
+                    continue;
+                }
                 purged_any = true;
                 self.purge_one(id).await?;
             }
+            if !held_back.is_empty() {
+                let mut queue = self.purges.queue.lock();
+                for id in &held_back {
+                    if !queue.contains(id) {
+                        queue.push_back(*id);
+                    }
+                }
+            }
 
-            // An idle turn is progress only when there is truly nothing to do.
-            if !purged_any && !owed_found && self.purges.queue.lock().is_empty() {
+            // An idle turn is progress only when there is truly nothing to do; ids held back for their instant are not work.
+            if !purged_any && !owed_found && self.purges.queue.lock().len() == held_back.len() {
                 self.mark_progress();
             }
+            let wait = match due {
+                Some(until) => {
+                    let ahead = until.saturating_sub(self.clock_bound_now_ms());
+                    Duration::from_millis(ahead.clamp(50, IDLE_TICK.as_millis() as u64))
+                }
+                None => IDLE_TICK,
+            };
             tokio::select! {
                 () = &mut woken => {}
-                () = tokio::time::sleep(IDLE_TICK) => {}
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }

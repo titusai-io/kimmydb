@@ -1529,6 +1529,7 @@ impl Engine {
             let _ = txn.open_table(tables::MISSING_THROUGH)?;
             let _ = txn.open_table(tables::LOSS_PENDING)?;
             crate::register::open_tables(&txn)?;
+            let _ = txn.open_table(tables::PURGE_NOT_BEFORE)?;
             // The first write of a start that decided the rebuild is forced:
             // from here the store says "rebuild required" whatever any exit
             // marker says (B3 design 2.1, layer 2).
@@ -5695,6 +5696,19 @@ impl Engine {
                 None,
                 Some(burial.at),
             )?;
+            // The purger leaves its rows alone for the requests that resolved the name before the burial (decision 5); a client's own
+            // drop is not deferred, and neither is a burial on a member configured with no deferral
+            let deferral = txn.engine.purge_deferral_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if deferral > 0 {
+                let not_before = txn.engine.clock_bound_now_ms().saturating_add(deferral);
+                let mut rows = txn.open_table(tables::PURGE_NOT_BEFORE)?;
+                for id in &buried.buried {
+                    let later = rows.get(id.0)?.is_none_or(|held| held.value() < not_before);
+                    if later {
+                        rows.insert(id.0, not_before)?;
+                    }
+                }
+            }
             txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried));
         }
         Ok(())
@@ -6308,6 +6322,10 @@ impl Engine {
         // a `drop` count climbing in thousands beside a flat `ddl` is a large
         // purge in progress. Only the drop purger runs them while the node
         // serves (ADR-189); the holder names the work, not who asked.
+        // A physical the register buried is left alone until its instant (decision 5): nothing is removed and nothing is read
+        if self.purge_deferred_until(id)?.is_some() {
+            return Ok(0);
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         self.purges.gate.pass()?;
         // Before the writer: see `warm_purge_chunk`.
@@ -6398,6 +6416,10 @@ impl Engine {
                 if removed < DROP_PURGE_CHUNK {
                     txn.live_counts().lock().forget_digest(id.0);
                     row_to_forget = txn.open_table(tables::LIVE_DIGESTS)?.get(id.0)?.is_some();
+                    // and the instant the register's burial recorded, which has done its work
+                    if txn.open_table(tables::PURGE_NOT_BEFORE)?.remove(id.0)?.is_some() {
+                        row_to_forget = true;
+                    }
                 }
                 removed
             }

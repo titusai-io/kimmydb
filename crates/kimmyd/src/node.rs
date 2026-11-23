@@ -299,6 +299,13 @@ fn apply_clock_bound(engine: &Engine, storage: &crate::config::StorageConfig) {
     engine.set_max_clock_skew(Duration::from_secs(storage.max_clock_skew_secs));
 }
 
+/// Hand the engine the purge deferral from the configuration: how long after the register buries a physical its rows are left
+/// alone, `server.request_timeout_secs` (ADR-272, decision 5), the longest a request that resolved the name before the swap can
+/// still be reading it. This member's own, never a protocol constant.
+fn apply_purge_deferral(engine: &Engine, server: &crate::config::ServerConfig) {
+    engine.set_purge_deferral(Duration::from_secs(server.request_timeout_secs));
+}
+
 /// Take the engine from its last owner and close it on this thread
 /// ([`Engine::close`]); `Err` with the reason it could not be.
 ///
@@ -893,6 +900,7 @@ async fn start_and_serve(
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     apply_clock_bound(&engine, &config.storage);
+    apply_purge_deferral(&engine, &config.server);
     apply_join_retention(&engine, &config.storage);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
@@ -3488,6 +3496,7 @@ mod tests {
         let install = production.find("front.install(app);").expect("the install");
         for call in [
             "apply_clock_bound(&engine, &config.storage);",
+            "apply_purge_deferral(&engine, &config.server);",
             "apply_join_retention(&engine, &config.storage);",
         ] {
             let set = production.find(call).expect(call);

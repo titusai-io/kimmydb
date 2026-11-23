@@ -666,6 +666,10 @@ mod tests {
         ),
         ("REGISTER_INFO", "the swap's register events ahead of their position: as REGISTER"),
         (
+            "PURGE_NOT_BEFORE",
+            "this member's own clock and requests (ADR-272, decision 5): a restore starts with no request in flight, so there is nothing to defer for",
+        ),
+        (
             "REGISTER_STAGES",
             "the swap's stage creations: as REGISTER (they are the creations in the oplog)",
         ),

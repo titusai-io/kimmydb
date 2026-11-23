@@ -428,3 +428,10 @@ pub const REGISTER_INFO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("r
 /// with the oplog: a later binding's validity and the burial of a stage by a later event read it. Written only by
 /// `crate::register`.
 pub const REGISTER_STAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_stages");
+
+/// `buried physical collection id -> this member's wall clock, in milliseconds, before which the purger leaves its rows alone`
+/// (ADR-272, decision 5): the burial's wall time plus `server.request_timeout_secs`, written in the burial's own transaction, so a
+/// request that resolved the name before the swap finishes reading what it resolved. **Member-local, never replicated and not
+/// carried by a backup**: it is this member's clock and this member's requests. Removed in the transaction of the chunk that
+/// empties the physical.
+pub const PURGE_NOT_BEFORE: TableDefinition<u64, u64> = TableDefinition::new("purge_not_before");
