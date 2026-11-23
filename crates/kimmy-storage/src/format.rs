@@ -1676,6 +1676,103 @@ mod tests {
         assert!(!sidecar_path(&restored).exists());
     }
 
+    /// The whole refusal text of a store an older schema wrote, in each of the forms its writer is named in: the one text an operator reads
+    /// (operations.md quotes its shape). Each is pinned whole, so a joining word cannot be doubled or dropped by a change to one half.
+    fn older_refusal(path: &Path, what: &str, build: &BuildVersions) -> String {
+        match Engine::open_as(path, None, build) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(!why.contains("with with"), "{what}: a doubled word in the refusal: {why}");
+                why
+            }
+            Err(other) => panic!("{what}: refused with the wrong error: {other}"),
+            Ok(_) => panic!("{what}: opened an older store"),
+        }
+    }
+
+    #[test]
+    fn the_refusal_of_an_older_store_with_no_sidecar_reads_whole() {
+        let (_dir, path) = a_store();
+        std::fs::remove_file(sidecar_path(&path)).unwrap();
+        let schema = crate::migrate::SCHEMA_VERSION;
+        let ahead = BuildVersions { schema: schema + 1, ..BuildVersions::ours() };
+        assert_eq!(
+            older_refusal(&path, "no sidecar", &ahead),
+            format!(
+                "{} is not opened by this build, and nothing in it was changed: it was written by a build that left no kimmy.format, \
+                 with storage schema {schema} (this build: {}). {}",
+                path.display(),
+                schema + 1,
+                crate::migrate::no_upgrade()
+            )
+        );
+    }
+
+    #[test]
+    fn the_refusal_of_an_older_store_with_a_schema_zero_sidecar_reads_whole() {
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.schema = 0);
+        let schema = crate::migrate::SCHEMA_VERSION;
+        let ahead = BuildVersions { schema: schema + 1, ..BuildVersions::ours() };
+        assert_eq!(
+            older_refusal(&path, "schema 0 sidecar", &ahead),
+            format!(
+                "{} is not opened by this build, and nothing in it was changed: its kimmy.format records no storage schema, \
+                 and the store was written by a build with storage schema {schema} (this build: {}). {}",
+                path.display(),
+                schema + 1,
+                crate::migrate::no_upgrade()
+            )
+        );
+    }
+
+    #[test]
+    fn the_refusal_of_an_older_store_whose_sidecar_names_its_build_reads_whole() {
+        let (_dir, path) = a_store();
+        let schema = crate::migrate::SCHEMA_VERSION;
+        with_sidecar(&path, |s| {
+            s.schema = schema - 1;
+            s.written_by = "0.61.0".into();
+        });
+        assert_eq!(
+            older_refusal(&path, "sidecar", &BuildVersions::ours()),
+            format!(
+                "{} is not opened by this build, and nothing in it was changed: it was written by 0.61.0 with storage schema {} \
+                 (this build: {schema}). {}",
+                path.display(),
+                schema - 1,
+                crate::migrate::no_upgrade()
+            )
+        );
+    }
+
+    #[test]
+    fn the_refusal_of_an_older_backup_reads_whole() {
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        let mut backup = Vec::new();
+        engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
+        drop(engine);
+        let dir = tempfile::tempdir().unwrap();
+        let schema = crate::migrate::SCHEMA_VERSION;
+        let ahead = BuildVersions { schema: schema + 1, ..BuildVersions::ours() };
+        match crate::backup::restore_with(
+            &dir.path().join("kimmy.redb"),
+            &mut backup.as_slice(),
+            &ahead,
+        ) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => assert_eq!(
+                why,
+                format!(
+                    "the backup was written under storage schema {schema} (this build: {}), and nothing was restored. {}",
+                    schema + 1,
+                    crate::migrate::no_upgrade()
+                )
+            ),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("restored an older schema"),
+        }
+    }
+
     #[test]
     fn a_newer_redb_minor_or_file_format_in_the_sidecar_is_refused_untouched() {
         let (_dir, path) = a_store();
