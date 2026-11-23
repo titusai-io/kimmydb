@@ -1622,26 +1622,28 @@ impl Engine {
         Ok(true)
     }
 
-    /// Rule S with the S-bind-origin trigger (ADR-272, decision 6): whether `entry`, a write that no held version lets win, is a
-    /// staged row this member must still be able to serve. It is one when its collection is a stage, its origin is the origin of
-    /// the stage's creation (the job that stages the rows), and its stamp is below the stage's binding here, or the stage has
-    /// none. Nothing wider: an ordinary write of another origin to a physical that was a stage, or one above the binding (a
-    /// late write), is witnessed away as ever. The caller never asks under `Hold`: a snapshot document is state, not history.
-    fn staged_row_is_owed(
+    /// Whether `entry`, a write that no held version lets win here, is a staging write this member must still be able to serve
+    /// (ADR-272, decision 4, rule S; widened in decision 9 to a stage this member holds no collection of): a write of the origin of
+    /// the stage's creation, stamped below the stage's earliest known binding or with none known, that is not in the oplog yet. Read
+    /// from the stage's creation row in the register, not from a collection, so it holds the same for a stage that is alive and one
+    /// that is not. Nothing wider: an ordinary write of another origin to a physical that was a stage, or one above the binding (a
+    /// late write), is witnessed away as ever. Never for a snapshot document (`Hold`): that is state, not history
+    /// ([`crate::register::StageRow::staging_logical`] holds the one test).
+    pub(crate) fn staging_write_is_owed(
         &self,
         txn: &WriteTxn<'_>,
-        coll: &CollectionMeta,
         entry: &OplogEntry,
+        position: Position,
     ) -> Result<bool> {
-        let Some(stage) = &coll.stage else { return Ok(false) };
-        if entry.stamp.origin() != stage.created.origin() {
-            return Ok(false);
-        }
-        let Some(logical) = kimmy_core::swap::logical_of_stage(&coll.name) else {
+        let Some(row) = crate::register::stage_row_named(txn, entry.collection)? else {
             return Ok(false);
         };
-        let bound = crate::register::binding_stamp_of(txn, &coll.db, logical, &coll.name)?;
-        Ok(bound.is_none_or(|binding| entry.stamp < binding))
+        let Some(logical) = row.staging_logical(entry, position) else { return Ok(false) };
+        let bound = crate::register::binding_stamp_of(txn, &row.db, logical, &row.physical)?;
+        if !bound.is_none_or(|binding| entry.stamp < binding) {
+            return Ok(false);
+        }
+        crate::engine::delete_entry_is_owed(txn, &entry.stamp)
     }
 
     /// The body of [`Self::apply_remote`], inside a transaction the caller
@@ -1757,12 +1759,8 @@ impl Engine {
                     && entry.body.is_none()
                     && existing.as_ref().is_some_and(|c| !c.is_live() && c.stamp == entry.stamp);
                 drop(docs);
-                // Rule S (ADR-272, decision 6): a staged row of the creator's, superseded here, is still appended.
-                if !owed
-                    && position != Position::Hold
-                    && self.staged_row_is_owed(txn, coll, entry)?
-                    && crate::engine::delete_entry_is_owed(txn, &entry.stamp)?
-                {
+                // Rule S (ADR-272, decision 4): a staged row of the creator's, superseded here, is still appended.
+                if !owed && self.staging_write_is_owed(txn, entry, position)? {
                     // No document, index or count write: the document stands, the entry joins this member's oplog so that it
                     // can serve it onward, and nothing is published.
                     let released = crate::engine::append_oplog_at(txn, entry, position)?;

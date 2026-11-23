@@ -39,17 +39,37 @@ pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
-/// Keep a stage's creation. Written in the transaction of the creation itself and never removed.
+/// What the register keeps of a stage's creation: the creation's stamp and deadline ([`StageMeta`]) and the names of the stage's
+/// collection. The names are part of the row so that a stage the register knows and this member holds no collection for can still be
+/// addressed by them: a staging write for it is judged by its creation's origin and its bindings (decision 4, rule S), and the logical
+/// name it belongs to follows from the physical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StageRow {
+    pub meta: StageMeta,
+    pub db: String,
+    pub physical: String,
+}
+
+/// Bytes of a stage row before its names: the creation's stamp key and the deadline.
+const STAGE_ROW_FIXED: usize = Stamp::KEY_LEN + HLC_ENCODED_LEN;
+
+/// Keep a stage's creation. Written in the transaction of the creation itself and never removed. Whatever rebuilds a stage's row from
+/// its creation entry rebuilds the names with it: they are the entry's own `db` and `name`.
 pub(crate) fn write_stage_row(
     txn: &redb::WriteTransaction,
-    physical: CollectionId,
+    db: &str,
+    physical: &str,
     stage: &StageMeta,
 ) -> Result<()> {
-    let mut value = Vec::with_capacity(Stamp::KEY_LEN + HLC_ENCODED_LEN);
+    let mut value = Vec::with_capacity(STAGE_ROW_FIXED + 2 + db.len() + physical.len());
     value.extend_from_slice(&stage.created.to_key_bytes());
     value.extend_from_slice(&stage.info.deadline.to_bytes());
+    // `db` is length-prefixed; `physical` is the rest
+    value.extend_from_slice(&(db.len() as u16).to_be_bytes());
+    value.extend_from_slice(db.as_bytes());
+    value.extend_from_slice(physical.as_bytes());
     txn.open_table(tables::REGISTER_STAGES)?
-        .insert(physical.0.to_be_bytes().as_slice(), value.as_slice())?;
+        .insert(CollectionId::derive(db, physical).0.to_be_bytes().as_slice(), value.as_slice())?;
     Ok(())
 }
 
@@ -61,6 +81,63 @@ pub(crate) fn stage_row(
     stage_in(&txn.open_table(tables::REGISTER_STAGES)?, physical)
 }
 
+/// [`stage_row`] with the names of the stage: the row a staging write for a stage this member holds no collection of is judged by.
+pub(crate) fn stage_row_named(
+    txn: &redb::WriteTransaction,
+    physical: CollectionId,
+) -> Result<Option<StageRow>> {
+    named_in(&txn.open_table(tables::REGISTER_STAGES)?, physical)
+}
+
+/// [`stage_row_named`] in a read transaction: the judgement made before the writer is taken.
+pub(crate) fn stage_row_named_read(
+    txn: &redb::ReadTransaction,
+    physical: CollectionId,
+) -> Result<Option<StageRow>> {
+    named_in(&txn.open_table(tables::REGISTER_STAGES)?, physical)
+}
+
+fn named_in(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    physical: CollectionId,
+) -> Result<Option<StageRow>> {
+    let Some(meta) = stage_in(table, physical)? else { return Ok(None) };
+    let raw = table.get(physical.0.to_be_bytes().as_slice())?.expect("read just above");
+    let rest = &raw.value()[STAGE_ROW_FIXED..];
+    let db_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| corrupt("a stage row with a name that is not text"))
+    };
+    Ok(Some(StageRow {
+        meta,
+        db: text(&rest[2..2 + db_len])?,
+        physical: text(&rest[2 + db_len..])?,
+    }))
+}
+
+impl StageRow {
+    /// The logical name of the stage if `entry` is a staging write at `position` (ADR-272, decision 4, rule S; and decision 9, burial
+    /// by a later event): a write of the origin of the stage's creation, the job that stages the rows, and never a snapshot document,
+    /// which is state and not history. **The one place the rule's trigger and its `Hold` test are written**: rule S for a stage this
+    /// member holds and the staging write for a stage it holds no collection of both ask it, over the same row. The binding the write
+    /// must stay below, and whether the entry is owed, are asked of the transaction by the caller.
+    pub(crate) fn staging_logical(
+        &self,
+        entry: &kimmy_core::OplogEntry,
+        position: crate::engine::Position,
+    ) -> Option<&str> {
+        if position == crate::engine::Position::Hold {
+            return None;
+        }
+        if entry.stamp.origin() != self.meta.created.origin() {
+            return None;
+        }
+        kimmy_core::swap::logical_of_stage(&self.physical)
+    }
+}
+
 /// [`stage_row`] over any readable table (a write or a read transaction's).
 fn stage_in(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -70,12 +147,17 @@ fn stage_in(
         return Ok(None);
     };
     let bytes = raw.value();
-    if bytes.len() != Stamp::KEY_LEN + HLC_ENCODED_LEN {
+    // the fixed part, the length of the database name, and the names (a database name is never empty, and neither is a physical's)
+    if bytes.len() < STAGE_ROW_FIXED + 2 {
+        return Err(corrupt("a stage row of the wrong length"));
+    }
+    let db_len = u16::from_be_bytes([bytes[STAGE_ROW_FIXED], bytes[STAGE_ROW_FIXED + 1]]) as usize;
+    if bytes.len() < STAGE_ROW_FIXED + 2 + db_len {
         return Err(corrupt("a stage row of the wrong length"));
     }
     let created: [u8; Stamp::KEY_LEN] = bytes[..Stamp::KEY_LEN].try_into().expect("checked length");
     let deadline: [u8; HLC_ENCODED_LEN] =
-        bytes[Stamp::KEY_LEN..].try_into().expect("checked length");
+        bytes[Stamp::KEY_LEN..STAGE_ROW_FIXED].try_into().expect("checked length");
     Ok(Some(StageMeta {
         created: Stamp::from_key_bytes(created),
         info: kimmy_core::StageInfo { deadline: Hlc::from_bytes(deadline) },

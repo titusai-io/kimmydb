@@ -1630,6 +1630,28 @@ impl Engine {
         Ok(found)
     }
 
+    /// Whether `entry`, judged history for a collection this member does not hold, may be a staging write of a stage: the register
+    /// holds the stage's creation, the entry is of that creation's origin and is not a snapshot document. A read of the creation row,
+    /// made once per stage in a batch, so that an entry that is plainly history costs no writer (decision 9, rule S widened).
+    fn may_be_a_staging_write(
+        &self,
+        memo: &mut Memo,
+        entry: &OplogEntry,
+        position: crate::engine::Position,
+    ) -> Result<bool> {
+        if !entry.kind.is_document() {
+            return Ok(false);
+        }
+        let row = match memo.stages.entry(entry.collection) {
+            std::collections::hash_map::Entry::Occupied(known) => known.get().clone(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let found = self.stage_row_of(entry.collection)?.map(Arc::new);
+                vacant.insert(found).clone()
+            }
+        };
+        Ok(row.is_some_and(|row| row.staging_logical(entry, position).is_some()))
+    }
+
     /// When the collection was dropped, as this batch last saw it.
     pub(crate) fn memo_dropped_at(
         &self,
@@ -1894,6 +1916,7 @@ pub(crate) fn arriving_life_ends_the_standing_one(
 pub(crate) struct Memo {
     collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>>,
     dropped: HashMap<CollectionId, Option<Stamp>>,
+    stages: HashMap<CollectionId, Option<Arc<crate::register::StageRow>>>,
 }
 
 /// A run of consecutive document entries sharing one transaction.
@@ -2152,6 +2175,11 @@ enum Judged {
     /// tombstone says why -- which ADR-148 defines as left, not taken, and
     /// which the carried `Step` distinguishes.
     Decided(Step),
+    /// History: superseded by a drop, or gone with its collection (decision 8's answer for an entry that lost to a register event is
+    /// given here, where an entry judged history is kept or not). `staging` is whether the entry may be a staging write of a stage
+    /// this member holds no collection of (decision 9; rule S widened): the stage's creation row names the entry's origin, and the
+    /// entry is not a snapshot document. The transaction decides it.
+    History { staging: bool },
     /// To be applied, into this definition.
     Apply(Arc<CollectionMeta>),
 }
@@ -2163,12 +2191,15 @@ impl Engine {
         &self,
         memo: &mut Memo,
         entry: &OplogEntry,
+        position: crate::engine::Position,
         outcome: &mut SyncOutcome,
     ) -> Result<Judged> {
         let collection = self.memo_collection(memo, entry.collection)?;
         if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
             outcome.superseded += 1;
-            return Ok(Judged::Decided(Step::Taken));
+            let staging =
+                collection.is_none() && self.may_be_a_staging_write(memo, entry, position)?;
+            return Ok(Judged::History { staging });
         }
 
         let Some(collection) = collection else {
@@ -2182,7 +2213,8 @@ impl Engine {
             // case and must not stop the batch.
             if self.memo_dropped_at(memo, entry.collection)?.is_some() {
                 outcome.superseded += 1;
-                return Ok(Judged::Decided(Step::Taken));
+                let staging = self.may_be_a_staging_write(memo, entry, position)?;
+                return Ok(Judged::History { staging });
             }
             return Ok(Judged::Decided(Step::Unknown(None)));
         };
@@ -2359,8 +2391,11 @@ impl Engine {
         // holds only a tombstone for was witnessed durably and dragged the clock at the next open. The bound inside
         // `apply_remote_in_txn` is never reached on those paths.
         self.refuse_entry_past_the_bound(entry)?;
-        let collection = match self.judge_document(memo, entry, outcome)? {
+        let collection = match self.judge_document(memo, entry, position, outcome)? {
             Judged::Decided(step) => return Ok(step),
+            Judged::History { staging } => {
+                return self.history_answer(run, entry, position, staging);
+            }
             Judged::Apply(collection) => collection,
         };
 
@@ -2386,11 +2421,16 @@ impl Engine {
             race_hooks::reach(race_hooks::Race::DocumentRun);
             self.run_txn(run)?;
             *memo = Memo::default();
-            match self.judge_document(memo, entry, outcome)? {
+            match self.judge_document(memo, entry, position, outcome)? {
                 Judged::Decided(step) => {
                     #[cfg(test)]
                     race_hooks::absorbed(race_hooks::Race::DocumentRun);
                     return Ok(step);
+                }
+                Judged::History { staging } => {
+                    #[cfg(test)]
+                    race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    return self.history_answer(run, entry, position, staging);
                 }
                 Judged::Apply(current) => {
                     #[cfg(test)]
@@ -2429,6 +2469,34 @@ impl Engine {
             RemoteApplied::Written { released } => {
                 outcome.superseded += 1;
                 run.released += u64::from(released);
+            }
+        }
+        Ok(Step::Taken)
+    }
+
+    /// What becomes of a document entry judged history (ADR-272). It is taken: witnessed, and not applied to any document. **Decision 8's
+    /// evaluation of an entry that lost to a register event belongs here**, at the one place a history answer ends, so that no route
+    /// to `Taken` can skip it. And a staging write of a stage this member holds no collection of is also appended in position and
+    /// served onward (decision 9, burial by a later event; rule S widened), so that a member behind this one still learns of a write
+    /// this one witnessed: the test is rule S's own over the stage's creation row ([`Self::staging_write_is_owed`]), and an entry
+    /// already in the oplog under a held mark has the mark released, as a superseded entry in a contiguous window does (ADR-169).
+    fn history_answer<'e>(
+        &'e self,
+        run: &mut Run<'e>,
+        entry: &OplogEntry,
+        position: crate::engine::Position,
+        staging: bool,
+    ) -> Result<Step> {
+        if staging {
+            let txn = self.run_txn(run)?;
+            if self.staging_write_is_owed(txn, entry, position)? {
+                let released = crate::engine::append_oplog_at(txn, entry, position)?;
+                run.released += u64::from(released);
+                self.witness(&entry.stamp);
+            } else if position == crate::engine::Position::InWindow
+                && crate::engine::release_held_in_position(txn, &entry.stamp)?
+            {
+                run.released += 1;
             }
         }
         Ok(Step::Taken)
@@ -3389,7 +3457,8 @@ impl Engine {
                 {
                     crate::register::write_stage_row(
                         &txn,
-                        CollectionId::derive(&target.db, &target.name),
+                        &target.db,
+                        &target.name,
                         &kimmy_core::StageMeta { created: entry.stamp, info },
                     )?;
                 }

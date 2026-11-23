@@ -3324,6 +3324,14 @@ impl Engine {
         }
     }
 
+    /// What the register keeps of the creation of the stage `id`, with its names, if it ever held one (ADR-272, decision 9).
+    pub(crate) fn stage_row_of(
+        &self,
+        id: CollectionId,
+    ) -> Result<Option<crate::register::StageRow>> {
+        crate::register::stage_row_named_read(&self.db.begin_read()?, id)
+    }
+
     /// Every collection tombstone this node holds.
     ///
     /// Bounded by `tombstone_retention_secs`: retention collects a tombstone
@@ -5418,7 +5426,7 @@ impl Engine {
                 info: arg.info,
             });
             if let Some(kept) = &meta.stage {
-                crate::register::write_stage_row(txn, id, kept)?;
+                crate::register::write_stage_row(txn, db, name, kept)?;
             }
             // A validator the collection is created with is written with it, stamped
             // by the creation that carries it (the entry's stamp from elsewhere, this

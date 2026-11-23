@@ -4,7 +4,7 @@
 //! the name absent.
 
 use kimmy_core::{
-    CollectionId, Error as CoreError, Hlc, MergePolicy, RegisterEvent, StageInfo, StageMeta, Stamp,
+    Error as CoreError, Hlc, MergePolicy, RegisterEvent, StageInfo, StageMeta, Stamp,
 };
 
 use crate::{Engine, StorageError, WriterHolder, physical_now_ms};
@@ -84,7 +84,8 @@ fn a_binding_whose_physical_is_not_alive_here_is_skipped_for_the_next_older_visi
     let txn = e.begin_write(WriterHolder::Ddl).unwrap();
     crate::register::write_stage_row(
         &txn,
-        CollectionId::derive(DB, ghost),
+        DB,
+        ghost,
         &StageMeta { created, info: StageInfo { deadline } },
     )
     .unwrap();

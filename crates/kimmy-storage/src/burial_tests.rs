@@ -125,7 +125,8 @@ fn the_old_physical_is_never_buried_unless_the_new_one_is_alive_here() {
     let txn = b.begin_write(WriterHolder::Ddl).unwrap();
     crate::register::write_stage_row(
         &txn,
-        CollectionId::derive(DB, ghost),
+        DB,
+        ghost,
         &kimmy_core::StageMeta {
             created,
             info: kimmy_core::StageInfo { deadline: Hlc::new(physical_now_ms() + 60_000, 0) },

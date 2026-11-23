@@ -249,3 +249,39 @@ fn only_this_module_opens_the_register_tables() {
         "the register tables are opened outside register.rs: {offenders:?}"
     );
 }
+
+/// The one trigger of a staging write, and its one `Hold` test (decision 4, rule S; decision 9): a snapshot document is state and not
+/// history, so a staging write that arrives under `Hold` is never owed, for a stage this member holds and one it does not.
+#[test]
+fn a_staging_write_is_never_owed_under_hold_and_is_owed_in_a_window() {
+    use crate::engine::Position;
+    let (author, _da) = engine();
+    author
+        .create_stage(DB, STAGE, MergePolicy::Document, Hlc::new(physical_now_ms() + 60_000, 0))
+        .unwrap();
+    let creation =
+        everything(&author).into_iter().find(|e| e.kind == OpKind::CreateCollection).unwrap();
+    let stage = author.get_collection(DB, STAGE).unwrap();
+    author.insert(&stage, bson::doc! { "_id": 1 }).unwrap();
+    let row = everything(&author).into_iter().find(|e| e.kind == OpKind::Insert).unwrap();
+    let (m, _dm) = engine();
+    m.apply_batch(&[creation]).unwrap();
+    let txn = m.begin_write(WriterHolder::Replication).unwrap();
+    assert!(
+        !m.staging_write_is_owed(&txn, &row, Position::Hold).unwrap(),
+        "under Hold a staging write is never owed: a snapshot document is state, with no entry to serve"
+    );
+    assert!(
+        m.staging_write_is_owed(&txn, &row, Position::InWindow).unwrap(),
+        "in a window the author's write, below any binding and not in the oplog, is owed"
+    );
+    let other = kimmy_core::OplogEntry {
+        stamp: Stamp::new(row.stamp.hlc, NodeId::from_bytes([3; 16]), row.stamp.epoch),
+        ..row.clone()
+    };
+    assert!(
+        !m.staging_write_is_owed(&txn, &other, Position::InWindow).unwrap(),
+        "a write of another origin is not a staging write"
+    );
+    txn.abort().unwrap();
+}
