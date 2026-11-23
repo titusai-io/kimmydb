@@ -121,6 +121,9 @@ mod clock_bound_entry_tests;
 mod clock_bound_document_tests;
 
 #[cfg(test)]
+mod swap_kind_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]

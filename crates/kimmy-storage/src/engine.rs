@@ -176,6 +176,8 @@ pub struct Engine {
     /// sees it. Exists only in test builds and under `test-hooks`.
     #[cfg(any(test, feature = "test-hooks"))]
     clock_offset_ms: std::sync::atomic::AtomicI64,
+    /// The physical clock U1 reads, held at one value (0 = not held); test builds and `test-hooks` only.
+    clock_frozen_ms: std::sync::atomic::AtomicU64,
     /// The parsed validators and their counters (ADR-257).
     pub(crate) validators: crate::validator::ValidatorState,
     /// Documents a `multi: true` filtered write commits per transaction
@@ -1665,6 +1667,7 @@ impl Engine {
             own_refusals: Mutex::new(Default::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
+            clock_frozen_ms: std::sync::atomic::AtomicU64::new(0),
             validators: Default::default(),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -2356,7 +2359,33 @@ impl Engine {
     /// This member's physical clock as U1 reads it: [`physical_now_ms`], and in a test build or
     /// under `test-hooks` plus this engine's own offset ([`Self::set_clock_offset_for_tests`]).
     pub fn clock_bound_now_ms(&self) -> u64 {
+        if let Some(frozen) = self.clock_frozen() {
+            return frozen;
+        }
         physical_now_ms().saturating_add_signed(self.clock_offset())
+    }
+
+    /// The physical clock U1 reads when a test holds it still ([`Self::freeze_clock_bound_for_tests`]).
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn clock_frozen(&self) -> Option<u64> {
+        match self.clock_frozen_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn clock_frozen(&self) -> Option<u64> {
+        None
+    }
+
+    /// Hold the physical clock U1 judges a stamp against at `ms`, or let it run again with `None`: a stamp exactly
+    /// the bound ahead of a clock that moves while the test runs is a coin toss, and the boundary is what a test of
+    /// the bound is about. Only the bound's clock is held; the logical clock still mints from the real one.
+    /// Test builds and `test-hooks` only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn freeze_clock_bound_for_tests(&self, ms: Option<u64>) {
+        self.clock_frozen_ms.store(ms.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// This engine's offset of the U1 clock: the test offset in a test build or under

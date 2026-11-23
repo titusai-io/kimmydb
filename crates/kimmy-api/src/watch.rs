@@ -315,6 +315,22 @@ mod tests {
         assert!(event["resumeToken"].is_string() && event["clusterTime"].is_string(), "{event}");
     }
 
+    /// A swap's entries (ADR-272) are no document change either, and a swap's loss record, which names a document, is
+    /// not rendered as a `conflictResolved` (Q7's) or as anything else.
+    #[test]
+    fn a_swaps_entries_are_not_rendered() {
+        let token =
+            ResumeToken::from_stamp(Stamp::new(Hlc::new(5, 0), NodeId::generate(), Epoch::ZERO));
+        for kind in [OpKind::BindCollection, OpKind::AbandonStage, OpKind::OutLossRecord] {
+            let swap = entry(kind, DocId::Int64(1), Some(vec![1, 2, 3]));
+            assert!(
+                render(&ChangeEvent::Change { entry: Arc::new(swap), token: token.clone() }, true)
+                    .is_none(),
+                "{kind:?} is rendered as no event"
+            );
+        }
+    }
+
     /// A loss record is replicated history, not a change a client asked for: until the stream has an event for
     /// it, it is not rendered as an ordinary document change.
     #[test]

@@ -2526,8 +2526,18 @@ pub(crate) mod tests {
             OpKind::UniqueViolation,
             OpKind::UnkeyedDocument,
             OpKind::LossRecord,
+            // A swap's entries (ADR-272): a register event is a schema change and its loss record is a record of
+            // its own, whose bytes a `conflictResolved` consumer would read as merge state.
+            OpKind::BindCollection,
+            OpKind::AbandonStage,
+            OpKind::OutLossRecord,
         ] {
             assert!(!wanted(&entry(kind, 1, 1), 1, &[]), "{kind:?} must not be delivered");
+            assert!(
+                !wanted(&entry(kind, 1, 1), 1, &["conflictResolved".to_string()])
+                    || kind == OpKind::LossRecord,
+                "{kind:?} is not a conflictResolved either"
+            );
         }
         for kind in [OpKind::Insert, OpKind::Update, OpKind::Replace, OpKind::Delete] {
             assert!(wanted(&entry(kind, 1, 1), 1, &[]), "{kind:?} should be delivered");

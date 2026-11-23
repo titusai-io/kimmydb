@@ -3214,17 +3214,22 @@ impl VectorError {
 }
 
 /// Whether an oplog entry of this kind can be a reason to embed a document again: not a member's own observation
-/// of its data (a unique violation, a document filed unkeyed) and not a loss record, which names a document and
-/// describes no change to it.
+/// of its data (a unique violation, a document filed unkeyed) and not a loss record (a Q7 one, or a swap's, ADR-272),
+/// which names a document and describes no change to it.
 fn describes_a_change_to_embed(kind: OpKind) -> bool {
-    !kind.is_local_observation() && !kind.is_loss_record()
+    !kind.is_local_observation() && !kind.is_loss_record() && !kind.is_out_loss_record()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
     fn only_a_change_to_a_document_is_a_reason_to_embed_again() {
-        for kind in [OpKind::UniqueViolation, OpKind::UnkeyedDocument, OpKind::LossRecord] {
+        for kind in [
+            OpKind::UniqueViolation,
+            OpKind::UnkeyedDocument,
+            OpKind::LossRecord,
+            OpKind::OutLossRecord,
+        ] {
             assert!(!describes_a_change_to_embed(kind), "{kind:?} is no reason to embed again");
         }
         for kind in [

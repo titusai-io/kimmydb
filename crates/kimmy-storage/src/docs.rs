@@ -1660,6 +1660,14 @@ impl Engine {
         // entry is also bounded by the state it carries; every other entry, a `document` entry and a loss record included,
         // by its stamp.
         self.refuse_replicated_stamp(coll, entry)?; // U1: the choke point, before the first witness
+        // A swap's loss record names a document and merges into none: it has its own arm of the batch step, and no
+        // route of the document apply may carry it (ADR-272, decision 13). One that does is refused, not applied as a
+        // write of the document it names.
+        if entry.kind.is_out_loss_record() {
+            return Err(StorageError::Corrupt(
+                "a swap's loss record reached the document apply path".into(),
+            ));
+        }
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
             self.witness(&entry.stamp);

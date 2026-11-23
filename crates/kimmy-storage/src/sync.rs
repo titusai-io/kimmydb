@@ -2289,6 +2289,22 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
+        // A swap's loss record (ADR-272) is a kind of its own: it merges into no document, it is not a schema change,
+        // and it is not one of Q7's loss records, whose bytes are merge state. The bound is its first step, as it is
+        // for a schema change: a stamp far ahead would move this member's clock when witnessed. What it does once
+        // taken (the report, the event) is not in this commit: the entry is read, appended and served onward.
+        if entry.kind.is_out_loss_record() {
+            self.refuse_if_past_the_bound(&entry.stamp, None)?;
+            self.commit_run(run)?;
+            if let Some(body) = &entry.body {
+                let _: kimmy_core::OutLoss = bson::deserialize_from_slice(body)?;
+            }
+            if let DdlOutcome::Applied = self.append_replicated_ddl(entry, position)? {
+                outcome.applied += 1;
+            }
+            return Ok(Step::Taken);
+        }
+
         // A legacy `Collection` entry names nothing and cannot be acted on. A loss record goes on: it is
         // judged by its collection as a document is, and relayed (kept in the oplog, written to no document)
         // by `apply_remote_in_txn`.
@@ -3051,6 +3067,17 @@ impl Engine {
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
                 }
+            }
+            // A bind and an abandon are register events and schema changes (ADR-272), decided here so that the bound
+            // above is their first step. Their bodies are read now, so that one that does not decode stops the
+            // round, as a malformed body of any other schema change does. What a member does with them (the
+            // register, the burial of a stage) is not in this commit: the entry is appended and served onward, as an
+            // entry that takes no effect is (ADR-236).
+            OpKind::BindCollection => {
+                let _: kimmy_core::CollectionBind = bson::deserialize_from_slice(body)?;
+            }
+            OpKind::AbandonStage => {
+                let _: kimmy_core::StageAbandon = bson::deserialize_from_slice(body)?;
             }
             _ => {}
         }

@@ -216,6 +216,21 @@ mod tests {
         LossAt::Field(kimmy_core::merge_state::Path::new(["a", "b"]).unwrap())
     }
 
+    /// A swap's loss record (ADR-272) names a document and is replicated like a Q7 loss entry, but its bytes are not
+    /// merge state: it is not a loss entry this module can render, whatever its body.
+    #[test]
+    fn a_swaps_loss_record_is_not_a_renderable_conflict() {
+        let swap = kimmy_core::OplogEntry {
+            stamp: Stamp::new(Hlc::new(5, 0), NodeId::from_bytes([3; 16]), Epoch::ZERO),
+            kind: OpKind::OutLossRecord,
+            collection: CollectionId(7),
+            doc_id: Some(DocId::Int64(1)),
+            body: Some(bson::serialize_to_vec(&doc! { "db": "d" }).unwrap()),
+            meta: None,
+        };
+        assert!(!is_renderable(&swap));
+    }
+
     /// The format is a promise to every consumer that deduplicates on it: these strings were computed by an independent implementation
     /// (SHA-256 over the encoding in `conflict_event_id`'s doc, in Python) and must never change without a new version prefix.
     #[test]
