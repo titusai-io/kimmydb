@@ -124,6 +124,9 @@ mod clock_bound_document_tests;
 mod clock_bound_tombstone_tests;
 
 #[cfg(test)]
+mod database_drop_stage_tests;
+
+#[cfg(test)]
 mod swap_kind_tests;
 
 #[cfg(test)]
