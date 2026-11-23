@@ -244,6 +244,32 @@ pub(crate) fn check_released_took_effect(
     }
 }
 
+/// The stamp of the earliest binding of `physical` this member knows, in effect or ahead of its position: the stamp rule S
+/// compares a staged row against (ADR-272, decision 6). `None` while the stage has no binding here.
+pub(crate) fn binding_stamp_of(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    physical: &str,
+) -> Result<Option<Stamp>> {
+    let known = |timeline: Timeline| {
+        timeline
+            .events()
+            .iter()
+            .filter(
+                |(_, event)| matches!(event, RegisterEvent::Bind { physical: p } if p == physical),
+            )
+            .map(|(stamp, _)| *stamp)
+            .min()
+    };
+    let in_effect = known(timeline(txn, db, logical)?);
+    let ahead = known(parked(txn, db, logical)?);
+    Ok(match (in_effect, ahead) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
+}
+
 /// Why a member serving `served` refuses writes to `logical` (decision 7): an event in effect supersedes it or, failing
 /// that, one known ahead of its position would.
 pub(crate) fn refusal(

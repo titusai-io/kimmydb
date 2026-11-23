@@ -1622,6 +1622,28 @@ impl Engine {
         Ok(true)
     }
 
+    /// Rule S with the S-bind-origin trigger (ADR-272, decision 6): whether `entry`, a write that no held version lets win, is a
+    /// staged row this member must still be able to serve. It is one when its collection is a stage, its origin is the origin of
+    /// the stage's creation (the job that stages the rows), and its stamp is below the stage's binding here, or the stage has
+    /// none. Nothing wider: an ordinary write of another origin to a physical that was a stage, or one above the binding (a
+    /// late write), is witnessed away as ever. The caller never asks under `Hold`: a snapshot document is state, not history.
+    fn staged_row_is_owed(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+    ) -> Result<bool> {
+        let Some(stage) = &coll.stage else { return Ok(false) };
+        if entry.stamp.origin() != stage.created.origin() {
+            return Ok(false);
+        }
+        let Some(logical) = kimmy_core::swap::logical_of_stage(&coll.name) else {
+            return Ok(false);
+        };
+        let bound = crate::register::binding_stamp_of(txn, &coll.db, logical, &coll.name)?;
+        Ok(bound.is_none_or(|binding| entry.stamp < binding))
+    }
+
     /// The body of [`Self::apply_remote`], inside a transaction the caller
     /// owns.
     ///
@@ -1735,6 +1757,18 @@ impl Engine {
                     && entry.body.is_none()
                     && existing.as_ref().is_some_and(|c| !c.is_live() && c.stamp == entry.stamp);
                 drop(docs);
+                // Rule S (ADR-272, decision 6): a staged row of the creator's, superseded here, is still appended.
+                if !owed
+                    && position != Position::Hold
+                    && self.staged_row_is_owed(txn, coll, entry)?
+                    && crate::engine::delete_entry_is_owed(txn, &entry.stamp)?
+                {
+                    // No document, index or count write: the document stands, the entry joins this member's oplog so that it
+                    // can serve it onward, and nothing is published.
+                    let released = crate::engine::append_oplog_at(txn, entry, position)?;
+                    self.witness(&entry.stamp);
+                    return Ok(RemoteApplied::Written { released });
+                }
                 if owed && crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
                     // No document, index or count write: the tombstone stands.
                     // The entry joins this member's oplog.

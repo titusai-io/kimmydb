@@ -35,6 +35,12 @@ pub fn is_stage_name(name: &str) -> bool {
     name.contains(STAGE_NAME_MARK)
 }
 
+/// The logical name a stage's physical name was made from (`orders` for `orders.__stg.0a1b`); `None` for a name that is not a
+/// stage's.
+pub fn logical_of_stage(name: &str) -> Option<&str> {
+    name.split_once(STAGE_NAME_MARK).map(|(logical, _)| logical)
+}
+
 /// A logical collection name being bound to a physical collection: the body of a
 /// `BindCollection` entry.
 ///
@@ -320,6 +326,8 @@ mod tests {
         assert!(!is_stage_name("orders.__vectors"));
         assert!(!is_stage_name("__stg.orders"), "the mark is a suffix of a name, with its dot");
         assert_eq!(STAGE_NAME_MARK, ".__stg.");
+        assert_eq!(logical_of_stage("orders.__stg.0a1b"), Some("orders"));
+        assert_eq!(logical_of_stage("orders"), None);
     }
 
     #[test]
