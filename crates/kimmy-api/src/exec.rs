@@ -3464,7 +3464,10 @@ pub(crate) fn plan_sink(
         )));
     }
     auth.require(Action::Write, target_db, Some(target_coll))?;
-    let existing = match state.engine.get_collection(target_db, target_coll) {
+    // The target is a name a client uses: resolved through the register FOR A WRITE (ADR-272, decision 7; D10), so a `$merge` or an
+    // insert-only `$out` into a name this member knows was superseded is refused like any write to it, and one into a swapped name
+    // writes the physical it answers from and never makes a collection named like it
+    let existing = match state.engine.resolve_for_write(target_db, target_coll).map(|r| r.meta) {
         Ok(meta) => Some(meta),
         Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
             ..

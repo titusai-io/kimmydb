@@ -23,8 +23,8 @@ const PHYSICAL_BY_NAME: &[(&str, usize, &str)] = &[
     ),
     (
         "exec.rs",
-        3,
-        "the two index paths and the `$out` target's existence check, which address the named collection itself",
+        2,
+        "the two index paths, which address the named collection itself (Q6.5 moves them to the register)",
     ),
 ];
 
