@@ -29,6 +29,7 @@ pub mod partial;
 pub mod path;
 pub mod record;
 pub mod regex;
+pub mod swap;
 pub mod type_names;
 pub mod validator;
 pub mod vector_meta;
@@ -55,6 +56,10 @@ pub use oplog::{Issued, MAX_TOKEN_ORIGINS, OpKind, OplogEntry, ResumeToken};
 pub use origin::{Epoch, Origin};
 pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;
+pub use swap::{
+    CollectionBind, MAX_PHYSICAL_NAME_LEN, OutLoss, RegisterDecodeError, RegisterEvent,
+    StageAbandon, StageInfo,
+};
 pub use validator::{ValidationAction, ValidationLevel, ValidatorSpec};
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
 pub use vector_record::{ChunkSource, Unstamped, VectorRecord, similarity};

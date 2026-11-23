@@ -81,6 +81,18 @@ pub enum OpKind {
     /// oplog in windows and snapshots like a write, and a member that receives one relays it. It is the carrier
     /// of a record to a member that takes the record by no other route.
     LossRecord,
+    /// A logical collection name was bound to a physical collection (ADR-272). Body:
+    /// [`crate::CollectionBind`]. A schema change: replicated, decided by the schema-change
+    /// dispatch.
+    BindCollection,
+    /// A writer gave up a stage it never bound (ADR-272). Body: [`crate::StageAbandon`]. A schema
+    /// change, replicated like [`OpKind::BindCollection`].
+    AbandonStage,
+    /// A write a swap made late was lost, and a member reports it (ADR-272). Body:
+    /// [`crate::OutLoss`]. Not a document write and not a schema change, and not one of
+    /// [`OpKind::LossRecord`]'s merge-state records: a record kind of its own, replicated, relayed
+    /// and applied to no document.
+    OutLossRecord,
 }
 
 impl OpKind {
@@ -94,7 +106,15 @@ impl OpKind {
                 | Self::DropIndex
                 | Self::ConfigureVectors
                 | Self::ConfigureValidator
+                | Self::BindCollection
+                | Self::AbandonStage
         )
+    }
+
+    /// Whether this entry is a swap's loss record ([`OpKind::OutLossRecord`]): replicated like a
+    /// write, applied to no document, and not a [`OpKind::LossRecord`].
+    pub fn is_out_loss_record(self) -> bool {
+        matches!(self, Self::OutLossRecord)
     }
 
     /// Whether this entry carries a loss record ([`OpKind::LossRecord`]): replicated like a write, applied to no
@@ -384,8 +404,52 @@ mod tests {
             OpKind::ConfigureVectors,
             OpKind::ConfigureValidator,
             OpKind::UnkeyedDocument,
+            OpKind::BindCollection,
+            OpKind::AbandonStage,
+            OpKind::OutLossRecord,
         ] {
             assert!(!other.is_loss_record(), "{other:?} is not a loss record");
+        }
+    }
+
+    #[test]
+    fn the_swap_kinds_are_what_they_are() {
+        // A bind and an abandon are schema changes: they take the schema-change dispatch, whose first
+        // step is the clock bound.
+        for kind in [OpKind::BindCollection, OpKind::AbandonStage] {
+            assert!(kind.is_ddl(), "{kind:?} is decided by the schema-change dispatch");
+            assert!(!kind.is_document() && !kind.is_loss_record() && !kind.is_out_loss_record());
+            assert!(!kind.is_local_observation(), "{kind:?} is replicated");
+        }
+        // A swap's loss record is its own kind: not a document write, not a schema change and not a
+        // Q7 loss record, which a Q7 consumer would read as merge-state bytes.
+        let loss = OpKind::OutLossRecord;
+        assert!(loss.is_out_loss_record());
+        assert!(!loss.is_ddl() && !loss.is_document() && !loss.is_loss_record());
+        assert!(!loss.is_local_observation(), "it is replicated");
+        for other in
+            [OpKind::Insert, OpKind::LossRecord, OpKind::CreateCollection, OpKind::DropCollection]
+        {
+            assert!(!other.is_out_loss_record(), "{other:?} is not a swap's loss record");
+        }
+    }
+
+    /// The names a kind has on the wire (serde, camel case). A rename is a protocol change.
+    #[test]
+    fn the_swap_kinds_have_these_wire_names() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct K {
+            kind: OpKind,
+        }
+        for (kind, name) in [
+            (OpKind::BindCollection, "bindCollection"),
+            (OpKind::AbandonStage, "abandonStage"),
+            (OpKind::OutLossRecord, "outLossRecord"),
+        ] {
+            let bytes = bson::serialize_to_vec(&K { kind }).unwrap();
+            let doc: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+            assert_eq!(doc.get_str("kind").unwrap(), name);
+            assert_eq!(bson::deserialize_from_slice::<K>(&bytes).unwrap(), K { kind });
         }
     }
 

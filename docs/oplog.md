@@ -284,6 +284,26 @@ load, but is never written and cannot be applied — it names nothing.
 
 ---
 
+## Swap entries (ADR-272)
+
+A replacing `$out` writes into a hidden physical collection and binds the logical name to it. Three kinds carry that
+between members. Each names its target by name, and the body is BSON; a field or a tag is the stored and wire format,
+so a rename, a reorder or a renumbering is a format change (storage schema 12), never an edit.
+
+| Kind (tag) | Body | Decided by |
+|---|---|---|
+| `BindCollection` (15) | `{ db, name, physical }`: the logical `name` is bound to the physical collection | the schema-change dispatch, as a schema change |
+| `AbandonStage` (16) | `{ db, physical }`: the writer gives up a stage it never bound | the schema-change dispatch, as a schema change |
+| `OutLossRecord` (17) | `{ db, name, loser, image, cut }`: a write the swap made late is lost and reported; `image` is the lost post-image cut at the collection's cut (absent for a lost delete) and `cut` says whether it was cut; the entry's `collection` is the logical name's id and its `doc_id` the document's `_id` | its own arm of the batch step: not a schema change, not a document write, and not a `LossRecord` |
+
+What a member keeps of a name's timeline is a register: each event is a stamp and one of a binding (`1`, the physical),
+a logical drop (`2`) or a recreation (`3`, the new physical), stored as `tag ‖ [length (u16 big endian) ‖ name]`.
+
+Every one of them is refused until due when its stamp is more than `storage.max_clock_skew_secs` ahead of the member's
+clock, before anything is written ([ADR-272](decisions.md), decision 14).
+
+---
+
 ## Collection-level entries
 
 DDL appends entries too, with `kind = Collection`, no `doc_id`, and no `body`.

@@ -389,6 +389,9 @@ fn op_kind_tag(kind: OpKind) -> u8 {
         OpKind::ConfigureValidator => 12,
         OpKind::UnkeyedDocument => 13,
         OpKind::LossRecord => 14,
+        OpKind::BindCollection => 15,
+        OpKind::AbandonStage => 16,
+        OpKind::OutLossRecord => 17,
     }
 }
 
@@ -408,6 +411,9 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
         12 => OpKind::ConfigureValidator,
         13 => OpKind::UnkeyedDocument,
         14 => OpKind::LossRecord,
+        15 => OpKind::BindCollection,
+        16 => OpKind::AbandonStage,
+        17 => OpKind::OutLossRecord,
         other => return Err(corrupt(&format!("unknown op kind {other}"))),
     })
 }
@@ -518,6 +524,85 @@ mod tests {
 
     fn meta_of(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Every kind and the tag it is stored under. The numbers are the stored format (storage schema
+    /// 12 added 15, 16 and 17) and are never renumbered or reused.
+    const OP_KIND_TAGS: [(OpKind, u8); 17] = [
+        (OpKind::Insert, 1),
+        (OpKind::Update, 2),
+        (OpKind::Replace, 3),
+        (OpKind::Delete, 4),
+        (OpKind::Collection, 5),
+        (OpKind::UniqueViolation, 6),
+        (OpKind::CreateCollection, 7),
+        (OpKind::DropCollection, 8),
+        (OpKind::CreateIndex, 9),
+        (OpKind::DropIndex, 10),
+        (OpKind::ConfigureVectors, 11),
+        (OpKind::ConfigureValidator, 12),
+        (OpKind::UnkeyedDocument, 13),
+        (OpKind::LossRecord, 14),
+        (OpKind::BindCollection, 15),
+        (OpKind::AbandonStage, 16),
+        (OpKind::OutLossRecord, 17),
+    ];
+
+    #[test]
+    fn every_op_kind_is_stored_under_its_own_tag_and_no_other_tag_decodes() {
+        for (kind, tag) in OP_KIND_TAGS {
+            assert_eq!(op_kind_tag(kind), tag, "{kind:?} is stored as {tag}");
+            assert_eq!(op_kind_from_tag(tag).unwrap(), kind, "{tag} reads back as {kind:?}");
+        }
+        for tag in (0..=u8::MAX).filter(|t| !OP_KIND_TAGS.iter().any(|(_, known)| known == t)) {
+            assert!(op_kind_from_tag(tag).is_err(), "{tag} names no kind");
+        }
+    }
+
+    /// The bytes of a swap entry as the `OPLOG` table stores it: `version ‖ kind ‖ collection ‖
+    /// document id ‖ body`. The body is BSON of the payload (`kimmy_core::swap`); a change of any
+    /// of these bytes is a format change.
+    #[test]
+    fn a_swap_entry_is_these_bytes_and_reads_back() {
+        let logical = CollectionId(0x0102_0304_0506_0708);
+        let bind = OplogEntry {
+            stamp: stamp(100, 1),
+            kind: OpKind::BindCollection,
+            collection: logical,
+            doc_id: None,
+            body: Some(vec![0xAA, 0xBB]),
+            meta: None,
+        };
+        let mut want = vec![FORMAT_VERSION, 15, 1, 2, 3, 4, 5, 6, 7, 8];
+        want.extend_from_slice(&u32::MAX.to_be_bytes()); // no document id
+        want.extend_from_slice(&[0, 0, 0, 2, 0xAA, 0xBB]); // the body
+        assert_eq!(encode_oplog_entry(&bind), want);
+
+        let abandon =
+            OplogEntry { kind: OpKind::AbandonStage, body: Some(vec![7]), ..bind.clone() };
+        let mut want = vec![FORMAT_VERSION, 16, 1, 2, 3, 4, 5, 6, 7, 8];
+        want.extend_from_slice(&u32::MAX.to_be_bytes());
+        want.extend_from_slice(&[0, 0, 0, 1, 7]);
+        assert_eq!(encode_oplog_entry(&abandon), want);
+
+        // The loss record names the document it is about: the id is `_id`, an int64 here.
+        let loss = OplogEntry {
+            kind: OpKind::OutLossRecord,
+            doc_id: Some(DocId::Int64(9)),
+            body: Some(vec![]),
+            ..bind.clone()
+        };
+        let bytes = encode_oplog_entry(&loss);
+        assert_eq!(&bytes[..10], &[FORMAT_VERSION, 17, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0], "an empty body is not an absent one");
+        assert_ne!(&bytes[10..14], &u32::MAX.to_be_bytes(), "the id is present");
+
+        for entry in [bind, abandon, loss] {
+            assert_eq!(oplog_round_trip(&entry).unwrap(), entry);
+            let (kind, collection) =
+                decode_oplog_kind_and_collection(&encode_oplog_entry(&entry)).unwrap();
+            assert_eq!((kind, collection), (entry.kind, logical));
+        }
     }
 
     #[test]

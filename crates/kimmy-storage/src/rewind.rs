@@ -212,14 +212,19 @@ impl Engine {
                 }
 
                 match entry.kind {
-                    // Not a mutation, and not something a rewind has to undo.
-                    OpKind::UniqueViolation | OpKind::UnkeyedDocument => continue,
+                    // Not a mutation, and not something a rewind has to undo. A swap's loss record is the
+                    // report of a write already lost, not a write.
+                    OpKind::UniqueViolation | OpKind::UnkeyedDocument | OpKind::OutLossRecord => {
+                        continue;
+                    }
                     OpKind::CreateCollection
                     | OpKind::DropCollection
                     | OpKind::CreateIndex
                     | OpKind::DropIndex
                     | OpKind::ConfigureVectors
                     | OpKind::ConfigureValidator
+                    | OpKind::BindCollection
+                    | OpKind::AbandonStage
                     | OpKind::Collection => {
                         if after {
                             schema_changes.push(entry.kind);

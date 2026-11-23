@@ -60,7 +60,7 @@ fn holds(e: &Engine, entry: &OplogEntry) -> bool {
 }
 
 #[test]
-fn the_op_kind_tag_is_14_and_the_next_one_is_refused() {
+fn the_op_kind_tag_is_14_and_the_first_tag_no_kind_has_is_refused() {
     let (a, _da) = engine();
     let coll = field_collection(&a);
     let (key, value) = a_record_of(&a);
@@ -71,8 +71,9 @@ fn the_op_kind_tag_is_14_and_the_next_one_is_refused() {
     let back = codec::decode_oplog_entry(&codec::oplog_key(&entry.stamp), &bytes).unwrap();
     assert_eq!(back, entry);
 
+    // 15, 16 and 17 are the swap's kinds (ADR-272); 18 is the first tag no build knows.
     let mut next = bytes.clone();
-    next[1] = 15;
+    next[1] = 18;
     let refused = codec::decode_oplog_entry(&codec::oplog_key(&entry.stamp), &next);
     assert!(refused.is_err(), "a kind no build knows is refused, not read as another");
     assert!(refused.unwrap_err().to_string().contains("unknown op kind"));

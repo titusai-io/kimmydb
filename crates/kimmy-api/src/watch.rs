@@ -229,6 +229,9 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
         kimmy_core::OpKind::UnkeyedDocument => "unkeyedDocument",
         kimmy_core::OpKind::LossRecord => "conflictResolved",
+        kimmy_core::OpKind::BindCollection => "bindCollection",
+        kimmy_core::OpKind::AbandonStage => "abandonStage",
+        kimmy_core::OpKind::OutLossRecord => "outLossRecord",
     }
 }
 
