@@ -413,3 +413,39 @@ fn a_staging_row_for_a_creation_a_database_drop_refused_is_served_onward_once() 
         "the author's staging row for a creation the database's drop refused is appended and served onward, once"
     );
 }
+
+// -- F1 of the review of items 6 and 6b: the creation of a stage that arrives after the drop of its name ---------------------------------
+
+#[test]
+fn a_stage_is_buried_on_both_members_whichever_of_its_creation_and_the_drop_of_its_name_arrives_first()
+ {
+    // W creates the stage S1 of `orders` (the deadline is its creation's own HLC) and vanishes. Z drops `orders` after the deadline.
+    // X meets the creation and then the drop; Y meets the drop first (an ordinary drop: the identity's tombstone) and then the creation.
+    let (w, _dw) = engine();
+    w.create_stage(DB, S1, MergePolicy::Document, Hlc::new(physical_now_ms(), 0)).unwrap();
+    let creation = creation_of(&w, S1);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let (z, _dz) = engine();
+    z.create_collection(DB, "orders").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(z.drop_collection(DB, "orders").unwrap(), "premise: Z dropped the name");
+    let from_z = everything(&z);
+    let (x, _dx) = engine();
+    window(&x, std::slice::from_ref(&creation));
+    window(&x, &from_z);
+    let (y, _dy) = engine();
+    window(&y, &from_z);
+    assert!(
+        y.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap().is_some(),
+        "premise: Y holds the drop as the identity's tombstone"
+    );
+    window(&y, std::slice::from_ref(&creation));
+    assert!(
+        x.get_collection(DB, S1).is_err(),
+        "X, which met the creation first, buried the stage when the drop arrived"
+    );
+    assert!(
+        y.get_collection(DB, S1).is_err(),
+        "Y, which met the drop first, buries the stage as soon as its creation arrives: nothing later repairs a stage whose writer is gone"
+    );
+}
