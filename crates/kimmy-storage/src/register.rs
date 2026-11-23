@@ -147,7 +147,15 @@ fn stage_in(
         return Ok(None);
     };
     let bytes = raw.value();
-    // the fixed part, the length of the database name, and the names (a database name is never empty, and neither is a physical's)
+    // The fixed part, the length of the database name, and the names (a database name is never empty, and neither is a physical's). A row of
+    // exactly the fixed part is the form before the row named its stage: a development store of schema 12 written by an earlier build, which
+    // 0.62.0 does not upgrade (the schema 12 rule for development stores), refused by name and not read as damage of unknown cause.
+    if bytes.len() == STAGE_ROW_FIXED {
+        return Err(StorageError::Corrupt(format!(
+            "the register holds a stage row of the form before it named its stage: this store was written by a development build of storage schema 12. {}",
+            crate::migrate::no_upgrade()
+        )));
+    }
     if bytes.len() < STAGE_ROW_FIXED + 2 {
         return Err(corrupt("a stage row of the wrong length"));
     }
