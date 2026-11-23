@@ -622,6 +622,18 @@ curl -XDELETE localhost:7878/v1/db/shop -H "$A"           # every collection in 
 set the collection's validator ([Validators](validation.md)); a schema that does
 not parse is `400` and creates nothing.
 
+**What a client sees of a replacing `$out`.** A replacing `$out` builds its output in a hidden
+staging collection, whose name carries the reserved mark `.__stg.`, and the swap makes that collection
+the one the target's name answers from ([ADR-272](decisions.md), decision 15). A staging collection is
+**never listed**: `GET /v1/db/{db}/collections` does not return it, in flight or left behind by a failed
+`$out`, under a wildcard grant or any other. A data request addressed to a stage's name (find, count,
+insert, update, delete, a read by id) answers **`404 not_found`**, exactly as for a collection that does
+not exist, whether or not this member holds the stage; a schema change addressed to it answers
+`400 stage_collection`. A swapped name is listed **once, under its own name**, whichever physical
+collection the register makes visible for it; a client never meets a physical name. A name dropped after
+a swap is not listed, and a name recreated after one is listed once under its own name, as a new
+collection.
+
 `mergePolicy` is `document` or `field`, chosen here and never changed; any other
 value is `400`. A request that names none gets **`field`**; the same goes for a collection a `$out` or `$merge` stage creates.
 `field` merges concurrent writes to different fields of one document and keeps
@@ -1531,7 +1543,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
 | 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |
-| 503 | `swap_in_progress` | wait | A **write to a name** whose replacement this member knows of and cannot yet make visible ([ADR-272](decisions.md), decision 7): a replacing `$out`'s binding it holds in effect whose stage it cannot serve, or one it learned ahead of its position, or a newer drop or recreate of the name. Nothing was written. The refusal ends by itself when the member makes the newer event visible (the next sync round, or the end of a join); reads are not refused. Carries `Retry-After`. A name this member sees absent answers `404 not_found` as for any absent collection. |
+| 503 | `swap_in_progress` | wait | A **write to a name** whose replacement this member knows of and cannot yet make visible ([ADR-272](decisions.md), decision 7): a replacing `$out`'s binding it holds in effect whose stage it cannot serve, or one it learned ahead of its position, or a newer drop or recreate of the name. Nothing was written. The refusal ends by itself when the member makes the newer event visible (the next sync round, or the end of a join); reads are not refused. Carries `Retry-After: 2` (seconds): a hint, since no timer decides when the member makes the event visible, and a client retries until it does. A name this member sees absent answers `404 not_found` as for any absent collection. |
 | 503 | `clock_ahead` | elsewhere | A schema change (creating or dropping a database, a collection or an index, setting a validator, configuring vectors) was refused before anything was written because this member's own changes would be held back by the rest of the cluster until they are due: its clock is ahead of its own physical clock by more than `storage.max_clock_skew_secs`, or a peer is refusing its entries for their clock. The message names which, and for how long. Retry on another member, and fix this member's clock ([Operations](operations.md)). Ordinary writes are not refused |
 | 503 | `resolver_busy` | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered ([Operations](operations.md#discovery-formats)). Nothing was done. Carries `Retry-After` in seconds, how long a failed lookup's answer is kept. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
 | 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |

@@ -718,6 +718,43 @@ case deliberately, and now fails under the mutant with the exact message it was
 written for. The first version of it did not — it was written and commented as
 if verified before being checked, and the check is what caught that.
 
+### A mutant that makes the test error is not a kill
+
+The mutant for "the purge instant does not survive a restart" first deleted the table
+that holds the instants when the engine opens. The test went red, but on
+`Table 'purge_not_before' does not exist`, an error raised before it reached its
+assertion, so it would have gone red for any bug that touched the table at all. A kill is
+a red on the assertion the test was written for. The mutant now clears the rows and
+leaves the table, and the test fails on "the reopened member still leaves them alone
+until the instant it recorded". The mutant runner checks the designed message, and a
+list entry whose message is an error text rather than an assertion is the sign of this.
+
+### What a lab can observe of a replacing `$out` (ADR-272)
+
+These are the observables that exist, read from the code, for a lab that has no access
+to the engine.
+
+- **A superseded physical kept as a zombie** (the mutant that buries the old physical
+  with `drop_keeping_later_writes`, a late write kept in a physical named exactly like
+  the logical name). A read, count or sum by name does **not** show it, because the name
+  answers from the physical the register makes visible. What shows it is a late write
+  with no `outReplaced` event on the member that kept it while the other members report
+  it, and the name appearing more than once, or not exactly once on every member, in
+  `GET /v1/db/{db}/collections`. The divergence digest has no register section.
+- **A purge.** `kimmy_storage_bytes` is the file's length and is not a purge signal. The
+  signals are the drop purger's two `info` lines, in
+  [operations](operations.md): its start and its end (`rows`, `elapsed_ms`). A buried
+  physical's rows are left for `server.request_timeout_secs` on that member's clock, so
+  the end line comes no earlier than the burial plus that window.
+- **A late delete held only as snapshot state** cannot be reached before the snapshot
+  carries the register's events (Q6.6). Until then a snapshot page carries a delete as the
+  bare tombstone of ADR-228, with no `_id`, and a member restored by snapshot reports
+  `kimmy_register_carried_drop_deferred_total` for a drop of a swapped name it did not
+  apply.
+- **A refused write.** `503 swap_in_progress` counts in `kimmy_responses_total{class="5xx"}`
+  with the other `503`s and writes no log line. A lab asserts on the response: status,
+  code, `Retry-After: 2`. `kimmy_api_refused_total{code}` is owed at Q6.5.
+
 ---
 
 ## Fuzzing
