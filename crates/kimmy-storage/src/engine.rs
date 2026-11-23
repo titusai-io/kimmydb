@@ -2432,7 +2432,7 @@ impl Engine {
 
     /// Count one binding that stopped a window because its stage's creation is not held here (ADR-272), under the origin that
     /// sent it.
-    pub(crate) fn count_register_waiting(&self, origin: &kimmy_core::Origin) {
+    pub fn count_register_waiting(&self, origin: &kimmy_core::Origin) {
         self.register_waiting.lock().add(origin, 1);
     }
 

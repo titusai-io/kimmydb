@@ -284,6 +284,8 @@ impl AppState {
             held_marks: self.engine.held_marks()?,
             // What U1 refused, by origin (a monotonic count the engine keeps, capped at 64 labels).
             clock_refusals: self.engine.clock_refusals(),
+            // The bindings that stopped a batch for the want of their stage's creation, by origin (ADR-272).
+            register_waiting: self.engine.register_waiting_for_stage(),
             // How far this member's own clock leads its physical clock, and how long a peer still refuses its entries for
             // theirs, in whole seconds rounded up (U1's guard on schema changes reads the same two).
             clock_hlc_lead_seconds: self.engine.clock_lead_ms().div_ceil(1000),
@@ -759,6 +761,26 @@ pub(crate) mod tests {
             out.contains(&format!("kimmy_sync_clock_refused_total{{origin=\"{node}\"}} 3\n")),
             "the scrape names the origin: {out}"
         );
+    }
+
+    /// The bindings that waited for their stage's creation reach the scrape by origin, and their sum is the snapshot's one scalar
+    /// (what the OTLP bridge carries).
+    #[test]
+    fn the_engines_register_waiting_reaches_the_readings_and_the_scrape_by_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
+        let node = kimmy_core::NodeId::from_bytes([8; 16]);
+        let origin = kimmy_core::Origin { node, epoch: kimmy_core::Epoch::ZERO };
+        state.engine.count_register_waiting(&origin);
+        state.engine.count_register_waiting(&origin);
+        let readings = state.storage_readings().unwrap();
+        assert_eq!(readings.register_waiting, vec![(node.to_string(), 2)]);
+        let out = state.metrics.render_with(&readings);
+        assert!(
+            out.contains(&format!("kimmy_register_waiting_for_stage{{origin=\"{node}\"}} 2\n")),
+            "the scrape names the origin: {out}"
+        );
+        assert_eq!(state.metrics.snapshot_with(&readings).register_waiting_for_stage, 2);
     }
 
     /// `kimmy_epoch_origins` is the length of the member's own version vector at

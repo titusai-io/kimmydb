@@ -548,6 +548,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
     let metrics = Metrics::default();
     let readings = StorageReadings {
         clock_refusals: Vec::new(),
+        register_waiting: Vec::new(),
         loss_records_refused: Vec::new(),
         conflicts_resolved: Vec::new(),
         databases: 1,

@@ -12190,6 +12190,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_entries_skipped_total",
         // Since U1: the one `origin="other"` sample of the per-origin refusal family, before any origin is named.
         "kimmy_sync_clock_refused_total",
+        // Since ADR-272: the one `origin="other"` sample of the per-origin family of bindings waiting for their stage.
+        "kimmy_register_waiting_for_stage",
         // Since U1's guard on schema changes, the two gauges that follow it.
         "kimmy_clock_hlc_lead_seconds",
         "kimmy_clock_own_stamps_refused_seconds",

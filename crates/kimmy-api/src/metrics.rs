@@ -170,6 +170,9 @@ pub struct StorageReadings {
     /// What U1 has refused since start, by the origin's node id in hex: at most 64 named and the
     /// rest summed under `other` (`Engine::clock_refusals`). Not a level: a monotonic count.
     pub clock_refusals: Vec<(String, u64)>,
+    /// The batches a binding stopped because its stage's creation is not held here (ADR-272), by the origin that sent the
+    /// binding: at most 64 named and the rest summed under `other` (`Engine::register_waiting_for_stage`). A monotonic count.
+    pub register_waiting: Vec<(String, u64)>,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -597,6 +600,9 @@ pub struct MetricsSnapshot {
     pub sync_entries_skipped_beyond_advertised: u64,
     pub sync_entries_skipped_purge_pending: u64,
     pub sync_entries_skipped_clock_refused: u64,
+    /// Batches a binding stopped for the want of its stage's creation, all origins summed (ADR-272): the one scalar the OTLP
+    /// bridge carries of `kimmy_register_waiting_for_stage{origin}`.
+    pub register_waiting_for_stage: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1628,6 +1634,7 @@ impl Metrics {
                 .get(&self.sync_entries_skipped_beyond_advertised),
             sync_entries_skipped_purge_pending: self.get(&self.sync_entries_skipped_purge_pending),
             sync_entries_skipped_clock_refused: self.get(&self.sync_entries_skipped_clock_refused),
+            register_waiting_for_stage: readings.register_waiting.iter().map(|(_, n)| *n).sum(),
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -2077,6 +2084,9 @@ impl Metrics {
              # HELP kimmy_sync_clock_refused_total Replicated entries and snapshot documents of any collection this node refused until due because their clock is more than max_clock_skew_secs ahead of its own (U1), by the origin (node id) that sent them. One per stopped batch or page, counted once its commit is final; at most 64 origins are named and the rest are summed under origin=\"other\", because the label comes from a peer's stamp. A refused entry is neither applied nor witnessed and applies once it is due: a rising value names a member whose clock is ahead of this one by more than the bound, or a write from the future.\n\
              # TYPE kimmy_sync_clock_refused_total counter\n\
              {sync_clock_refused_lines}\
+             # HELP kimmy_register_waiting_for_stage Replicated bindings of a swap's stage (`$out`, ADR-272) that stopped a sync batch because the stage's creation is not held here, by the origin (node id) that sent the binding. One per stopped batch, counted once its transaction aborted; at most 64 origins are named and the rest are summed under origin=\"other\". Nothing is lost: the batch stops at the binding, is asked for again from the same place, and goes on once the creation arrives, in the same round. A value that keeps rising for one origin names a member whose stage creation never reaches this node.\n\
+             # TYPE kimmy_register_waiting_for_stage counter\n\
+             {register_waiting_lines}\
              # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.\n\
              # TYPE kimmy_clock_hlc_lead_seconds gauge\n\
              kimmy_clock_hlc_lead_seconds {clock_hlc_lead_seconds}\n\
@@ -2322,6 +2332,17 @@ impl Metrics {
                     .iter()
                     .map(|(origin, n)| {
                         format!("kimmy_sync_clock_refused_total{{origin=\"{origin}\"}} {n}\n")
+                    })
+                    .collect::<String>()
+            },
+            register_waiting_lines = if readings.register_waiting.is_empty() {
+                "kimmy_register_waiting_for_stage{origin=\"other\"} 0\n".to_string()
+            } else {
+                readings
+                    .register_waiting
+                    .iter()
+                    .map(|(origin, n)| {
+                        format!("kimmy_register_waiting_for_stage{{origin=\"{origin}\"}} {n}\n")
                     })
                     .collect::<String>()
             },
@@ -3357,6 +3378,10 @@ mod tests {
                 ("01010101010101010101010101010101".to_string(), 94),
                 ("other".to_string(), 95),
             ],
+            register_waiting: vec![
+                ("02020202020202020202020202020202".to_string(), 96),
+                ("other".to_string(), 97),
+            ],
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4152,6 +4177,10 @@ kimmy_sync_entries_skipped_total{reason=\"clock_refused\"} 82
 # TYPE kimmy_sync_clock_refused_total counter
 kimmy_sync_clock_refused_total{origin=\"01010101010101010101010101010101\"} 94
 kimmy_sync_clock_refused_total{origin=\"other\"} 95
+# HELP kimmy_register_waiting_for_stage Replicated bindings of a swap's stage (`$out`, ADR-272) that stopped a sync batch because the stage's creation is not held here, by the origin (node id) that sent the binding. One per stopped batch, counted once its transaction aborted; at most 64 origins are named and the rest are summed under origin=\"other\". Nothing is lost: the batch stops at the binding, is asked for again from the same place, and goes on once the creation arrives, in the same round. A value that keeps rising for one origin names a member whose stage creation never reaches this node.
+# TYPE kimmy_register_waiting_for_stage counter
+kimmy_register_waiting_for_stage{origin=\"02020202020202020202020202020202\"} 96
+kimmy_register_waiting_for_stage{origin=\"other\"} 97
 # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.
 # TYPE kimmy_clock_hlc_lead_seconds gauge
 kimmy_clock_hlc_lead_seconds 7001
@@ -5181,6 +5210,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // Since U1, the skipped-entries series for `clock_refused` and the one `origin="other"`
             // sample of `kimmy_sync_clock_refused_total` that exists before any origin is named.
             2
+            // Since ADR-272, the one `origin="other"` sample of `kimmy_register_waiting_for_stage`.
+            + 1
             // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
             + 6
             // Since Q7 Step 4 (C8), `kimmy_conflicts_resolved_total` and its six kinds.
@@ -5465,6 +5496,32 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         assert!(out.contains("kimmy_sync_clock_refused_total{origin=\"ab\"} 4\n"));
         assert!(out.contains("kimmy_sync_clock_refused_total{origin=\"other\"} 6\n"));
         assert!(!out.contains("kimmy_sync_clock_refused_total{origin=\"other\"} 0\n"));
+    }
+
+    /// ADR-272: the bindings that waited for their stage's creation are rendered by origin, with `origin="other"` present at zero
+    /// before any, and the snapshot carries their sum for the OTLP bridge.
+    #[test]
+    fn bindings_waiting_for_their_stage_are_counted_by_origin_and_summed_for_the_bridge() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(
+            empty.contains("kimmy_register_waiting_for_stage{origin=\"other\"} 0\n"),
+            "the series exists before anything waits"
+        );
+        assert!(empty.contains("# TYPE kimmy_register_waiting_for_stage counter\n"));
+        let readings = StorageReadings {
+            register_waiting: vec![("ab".to_string(), 4), ("other".to_string(), 6)],
+            ..Default::default()
+        };
+        let out = m.render_with(&readings);
+        assert!(out.contains("kimmy_register_waiting_for_stage{origin=\"ab\"} 4\n"));
+        assert!(out.contains("kimmy_register_waiting_for_stage{origin=\"other\"} 6\n"));
+        assert!(!out.contains("kimmy_register_waiting_for_stage{origin=\"other\"} 0\n"));
+        assert_eq!(
+            m.snapshot_with(&readings).register_waiting_for_stage,
+            10,
+            "the bridge reads the sum"
+        );
     }
 
     #[test]

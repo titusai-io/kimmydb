@@ -2315,6 +2315,15 @@ impl TelemetryGuard {
             "Sync batches and snapshot pages stopped at an entry whose clock is past max_clock_skew_secs; re-served from the same place until the entry is due.",
             sync_entries_skipped_clock_refused
         );
+        // The bindings of a swap's stage that waited for the stage's creation (ADR-272), all origins summed; the origin is on the
+        // scrape.
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.waiting_for_stage",
+            "{batch}",
+            "Sync batches stopped at a binding of a swap's stage whose creation is not held here; re-served from the same place and taken once the creation arrives.",
+            register_waiting_for_stage
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
@@ -2765,6 +2774,16 @@ fn meter_provider(cfg: &TelemetryConfig, resource: Resource) -> Result<SdkMeterP
 /// instruments above this list; an empty list says the series has none.
 #[cfg(test)]
 const NOT_BRIDGED: &[(&str, &str, &[&str])] = &[
+    (
+        "kimmy_register_waiting_for_stage",
+        "Labelled by the origin (node id) of the binding, a label that comes from a peer's \
+         stamp and is capped at 64 names on `/metrics`; every instrument on this bridge \
+         is a fixed scalar read from a `Copy` snapshot, so a per-origin family would need \
+         its own attributes and its own cardinality bound here. The total is bridged as \
+         `kimmy.register.waiting_for_stage` (the same stops, summed); the origin is on the \
+         scrape.",
+        &["kimmy.register.waiting_for_stage"],
+    ),
     (
         "kimmy_sync_clock_refused_total",
         "Labelled by the origin (node id) of the entry, a label that comes from a peer's \
