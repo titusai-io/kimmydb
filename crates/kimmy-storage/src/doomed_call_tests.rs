@@ -449,3 +449,76 @@ fn a_stage_is_buried_on_both_members_whichever_of_its_creation_and_the_drop_of_i
         "Y, which met the drop first, buries the stage as soon as its creation arrives: nothing later repairs a stage whose writer is gone"
     );
 }
+
+// -- F4 of the review of items 6 and 6b (Chris, 2026-11-23): no cause is recorded; a binding is judged by the register alone ---------------
+
+/// The drop of `orders`, stamped `wall_ms`, as a member `z` would send it.
+fn drop_of_orders(z: &Engine, wall_ms: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), z.node_id(), z.epoch()),
+        kind: OpKind::DropCollection,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: None,
+        body: Some(bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders")).unwrap()),
+        meta: None,
+    }
+}
+
+fn register_holds_an_event_for_orders(e: &Engine) -> bool {
+    use redb::ReadableDatabase;
+    let txn = e.db().begin_read().unwrap();
+    crate::register::has_events(&txn, DB, "orders").unwrap()
+}
+
+#[test]
+fn a_tombstone_on_a_stage_never_makes_its_valid_binding_history() {
+    // A stage that carries a tombstone here, whatever buried it and at whatever stamp, still has its valid binding (stamped at or below the deadline, in
+    // position) judged by the register alone: it takes effect as a register event, and it is never visible while the stage is not alive here. Two stamps:
+    // the tombstone above the binding (the drop of the name after the deadline buried the stage) and below it (the database's drop, before the binding)
+    for tombstone_above_the_binding in [true, false] {
+        let (a, _da) = engine();
+        let (z, _dz) = engine();
+        let now = physical_now_ms();
+        a.create_stage(DB, S1, MergePolicy::Document, Hlc::new(now + 60_000, 0)).unwrap();
+        let creation = creation_of(&a, S1);
+        let (m, _dm) = engine();
+        window(&m, std::slice::from_ref(&creation));
+        let binding_wall = creation.stamp.hlc.wall_ms + 10;
+        if tombstone_above_the_binding {
+            // the drop of the name stamped above the stage's deadline: the stage is buried by it, with a tombstone at that stamp
+            window(&m, std::slice::from_ref(&drop_of_orders(&z, now + 120_000)));
+        } else {
+            // the database's drop, stamped just above the creation and below the binding: the stage is buried with a tombstone below the binding
+            z.create_collection(DB, "orders").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(z.drop_database(DB).unwrap());
+            window(&m, &everything(&z));
+        }
+        assert!(
+            m.get_collection(DB, S1).is_err(),
+            "premise: the stage is buried here (above the binding: {tombstone_above_the_binding})"
+        );
+        assert!(
+            m.collection_dropped_at(CollectionId::derive(DB, S1)).unwrap().is_some(),
+            "premise: the stage's own id carries a tombstone"
+        );
+        let binding_wall = if tombstone_above_the_binding {
+            binding_wall
+        } else {
+            binding_wall.max(
+                m.collection_dropped_at(CollectionId::derive(DB, S1)).unwrap().unwrap().hlc.wall_ms
+                    + 1,
+            )
+        };
+        let bind = bind_of(&a, S1, binding_wall);
+        window(&m, std::slice::from_ref(&bind));
+        assert!(
+            register_holds_an_event_for_orders(&m),
+            "the valid binding is stored in the register, not history (tombstone above the binding: {tombstone_above_the_binding})"
+        );
+        assert!(
+            m.resolve(DB, "orders").is_err() && m.get_collection(DB, S1).is_err(),
+            "and it is never visible while its physical is not alive here (tombstone above the binding: {tombstone_above_the_binding})"
+        );
+    }
+}
