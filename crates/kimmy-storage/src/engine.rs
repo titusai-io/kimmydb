@@ -6664,12 +6664,12 @@ pub(crate) fn raise_origin_version(
     Ok(higher)
 }
 
-/// Whether a `Delete` entry whose tombstone is already here under the same stamp is
-/// missing from the oplog and may be appended: read **in the write transaction**, so two
-/// appliers of one entry cannot both decide yes, and gated **above** retention's record
-/// for the origin, which `gc` raises in the transaction that removes the entries (an
-/// entry retention took is not rebuilt below its own horizon). ADR-228.
-pub(crate) fn delete_entry_is_owed(txn: &WriteTxn<'_>, stamp: &Stamp) -> Result<bool> {
+/// Whether an entry that is not applied to any document here (a `Delete` whose tombstone is already here under the same stamp, a
+/// staged row rule S still serves onward) is missing from the oplog and may be appended. It reads only the stamp, so it is the same
+/// answer for every kind: read **in the write transaction**, so two appliers of one entry cannot both decide yes, and gated **above**
+/// retention's record for the origin, which `gc` raises in the transaction that removes the entries (an entry retention took is not
+/// rebuilt below its own horizon). ADR-228.
+pub(crate) fn entry_is_owed_to_the_oplog(txn: &WriteTxn<'_>, stamp: &Stamp) -> Result<bool> {
     #[cfg(test)]
     owed_reads::note();
     let key = codec::oplog_key(stamp);

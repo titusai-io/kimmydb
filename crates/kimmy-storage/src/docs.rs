@@ -1643,7 +1643,7 @@ impl Engine {
         if !bound.is_none_or(|binding| entry.stamp < binding) {
             return Ok(false);
         }
-        crate::engine::delete_entry_is_owed(txn, &entry.stamp)
+        crate::engine::entry_is_owed_to_the_oplog(txn, &entry.stamp)
     }
 
     /// The body of [`Self::apply_remote`], inside a transaction the caller
@@ -1767,7 +1767,7 @@ impl Engine {
                     self.witness(&entry.stamp);
                     return Ok(RemoteApplied::Written { released });
                 }
-                if owed && crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
+                if owed && crate::engine::entry_is_owed_to_the_oplog(txn, &entry.stamp)? {
                     // No document, index or count write: the tombstone stands.
                     // The entry joins this member's oplog.
                     let released = crate::engine::append_oplog_at(txn, entry, position)?;
@@ -2345,7 +2345,7 @@ impl Engine {
     ) -> Result<RemoteApplied> {
         let (released, appended) = if position == Position::Hold {
             (false, false)
-        } else if crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
+        } else if crate::engine::entry_is_owed_to_the_oplog(txn, &entry.stamp)? {
             (crate::engine::append_oplog_at(txn, entry, position)?, true)
         } else {
             (
