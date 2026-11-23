@@ -149,6 +149,9 @@ mod resolve_tests;
 mod burial_tests;
 
 #[cfg(test)]
+mod logical_drop_tests;
+
+#[cfg(test)]
 mod own_clock_tests;
 
 #[cfg(test)]
