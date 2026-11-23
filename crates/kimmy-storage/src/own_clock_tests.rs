@@ -256,3 +256,26 @@ fn only_the_peer_that_cleared_is_cleared() {
         "{refusal:?}"
     );
 }
+
+/// The whole text of each refusal an operator reads (`clock_ahead`, `503`): each clock is named once and unambiguously, so a message cannot
+/// say that a clock is ahead of "its own clock", or leave "their" and "its" to be guessed at.
+#[test]
+fn the_clock_ahead_refusal_names_the_logical_clock_and_the_system_clock() {
+    assert_eq!(
+        OwnStampRefusal::ClockAhead { lead_ms: 597_001, bound_ms: SKEW_MS }.to_string(),
+        "this member's logical clock is 598 s ahead of its system clock, more than the 300 s the cluster allows, so every other member would \
+         hold back this change until it is due; retry on another member, and fix this member's clock"
+    );
+}
+
+#[test]
+fn the_peer_refusal_names_each_clock_it_compares() {
+    let peer = NodeId::from_bytes([7; 16]);
+    assert_eq!(
+        OwnStampRefusal::PeerRefused { peer, due_in_ms: 11_001 }.to_string(),
+        format!(
+            "member {peer} is refusing this member's changes because this member's logical clock is ahead of member {peer}'s system clock, \
+             for about 12 s more, so it would not take this change; retry on another member, and check the clocks"
+        )
+    );
+}
