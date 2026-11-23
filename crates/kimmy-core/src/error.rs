@@ -327,6 +327,8 @@ impl Error {
             Some("must not contain '/', '\\', '$', spaces, or NUL")
         } else if name == "." || name == ".." {
             Some("must not be '.' or '..'")
+        } else if crate::swap::is_recreation_name(name) {
+            Some("the mark `.__rc.` is reserved for the physical collection of a recreated name")
         } else {
             None
         };
@@ -341,6 +343,14 @@ impl Error {
     /// the mark is reserved, so a client can never legitimately make such a name, and an answer that depended on the stage being
     /// held here would differ between members.
     pub fn refuse_stage_name(name: &str) -> Result<()> {
+        if crate::swap::is_recreation_name(name) {
+            // The physical of a recreated name is as hidden as a stage: refused on the name alone, with the reason a name
+            // that carries the reserved mark gets
+            return Err(Error::InvalidName {
+                name: name.to_string(),
+                reason: "the mark `.__rc.` is reserved for the physical collection of a recreated name",
+            });
+        }
         match crate::swap::logical_of_stage(name) {
             Some(logical) => {
                 Err(Error::StageCollection { name: name.to_string(), logical: logical.to_string() })
@@ -376,6 +386,23 @@ mod tests {
         }
         for fine in ["orders", "orders.stg.zz", "orders__stg", "stg", "orders.__stg"] {
             assert!(Error::refuse_stage_name(fine).is_ok(), "{fine} carries no stage mark");
+        }
+    }
+
+    #[test]
+    fn a_recreations_physical_name_is_refused_by_its_mark_and_no_client_can_make_one() {
+        for name in ["orders.__rc.zz", "a.__rc.", "orders.__rc.0a1b2c"] {
+            assert!(
+                matches!(Error::refuse_stage_name(name), Err(Error::InvalidName { .. })),
+                "{name} is refused on the name alone"
+            );
+            assert!(
+                matches!(Error::validate_name(name), Err(Error::InvalidName { .. })),
+                "{name} is not a name a client can create"
+            );
+        }
+        for fine in ["orders", "orders.rc.zz", "orders__rc", "orders.__rc", "rc.__rc"] {
+            assert!(Error::refuse_stage_name(fine).is_ok(), "{fine} carries no recreation mark");
         }
     }
 

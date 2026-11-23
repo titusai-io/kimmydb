@@ -41,6 +41,42 @@ pub fn logical_of_stage(name: &str) -> Option<&str> {
     name.split_once(STAGE_NAME_MARK).map(|(logical, _)| logical)
 }
 
+/// What a recreation's physical name contains: `{name}.__rc.{stamp}` (ADR-272, decision 6). Every recreate of a once-swapped
+/// name makes a NEW physical collection named by its own event, so that its birth is its stamp and the id of an earlier life
+/// is never reused: reusing one makes the physical's birth depend on arrival order. The name is hidden as a stage's is; the
+/// logical name answers from it once the member has made the recreate visible.
+pub const RECREATE_NAME_MARK: &str = ".__rc.";
+
+/// Whether `name` is a recreation's physical name.
+pub fn is_recreation_name(name: &str) -> bool {
+    name.contains(RECREATE_NAME_MARK)
+}
+
+/// The logical name a recreation's physical name was made from (`orders` for `orders.__rc.0a1b`); `None` for a name that is
+/// not a recreation's.
+pub fn logical_of_recreation(name: &str) -> Option<&str> {
+    name.split_once(RECREATE_NAME_MARK).map(|(logical, _)| logical)
+}
+
+/// The physical name of the recreation of `logical` that the event stamped `stamp` makes: the name, the mark and the
+/// stamp's key in hex, so two recreations never share a name and every member derives the same one.
+pub fn recreation_name(logical: &str, stamp: &Stamp) -> String {
+    let mut name =
+        String::with_capacity(logical.len() + RECREATE_NAME_MARK.len() + 2 * Stamp::KEY_LEN);
+    name.push_str(logical);
+    name.push_str(RECREATE_NAME_MARK);
+    for byte in stamp.to_key_bytes() {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name
+}
+
+/// Whether `name` is a physical name no client can address: a stage's or a recreation's. Such a name is never listed or served
+/// as itself, and a schema change addressed to it is refused on the name alone.
+pub fn is_hidden_name(name: &str) -> bool {
+    is_stage_name(name) || is_recreation_name(name)
+}
+
 /// A logical collection name being bound to a physical collection: the body of a
 /// `BindCollection` entry.
 ///
@@ -328,6 +364,25 @@ mod tests {
         assert_eq!(STAGE_NAME_MARK, ".__stg.");
         assert_eq!(logical_of_stage("orders.__stg.0a1b"), Some("orders"));
         assert_eq!(logical_of_stage("orders"), None);
+    }
+
+    #[test]
+    fn a_recreation_is_named_by_its_event() {
+        let stamp = Stamp::new(
+            Hlc::new(1_700_000_000_123, 4),
+            crate::NodeId::from_bytes([7; 16]),
+            crate::Epoch::ZERO,
+        );
+        let name = recreation_name("orders", &stamp);
+        assert!(name.starts_with("orders.__rc."));
+        assert!(is_recreation_name(&name) && is_hidden_name(&name) && !is_stage_name(&name));
+        assert_eq!(logical_of_recreation(&name), Some("orders"));
+        assert_eq!(name, recreation_name("orders", &stamp), "every member derives the same name");
+        let other = Stamp::new(Hlc::new(1_700_000_000_123, 5), stamp.node, stamp.epoch);
+        assert_ne!(name, recreation_name("orders", &other), "two events never share a name");
+        assert_eq!(RECREATE_NAME_MARK, ".__rc.");
+        assert!(!is_recreation_name("__rc.orders") && !is_recreation_name("orders.rc.x"));
+        assert!(is_hidden_name("orders.__stg.a") && !is_hidden_name("orders"));
     }
 
     #[test]

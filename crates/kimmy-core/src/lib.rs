@@ -58,8 +58,9 @@ pub use origin::{Epoch, Origin};
 pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;
 pub use swap::{
-    CollectionBind, MAX_PHYSICAL_NAME_LEN, OutLoss, RegisterDecodeError, RegisterEvent,
-    STAGE_NAME_MARK, StageAbandon, StageInfo, StageMeta, is_stage_name,
+    CollectionBind, MAX_PHYSICAL_NAME_LEN, OutLoss, RECREATE_NAME_MARK, RegisterDecodeError,
+    RegisterEvent, STAGE_NAME_MARK, StageAbandon, StageInfo, StageMeta, is_hidden_name,
+    is_recreation_name, is_stage_name, logical_of_recreation, recreation_name,
 };
 pub use validator::{ValidationAction, ValidationLevel, ValidatorSpec};
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
