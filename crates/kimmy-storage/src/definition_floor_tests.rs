@@ -111,11 +111,40 @@ struct World {
     /// A logical drop of the name, stamped above the stages' creation and below the second binding.
     drop_between: OplogEntry,
     _author: (Engine, tempfile::TempDir),
+    /// The author of the stages when they are made apart from the life (so the life's author never held them).
+    _stage_author: Option<(Engine, tempfile::TempDir)>,
 }
 
 fn world() -> World {
+    world_with(false)
+}
+
+/// A world whose stages are created BELOW the drop at `T` (before the first life is made), as when the swap began before the drop.
+fn world_below() -> World {
+    world_with(true)
+}
+
+fn world_with(stages_first: bool) -> World {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let a = Engine::open(&dir.path().join("kimmy.redb")).expect("the author's engine opens");
+    let stage_author = stages_first.then(|| {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let s =
+            Engine::open(&dir.path().join("kimmy.redb")).expect("the stage author's engine opens");
+        (s, dir)
+    });
+    let make_stages = |a: &Engine| {
+        let now = physical_now_ms();
+        a.create_stage(DB, FIRST, MergePolicy::Document, Hlc::new(now + 120_000, 0))
+            .expect("the first stage is created");
+        a.create_stage(DB, SECOND, MergePolicy::Document, Hlc::new(now + 121_000, 0))
+            .expect("the second stage is created");
+    };
+    if let Some((s, _)) = &stage_author {
+        // the stages are made by another writer, before the life: they are stamped below the drop, and the life's author never held them
+        make_stages(s);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let first = a.create_collection(DB, "orders").expect("the first life is created");
     a.create_index(DB, "orders", vec![IndexField::ascending("t")], false, Some(INDEX.into()))
         .expect("the first life takes an index");
@@ -129,12 +158,14 @@ fn world() -> World {
     a.finish_purges_now().expect("the purge of the first life finishes");
     std::thread::sleep(std::time::Duration::from_millis(5));
     a.create_collection(DB, "orders").expect("the second life is created");
+    if !stages_first {
+        make_stages(&a);
+    }
     let now = physical_now_ms();
-    a.create_stage(DB, FIRST, MergePolicy::Document, Hlc::new(now + 120_000, 0))
-        .expect("the first stage is created");
-    a.create_stage(DB, SECOND, MergePolicy::Document, Hlc::new(now + 121_000, 0))
-        .expect("the second stage is created");
-    let all = everything(&a);
+    let mut all = everything(&a);
+    if let Some((s, _)) = &stage_author {
+        all.extend(everything(s));
+    }
     let of = |kind: OpKind, id: CollectionId| -> Vec<OplogEntry> {
         all.iter().filter(|e| e.kind == kind && e.collection == id).cloned().collect()
     };
@@ -167,6 +198,7 @@ fn world() -> World {
         bind_second,
         drop_between,
         _author: (a, dir),
+        _stage_author: stage_author,
     }
 }
 
@@ -259,6 +291,11 @@ fn the_floor_is_carried_from_a_physical_that_had_taken_it_to_the_next_flip() {
 #[test]
 fn the_floor_includes_the_tombstone_the_old_id_held_before_its_burial_and_not_the_bindings_stamp() {
     // the identity has no incarnation floor and holds a tombstone of its own id: a drop that this life survived
+    // Is there a product route that leaves a tombstone on a standing identity with NO incarnation floor? The one I found by reading: a replicated
+    // drop aimed at a previous incarnation is ignored and its tombstone is still recorded (sync.rs:2884-2892, `record_collection_drop`),
+    // without a floor, on a life created above it. The tombstone it leaves is below the life's `created`, so the term can only return a value
+    // under the life's own creation: this test sets a tombstone above `created` by hand, which that route does not leave. The term is therefore
+    // close to DEFENSIVE (nothing in a product state needs it to decide); it stays a live mutant on this test.
     let w = world();
     let (m, _d) = engine();
     m.create_collection(DB, "orders").expect("the identity is created");
@@ -554,17 +591,19 @@ fn doc_on(w: &World, physical: &str, id: i64, wall_ms: u64) -> OplogEntry {
         .get_collection(DB, "scratch")
         .or_else(|_| a.create_collection(DB, "scratch"))
         .expect("the author's scratch collection");
-    a.insert(&scratch, bson::doc! { "_id": id, "t": id, "v": id })
-        .expect("the author writes a document");
-    let mut entry = everything(a)
-        .into_iter()
-        .rev()
-        .find(|e| {
+    // written once: a test that builds several members from one world asks for the same document again
+    let written = |a: &Engine| {
+        everything(a).into_iter().rev().find(|e| {
             e.kind == OpKind::Insert
                 && e.collection == scratch.id
                 && e.doc_id == Some(DocId::Int64(id))
         })
-        .expect("the insert is in the author's oplog");
+    };
+    if written(a).is_none() {
+        a.insert(&scratch, bson::doc! { "_id": id, "t": id, "v": id })
+            .expect("the author writes a document");
+    }
+    let mut entry = written(a).expect("the insert is in the author's oplog");
     entry.collection = CollectionId::derive(DB, physical);
     entry.stamp = Stamp::new(Hlc::new(wall_ms, 0), a.node_id(), a.epoch());
     entry
@@ -719,4 +758,144 @@ fn logical_drops_in_effect(m: &Engine) -> usize {
         .count();
     txn.abort().expect("the read ends");
     drops
+}
+
+// -- The floor before the flip, through product routes (the shapes A and B) ----------------------------------------------------------------
+//
+// The two-member test above sets the identity's floor by hand on a member that already holds the stages. These reach the same floor the way a
+// member does: built WITHOUT the stages, so the drop at `T` is an ordinary drop (no stage is held, so `drop_is_a_logical_drop` says no), and
+// then the stage, its copy and the binding arrive. The copy is written by hand: no product route gives a stage a copy before Q6.7. They run
+// against today's seed (register.rs:698); the F3 fix will change how the drop is judged while the name's only events are parked, and so
+// the setup of these tests, which is a known future change and not a defect of theirs.
+
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    /// The drop at `T`, then the name made again (the incarnation floor is `T`).
+    A,
+    /// The drop at `T` meets a write stamped above it: the life is re-dated, kept, and the id holds the drop's tombstone.
+    B,
+}
+
+fn stage_copy_and_flip(m: &Engine, w: &World) {
+    m.apply_batch(&w.stages).expect("the stages apply");
+    first_stage_with_a_copy(m, w, w.t.wall_ms);
+    window(m, std::slice::from_ref(&w.bind_first));
+    assert_eq!(served(m), FIRST, "premise: the flip");
+}
+
+fn the_end_state(m: &Engine, what: &str) {
+    assert!(!index_on(m, FIRST), "no x ({what})");
+    assert_eq!(entries_of_index(m, FIRST, INDEX), 0, "and no entries of it ({what})");
+    assert!(
+        entries_of_index(m, FIRST, "kept") > 0,
+        "the index above the floor is present, with entries ({what})"
+    );
+}
+
+/// What the register holds for the name: how many logical drops are in effect.
+fn shapes_end_as_the_flip_first_member(w: &World, below: bool) {
+    // the flip-first member: the name made here, the stages, the copy, the binding, and the drop at `T` after the flip (a logical drop,
+    // since an event of the name is in effect)
+    let (flip_first, _d0) = engine();
+    flip_first.create_collection(DB, "orders").expect("the name is made");
+    stage_copy_and_flip(&flip_first, w);
+    assert!(
+        index_on(&flip_first, FIRST),
+        "premise: x is still on the stage before the drop arrives"
+    );
+    window(&flip_first, std::slice::from_ref(&w.life[1]));
+    assert_eq!(
+        logical_drops_in_effect(&flip_first),
+        1,
+        "premise: the drop took effect below the stage"
+    );
+    the_end_state(&flip_first, "the flip, then the drop");
+
+    for shape in [Shape::A, Shape::B] {
+        let (m, _d) = engine();
+        match shape {
+            Shape::A => {
+                m.apply_batch(&w.life).expect("the first life, the drop and the second life apply");
+                assert_eq!(
+                    m.get_collection(DB, "orders").expect("held").incarnation_floor,
+                    Some(w.t),
+                    "premise: the ordinary drop left the identity's incarnation floor at T"
+                );
+            }
+            Shape::B => {
+                window(&m, std::slice::from_ref(&w.life[0]));
+                let stray = doc_on(w, "orders", 300, w.t.wall_ms + 1);
+                assert!(
+                    stray.stamp.hlc > w.t,
+                    "premise: the stray write is stamped above the drop"
+                );
+                window(&m, std::slice::from_ref(&stray));
+                window(&m, std::slice::from_ref(&w.life[1]));
+                let held =
+                    m.get_collection(DB, "orders").expect("premise: the life is kept, re-dated");
+                // The survivors path re-dates the life and the sweep it starts gives it the floor `T` (late_drop.rs:317, after the re-dating
+                // at 744-775), together with the tombstone at `T`: B closes through Held's incarnation term exactly as A does. Under the old
+                // flip rule it diverged all the same (no logical drop in effect, so nothing was floored). The tombstone-only term has its own
+                // test (the identity with a tombstone and no floor, set by hand).
+                assert_eq!(
+                    held.incarnation_floor,
+                    Some(w.t),
+                    "premise: the re-dated life carries the floor T, set by the sweep ({shape:?})"
+                );
+                assert_eq!(
+                    m.collection_dropped_at(orders_id()).expect("reads").map(|s| s.hlc),
+                    Some(w.t),
+                    "premise: the id holds the drop's tombstone at T"
+                );
+            }
+        }
+        m.apply_batch(&w.stages).expect("the stages apply");
+        let before = logical_drops_in_effect(&m);
+        first_stage_with_a_copy(&m, w, w.t.wall_ms);
+        window(&m, std::slice::from_ref(&w.bind_first));
+        assert_eq!(served(&m), FIRST, "premise: the flip ({shape:?})");
+        let after = logical_drops_in_effect(&m);
+        if !below {
+            // the stages are made above the drop by a writer that had not received it: no seed fires, in either shape, so a seed that fires
+            // wrongly (or a drop judged logical) is seen here
+            assert_eq!(
+                after, 0,
+                "the register's logical drops after the flip ({shape:?}, stages above the drop; before the flip: {before})"
+            );
+        }
+        if below {
+            // The stages were created below the drop: the swap began before it. What the register holds records which mechanism closes
+            // the shape. B: the seed writes the logical drop at `T` (the drop leaves the life it re-dated and the swap began below it); A: a
+            // plain recreation, so there is no seed and the end state is the new flip floor's alone.
+            let want = if matches!(shape, Shape::B) { 1 } else { 0 };
+            assert_eq!(
+                after, want,
+                "the register's logical drops after the flip ({shape:?}, stages below the drop; before the flip: {before})"
+            );
+        }
+        assert_eq!(
+            floor_of(&m, FIRST),
+            Some(w.t),
+            "premise: the flip assigned the stage the floor T ({shape:?})"
+        );
+        the_end_state(
+            &m,
+            &format!(
+                "{shape:?}: the drop, then the stages and the flip (stages below the drop: {below})"
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_member_that_met_the_ordinary_drop_before_the_stages_ends_as_one_that_met_the_flip_first() {
+    // the stages are created ABOVE the drop, by a writer that had not received it: its copy still holds x
+    shapes_end_as_the_flip_first_member(&world(), false);
+}
+
+#[test]
+fn the_same_with_the_stages_created_below_the_drop_records_which_mechanism_closes_each_shape() {
+    // B: the swap began before the drop, the life is kept, so the seed writes the logical drop (register.rs:723); A: a plain recreation, no
+    // seed, and x is absent only because the flip floors the new physical itself
+    shapes_end_as_the_flip_first_member(&world_below(), true);
 }
