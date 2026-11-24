@@ -5621,7 +5621,7 @@ impl Engine {
     /// drop entry; the burial is finished (the rows handed to the purger) when the transaction commits.
     /// The register events of `logical` in effect, and the readiness of the identity and of every physical they name, as the
     /// writer sees them.
-    fn register_view_in_txn(
+    pub(crate) fn register_view_in_txn(
         txn: &WriteTxn<'_>,
         db: &str,
         logical: &str,
@@ -5850,6 +5850,15 @@ impl Engine {
             *txn.swaps.lock() += 1;
         }
         let burials = timeline.burials(&visible, lookup);
+        // The newest logical drop in effect: what a definition must be stamped above to belong to the name's present life
+        let floor = timeline
+            .events()
+            .iter()
+            .filter(|(_, event)| {
+                event.physical().is_none() // a logical drop names no physical
+            })
+            .map(|(stamp, _)| stamp.hlc)
+            .max();
         // Burial by a later event: a stage with no binding in effect whose deadline is strictly below the visible event can never be
         // the visible physical (every valid binding of it is at or below its deadline), so it goes with the event, stamped by it
         let stage_deadlines: Vec<(&str, Hlc)> =
@@ -5864,6 +5873,7 @@ impl Engine {
         };
         let causes = std::iter::repeat_n(loser_cause, burials.len())
             .chain(std::iter::repeat_n(BuryCause::Doomed, doomed.len()));
+        let mut row_written = false;
         for (burial, cause) in burials.into_iter().chain(doomed).zip(causes) {
             let meta = {
                 let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -5887,8 +5897,11 @@ impl Engine {
                     .events()
                     .iter()
                     .any(|(_, event)| event.physical() == Some(burial.physical.as_str()));
+            // ... and the post-drop row is written from every physical a logical drop buries, the same way
+            let dropping = cause == BuryCause::Drop && matches!(&visible, Visible::Dropped { .. });
             let held = match &join_into {
                 Some(_) if has_own_event => Some(Self::read_held(txn, meta.clone())?),
+                _ if dropping => Some(Self::read_held(txn, meta.clone())?),
                 _ => None,
             };
             let buried = txn.engine.bury_standing_in_txn(
@@ -5913,17 +5926,52 @@ impl Engine {
                 }
             }
             if let (Some(into), Some(held)) = (&join_into, &held) {
-                let floor = timeline
-                    .events()
-                    .iter()
-                    .filter(|(_, event)| {
-                        event.physical().is_none() // a logical drop names no physical
-                    })
-                    .map(|(stamp, _)| stamp.hlc)
-                    .max();
                 txn.engine.join_definitions_in_txn(txn, into, held, floor)?;
             }
+            // what a logical drop buries, stamped above it, is what the name's post-drop row keeps (decision 6)
+            if dropping && let Some(held) = &held {
+                let mut row = crate::register::post_row(txn, db, logical)?.unwrap_or_default();
+                // what the row already held is floored by this drop first, and what the burial brings is floored as it is merged: two
+                // floors on two sets of data, so the row that is committed is the floor's, with nothing left to floor it afterwards
+                if let Some(floor) = floor {
+                    row.floor(floor);
+                }
+                row_written = true;
+                row.merge(
+                    &held.indexes,
+                    &held.tombstones,
+                    held.validator_changed.map(|changed| (&held.validator, changed)),
+                    floor,
+                );
+                crate::register::write_post_row(txn, db, logical, &row)?;
+            }
             txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried, cause));
+        }
+        // The post-drop row (decision 6): a later drop floors it; the next physical that becomes visible takes it through the join and
+        // deletes it in this transaction; a physical that becomes visible by this event keeps of its own copy only what is above the floor
+        match &visible {
+            // a drop that buried nothing (the name was already absent) still floors the row it finds; one whose burial wrote the row has
+            // floored it already
+            Visible::Dropped { .. } if !row_written => {
+                if let (Some(floor), Some(mut row)) =
+                    (floor, crate::register::post_row(txn, db, logical)?)
+                {
+                    row.floor(floor);
+                    crate::register::write_post_row(txn, db, logical, &row)?;
+                }
+            }
+            Visible::Bound { physical, stamp } | Visible::Created { physical, stamp } => {
+                if took_effect == Some(*stamp)
+                    && let Some(floor) = floor
+                {
+                    txn.engine.floor_definitions_in_txn(txn, db, physical, floor)?;
+                }
+                if let Some(row) = crate::register::post_row(txn, db, logical)? {
+                    txn.engine.join_definitions_in_txn(txn, physical, &row.into_held(db), floor)?;
+                    crate::register::delete_post_row(txn, db, logical)?;
+                }
+            }
+            Visible::Dropped { .. } | Visible::Identity => {}
         }
         // After the pass, before the commit: the point where a transaction that fails must leave every counter as it was
         #[cfg(test)]

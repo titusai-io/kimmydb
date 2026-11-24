@@ -2990,12 +2990,27 @@ impl Engine {
                         self.release_ddl_mark_if_held(&entry.stamp, position)?;
                         return Ok(DdlOutcome::Applied);
                     }
-                    Ddl::Gone => {
-                        return Ok(DdlOutcome::UnknownCollection(format!(
-                            "{}.{}",
-                            target.db, target.collection
-                        )));
-                    }
+                    // A swapped name that a logical drop has made absent keeps the definition in its post-drop row (rule 2: never an unknown
+                    // collection, never a stop); anything else is the unknown collection it was.
+                    Ddl::Gone => match self.definition_for_an_absent_swapped_name(
+                        &target.db,
+                        &target.collection,
+                        crate::join::Definition::Index(&target.index),
+                        entry.stamp,
+                    )? {
+                        crate::join::Absent::NotSwapped => {
+                            return Ok(DdlOutcome::UnknownCollection(format!(
+                                "{}.{}",
+                                target.db, target.collection
+                            )));
+                        }
+                        crate::join::Absent::History => {
+                            self.release_ddl_mark_if_held(&entry.stamp, position)?;
+                            return Ok(DdlOutcome::Applied);
+                        }
+                        // its entry is appended below, as for one that stands
+                        crate::join::Absent::Written => {}
+                    },
                     Ddl::Refused(reason) => {
                         // The operator's signal: this node now lacks an index
                         // its peers hold, and nothing will retry it. Once per
@@ -3135,6 +3150,22 @@ impl Engine {
                     }
                     Ddl::Applied(_) => {}
                     Ddl::Gone => {
+                        match self.definition_for_an_absent_swapped_name(
+                            &target.db,
+                            &target.collection,
+                            crate::join::Definition::DropIndex(&target.index),
+                            entry.stamp,
+                        )? {
+                            crate::join::Absent::NotSwapped => {}
+                            crate::join::Absent::History => {
+                                self.release_ddl_mark_if_held(&entry.stamp, position)?;
+                                return Ok(DdlOutcome::Applied);
+                            }
+                            // a swapped name that a logical drop made absent: the drop is in its post-drop row, its entry appended below
+                            crate::join::Absent::Written => {
+                                return self.append_replicated_ddl(entry, position);
+                            }
+                        }
                         // The collection is gone, and with it the index; the
                         // drop is history. The tombstone is still recorded,
                         // for the reason the `DropCollection` arm records
@@ -3229,6 +3260,7 @@ impl Engine {
                 let target: kimmy_core::ValidatorSet = bson::deserialize_from_slice(body)?;
                 // Last writer wins, on the stamp, and never refused for what the schema
                 // says: a replicated change is applied as sent (ADR-257).
+                let spec = target.validator.clone();
                 let applied = settle(self.set_validator_inner(
                     &target.db,
                     &target.collection,
@@ -3238,12 +3270,24 @@ impl Engine {
                 ))?;
                 match applied {
                     Ddl::Applied(_) => {}
-                    Ddl::Gone => {
-                        return Ok(DdlOutcome::UnknownCollection(format!(
-                            "{}.{}",
-                            target.db, target.collection
-                        )));
-                    }
+                    Ddl::Gone => match self.definition_for_an_absent_swapped_name(
+                        &target.db,
+                        &target.collection,
+                        crate::join::Definition::Validator(&spec),
+                        entry.stamp,
+                    )? {
+                        crate::join::Absent::NotSwapped => {
+                            return Ok(DdlOutcome::UnknownCollection(format!(
+                                "{}.{}",
+                                target.db, target.collection
+                            )));
+                        }
+                        crate::join::Absent::History => {
+                            self.release_ddl_mark_if_held(&entry.stamp, position)?;
+                            return Ok(DdlOutcome::Applied);
+                        }
+                        crate::join::Absent::Written => {}
+                    },
                     Ddl::Refused(reason) => {
                         warn!(
                             db = %target.db,

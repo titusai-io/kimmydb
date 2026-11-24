@@ -235,3 +235,121 @@ impl Engine {
         Ok(())
     }
 }
+
+impl crate::register::PostRow {
+    /// The row as the data a join takes from.
+    pub(crate) fn into_held(self, db: &str) -> Held {
+        Held {
+            db: db.to_string(),
+            id: None,
+            indexes: self.indexes,
+            tombstones: self.tombstones,
+            validator: self.validator,
+            validator_changed: self.validator_changed,
+        }
+    }
+}
+
+/// A definition entry, as the post-drop row takes it.
+pub(crate) enum Definition<'a> {
+    /// A creation of an index (its stamp is the entry's).
+    Index(&'a IndexMeta),
+    /// A drop of the index of this name.
+    DropIndex(&'a str),
+    /// A validator change, its removal included.
+    Validator(&'a Option<kimmy_core::ValidatorSpec>),
+}
+
+/// What became of a definition entry for a name that has no collection to apply to.
+pub(crate) enum Absent {
+    /// The name is not a swapped name with a logical drop in effect: today's answer, an unknown collection, stands.
+    NotSwapped,
+    /// Stamped at or below the logical drop: the dropped life's, history.
+    History,
+    /// Merged into the name's post-drop row.
+    Written,
+}
+
+impl Engine {
+    /// A definition made to a swapped name that a logical drop in effect has made absent (ADR-272, decision 6; Q6.5-2): stamped above the drop
+    /// it merges into the name's post-drop row, in a transaction of its own as every definition arm applies (the merge replaces per name and
+    /// stamp, so an apply delivered again leaves the row as after one delivery); at or below it, it is history. A name that is not a swapped
+    /// name with a drop in effect (no register event, or the newest drop only parked, so that the name still answers) is
+    /// [`Absent::NotSwapped`] and the caller does what it did before.
+    pub(crate) fn definition_for_an_absent_swapped_name(
+        &self,
+        db: &str,
+        logical: &str,
+        definition: Definition<'_>,
+        stamp: Stamp,
+    ) -> Result<Absent> {
+        use kimmy_core::register_state::Visible;
+        let txn = self.begin_write(crate::engine::WriterHolder::Ddl)?;
+        let (timeline, ready) = Self::register_view_in_txn(&txn, db, logical)?;
+        let visible = timeline.visible(|p| {
+            ready.get(p).copied().unwrap_or(kimmy_core::register_state::Ready::Buried)
+        });
+        let Visible::Dropped { stamp: dropped } = visible else {
+            txn.abort()?;
+            return Ok(Absent::NotSwapped);
+        };
+        if stamp.hlc <= dropped.hlc {
+            txn.abort()?;
+            return Ok(Absent::History);
+        }
+        let mut row = crate::register::post_row(&txn, db, logical)?.unwrap_or_default();
+        let floor = Some(dropped.hlc);
+        match definition {
+            Definition::Index(index) => {
+                let mut index = index.clone();
+                index.created = Some(stamp);
+                row.merge(std::slice::from_ref(&index), &[], None, floor);
+            }
+            Definition::DropIndex(name) => {
+                row.merge(&[], &[(IndexMeta::derive_id(name), stamp)], None, floor);
+            }
+            Definition::Validator(spec) => row.merge(&[], &[], Some((spec, stamp)), floor),
+        }
+        crate::register::write_post_row(&txn, db, logical, &row)?;
+        txn.commit()?;
+        Ok(Absent::Written)
+    }
+
+    /// A physical that becomes visible keeps of its own definitions only what is stamped above the newest logical drop in effect: a stage
+    /// created below the drop and bound above it carries a copy of the dropped life's definitions, which are not the new life's (model A3).
+    pub(crate) fn floor_definitions_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        db: &str,
+        physical: &str,
+        floor: Hlc,
+    ) -> Result<()> {
+        let mut n: CollectionMeta = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let Some(row) = collections.get((db, physical))? else { return Ok(()) };
+            serde_json::from_slice(row.value())?
+        };
+        let fill = self.walk(WalkScope::Background);
+        let ended: Vec<u32> = n
+            .indexes
+            .iter()
+            .filter(|i| i.created.is_none_or(|c| c.hlc <= floor))
+            .map(|i| i.id)
+            .collect();
+        let validator_ended =
+            n.validator_changed.is_none_or(|c| c.hlc <= floor) && n.validator.is_some();
+        if ended.is_empty() && !validator_ended {
+            return Ok(());
+        }
+        for id in &ended {
+            let mut entries = open_walk_table_in(txn, tables::INDEX_ENTRIES, fill)?;
+            index::clear_index_entries(&mut entries, index::index_id_range(n.id, *id))?;
+        }
+        n.indexes.retain(|i| !ended.contains(&i.id));
+        if validator_ended {
+            n.validator = None;
+            n.validator_changed = None;
+        }
+        Self::put_collection_meta(txn, &n)
+    }
+}

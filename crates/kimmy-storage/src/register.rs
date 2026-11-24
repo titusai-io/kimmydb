@@ -44,7 +44,6 @@ pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
 /// while the name is absent. Merged by stamp (the higher wins, a tie goes to the drop), joined into the next physical that becomes visible
 /// and deleted in that transaction.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // read by the tests of this commit and written by the next
 pub(crate) struct PostRow {
     /// The indexes, each with its creation stamp.
     pub(crate) indexes: Vec<kimmy_core::IndexMeta>,
@@ -59,8 +58,121 @@ fn post_key(db: &str, logical: &str) -> [u8; 8] {
     CollectionId::derive(db, logical).0.to_be_bytes()
 }
 
+impl PostRow {
+    /// Whether the row holds nothing: no index, no tombstone, no validator.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+            && self.tombstones.is_empty()
+            && self.validator.is_none()
+            && self.validator_changed.is_none()
+    }
+
+    /// Remove what is stamped at or below `floor` (a logical drop's hlc): the dropped life's.
+    pub(crate) fn floor(&mut self, floor: Hlc) {
+        self.indexes.retain(|i| i.created.is_some_and(|c| c.hlc > floor));
+        self.tombstones.retain(|(_, s)| s.hlc > floor);
+        if self.validator_changed.is_none_or(|s| s.hlc <= floor) {
+            self.validator = None;
+            self.validator_changed = None;
+        }
+    }
+
+    /// Merge definitions into the row by stamp, carrying only what is stamped above `floor`: per index name the higher stamp wins and a tie
+    /// goes to the drop; two definitions that differ go to the later creation stamp; the validator goes by its stamp. REPLACES per name and
+    /// stamp and never appends, so delivering the same definition twice leaves the row as after one delivery.
+    pub(crate) fn merge(
+        &mut self,
+        indexes: &[kimmy_core::IndexMeta],
+        tombstones: &[(u32, Stamp)],
+        validator: Option<(&Option<kimmy_core::ValidatorSpec>, Stamp)>,
+        floor: Option<Hlc>,
+    ) {
+        let above = |s: &Stamp| floor.is_none_or(|f| s.hlc > f);
+        let mut ids: Vec<u32> = indexes.iter().map(|i| i.id).collect();
+        ids.extend(self.indexes.iter().map(|i| i.id));
+        ids.extend(tombstones.iter().map(|(i, _)| *i));
+        ids.extend(self.tombstones.iter().map(|(i, _)| *i));
+        ids.sort_unstable();
+        ids.dedup();
+        let tomb =
+            |tombs: &[(u32, Stamp)], id: u32| tombs.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
+        let mut next_indexes = Vec::new();
+        let mut next_tombs = Vec::new();
+        for id in ids {
+            let src_def = indexes
+                .iter()
+                .find(|i| i.id == id)
+                .filter(|i| i.created.as_ref().is_none_or(&above));
+            let dst_def = self.indexes.iter().find(|i| i.id == id);
+            let drop = [tomb(tombstones, id).filter(|s| above(s)), tomb(&self.tombstones, id)]
+                .into_iter()
+                .flatten()
+                .max();
+            let winner = match (src_def, dst_def) {
+                (Some(s), Some(d)) if s.differences(d).is_empty() => {
+                    let mut kept = d.clone();
+                    if let (Some(sc), Some(dc)) = (s.created, d.created)
+                        && sc > dc
+                    {
+                        kept.created = Some(sc);
+                    }
+                    Some(kept)
+                }
+                (Some(s), Some(d)) => match (s.created, d.created) {
+                    (Some(sc), Some(dc)) if sc > dc => Some(s.clone()),
+                    _ => Some(d.clone()),
+                },
+                (Some(s), None) => Some(s.clone()),
+                (None, Some(d)) => Some(d.clone()),
+                (None, None) => None,
+            };
+            let ended = match (&winner, drop) {
+                (Some(w), Some(d)) => w.created.is_none_or(|c| d >= c),
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            if let Some(d) = drop {
+                next_tombs.push((id, d));
+            }
+            if !ended && let Some(w) = winner {
+                next_indexes.push(w);
+            }
+        }
+        self.indexes = next_indexes;
+        self.tombstones = next_tombs;
+        if let Some((spec, changed)) = validator
+            && above(&changed)
+            && self.validator_changed.is_none_or(|c| changed > c)
+        {
+            self.validator = spec.clone();
+            self.validator_changed = Some(changed);
+        }
+    }
+}
+
+/// Write the post-drop row of `logical`, or delete it when it holds nothing.
+pub(crate) fn write_post_row(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    row: &PostRow,
+) -> Result<()> {
+    let mut table = txn.open_table(tables::REGISTER_POST)?;
+    if row.is_empty() {
+        table.remove(post_key(db, logical).as_slice())?;
+    } else {
+        table.insert(post_key(db, logical).as_slice(), serde_json::to_vec(row)?.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Delete the post-drop row of `logical`, in the transaction that joins it into the next physical.
+pub(crate) fn delete_post_row(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<()> {
+    txn.open_table(tables::REGISTER_POST)?.remove(post_key(db, logical).as_slice())?;
+    Ok(())
+}
+
 /// The post-drop row of `logical`, if it has one.
-#[allow(dead_code)] // read by the next commit's join
 pub(crate) fn post_row(
     txn: &redb::WriteTransaction,
     db: &str,
