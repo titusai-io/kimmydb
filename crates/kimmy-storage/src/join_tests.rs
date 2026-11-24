@@ -1934,3 +1934,389 @@ fn a_definition_entry_addressed_to_a_physical_the_member_never_held_stops_the_wi
         "an entry addressed to a physical this member never held is an unknown collection and stops the window (today)"
     );
 }
+
+// -- The arms' floor (ADR-272, decision 6, rule 4; Q6.5-4) --------------------------------------------------------------------------------
+//
+// A physical that became visible has no tombstone of its own and no incarnation floor, so what an arm judged a definition by (the standing
+// collection's own floors and tombstones) says nothing of the drop that ended the life it replaced. The one rule every route judges a
+// definition by (`definition_of_an_ended_life`) reads the newest logical drop in effect for the name as well, on the `hlc`, a tie being the
+// drop's. And what an arm remembers of a definition (an index's tombstone, a refusal's hint) is keyed by the physical it judged it against.
+
+/// A member whose recreation is visible over the logical drop at `W + 5` that is in effect, with nothing delivered to the recreation: it
+/// holds no incarnation floor, no definition floor and no tombstone of its own.
+fn recreation_visible_over_the_drop_in_effect(
+    w: &World,
+) -> (Arc<Engine>, tempfile::TempDir, String, OplogEntry) {
+    let (m, d) = member(w);
+    flip(&m, &w.bind, Route::Window);
+    let drop = logical_drop(w, 5);
+    window(&m, std::slice::from_ref(&drop));
+    let (recreate, physical) = recreation(w, 9, None);
+    window(&m, std::slice::from_ref(&recreate));
+    assert_eq!(served(&m), physical, "premise: the recreation is visible");
+    let standing = m.get_collection(DB, &physical).expect("premise: the recreation is held");
+    assert!(
+        standing.incarnation_floor.is_none() && standing.definition_floor.is_none(),
+        "premise: the recreation has no floor of its own"
+    );
+    assert_eq!(
+        m.collection_dropped_at(standing.id).expect("reads"),
+        None,
+        "premise: the recreation's id holds no tombstone"
+    );
+    (m, d, physical, drop)
+}
+
+#[test]
+fn a_definition_at_or_below_the_drop_arriving_after_the_recreation_is_visible_is_history_by_the_registers_floor_alone()
+ {
+    // the runs moved from Q6.5-3's test 5 (an equal `hlc` from a node above the drop's and from one below it) and test 6 (below the drop).
+    // A failure is COLLECTED per run and asserted at the end, so a run that fails does not hide the runs after it
+    let mut failures: Vec<String> = Vec::new();
+    for (run, tie, above) in
+        [("tie, node above", true, true), ("tie, node below", true, false), ("below", false, true)]
+    {
+        let w = world();
+        let (m, _d, physical, drop) = recreation_visible_over_the_drop_in_effect(&w);
+        let (other, _od) = author_sorting(author(&w), above);
+        let old = if tie {
+            stage_index_entry(&other, "orders", "old_1", "t", drop.stamp.hlc.wall_ms)
+        } else {
+            stage_index_entry(&other, "orders", "old_1", "t", at(&w, 3))
+        };
+        if tie {
+            assert_eq!(old.stamp.hlc, drop.stamp.hlc, "premise: the same hlc ({run})");
+            assert_eq!(old.stamp > drop.stamp, above, "premise: the node sorts as the run says");
+        }
+        let later = stage_index_entry(&other, "orders", "after_1", "v", at(&w, 11));
+        let outcome = window(&m, &[old.clone(), later.clone()]);
+        if outcome.stopped() {
+            failures.push(format!("the entries are judged, not a stop ({run})"));
+        }
+        if holds(&m, &physical, "old_1") {
+            failures.push(format!("old_1 is on the recreation ({run})"));
+        }
+        if !holds(&m, &physical, "after_1") {
+            failures.push(format!("the later entry of the same window was not applied ({run})"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a definition at or below the drop is the dropped life's, on the recreation that has no floor of its own, and a later entry of the same window was applied: {failures:?}"
+    );
+}
+
+#[test]
+fn an_older_index_delivered_again_is_history_on_a_member_that_floored_at_the_join_and_never_held_it()
+ {
+    // Expected RED before the arm reads the register. The drop is met first, then the flip: the member never held `old_1` and wrote no
+    // tombstone for it, the identity was made at the real clock and has no incarnation floor, and the flip assigns the new physical no
+    // definition floor here, so nothing but the register's floor refuses the older create. If this is green at the tests commit, something
+    // else refused it, and that is to be found and named, not assumed.
+    let w = world();
+    let (m, _d) = member(&w);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(served(&m), UNBOUND, "premise: the flip over the drop in effect");
+    assert_eq!(tombstone(&m, UNBOUND, "old_1"), None, "premise: no tombstone for the index");
+    assert!(!holds(&m, UNBOUND, "old_1"), "premise: the member never held it");
+    let outcome = window(&m, &[definition(&w, "old_1", "t", 3), definition(&w, "later_1", "t", 8)]);
+    assert!(!outcome.stopped(), "the redelivery reached the arm and the window did not stop");
+    assert!(holds(&m, UNBOUND, "later_1"), "a later entry of the same window was applied");
+    assert!(
+        !holds(&m, UNBOUND, "old_1"),
+        "the older create is history on the member that floored at the join"
+    );
+}
+
+#[test]
+fn a_drop_of_an_index_older_than_the_one_on_the_new_physical_is_remembered_under_the_new_physical_and_not_under_the_identity()
+ {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&definition(&w, "i_1", "t", 7)));
+    assert!(holds(&m, BOUND, "i_1"), "premise: the index is on the new physical");
+    let id = kimmy_core::IndexMeta::derive_id("i_1");
+    let identity = CollectionId::derive(DB, "orders");
+    assert_eq!(
+        m.index_dropped_at(identity, id).expect("reads"),
+        None,
+        "premise: nothing under the identity"
+    );
+    assert_eq!(tombstone(&m, BOUND, "i_1"), None, "premise: nothing under the new physical");
+    // a drop stamped below the index's creation, from a member that had not seen it: declined, and remembered
+    let stale = drop_index_entry(author(&w), "i_1", at(&w, 6), None);
+    let outcome = window(&m, std::slice::from_ref(&stale));
+    assert!(!outcome.stopped(), "the drop is judged, not a stop");
+    assert_eq!(outcome.ddl_declined, 1, "premise: the drop was declined and counted, as news");
+    assert!(holds(&m, BOUND, "i_1"), "the drop is older than the index it names: declined");
+    assert_eq!(
+        tombstone(&m, BOUND, "i_1"),
+        Some(stale.stamp),
+        "remembered under the physical that holds the index, at the drop's stamp"
+    );
+    assert_eq!(
+        m.index_dropped_at(identity, id).expect("reads"),
+        None,
+        "and none is written under the identity's id, which the burial never clears"
+    );
+    // served again, the drop is one this member has recorded: not counted a second time (a re-served window is not news)
+    let again = window(&m, std::slice::from_ref(&stale));
+    assert_eq!(
+        again.ddl_declined, 0,
+        "a drop recorded under the physical is a replay, and not counted"
+    );
+}
+
+#[test]
+fn a_refused_index_leaves_its_hint_under_the_new_physical_and_the_burial_clears_it() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let identity = CollectionId::derive(DB, "orders");
+    let bound = CollectionId::derive(DB, BOUND);
+    // an index this build cannot apply: a time-to-live over two fields
+    let refused = {
+        let index = kimmy_core::IndexMeta {
+            id: kimmy_core::IndexMeta::derive_id("ttl_2"),
+            name: "ttl_2".into(),
+            fields: vec![IndexField::ascending("a"), IndexField::ascending("b")],
+            unique: false,
+            enforcement: Enforcement::Local,
+            multikey: false,
+            expire_after_secs: Some(60),
+            partial_filter: None,
+            created: None,
+        };
+        OplogEntry {
+            stamp: Stamp::new(Hlc::new(at(&w, 7), 0), author(&w).node_id(), author(&w).epoch()),
+            kind: OpKind::CreateIndex,
+            collection: identity,
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&IndexCreate {
+                    db: DB.into(),
+                    collection: "orders".into(),
+                    index,
+                })
+                .expect("the creation body encodes"),
+            ),
+            meta: None,
+        }
+    };
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty()
+            && m.refusal_hints(bound).expect("reads").is_empty(),
+        "premise: no hint under either id"
+    );
+    let outcome = window(&m, std::slice::from_ref(&refused));
+    assert_eq!(outcome.ddl_refused, 1, "premise: the member refused the index");
+    assert_eq!(
+        m.refusal_hints(bound).expect("reads").len(),
+        1,
+        "the hint is under the physical that refused it"
+    );
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty(),
+        "and none is under the identity's id, which nothing clears"
+    );
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(served(&m), UNBOUND, "premise: the second flip buries the first physical");
+    assert!(
+        m.refusal_hints(bound).expect("reads").is_empty(),
+        "the burial clears the hint with the physical"
+    );
+}
+
+// -- The same floor on the other routes that judge a definition, and the tombstone of a drop that is applied -------------------------------
+
+/// Apply the pages of a snapshot of `orders` from `sender` to `m`, with a BOUND: a route that refuses every page whole may never advance its
+/// progress, and a loop with no bound hangs the queue instead of failing on a designed message.
+fn apply_the_pages(m: &Engine, sender: &Engine) {
+    let mut progress = crate::SnapshotProgress::of_collection(CollectionId::derive(DB, "orders"));
+    for _ in 0..50 {
+        if progress.is_complete() {
+            return;
+        }
+        let page = sender
+            .snapshot_page(progress.after().cloned(), progress.scope())
+            .expect("the sender's page");
+        m.apply_snapshot_page(sender.node_id(), &mut progress, &page).expect("the page applies");
+    }
+    assert!(
+        progress.is_complete(),
+        "the page route did not advance: 50 pages and the pull is not complete"
+    );
+}
+
+/// A sender that holds `orders` with an index made at its own clock, which is below every stamp of the author of the swap (the author's
+/// stamps are `world()`'s margin above the real clock): the dropped life's definition, as a page names it.
+fn a_sender_with_an_old_index(name: &str) -> (Arc<Engine>, tempfile::TempDir) {
+    let (a, d) = engine();
+    a.create_collection(DB, "orders").expect("the sender's collection");
+    a.create_index(DB, "orders", field("t"), false, Some(name.into())).expect("the sender's index");
+    (a, d)
+}
+
+#[test]
+fn a_snapshot_page_naming_an_index_at_or_below_the_drop_does_not_restore_it_into_the_recreation() {
+    let w = world();
+    let (m, _d, physical, drop) = recreation_visible_over_the_drop_in_effect(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    assert!(
+        a.get_collection(DB, "orders")
+            .expect("the sender holds it")
+            .index("by_t")
+            .and_then(|i| i.created)
+            .is_some_and(|created| created.hlc < drop.stamp.hlc),
+        "premise: the index is the dropped life's"
+    );
+    apply_the_pages(&m, &a);
+    assert!(
+        !holds(&m, &physical, "by_t"),
+        "a page's definition of the dropped life is not restored into the physical that stands"
+    );
+}
+
+#[test]
+fn a_drop_of_an_index_after_the_flip_leaves_its_tombstone_under_the_new_physical_and_the_older_creation_is_history_there()
+ {
+    // PINS Q6.5-1's door: the drop is applied by the target it resolved, so the tombstone was already keyed by the physical's id
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&definition(&w, "i_1", "t", 7)));
+    assert!(
+        entries(&m, BOUND, "i_1") > 0,
+        "premise: the index is on the new physical with entries"
+    );
+    let id = kimmy_core::IndexMeta::derive_id("i_1");
+    let identity = CollectionId::derive(DB, "orders");
+    assert!(
+        tombstone(&m, BOUND, "i_1").is_none()
+            && m.index_dropped_at(identity, id).expect("reads").is_none(),
+        "premise: no tombstone under either id"
+    );
+    let drop = drop_index_entry(author(&w), "i_1", at(&w, 8), None);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(!holds(&m, BOUND, "i_1"), "the index is dropped");
+    assert_eq!(
+        tombstone(&m, BOUND, "i_1"),
+        Some(drop.stamp),
+        "the tombstone is under the new physical's id, at the drop's stamp"
+    );
+    assert_eq!(
+        m.index_dropped_at(identity, id).expect("reads"),
+        None,
+        "and none is under the identity's id"
+    );
+    let outcome = window(&m, &[definition(&w, "i_1", "t", 6), definition(&w, "later_1", "v", 9)]);
+    assert!(!outcome.stopped(), "the older creation delivered again is judged, not a stop");
+    assert!(holds(&m, BOUND, "later_1"), "a later entry of the same window was applied");
+    assert!(
+        !holds(&m, BOUND, "i_1"),
+        "the older creation is history by the tombstone, and the index is still absent"
+    );
+}
+
+// Controls for the one site of an index drop that keeps the entry's id (the collection is gone, so no physical stands to name another): an
+// ordinary absent name records the tombstone under the name's own id and is an unknown collection, as it always was; a swapped absent name
+// records none, because the drop goes to the name's post-drop row.
+#[test]
+fn an_index_drop_for_an_absent_name_nobody_swapped_records_its_tombstone_under_the_entrys_id() {
+    let w = world();
+    let (m, _d) = engine();
+    let drop = drop_index_entry(author(&w), "i_1", at(&w, 3), None);
+    let outcome = window(&m, std::slice::from_ref(&drop));
+    assert_eq!(outcome.unknown_collection, 1, "an unknown collection, as it always was");
+    assert_eq!(
+        m.index_dropped_at(
+            CollectionId::derive(DB, "orders"),
+            kimmy_core::IndexMeta::derive_id("i_1")
+        )
+        .expect("reads"),
+        Some(drop.stamp),
+        "the tombstone is recorded under the name's own id"
+    );
+}
+
+#[test]
+fn an_index_drop_for_a_swapped_name_that_is_absent_goes_to_the_row_and_records_no_tombstone() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert!(absent(&m), "premise: the name is absent under the drop in effect");
+    let drop = drop_index_entry(author(&w), "i_1", at(&w, 7), None);
+    let outcome = window(&m, std::slice::from_ref(&drop));
+    assert!(!outcome.stopped() && outcome.unknown_collection == 0, "not an unknown collection");
+    assert_eq!(
+        m.index_dropped_at(
+            CollectionId::derive(DB, "orders"),
+            kimmy_core::IndexMeta::derive_id("i_1")
+        )
+        .expect("reads"),
+        None,
+        "no tombstone is recorded under the identity's id: the drop is in the post-drop row"
+    );
+    assert!(!no_row(&m), "the post-drop row holds it");
+}
+
+#[test]
+fn a_definition_at_or_below_the_drop_arriving_after_the_bound_stage_took_it_is_history_on_the_stage()
+ {
+    // the standing physical is a STAGE: the name is found from the stage's own name. The drop is stamped BELOW the binding (W - 5), so the
+    // stage stays visible over it (a drop above the flip would bury the bound stage).
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&drop_below(&w, 5)));
+    assert_eq!(served(&m), BOUND, "premise: the bound stage still serves, over a drop below it");
+    let wall = w.bind.stamp.hlc.wall_ms;
+    let old = stage_index_entry(author(&w), "orders", "old_1", "t", wall - 6);
+    let later = stage_index_entry(author(&w), "orders", "later_1", "v", wall - 3);
+    let outcome = window(&m, &[old, later]);
+    assert!(!outcome.stopped(), "the entries are judged, not a stop");
+    assert!(
+        !holds(&m, BOUND, "old_1"),
+        "a definition at or below the drop in effect is the dropped life's on the stage"
+    );
+    assert!(holds(&m, BOUND, "later_1"), "and a later entry of the same window was applied");
+}
+
+#[test]
+fn a_definition_between_two_logical_drops_in_effect_is_history_by_the_newer() {
+    // both drops are below the binding (W - 8 and W - 5), so the stage serves over both; the definition is above the older and at or below
+    // the newer
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&drop_below(&w, 8)));
+    window(&m, std::slice::from_ref(&drop_below(&w, 5)));
+    assert_eq!(served(&m), BOUND, "premise: the bound stage still serves over both drops");
+    assert_eq!(logical_drops_in_register(&m), 2, "premise: both drops are in effect");
+    let wall = w.bind.stamp.hlc.wall_ms;
+    let between = stage_index_entry(author(&w), "orders", "between_1", "t", wall - 6);
+    let after = stage_index_entry(author(&w), "orders", "after_1", "v", wall - 3);
+    let outcome = window(&m, &[between, after]);
+    assert!(!outcome.stopped(), "the entries are judged, not a stop");
+    assert!(
+        !holds(&m, BOUND, "between_1"),
+        "a definition above the older drop and below the newer is the dropped life's: judged by the newest drop in effect"
+    );
+    assert!(holds(&m, BOUND, "after_1"), "and a later entry of the same window was applied");
+}
+
+/// How many logical drops of `orders` are in effect on the member.
+fn logical_drops_in_register(m: &Engine) -> usize {
+    let txn = m.begin_write(crate::WriterHolder::Ddl).expect("a writer");
+    let drops = crate::register::timeline(&txn, DB, "orders")
+        .expect("the register reads")
+        .events()
+        .iter()
+        .filter(|(_, event)| event.physical().is_none())
+        .count();
+    txn.abort().expect("the read ends");
+    drops
+}

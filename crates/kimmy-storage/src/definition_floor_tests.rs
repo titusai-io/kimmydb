@@ -511,7 +511,9 @@ fn a_definition_between_the_floor_and_a_later_drop_that_the_standing_physical_ho
     window(&m, std::slice::from_ref(&w.bind_first));
     assert_eq!(served(&m), FIRST, "premise: the first stage is visible above the drop");
     assert_eq!(floor_of(&m, FIRST), Some(w.t), "premise: it took the floor T");
-    window(&m, std::slice::from_ref(&between));
+    // by hand: with the drop already in effect the arm refuses a definition at or below it (rule 4), and this test is about the state of the
+    // stage that holds one, which the next flip must not carry
+    index_by_hand(&m, &w, FIRST, INDEX, "t", between.stamp.hlc.wall_ms);
     assert!(
         index_on(&m, FIRST),
         "premise: the definition between T and the drop is on the first stage"
@@ -660,6 +662,47 @@ fn index_rows(m: &Engine, physical: &str, name: &str) -> usize {
     )
     .expect("the index rows are readable")
     .len()
+}
+
+/// An index on `physical` made at `wall_ms` by the author, by hand: through the restored-definition door, which names the physical and asks
+/// nothing of the register, so it lands where the arm would refuse it (a definition at or below a logical drop in effect, rule 4) and the
+/// rows of the documents already there are built under it.
+fn index_by_hand(m: &Engine, w: &World, physical: &str, name: &str, path: &str, wall_ms: u64) {
+    let created = Stamp::new(Hlc::new(wall_ms, 0), w._author.0.node_id(), w._author.0.epoch());
+    m.create_index_inner(
+        DB,
+        physical,
+        vec![IndexField::ascending(path)],
+        false,
+        Enforcement::Local,
+        Some(name.into()),
+        None,
+        None,
+        crate::index::CreateOrigin::Restored(created),
+        &|_, _| Ok(false),
+    )
+    .expect("the index is made by hand");
+}
+
+/// [`first_stage_with_a_copy`] for a stage that stands under a drop already in effect, where the arm refuses `x` (at or below the drop):
+/// the documents arrive by the window and the two indexes are made by hand.
+fn first_stage_with_a_copy_by_hand(m: &Engine, w: &World, x_wall: u64) {
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    window(
+        m,
+        &[
+            doc_on(w, FIRST, 201, wall - 8),
+            doc_on(w, FIRST, 202, wall - 8),
+            doc_on(w, FIRST, 203, wall - 8),
+        ],
+    );
+    index_by_hand(m, w, FIRST, INDEX, "t", x_wall);
+    index_by_hand(m, w, FIRST, "kept", "v", wall + 7);
+    assert!(entries_of_index(m, FIRST, INDEX) > 0, "premise: x is on the first stage with entries");
+    assert!(
+        entries_of_index(m, FIRST, "kept") > 0,
+        "premise: the index above the floor is on it with entries"
+    );
 }
 
 /// The first stage's own copy, by hand: three documents and two indexes, `x` at `x_wall` and `kept` above everything.
@@ -887,7 +930,13 @@ fn shapes_end_as_the_flip_first_member(w: &World, below: bool) {
         }
         m.apply_batch(&w.stages).expect("the stages apply");
         let before = logical_drops_in_effect(&m);
-        first_stage_with_a_copy(&m, w, w.t.wall_ms);
+        if below {
+            // the stages were created below the drop: the drop is in effect once they are here (the seed, or the shape's own recreation), and
+            // the arm refuses `x` after it, so the stage's copy is made by hand
+            first_stage_with_a_copy_by_hand(&m, w, w.t.wall_ms);
+        } else {
+            first_stage_with_a_copy(&m, w, w.t.wall_ms);
+        }
         window(&m, std::slice::from_ref(&w.bind_first));
         assert_eq!(served(&m), FIRST, "premise: the flip ({shape:?})");
         let after = logical_drops_in_effect(&m);
@@ -1137,6 +1186,8 @@ fn a_drop_arriving_between_two_parked_bindings_floors_both_physicals() {
     for how in RELEASES {
         let w = world();
         let (m, _d) = member_of_the_first_life(&w);
+        // before anything makes the drop in effect: the copy is the stage's own and lands as it was made (the arm refuses it afterwards)
+        copy_on(&m, &w, SECOND);
         m.apply_batch(std::slice::from_ref(&w.bind_first))
             .expect("the first binding is stored ahead");
         window(&m, std::slice::from_ref(&w.life[1]));
@@ -1152,7 +1203,6 @@ fn a_drop_arriving_between_two_parked_bindings_floors_both_physicals() {
             1,
             "an event parked after the drop seeds it at park time, with the first binding still only parked ({how:?})"
         );
-        copy_on(&m, &w, SECOND);
         release_bindings(&m, &[&w.bind_first, &w.bind_second], how);
         assert_eq!(
             served(&m),
@@ -1169,13 +1219,14 @@ fn the_drop_first_and_the_binding_parked_after_it_floors_the_new_physical_as_it_
     for how in RELEASES {
         let w = world();
         let (m, _d) = member_of_the_first_life(&w);
+        // before anything makes the drop in effect: the copy is the stage's own and lands as it was made (the arm refuses it afterwards)
+        copy_on(&m, &w, FIRST);
         window(&m, std::slice::from_ref(&w.life[1]));
         assert!(
             m.get_collection(DB, "orders").is_err(),
             "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
         );
         m.apply_batch(std::slice::from_ref(&w.bind_first)).expect("the binding is stored ahead");
-        copy_on(&m, &w, FIRST);
         release_bindings(&m, &[&w.bind_first], how);
         assert_eq!(served(&m), FIRST, "premise: the flip ({how:?})");
         the_stage_ends_as_a_floored_one(&m, FIRST, &format!("{how:?}"));
@@ -1197,6 +1248,8 @@ fn a_stage_created_below_a_drop_judged_ordinary_makes_it_logical_when_it_arrives
         let (m, _d) = engine();
         m.apply_batch(std::slice::from_ref(&w.life[0])).expect("the first life applies");
         m.apply_batch(&w.stages[1..]).expect("the second stage's creation applies");
+        // before anything makes the drop in effect: the copy is the stage's own and lands as it was made (the arm refuses it afterwards)
+        copy_on(&m, &w, SECOND);
         m.apply_batch(std::slice::from_ref(&w.bind_second)).expect("the binding is stored ahead");
         window(&m, std::slice::from_ref(&w.life[1]));
         assert!(
@@ -1233,7 +1286,6 @@ fn a_stage_created_below_a_drop_judged_ordinary_makes_it_logical_when_it_arrives
             met_first,
             "the stage created below the drop ends as it does on a member that met its creation first ({how:?})"
         );
-        copy_on(&m, &w, SECOND);
         release_bindings(&m, &[&w.bind_second], how);
         assert_eq!(served(&m), SECOND, "premise: the flip ({how:?})");
         the_stage_ends_as_a_floored_one(&m, SECOND, &format!("{how:?}"));
