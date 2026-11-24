@@ -3466,27 +3466,29 @@ impl Engine {
                 // without what it did, or what it did without the entry (decision 3).
                 let mut append_at = position;
                 if let Some(apply) = register {
-                    let put = match (&apply.event, apply.mode) {
+                    let (put, seeded) = match (&apply.event, apply.mode) {
                         // no event: the entry only changes what the register decides (a stage's creation). The first thing a name's register
                         // learns may be this creation, with the name's drop already held as the identity's tombstone: the drop is a logical
                         // drop at its stamp, as it is when a binding is the first event, so a stage created below it is judged against it
-                        // (and doomed) here as it is on a member that met the creation first (review of items 6 and 6b, F1)
+                        // (and doomed) here as it is on a member that met the creation first (review of items 6 and 6b, F1). The creation's
+                        // stamp is the stage's, which is what the seed asks of a standing identity.
                         (None, _) => {
-                            crate::register::seed_from_the_tombstone(
+                            let seeded = crate::register::seed_from_the_tombstone(
                                 &txn,
                                 &apply.db,
                                 &apply.logical,
+                                Some(entry.stamp),
                             )?;
-                            kimmy_core::register_state::Put::Stored
+                            (kimmy_core::register_state::Put::Stored, seeded)
                         }
-                        (Some(event), RegisterMode::Effect) => crate::register::put(
+                        (Some(event), RegisterMode::Effect) => crate::register::put_seeding(
                             &txn,
                             &apply.db,
                             &apply.logical,
                             entry.stamp,
                             event.clone(),
                         )?,
-                        (Some(event), RegisterMode::Park) => crate::register::park(
+                        (Some(event), RegisterMode::Park) => crate::register::park_seeding(
                             &txn,
                             &apply.db,
                             &apply.logical,
@@ -3506,9 +3508,12 @@ impl Engine {
                     if apply.mode == RegisterMode::Park {
                         append_at = crate::engine::Position::Hold;
                     }
-                    // A binding that took effect buries the physicals it binds out, in this transaction (Q6.4 item 1)
-                    if put == kimmy_core::register_state::Put::Stored
-                        && apply.mode == RegisterMode::Effect
+                    // A binding that took effect buries the physicals it binds out, in this transaction (Q6.4 item 1). So does a seed: the
+                    // drop it put in effect ends the remains of the identity now, whatever became of the event that brought it (a first event
+                    // that is only parked, or a binding judged invalid, included), and not at the next settle.
+                    if seeded
+                        || (put == kimmy_core::register_state::Put::Stored
+                            && apply.mode == RegisterMode::Effect)
                     {
                         Engine::settle_register_in_txn(&txn, &apply.db, &apply.logical)?;
                     }

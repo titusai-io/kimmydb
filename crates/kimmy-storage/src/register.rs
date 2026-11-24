@@ -292,8 +292,20 @@ pub(crate) fn put(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
-    seed_from_the_tombstone(txn, db, logical)?;
-    store(txn, tables::REGISTER, db, logical, stamp, event)
+    Ok(put_seeding(txn, db, logical, stamp, event)?.0)
+}
+
+/// [`put`], and whether the name's register was seeded from the identity's tombstone on the way (the caller settles the name when it
+/// was: a seeded drop is in effect whatever became of the event itself).
+pub(crate) fn put_seeding(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    stamp: Stamp,
+    event: RegisterEvent,
+) -> Result<(Put, bool)> {
+    let seeded = seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
+    Ok((store(txn, tables::REGISTER, db, logical, stamp, event)?, seeded))
 }
 
 /// Record an event that arrived ahead of its position: known, not in effect. The same door, so a binding that could never
@@ -305,11 +317,32 @@ pub(crate) fn park(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<Put> {
-    seed_from_the_tombstone(txn, db, logical)?;
+    Ok(park_seeding(txn, db, logical, stamp, event)?.0)
+}
+
+/// [`park`], and whether the name's register was seeded on the way, as [`put_seeding`].
+pub(crate) fn park_seeding(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    stamp: Stamp,
+    event: RegisterEvent,
+) -> Result<(Put, bool)> {
+    let seeded = seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
     if timeline(txn, db, logical)?.events().iter().any(|(held, _)| *held == stamp) {
-        return Ok(Put::Duplicate);
+        return Ok((Put::Duplicate, seeded));
     }
-    store(txn, tables::REGISTER_INFO, db, logical, stamp, event)
+    Ok((store(txn, tables::REGISTER_INFO, db, logical, stamp, event)?, seeded))
+}
+
+/// The stamp of the creation of the stage `event` names: `None` for an event that names none (a drop, a recreation) and for a
+/// binding of a stage whose creation this member does not know.
+fn stage_created_by(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    event: &RegisterEvent,
+) -> Result<Option<Stamp>> {
+    Ok(stage_of(txn, db, event)?.map(|stage| stage.created))
 }
 
 fn store(
@@ -481,31 +514,51 @@ pub(crate) fn event_target(
 /// The first event of a name seeds the register from the identity's drop (Q6.4 item 1b): a member that applied a drop of the
 /// name before it knew of any swap holds that drop only as the identity's tombstone, and the binding that arrives afterwards
 /// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name
-/// known, in effect or ahead, and the identity not standing, a tombstone is a logical drop at its stamp. A binding stamped
-/// above it is not touched by it, and one below it is buried by it, as on every other member.
+/// known, in effect or ahead, a tombstone is a logical drop at its stamp, and a binding stamped above it is not touched by it
+/// while one below it is buried by it, as on every other member. Returns whether it wrote the row, so that the caller settles
+/// the name: the seeded drop is in effect, and what it ends is buried in the same transaction, whatever became of the event
+/// that brought the seed (a first event that is only parked, or a binding judged invalid, included).
+///
+/// The rule behind it: **a past drop of a name is a logical drop only if a stage of the name was created below it.** The
+/// identity not standing, the drop took it whole and the first event that arrives is judged against the drop as it is (no life
+/// is left for the seed to bury). The identity standing, a tombstone is also what an ordinary re-create leaves behind (the
+/// creation reads it for its floor and never removes it) and what a database's drop leaves on a life it spared, so the
+/// seed buries a standing life only when it is the remains this very drop re-dated (it keeps writes stamped after the drop,
+/// ADR-231, and its `created` is the drop's successor: a life created after the drop is not what the drop ended) and
+/// the swap began below the drop (`stage_created`, the creation of the stage the first event names, is below it). `None`
+/// is an event that names no stage, which never seeds on a standing identity.
 pub(crate) fn seed_from_the_tombstone(
     txn: &redb::WriteTransaction,
     db: &str,
     logical: &str,
-) -> Result<()> {
+    stage_created: Option<Stamp>,
+) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
     if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
         || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()
     {
-        return Ok(());
-    }
-    if txn.open_table(tables::COLLECTIONS)?.get((db, logical))?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let dropped = {
         let table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
         match table.get(id.0)? {
             Some(raw) => crate::codec::decode_oplog_key(raw.value())?,
-            None => return Ok(()),
+            None => return Ok(false),
         }
     };
-    store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?;
-    Ok(())
+    let standing = match txn.open_table(tables::COLLECTIONS)?.get((db, logical))? {
+        Some(raw) => Some(serde_json::from_slice::<crate::meta::CollectionMeta>(raw.value())?),
+        None => None,
+    };
+    if let Some(meta) = standing {
+        let remains_of_this_drop = meta.is_redated() && meta.created == dropped.hlc.successor();
+        let began_below = stage_created.is_some_and(|created| created < dropped);
+        if !(remains_of_this_drop && began_below) {
+            return Ok(false);
+        }
+    }
+    Ok(store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?
+        == Put::Stored)
 }
 
 /// Whether the name has a register event on this member, in effect or ahead of its position.
