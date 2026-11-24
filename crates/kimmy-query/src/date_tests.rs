@@ -66,7 +66,11 @@ fn tzd(op: &str, date: Bson, tz: &str) -> Bson {
 
 #[test]
 fn the_bundled_tz_database_is_the_one_the_docs_name() {
-    assert_eq!(jiff_tzdb::VERSION, Some("2026e"), "update docs/aggregation.md with the crate");
+    assert_eq!(
+        jiff_tzdb::VERSION,
+        "2026f",
+        "update docs/aggregation.md and docs/deviations.md with the crate"
+    );
 }
 
 // -- parts, with and without a zone ------------------------------------------

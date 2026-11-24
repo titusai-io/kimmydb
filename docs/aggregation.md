@@ -1215,7 +1215,7 @@ identifier`. A constant zone is read when the operator reaches it, like a
 computed one, so a bad constant beside a null date is `null`, as in the
 reference. No system tz database is
 read: the data is built in, so a name means the same on every host. It is
-**version 2026e** (`jiff-tzdb` 0.1.9, which `jiff` reads); it changes only when
+**version 2026f** (`jiff-tzdb` 1.0.0, which `jiff` reads); it changes only when
 that dependency is bumped, which is a normal dependency update and is recorded in
 the changelog. A date in an old year uses the zone's historical offset, including
 the seconds of local mean time (`-04:56:02` for New York before 1883); `%z` and

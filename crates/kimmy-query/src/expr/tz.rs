@@ -115,7 +115,7 @@ impl Zone {
                 let sub = local_ms.rem_euclid(1000);
                 // The local reading as a civil date-time, via UTC as a ruler.
                 let Ok(ts) = Timestamp::from_second(secs) else { return local_ms };
-                let dt: DateTime = ts.to_zoned(TimeZone::UTC).datetime();
+                let dt: DateTime = ts.to_zoned_datetime(TimeZone::UTC).datetime();
                 let ambiguous = tz.to_ambiguous_timestamp(dt);
                 let resolved = match (keep, ambiguous.offset()) {
                     (Some(want), AmbiguousOffset::Fold { before, .. })
@@ -457,5 +457,58 @@ mod tests {
             added.iter().map(|l| format!("  + {l}")).collect::<Vec<_>>().join("\n"),
             removed.iter().map(|l| format!("  - {l}")).collect::<Vec<_>>().join("\n"),
         );
+    }
+
+    /// The version of the package `name` that `kimmy-query` is locked to, read from `Cargo.lock`: a dependency line is `"name"` when one
+    /// version of it is locked and `"name <version>"` when two are (a logger in the tree still reads jiff 0.2, which is not the one this
+    /// crate reads).
+    fn locked_version_read_by_this_crate(lock: &str, name: &str) -> String {
+        let packages: Vec<&str> = lock.split("[[package]]").collect();
+        let mine = packages
+            .iter()
+            .find(|p| p.contains("name = \"kimmy-query\"\n"))
+            .expect("kimmy-query in Cargo.lock");
+        let line = mine
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("\"{name}\"")) || l.starts_with(&format!("\"{name} ")))
+            .unwrap_or_else(|| panic!("{name} is not a dependency of kimmy-query in Cargo.lock"));
+        let inner = line.trim_end_matches(',').trim_matches('"');
+        if let Some((_, version)) = inner.split_once(' ') {
+            return version.to_string();
+        }
+        let named = format!("name = \"{name}\"\n");
+        let versions: Vec<String> = packages
+            .iter()
+            .filter(|p| p.contains(&named))
+            .filter_map(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"').to_string())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "{name} locked at {versions:?}, and the dependency line does not say which"
+        );
+        versions.into_iter().next().unwrap()
+    }
+
+    /// A new major of the tz crate or of its bundled database is a decision, not a routine bump: its answers are what `tz_golden.txt` pins
+    /// and what `docs/aggregation.md` and `docs/deviations.md` describe, and its API is not this crate's to assume. This fails on exactly
+    /// the `Cargo.lock` major, as `the_redb_constants_are_what_this_build_is_on` does for redb.
+    #[test]
+    fn the_tz_crates_are_the_major_the_golden_file_was_written_on() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        for name in ["jiff", "jiff-tzdb"] {
+            let version = locked_version_read_by_this_crate(&lock, name);
+            assert_eq!(
+                version.split('.').next(),
+                Some("1"),
+                "kimmy-query reads {name} {version}: re-read tz_golden.txt, docs/aggregation.md and docs/deviations.md against it, then move this \
+                 canary"
+            );
+        }
     }
 }

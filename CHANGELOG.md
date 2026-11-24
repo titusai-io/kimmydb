@@ -16,6 +16,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **The storage engine is redb 4.6 where it was 4.5, which is a storage boundary, and it rides in the wipe the next release already carries.** A build refuses a store whose recorded redb major.minor is not its own (ADR-190), so a build on redb 4.6 does not open a store a build on redb 4.5 wrote, nor the reverse: stop every member, wipe each member's data directory and start every member on the new release on an empty one, as the release's own upgrade note says. The file format is unchanged (still 3) and nothing of redb's new multi-process modes is used. redb 4.6 starts a new database at 72 KiB instead of about 1 MiB, and its repair no longer falls back to a commit slot that failed its checksum; what a store holds is otherwise the same.
 
+### Changed
+
+- **The tz database built into the date operators is 2026f where it was 2026e** (`jiff` 1.0 and `jiff-tzdb` 1.0). Cuba keeps -04 through 2027-11-07 and does not fall back to -05 on 2026-11-01, so `America/Havana` and `Cuba` read -04 on a date between those days, where they read -05 from 2026-11-01; and Brazil's 1965 and 1966 DST endings moved by an hour (1965-03-31 at 24:00, and 1966-03-01 at 01:00, where they were at 00:00), so the 21 Brazilian names (`America/Sao_Paulo`, `Brazil/East`, `America/Manaus` and the rest) read the hours between the old and the new ending differently. Nothing else a date operator reads moved: a golden file of every name's offset at 21 instants, and of 16 zones' offsets at 55, was written on 2026e and differs only in those 23 names.
+
 ## 0.61.0 - 2026-11-21
 
 0.61.0 makes field-level merge the default: a collection merges concurrent writes field by field, keeps and reports what a merge lost, and tells a change stream and a webhook about it. It also gives a path through arrays one rule and a document value one order, and it lengthens every stamp, resume token and webhook event id, so it is a `0.MINOR` bump and a wipe release.

@@ -327,7 +327,7 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 - **The reference 6.0.5's own tz data is older than 2022f.** For a date after
   the rule changes of 2022 to 2024 the two disagree: Mexico City in July 2024
   (-05 there, -06 here), Nuuk, Almaty, Cairo and Asuncion. Nothing is done about
-  it here: the built-in database is current (2026e) on purpose.
+  it here: the built-in database is current (2026f) on purpose.
 - **`$dateTrunc` bounds `binSize` by what the unit can count.** A year, quarter,
   month, week or day bin larger than the number of that unit (counted with its
   shortest length) that 64 bits of milliseconds hold (292,471,208 years,
@@ -365,7 +365,7 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
   parsed.
 - **Error messages** carry the reference's wording where it is known, without
   its numeric codes, and every date error is a `400`.
-- **The tz database is the one built in** (2026e), not the host's. A zone whose
+- **The tz database is the one built in** (2026f), not the host's. A zone whose
   rules changed after the build keeps the old rules until the dependency is
   bumped.
 
