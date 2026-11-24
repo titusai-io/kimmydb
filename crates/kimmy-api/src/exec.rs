@@ -6038,6 +6038,10 @@ mod join_tests;
 
 #[cfg(test)]
 mod definition_api_tests;
+
+#[cfg(test)]
+mod refused_metrics_tests;
+
 #[cfg(test)]
 mod resolve_memo_tests;
 

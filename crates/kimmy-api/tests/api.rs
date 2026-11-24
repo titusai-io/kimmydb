@@ -23672,10 +23672,9 @@ async fn a_schema_change_addressed_to_a_stage_is_refused_400_stage_collection_wh
     assert!(texts[0].contains("after the stage's deadline"), "{}", texts[0]);
 }
 
-/// D10 (ADR-272, decision 7): a member that knows of a binding it has not made visible refuses a WRITE to the name with
-/// `503 swap_in_progress`, `retry: wait` and a `Retry-After`, writes nothing, and goes on answering reads.
-#[tokio::test]
-async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_swap_in_progress() {
+/// A member that holds `shop.orders` and knows of a binding for it that it has not made visible: a stage under the name and another
+/// member's binding, known ahead of its position (no window behind it). Writes to the name are refused `503 swap_in_progress`.
+async fn a_member_that_knows_of_a_binding_it_has_not_made_visible() -> (Server, String) {
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
@@ -23716,6 +23715,14 @@ async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_
     };
     engine.apply_batch(std::slice::from_ref(&bind)).unwrap();
 
+    (server, token)
+}
+
+/// D10 (ADR-272, decision 7): a member that knows of a binding it has not made visible refuses a WRITE to the name with
+/// `503 swap_in_progress`, `retry: wait` and a `Retry-After`, writes nothing, and goes on answering reads.
+#[tokio::test]
+async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_swap_in_progress() {
+    let (server, token) = a_member_that_knows_of_a_binding_it_has_not_made_visible().await;
     let refused =
         server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 7})).await;
     assert_eq!(refused.status, 503, "{:?}", refused.body);
@@ -23728,6 +23735,93 @@ async fn a_write_to_a_name_whose_replacement_the_member_knows_of_is_refused_503_
     // nothing landed, and a read is answered
     let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
     assert_eq!((count.status, &count.body["count"]), (200, &json!(0)), "{:?}", count.body);
+}
+
+/// `kimmy_api_refused_total{code}`, read off the rendered `/metrics` page: `[stage_collection, swap_in_progress, clock_ahead]`.
+async fn refused_series(server: &Server) -> [u64; 3] {
+    let page = metrics_text(server).await;
+    let read = |code: &str| -> u64 {
+        let series = format!("kimmy_api_refused_total{{code=\"{code}\"}} ");
+        page.lines()
+            .find_map(|line| line.strip_prefix(&series))
+            .unwrap_or_else(|| panic!("`{series}` is missing from /metrics"))
+            .trim()
+            .parse()
+            .expect("the series reads as a number")
+    };
+    [read("stage_collection"), read("swap_in_progress"), read("clock_ahead")]
+}
+
+/// How far each series moved between two readings.
+fn moved(before: [u64; 3], after: [u64; 3]) -> [u64; 3] {
+    [after[0] - before[0], after[1] - before[1], after[2] - before[2]]
+}
+
+/// C1 (ADR-272, decision 7), one test per code over HTTP through the router and its middleware: a request that gets the refusal moves that
+/// series by exactly one and the other two by none.
+#[tokio::test]
+async fn a_schema_change_refused_stage_collection_moves_that_series_by_exactly_one() {
+    let (server, token) = a_server_holding_a_stage().await;
+    let before = refused_series(&server).await;
+    let res = server
+        .post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders.__stg.real" }))
+        .await;
+    assert_eq!(
+        (res.status, res.body["error"].as_str()),
+        (400, Some("stage_collection")),
+        "premise: the refusal is the one this test counts: {:?}",
+        res.body
+    );
+    assert_eq!(moved(before, refused_series(&server).await), [1, 0, 0]);
+}
+
+#[tokio::test]
+async fn a_write_refused_swap_in_progress_moves_that_series_by_exactly_one() {
+    let (server, token) = a_member_that_knows_of_a_binding_it_has_not_made_visible().await;
+    let before = refused_series(&server).await;
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 7})).await;
+    assert_eq!(
+        (res.status, res.body["error"].as_str()),
+        (503, Some("swap_in_progress")),
+        "premise: the refusal is the one this test counts: {:?}",
+        res.body
+    );
+    assert_eq!(moved(before, refused_series(&server).await), [0, 1, 0]);
+}
+
+#[tokio::test]
+async fn a_schema_change_refused_clock_ahead_moves_that_series_by_exactly_one() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    // this member's logical clock leads its physical clock by 400 s, past the 300 s bound: its own stamps would be refused
+    server.state.engine.set_clock_offset_for_tests(-400_000);
+    let before = refused_series(&server).await;
+    let res = server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    assert_eq!(
+        (res.status, res.body["error"].as_str()),
+        (503, Some("clock_ahead")),
+        "premise: the refusal is the one this test counts: {:?}",
+        res.body
+    );
+    assert_eq!(moved(before, refused_series(&server).await), [0, 0, 1]);
+}
+
+/// A refusal that is not one of the three is counted by none of them, whatever its status class.
+#[tokio::test]
+async fn a_different_400_and_a_different_404_move_no_refused_series() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let before = refused_series(&server).await;
+    let invalid = server.post("/v1/db/shop/collections", Some(&token), json!({"name": ""})).await;
+    assert_eq!(
+        (invalid.status, invalid.body["error"].as_str()),
+        (400, Some("bad_request")),
+        "premise: an empty name is a plain 400: {:?}",
+        invalid.body
+    );
+    let missing = server.get("/v1/db/shop/coll/nothing/docs", Some(&token)).await;
+    assert_eq!(missing.status, 404, "premise: a plain 404: {:?}", missing.body);
+    assert_eq!(moved(before, refused_series(&server).await), [0, 0, 0]);
 }
 
 /// The sink door: a `$merge` (or an insert-only `$out`) whose TARGET is a name the member knows has been superseded is a write to that

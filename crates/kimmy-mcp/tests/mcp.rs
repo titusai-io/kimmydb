@@ -215,6 +215,29 @@ impl Server {
             .map(|line| line.split_once(':').unwrap().1.trim().to_string())
     }
 
+    /// `kimmy_api_refused_total{code}`, scraped off `/metrics`: `[stage_collection, swap_in_progress, clock_ahead]`.
+    async fn refused(&self) -> [u64; 3] {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let host = self.base.strip_prefix("http://").unwrap();
+        let request = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let page = String::from_utf8_lossy(&raw).into_owned();
+        let read = |code: &str| -> u64 {
+            let series = format!("kimmy_api_refused_total{{code=\"{code}\"}} ");
+            page.lines()
+                .find_map(|line| line.strip_prefix(&series))
+                .unwrap_or_else(|| panic!("`{series}` is missing from /metrics"))
+                .trim()
+                .parse()
+                .expect("the series reads as a number")
+        };
+        [read("stage_collection"), read("swap_in_progress"), read("clock_ahead")]
+    }
+
     /// `kimmy_requests_total`, scraped off `/metrics`.
     async fn request_count(&self) -> u64 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2412,4 +2435,71 @@ async fn a_confirmation_that_hears_from_no_one_is_pending_and_not_a_timeout() {
     );
     assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     assert!(!server.engine.list_indexes("sales", "orders").unwrap().is_empty(), "the index exists");
+}
+
+/// C1 (ADR-272, decision 7): a tool call refused with `swap_in_progress` leaves as a JSON-RPC error inside an HTTP `200`, so the middleware
+/// that counts REST refusals never sees it; the MCP exit counts it, once.
+#[tokio::test]
+async fn a_tool_call_refused_swap_in_progress_moves_the_refused_series_by_exactly_one() {
+    let server = Server::start().await;
+    seed(&server);
+    let engine = &server.engine;
+    // a binding from another member for `sales.orders`, known ahead of its position: the name is superseded and not yet visible here
+    engine
+        .create_stage(
+            "sales",
+            "orders.__stg.mcp",
+            kimmy_core::MergePolicy::Document,
+            kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0),
+        )
+        .expect("premise: a stage is created under the name");
+    let creation = engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .expect("premise: the oplog is readable")
+        .entries
+        .into_iter()
+        .find(|e| {
+            e.kind == kimmy_core::OpKind::CreateCollection
+                && e.collection == kimmy_core::CollectionId::derive("sales", "orders.__stg.mcp")
+        })
+        .expect("premise: the stage's creation entry is in the oplog");
+    let bind = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            kimmy_core::Epoch::ZERO,
+        ),
+        kind: kimmy_core::OpKind::BindCollection,
+        collection: kimmy_core::CollectionId::derive("sales", "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                db: "sales".into(),
+                name: "orders".into(),
+                physical: "orders.__stg.mcp".into(),
+            })
+            .expect("the binding encodes"),
+        ),
+        meta: None,
+    };
+    engine.apply_batch(std::slice::from_ref(&bind)).expect("premise: the binding is known here");
+
+    let before = server.refused().await;
+    let body = server
+        .call(
+            &server.root(),
+            "insert",
+            json!({"database": "sales", "collection": "orders", "document": {"_id": "z"}}),
+        )
+        .await;
+    assert!(
+        body["error"].to_string().contains("swap_in_progress"),
+        "premise: the call is refused with swap_in_progress as a protocol error: {body}"
+    );
+    let after = server.refused().await;
+    assert_eq!(
+        [after[0] - before[0], after[1] - before[1], after[2] - before[2]],
+        [0, 1, 0],
+        "one refusal over MCP moves swap_in_progress by one (the middleware saw an HTTP 200 and counted nothing) and the others by none"
+    );
 }
