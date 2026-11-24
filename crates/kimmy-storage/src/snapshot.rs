@@ -1282,6 +1282,11 @@ impl Engine {
                 })) => {}
                 Err(e) => return Err(e),
             }
+            // A swapped name is not made again beside its buried identity: `restore_collection`'s swapped branch creates no identity, so
+            // it has nothing to wait for (the same predicate as that branch).
+            if self.name_is_swapped(&state.db, &state.name)? {
+                continue;
+            }
             let id = CollectionId::derive(&state.db, &state.name);
             // A definition the tombstone here makes history is not restored
             // (`restore_collection`'s rule), so it waits on nothing.
@@ -2836,6 +2841,11 @@ impl Engine {
     /// definition does, and arrives with the life, by the scoped page or by a whole page
     /// once the sender has re-dated it. A document of the life is history here as it is by
     /// entries (ADR-148), and the existence and count halves repair it.
+    ///
+    /// For a swapped name whose identity is buried this still runs after the swapped branch of `restore_collection` has applied the page's
+    /// definitions through the register, and may withhold the coverage of one the branch applied (it judges them against the identity's
+    /// tombstone). Accepted as harmless (Q6.5-4): a definition whose coverage is withheld is served again, and the arms judge it by the one
+    /// rule; nothing is lost and nothing is applied twice.
     fn definitions_a_refused_life_keeps(&self, state: &CollectionState) -> Result<Vec<Stamp>> {
         if self.get_collection(&state.db, &state.name).is_ok() {
             return Ok(Vec::new());
@@ -2972,6 +2982,25 @@ impl Engine {
         // node is about to serve, or its next local write is stamped below it.
         self.witness_covered_hlc(state.created, versions);
         self.bury_the_life_this_one_followed(state, versions, carried)?;
+        // A name this member swapped, whose identity is buried (the register answers from a stage or a recreation, or the name is absent under
+        // a drop in effect): the identity is not made again beside it, and what the page offers is judged and applied through the register as
+        // the replicated arms do (ADR-272, decision 6; Q6.5-4).
+        if self.get_collection(&state.db, &state.name).is_err()
+            && self.name_is_swapped(&state.db, &state.name)?
+        {
+            // A page older than the drop of its database (ADR-229) is refused as the create branch refuses it, and leaves the tombstone
+            // that makes the entries which follow history and not a stop.
+            if self.database_refusal(&state.db, state.created)?.is_some() {
+                self.record_database_refusal(&state.db, &state.name, state.created)?;
+                debug!(
+                    db = %state.db,
+                    collection = %state.name,
+                    "ignored a definition of a swapped name older than the drop of its database"
+                );
+                return Ok(0);
+            }
+            return self.restore_definitions_of_a_swapped_name(state, versions);
+        }
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -3260,6 +3289,92 @@ impl Engine {
         Ok(refused)
     }
 
+    /// Whether this member has swapped `name`: it has register events of it, in effect or ahead of their position, or holds a stage of it.
+    fn name_is_swapped(&self, db: &str, name: &str) -> Result<bool> {
+        let txn = self.db().begin_read()?;
+        crate::register::is_swapped(&txn, db, name)
+    }
+
+    /// What a page offers for a name this member swapped and whose identity is buried: each index is judged by the one rule against the
+    /// collection the name answers from and restored through the name's door; a name absent under a drop in effect sends it the way the
+    /// arms do (history at or below the drop, otherwise the post-drop row); the validator goes through the same door. A vector
+    /// configuration is not restored: a swapped name keeps none (decision 12, "the swap wins"). Returns how many it refused.
+    fn restore_definitions_of_a_swapped_name(
+        &self,
+        state: &CollectionState,
+        versions: &VersionVector,
+    ) -> Result<usize> {
+        let Some(standing) = Self::unless_gone(self.definition_target(&state.db, &state.name))?
+        else {
+            for index in &state.indexes {
+                let Some(created) = index.created else { continue };
+                self.definition_for_an_absent_swapped_name(
+                    &state.db,
+                    &state.name,
+                    crate::join::Definition::Index(index),
+                    created,
+                )?;
+            }
+            return Ok(0);
+        };
+        let mut refused = 0usize;
+        for index in &state.indexes {
+            // A definition with no stamp (a sender before ADR-132) is NOT restored into a swapped name: with no stamp nothing can place it
+            // against a drop of the name or the floor of the physical that stands, so it is skipped, and the entries route brings the
+            // definition with its stamp. (The ordinary loop restores it when no tombstone says otherwise; a swapped name has the register's
+            // events and a floor to say otherwise, and a swap is new in 0.62.0, so no stampless sender can be a peer of a swapped name.)
+            let Some(created) = index.created else { continue };
+            if self.definition_of_an_ended_life(&standing, created)? {
+                debug!(
+                    db = %state.db,
+                    collection = %state.name,
+                    index = %index.name,
+                    "a snapshot page named an index of a life of the swapped name that has ended; not restored"
+                );
+                continue;
+            }
+            // By the physical that stands, as a restored definition names the physical it is made on (`CreateOrigin::Restored`): the logical
+            // name would be read exactly and find the buried identity.
+            let built = self.create_index_inner(
+                &state.db,
+                &standing.name,
+                index.fields.clone(),
+                index.unique,
+                index.enforcement,
+                Some(index.name.clone()),
+                index.expire_after_secs,
+                index.partial_filter.clone(),
+                crate::index::CreateOrigin::Restored(created),
+                &|held, dropped| {
+                    Ok(self.definition_of_an_ended_life(held, created)?
+                        || dropped.is_some_and(|at| created < at))
+                },
+            );
+            match crate::sync::settle(built)? {
+                crate::sync::Ddl::Applied((_, violations)) => {
+                    if !violations.is_empty() {
+                        self.report_index_backfill_violations(&standing, &violations)?;
+                    }
+                }
+                crate::sync::Ddl::Gone | crate::sync::Ddl::PurgePending(_) => break,
+                crate::sync::Ddl::Refused(reason) => {
+                    refused += 1;
+                    warn!(
+                        db = %state.db,
+                        collection = %state.name,
+                        index = %index.name,
+                        reason = %reason,
+                        "skipped an index in a snapshot this node cannot build; the definition stands on its peers and the \
+                         divergence is counted in kimmy_sync_ddl_refused_total"
+                    );
+                    self.note_refused_index(standing.id, index, created)?;
+                }
+            }
+        }
+        self.restore_validator_state(state, versions)?;
+        Ok(refused)
+    }
+
     /// The validator a page describes, applied by the stamp it carries (ADR-257), as
     /// [`Self::restore_vector_state`] applies a vector configuration (ADR-226).
     ///
@@ -3279,7 +3394,8 @@ impl Engine {
         let Some(stamp) = state.validator_changed else {
             return Ok(());
         };
-        if Self::unless_gone(self.get_collection(&state.db, &state.name))?.is_none() {
+        // through the register's door: a name with no register event is `get_collection` exactly, and a swapped name finds the physical it answers from
+        if Self::unless_gone(self.definition_target(&state.db, &state.name))?.is_none() {
             return Ok(());
         }
         if stamp.hlc > versions.get(stamp.origin()) {

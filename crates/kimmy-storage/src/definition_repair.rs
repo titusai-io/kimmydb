@@ -160,11 +160,46 @@ impl crate::Engine {
         left: &mut Vec<String>,
     ) -> Result<DefinitionRestore> {
         let mut out = DefinitionRestore::default();
-        let id = CollectionId::derive(&state.db, &state.name);
-        let Some(standing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
-            out.gone += 1;
+        // The collection a definition belongs to is the one the name answers from, found through the register as the replicated arms find it
+        // (ADR-272, decision 6): a name swapped by a replacing `$out` is not the buried identity that an exact-name read finds.
+        let Some(standing) = Self::unless_gone(self.definition_target(&state.db, &state.name))?
+        else {
+            // Absent. A name this member swapped that a logical drop in effect made absent judges each definition as the arms do: history
+            // at or below the drop, otherwise the post-drop row, which gives it to the next physical that becomes visible. Never `gone`.
+            let swapped = {
+                use redb::ReadableDatabase;
+                let txn = self.db().begin_read()?;
+                crate::register::is_swapped(&txn, &state.db, &state.name)?
+            };
+            if !swapped {
+                out.gone += 1;
+                return Ok(out);
+            }
+            for index in &state.indexes {
+                let Some(created) = index.created else {
+                    out.history += 1;
+                    leave(left, "history", &index.name);
+                    continue;
+                };
+                match self.definition_for_an_absent_swapped_name(
+                    &state.db,
+                    &state.name,
+                    crate::join::Definition::Index(index),
+                    created,
+                )? {
+                    crate::join::Absent::History => {
+                        out.history += 1;
+                        leave(left, "history", &index.name);
+                    }
+                    // in the row, which builds it when the next physical becomes visible
+                    crate::join::Absent::Written => out.to_row += 1,
+                    crate::join::Absent::NotSwapped => out.gone += 1,
+                }
+            }
             return Ok(out);
         };
+        // The tombstone, the live count and the hint are keyed by the physical that stands, never by the logical name's id
+        let id = standing.id;
         // A vector shadow is its own collection and is not repaired here: embedding is not
         // started by a repair.
         if kimmy_core::vector_meta::is_shadow(&state.name) {
@@ -271,9 +306,11 @@ impl crate::Engine {
             vetoed_by.set(reason);
             Ok(reason.is_some())
         };
+        // A restored definition names the physical it is made on (`CreateOrigin::Restored`): the one that stands, which is the stage or the
+        // recreation a swapped name answers from, and not the logical name, which the exact read of the build would find buried.
         let built = self.create_index_inner(
             &state.db,
-            &state.name,
+            &standing.name,
             index.fields.clone(),
             index.unique,
             index.enforcement,
@@ -287,7 +324,7 @@ impl crate::Engine {
             crate::sync::Ddl::Applied((crate::index::IndexCreated::Built(_), violations)) => {
                 out.built += 1;
                 if !violations.is_empty() {
-                    let current = self.get_collection(&state.db, &state.name)?;
+                    let current = self.definition_target(&state.db, &state.name)?;
                     self.report_index_backfill_violations(&current, &violations)?;
                 }
             }
