@@ -234,6 +234,7 @@ fn only_this_module_opens_the_register_tables() {
         let text = std::fs::read_to_string(&file).unwrap();
         for table in [
             "tables::REGISTER_STAGES",
+            "tables::REGISTER_POST",
             "tables::REGISTER_INFO",
             "tables::REGISTER;",
             "tables::REGISTER)",

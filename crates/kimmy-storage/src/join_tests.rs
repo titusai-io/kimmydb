@@ -866,3 +866,369 @@ fn a_stage_that_never_took_effect_is_never_joined_and_builds_nothing_on_the_visi
         "and no build ran for it (the identity held no index to join either)"
     );
 }
+
+// =====================================================================================================================================
+// The post-drop row (Q6.5-2, B2): the definitions of a swapped name stamped above its newest logical drop, kept while the name is absent
+// =====================================================================================================================================
+//
+// A logical drop in effect makes the name absent. What was made to the name above the drop (by members that had not heard of it, or after
+// it) must not be lost with the physicals the drop buries, and must reach the next physical that becomes visible: the drop's burial writes
+// the row from the physicals it buries, a definition that arrives while the name is absent merges into it, a later drop floors it, and the
+// next physical that becomes visible takes it through the join and deletes it in the same transaction. Rows c and d of the model.
+//
+// Stamps are explicit, from the author of the swap: W is the first binding, `early` W+2, `old` W+3, the drop d at W+5, `late` W+7 and its
+// validator W+8, the second binding W+10. Everything stamped above d is the new life's; everything at or below it is the dropped life's.
+
+fn at(w: &World, offset: u64) -> u64 {
+    w.bind.stamp.hlc.wall_ms + offset
+}
+
+fn author(w: &World) -> &Engine {
+    &w._author.0
+}
+
+fn logical_drop(w: &World, offset: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(at(w, offset), 0), author(w).node_id(), author(w).epoch()),
+        kind: OpKind::DropCollection,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders"))
+                .expect("the drop encodes"),
+        ),
+        meta: None,
+    }
+}
+
+/// An index made to the logical name `orders` by the author at `W + offset`.
+fn definition(w: &World, name: &str, path: &str, offset: u64) -> OplogEntry {
+    stage_index_entry(author(w), "orders", name, path, at(w, offset))
+}
+
+fn validator_entry(w: &World, tag: &str, offset: u64) -> OplogEntry {
+    crate::engine::ddl_entry(
+        Stamp::new(Hlc::new(at(w, offset), 0), author(w).node_id(), author(w).epoch()),
+        OpKind::ConfigureValidator,
+        CollectionId::derive(DB, "orders"),
+        &kimmy_core::ValidatorSet {
+            db: DB.into(),
+            collection: "orders".into(),
+            validator: Some(validator(tag)),
+        },
+    )
+    .expect("the validator entry encodes")
+}
+
+fn the_row(m: &Engine) -> crate::register::PostRow {
+    crate::register::post_row_for_tests(m, DB, "orders")
+        .expect("the row is readable")
+        .expect("the post-drop row exists")
+}
+
+fn no_row(m: &Engine) -> bool {
+    crate::register::post_row_for_tests(m, DB, "orders").expect("the row is readable").is_none()
+}
+
+fn names(row: &crate::register::PostRow) -> Vec<String> {
+    let mut names: Vec<String> = row.indexes.iter().map(|i| i.name.clone()).collect();
+    names.sort();
+    names
+}
+
+fn absent(m: &Engine) -> bool {
+    matches!(
+        m.resolve(DB, "orders"),
+        Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+    )
+}
+
+/// A member that made the flip, then took the definitions of a member that had not heard of the drop: `early` (below d), `late` and its
+/// validator (above d), all landing on the bound stage, which is the physical the name answers from.
+fn flipped_with_definitions(w: &World) -> (Arc<Engine>, tempfile::TempDir) {
+    let (m, d) = member(w);
+    flip(&m, &w.bind, Route::Window);
+    window(
+        &m,
+        &[
+            definition(w, "early_1", "t", 2),
+            definition(w, "late_1", "v", 7),
+            validator_entry(w, "late", 8),
+        ],
+    );
+    let on = m.get_collection(DB, BOUND).expect("the bound stage is held");
+    assert!(
+        on.index("early_1").is_some() && on.index("late_1").is_some(),
+        "premise: both definitions landed on the bound stage"
+    );
+    (m, d)
+}
+
+#[test]
+fn a_logical_drop_writes_the_definitions_above_it_into_the_row_and_not_the_ones_at_or_below_it_in_every_order()
+ {
+    // Row d, M1: the definitions are on the bound physical when the drop takes effect. M4: the same with the drop known ahead of its
+    // position and released by a window. The positive assertion comes first: what is above d is in the row, with its stamps.
+    for parked in [false, true] {
+        let w = world();
+        let (m, _d) = flipped_with_definitions(&w);
+        let drop = logical_drop(&w, 5);
+        if parked {
+            m.apply_batch(std::slice::from_ref(&drop))
+                .expect("the drop is stored ahead of its position");
+            assert!(
+                !absent(&m),
+                "premise: the parked drop is not in effect, the name still answers"
+            );
+            assert!(no_row(&m), "premise: no row until the drop takes effect");
+        }
+        window(&m, std::slice::from_ref(&drop));
+        assert!(absent(&m), "premise: the drop is in effect, parked={parked}");
+        let row = the_row(&m);
+        assert_eq!(
+            names(&row),
+            vec!["late_1".to_string()],
+            "parked={parked}: only the index stamped above the drop is in the row"
+        );
+        let late = definition(&w, "late_1", "v", 7);
+        assert_eq!(
+            row.indexes[0].created,
+            Some(late.stamp),
+            "parked={parked}: with its original stamp"
+        );
+        assert_eq!(
+            row.validator,
+            Some(validator("late")),
+            "parked={parked}: and the validator stamped above the drop"
+        );
+        assert_eq!(
+            row.validator_changed,
+            Some(validator_entry(&w, "late", 8).stamp),
+            "parked={parked}: with its stamp"
+        );
+    }
+}
+
+#[test]
+fn a_definition_that_arrives_while_the_name_is_absent_merges_into_the_row_and_one_at_or_below_the_drop_is_history()
+ {
+    // Row d, M2: the drop first, the definitions after, in an order of their own. Nothing stops the batch, and delivering one again (as an
+    // interrupted apply is delivered again) leaves the row exactly as after one delivery.
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert!(absent(&m), "premise: the name is absent");
+    let entries = [
+        definition(&w, "late_1", "v", 7),
+        definition(&w, "old_1", "t", 3),
+        validator_entry(&w, "late", 8),
+    ];
+    let outcome = window(&m, &entries);
+    assert_eq!(
+        outcome.unknown_collection, 0,
+        "the batch does not stop at a definition for an absent swapped name: {outcome:?}"
+    );
+    assert_eq!(outcome.ddl, 3, "all three were taken: {outcome:?}");
+    let row = the_row(&m);
+    assert_eq!(
+        names(&row),
+        vec!["late_1".to_string()],
+        "the one above the drop is in the row, the one below it is history"
+    );
+    assert_eq!(row.validator, Some(validator("late")), "and so is the validator");
+    window(&m, &entries);
+    assert_eq!(the_row(&m), row, "delivered again, the row ends exactly as after one delivery");
+}
+
+#[test]
+fn a_swapped_name_whose_newest_drop_is_only_parked_still_answers_and_a_definition_lands_on_the_physical_it_answers_from()
+ {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    m.apply_batch(std::slice::from_ref(&logical_drop(&w, 5)))
+        .expect("the drop is stored ahead of its position");
+    assert!(!absent(&m), "premise: the name answers while the drop is parked");
+    window(&m, &[definition(&w, "late_1", "v", 7)]);
+    assert!(
+        m.get_collection(DB, BOUND).expect("held").index("late_1").is_some(),
+        "the definition is on the visible physical"
+    );
+    assert!(no_row(&m), "and no row was written: the name is not absent");
+}
+
+#[test]
+fn a_definition_for_a_collection_nobody_swapped_still_stops_the_batch_as_an_unknown_collection() {
+    let w = world();
+    let (m, _d) = member(&w);
+    let ghost = stage_index_entry(author(&w), "ghost", "g_1", "t", at(&w, 7));
+    let outcome = window(&m, std::slice::from_ref(&ghost));
+    assert_eq!(
+        outcome.unknown_collection, 1,
+        "a plain unknown collection is today's stop: {outcome:?}"
+    );
+}
+
+#[test]
+fn the_next_physical_that_becomes_visible_takes_the_row_and_deletes_it_and_a_second_drop_and_recreate_inherit_nothing()
+ {
+    let w = world();
+    let (m, _d) = flipped_with_definitions(&w);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    let row = the_row(&m);
+    assert_eq!(
+        names(&row),
+        vec!["late_1".to_string()],
+        "premise: the row exists with known content"
+    );
+    m.create_collection(DB, "orders").expect("the create of a dropped swapped name is a recreate");
+    let recreation =
+        m.resolve(DB, "orders").expect("the name answers from the recreation").physical;
+    assert!(
+        kimmy_core::is_recreation_name(&recreation),
+        "premise: it is a recreation: {recreation}"
+    );
+    let on = m.get_collection(DB, &recreation).expect("the recreation is held");
+    assert_eq!(
+        on.indexes.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        vec!["late_1"],
+        "the first recreate inherits exactly the row's content"
+    );
+    assert_eq!(on.validator, Some(validator("late")), "validator included");
+    assert!(no_row(&m), "the row is gone in the same transaction");
+    assert!(m.drop_collection(DB, "orders").expect("the local drop runs"), "the second drop");
+    m.create_collection(DB, "orders").expect("the second recreate");
+    let second = m.resolve(DB, "orders").expect("the name answers").physical;
+    assert_ne!(second, recreation, "premise: a new physical");
+    let on = m.get_collection(DB, &second).expect("held");
+    assert!(
+        on.indexes.is_empty() && on.validator.is_none(),
+        "the second recreate inherits nothing: the row was deleted"
+    );
+}
+
+#[test]
+fn a_stage_created_below_the_drop_and_bound_above_it_takes_the_row_and_its_own_copy_only_above_the_drop()
+ {
+    let w = world();
+    let (m, _d) = flipped_with_definitions(&w);
+    let second = m.get_collection(DB, UNBOUND).expect("premise: the second stage is held");
+    for id in 20..22 {
+        m.insert(&second, doc! { "_id": id, "v": id, "t": id })
+            .expect("the second stage takes a row of the job's output");
+    }
+    // the second stage was created WITH an index, stamped below the drop (by hand, as the creation entry will carry it)
+    let (author_copy, _dc) = engine();
+    author_copy.apply_batch(&w.creations).expect("the author holds the stages");
+    window(&m, &[stage_index_entry(&author_copy, UNBOUND, "copy_old_1", "t", at(&w, 1))]);
+    assert!(
+        m.get_collection(DB, UNBOUND).expect("held").index("copy_old_1").is_some(),
+        "premise: the stage's own copy holds it"
+    );
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert_eq!(
+        names(&the_row(&m)),
+        vec!["late_1".to_string()],
+        "premise: the row holds the definition above the drop"
+    );
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(
+        m.resolve(DB, "orders").expect("the name resolves").physical,
+        UNBOUND,
+        "premise: the stage bound above the drop is visible"
+    );
+    let on = m.get_collection(DB, UNBOUND).expect("the second stage is held");
+    assert!(on.index("late_1").is_some(), "it takes the row's definition");
+    assert_eq!(entries(&m, UNBOUND, "late_1"), 2, "built over its own two rows");
+    assert!(
+        on.index("copy_old_1").is_none(),
+        "its own copy keeps only what is above the drop: the one below it is the dropped life's"
+    );
+    assert!(no_row(&m), "and the row is gone");
+}
+
+#[test]
+fn a_later_drop_removes_from_the_row_everything_at_or_below_it() {
+    let w = world();
+    let (m, _d) = flipped_with_definitions(&w);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert_eq!(
+        names(&the_row(&m)),
+        vec!["late_1".to_string()],
+        "premise: the row holds late_1, stamped W+7"
+    );
+    window(&m, std::slice::from_ref(&logical_drop(&w, 9)));
+    assert!(absent(&m), "premise: still absent");
+    let row = crate::register::post_row_for_tests(&m, DB, "orders").expect("readable");
+    assert!(
+        row.is_none_or(|r| r.indexes.is_empty() && r.validator.is_none()),
+        "the second drop, above both, removed what the first row held"
+    );
+}
+
+#[test]
+fn a_pass_that_fails_after_writing_the_row_leaves_no_row_and_the_redelivery_writes_it_once() {
+    let w = world();
+    let (m, _d) = flipped_with_definitions(&w);
+    let drop = logical_drop(&w, 5);
+    crate::sync::race_hooks::fail_after_the_next_settle();
+    let attempt = try_window(&m, std::slice::from_ref(&drop));
+    assert!(attempt.is_err(), "premise: the transaction failed: {attempt:?}");
+    assert!(!absent(&m), "premise: the drop was not committed");
+    assert!(no_row(&m), "a transaction that aborts leaves no row");
+    window(&m, std::slice::from_ref(&drop));
+    assert_eq!(names(&the_row(&m)), vec!["late_1".to_string()], "the redelivery writes it, once");
+}
+
+#[test]
+fn a_recreation_in_effect_while_the_older_drop_is_parked_carries_the_dropped_lifes_definitions_with_no_floor()
+ {
+    // PINS TODAY'S RULE FOR THIS UNIT; Q6.5-3 (the re-floor of a standing physical when a drop takes effect below it) flips it. The drop is
+    // known and not in effect, so the join runs with no floor and carries what the bound stage held, `old_1` (stamped at or below the
+    // drop) included; when the drop is released Q6.5-3 will remove it from the recreation.
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, &[definition(&w, "old_1", "t", 3)]);
+    m.apply_batch(std::slice::from_ref(&logical_drop(&w, 5)))
+        .expect("the drop is stored ahead of its position");
+    let rc_stamp = Stamp::new(Hlc::new(at(&w, 9), 0), author(&w).node_id(), author(&w).epoch());
+    let physical = kimmy_core::recreation_name("orders", &rc_stamp);
+    let recreate = crate::engine::ddl_entry(
+        rc_stamp,
+        OpKind::CreateCollection,
+        CollectionId::derive(DB, &physical),
+        &kimmy_core::CollectionCreate {
+            db: DB.into(),
+            name: physical.clone(),
+            merge_policy: MergePolicy::Document,
+            validator: None,
+            join_retention_ms: None,
+            loss_limits: None,
+            stage: None,
+        },
+    )
+    .expect("the recreation's creation encodes");
+    window(&m, std::slice::from_ref(&recreate));
+    assert_eq!(
+        m.resolve(DB, "orders").expect("the name resolves").physical,
+        physical,
+        "premise: the recreation is visible"
+    );
+    assert!(
+        m.get_collection(DB, &physical).expect("held").index("old_1").is_some(),
+        "no floor is in effect (the drop is parked), so the join carries the dropped life's definition (Q6.5-3 flips this)"
+    );
+}
+
+#[test]
+fn a_fresh_engine_has_the_post_drop_table_and_no_row() {
+    let (m, _d) = engine();
+    assert!(
+        crate::register::post_row_for_tests(&m, DB, "orders")
+            .expect("the table exists from the open: a read of it never meets a missing table")
+            .is_none(),
+        "no row on a store that has seen no drop"
+    );
+}

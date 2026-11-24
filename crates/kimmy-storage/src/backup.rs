@@ -662,16 +662,17 @@ mod tests {
         ("UNIQUE_VIOLATIONS", "derived from the oplog"),
         (
             "REGISTER",
-            "the swap's register events in effect: re-derived from the oplog by the restore commit of the swap's series",
+            "the swap's register events in effect: carried from Q6.6 (Chris, 2026-11-23); not yet. Until then a restore does not rebuild them",
         ),
         ("REGISTER_INFO", "the swap's register events ahead of their position: as REGISTER"),
         (
             "PURGE_NOT_BEFORE",
             "this member's own clock and requests (ADR-272, decision 5): a restore starts with no request in flight, so there is nothing to defer for",
         ),
+        ("REGISTER_STAGES", "the swap's stage creations: as REGISTER (carried from Q6.6; not yet)"),
         (
-            "REGISTER_STAGES",
-            "the swap's stage creations: as REGISTER (they are the creations in the oplog)",
+            "REGISTER_POST",
+            "the post-drop row of a swapped name: carried from Q6.6 (Chris, 2026-11-23); not yet",
         ),
         (
             "VECTOR_VERIFIED",

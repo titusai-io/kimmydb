@@ -31,12 +31,63 @@ fn corrupt(what: &str) -> StorageError {
     StorageError::Corrupt(format!("the register: {what}"))
 }
 
-/// Create the three tables, so a read of them never meets a missing table.
+/// Create the register's tables, so a read of them never meets a missing table.
 pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
     let _ = txn.open_table(tables::REGISTER)?;
     let _ = txn.open_table(tables::REGISTER_INFO)?;
     let _ = txn.open_table(tables::REGISTER_STAGES)?;
+    let _ = txn.open_table(tables::REGISTER_POST)?;
     Ok(())
+}
+
+/// The post-drop row of a logical name (ADR-272, decision 6; Q6.5-2): the definitions stamped above the name's newest logical drop, kept
+/// while the name is absent. Merged by stamp (the higher wins, a tie goes to the drop), joined into the next physical that becomes visible
+/// and deleted in that transaction.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)] // read by the tests of this commit and written by the next
+pub(crate) struct PostRow {
+    /// The indexes, each with its creation stamp.
+    pub(crate) indexes: Vec<kimmy_core::IndexMeta>,
+    /// The index tombstones: `(index id, stamp of the drop)`.
+    pub(crate) tombstones: Vec<(u32, Stamp)>,
+    /// The validator and the stamp of its latest change.
+    pub(crate) validator: Option<kimmy_core::ValidatorSpec>,
+    pub(crate) validator_changed: Option<Stamp>,
+}
+
+fn post_key(db: &str, logical: &str) -> [u8; 8] {
+    CollectionId::derive(db, logical).0.to_be_bytes()
+}
+
+/// The post-drop row of `logical`, if it has one.
+#[allow(dead_code)] // read by the next commit's join
+pub(crate) fn post_row(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Option<PostRow>> {
+    let table = txn.open_table(tables::REGISTER_POST)?;
+    match table.get(post_key(db, logical).as_slice())? {
+        Some(raw) => Ok(Some(serde_json::from_slice(raw.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// The post-drop row of `logical`, read outside any write transaction. Test builds only: the one-module guard lets nothing but this file
+/// open the table, so a test reads it through here.
+#[cfg(test)]
+pub(crate) fn post_row_for_tests(
+    engine: &crate::Engine,
+    db: &str,
+    logical: &str,
+) -> Result<Option<PostRow>> {
+    use redb::ReadableDatabase;
+    let txn = engine.db().begin_read()?;
+    let table = txn.open_table(tables::REGISTER_POST)?;
+    match table.get(post_key(db, logical).as_slice())? {
+        Some(raw) => Ok(Some(serde_json::from_slice(raw.value())?)),
+        None => Ok(None),
+    }
 }
 
 /// What the register keeps of a stage's creation: the creation's stamp and deadline ([`StageMeta`]) and the names of the stage's

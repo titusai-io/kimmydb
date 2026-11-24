@@ -429,6 +429,13 @@ pub const REGISTER_INFO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("r
 /// `crate::register`.
 pub const REGISTER_STAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_stages");
 
+/// `logical collection id (8) -> the post-drop row of the name` (JSON, `register::PostRow`): the definitions of a swapped name stamped above
+/// its newest logical drop, kept while the name is absent (ADR-272, decision 6; Q6.5-2). The indexes with their creation stamps, the index
+/// tombstones and the validator with its stamp: what the drop's burial took from the physicals it buried, what arrived while the name was
+/// absent, merged by stamp. Joined into the next physical that becomes visible and deleted in that transaction. Written only by
+/// `crate::register`. Member-local state, not carried by a backup until Q6.6 does.
+pub const REGISTER_POST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_post");
+
 /// `buried physical collection id -> this member's wall clock, in milliseconds, before which the purger leaves its rows alone`
 /// (ADR-272, decision 5): the burial's wall time plus `server.request_timeout_secs`, written in the burial's own transaction, so a
 /// request that resolved the name before the swap finishes reading what it resolved. **Member-local, never replicated and not
