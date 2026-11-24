@@ -474,6 +474,11 @@ async fn count_request(
         state.metrics.record_latency(started.elapsed());
     }
     state.metrics.record_request(response.status().as_u16());
+    // A refusal this member built is counted by its code where it leaves (`kimmy_api_refused_total`); a response
+    // that carries no code, or one relayed from elsewhere, is not.
+    if let Some(code) = response.extensions().get::<crate::error::ErrorCode>() {
+        state.metrics.record_refused(*code);
+    }
     response
 }
 

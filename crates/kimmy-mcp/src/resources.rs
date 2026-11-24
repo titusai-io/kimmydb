@@ -78,8 +78,11 @@ impl ServerHandler for KimmyMcp {
     ) -> Result<ListResourcesResult, ErrorData> {
         let auth = principal(&ctx)?;
 
-        let databases =
-            self.state.engine.list_databases().map_err(|e| crate::tools::error(e.into()))?;
+        let databases = self
+            .state
+            .engine
+            .list_databases()
+            .map_err(|e| crate::tools::refused(&self.state, e.into()))?;
 
         let mut resources = Vec::new();
         for database in databases {
@@ -90,7 +93,7 @@ impl ServerHandler for KimmyMcp {
                 .state
                 .engine
                 .list_logical_collections(&database.name)
-                .map_err(|e| crate::tools::error(e.into()))?;
+                .map_err(|e| crate::tools::refused(&self.state, e.into()))?;
 
             for collection in collections {
                 if is_internal_collection(&collection.name) {
@@ -122,11 +125,11 @@ impl ServerHandler for KimmyMcp {
 
         let schema =
             kimmy_api::schema::describe_collection(&self.state, &auth, db, coll, None, true)
-                .map_err(crate::tools::error)?;
+                .map_err(|e| crate::tools::refused(&self.state, e))?;
 
         let samples =
             kimmy_api::schema::sample_documents(&self.state, &auth, db, coll, SAMPLE_DOCUMENTS)
-                .map_err(crate::tools::error)?;
+                .map_err(|e| crate::tools::refused(&self.state, e))?;
 
         let body = json!({ "schema": schema, "samples": samples });
         let text = serde_json::to_string_pretty(&body)

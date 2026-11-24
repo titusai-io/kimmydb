@@ -469,6 +469,7 @@ impl KimmyMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
         render(
+            &self.state,
             exec::list_databases(&self.state, &auth).map(|value| {
                 omit_internal(value, "databases", crate::resources::is_internal_database)
             }),
@@ -487,9 +488,12 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::list_collections(&self.state, &auth, &args.database).map(|value| {
-            omit_internal(value, "collections", crate::resources::is_internal_collection)
-        }))
+        render(
+            &self.state,
+            exec::list_collections(&self.state, &auth, &args.database).map(|value| {
+                omit_internal(value, "collections", crate::resources::is_internal_collection)
+            }),
+        )
     }
 
     /// Sampled schema of a collection.
@@ -506,14 +510,17 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(schema::describe_collection(
+        render(
             &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            args.sample,
-            true,
-        ))
+            schema::describe_collection(
+                &self.state,
+                &auth,
+                &args.database,
+                &args.collection,
+                args.sample,
+                true,
+            ),
+        )
     }
 
     /// Query documents.
@@ -546,7 +553,10 @@ impl KimmyMcp {
             stamps: false,
             covers: None,
         };
-        render(exec::find(&self.state, &auth, &args.database, &args.collection, params))
+        render(
+            &self.state,
+            exec::find(&self.state, &auth, &args.database, &args.collection, params),
+        )
     }
 
     /// Count matching documents.
@@ -560,7 +570,10 @@ impl KimmyMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
         let params = exec::FindParams { filter: args.filter, ..Default::default() };
-        render(exec::count(&self.state, &auth, &args.database, &args.collection, params))
+        render(
+            &self.state,
+            exec::count(&self.state, &auth, &args.database, &args.collection, params),
+        )
     }
 
     /// Group, reshape and summarise.
@@ -607,15 +620,19 @@ impl KimmyMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
         if args.explain {
-            return render(kimmy_api::explain::aggregate_explain(
+            return render(
                 &self.state,
-                &auth,
-                &args.database,
-                &args.collection,
-                &args.pipeline,
-            ));
+                kimmy_api::explain::aggregate_explain(
+                    &self.state,
+                    &auth,
+                    &args.database,
+                    &args.collection,
+                    &args.pipeline,
+                ),
+            );
         }
         render(
+            &self.state,
             exec::aggregate(&self.state, &auth, &args.database, &args.collection, &args.pipeline)
                 .await,
         )
@@ -635,7 +652,10 @@ impl KimmyMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
         let (db, coll, request) = search_request(args);
-        render(vectors::run_vector_search(&self.state, &auth, &db, &coll, &request).await)
+        render(
+            &self.state,
+            vectors::run_vector_search(&self.state, &auth, &db, &coll, &request).await,
+        )
     }
 
     /// Combined semantic and keyword search.
@@ -669,7 +689,10 @@ impl KimmyMcp {
         request.weights =
             args.weights.map(|w| vectors::FusionWeights { dense: w.dense, lexical: w.lexical });
         request.min_overlap = args.min_overlap;
-        render(vectors::run_hybrid_search(&self.state, &auth, &db, &coll, &request).await)
+        render(
+            &self.state,
+            vectors::run_hybrid_search(&self.state, &auth, &db, &coll, &request).await,
+        )
     }
 
     /// Insert a document.
@@ -680,7 +703,10 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::insert(&self.state, &auth, &args.database, &args.collection, &args.document))
+        render(
+            &self.state,
+            exec::insert(&self.state, &auth, &args.database, &args.collection, &args.document),
+        )
     }
 
     /// Insert many documents at once.
@@ -694,13 +720,16 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::insert_many(
+        render(
             &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            &args.documents,
-        ))
+            exec::insert_many(
+                &self.state,
+                &auth,
+                &args.database,
+                &args.collection,
+                &args.documents,
+            ),
+        )
     }
 
     /// Update documents.
@@ -729,14 +758,17 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: args.array_filters,
         };
-        render(exec::update(
+        render(
             &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            &args.update,
-            params,
-        ))
+            exec::update(
+                &self.state,
+                &auth,
+                &args.database,
+                &args.collection,
+                &args.update,
+                params,
+            ),
+        )
     }
 
     /// Delete documents.
@@ -755,7 +787,10 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: Vec::new(),
         };
-        render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
+        render(
+            &self.state,
+            exec::delete(&self.state, &auth, &args.database, &args.collection, params),
+        )
     }
 
     /// Create a collection.
@@ -769,7 +804,7 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::create_collection(&self.state, &auth, &args.database, &args.name))
+        render(&self.state, exec::create_collection(&self.state, &auth, &args.database, &args.name))
     }
 
     /// Create a secondary index.
@@ -807,6 +842,7 @@ impl KimmyMcp {
             partial_filter_expression: None,
         };
         render(
+            &self.state,
             exec::create_index_confirmed(
                 &self.state,
                 &auth,
@@ -868,7 +904,21 @@ fn omit_internal(mut value: Value, key: &str, is_internal: fn(&str) -> bool) -> 
 /// could not take the writer): the REST `503` envelope in `structuredContent`, class
 /// `wait`. Every other failure stays a protocol error, carrying its code and class in
 /// `data`.
-pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, ErrorData> {
+pub(crate) fn render(
+    state: &SharedState,
+    result: Result<Value, ApiError>,
+) -> Result<CallToolResult, ErrorData> {
+    // The one place an MCP refusal is counted (`kimmy_api_refused_total{code}`): a tool call refused with a
+    // counted code leaves here as a tool result or a protocol error, and either way it is counted once. The
+    // middleware never counts it, because an MCP refusal is a JSON-RPC error inside an HTTP `200`.
+    if let Err(e) = &result {
+        state.metrics.record_refused(e.code);
+    }
+    shape(result)
+}
+
+/// [`render`] without the count: the shape of a tool's outcome alone.
+fn shape(result: Result<Value, ApiError>) -> Result<CallToolResult, ErrorData> {
     match result {
         Ok(value) => Ok(ok(value)),
         Err(e) if e.retry() == Retry::Verify => Ok(unknown(e)),
@@ -954,6 +1004,13 @@ pub(crate) fn ok(value: Value) -> CallToolResult {
     result
 }
 
+/// Count an API failure that a resource read refused with, and map it onto an MCP error: the exit of a refusal that
+/// is not a tool call (`kimmy_api_refused_total{code}`).
+pub(crate) fn refused(state: &SharedState, e: ApiError) -> ErrorData {
+    state.metrics.record_refused(e.code);
+    error(e)
+}
+
 /// Map an API failure onto an MCP error.
 ///
 /// The distinction rmcp draws is *whose problem it is*. A rejected filter or a
@@ -980,7 +1037,7 @@ mod tests {
 
     #[test]
     fn an_unknown_outcome_is_a_tool_result_the_model_reads() {
-        let result = render(Err(ApiError::outcome_unknown())).expect("a tool result, not an error");
+        let result = shape(Err(ApiError::outcome_unknown())).expect("a tool result, not an error");
         assert_eq!(result.is_error, Some(true));
         let envelope = result.structured_content.expect("the envelope rides in the result");
         assert_eq!(envelope["error"], "outcome_unknown");
@@ -991,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_refusal_and_a_server_fault_are_errors_carrying_their_code_and_class() {
-        let refused = render(Err(ApiError::bad_request("no such operator $nope")))
+        let refused = shape(Err(ApiError::bad_request("no such operator $nope")))
             .expect_err("a refusal stays a protocol error");
         assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         let data = refused.data.expect("the envelope rides in data");
@@ -1000,7 +1057,7 @@ mod tests {
         assert_eq!(data["message"], "no such operator $nope");
 
         // A server fault that is not a timeout is an internal error, the envelope in `data`.
-        let fault = render(Err(ApiError::new(
+        let fault = shape(Err(ApiError::new(
             http::StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Snapshot,
             "the snapshot could not be read",
@@ -1018,7 +1075,7 @@ mod tests {
     fn a_busy_writer_is_a_tool_result_carrying_the_timeout_envelope() {
         let mut busy = ApiError::writer_busy(std::time::Duration::from_secs(30));
         busy.retry_after_secs = Some(2);
-        let busy = render(Err(busy)).expect("a busy writer is a tool result the model reads");
+        let busy = shape(Err(busy)).expect("a busy writer is a tool result the model reads");
         assert_eq!(busy.is_error, Some(true));
         let data = busy.structured_content.expect("the envelope rides in the result");
         assert_eq!(data["error"], "timeout");
@@ -1061,7 +1118,7 @@ mod tests {
             &applied,
             kimmy_storage::StorageError::Stopping(kimmy_storage::StopReason::DrainDeadline),
         );
-        let result = render(Err(e)).expect("a tool result, not an error");
+        let result = shape(Err(e)).expect("a tool result, not an error");
         assert_eq!(result.is_error, Some(true));
         let envelope = result.structured_content.expect("the envelope rides in the result");
         assert_eq!(envelope["error"], "partially_applied");
@@ -1073,7 +1130,7 @@ mod tests {
     #[test]
     fn a_retry_override_is_the_class_carried() {
         let moved = ApiError::not_found("no collection here").with_retry(Retry::Elsewhere);
-        let data = render(Err(moved)).expect_err("a refusal").data.expect("data");
+        let data = shape(Err(moved)).expect_err("a refusal").data.expect("data");
         assert_eq!(data["retry"], "elsewhere");
     }
 }

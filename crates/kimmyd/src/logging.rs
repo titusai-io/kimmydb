@@ -246,6 +246,28 @@ impl TelemetryGuard {
             "Loss records this member did not keep: with a total past the bound or a decimal no writer produces. An event on this member, not a count of distinct records.",
             |s| s.loss_records_refused[5]
         );
+        // `kimmy_api_refused_total{code}` (ADR-272, decision 7): one instrument per code, in the order of `REFUSED_CODES`.
+        observe!(
+            u64_observable_counter,
+            "kimmy.api_refused.stage_collection",
+            "{refusal}",
+            "Schema changes refused with 400 stage_collection: addressed to a hidden staging copy of a replacing $out. Counted where the answer leaves this member.",
+            |s| s.api_refused[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.api_refused.swap_in_progress",
+            "{refusal}",
+            "Requests refused with 503 swap_in_progress: a write or a vector change to a name whose replacing $out is in flight on this member. Counted where the answer leaves this member.",
+            |s| s.api_refused[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.api_refused.clock_ahead",
+            "{refusal}",
+            "Schema changes refused with 503 clock_ahead: this member's own stamps would be refused by the rest of the cluster. Counted where the answer leaves this member.",
+            |s| s.api_refused[2]
+        );
         // `kimmy_conflicts_resolved_total{kind}` (Q7 Step 4, C8): one instrument per kind, in the order of `LossKind::ALL` (the order
         // the snapshot's array is filled in), spelled in snake case as `kimmy.catching_up.*` is.
         observe!(
@@ -3362,6 +3384,23 @@ mod tests {
                 call.ends_with(&want),
                 "{name} does not read slot {slot}, the slot of `{}`: {call}",
                 reason.label()
+            );
+        }
+    }
+
+    #[test]
+    fn each_api_refused_instrument_reads_the_slot_of_its_own_code() {
+        // `every_metrics_series_reaches_the_bridge` matches by stem, so one instrument among several labels satisfies it while the others are
+        // missing. This asserts every code's own instrument literal is in this file once (`instrument_call` fails on none or two) and that
+        // it reads the slot of its code in `REFUSED_CODES`, the order the snapshot's array is filled in.
+        for (slot, code) in kimmy_api::metrics::REFUSED_CODES.iter().enumerate() {
+            let name = format!("kimmy.api_refused.{}", code.as_str());
+            let call = instrument_call(&name);
+            let want = format!("|s|s.api_refused[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{}`: {call}",
+                code.as_str()
             );
         }
     }

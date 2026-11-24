@@ -228,6 +228,12 @@ pub struct OwnershipReading {
     pub evaluator: YieldReading,
 }
 
+/// The refusal codes `kimmy_api_refused_total{code}` counts, in the order the series renders them (ADR-272, decision 7).
+pub const REFUSED_CODES: [crate::error::ErrorCode; 3] = [
+    crate::error::ErrorCode::StageCollection,
+    crate::error::ErrorCode::SwapInProgress,
+    crate::error::ErrorCode::ClockAhead,
+];
 /// The classes' states, in the order the series renders them; `unknown` is not a
 /// series (an evaluator that stopped ticking is told by its age).
 pub const YIELD_STATES: [&str; 4] = ["ok", "idle", "suspect", "stalled"];
@@ -514,6 +520,9 @@ pub struct MetricsSnapshot {
     /// `ReplayResult::ALL` order: what the process-wide counters hold plus what
     /// was recorded here (the tests' door).
     pub replay: [[u64; 5]; 2],
+    /// API refusals answered to a client, by code, in [`REFUSED_CODES`] order: the series
+    /// `kimmy_api_refused_total{code}` (ADR-272, decision 7).
+    pub api_refused: [u64; REFUSED_CODES.len()],
     /// Peer connections this node failed to serve, by reason, in
     /// `ServeFailure::ALL` order.
     pub sync_serve_failures: [u64; kimmy_cluster::ServeFailure::COUNT],
@@ -695,6 +704,7 @@ pub struct Metrics {
     ddl_confirm_pushes: AtomicU64,
     /// [`Self::record_replay`]'s count, added to the transport's own counters.
     replay_recorded: [[AtomicU64; 5]; 2],
+    api_refused: [AtomicU64; REFUSED_CODES.len()],
     sync_serve_failures: [AtomicU64; kimmy_cluster::ServeFailure::COUNT],
     accept_errors: [AtomicU64; kimmy_cluster::AcceptListener::COUNT],
     sync_divergent_collections: AtomicU64,
@@ -843,6 +853,7 @@ impl Default for Metrics {
             ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
             ddl_confirm_pushes: AtomicU64::new(0),
             replay_recorded: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            api_refused: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_serve_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             accept_errors: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_divergent_collections: AtomicU64::new(0),
@@ -1222,6 +1233,16 @@ impl Metrics {
         self.ddl_confirmations[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One refusal answered to a client (ADR-272, decision 7). Called at the two exits an answer leaves
+    /// the member by, the HTTP middleware and the MCP `render`, never where the error is built: a built
+    /// error may never be answered, and nothing there holds the metrics. Only the three codes of
+    /// [`REFUSED_CODES`] count; every other code is ignored, so the series has no `other`.
+    pub fn record_refused(&self, code: crate::error::ErrorCode) {
+        if let Some(slot) = REFUSED_CODES.iter().position(|c| *c == code) {
+            self.api_refused[slot].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// One peer connection this node failed to serve, and why.
     pub fn record_sync_serve_failure(&self, reason: kimmy_cluster::ServeFailure) {
         self.sync_serve_failures[reason.slot()].fetch_add(1, Ordering::Relaxed);
@@ -1584,6 +1605,7 @@ impl Metrics {
             ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
             replay: self.replay_totals(),
             accept_errors: std::array::from_fn(|slot| self.get(&self.accept_errors[slot])),
+            api_refused: std::array::from_fn(|slot| self.get(&self.api_refused[slot])),
             sync_serve_failures: std::array::from_fn(|slot| {
                 self.get(&self.sync_serve_failures[slot])
             }),
@@ -1735,6 +1757,18 @@ impl Metrics {
                     "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
                     outcome.label(),
                     self.get(&self.ddl_confirmations[outcome.slot()])
+                )
+            })
+            .collect::<String>();
+        // One line per code, always, from the fixed array and never from what has been seen.
+        let api_refused = REFUSED_CODES
+            .iter()
+            .enumerate()
+            .map(|(slot, code)| {
+                format!(
+                    "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
+                    code.as_str(),
+                    self.get(&self.api_refused[slot])
                 )
             })
             .collect::<String>();
@@ -1927,6 +1961,9 @@ impl Metrics {
              kimmy_responses_total{{class=\"2xx\"}} {ok}\n\
              kimmy_responses_total{{class=\"4xx\"}} {client}\n\
              kimmy_responses_total{{class=\"5xx\"}} {server}\n\
+             # HELP kimmy_api_refused_total API refusals answered to a client, by code: `stage_collection` (400: a schema change addressed to a hidden staging copy of a replacing `$out`), `swap_in_progress` (503: a write or a vector change to a name whose replacing `$out` is in flight on this member; retry) and `clock_ahead` (503: a schema change refused because this member's own stamps would be refused by the rest of the cluster; retry on another member). Counted where the answer leaves this member, over HTTP and over MCP, so an error that was built and never answered does not count. Every other refusal is not counted here. This member's own count: not part of any state, and not replicated.\n\
+             # TYPE kimmy_api_refused_total counter\n\
+             {api_refused}\
              # HELP kimmy_authz_denied_total Operations refused by RBAC.\n\
              # TYPE kimmy_authz_denied_total counter\n\
              kimmy_authz_denied_total {denied}\n\
@@ -3219,6 +3256,12 @@ mod tests {
         // recorded under `via="pull"` would read 186 there.
         m.record_ddl_applied_push(97);
         m.record_ddl_held_push(58);
+        // A distinct count per refusal code: 120 for the first, one more for each after it, so a line under the wrong label cannot match.
+        for (slot, code) in REFUSED_CODES.iter().enumerate() {
+            for _ in 0..(120 + slot) {
+                m.record_refused(*code);
+            }
+        }
         // A distinct count per reason: 140 for the first, one more for each
         // after it, so a line under the wrong label cannot match.
         for reason in kimmy_cluster::ServeFailure::ALL {
@@ -3950,6 +3993,11 @@ kimmy_requests_total 10
 kimmy_responses_total{class=\"2xx\"} 2
 kimmy_responses_total{class=\"4xx\"} 3
 kimmy_responses_total{class=\"5xx\"} 4
+# HELP kimmy_api_refused_total API refusals answered to a client, by code: `stage_collection` (400: a schema change addressed to a hidden staging copy of a replacing `$out`), `swap_in_progress` (503: a write or a vector change to a name whose replacing `$out` is in flight on this member; retry) and `clock_ahead` (503: a schema change refused because this member's own stamps would be refused by the rest of the cluster; retry on another member). Counted where the answer leaves this member, over HTTP and over MCP, so an error that was built and never answered does not count. Every other refusal is not counted here. This member's own count: not part of any state, and not replicated.
+# TYPE kimmy_api_refused_total counter
+kimmy_api_refused_total{code=\"stage_collection\"} 120
+kimmy_api_refused_total{code=\"swap_in_progress\"} 121
+kimmy_api_refused_total{code=\"clock_ahead\"} 122
 # HELP kimmy_authz_denied_total Operations refused by RBAC.
 # TYPE kimmy_authz_denied_total counter
 kimmy_authz_denied_total 1
@@ -4689,6 +4737,13 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_responses_total{{class=\"2xx\"}} {}\n", s.responses_2xx));
         expect(&format!("kimmy_responses_total{{class=\"4xx\"}} {}\n", s.responses_4xx));
         expect(&format!("kimmy_responses_total{{class=\"5xx\"}} {}\n", s.responses_5xx));
+        for (slot, code) in REFUSED_CODES.iter().enumerate() {
+            expect(&format!(
+                "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
+                code.as_str(),
+                s.api_refused[slot]
+            ));
+        }
         expect(&format!("kimmy_authz_denied_total {}\n", s.authz_denied));
         expect(&format!("kimmy_auth_failures_total {}\n", s.auth_failures));
         expect(&format!("kimmy_rate_limited_total {}\n", s.rate_limited));
@@ -5260,6 +5315,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 2
                 // And those already held, pulled and pushed.
                 + 2
+                // API refusals answered to a client, by code (ADR-272, decision 7).
+                + REFUSED_CODES.len()
                 // Peer connections this node failed to serve, by reason.
                 + kimmy_cluster::ServeFailure::COUNT
                 // Accept errors a listener had, by listener.
@@ -6006,5 +6063,51 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         assert!(again.peak_resident_bytes >= m.peak_resident_bytes, "{m:?} then {again:?}");
         // Recorded in the process-wide maximum the next reading is folded into.
         assert!(PEAK_SEEN.load(std::sync::atomic::Ordering::Relaxed) >= again.peak_resident_bytes);
+    }
+
+    #[test]
+    fn the_api_refused_series_render_at_zero_for_every_code_before_any_refusal() {
+        // From the fixed array and never from what has been seen, as `kimmy_loss_records_refused_total` is: a series that appears
+        // only once it has moved cannot be told apart from one that does not exist.
+        let page = Metrics::default().render_with(&StorageReadings::default());
+        for code in ["stage_collection", "swap_in_progress", "clock_ahead"] {
+            let line = format!("kimmy_api_refused_total{{code=\"{code}\"}} 0\n");
+            assert!(page.contains(&line), "no `{line}` in the page at rest");
+        }
+        assert_eq!(
+            page.matches("kimmy_api_refused_total{").count(),
+            3,
+            "three series and no `other`"
+        );
+    }
+
+    #[test]
+    fn a_refusal_counts_under_its_own_code_and_no_other_code_counts_at_all() {
+        let m = Metrics::default();
+        for (slot, code) in REFUSED_CODES.iter().enumerate() {
+            m.record_refused(*code);
+            let seen = m.snapshot().api_refused;
+            let mut want = [0u64; REFUSED_CODES.len()];
+            want[slot] = 1;
+            assert_eq!(
+                seen,
+                want,
+                "{}: one refusal moves its own series by one and nothing else",
+                code.as_str()
+            );
+            m.api_refused[slot].store(0, Ordering::Relaxed);
+        }
+        // every code that is not one of the three, whatever its status: counted nowhere
+        for code in crate::error::ErrorCode::ALL {
+            if REFUSED_CODES.contains(&code) {
+                continue;
+            }
+            m.record_refused(code);
+        }
+        assert_eq!(
+            m.snapshot().api_refused,
+            [0; REFUSED_CODES.len()],
+            "a code outside the three (a 503 `writer_busy`, a 400 `bad_request`, ...) moves none of them"
+        );
     }
 }

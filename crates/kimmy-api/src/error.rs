@@ -1029,6 +1029,10 @@ impl IntoResponse for ApiError {
             }
         }
         let mut response = (self.status, Json(body)).into_response();
+        // The code rides on the response, never on the wire: the middleware that counts API refusals reads it
+        // from here (`kimmy_api_refused_total{code}`), so the label comes from this enum and from nothing a body
+        // relayed from elsewhere could carry.
+        response.extensions_mut().insert(self.code);
         if let Some(description) = self.challenge_description {
             response.extensions_mut().insert(ChallengeDescription(description));
         }

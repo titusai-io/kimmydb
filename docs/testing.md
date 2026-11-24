@@ -753,7 +753,9 @@ to the engine.
   apply.
 - **A refused write.** `503 swap_in_progress` counts in `kimmy_responses_total{class="5xx"}`
   with the other `503`s and writes no log line. A lab asserts on the response: status,
-  code, `Retry-After: 2`. `kimmy_api_refused_total{code}` is owed at Q6.5.
+  code, `Retry-After: 2`. `kimmy_api_refused_total{code="swap_in_progress"}` counts it once, where
+  the answer leaves the member (over HTTP the middleware, over MCP the tool's render), beside
+  `stage_collection` and `clock_ahead`; read it from `/metrics`, not from a field.
 
 ---
 

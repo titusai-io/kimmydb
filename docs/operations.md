@@ -761,7 +761,8 @@ kept. They are `bad_request`, `payload_too_large`, `document_too_large`,
 except `collection_purging`, a `503` the drop purger's own log lines already
 account for, and `swap_in_progress`, a `503` a member answers while it holds a swap's
 binding it cannot yet make visible (`kimmy_register_waiting_for_stage` and its
-sync logs say why); read the authorization decisions among them in
+sync logs say why); those two are also counted by code, in
+`kimmy_api_refused_total{code}`, which counts one refusal that is logged beside them; read the authorization decisions among them in
 [the audit log](#the-audit-log), and see [HTTP API](http-api.md#errors) for what
 each one means to the client.
 
@@ -1363,6 +1364,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_process_resident_peak_bytes` | The most the process has had resident at any moment since it started (`VmHWM`) — what a limit was reached *by*, readable after the current figure has come back down. It is the most this process has seen, including between the kernel's own updates of `VmHWM`, which can read lower than an earlier `VmRSS`. Never falls within one process life; a restart resets it. 0 where there is no `/proc` |
 | `kimmy_requests_total` | HTTP requests handled |
 | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
+| `kimmy_api_refused_total{code}` | API refusals this member answered to a client, by code: **`stage_collection`** (`400`: a schema change addressed to a hidden staging copy of a replacing `$out`, [ADR-272](decisions.md)), **`swap_in_progress`** (`503`, retry: a write or a vector change to a name whose replacing `$out` is in flight on this member, or a `$out`/`$merge` whose request found a collection it read replaced before it wrote) and **`clock_ahead`** (`503`, retry on another member: a schema change refused because this member's own stamps would be refused by the rest of the cluster, see `kimmy_clock_hlc_lead_seconds`). Counted where the answer leaves this member, over HTTP and over MCP alike, so a refusal that was built and never answered is not counted, and one answered over MCP is counted once, not again as the HTTP `200` that carries it. **Always three series, each `0` until it moves; no `other`.** Every other refusal is counted only in `kimmy_responses_total` and writes no line. This member's own count: not part of any state, and not replicated. |
 | `kimmy_authz_denied_total` | Refused by RBAC |
 | `kimmy_auth_failures_total` | Rejected credentials and tokens |
 | `kimmy_rate_limited_total` | Refused by a rate limit — the login limiters and the per-principal one together |
