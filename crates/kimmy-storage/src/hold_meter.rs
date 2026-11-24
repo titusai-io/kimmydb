@@ -1133,6 +1133,28 @@ mod tests {
         }
     }
 
+    /// The collection `shop.orders`, with enough padding written to it (1,000 rows of 4,000 bytes: a flip of the magnitude fails loudly) that
+    /// the file is as large as the rows a test measures next need. `MIN_DESIRED_USABLE_BYTES` in redb's page_manager.rs went from 1 MiB
+    /// to 64 KiB in redb 4.6 (a 72 KiB file that doubles as it grows), and redb syncs the file when it grows it, in the commit that
+    /// needed the room, durable or not (`sync_file` after `set_len`, the same in 4.5 and 4.6).
+    fn grown(engine: &Engine) -> crate::meta::CollectionMeta {
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let padding = "x".repeat(4_000);
+        engine
+            .insert_many(
+                &coll,
+                (0..1_000).map(|i| doc! { "n": i, "pad": padding.clone() }).collect(),
+            )
+            .unwrap();
+        coll
+    }
+
+    fn inserts_into(engine: &Engine, coll: &crate::meta::CollectionMeta, n: usize) {
+        for i in 0..n {
+            engine.insert(coll, doc! { "n": i as i64, "body": "x".repeat(200) }).unwrap();
+        }
+    }
+
     /// Every component sums to the hold it came from, to within the rounding of
     /// the hold histogram's microseconds: one per hold.
     fn assert_adds_up(row: &Row) {
@@ -1270,21 +1292,21 @@ mod tests {
         // The pair: under `durable` the fsync is inside the write's hold; under
         // `coalesced` the write's hold has none and the barrier's has it. A
         // `sync` that read the same under both would pass either half alone.
+        // Both halves write their padding before they measure (`grown`): redb syncs the file when it grows it, in the
+        // commit that needed the room, so a measured commit that grew it would show a sync that is not its own fsync
+        // (the durable half's `Sync > 0` could then pass on growth alone, the coalesced half's `Sync == 0` would fail).
         let (engine, _dir) = fresh();
-        let durable = during(&engine, WriterHolder::Write, || inserts(&engine, 10));
+        let coll = grown(&engine);
+        let durable = during(&engine, WriterHolder::Write, || inserts_into(&engine, &coll, 10));
         assert!(durable.get(Component::Sync) > Duration::ZERO, "{durable:?}");
         assert!(durable.get(Component::Write) > Duration::ZERO, "{durable:?}");
         assert!(durable.write_bytes > 0, "{durable:?}");
 
         let (engine, _dir) = fresh();
         engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(2));
-        let coll = engine.create_collection("shop", "orders").unwrap();
+        let coll = grown(&engine);
         let before = engine.writer_hold_decomposition();
-        let write = during(&engine, WriterHolder::Write, || {
-            for i in 0..10 {
-                engine.insert(&coll, doc! { "n": i }).unwrap();
-            }
-        });
+        let write = during(&engine, WriterHolder::Write, || inserts_into(&engine, &coll, 10));
         let after = engine.writer_hold_decomposition();
         let barrier = WriterHolder::Durability.slot();
         let barrier_sync = after.component_ns[barrier][Component::Sync.slot()]

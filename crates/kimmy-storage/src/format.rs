@@ -48,11 +48,11 @@ use crate::error::{RefusedKind, Result, StorageError};
 use crate::tables;
 
 /// The redb major.minor this build is compiled against. `Cargo.toml` pins redb
-/// to `~4.5`, so a patch release is the only kind that can arrive unnoticed; a
+/// to `~4.6`, so a patch release is the only kind that can arrive unnoticed; a
 /// test holds this constant to `Cargo.lock`.
-pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 5);
+pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 6);
 
-/// The file-format byte redb 4.5 writes in each commit slot, the same as 4.1's.
+/// The file-format byte redb 4.6 writes in each commit slot, the same as 4.1's.
 /// A test creates a store and reads it back.
 pub const REDB_FILE_FORMAT: u8 = 3;
 

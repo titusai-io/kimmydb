@@ -8631,6 +8631,51 @@ mod tests {
         );
     }
 
+    /// Make the file as large as a few megabytes of rows need, so that the two one-row commits a test makes next do not grow it. redb
+    /// syncs the file when it grows it, in the commit that needed the room, durable or not (`sync_file` after `set_len`, the same in
+    /// redb 4.5 and 4.6); `MIN_DESIRED_USABLE_BYTES` in redb's page_manager.rs went from 1 MiB to 64 KiB in 4.6 (a 72 KiB file), so the
+    /// first commits of a test grew it where they did not, and a sync a test armed to fail, or a hold it measured for one, met that growth and not the flush it was
+    /// written about.
+    fn grow_the_file_beyond_what_two_commits_need(engine: &Engine, coll: &CollectionMeta) {
+        use bson::doc;
+        let docs: Vec<_> =
+            (0..1_000i64).map(|i| doc! {"_id": 1_000 + i, "pad": "x".repeat(4_000)}).collect();
+        engine.insert_many(coll, docs).unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_while_the_file_grows_fails_the_commit_and_latches_the_storage_failure() {
+        // The twin of the test below, on a file that still has to grow: the sync that fails is the growth's own, inside the commit that
+        // needed the room, so the commit returns its error before it waits for any shared flush and no committer is left behind it. What
+        // is held is the product's own latch (`storage_failed`, which says what failed, as `a_commit_whose_fsync_fails_is_outcome_unknown`
+        // does), not redb's wording of the refusal that follows.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(300));
+        let coll = engine.create_collection("app", "c").unwrap();
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let docs: Vec<_> =
+            (0..1_000i64).map(|i| doc! {"_id": i, "pad": "x".repeat(4_000)}).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (engine, coll) = (Arc::clone(&engine), coll.clone());
+            std::thread::spawn(move || {
+                tx.send(engine.insert_many(&coll, docs).map(|_| ()).map_err(|e| e.to_string()))
+                    .unwrap();
+            });
+        }
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a commit whose sync failed was left waiting");
+        result.expect_err("a commit whose sync failed is not acknowledged");
+        assert_eq!(
+            engine.storage_failed().expect("the failure is latched").call,
+            "sync_data",
+            "and the product says what failed"
+        );
+    }
+
     #[test]
     fn a_failed_flush_fails_the_commits_it_covered_and_leaves_none_waiting() {
         // A leader's flush fails with a waiter behind it. The waiter gets the
@@ -8640,8 +8685,9 @@ mod tests {
         use bson::doc;
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(300));
         let coll = engine.create_collection("app", "c").unwrap();
+        grow_the_file_beyond_what_two_commits_need(&engine, &coll);
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(300));
         assert!(engine.arm_test_storage_failure("sync_data"));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -9447,7 +9493,11 @@ mod clearing {
         let t = a.create_collection("shop", "t").unwrap();
         // A count that does not leave the file next to one of redb's growth steps: the
         // bound below is on growth, and a store a commit smaller or larger can sit on one.
-        let docs: Vec<bson::Document> = (0..6_000i64).map(|i| doc! {"_id": i}).collect();
+        // redb's steps follow its first size, `MIN_DESIRED_USABLE_BYTES` in its page_manager.rs
+        // (1 MiB in redb 4.5, 64 KiB, a 72 KiB file, since 4.6), and the file doubles as it grows, and the final page's own rows doubled
+        // the file here at 3,000 and at 6,000 documents. 4,500 sits in the middle of the span
+        // (3,500 to 5,500) that leaves it as it was.
+        let docs: Vec<bson::Document> = (0..4_500i64).map(|i| doc! {"_id": i}).collect();
         a.insert_many(&t, docs).unwrap();
 
         let mut progress = crate::snapshot::SnapshotProgress::whole_database();
