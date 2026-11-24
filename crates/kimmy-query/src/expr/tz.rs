@@ -115,7 +115,7 @@ impl Zone {
                 let sub = local_ms.rem_euclid(1000);
                 // The local reading as a civil date-time, via UTC as a ruler.
                 let Ok(ts) = Timestamp::from_second(secs) else { return local_ms };
-                let dt: DateTime = ts.to_zoned(TimeZone::UTC).datetime();
+                let dt: DateTime = ts.to_zoned_datetime(TimeZone::UTC).datetime();
                 let ambiguous = tz.to_ambiguous_timestamp(dt);
                 let resolved = match (keep, ambiguous.offset()) {
                     (Some(want), AmbiguousOffset::Fold { before, .. })
@@ -281,5 +281,234 @@ mod tests {
             ny.local_to_utc_keeping(1_720_000_000_000, -5 * 3600),
             1_720_000_000_000 + 4 * 3_600_000
         );
+    }
+
+    /// The instants the offsets are read at: eras, the one millisecond either side of the transitions of 2024 and of a few earlier years that the zones below have, and the far ends.
+    const INSTANTS: [(&str, i64); 49] = [
+        ("1800-01-01T00:00:00Z", -5364662400000),
+        ("1850-06-15T12:00:00Z", -3772526400000),
+        ("1883-11-18T16:59:59.999Z", -2717650800001),
+        ("1883-11-18T17:00:00Z", -2717650800000),
+        ("1900-01-01T00:00:00Z", -2208988800000),
+        ("1918-03-31T07:00:00Z -1ms", -1633280400001),
+        ("1918-03-31T07:00:00Z", -1633280400000),
+        ("1945-08-15T12:00:00Z", -769348800000),
+        ("1969-12-31T23:59:59.999Z", -1),
+        ("1970-01-01T00:00:00Z", 0),
+        ("1986-01-01T00:00:00Z", 504921600000),
+        ("2000-01-01T00:00:00Z", 946684800000),
+        ("2007-03-11T07:00:00Z -1ms", 1173596399999),
+        ("2007-03-11T07:00:00Z", 1173596400000),
+        ("2011-12-30T10:00:00Z -1ms", 1325239199999),
+        ("2011-12-30T10:00:00Z", 1325239200000),
+        ("2022-03-21T20:30:00Z -1ms", 1647894599999),
+        ("2022-03-21T20:30:00Z", 1647894600000),
+        ("2024-03-10T02:00:00Z -1ms", 1710035999999),
+        ("2024-03-10T02:00:00Z", 1710036000000),
+        ("2024-03-10T07:00:00Z -1ms", 1710053999999),
+        ("2024-03-10T07:00:00Z", 1710054000000),
+        ("2024-03-31T01:00:00Z -1ms", 1711846799999),
+        ("2024-03-31T01:00:00Z", 1711846800000),
+        ("2024-04-06T14:45:00Z -1ms", 1712414699999),
+        ("2024-04-06T14:45:00Z", 1712414700000),
+        ("2024-04-06T15:00:00Z -1ms", 1712415599999),
+        ("2024-04-06T15:00:00Z", 1712415600000),
+        ("2024-04-06T16:00:00Z -1ms", 1712419199999),
+        ("2024-04-06T16:00:00Z", 1712419200000),
+        ("2024-04-14T02:00:00Z -1ms", 1713059999999),
+        ("2024-04-14T02:00:00Z", 1713060000000),
+        ("2024-07-01T00:00:00Z", 1719792000000),
+        ("2024-09-28T14:45:00Z -1ms", 1727534699999),
+        ("2024-09-28T14:45:00Z", 1727534700000),
+        ("2024-10-05T16:00:00Z -1ms", 1728143999999),
+        ("2024-10-05T16:00:00Z", 1728144000000),
+        ("2024-10-06T15:30:00Z -1ms", 1728228599999),
+        ("2024-10-06T15:30:00Z", 1728228600000),
+        ("2024-10-27T01:00:00Z -1ms", 1729990799999),
+        ("2024-10-27T01:00:00Z", 1729990800000),
+        ("2024-11-03T06:00:00Z -1ms", 1730613599999),
+        ("2024-11-03T06:00:00Z", 1730613600000),
+        ("2024-12-31T23:59:59.999Z", 1735689599999),
+        ("2038-01-19T03:14:07.999Z", 2147483647999),
+        ("2050-07-01T12:00:00Z", 2540289600000),
+        ("2099-12-31T23:59:59.999Z", 4102444799999),
+        ("2100-03-14T12:00:00Z", 4108708800000),
+        ("2100-12-31T23:59:59.999Z", 4133980799999),
+    ];
+
+    // -- the tz database and the library that reads it, pinned ------------------------------------------------------------------------
+    //
+    // `tz_golden.txt` is every answer this module takes from the tz crate and the bundled database: the offset of 16 zones at the
+    // instants below (eras, the millisecond either side of transitions, the far ends and the clamp), the bounds of the instants the
+    // crate represents, and, for every name the database lists, whether `Zone::parse` accepts it and the offset it reads at 21 instants
+    // from 1850 to 2100. A new tz crate or a new database changes the file, and the change has to be explained line by line by the
+    // database's release notes (a rule moved, a zone added, a link renamed) and never by the crate's code.
+    //
+    // To write the file anew after such a change: `KIMMY_BLESS_TZ_GOLDEN=1 cargo test -p kimmy-query tz_golden`.
+
+    /// The instants every name the database lists is read at: 1850, 1900, and then a winter or summer day of 1930, 1950, 1970, 1990, 2000, 2010,
+    /// 2020, 2024 (both), 2026, 2030 (both), 2060 and 2100, at noon UTC, with the days a recent database release moved: 1965-03-31 and
+    /// 1966-03-01 (Brazil's DST ended at other hours, 2026f) and the winter of 2026 to 2027 and the end of 2027 (Cuba, 2026f).
+    const NAME_INSTANTS: [i64; 21] = [
+        -3772526400000,
+        -2208945600000,
+        -1246622400000,
+        -629899200000,
+        -150033600000,
+        -121120200000,
+        15681600000,
+        632404800000,
+        962452800000,
+        1263556800000,
+        1593604800000,
+        1705320000000,
+        1719835200000,
+        1782907200000,
+        1796126400000,
+        1800014400000,
+        1827662400000,
+        1894708800000,
+        1909137600000,
+        2855908800000,
+        4118126400000,
+    ];
+
+    const ZONES: [&str; 16] = [
+        "America/New_York",
+        "America/Sao_Paulo",
+        "America/St_Johns",
+        "Europe/London",
+        "Europe/Berlin",
+        "Europe/Moscow",
+        "Africa/Casablanca",
+        "Asia/Kolkata",
+        "Asia/Kathmandu",
+        "Asia/Tehran",
+        "Australia/Sydney",
+        "Australia/Lord_Howe",
+        "Pacific/Apia",
+        "Pacific/Chatham",
+        "Pacific/Kiritimati",
+        "Etc/GMT+5",
+    ];
+
+    fn golden_text() -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let min = min_ms();
+        let max = max_ms();
+        writeln!(out, "bounds min_ms={min} max_ms={max}").unwrap();
+        // The far ends: the bounds themselves, one inside, and one outside (read at the edge, `offset_at` clamps).
+        let mut instants: Vec<(String, i64)> =
+            INSTANTS.iter().map(|(label, ms)| (label.to_string(), *ms)).collect();
+        instants.push(("min_ms".into(), min));
+        instants.push(("min_ms+1".into(), min + 1));
+        instants.push(("max_ms".into(), max));
+        instants.push(("max_ms-1".into(), max - 1));
+        instants.push(("i64::MIN".into(), i64::MIN));
+        instants.push(("i64::MAX".into(), i64::MAX));
+        for zone in ZONES {
+            let parsed = Zone::parse(zone).unwrap_or_else(|e| panic!("{zone}: {e}"));
+            for (label, ms) in &instants {
+                writeln!(out, "offset {zone} {label} {}", parsed.offset_at(*ms)).unwrap();
+            }
+        }
+        let mut names: Vec<&str> = jiff_tzdb::available().collect();
+        names.sort_unstable();
+        writeln!(out, "names {}", names.len()).unwrap();
+        for name in names {
+            match Zone::parse(name) {
+                Ok(zone) => {
+                    let read: Vec<String> =
+                        NAME_INSTANTS.iter().map(|ms| zone.offset_at(*ms).to_string()).collect();
+                    writeln!(out, "name {name} {}", read.join(" ")).unwrap()
+                }
+                Err(_) => writeln!(out, "name {name} REFUSED").unwrap(),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tz_golden_the_offsets_the_bounds_and_the_accepted_names_are_what_the_file_pins() {
+        let got = golden_text();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/expr/tz_golden.txt");
+        if std::env::var_os("KIMMY_BLESS_TZ_GOLDEN").is_some() {
+            std::fs::write(&path, &got).unwrap();
+            return;
+        }
+        let want = include_str!("tz_golden.txt");
+        if got == want {
+            return;
+        }
+        let (got_lines, want_lines): (Vec<&str>, Vec<&str>) =
+            (got.lines().collect(), want.lines().collect());
+        let in_want: std::collections::HashSet<&str> = want_lines.iter().copied().collect();
+        let in_got: std::collections::HashSet<&str> = got_lines.iter().copied().collect();
+        let added: Vec<&&str> =
+            got_lines.iter().filter(|l| !in_want.contains(**l)).take(40).collect();
+        let removed: Vec<&&str> =
+            want_lines.iter().filter(|l| !in_got.contains(**l)).take(40).collect();
+        panic!(
+            "the tz answers changed ({} lines now, {} pinned). Explain each by the tz database's release notes, then \
+             KIMMY_BLESS_TZ_GOLDEN=1.\nnow, not pinned (first 40):\n{}\npinned, not now (first 40):\n{}",
+            got_lines.len(),
+            want_lines.len(),
+            added.iter().map(|l| format!("  + {l}")).collect::<Vec<_>>().join("\n"),
+            removed.iter().map(|l| format!("  - {l}")).collect::<Vec<_>>().join("\n"),
+        );
+    }
+
+    /// The version of the package `name` that `kimmy-query` is locked to, read from `Cargo.lock`: a dependency line is `"name"` when one
+    /// version of it is locked and `"name <version>"` when two are (a logger in the tree still reads jiff 0.2, which is not the one this
+    /// crate reads).
+    fn locked_version_read_by_this_crate(lock: &str, name: &str) -> String {
+        let packages: Vec<&str> = lock.split("[[package]]").collect();
+        let mine = packages
+            .iter()
+            .find(|p| p.contains("name = \"kimmy-query\"\n"))
+            .expect("kimmy-query in Cargo.lock");
+        let line = mine
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("\"{name}\"")) || l.starts_with(&format!("\"{name} ")))
+            .unwrap_or_else(|| panic!("{name} is not a dependency of kimmy-query in Cargo.lock"));
+        let inner = line.trim_end_matches(',').trim_matches('"');
+        if let Some((_, version)) = inner.split_once(' ') {
+            return version.to_string();
+        }
+        let named = format!("name = \"{name}\"\n");
+        let versions: Vec<String> = packages
+            .iter()
+            .filter(|p| p.contains(&named))
+            .filter_map(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"').to_string())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "{name} locked at {versions:?}, and the dependency line does not say which"
+        );
+        versions.into_iter().next().unwrap()
+    }
+
+    /// A new major of the tz crate or of its bundled database is a decision, not a routine bump: its answers are what `tz_golden.txt` pins
+    /// and what `docs/aggregation.md` and `docs/deviations.md` describe, and its API is not this crate's to assume. This fails on exactly
+    /// the `Cargo.lock` major, as `the_redb_constants_are_what_this_build_is_on` does for redb.
+    #[test]
+    fn the_tz_crates_are_the_major_the_golden_file_was_written_on() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        for name in ["jiff", "jiff-tzdb"] {
+            let version = locked_version_read_by_this_crate(&lock, name);
+            assert_eq!(
+                version.split('.').next(),
+                Some("1"),
+                "kimmy-query reads {name} {version}: re-read tz_golden.txt, docs/aggregation.md and docs/deviations.md against it, then move this \
+                 canary"
+            );
+        }
     }
 }

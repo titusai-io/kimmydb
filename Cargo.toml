@@ -84,10 +84,10 @@ async-trait = "0.1"
 # transition lookups are used; the calendar arithmetic is ours, because a BSON
 # date reaches far outside the years jiff represents. `alloc` is the one
 # runtime feature the bundled database needs.
-jiff = { version = "0.2", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
+jiff = { version = "1", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 # The same bundle jiff reads, named only to report which tz database version is
 # compiled in (`VERSION`), so the docs and a test can state it. Raw data, no code.
-jiff-tzdb = "0.1"
+jiff-tzdb = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -119,11 +119,11 @@ bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 
 # Storage
-# Pinned to 4.5.x: a redb minor may change allocator or system-table rules,
+# Pinned to 4.6.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
 # redb's `cache_metrics` is not enabled here: kimmy-storage's `cache-metrics`
 # feature turns it on, for a build that wants `kimmy_storage_cache_*`.
-redb = "~4.5"
+redb = "~4.6"
 
 # HTTP client, for every request the node makes outward: webhook deliveries,
 # the remote embedding providers, and OIDC discovery and JWKS. One spec, so

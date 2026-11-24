@@ -873,9 +873,14 @@ mod tests {
         (dir, path)
     }
 
-    /// [`an_unclean_store`], after ten more documents and 250 deletes: the
+    /// [`an_unclean_store`], after three hundred more documents and 250 deletes: the
     /// deletes free pages, and the freed table is where a cut of the file's
-    /// last two blocks reaches a page past the end of its region.
+    /// last block reaches a page past the end of its region. (Ten documents and a
+    /// cut of two blocks did, while a new database started at about 1 MiB; redb's
+    /// `MIN_DESIRED_USABLE_BYTES` went from 1 MiB to 64 KiB in 4.6, a 72 KiB file that
+    /// doubles as it grows, so the pages fall elsewhere
+    /// and the same cut was met by the walk of the view instead, a verdict of
+    /// damage as well, but not redb's own layout check this test is for.)
     fn an_unclean_store_with_freed_pages() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("live.redb");
@@ -886,7 +891,7 @@ mod tests {
         let c = engine.get_collection("shop", "orders").unwrap();
         let pad = "y".repeat(300);
         let docs =
-            (0..10).map(|i| bson::doc! { "_id": format!("x{i}"), "pad": pad.clone() }).collect();
+            (0..300).map(|i| bson::doc! { "_id": format!("x{i}"), "pad": pad.clone() }).collect();
         engine.insert_many(&c, docs).unwrap();
         for i in 0..250 {
             engine.delete(&c, &kimmy_core::DocId::String(format!("d{i}"))).unwrap();
@@ -1247,19 +1252,36 @@ mod tests {
     /// without them has nothing there for the cut to pass.
     #[test]
     fn a_killed_store_cut_into_its_last_region_is_damaged_by_redb() {
-        let (_dir, path) = an_unclean_store_with_freed_pages();
-        let len = std::fs::metadata(&path).unwrap().len();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(len - 2 * BLOCK)
-            .unwrap();
-        let report = check_untouched(&path, PreviousRun::NotClean);
-        assert_eq!(report.verdict, Verdict::Damaged, "{report:?}");
-        assert_eq!(report.exit_code(), 65);
-        assert!(report.detail.contains("extends past the end of its region"), "{report:?}");
-        assert!(report.detail.contains("kimmyd restore"), "{report:?}");
+        // Self-calibrating, since where redb's own layout check is reached depends on where its pages fall (a 72 KiB first size
+        // since redb 4.6, `MIN_DESIRED_USABLE_BYTES`; a cut of one block of this fixture reaches it, probed over cuts of 1 to 24
+        // blocks, every one of which is damage): every cut of up to eight blocks is Damaged, exit 65, with the way out, and at
+        // least one of them is refused by redb's own check, the message this test is for. If a later redb moves the pages so that none
+        // is, the last assertion says so, and the fixture is probed again.
+        let mut by_redb = Vec::new();
+        for blocks in 1..=8u64 {
+            let (_dir, path) = an_unclean_store_with_freed_pages();
+            let len = std::fs::metadata(&path).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(len - blocks * BLOCK)
+                .unwrap();
+            let report = check_untouched(&path, PreviousRun::NotClean);
+            assert_eq!(report.verdict, Verdict::Damaged, "a cut of {blocks} blocks: {report:?}");
+            assert_eq!(report.exit_code(), 65, "a cut of {blocks} blocks: {report:?}");
+            assert!(
+                report.detail.contains("kimmyd restore"),
+                "a cut of {blocks} blocks: {report:?}"
+            );
+            if report.detail.contains("extends past the end of its region") {
+                by_redb.push(blocks);
+            }
+        }
+        assert!(
+            !by_redb.is_empty(),
+            "no cut of one to eight blocks reaches redb's own layout check any more: probe the fixture again"
+        );
     }
 
     /// The file shrinking under a running check is not the store's damage:
