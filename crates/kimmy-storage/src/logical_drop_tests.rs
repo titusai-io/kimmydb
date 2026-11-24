@@ -154,6 +154,19 @@ fn register_events(e: &Engine) -> Vec<Stamp> {
     events
 }
 
+/// The register events of `orders` known ahead of their position (information: not in effect).
+fn parked_events(e: &Engine) -> Vec<Stamp> {
+    let txn = e.begin_write(WriterHolder::Ddl).unwrap();
+    let events = crate::register::parked(&txn, DB, "orders")
+        .unwrap()
+        .events()
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    txn.abort().unwrap();
+    events
+}
+
 fn absent(e: &Engine) -> bool {
     matches!(
         e.resolve(DB, "orders"),
@@ -402,9 +415,330 @@ fn a_drop_that_kept_later_writes_before_the_swap_was_known_ends_as_on_a_member_t
     me.sort();
     assert_eq!(me, ke, "the same register events as the member that knew");
     assert_eq!(absent(&m), absent(&k), "the name resolves the same way on both members");
+    assert!(absent(&k), "the member that knew: the name is dropped");
+    assert_eq!(
+        buried_at(&k, CollectionId::derive(DB, STAGE)),
+        Some(drop.stamp),
+        "the member that knew buried the bound physical at the drop"
+    );
     assert_eq!(
         buried_at(&m, CollectionId::derive(DB, STAGE)),
         buried_at(&k, CollectionId::derive(DB, STAGE)),
         "the bound physical is buried at the same stamp on both"
+    );
+}
+
+// -- The widened seed: what a standing identity is seeded for, and what it is not (ADR-272 decision 6, 2026-11-23) ---------------------
+//
+// A past drop of a name is a logical drop only if a stage of the name was created below it. A tombstone is also what an ordinary
+// re-create leaves behind and what a database's drop leaves on a life it spared, so the seed buries a standing identity only when it
+// is the remains that very drop re-dated and the swap began below the drop.
+
+/// A drop of the whole database `app` as the member `by` would mint it at `wall_ms`.
+fn a_database_drop(by: &Engine, wall_ms: u64) -> OplogEntry {
+    crate::engine::ddl_entry(
+        Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        OpKind::DropCollection,
+        kimmy_core::database_drop_id(DB),
+        &CollectionRef::new(DB, "__dropped_database"),
+    )
+    .unwrap()
+}
+
+/// The wall time of a drop stamped above the life's creation and above the binding, and below the write a life of
+/// [`a_life_and_a_later_write`] keeps.
+fn above_the_creation_and_the_binding(w: &World, life: &[OplogEntry]) -> u64 {
+    let created = life
+        .iter()
+        .find(|e| e.kind == OpKind::CreateCollection)
+        .expect("the life's creation")
+        .stamp
+        .hlc
+        .wall_ms;
+    created.max(w.bind.stamp.hlc.wall_ms) + 1
+}
+
+/// How many documents the identity `orders` holds.
+fn documents_kept(e: &Engine) -> u64 {
+    let orders = e.get_collection(DB, "orders").unwrap();
+    e.count(&orders, WalkScope::Background).unwrap()
+}
+
+fn serves_the_identity(e: &Engine) -> bool {
+    e.resolve(DB, "orders").is_ok_and(|served| served.physical == "orders")
+}
+
+/// A member that has applied the drop of a life it re-created: the life made, dropped (buried: nothing was written after the drop),
+/// and made again by a member that did not know of any swap, with one document in it. The next thing it meets is a swap.
+fn recreated_after(
+    drop_of_the_first: impl FnOnce(&Engine, u64) -> OplogEntry,
+) -> (Engine, tempfile::TempDir, OplogEntry) {
+    let (m, d) = engine();
+    let first = m.create_collection(DB, "orders").unwrap();
+    let (x, _dx) = engine();
+    let drop = drop_of_the_first(&x, first.created.wall_ms + 1);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        m.get_collection(DB, "orders").is_err(),
+        "premise: the drop buried the life it was aimed at"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let again = m.create_collection(DB, "orders").unwrap();
+    m.insert(&again, doc! { "_id": 1, "v": "made after the drop" }).unwrap();
+    (m, d, drop)
+}
+
+fn a_swap_that_began_after_a_re_create_does_not_bury_the_new_life(
+    drop_of_the_first: impl FnOnce(&Engine, u64) -> OplogEntry,
+) {
+    let (m, _d, drop) = recreated_after(drop_of_the_first);
+    let orders = CollectionId::derive(DB, "orders");
+    assert!(
+        buried_at(&m, orders).is_some(),
+        "premise: the drop left its tombstone, which the re-create does not remove"
+    );
+    let before = m.get_collection(DB, "orders").unwrap();
+    assert!(
+        !before.is_redated(),
+        "premise: the life is one made after the drop, not remains it re-dated"
+    );
+    // the swap begins now: its stage is created above the life that stands
+    let w = world();
+    assert!(
+        w.creation.stamp.hlc > m.get_collection(DB, "orders").unwrap().created,
+        "premise: the swap began after the life that stands was made"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    assert!(register_events(&m).is_empty(), "no event: the stage's creation is no drop");
+    assert!(serves_the_identity(&m), "the name serves the life made after the drop");
+    assert_eq!(documents_kept(&m), 1, "with its document");
+    let after = m.get_collection(DB, "orders").unwrap();
+    assert_eq!(after.created, before.created, "the life is the one that was made ({drop:?})");
+    assert!(!after.is_redated(), "and nothing re-dated or buried it");
+    // and the binding, when it comes, is the swap: the stage serves and the identity is bound out at the binding
+    window(&m, std::slice::from_ref(&w.bind));
+    assert_eq!(m.resolve(DB, "orders").unwrap().physical, STAGE, "the swap after the drop stands");
+    assert_eq!(buried_at(&m, orders), Some(w.bind.stamp), "the identity is buried at the binding");
+}
+
+#[test]
+fn a_swap_that_began_after_an_ordinary_re_create_does_not_bury_the_new_life() {
+    a_swap_that_began_after_a_re_create_does_not_bury_the_new_life(drop_of);
+}
+
+#[test]
+fn a_binding_met_after_a_re_create_over_a_database_drop_seeds_no_drop_over_the_new_life() {
+    // The swap began FIRST: the stage and its binding are stamped below the database's drop. M knows no swap: it applies the database's
+    // drop, then makes the name again (the life stands over the database's tombstone, which the creation takes for its own), and then
+    // meets the stage's creation (history under the database's drop, its row written) and the binding. The tombstone the new life
+    // carries is the database's, not a drop of the life: the seed must not read it as one and bury what the drop did not end.
+    //
+    // Pins the rule before C3. With C3 and P2 (Chris, 2026-11-23: lost and reported) the seed buries this life and the register holds
+    // the drop and the binding: Q65-model-rows C3-6, database form. This test, and mutant M2 of the seed's list, change there.
+    let w = world();
+    let (x, _dx) = engine();
+    let drop = a_database_drop(&x, w.bind.stamp.hlc.wall_ms + 5);
+    assert!(
+        w.creation.stamp < drop.stamp && w.bind.stamp < drop.stamp,
+        "premise: the swap began below the drop"
+    );
+    let (m, _dm) = engine();
+    window(&m, std::slice::from_ref(&drop));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let orders = m.create_collection(DB, "orders").unwrap();
+    m.insert(&orders, doc! { "_id": 1, "v": "made after the database's drop" }).unwrap();
+    assert!(
+        buried_at(&m, CollectionId::derive(DB, "orders")).is_some(),
+        "premise: the life stands over a tombstone"
+    );
+    assert!(
+        orders.created > drop.stamp.hlc,
+        "premise: the life was made after the database's drop"
+    );
+    assert!(
+        !orders.is_redated(),
+        "premise: it is a life made after the drop, not remains the drop re-dated"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    // the binding, known ahead of its position: it brings the seed if there is one, and the seed settles at once
+    m.apply_batch(std::slice::from_ref(&w.bind)).unwrap();
+    assert_eq!(
+        parked_events(&m),
+        vec![w.bind.stamp],
+        "premise: the binding is known ahead of its position"
+    );
+    assert!(
+        register_events(&m).is_empty(),
+        "no drop of the name was seeded over a life made after the database's drop"
+    );
+    assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
+    assert_eq!(documents_kept(&m), 1, "with its document");
+    // and when the binding's turn comes it is the one event of the name
+    window(&m, std::slice::from_ref(&w.bind));
+    assert_eq!(register_events(&m), vec![w.bind.stamp], "the binding alone");
+    // the state in which this member and the one that knew agree today, and the one that changes with C3
+    assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
+    assert_eq!(documents_kept(&m), 1, "with its document");
+}
+
+#[test]
+fn a_swap_that_began_after_a_re_create_over_a_database_drop_does_not_bury_the_new_life() {
+    a_swap_that_began_after_a_re_create_does_not_bury_the_new_life(a_database_drop);
+}
+
+#[test]
+fn a_swap_that_began_after_a_drop_that_kept_later_writes_leaves_the_remains() {
+    // The remains a drop re-dated: clause 1 holds. The swap began above the drop, so clause 2 does not, and the remains stand.
+    let (life, _ds) = a_life_and_a_later_write();
+    let created =
+        life.iter().find(|e| e.kind == OpKind::CreateCollection).unwrap().stamp.hlc.wall_ms;
+    let (x, _dx) = engine();
+    let drop = drop_of(&x, created + 1);
+    let write = life.iter().find(|e| e.kind == OpKind::Insert).unwrap();
+    assert!(write.stamp.hlc > drop.stamp.hlc, "premise: the write is stamped after the drop");
+    let w = world(); // after the write: the stage is created above the drop
+    assert!(w.creation.stamp > drop.stamp, "premise: the swap began after the drop");
+    let (m, _dm) = engine();
+    window(&m, &life);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        m.get_collection(DB, "orders").is_ok(),
+        "premise: the drop kept the write and the identity"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    assert!(register_events(&m).is_empty(), "no seed: the swap did not begin below the drop");
+    assert!(serves_the_identity(&m), "the name still serves the remains");
+    assert_eq!(documents_kept(&m), 1, "with the write the drop kept");
+}
+
+/// Entries of one world, applied in the order a member that knew (K) and one that did not (M) meet them.
+fn knew_and_did_not(
+    w: &World,
+    life: &[OplogEntry],
+    drops: &[OplogEntry],
+) -> ((Engine, tempfile::TempDir), (Engine, tempfile::TempDir)) {
+    // K knew of the swap when the drops arrived: the stage's creation, the binding (flip), then the drops.
+    let k = engine();
+    window(&k.0, life);
+    k.0.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    window(&k.0, std::slice::from_ref(&w.bind));
+    for drop in drops {
+        window(&k.0, std::slice::from_ref(drop));
+    }
+    // M applies the drops FIRST (no swap known), keeps the write, and then meets the creation and the binding.
+    let m = engine();
+    window(&m.0, life);
+    for drop in drops {
+        window(&m.0, std::slice::from_ref(drop));
+    }
+    assert!(
+        m.0.get_collection(DB, "orders").is_ok(),
+        "premise: the drops kept the identity, which holds the write stamped after them"
+    );
+    m.0.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    window(&m.0, std::slice::from_ref(&w.bind));
+    (k, m)
+}
+
+#[test]
+fn a_drop_that_kept_later_writes_is_seeded_by_the_stage_creation_alone() {
+    // T1 with no binding: the stage's creation is the first thing the register learns, and its stamp (below the drop) is what the seed
+    // asks of the standing identity. K knew of the swap when the drop arrived; M applied the drop first and kept the write.
+    let w = world();
+    let (life, _ds) = a_life_and_a_later_write();
+    let drop = drop_of(&w.x, above_the_creation_and_the_binding(&w, &life));
+    let write = life.iter().find(|e| e.kind == OpKind::Insert).expect("the write");
+    assert!(write.stamp.hlc > drop.stamp.hlc, "premise: the write is stamped after the drop");
+    assert!(w.creation.stamp < drop.stamp, "premise: the swap began below the drop");
+
+    let (k, _dk) = engine();
+    window(&k, &life);
+    k.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    window(&k, std::slice::from_ref(&drop));
+
+    let (m, _dm) = engine();
+    window(&m, &life);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        m.get_collection(DB, "orders").is_ok(),
+        "premise: the drop kept the identity and its write"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+
+    let mut ke = register_events(&k);
+    let mut me = register_events(&m);
+    ke.sort();
+    me.sort();
+    assert_eq!(ke, vec![drop.stamp], "premise: the member that knew holds the drop alone");
+    assert_eq!(me, ke, "the same register events as the member that knew");
+    assert!(absent(&k) && absent(&m), "the name is dropped on both");
+    assert!(
+        k.get_collection(DB, "orders").is_err() && m.get_collection(DB, "orders").is_err(),
+        "the identity is gone on both"
+    );
+}
+
+#[test]
+fn a_database_drop_that_kept_later_writes_before_the_swap_was_known_ends_as_on_a_member_that_knew()
+{
+    let w = world();
+    let (life, _ds) = a_life_and_a_later_write();
+    let drop = a_database_drop(&w.x, above_the_creation_and_the_binding(&w, &life));
+    let write = life.iter().find(|e| e.kind == OpKind::Insert).expect("the write");
+    assert!(write.stamp.hlc > drop.stamp.hlc, "premise: the write is stamped after the drop");
+    let ((k, _dk), (m, _dm)) = knew_and_did_not(&w, &life, std::slice::from_ref(&drop));
+    assert!(absent(&k), "the member that knew: the name is dropped");
+    assert_eq!(absent(&m), absent(&k), "the name resolves the same way on both members");
+    assert!(
+        k.get_collection(DB, "orders").is_err() && m.get_collection(DB, "orders").is_err(),
+        "the identity is gone on both"
+    );
+    // (the register events differ until the database's drop is a logical drop of the swapped names: Q6.5, C3)
+}
+
+#[test]
+fn a_collection_drop_then_a_database_drop_that_each_kept_later_writes_end_as_on_a_member_that_knew()
+{
+    let w = world();
+    let (life, _ds) = a_life_and_a_later_write();
+    let first = above_the_creation_and_the_binding(&w, &life);
+    let t = drop_of(&w.x, first);
+    let d = a_database_drop(&w.x, first + 1);
+    let write = life.iter().find(|e| e.kind == OpKind::Insert).expect("the write");
+    assert!(write.stamp.hlc > d.stamp.hlc, "premise: the write is stamped after both drops");
+    let ((k, _dk), (m, _dm)) = knew_and_did_not(&w, &life, &[t, d]);
+    assert!(absent(&k), "the member that knew: the name is dropped");
+    assert!(
+        absent(&m),
+        "the name is dropped on the member that did not know, as on the one that did"
+    );
+}
+
+#[test]
+fn a_seed_over_remains_settles_when_the_first_event_is_only_known_ahead_of_its_position() {
+    // The binding is the first event of the name, known ahead of its position (information): the seed is what puts the drop in effect,
+    // and the remains it ends are buried in that transaction, not at the next settle.
+    let w = world();
+    let (life, _ds) = a_life_and_a_later_write();
+    let drop = a_database_drop(&w.x, above_the_creation_and_the_binding(&w, &life));
+    let (m, _dm) = engine();
+    window(&m, &life);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(m.get_collection(DB, "orders").is_ok(), "premise: the remains stand");
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap(); // history under the database's drop, its row written
+    m.apply_batch(std::slice::from_ref(&w.bind)).unwrap(); // no window behind it: known ahead of its position
+    assert_eq!(
+        parked_events(&m),
+        vec![w.bind.stamp],
+        "premise: the binding is known ahead of its position"
+    );
+    assert_eq!(
+        register_events(&m),
+        vec![drop.stamp],
+        "the seeded drop is in effect, the binding is only known"
+    );
+    assert!(
+        m.get_collection(DB, "orders").is_err(),
+        "the remains are buried at once, not at the next settle"
     );
 }
