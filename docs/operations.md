@@ -1634,6 +1634,8 @@ Three things an operator can watch:
 - **A definition of the life a flip replaced is ignored as history on the new physical.** A physical that becomes visible
   takes the boundary of the life it replaces (its definition floor), so a definition of the replaced life that is served
   again after the flip does not build on the new physical.
+  This holds whichever of the drop that ended the life and the binding reached the member first, including a drop that
+  arrived while the binding was known only ahead of its position.
 - **The shadow of a vector configuration goes with its physical.** A configuration is not carried to the new
   physical; the old physical's shadow is buried in the flip and its rows are purged after the deferral, as the old
   physical's are.

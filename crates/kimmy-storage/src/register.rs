@@ -546,7 +546,12 @@ pub(crate) fn release(
         let Some(raw) = removed else { return Ok(None) };
         RegisterEvent::decode(raw.value()).map_err(|e| corrupt(&e.to_string()))?
     };
-    // not `put`: the name is known already (this event was), so there is nothing left to seed
+    // The name's drop may have been judged ordinary while this event was the only one it had (a drop is logical when an event is in effect
+    // or a stage was created below it, and a parked binding of a stage above it is neither): it left its tombstone and nothing in the
+    // register, so the event takes effect with no drop below it and the physical it makes visible would have no floor (F3). The seed asks
+    // whether an event is in effect, which this one is about to be: once, here, for both of the ways a parked event is released (a window
+    // that carries it, `release_ddl_mark_with_effect`, and a grant that covers it, `release_covered`), whose callers settle the name after.
+    seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
     store(txn, tables::REGISTER, db, logical, *stamp, event).map(Some)
 }
 
@@ -682,7 +687,7 @@ pub(crate) fn event_target(
 /// The first event of a name seeds the register from the identity's drop (Q6.4 item 1b): a member that applied a drop of the
 /// name before it knew of any swap holds that drop only as the identity's tombstone, and the binding that arrives afterwards
 /// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name
-/// known, in effect or ahead, a tombstone is a logical drop at its stamp, and a binding stamped above it is not touched by it
+/// in effect (one that is only ahead of its position does not count, F3), a tombstone is a logical drop at its stamp, and a binding stamped above it is not touched by it
 /// while one below it is buried by it, as on every other member. Returns whether it wrote the row, so that the caller settles
 /// the name: the seeded drop is in effect, and what it ends is buried in the same transaction, whatever became of the event
 /// that brought the seed (a first event that is only parked, or a binding judged invalid, included).
@@ -702,9 +707,10 @@ pub(crate) fn seed_from_the_tombstone(
     stage_created: Option<Stamp>,
 ) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
-    if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
-        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()
-    {
+    // only an event IN EFFECT keeps the seed away: an event that is still ahead of its position judged no drop, and a drop that arrived
+    // while it was the name's only one was judged without it (F3). The drop seeded here is below every event that is parked: it was
+    // judged ordinary only because every parked binding names a stage above it
+    if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty() {
         return Ok(false);
     }
     let dropped = {
