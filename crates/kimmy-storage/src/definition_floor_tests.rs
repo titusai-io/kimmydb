@@ -473,6 +473,9 @@ fn the_join_floors_at_the_greater_of_the_drop_and_the_floor_of_the_physical_it_l
     // made before it heard of any stage, while the logical drop `d` (below `T2`) came from a member that had: here the first stage holds a
     // definition stamped between `d` and `T2`, written before the floor reached it (it is applied, as it would be on that member), and the
     // floor is then raised by hand to `T2`, which is that state. The definition must not be carried by the next flip.
+    // (A drop at `T2` arriving AFTER a flip would itself be a logical drop and become the newest drop in effect, so this is observable only
+    // because `T2` comes from the identity's floor before the flip. Since the flip floors the new physical at the greater of the drop and its
+    // own floor after the join, the join's own floor is a second line of defence here and is kept as one.)
     let w = world();
     let (m, _d) = member(&w);
     let wall = w.bind_first.stamp.hlc.wall_ms;
@@ -501,4 +504,215 @@ fn the_join_floors_at_the_greater_of_the_drop_and_the_floor_of_the_physical_it_l
         !index_on(&m, SECOND),
         "the join floors at the greater of the drop and the held floor: a definition between the drop and the held floor is not carried"
     );
+}
+
+/// An index on `physical`, named `name` on `path`, as Q6.7's creation entry will carry it: a replicated `CreateIndex` addressed to the
+/// physical, stamped at `wall_ms` by the author `by`.
+fn named_index_entry(
+    by: &Engine,
+    physical: &str,
+    name: &str,
+    path: &str,
+    wall_ms: u64,
+) -> OplogEntry {
+    let index = IndexMeta {
+        id: IndexMeta::derive_id(name),
+        name: name.into(),
+        fields: vec![IndexField::ascending(path)],
+        unique: false,
+        enforcement: Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: None,
+    };
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::CreateIndex,
+        collection: CollectionId::derive(DB, physical),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&IndexCreate {
+                db: DB.into(),
+                collection: physical.into(),
+                index,
+            })
+            .expect("the creation body encodes"),
+        ),
+        meta: None,
+    }
+}
+
+/// A document written by the author to `physical` at `wall_ms`, as an entry.
+fn doc_on(w: &World, physical: &str, id: i64, wall_ms: u64) -> OplogEntry {
+    let a = &w._author.0;
+    let scratch = a
+        .get_collection(DB, "scratch")
+        .or_else(|_| a.create_collection(DB, "scratch"))
+        .expect("the author's scratch collection");
+    a.insert(&scratch, bson::doc! { "_id": id, "t": id, "v": id })
+        .expect("the author writes a document");
+    let mut entry = everything(a)
+        .into_iter()
+        .rev()
+        .find(|e| {
+            e.kind == OpKind::Insert
+                && e.collection == scratch.id
+                && e.doc_id == Some(DocId::Int64(id))
+        })
+        .expect("the insert is in the author's oplog");
+    entry.collection = CollectionId::derive(DB, physical);
+    entry.stamp = Stamp::new(Hlc::new(wall_ms, 0), a.node_id(), a.epoch());
+    entry
+}
+
+/// How many entries the index `name` holds on `physical` (0 when it has no such index).
+fn entries_of_index(m: &Engine, physical: &str, name: &str) -> usize {
+    let coll = m.get_collection(DB, physical).expect("the physical is held");
+    let Some(index) = coll.index(name) else { return 0 };
+    crate::index::scan_range(
+        m,
+        WalkScope::Request,
+        coll.id,
+        index.id,
+        &[],
+        None,
+        crate::index::Unkeyed::Exclude,
+    )
+    .expect("the index is readable")
+    .len()
+}
+
+/// The first stage's own copy, by hand: three documents and two indexes, `x` at `x_wall` and `kept` above everything.
+fn first_stage_with_a_copy(m: &Engine, w: &World, x_wall: u64) {
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    window(
+        m,
+        &[
+            doc_on(w, FIRST, 201, wall - 8),
+            doc_on(w, FIRST, 202, wall - 8),
+            doc_on(w, FIRST, 203, wall - 8),
+            named_index_entry(&w._author.0, FIRST, INDEX, "t", x_wall),
+            named_index_entry(&w._author.0, FIRST, "kept", "v", wall + 7),
+        ],
+    );
+    assert!(entries_of_index(m, FIRST, INDEX) > 0, "premise: x is on the first stage with entries");
+    assert!(
+        entries_of_index(m, FIRST, "kept") > 0,
+        "premise: the index above the floor is on it with entries"
+    );
+}
+
+#[test]
+fn a_flip_floors_the_new_physicals_own_copy_at_the_floor_it_was_assigned_even_with_no_drop_in_effect()
+ {
+    // The identity's own floor `T2` (set before anything else, as an ordinary drop of the identity at `T2` leaves it). The first stage
+    // carries a copy of the target's definitions, by hand (as Q6.7's creation entry will): `x` stamped in `T2`'s own hlc, and `kept`
+    // above it. The flip assigns the stage the floor, and the stage itself must not keep what its floor calls history.
+    let w = world();
+    let (m, _d) = member(&w);
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    let t2 = Hlc::new(wall - 2, 0);
+    let mut identity = m.get_collection(DB, "orders").expect("the identity is held");
+    identity.incarnation_floor = Some(t2);
+    put_meta(&m, &identity);
+    first_stage_with_a_copy(&m, &w, t2.wall_ms);
+    assert_eq!(floor_of(&m, FIRST), None, "premise: the stage has no floor before the flip");
+    assert_eq!(logical_drops_in_effect(&m), 0, "premise: no logical drop is in effect");
+    window(&m, std::slice::from_ref(&w.bind_first));
+    assert_eq!(served(&m), FIRST, "premise: the flip");
+    assert_eq!(floor_of(&m, FIRST), Some(t2), "premise: the flip assigned the stage the floor T2");
+    assert!(
+        !index_on(&m, FIRST),
+        "the flip floors the new physical's own copy at the floor it was assigned: x, at T2's own hlc, is gone"
+    );
+    assert_eq!(entries_of_index(&m, FIRST, INDEX), 0, "and so are its entries");
+    assert!(
+        entries_of_index(&m, FIRST, "kept") > 0,
+        "an index above the floor stays, with its entries"
+    );
+}
+
+#[test]
+fn two_members_that_meet_the_floor_before_the_flip_and_after_it_end_with_the_same_definitions() {
+    // Member 1 knows the floor `T2` (the identity's own) before the flip; member 2 meets the flip first and the drop at `T2` after it, as a
+    // logical drop below the visible stage. Each is asserted absolutely: no x, and the index above `T2` is present with entries.
+    for floor_first in [true, false] {
+        let w = world();
+        let (m, _d) = member(&w);
+        let wall = w.bind_first.stamp.hlc.wall_ms;
+        let t2 = Hlc::new(wall - 2, 0);
+        let order = if floor_first {
+            "the floor, then the flip"
+        } else {
+            "the flip, then the drop at the floor"
+        };
+        if floor_first {
+            let mut identity = m.get_collection(DB, "orders").expect("the identity is held");
+            identity.incarnation_floor = Some(t2);
+            put_meta(&m, &identity);
+        }
+        first_stage_with_a_copy(&m, &w, t2.wall_ms);
+        window(&m, std::slice::from_ref(&w.bind_first));
+        assert_eq!(served(&m), FIRST, "premise: the flip ({order})");
+        if !floor_first {
+            assert!(index_on(&m, FIRST), "premise: x is still there before the drop ({order})");
+            window(&m, std::slice::from_ref(&drop_of(&w._author.0, t2.wall_ms)));
+            assert_eq!(logical_drops_in_effect(&m), 1, "premise: the drop took effect ({order})");
+        }
+        assert!(!index_on(&m, FIRST), "no x ({order})");
+        assert!(
+            entries_of_index(&m, FIRST, "kept") > 0,
+            "the index above the floor is present, with entries ({order})"
+        );
+    }
+}
+
+#[test]
+fn a_flip_over_a_drop_in_effect_floors_the_stages_copy_at_the_drop_and_not_at_the_lesser_floor() {
+    // The identity's floor `T` (from the life it replaced) is below the drop `d` in effect: a copy stamped between them is the dropped life's
+    let w = world();
+    let (m, _d) = member(&w);
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    window(
+        &m,
+        &[
+            doc_on(&w, FIRST, 201, wall - 8),
+            doc_on(&w, FIRST, 202, wall - 8),
+            named_index_entry(&w._author.0, FIRST, INDEX, "t", wall - 7),
+        ],
+    );
+    let drop = drop_of(&w._author.0, wall - 5);
+    assert!(
+        w.t < drop.stamp.hlc && Hlc::new(wall - 7, 0) > w.t,
+        "premise: the copy is between T and the drop"
+    );
+    assert!(
+        entries_of_index(&m, FIRST, INDEX) > 0,
+        "premise: the copy is on the stage with entries"
+    );
+    window(&m, std::slice::from_ref(&drop));
+    window(&m, std::slice::from_ref(&w.bind_first));
+    assert_eq!(served(&m), FIRST, "premise: the flip over the drop in effect");
+    assert_eq!(
+        floor_of(&m, FIRST),
+        Some(w.t),
+        "premise: the stage took the floor T, below the drop"
+    );
+    assert!(
+        !index_on(&m, FIRST),
+        "the copy between the floor and the drop is the dropped life's: the flip floors at the drop"
+    );
+}
+
+fn logical_drops_in_effect(m: &Engine) -> usize {
+    let txn = m.begin_write(crate::WriterHolder::Ddl).expect("a writer");
+    let drops = crate::register::timeline(&txn, DB, "orders")
+        .expect("the register reads")
+        .events()
+        .iter()
+        .filter(|(_, event)| event.physical().is_none())
+        .count();
+    txn.abort().expect("the read ends");
+    drops
 }
