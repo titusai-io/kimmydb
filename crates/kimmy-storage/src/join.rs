@@ -343,6 +343,7 @@ impl Engine {
         db: &str,
         physical: &str,
         floor: Hlc,
+        tombstones_at: Option<Stamp>,
     ) -> Result<()> {
         let mut n: CollectionMeta = {
             let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -350,22 +351,31 @@ impl Engine {
             serde_json::from_slice(row.value())?
         };
         let fill = self.walk(WalkScope::Background);
-        let ended: Vec<u32> = n
+        let ended: Vec<(u32, Option<Stamp>)> = n
             .indexes
             .iter()
             .filter(|i| i.created.is_none_or(|c| c.hlc <= floor))
-            .map(|i| i.id)
+            .map(|i| (i.id, i.created))
             .collect();
         let validator_ended =
             n.validator_changed.is_none_or(|c| c.hlc <= floor) && n.validator.is_some();
         if ended.is_empty() && !validator_ended {
             return Ok(());
         }
-        for id in &ended {
+        for (id, created) in &ended {
             let mut entries = open_walk_table_in(txn, tables::INDEX_ENTRIES, fill)?;
             index::clear_index_entries(&mut entries, index::index_id_range(n.id, *id))?;
+            // At max(drop, created), where the creation sorts above the drop's own stamp, as `sweep_late_definitions` leaves it
+            if let Some(drop) = tombstones_at {
+                Self::record_index_drop_in_txn(
+                    txn,
+                    n.id,
+                    *id,
+                    created.map_or(drop, |c| drop.max(c)),
+                )?;
+            }
         }
-        n.indexes.retain(|i| !ended.contains(&i.id));
+        n.indexes.retain(|i| !ended.iter().any(|(id, _)| *id == i.id));
         if validator_ended {
             n.validator = None;
             n.validator_changed = None;

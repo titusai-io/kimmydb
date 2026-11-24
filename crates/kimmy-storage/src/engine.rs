@@ -5856,14 +5856,22 @@ impl Engine {
         }
         let burials = timeline.burials(&visible, lookup);
         // The newest logical drop in effect: what a definition must be stamped above to belong to the name's present life
-        let floor = timeline
+        let newest_drop = timeline
             .events()
             .iter()
             .filter(|(_, event)| {
                 event.physical().is_none() // a logical drop names no physical
             })
-            .map(|(stamp, _)| stamp.hlc)
+            .map(|(stamp, _)| *stamp)
             .max();
+        let floor = newest_drop.map(|stamp| stamp.hlc);
+        // The event that has just taken effect is a logical drop: below a physical that is visible now, it re-floors that physical
+        let a_drop_took_effect = took_effect.is_some_and(|effect| {
+            timeline
+                .events()
+                .iter()
+                .any(|(stamp, event)| *stamp == effect && event.physical().is_none())
+        });
         // Burial by a later event: a stage with no binding in effect whose deadline is strictly below the visible event can never be
         // the visible physical (every valid binding of it is at or below its deadline), so it goes with the event, stamped by it
         let stage_deadlines: Vec<(&str, Hlc)> =
@@ -5982,7 +5990,11 @@ impl Engine {
                 if took_effect == Some(*stamp)
                     && let Some(floor) = floor
                 {
-                    txn.engine.floor_definitions_in_txn(txn, db, physical, floor)?;
+                    txn.engine.floor_definitions_in_txn(txn, db, physical, floor, None)?;
+                } else if a_drop_took_effect && let Some(drop) = newest_drop {
+                    // a drop that takes effect below the physical that is visible: nothing buries it, so what it holds at or below the
+                    // drop is removed here, and the index tombstones are left under it as a peer's drop of each would have left them
+                    txn.engine.floor_definitions_in_txn(txn, db, physical, drop.hlc, Some(drop))?;
                 }
                 if let Some(row) = crate::register::post_row(txn, db, logical)? {
                     txn.engine.join_definitions_in_txn(txn, physical, &row.into_held(db), floor)?;
