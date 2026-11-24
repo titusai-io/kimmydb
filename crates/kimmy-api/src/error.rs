@@ -1198,6 +1198,13 @@ impl From<StorageError> for ApiError {
             }
             // A write to a name whose replacement this member knows of and cannot yet make visible (D10): nothing was written.
             e @ StorageError::NameSuperseded { .. } => ApiError::swap_in_progress(e.to_string()),
+            // A vector configuration change of a swapped name: permanent for the name, a 400 whose message is the sentence as written (it is
+            // not a query, so it does not carry the query refusal's prefix).
+            e @ StorageError::SwappedNameKeepsNoVectors { .. } => {
+                ApiError::bad_request(e.to_string())
+            }
+            // A vector configuration of a name that has a replacing `$out` in flight here: retryable, counted as `swap_in_progress`.
+            e @ StorageError::SwapInFlight { .. } => ApiError::swap_in_progress(e.to_string()),
             // This member's own stamps would be refused by every other member until due: nothing was written, and
             // another member's clock is the one to use.
             StorageError::OwnStampsRefused(refusal) => ApiError::clock_ahead(&refusal),
@@ -1821,6 +1828,43 @@ mod tests {
     fn a_bad_query_is_the_callers_fault() {
         let e: ApiError = CoreError::InvalidQuery("nope".into()).into();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_vector_change_on_a_swapped_name_is_a_400_with_the_sentence_and_no_prefix() {
+        // The client-visible body, not only the storage Display: no "invalid query:" in front of a request that is not a query.
+        let storage = StorageError::SwappedNameKeepsNoVectors {
+            db: "app".into(),
+            logical: "orders".into(),
+            change: "configured on",
+        };
+        let said = storage.to_string();
+        let e: ApiError = storage.into();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.code, ErrorCode::BadRequest);
+        assert_eq!(e.retry_after_secs, None, "permanent for the name: nothing to wait for");
+        assert_eq!(
+            e.message,
+            "vectors cannot be configured on `app`.`orders`: a replacing `$out` has swapped this name, and a swapped name keeps no vector configuration in this release (ADR-272, decision 12)"
+        );
+        assert_eq!(e.message, said);
+    }
+
+    #[test]
+    fn a_vector_change_on_a_name_with_a_swap_in_flight_is_a_retryable_503_swap_in_progress() {
+        // The code C1 counts, with the hint a name superseded by a register event carries, and the sentence the storage error says.
+        let storage = StorageError::SwapInFlight {
+            db: "app".into(),
+            logical: "orders".into(),
+            deadline: kimmy_core::Hlc::new(1_700_000_000_000, 0),
+        };
+        let said = storage.to_string();
+        let e: ApiError = storage.into();
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.code, ErrorCode::SwapInProgress);
+        assert_eq!(e.retry_after_secs, Some(SWAP_IN_PROGRESS_RETRY_AFTER_SECS));
+        assert_eq!(e.message, said);
+        assert!(said.contains("until 2023-11-14T22:13:20Z"), "{said}");
     }
 
     #[test]

@@ -617,6 +617,34 @@ pub(crate) fn a_stage_is_older_than(
     Ok(false)
 }
 
+/// The latest effective deadline among the stages of the name this member holds, if one has not passed on this member's clock
+/// (`now_ms`): the name is mid-`$out` here (ADR-272, decision 12; Q6.5-1). A stage past its deadline is an orphan whose writer vanished,
+/// held until a later event of the name removes it, and it is not asked.
+pub(crate) fn held_stage_deadline_inside(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+    now_ms: u64,
+) -> Result<Option<Hlc>> {
+    let stages = txn.open_table(tables::REGISTER_STAGES)?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let prefix = format!("{logical}{}", kimmy_core::swap::STAGE_NAME_MARK);
+    let mut latest: Option<Hlc> = None;
+    for row in collections.range((db, prefix.as_str())..=(db, "\u{10FFFF}"))? {
+        let physical = row?.0.value().1.to_string();
+        if !physical.starts_with(&prefix) {
+            break;
+        }
+        // A held stage whose creation row is missing (a restore) has no deadline to read: it is not asked.
+        let Some(stage) = stage_in(&stages, CollectionId::derive(db, &physical))? else { continue };
+        let deadline = stage.info.effective_deadline(&stage.created);
+        if deadline.wall_ms > now_ms && latest.is_none_or(|held| deadline > held) {
+            latest = Some(deadline);
+        }
+    }
+    Ok(latest)
+}
+
 /// Whether the name has a register event in effect on this member: not the events known ahead of their position.
 pub(crate) fn has_events_in_effect(
     txn: &redb::ReadTransaction,

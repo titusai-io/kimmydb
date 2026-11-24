@@ -134,6 +134,40 @@ impl Configured {
 }
 
 impl crate::Engine {
+    /// The swap wins (ADR-272, decision 12; ruled 2026-11-23): a name with a register event of its own, in effect or only known ahead of
+    /// its position, keeps no vector configuration in this release, and answers `SwappedNameKeepsNoVectors` (a 400); a name that only has a stage held,
+    /// inside its deadline on this member's clock, is mid-`$out` and answers the retryable [`StorageError::SwapInFlight`]. The register
+    /// event decides before the held stage is asked, and a stage past its deadline is an orphan that blocks nothing. A local door only: a
+    /// replicated configuration is judged by the arms (Q6.5-4).
+    fn refuse_vectors_on_a_swapped_name(
+        &self,
+        db: &str,
+        collection: &str,
+        verb: &'static str,
+    ) -> Result<()> {
+        let txn = self.db().begin_read()?;
+        if crate::register::has_events(&txn, db, collection)? {
+            return Err(StorageError::SwappedNameKeepsNoVectors {
+                db: db.to_string(),
+                logical: collection.to_string(),
+                change: verb,
+            });
+        }
+        if let Some(deadline) = crate::register::held_stage_deadline_inside(
+            &txn,
+            db,
+            collection,
+            crate::physical_now_ms(),
+        )? {
+            return Err(StorageError::SwapInFlight {
+                db: db.to_string(),
+                logical: collection.to_string(),
+                deadline,
+            });
+        }
+        Ok(())
+    }
+
     /// Enable or replace auto-embedding for a collection.
     ///
     /// Creates the shadow collection if needed. Rejects an invalid
@@ -147,6 +181,7 @@ impl crate::Engine {
     ) -> Result<CollectionMeta> {
         kimmy_core::Error::refuse_stage_name(collection)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_vectors_on_a_swapped_name(db, collection, "configured on")?; // decision 12: the swap wins
         self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| Ok(false))
     }
 
@@ -402,6 +437,7 @@ impl crate::Engine {
     ) -> Result<VectorsOff> {
         kimmy_core::Error::refuse_stage_name(collection)?; // ADR-272, decision 15: first, on the name alone, before any lookup or state-dependent refusal
         self.refuse_ddl_if_own_stamps_would_be_refused()?; // U1 (b): a schema change fails closed when this member's stamps will be refused
+        self.refuse_vectors_on_a_swapped_name(db, collection, "removed from")?; // decision 12: the swap wins
         let off =
             self.disable_vectors_inner(db, collection, drop_vectors, Configured::Locally, &|_| {
                 Ok(false)

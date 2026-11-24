@@ -985,6 +985,10 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         // A user's schema change refused before it was written because this member's own stamps would be refused:
         // nobody's failure, and never an apply's.
         | E::OwnStampsRefused(_)
+        // A client's vector configuration refused because the name was swapped, or has a swap in flight (ADR-272, decision 12):
+        // nobody's failure, and never an apply's.
+        | E::SwappedNameKeepsNoVectors { .. }
+        | E::SwapInFlight { .. }
         // Placed, but never asked: a clock refusal is answered as `ProtocolError::ClockStop` by the
         // callers (`from_storage`, the push receiver) before this is, and it is nobody's failure.
         | E::ClockRefused(_) => false,

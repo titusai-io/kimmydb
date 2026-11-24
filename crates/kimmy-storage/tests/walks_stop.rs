@@ -100,6 +100,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "a prefix range of the collections table that reads the stages of ONE logical name, a handful, under the writer of the transaction that settles the register for that name (ADR-272, decision 5)",
     ),
     (
+        "register::held_stage_deadline_inside",
+        "a prefix range of the collections table that reads the stages of ONE logical name, a handful, in the read transaction of a local vector configuration or removal that asks whether the name is mid-`$out` (ADR-272, decision 12)",
+    ),
+    (
         "register::a_stage_is_older_than",
         "a prefix range of the collections table that reads the stages of ONE logical name, a handful, and the rows of the register's information table for that name, empty or a handful, in the read transaction of a replicated drop that asks whether the drop is a logical drop (ADR-272, decision 6)",
     ),

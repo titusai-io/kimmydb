@@ -110,6 +110,26 @@ pub enum StorageError {
     )]
     NameSuperseded { logical: String, event: kimmy_core::Stamp, parked: bool },
 
+    /// A vector configuration change refused because a replacing `$out` has swapped the name (ADR-272, decision 12; Q6.5-1): a name with
+    /// a register event of its own, in effect or only known ahead of its position, keeps no vector configuration in this release.
+    /// `change` is "configured on" or "removed from". Permanent for the name: the API answers 400, with this sentence and no prefix.
+    #[error(
+        "vectors cannot be {change} `{db}`.`{logical}`: a replacing `$out` has swapped this name, and a swapped name keeps no vector \
+         configuration in this release (ADR-272, decision 12)"
+    )]
+    SwappedNameKeepsNoVectors { db: String, logical: String, change: &'static str },
+
+    /// A vector configuration refused because a replacing `$out` of the name is in flight here: a stage of `logical` is held, and
+    /// its effective deadline (`deadline`) has not passed on this member's clock (ADR-272, decision 12; Q6.5-1). Nothing was changed,
+    /// and the caller may retry: the refusal ends when the swap completes or is abandoned, and a stage past its deadline is an
+    /// orphan that blocks nothing.
+    #[error(
+        "`{db}`.`{logical}` has a replacing `$out` in progress (its staging collection is held here until {}); its vector \
+         configuration cannot change until the swap completes or is abandoned: retry after it",
+        rfc3339(.deadline)
+    )]
+    SwapInFlight { db: String, logical: String, deadline: kimmy_core::Hlc },
+
     /// A replicated entry or state of a `field` collection whose clock is more than the allowed
     /// skew ahead of this member's physical clock (U1). Nothing was written and nothing was
     /// witnessed: it applies once it is due. Not a fault of the peer or of this node, and never
@@ -322,4 +342,11 @@ impl From<bson::error::Error> for StorageError {
     fn from(e: bson::error::Error) -> Self {
         StorageError::Corrupt(format!("bson: {e}"))
     }
+}
+
+/// A deadline as the RFC 3339 text a client reads.
+fn rfc3339(at: &kimmy_core::Hlc) -> String {
+    bson::DateTime::from_millis(at.wall_ms as i64)
+        .try_to_rfc3339_string()
+        .unwrap_or_else(|_| format!("{} ms", at.wall_ms))
 }
