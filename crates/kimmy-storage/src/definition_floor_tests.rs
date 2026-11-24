@@ -899,3 +899,87 @@ fn the_same_with_the_stages_created_below_the_drop_records_which_mechanism_close
     // seed, and x is absent only because the flip floors the new physical itself
     shapes_end_as_the_flip_first_member(&world_below(), true);
 }
+
+// -- The side effects of the join's own floor (state tests) ---------------------------------------------------------------------------------
+//
+// The flip floors the new physical itself after the joins, so the FINAL definitions do not depend on the join's own floor; its SIDE EFFECTS
+// do: the join builds what it carries, under the writer, and a unique index whose rows violate it queues a violation that is reported after
+// the commit and that nothing takes back. A copy at or below the held floor on the physical that is left cannot be set up through a product
+// route (the flip floored it away, and the arm refuses an arrival at or below the floor), so the state is made by hand: the held floor and
+// the index are written into the first stage's metadata after the first flip, with the drop in effect.
+
+fn a_unique_index_at_or_below_the_floor_is_not_built_by_the_next_flip(
+    d_wall: u64,
+    held_wall: u64,
+    index_wall: u64,
+    what: &str,
+) {
+    let w = world();
+    let (m, _d) = member(&w);
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    let (d_wall, held_wall, index_wall) = (wall - d_wall, wall - held_wall, wall - index_wall);
+    window(&m, std::slice::from_ref(&w.bind_first));
+    assert_eq!(served(&m), FIRST, "premise: the first flip ({what})");
+    window(&m, std::slice::from_ref(&drop_of(&w._author.0, d_wall)));
+    assert_eq!(logical_drops_in_effect(&m), 1, "premise: the drop is in effect ({what})");
+    let mut first = m.get_collection(DB, FIRST).expect("the first stage is held");
+    first.definition_floor = Some(Hlc::new(held_wall, 0));
+    first.indexes.push(IndexMeta {
+        id: IndexMeta::derive_id("u_1"),
+        name: "u_1".into(),
+        fields: vec![IndexField::ascending("u")],
+        unique: true,
+        enforcement: Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: Some(Stamp::new(
+            Hlc::new(index_wall, 0),
+            w._author.0.node_id(),
+            w._author.0.epoch(),
+        )),
+    });
+    put_meta(&m, &first);
+    let second = m.get_collection(DB, SECOND).expect("the second stage is held");
+    for id in [401, 402] {
+        m.insert(&second, bson::doc! { "_id": id, "u": 1 })
+            .expect("the second stage takes a row with the same key");
+    }
+    let (builds, violations) = (m.index_builds_for_tests(), m.unique_violations());
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(served(&m), SECOND, "premise: the second flip ({what})");
+    assert_eq!(
+        m.index_builds_for_tests(),
+        builds,
+        "the join builds nothing at or below the greater of the drop and the held floor: the build counter did not move ({what})"
+    );
+    assert_eq!(
+        m.unique_violations(),
+        violations,
+        "and no unique violation was reported for an index the join did not carry ({what})"
+    );
+}
+
+#[test]
+fn the_join_builds_and_reports_nothing_for_a_unique_index_at_or_below_the_held_floor_when_that_floor_is_above_the_drop()
+ {
+    // d = W-5, T2 = W-2, the index at W-3: in (d, T2]
+    a_unique_index_at_or_below_the_floor_is_not_built_by_the_next_flip(
+        5,
+        2,
+        3,
+        "held floor above the drop",
+    );
+}
+
+#[test]
+fn the_join_builds_and_reports_nothing_for_a_unique_index_at_or_below_the_drop_when_the_drop_is_above_the_held_floor()
+ {
+    // T2 = W-5, d = W-2, the index at W-3: in (T2, d]
+    a_unique_index_at_or_below_the_floor_is_not_built_by_the_next_flip(
+        2,
+        5,
+        3,
+        "drop above the held floor",
+    );
+}
