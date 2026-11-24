@@ -259,6 +259,10 @@ pub struct Engine {
     /// Swaps this member applied live (`kimmy_out_swaps_total`, ADR-272): a binding that took effect in a committed transaction and was
     /// the event the name answered from when the pass ended. Per member, since start, in no state and no digest.
     out_swaps: std::sync::atomic::AtomicU64,
+    /// Index backfills run on this engine, counted where one starts, whatever transaction it runs in: what a test reads to assert that a
+    /// build ran, or that none did. Per instance, so parallel tests do not share it. Test builds and `test-hooks` only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) index_builds: std::sync::atomic::AtomicU64,
     /// Burials of a swap's physicals by cause (`kimmy_out_buried_total{cause}`, [`OUT_BURIAL_CAUSES`]): added by the commit that
     /// finished them, never by the settle pass, which can still abort. Per member, since start, in no state and no digest.
     out_buried: [std::sync::atomic::AtomicU64; 4],
@@ -1753,6 +1757,8 @@ impl Engine {
             loss_refused: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             conflicts_resolved: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             out_swaps: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            index_builds: std::sync::atomic::AtomicU64::new(0),
             out_buried: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             out_loss_records: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_gate: WriterGate::new(),
@@ -2382,6 +2388,12 @@ impl Engine {
                 )
             })
             .collect()
+    }
+
+    /// Index backfills this engine has run (see the field). Test builds and `test-hooks` only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn index_builds_for_tests(&self) -> u64 {
+        self.index_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Swaps this member applied live since start (`kimmy_out_swaps_total`): one for each binding that took effect on this member

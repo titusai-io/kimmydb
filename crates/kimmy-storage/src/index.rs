@@ -761,6 +761,8 @@ impl crate::Engine {
         index: &IndexMeta,
         local: bool,
     ) -> Result<Built> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.index_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let docs = open_walk_table_in(txn, tables::DOCS, fill)?;
         let mut entries = open_walk_table_in(txn, tables::INDEX_ENTRIES, fill)?;
         // What a unique index has filed so far. Locally only the keys

@@ -160,6 +160,9 @@ mod logical_drop_tests;
 mod out_counter_tests;
 
 #[cfg(test)]
+mod join_tests;
+
+#[cfg(test)]
 mod carried_drop_tests;
 
 #[cfg(test)]
