@@ -117,7 +117,11 @@ fn world() -> World {
         .max()
         .expect("two creations")
         .max(physical_now_ms())
-        + 10;
+        // far enough above the real clock that no run can build a member after the author's stamps: a member's identity is created at the
+        // real clock of the test, and a drop stamped below it is aimed at an earlier life of the identity. 30 s is more than any build of a
+        // member takes under load, and it is safe: it is far below the stage deadlines (60 s from the same clock, so the binding is valid)
+        // and below the clock-skew bound (300 s), so no entry is refused as ahead
+        + 30_000;
     let bind = bind_of(&author, wall, BOUND);
     let bind_second = bind_of(&author, wall + 10, UNBOUND);
     World { creations, bind, bind_second, _author: (author, dir) }
@@ -1182,11 +1186,11 @@ fn a_pass_that_fails_after_writing_the_row_leaves_no_row_and_the_redelivery_writ
 }
 
 #[test]
-fn a_recreation_in_effect_while_the_older_drop_is_parked_carries_the_dropped_lifes_definitions_with_no_floor()
+fn a_recreation_in_effect_while_the_older_drop_is_parked_carries_the_dropped_lifes_definitions_until_the_drop_is_released()
  {
-    // PINS TODAY'S RULE FOR THIS UNIT; Q6.5-3 (the re-floor of a standing physical when a drop takes effect below it) flips it. The drop is
-    // known and not in effect, so the join runs with no floor and carries what the bound stage held, `old_1` (stamped at or below the
-    // drop) included; when the drop is released Q6.5-3 will remove it from the recreation.
+    // The drop is known and not in effect, so the join runs with no floor and carries what the bound stage held, `old_1` (stamped at or
+    // below the drop) included; a parked drop is not a floor. When the drop is released, the re-floor (Q6.5-3) removes it from the
+    // recreation.
     let w = world();
     let (m, _d) = member(&w);
     flip(&m, &w.bind, Route::Window);
@@ -1218,7 +1222,13 @@ fn a_recreation_in_effect_while_the_older_drop_is_parked_carries_the_dropped_lif
     );
     assert!(
         m.get_collection(DB, &physical).expect("held").index("old_1").is_some(),
-        "no floor is in effect (the drop is parked), so the join carries the dropped life's definition (Q6.5-3 flips this)"
+        "no floor is in effect (the drop is parked), so the join carries the dropped life's definition"
+    );
+    // Q6.5-3: when the drop takes effect below the recreation, the re-floor removes what is at or below it from the recreation
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert!(
+        m.get_collection(DB, &physical).expect("held").index("old_1").is_none(),
+        "the drop, released below the recreation, removes the dropped life's definition from it"
     );
 }
 
@@ -1230,5 +1240,576 @@ fn a_fresh_engine_has_the_post_drop_table_and_no_row() {
             .expect("the table exists from the open: a read of it never meets a missing table")
             .is_none(),
         "no row on a store that has seen no drop"
+    );
+}
+
+// -- The re-floor of a standing physical (Q6.5-3; ADR-272, decision 6) ------------------------------------------------------------------
+//
+// A drop at `d` that takes effect BELOW a physical that is visible (a recreation made visible before the older drop arrived, or a stage
+// bound above the drop whose drop arrives after the flip) removes from it every definition stamped at or below `d`: the index with its
+// entries, and the validator. The physical was born above the drop, so nothing buries it. The re-floor writes index tombstones under the
+// standing physical at max(d, created), as a peer's drop of each index at the drop's stamp would have done. It is NOT an incarnation floor:
+// documents are judged by nothing here, and a document stamped at or below `d` is still applied afterwards.
+
+fn drop_below(w: &World, minus: u64) -> OplogEntry {
+    let mut drop = logical_drop(w, 0);
+    drop.stamp = Stamp::new(
+        Hlc::new(w.bind.stamp.hlc.wall_ms - minus, 0),
+        author(w).node_id(),
+        author(w).epoch(),
+    );
+    drop
+}
+
+/// A recreation of `orders` by the author at `W + offset`, with the validator it was made with.
+fn recreation(w: &World, offset: u64, validator: Option<ValidatorSpec>) -> (OplogEntry, String) {
+    let stamp = Stamp::new(Hlc::new(at(w, offset), 0), author(w).node_id(), author(w).epoch());
+    let physical = kimmy_core::recreation_name("orders", &stamp);
+    let entry = crate::engine::ddl_entry(
+        stamp,
+        OpKind::CreateCollection,
+        CollectionId::derive(DB, &physical),
+        &kimmy_core::CollectionCreate {
+            db: DB.into(),
+            name: physical.clone(),
+            merge_policy: MergePolicy::Document,
+            validator,
+            join_retention_ms: None,
+            loss_limits: None,
+            stage: None,
+        },
+    )
+    .expect("the recreation's creation encodes");
+    (entry, physical)
+}
+
+/// A document written by the author to `physical` at `wall_ms`, as an entry.
+fn doc_entry(w: &World, physical: &str, id: i64, wall_ms: u64) -> OplogEntry {
+    let scratch = author(w)
+        .get_collection(DB, "scratch")
+        .or_else(|_| author(w).create_collection(DB, "scratch"))
+        .expect("the author's scratch collection");
+    author(w)
+        .insert(&scratch, doc! { "_id": id, "v": id, "t": id })
+        .expect("the author writes a document");
+    let mut entry = entries_of(author(w), OpKind::Insert)
+        .into_iter()
+        .rev()
+        .find(|e| e.collection == scratch.id && e.doc_id == Some(kimmy_core::DocId::Int64(id)))
+        .expect("the insert is in the author's oplog");
+    entry.collection = CollectionId::derive(DB, physical);
+    entry.stamp = Stamp::new(Hlc::new(wall_ms, 0), author(w).node_id(), author(w).epoch());
+    entry
+}
+
+fn holds(m: &Engine, physical: &str, name: &str) -> bool {
+    m.get_collection(DB, physical).is_ok_and(|c| c.index(name).is_some())
+}
+
+fn validator_of(m: &Engine, physical: &str) -> Option<String> {
+    m.get_collection(DB, physical)
+        .expect("the physical is held")
+        .validator
+        .map(|v| v.schema.get_str("title").unwrap_or_default().to_string())
+}
+
+fn has_doc(m: &Engine, physical: &str, id: i64) -> bool {
+    let coll = m.get_collection(DB, physical).expect("the physical is held");
+    m.get(&coll, &kimmy_core::DocId::Int64(id)).expect("the physical reads").is_some()
+}
+
+fn served(m: &Engine) -> String {
+    m.resolve(DB, "orders").expect("the name resolves").physical
+}
+
+/// A member that made the flip and holds, on the bound stage, `old_1` (at `W + 3`, below the drop at `W + 5`), a validator (`W + 4`) and
+/// `new_1` (`W + 7`, above it), each index with entries.
+fn flipped_with_old_and_new(w: &World) -> (Arc<Engine>, tempfile::TempDir) {
+    let (m, d) = member(w);
+    flip(&m, &w.bind, Route::Window);
+    window(
+        &m,
+        &[
+            definition(w, "old_1", "t", 3),
+            validator_entry(w, "old", 4),
+            definition(w, "new_1", "v", 7),
+        ],
+    );
+    assert!(entries(&m, BOUND, "old_1") > 0 && entries(&m, BOUND, "new_1") > 0, "premise: entries");
+    assert_eq!(validator_of(&m, BOUND).as_deref(), Some("old"), "premise: the validator");
+    (m, d)
+}
+
+/// A member whose recreation is visible while the drop at `W + 5` is not in effect: unknown (route `Window`) or parked.
+fn recreation_over_a_drop_not_yet_in_effect(
+    w: &World,
+    route: Route,
+) -> (Arc<Engine>, tempfile::TempDir, String, OplogEntry) {
+    let (m, d) = flipped_with_old_and_new(w);
+    let drop = logical_drop(w, 5);
+    if !matches!(route, Route::Window) {
+        learn(&m, &drop, route);
+    }
+    let (recreate, physical) = recreation(w, 9, None);
+    window(&m, std::slice::from_ref(&recreate));
+    assert_eq!(served(&m), physical, "premise: the recreation is visible");
+    // a recreation starts with no documents, so the joined indexes have no entries until it takes some
+    window(&m, &[doc_entry(w, &physical, 50, at(w, 10)), doc_entry(w, &physical, 51, at(w, 10))]);
+    assert!(
+        entries(&m, &physical, "old_1") > 0
+            && validator_of(&m, &physical).as_deref() == Some("old"),
+        "premise: with no floor in effect the recreation carries the dropped life's definitions, with entries"
+    );
+    (m, d, physical, drop)
+}
+
+fn take_effect(m: &Engine, drop: &OplogEntry, route: Route) {
+    match route {
+        Route::Window => {
+            window(m, std::slice::from_ref(drop));
+        }
+        _ => release(m, drop, route),
+    }
+}
+
+#[test]
+fn a_drop_that_takes_effect_below_a_recreation_removes_what_is_at_or_below_it_from_the_recreation_by_every_route()
+ {
+    for route in ROUTES {
+        let w = world();
+        let (m, _d, physical, drop) = recreation_over_a_drop_not_yet_in_effect(&w, route);
+        take_effect(&m, &drop, route);
+        assert_eq!(served(&m), physical, "the recreation still serves ({route:?})");
+        assert!(
+            !holds(&m, &physical, "old_1"),
+            "the index at or below the drop is gone ({route:?})"
+        );
+        assert_eq!(entries(&m, &physical, "old_1"), 0, "and its entries ({route:?})");
+        assert_eq!(validator_of(&m, &physical), None, "and the validator ({route:?})");
+        assert!(
+            entries(&m, &physical, "new_1") > 0,
+            "an index made above the drop stays, with its entries ({route:?})"
+        );
+        assert_eq!(
+            tombstone(&m, &physical, "old_1"),
+            Some(drop.stamp),
+            "the re-floor leaves the index's tombstone under the standing physical, at max(d, created) ({route:?})"
+        );
+    }
+}
+
+#[test]
+fn a_drop_that_takes_effect_below_a_bound_stage_removes_the_copied_definitions_and_is_not_an_incarnation_floor()
+ {
+    for route in ROUTES {
+        let w = world();
+        let (m, _d) = member(&w);
+        let wall = w.bind.stamp.hlc.wall_ms;
+        // the stage was created below the drop and carries the target's definitions (by hand, as Q6.7's creation entry will), and rows
+        // written by explicit entries on both sides of the drop at `wall - 5`
+        window(
+            &m,
+            &[
+                stage_index_entry(author(&w), BOUND, "copied", "t", wall - 8),
+                crate::engine::ddl_entry(
+                    Stamp::new(Hlc::new(wall - 7, 0), author(&w).node_id(), author(&w).epoch()),
+                    OpKind::ConfigureValidator,
+                    CollectionId::derive(DB, BOUND),
+                    &kimmy_core::ValidatorSet {
+                        db: DB.into(),
+                        collection: BOUND.into(),
+                        validator: Some(validator("copied")),
+                    },
+                )
+                .expect("the stage's validator encodes"),
+                doc_entry(&w, BOUND, 30, wall - 6),
+                doc_entry(&w, BOUND, 31, wall + 7),
+            ],
+        );
+        flip(&m, &w.bind, Route::Window);
+        assert!(entries(&m, BOUND, "copied") > 0, "premise: the copied index has entries");
+        assert_eq!(validator_of(&m, BOUND).as_deref(), Some("copied"), "premise: the validator");
+        assert!(
+            has_doc(&m, BOUND, 30) && has_doc(&m, BOUND, 31),
+            "premise: a row at or below the drop and one above it"
+        );
+        let before: Vec<bool> =
+            [10, 11, 12, 30, 31].iter().map(|id| has_doc(&m, BOUND, *id)).collect();
+
+        let drop = drop_below(&w, 5);
+        learn(&m, &drop, route);
+        release(&m, &drop, route);
+        assert_eq!(served(&m), BOUND, "the stage still serves ({route:?})");
+        assert!(!holds(&m, BOUND, "copied"), "the copied index is gone ({route:?})");
+        assert_eq!(entries(&m, BOUND, "copied"), 0, "and its entries ({route:?})");
+        assert_eq!(validator_of(&m, BOUND), None, "and the validator ({route:?})");
+        let after: Vec<bool> =
+            [10, 11, 12, 30, 31].iter().map(|id| has_doc(&m, BOUND, *id)).collect();
+        assert_eq!(before, after, "no document is removed ({route:?})");
+        window(&m, &[doc_entry(&w, BOUND, 32, wall - 4)]);
+        assert!(
+            has_doc(&m, BOUND, 32),
+            "a document stamped at or below the drop, delivered after the re-floor, is applied: the re-floor is not an incarnation floor ({route:?})"
+        );
+    }
+}
+
+#[test]
+fn a_flip_then_a_drop_and_a_drop_then_a_flip_end_with_the_same_definitions() {
+    let w = world();
+    let wall = w.bind.stamp.hlc.wall_ms;
+    let by_hand = |m: &Engine| {
+        window(
+            m,
+            &[
+                stage_index_entry(author(&w), BOUND, "copied", "t", wall - 8),
+                stage_index_entry(author(&w), BOUND, "kept", "v", wall + 7),
+            ],
+        );
+        assert!(
+            entries(m, BOUND, "copied") > 0 && entries(m, BOUND, "kept") > 0,
+            "premise: both are on the stage"
+        );
+    };
+    let drop = drop_below(&w, 5);
+    // the flip first, then the drop
+    let (flip_first, _d1) = member(&w);
+    by_hand(&flip_first);
+    flip(&flip_first, &w.bind, Route::Window);
+    assert!(
+        holds(&flip_first, BOUND, "copied"),
+        "premise: the definition to be removed existed before the drop"
+    );
+    window(&flip_first, std::slice::from_ref(&drop));
+    // the drop first, then the flip
+    let (drop_first, _d2) = member(&w);
+    by_hand(&drop_first);
+    window(&drop_first, std::slice::from_ref(&drop));
+    flip(&drop_first, &w.bind, Route::Window);
+    for (m, order) in [(&flip_first, "flip then drop"), (&drop_first, "drop then flip")] {
+        assert!(
+            !holds(m, BOUND, "copied"),
+            "the definition at or below the drop is gone ({order})"
+        );
+        assert!(
+            entries(m, BOUND, "kept") > 0,
+            "the definition above it stands, with entries ({order})"
+        );
+        assert_eq!(
+            m.get_collection(DB, BOUND).expect("held").indexes.len(),
+            1,
+            "and it is the only one ({order})"
+        );
+    }
+}
+
+/// An author whose node sorts above (`above`) or below the node of `reference`'s author.
+fn author_sorting(reference: &Engine, above: bool) -> (Engine, tempfile::TempDir) {
+    loop {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let candidate = Engine::open(&dir.path().join("kimmy.redb")).expect("an engine opens");
+        if (candidate.node_id() > reference.node_id()) == above {
+            return (candidate, dir);
+        }
+    }
+}
+
+// Every floor is an `Hlc` at every site (the row's floor and merge, the join's `above`, `floor_definitions_in_txn`), so these runs pin an
+// hlc-only comparison: the node-above and node-below runs both end the same way, and are killed together by `>=` for `>` and `<` for `<=`.
+// A comparison on the full stamp would be a code change and has no sed mutant.
+#[test]
+fn a_definition_in_the_drops_own_hlc_is_the_drops_from_a_node_above_it_and_from_one_below_it_whenever_it_arrives()
+ {
+    for above in [true, false] {
+        for before_the_drop in [true, false] {
+            let w = world();
+            let (m, _d) = member(&w);
+            flip(&m, &w.bind, Route::Window);
+            let drop = logical_drop(&w, 5);
+            let (other, _od) = author_sorting(author(&w), above);
+            let tie = stage_index_entry(&other, "orders", "tie_1", "t", drop.stamp.hlc.wall_ms);
+            assert_eq!(tie.stamp.hlc, drop.stamp.hlc, "premise: the same hlc");
+            assert_eq!(tie.stamp > drop.stamp, above, "premise: the node sorts as the run says");
+            let later = stage_index_entry(&other, "orders", "after_1", "v", at(&w, 7));
+            let run = format!("node above: {above}, before the drop: {before_the_drop}");
+            if before_the_drop {
+                let outcome = window(&m, &[tie.clone(), later.clone()]);
+                assert!(!outcome.stopped(), "the entries are judged ({run})");
+                window(&m, std::slice::from_ref(&drop));
+            } else {
+                window(&m, std::slice::from_ref(&drop));
+                let outcome = window(&m, &[tie.clone(), later.clone()]);
+                assert!(!outcome.stopped(), "the entries are judged, not a stop ({run})");
+            }
+            let (recreate, physical) = recreation(&w, 9, None);
+            window(&m, std::slice::from_ref(&recreate));
+            assert_eq!(served(&m), physical, "premise: the recreation is visible ({run})");
+            assert!(
+                !holds(&m, &physical, "tie_1"),
+                "a definition in the drop's own hlc is the drop's ({run})"
+            );
+            assert!(
+                holds(&m, &physical, "after_1"),
+                "and a later entry of the same origin in the same window was applied ({run})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_second_cycle_of_drop_and_recreate_inherits_nothing_from_before_the_second_drop() {
+    let w = world();
+    let (m, _d) = flipped_with_old_and_new(&w);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    m.finish_purges_now().expect("the purge finishes");
+    m.create_collection(DB, "orders").expect("the first recreate");
+    let first = served(&m);
+    assert!(
+        holds(&m, &first, "new_1") && !holds(&m, &first, "old_1"),
+        "premise: the first recreation"
+    );
+    m.create_index(DB, "orders", vec![IndexField::ascending("t")], false, Some("cycle_2".into()))
+        .expect("a definition is made on the first recreation");
+    assert!(holds(&m, &first, "cycle_2"), "premise: it exists before the second drop");
+    assert!(m.drop_collection(DB, "orders").expect("the second drop"), "premise: the second drop");
+    assert!(
+        crate::register::post_row_for_tests(&m, DB, "orders").expect("reads").is_none_or(|row| {
+            !row.indexes.iter().any(|i| i.name == "old_1" || i.name == "new_1")
+        }),
+        "premise: the row holds nothing of the first life"
+    );
+    m.finish_purges_now().expect("the purge finishes");
+    m.create_collection(DB, "orders").expect("the second recreate");
+    let second = served(&m);
+    assert_ne!(second, first, "premise: a new physical");
+    let held = m.get_collection(DB, &second).expect("held");
+    let names: Vec<&str> = held.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        !names.contains(&"old_1") && !names.contains(&"new_1"),
+        "nothing of the first life: {names:?}"
+    );
+}
+
+#[test]
+fn a_recreation_made_with_a_validator_keeps_its_own_over_an_older_one_in_the_row() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, &[validator_entry(&w, "row_validator", 8)]);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    let row = the_row(&m);
+    assert_eq!(
+        row.validator.as_ref().and_then(|v| v.schema.get_str("title").ok()),
+        Some("row_validator"),
+        "premise: the row holds the older validator"
+    );
+    let (recreate, physical) = recreation(&w, 12, Some(validator("own")));
+    window(&m, std::slice::from_ref(&recreate));
+    assert_eq!(served(&m), physical, "premise: the recreation is visible");
+    assert_eq!(
+        validator_of(&m, &physical).as_deref(),
+        Some("own"),
+        "the creation's own validator stands over the row's"
+    );
+}
+
+#[test]
+fn a_drop_that_is_only_parked_is_not_a_floor_and_the_re_floor_waits_for_its_release() {
+    let w = world();
+    let (m, _d, physical, drop) =
+        recreation_over_a_drop_not_yet_in_effect(&w, Route::ParkedThenWindow);
+    // parked: a definition below it that arrives is applied to the visible recreation
+    window(&m, &[definition(&w, "old_2", "v", 2)]);
+    assert!(
+        entries(&m, &physical, "old_2") > 0 && entries(&m, &physical, "old_1") > 0,
+        "a parked drop is not a floor: what is below it is applied and stays until it is released"
+    );
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        !holds(&m, &physical, "old_1") && !holds(&m, &physical, "old_2"),
+        "gone after the release"
+    );
+}
+
+// Half one ("an aborted drop re-floors nothing") is a STRUCTURAL guard and cannot be mutated: the removal runs inside the window's own
+// WriteTxn, so a re-floor made in the pass is made before the commit and an abort rolls it back. The pass reaches the removal only through
+// `floor_definitions_in_txn(txn: &WriteTxn, ..)` (join.rs:340), which takes only that transaction and opens none of its own, and the pass is
+// called only inside a commit's transaction (sync.rs:3583 and 3664, engine.rs:4029, 5730 and 5789). A mutant that survived an abort would
+// need a second, independently committed write path, and there is none. Half two ("the redelivery re-floors") is the red.
+#[test]
+fn a_drop_released_in_a_transaction_that_fails_re_floors_nothing_and_the_redelivery_re_floors_once()
+{
+    let w = world();
+    let (m, _d, physical, drop) =
+        recreation_over_a_drop_not_yet_in_effect(&w, Route::ParkedThenWindow);
+    let passes = crate::sync::race_hooks::settle_passes();
+    crate::sync::race_hooks::fail_after_the_next_settle();
+    let attempt = try_window(&m, std::slice::from_ref(&drop));
+    assert!(attempt.is_err(), "premise: the transaction failed: {attempt:?}");
+    assert_eq!(crate::sync::race_hooks::settle_passes(), passes + 1, "premise: the pass ran");
+    assert!(
+        entries(&m, &physical, "old_1") > 0 && validator_of(&m, &physical).is_some(),
+        "an aborted drop re-floors nothing"
+    );
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        !holds(&m, &physical, "old_1") && validator_of(&m, &physical).is_none(),
+        "the redelivery re-floors"
+    );
+    assert!(entries(&m, &physical, "new_1") > 0, "and keeps what is above the drop");
+}
+
+#[test]
+fn an_older_index_delivered_again_after_the_re_floor_is_history_where_it_re_floored() {
+    let w = world();
+    let (m, _d, physical, drop) =
+        recreation_over_a_drop_not_yet_in_effect(&w, Route::ParkedThenWindow);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(!holds(&m, &physical, "old_1"), "premise: re-floored");
+    let outcome = window(&m, &[definition(&w, "old_1", "t", 3), definition(&w, "later_1", "t", 8)]);
+    assert!(!outcome.stopped(), "the redelivery reached the arm and the window did not stop");
+    assert!(holds(&m, &physical, "later_1"), "a later entry of the same window was applied");
+    assert!(
+        !holds(&m, &physical, "old_1"),
+        "the older create is history on the member that re-floored"
+    );
+    assert_eq!(
+        tombstone(&m, &physical, "old_1"),
+        Some(drop.stamp),
+        "by the tombstone under the standing physical, at max(d, created)"
+    );
+}
+
+#[test]
+fn a_recreate_inherits_nothing_at_or_below_the_drop_on_the_local_door_and_on_a_replica() {
+    let w = world();
+    let (m, _d) = flipped_with_old_and_new(&w);
+    let drop = logical_drop(&w, 5);
+    window(&m, std::slice::from_ref(&drop));
+    assert_eq!(
+        names(&the_row(&m)),
+        vec!["new_1".to_string()],
+        "premise: the row holds only what is above the drop"
+    );
+    m.create_collection(DB, "orders").expect("the create of a dropped swapped name is a recreate");
+    let local = served(&m);
+    let on_local = m.get_collection(DB, &local).expect("the recreation is held");
+    m.insert(&on_local, doc! { "_id": 60, "v": 60, "t": 60 })
+        .expect("the recreation takes a document");
+    assert!(kimmy_core::is_recreation_name(&local), "premise: a recreation: {local}");
+    // a replica that meets the same events and the recreation as an entry
+    let (replica, _dr) = flipped_with_old_and_new(&w);
+    window(&replica, std::slice::from_ref(&drop));
+    let creation = everything(&m)
+        .into_iter()
+        .find(|e| {
+            e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive(DB, &local)
+        })
+        .expect("the local recreation minted its creation entry");
+    window(&replica, std::slice::from_ref(&creation));
+    let written = everything(&m)
+        .into_iter()
+        .find(|e| e.kind == OpKind::Insert && e.collection == CollectionId::derive(DB, &local))
+        .expect("the local insert minted its entry");
+    window(&replica, std::slice::from_ref(&written));
+    for (member, door) in [(&m, "local door"), (&replica, "replica")] {
+        assert_eq!(served(member), local, "the recreation serves ({door})");
+        assert!(
+            entries(member, &local, "new_1") > 0,
+            "the index above the drop is on it, with entries ({door})"
+        );
+        assert!(!holds(member, &local, "old_1"), "the index at or below the drop is not ({door})");
+        assert_eq!(validator_of(member, &local), None, "nor the validator ({door})");
+    }
+}
+
+#[test]
+fn two_recreations_do_not_merge_their_documents_and_the_losers_definitions_join_the_winner_in_every_order()
+ {
+    // R1 and R2 are made at once by two members; every member ends with R2 visible and R1 bound out. A document written to R1 and an index
+    // made on R1 above the drop: the document is not merged into R2 and the index is
+    let orders: [(&str, [usize; 4]); 3] = [
+        ("R1, the document and the index, then R2", [0, 2, 3, 1]),
+        ("R2, then R1, then the document and the index", [1, 0, 2, 3]),
+        ("R1, R2, then the document and the index", [0, 1, 2, 3]),
+    ];
+    for (name, order) in orders {
+        let w = world();
+        let (m, _d) = member(&w);
+        flip(&m, &w.bind, Route::Window);
+        window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+        let (r1, p1) = recreation(&w, 9, None);
+        let (r2, p2) = recreation(&w, 10, None);
+        let doc = doc_entry(&w, &p1, 40, at(&w, 11));
+        let index = definition(&w, "r1_idx", "t", 12);
+        let items = [r1, r2, doc, index];
+        for i in order {
+            window(&m, std::slice::from_ref(&items[i]));
+        }
+        assert_eq!(served(&m), p2, "R2 serves ({name})");
+        assert!(!has_doc(&m, &p2, 40), "the document written to R1 is not in R2 ({name})");
+        assert!(holds(&m, &p2, "r1_idx"), "the index made on R1 above the drop is on R2 ({name})");
+    }
+}
+
+#[test]
+fn a_definition_in_the_drops_own_hlc_from_a_node_above_it_is_removed_by_the_re_floor_and_its_tombstone_sorts_above_the_drop()
+ {
+    // the index sorts above the drop's stamp (the same hlc, a higher node), so its tombstone is at its own stamp and not at the drop's
+    let w = world();
+    let (m, _d) = flipped_with_old_and_new(&w);
+    let drop = logical_drop(&w, 5);
+    let (other, _od) = author_sorting(author(&w), true);
+    let tie = stage_index_entry(&other, "orders", "tie_2", "t", drop.stamp.hlc.wall_ms);
+    assert!(
+        tie.stamp > drop.stamp && tie.stamp.hlc == drop.stamp.hlc,
+        "premise: the same hlc, above the drop's stamp"
+    );
+    window(&m, std::slice::from_ref(&tie));
+    m.apply_batch(std::slice::from_ref(&drop)).expect("the drop is stored ahead");
+    let (recreate, physical) = recreation(&w, 9, None);
+    window(&m, std::slice::from_ref(&recreate));
+    window(&m, &[doc_entry(&w, &physical, 50, at(&w, 10))]);
+    assert!(
+        entries(&m, &physical, "tie_2") > 0,
+        "premise: the recreation carries it, with entries"
+    );
+    release(&m, &drop, Route::ParkedThenWindow);
+    assert!(
+        !holds(&m, &physical, "tie_2"),
+        "an index in the drop's own hlc is the drop's, from whichever node"
+    );
+    assert_eq!(
+        tombstone(&m, &physical, "tie_2"),
+        Some(tie.stamp),
+        "the tombstone is at the index's own stamp where that sorts above the drop's"
+    );
+}
+
+#[test]
+fn a_definition_entry_addressed_to_a_physical_the_member_never_held_stops_the_window_as_an_unknown_collection_today()
+ {
+    // PINS TODAY'S BEHAVIOUR. No route mints such an entry: a local index, drop and validator change are addressed to the LOGICAL name
+    // (rule 1: index.rs:1601, 1921, 2078, validator.rs:235), a recreation's creation carries its validator in the creation entry itself, a
+    // snapshot page carries collection state and no definition entries, and the vector doors refuse a name with a register event, so a
+    // vector entry is never addressed to a swapped name's physical (vectors.rs:389, 571 name `meta.id` of a name that has no event).
+    // Only an entry made by hand reaches it, as Q6.7's stage definitions would if they were separate entries; Q6.7 carries the
+    // stage's definitions in the stage's creation entry (Q67-prebuild unit 1), which the member holds. A stop on an unknown collection
+    // plans a snapshot, which never brings a buried physical: if Q6.7 ever sends such an entry the arm must treat it as history.
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    let (r1, p1) = recreation(&w, 9, None);
+    let (r2, p2) = recreation(&w, 10, None);
+    window(&m, std::slice::from_ref(&r2));
+    window(&m, std::slice::from_ref(&r1));
+    assert!(m.get_collection(DB, &p1).is_err(), "premise: the losing recreation is not held here");
+    assert_eq!(served(&m), p2, "premise: the winner serves");
+    let by_hand = stage_index_entry(author(&w), &p1, "r1_idx", "t", at(&w, 12));
+    let outcome = window(&m, std::slice::from_ref(&by_hand));
+    assert!(
+        outcome.stopped() && outcome.unknown_collection == 1,
+        "an entry addressed to a physical this member never held is an unknown collection and stops the window (today)"
     );
 }
