@@ -10,7 +10,7 @@ use kimmy_storage::Engine;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::discovery::SeedSource;
-use crate::health::{DEFAULT_FANOUT, PeerHealth};
+use crate::health::{DEFAULT_FANOUT, ListedLive, PeerHealth};
 use crate::membership::Members;
 use crate::protocol::ProtocolError;
 use crate::repair_ledger::Judged;
@@ -818,6 +818,9 @@ impl DialsInFlight {
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovered: BTreeSet<SocketAddr> = BTreeSet::new();
     let mut health = PeerHealth::new(config.fanout, config.sync_interval);
+    // What membership listed as live at the tick before, for the peers it lists again (a backoff is a guess made from failed
+    // rounds, and membership is the better evidence that a peer is back).
+    let mut listed_live = ListedLive::default();
     let mut discovery = ticker(config.discovery_interval);
     let mut sync = ticker(config.sync_interval);
 
@@ -1085,6 +1088,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // (ADR-202): not dialled again, and never a failed round.
                 self_addresses.retain(|_, at| at.elapsed() < config.self_recheck);
                 peers.retain(|peer| !self_addresses.contains_key(peer));
+                // A peer membership lists as live that it did not list at the tick before is ready at once and backs off from the
+                // base again, however long this node's own failed rounds had put it off. Only a listing counts: the discovery
+                // fallback, used while membership is empty, lists no one.
+                let listed = match &config.members {
+                    Some(members) if !members.is_empty() => peers.clone(),
+                    _ => BTreeSet::new(),
+                };
+                for peer in listed_live.newly_listed(&listed) {
+                    health.came_up(peer, Instant::now());
+                }
                 // A peer membership no longer lists as live, one SWIM marked
                 // down included, counts no more towards the lag gauge.
                 if let Some(lag) = &config.lag_vectors {
@@ -3254,6 +3267,59 @@ mod tests {
             at.elapsed() < Duration::from_millis(300),
             "from the first delay: {:?}",
             at.elapsed()
+        );
+        looping.abort();
+    }
+
+    /// **A peer dialled by discovery through a partition is dialled in the tick after membership lists it.** Membership is empty
+    /// (the discovery fallback), the peer's rounds fail and it backs off a whole interval; then SWIM lists it as live. Its backoff
+    /// was a guess made from failed rounds and membership is the better evidence, so the tick after the listing dials it, where
+    /// the backoff would have held it back (here until the interval after, and at most for the cap in a cluster that had been
+    /// partitioned for long).
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_dialled_by_discovery_through_a_partition_is_dialled_in_the_tick_after_membership_lists_it()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let members = Members::default();
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![dead])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(600);
+        config.members = Some(members.clone());
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+
+        // Discovery names the peer, the round against it fails, and it backs off for a whole interval.
+        let mut dialled = None;
+        for _ in 0..12 {
+            let report = rx.recv().await.unwrap();
+            if report.failed == 1 {
+                dialled = Some(report);
+                break;
+            }
+        }
+        let dialled = dialled.expect("discovery found the peer and dialled it");
+        assert_eq!(dialled.peers_known, 1, "{dialled:?}");
+        assert_eq!(
+            dialled.backing_off, 1,
+            "premise: it is backing off after the failure: {dialled:?}"
+        );
+
+        // SWIM lists it: the next tick dials it again at once.
+        members.insert_for_test(dead, kimmy_core::NodeId::generate());
+        let next = rx.recv().await.unwrap();
+        assert!(!next.early_retry, "the next tick is the ticker's: {next:?}");
+        assert_eq!(next.peers_known, 1, "{next:?}");
+        assert_eq!(
+            next.failed, 1,
+            "membership lists the peer: it is dialled at once, not left in the backoff its failed rounds put it in: {next:?}"
         );
         looping.abort();
     }

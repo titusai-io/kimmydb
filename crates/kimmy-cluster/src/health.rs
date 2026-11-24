@@ -185,6 +185,18 @@ impl PeerHealth {
         due
     }
 
+    /// Membership lists `peer` as live again, having not listed it at the tick before: it is ready at once and its next failure
+    /// backs off from the base, as a peer never seen fails.
+    ///
+    /// A backoff is this node's own guess that a peer is gone, made from rounds that failed. Membership is the cluster's
+    /// better evidence that it is back, and a peer whose rounds failed through a partition was backing off by up to
+    /// [`MAX_BACKOFF`] when the partition healed: it was not dialled for as long as the cap even though SWIM listed it. The
+    /// warning clock is kept, so a peer that flaps does not warn on every return. Nothing is recorded for a peer with no
+    /// failures.
+    pub fn came_up(&mut self, peer: SocketAddr, now: Instant) {
+        let _ = (peer, now); // NOT BUILT: the tests of the change come first and are red on this
+    }
+
     /// Consecutive failures recorded for a peer.
     pub fn failures(&self, peer: SocketAddr) -> u32 {
         self.state.get(&peer).map_or(0, |s| s.failures)
@@ -193,6 +205,23 @@ impl PeerHealth {
     /// Peers currently being backed off.
     pub fn backing_off(&self, now: Instant) -> usize {
         self.state.values().filter(|s| s.next_attempt > now).count()
+    }
+}
+
+/// The peers membership listed as live at the last tick, so that a tick can tell the ones it lists for the first time.
+///
+/// Empty when membership is empty or absent: the discovery fallback is not a listing, so a peer discovery has been dialling is
+/// new to this the tick membership first names it.
+#[derive(Debug, Default)]
+pub struct ListedLive {
+    listed: BTreeSet<SocketAddr>,
+}
+
+impl ListedLive {
+    /// Record `live` as this tick's listing and return the addresses in it that the tick before did not list.
+    pub fn newly_listed(&mut self, live: &BTreeSet<SocketAddr>) -> Vec<SocketAddr> {
+        let _ = live; // NOT BUILT: the tests of the change come first and are red on this
+        Vec::new()
     }
 }
 
@@ -355,6 +384,83 @@ mod tests {
         }
 
         assert_eq!(h.select(&all, now), vec![live], "the reachable peer must still be contacted");
+    }
+
+    #[test]
+    fn a_peer_membership_reports_up_is_ready_at_once_and_backs_off_from_the_base_again() {
+        let mut h = health();
+        let now = Instant::now();
+        let peer = *peers(1).iter().next().unwrap();
+        let other = peers(2).into_iter().next_back().unwrap();
+
+        // A partition: eight rounds failed, the first warned, and the peer is backed off by the cap.
+        let mut warned = Vec::new();
+        for _ in 0..8 {
+            warned.push(h.failed(peer, now));
+        }
+        assert_eq!(
+            warned.iter().filter(|w| **w).count(),
+            1,
+            "premise: only the first failure warned"
+        );
+        let healed = now + Duration::from_secs(10);
+        assert!(h.select(&peers(1), healed).is_empty(), "premise: still backing off at the heal");
+        assert_eq!(h.backing_off(healed), 1);
+
+        h.came_up(peer, healed);
+        assert_eq!(h.failures(peer), 0, "membership lists it again: the count starts over");
+        assert_eq!(h.select(&peers(1), healed), vec![peer], "ready at once, not at the cap");
+        assert_eq!(h.backing_off(healed), 0);
+
+        // It fails again: the backoff starts from the base, not from where the partition left it, and the warning clock
+        // is the one it had (a peer that flaps does not warn on every return).
+        let warn_again = h.failed(peer, healed);
+        assert!(!warn_again, "the warning clock is kept: it warned ten seconds ago");
+        assert_eq!(h.failures(peer), 1);
+        assert!(h.select(&peers(1), healed + Duration::from_secs(4)).is_empty());
+        assert_eq!(
+            h.select(&peers(1), healed + Duration::from_secs(5)),
+            vec![peer],
+            "the base: 5 s"
+        );
+
+        // A peer with no failures has nothing recorded for it, and a peer never seen fails as a first failure does.
+        h.came_up(other, healed);
+        assert_eq!(h.backing_off(healed), 1, "only the peer that failed again is backing off");
+        assert!(h.failed(other, healed), "a first failure is reported at warning level");
+    }
+
+    #[test]
+    fn membership_lists_a_peer_as_new_only_at_the_tick_it_first_appears() {
+        let all = peers(3);
+        let (a, b, c) = {
+            let mut it = all.iter().copied();
+            (it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
+        };
+        let set = |xs: &[SocketAddr]| xs.iter().copied().collect::<BTreeSet<_>>();
+        let mut listed = ListedLive::default();
+        assert_eq!(
+            listed.newly_listed(&set(&[a, b])),
+            vec![a, b],
+            "the first listing names everyone"
+        );
+        assert!(
+            listed.newly_listed(&set(&[a, b])).is_empty(),
+            "a peer listed all along is not new"
+        );
+        assert_eq!(listed.newly_listed(&set(&[a, b, c])), vec![c], "one that joins is");
+        assert!(listed.newly_listed(&set(&[a])).is_empty(), "a peer going away is not new");
+        assert_eq!(
+            listed.newly_listed(&set(&[a, b])),
+            vec![b],
+            "and one that comes back after a tick without it is"
+        );
+        assert!(listed.newly_listed(&BTreeSet::new()).is_empty());
+        assert_eq!(
+            listed.newly_listed(&set(&[a])),
+            vec![a],
+            "an empty listing (membership empty, or the discovery fallback) forgets everyone"
+        );
     }
 
     #[test]
