@@ -184,8 +184,16 @@ impl crate::Engine {
         }
         // A loop, not a self-call: see `configure_vectors_inner`.
         for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
-            let mut meta = self.get_collection(db, collection)?;
+            // A local change is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry loop; a
+            // replicated or restored one names the collection it applies to (the arms' lookup is the next commit's).
+            let mut meta = if matches!(by, Validated::Locally) {
+                self.definition_target(db, collection)?
+            } else {
+                self.get_collection(db, collection)?
+            };
             let read = meta.clone();
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Validator);
             // A change of a life that has since been dropped and recreated here is
             // history, judged on the definition read here and held unchanged by
             // `definition_is` below.
@@ -218,7 +226,7 @@ impl crate::Engine {
                 let entry = crate::engine::ddl_entry(
                     stamp.expect("a local change mints its stamp"),
                     kimmy_core::OpKind::ConfigureValidator,
-                    meta.id,
+                    CollectionId::derive(db, collection), // rule 1: only a local change mints, addressed to the logical name
                     &kimmy_core::ValidatorSet {
                         db: db.to_string(),
                         collection: collection.to_string(),

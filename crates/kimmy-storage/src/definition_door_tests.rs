@@ -302,3 +302,24 @@ fn a_flip_between_the_doors_read_and_its_write_ends_on_the_new_physical() {
         "the index is on the physical the name answers from"
     );
 }
+
+#[test]
+fn a_flip_between_the_validators_read_and_its_write_ends_on_the_new_physical() {
+    // The validator door reads the definition (the identity, before the flip), the binding takes effect, and the door takes the
+    // writer: the retry resolves the name again and the validator lands on the stage, never on the buried identity.
+    let s = before_the_flip();
+    let (m, bind) = (Arc::clone(&s.m), s.bind.clone());
+    let (result, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::Validator,
+        move || {
+            window(&m, std::slice::from_ref(&bind));
+        },
+        || s.m.set_validator(DB, "orders", Some(validator())),
+    );
+    result.expect("the door was retried and found the name where it answers now");
+    assert_eq!(s.m.resolve(DB, "orders").unwrap().physical, BOUND, "premise: the flip took effect");
+    assert!(
+        s.m.get_collection(DB, BOUND).unwrap().validator.is_some(),
+        "the validator is on the bound stage"
+    );
+}

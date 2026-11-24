@@ -1339,7 +1339,13 @@ impl crate::Engine {
                 )));
             }
 
-            let mut meta = self.get_collection(db, collection)?;
+            // A local create is addressed to the LOGICAL name: the door resolves it through the register, here, inside the retry
+            // loop, so a flip between this read and the writer sends the retry to the physical the name answers from now. A
+            // replicated or restored one names the collection it applies to (Q6.5-1: the arms' lookup is the next commit's).
+            let mut meta = match origin {
+                CreateOrigin::Local => self.definition_target(db, collection)?,
+                _ => self.get_collection(db, collection)?,
+            };
             let read = meta.clone();
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexCreation);
@@ -1472,7 +1478,7 @@ impl crate::Engine {
                             let entry = crate::engine::ddl_entry(
                                 minted,
                                 kimmy_core::OpKind::CreateIndex,
-                                meta.id,
+                                CollectionId::derive(db, collection), // rule 1: addressed to the logical name
                                 &logged_definition(db, collection, &restamped),
                             )?;
                             crate::engine::append_oplog(&txn, &entry)?;
@@ -1884,7 +1890,7 @@ impl crate::Engine {
                     let entry = crate::engine::ddl_entry(
                         stamp.expect("a local create mints its stamp above"),
                         kimmy_core::OpKind::CreateIndex,
-                        meta.id,
+                        CollectionId::derive(db, collection), // rule 1: addressed to the logical name
                         &logged_definition(db, collection, &index),
                     )?;
                     crate::engine::append_oplog(&txn, &entry)?;
@@ -2025,7 +2031,13 @@ impl crate::Engine {
                 // no index it could ever name, and the caller is there to be told.
                 CoreError::validate_name(name).map_err(StorageError::Core)?;
             }
-            let mut meta = self.get_collection(db, collection)?;
+            // A local drop is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry loop; a replicated
+            // one names the collection it applies to (the arms' lookup is the next commit's).
+            let mut meta = if replicated.is_none() {
+                self.definition_target(db, collection)?
+            } else {
+                self.get_collection(db, collection)?
+            };
             let read = meta.clone();
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexDrop);
@@ -2040,7 +2052,7 @@ impl crate::Engine {
                 crate::engine::ddl_entry(
                     stamp,
                     kimmy_core::OpKind::DropIndex,
-                    meta.id,
+                    CollectionId::derive(db, collection), // rule 1: only a local drop mints, addressed to the logical name
                     &kimmy_core::IndexDrop {
                         db: db.to_string(),
                         collection: collection.to_string(),
@@ -2163,8 +2175,9 @@ impl crate::Engine {
         Err(crate::Engine::retries_exhausted_error(db, collection))
     }
 
+    /// The indexes of the physical the name `collection` answers from (a plain name is its own physical; Q6.5-1).
     pub fn list_indexes(&self, db: &str, collection: &str) -> Result<Vec<IndexMeta>> {
-        Ok(self.get_collection(db, collection)?.indexes)
+        Ok(self.definition_target(db, collection)?.indexes)
     }
 
     /// Document keys an index range points at, and the documents the index

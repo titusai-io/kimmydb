@@ -3838,6 +3838,8 @@ pub(crate) mod race_hooks {
         /// A document repair's page has been taken and judged to apply, and has not yet taken
         /// the writer: a retention pass can commit between a plan and the page.
         ConvergePage,
+        /// A validator change read the collection's definition, and has not yet taken the writer to write it back.
+        Validator,
     }
 
     type Hook = Box<dyn FnOnce()>;

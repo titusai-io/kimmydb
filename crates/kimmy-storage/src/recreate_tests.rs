@@ -397,12 +397,11 @@ fn a_recreated_name_is_listed_under_its_own_name_and_its_physical_is_not() {
 }
 
 #[test]
-fn a_definition_addressed_to_a_swapped_name_finds_nothing_until_q6_5() {
-    // A PIN of today's behaviour, not of the intended one. Decision 6 says an index, a validator, a vector configuration and a TTL
-    // address the LOGICAL name and are stamped registers joined across the physicals of the chain; that is Q6.5 ("definition
-    // registers"). Until then these entry points look the name up with `get_collection`, which finds a physical by its own name,
-    // so after a flip (the identity buried, the stage serving) they answer CollectionNotFound. Nothing is lost and nothing
-    // diverges. Q6.5's failing-first commit flips this test to "the definition lands on the physical the name answers from".
+fn a_definition_addressed_to_a_swapped_name_lands_on_the_physical_the_name_answers_from() {
+    // Decision 6: an index, a validator, a vector configuration and a TTL address the LOGICAL name. Until Q6.5-1 these entry points
+    // looked the name up with `get_collection`, which finds a physical by its own name, so after a flip (the identity buried, the stage
+    // serving) they answered CollectionNotFound; this test pinned that. It now says where they land (the storage tests of the doors
+    // are in definition_door_tests.rs).
     let (m, _d) = with_orders();
     let (a, _da) = engine();
     a.create_stage(DB, STAGE, MergePolicy::Document, Hlc::new(physical_now_ms() + 60_000, 0))
@@ -419,21 +418,10 @@ fn a_definition_addressed_to_a_swapped_name_finds_nothing_until_q6_5() {
         std::slice::from_ref(&bind_of(&a, physical_now_ms().max(creation.stamp.hlc.wall_ms) + 1)),
     );
     assert_eq!(m.resolve(DB, "orders").unwrap().physical, STAGE, "premise: the flip is visible");
-    let created =
-        m.create_index(DB, "orders", vec![kimmy_core::IndexField::ascending("v")], false, None);
-    assert!(
-        matches!(
-            created,
-            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
-        ),
-        "an index on a swapped name: {created:?}"
-    );
-    let validator = m.set_validator(DB, "orders", None);
-    assert!(
-        matches!(
-            validator,
-            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
-        ),
-        "a validator on a swapped name: {validator:?}"
-    );
+    let created = m
+        .create_index(DB, "orders", vec![kimmy_core::IndexField::ascending("v")], false, None)
+        .expect("an index on a swapped name lands on the physical the name answers from");
+    assert!(m.get_collection(DB, STAGE).unwrap().index(&created.name).is_some(), "on the stage");
+    m.set_validator(DB, "orders", None)
+        .expect("a validator on a swapped name lands on the physical the name answers from");
 }

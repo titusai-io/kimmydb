@@ -5791,6 +5791,21 @@ impl Engine {
         }
     }
 
+    /// The physical collection a schema change addressed to the LOGICAL name `logical` applies to (ADR-272, decision 6; Q6.5-1): the
+    /// one the name answers from, resolved through the register as a read resolves it. It never answers an unbound stage or a buried
+    /// identity, and a name that reads absent (a logical drop in effect) is [`CoreError::CollectionNotFound`]. A name with no
+    /// register event is [`Self::get_collection`] exactly.
+    ///
+    /// The plain [`Self::resolve`], not [`Self::resolve_for_write`]: a schema change is not refused while a superseding event is only
+    /// known ahead of its position. Rule 2 of the definition registers sends it to the physical the name answers from now, and the
+    /// join at the release carries it (Q6.5-2).
+    ///
+    /// Every door that reads a definition, takes the writer and checks the definition unchanged calls this INSIDE its retry loop, so
+    /// a flip between the read and the writer sends the retry to the new physical and not to the one that was just buried.
+    pub(crate) fn definition_target(&self, db: &str, logical: &str) -> Result<CollectionMeta> {
+        Ok(self.resolve(db, logical)?.meta)
+    }
+
     fn resolve_in(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
         use kimmy_core::register_state::{Ready, Visible};
         let timeline = crate::register::timeline_read(txn, db, name)?;
