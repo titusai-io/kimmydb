@@ -5953,6 +5953,8 @@ impl Engine {
                     row.floor(floor);
                 }
                 row_written = true;
+                row.definition_floor =
+                    [row.definition_floor, held.definition_floor].into_iter().flatten().max();
                 row.merge(
                     &held.indexes,
                     &held.tombstones,

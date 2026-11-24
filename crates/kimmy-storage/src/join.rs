@@ -50,6 +50,9 @@ pub(crate) struct Held {
     /// The validator and the stamp of its latest change.
     pub(crate) validator: Option<kimmy_core::ValidatorSpec>,
     pub(crate) validator_changed: Option<Stamp>,
+    /// The definition floor the physical that takes this passes on: the greatest of the old physical's incarnation floor, its own
+    /// definition floor and the `hlc` of the tombstone its id held (`None` when it had none of them).
+    pub(crate) definition_floor: Option<Hlc>,
 }
 
 impl Engine {
@@ -67,6 +70,16 @@ impl Engine {
     /// Read what `meta`'s physical holds, before it is buried.
     pub(crate) fn read_held(txn: &WriteTxn<'_>, meta: CollectionMeta) -> Result<Held> {
         let tombstones = Self::tombstones_of(txn, meta.id)?;
+        // The tombstone the id holds NOW: the burial that follows moves it to the binding's stamp, which is not a boundary of the life
+        let dropped = {
+            let table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            match table.get(meta.id.0)? {
+                Some(raw) => Some(crate::codec::decode_oplog_key(raw.value())?.hlc),
+                None => None,
+            }
+        };
+        let definition_floor =
+            [meta.incarnation_floor, meta.definition_floor, dropped].into_iter().flatten().max();
         Ok(Held {
             db: meta.db,
             id: Some(meta.id),
@@ -74,6 +87,7 @@ impl Engine {
             tombstones,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
+            definition_floor,
         })
     }
 
@@ -95,6 +109,8 @@ impl Engine {
         if held.id == Some(n.id) {
             return Ok(());
         }
+        // what is carried is above the logical drop in effect and above the boundary of the life the definitions come from
+        let floor = [floor, held.definition_floor].into_iter().flatten().max();
         let above = |stamp: &Stamp| floor.is_none_or(|f| stamp.hlc > f);
         let n_tombs = Self::tombstones_of(txn, n.id)?;
         let tomb_of =
@@ -224,6 +240,9 @@ impl Engine {
             n.validator_changed = Some(q_changed);
         }
 
+        // the boundary goes with the definitions: `N` judges a definition of the life it replaces as that life's physical did
+        n.definition_floor =
+            [n.definition_floor, held.definition_floor].into_iter().flatten().max();
         Self::put_collection_meta(txn, &n)?;
         for (_, violations) in built {
             post.violations.push((n.clone(), violations));
@@ -246,6 +265,7 @@ impl crate::register::PostRow {
             tombstones: self.tombstones,
             validator: self.validator,
             validator_changed: self.validator_changed,
+            definition_floor: self.definition_floor,
         }
     }
 }

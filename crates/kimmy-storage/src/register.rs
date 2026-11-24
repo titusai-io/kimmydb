@@ -63,12 +63,13 @@ fn post_key(db: &str, logical: &str) -> [u8; 8] {
 }
 
 impl PostRow {
-    /// Whether the row holds nothing: no index, no tombstone, no validator.
+    /// Whether the row holds nothing: no index, no tombstone, no validator, no definition floor.
     pub(crate) fn is_empty(&self) -> bool {
         self.indexes.is_empty()
             && self.tombstones.is_empty()
             && self.validator.is_none()
             && self.validator_changed.is_none()
+            && self.definition_floor.is_none()
     }
 
     /// Remove what is stamped at or below `floor` (a logical drop's hlc): the dropped life's.

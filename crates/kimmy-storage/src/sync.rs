@@ -1764,6 +1764,10 @@ impl Engine {
         if below_floor(standing, stamp) {
             return Ok(true);
         }
+        // the boundary a physical took from the life it replaced (decision 6, the definition floor): for definitions only, never documents
+        if standing.definition_floor.is_some_and(|floor| stamp.hlc <= floor) {
+            return Ok(true);
+        }
         let drops =
             [self.collection_dropped_at(standing.id)?, self.database_dropped_at(&standing.db)?];
         Ok(drops.into_iter().flatten().any(|dropped| stamp.hlc <= dropped.hlc))
