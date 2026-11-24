@@ -102,6 +102,13 @@ pub struct CollectionMeta {
     /// only guard: inventing a floor from a local clock would suppress
     /// legitimate catch-up.
     pub incarnation_floor: Option<Hlc>,
+    /// The `hlc` at or below which a **definition** (an index's creation, a vector configuration, a validator change) belongs to an
+    /// earlier life of the name than this physical (ADR-272, decision 6; Q6.5-2): a physical that becomes visible by a binding or a
+    /// recreation has no incarnation floor and no tombstone of its own, and takes this one from the physical it replaces, so that an entry
+    /// of the first life served again after the flip is history on the new physical as it was on the old one. It judges definitions only,
+    /// never documents: a stage's rows are the job's output and may be stamped below it. `None` for a physical that replaced nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_floor: Option<Hlc>,
     /// Set when a replicated drop met writes stamped after it and the life was
     /// **re-dated** instead of buried: `created` was moved to just after the
     /// drop (ADR-231, extended). Holds that `created` and, once the sweep is
@@ -188,6 +195,7 @@ impl CollectionMeta {
             validator: None,
             validator_changed: None,
             incarnation_floor,
+            definition_floor: None,
             redated: None,
         }
     }

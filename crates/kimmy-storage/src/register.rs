@@ -52,6 +52,10 @@ pub(crate) struct PostRow {
     /// The validator and the stamp of its latest change.
     pub(crate) validator: Option<kimmy_core::ValidatorSpec>,
     pub(crate) validator_changed: Option<Stamp>,
+    /// The definition floor of the physicals the drop buried, the greatest of them: the next physical takes it
+    /// ([`crate::meta::CollectionMeta::definition_floor`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) definition_floor: Option<Hlc>,
 }
 
 fn post_key(db: &str, logical: &str) -> [u8; 8] {

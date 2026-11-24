@@ -167,6 +167,9 @@ mod join_tests;
 mod shadow_burial_tests;
 
 #[cfg(test)]
+mod definition_floor_tests;
+
+#[cfg(test)]
 mod carried_drop_tests;
 
 #[cfg(test)]
