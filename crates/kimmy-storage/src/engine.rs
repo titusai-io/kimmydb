@@ -5987,18 +5987,33 @@ impl Engine {
                 }
             }
             Visible::Bound { physical, stamp } | Visible::Created { physical, stamp } => {
-                if took_effect == Some(*stamp)
-                    && let Some(floor) = floor
-                {
-                    txn.engine.floor_definitions_in_txn(txn, db, physical, floor, None)?;
+                if let Some(row) = crate::register::post_row(txn, db, logical)? {
+                    txn.engine.join_definitions_in_txn(txn, physical, &row.into_held(db), floor)?;
+                    crate::register::delete_post_row(txn, db, logical)?;
+                }
+                if took_effect == Some(*stamp) {
+                    // The physical that has just become visible keeps nothing at or below its own floor: the greater of the newest logical
+                    // drop in effect (if any) and the definition floor the joins above gave it (if any), read after the row is taken. A flip
+                    // that floored only at the drop in effect left a copy the physical's own floor calls history, and two members that met the
+                    // floor before the flip and after it then ended with different definitions until the next flip. The joins keep their own
+                    // floors as they were; one floor for the whole pass is a cleaner shape and a possible later refactor.
+                    let own = {
+                        let collections = txn.open_table(tables::COLLECTIONS)?;
+                        match collections.get((db, physical.as_str()))? {
+                            Some(row) => {
+                                serde_json::from_slice::<CollectionMeta>(row.value())?
+                                    .definition_floor
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(at) = [floor, own].into_iter().flatten().max() {
+                        txn.engine.floor_definitions_in_txn(txn, db, physical, at, None)?;
+                    }
                 } else if a_drop_took_effect && let Some(drop) = newest_drop {
                     // a drop that takes effect below the physical that is visible: nothing buries it, so what it holds at or below the
                     // drop is removed here, and the index tombstones are left under it as a peer's drop of each would have left them
                     txn.engine.floor_definitions_in_txn(txn, db, physical, drop.hlc, Some(drop))?;
-                }
-                if let Some(row) = crate::register::post_row(txn, db, logical)? {
-                    txn.engine.join_definitions_in_txn(txn, physical, &row.into_held(db), floor)?;
-                    crate::register::delete_post_row(txn, db, logical)?;
                 }
             }
             Visible::Dropped { .. } | Visible::Identity => {}

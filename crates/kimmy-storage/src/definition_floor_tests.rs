@@ -356,8 +356,9 @@ fn stage_index_entry(by: &Engine, stage: &str, wall_ms: u64) -> OplogEntry {
 
 #[test]
 fn the_join_carries_no_definition_at_or_below_the_floor_of_the_physical_it_leaves() {
-    // the first stage holds, by hand, an index stamped below `T` (nothing has given it a floor yet); the first flip gives it the floor; the
-    // second flip joins it into the second stage, and what is at or below the floor is not carried
+    // the first stage holds, by hand, an index stamped below `T` (nothing has given it a floor yet); the first flip gives it the floor and
+    // floors its own copy at it, so nothing at or below the floor is left for the second flip to carry (the join's own floor, which would
+    // refuse it, is a second line of defence that no product state reaches while the flip floors the new physical itself)
     let w = world();
     let (m, _d) = member(&w);
     let author = &w._author.0;
@@ -367,7 +368,10 @@ fn the_join_carries_no_definition_at_or_below_the_floor_of_the_physical_it_leave
     assert!(index_on(&m, FIRST), "premise: the stage holds the index, built over its rows");
     window(&m, std::slice::from_ref(&w.bind_first));
     assert_eq!(floor_of(&m, FIRST), Some(w.t), "premise: the first flip gave the stage the floor");
-    assert!(index_on(&m, FIRST), "premise: the stage keeps the definition it already held");
+    assert!(
+        !index_on(&m, FIRST),
+        "the flip floored the stage's own copy at the floor it was assigned: the definition below T is gone"
+    );
     window(&m, std::slice::from_ref(&w.bind_second));
     assert_eq!(served(&m), SECOND, "premise: the second flip");
     assert!(
