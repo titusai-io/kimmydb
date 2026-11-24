@@ -343,3 +343,68 @@ fn a_grant_that_covers_a_parked_drop_puts_it_in_effect_and_buries_in_the_same_tr
     assert!(absent(&b), "the grant released the drop and it buried the bound physical with it");
     assert_eq!(buried_at(&b, CollectionId::derive(DB, STAGE)), Some(drop.stamp));
 }
+
+// -- A drop that kept later writes before the swap was known (ADR-272 decision 6, 2026-11-23) --------------------------------------------
+//
+// `seed_from_the_tombstone` returns early when the identity stands. A member that applied the drop as a plain drop and KEPT a write
+// stamped after it (the survivors path re-dates the identity, ADR-236) holds the drop as the identity's tombstone and a standing
+// identity; the binding stamped below that drop, which arrives afterwards, must be buried by the drop as on a member that knew of the
+// swap when the drop arrived.
+
+/// The creation of `orders` and one write to it stamped ABOVE the creation by a few milliseconds, both made on a third member (the
+/// same two entries for every member under test).
+fn a_life_and_a_later_write() -> (Vec<OplogEntry>, tempfile::TempDir) {
+    let (s, d) = engine();
+    let orders = s.create_collection(DB, "orders").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    s.insert(&orders, doc! { "_id": 1, "v": "after the drop" }).unwrap();
+    (everything(&s), d)
+}
+
+#[test]
+fn a_drop_that_kept_later_writes_before_the_swap_was_known_ends_as_on_a_member_that_knew() {
+    let w = world();
+    let (life, _ds) = a_life_and_a_later_write();
+    let created = life
+        .iter()
+        .find(|e| e.kind == OpKind::CreateCollection)
+        .expect("the life's creation")
+        .stamp
+        .hlc
+        .wall_ms;
+    // The drop is stamped above the life's creation and above the binding, and below the write: the write survives it.
+    let drop = drop_of(&w.x, created.max(w.bind.stamp.hlc.wall_ms) + 1);
+    let write = life.iter().find(|e| e.kind == OpKind::Insert).expect("the write");
+    assert!(write.stamp.hlc > drop.stamp.hlc, "premise: the write is stamped after the drop");
+    assert!(w.bind.stamp.hlc < drop.stamp.hlc, "premise: the binding is stamped below the drop");
+
+    // K knew of the swap when the drop arrived: the stage's creation, the binding (flip), then the drop.
+    let (k, _dk) = engine();
+    window(&k, &life);
+    k.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    window(&k, std::slice::from_ref(&w.bind));
+    window(&k, std::slice::from_ref(&drop));
+
+    // M applies the drop as a plain drop FIRST (no swap known), keeps the write, and then meets the creation and the binding.
+    let (m, _dm) = engine();
+    window(&m, &life);
+    window(&m, std::slice::from_ref(&drop));
+    assert!(
+        m.get_collection(DB, "orders").is_ok(),
+        "premise: the plain drop kept the identity, which holds the write stamped after the drop"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    window(&m, std::slice::from_ref(&w.bind));
+
+    let mut ke = register_events(&k);
+    let mut me = register_events(&m);
+    ke.sort();
+    me.sort();
+    assert_eq!(me, ke, "the same register events as the member that knew");
+    assert_eq!(absent(&m), absent(&k), "the name resolves the same way on both members");
+    assert_eq!(
+        buried_at(&m, CollectionId::derive(DB, STAGE)),
+        buried_at(&k, CollectionId::derive(DB, STAGE)),
+        "the bound physical is buried at the same stamp on both"
+    );
+}
