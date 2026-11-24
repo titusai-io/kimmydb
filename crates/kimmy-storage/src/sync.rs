@@ -2519,7 +2519,7 @@ impl Engine {
             &target.db,
             &target.name,
             Some(spec.clone()),
-            crate::validator::Validated::FromEntry(entry.stamp),
+            crate::validator::Validated::FromCreation(entry.stamp),
             &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
         ))?;
         Ok(match applied {
@@ -3039,7 +3039,7 @@ impl Engine {
                 // reads as older than the drop: the drop applies, which is
                 // what ADR-123 left and what a caller reading the reference
                 // before this expects.
-                if let Ok(current) = self.get_collection(&target.db, &target.collection)
+                if let Ok(current) = self.definition_target(&target.db, &target.collection)
                     && let Some(index) = current.index(&target.index)
                     && index.created.is_some_and(|created| entry.stamp < created)
                 {
@@ -3636,7 +3636,8 @@ impl Engine {
         entry: &OplogEntry,
     ) -> Result<RemoteIndex> {
         let stamp = entry.stamp;
-        let meta = self.get_collection(&target.db, &target.collection)?;
+        // Addressed to the logical name: resolved through the register as the door resolves it (Q6.5-1, rule 2).
+        let meta = self.definition_target(&target.db, &target.collection)?;
 
         // A creation older than the drop that removed the index is history,
         // not an instruction — the same rule the `CreateCollection` arm

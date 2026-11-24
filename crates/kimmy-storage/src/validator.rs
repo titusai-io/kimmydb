@@ -46,8 +46,11 @@ pub(crate) enum Validated {
     /// A client's change here: stamped under the writer, above the standing stamp,
     /// and logged.
     Locally,
-    /// A peer's `ConfigureValidator` entry, stamped so.
+    /// A peer's `ConfigureValidator` entry, stamped so. Addressed to the LOGICAL name (Q6.5-1).
     FromEntry(Stamp),
+    /// The validator a peer's `CreateCollection` entry carries, stamped by that creation. It names the physical the creation made, not a
+    /// logical name: found as a physical is, never through the register.
+    FromCreation(Stamp),
     /// A snapshot page's definition, with the stamp of the change it describes.
     FromSnapshot(Stamp),
     /// A late-drop sweep removing a validator of the life before (ADR-231), at the
@@ -60,7 +63,10 @@ impl Validated {
     fn stamp(self) -> Option<Stamp> {
         match self {
             Self::Locally => None,
-            Self::FromEntry(stamp) | Self::FromSnapshot(stamp) | Self::Swept(stamp) => Some(stamp),
+            Self::FromEntry(stamp)
+            | Self::FromCreation(stamp)
+            | Self::FromSnapshot(stamp)
+            | Self::Swept(stamp) => Some(stamp),
         }
     }
 }
@@ -184,9 +190,9 @@ impl crate::Engine {
         }
         // A loop, not a self-call: see `configure_vectors_inner`.
         for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
-            // A local change is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry loop; a
-            // replicated or restored one names the collection it applies to (the arms' lookup is the next commit's).
-            let mut meta = if matches!(by, Validated::Locally) {
+            // A local or a replicated change is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry
+            // loop. A snapshot page's and a sweep's name the physical they apply to.
+            let mut meta = if matches!(by, Validated::Locally | Validated::FromEntry(_)) {
                 self.definition_target(db, collection)?
             } else {
                 self.get_collection(db, collection)?

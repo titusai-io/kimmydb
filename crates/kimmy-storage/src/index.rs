@@ -1339,12 +1339,14 @@ impl crate::Engine {
                 )));
             }
 
-            // A local create is addressed to the LOGICAL name: the door resolves it through the register, here, inside the retry
-            // loop, so a flip between this read and the writer sends the retry to the physical the name answers from now. A
-            // replicated or restored one names the collection it applies to (Q6.5-1: the arms' lookup is the next commit's).
+            // A local or a replicated create is addressed to the LOGICAL name: resolved through the register, here, inside the retry
+            // loop, so a flip between this read and the writer sends the retry to the physical the name answers from now (rules 1
+            // and 2 of the definition registers). A restored one names the physical it was made on.
             let mut meta = match origin {
-                CreateOrigin::Local => self.definition_target(db, collection)?,
-                _ => self.get_collection(db, collection)?,
+                CreateOrigin::Local | CreateOrigin::Replicated { .. } => {
+                    self.definition_target(db, collection)?
+                }
+                CreateOrigin::Restored(_) => self.get_collection(db, collection)?,
             };
             let read = meta.clone();
             #[cfg(test)]
@@ -2031,13 +2033,8 @@ impl crate::Engine {
                 // no index it could ever name, and the caller is there to be told.
                 CoreError::validate_name(name).map_err(StorageError::Core)?;
             }
-            // A local drop is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry loop; a replicated
-            // one names the collection it applies to (the arms' lookup is the next commit's).
-            let mut meta = if replicated.is_none() {
-                self.definition_target(db, collection)?
-            } else {
-                self.get_collection(db, collection)?
-            };
+            // A local or a replicated drop is addressed to the LOGICAL name (Q6.5-1): resolved through the register inside the retry loop.
+            let mut meta = self.definition_target(db, collection)?;
             let read = meta.clone();
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexDrop);
