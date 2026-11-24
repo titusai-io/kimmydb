@@ -87,6 +87,34 @@ pub fn pass(engine: &Engine, me: NodeId, members: &BTreeSet<NodeId>, now_ms: u64
 /// [`pass`], asking `owners` which collections this member may expire: the
 /// members known to hold a collection's TTL index, not every live one
 /// (ADR-201).
+/// The collections of `db` whose documents a client can see: every one that is not hidden, and a hidden one (a stage, a recreation) only
+/// when it is the physical its logical name answers from now (ADR-272, decision 6; Q6.5-1). A stage that is not, an unbound one or a
+/// buried one, holds documents nobody can read, and is not swept: a TTL index copied into it expires nothing until the name is bound to it.
+fn answering_collections(
+    engine: &Engine,
+    db: &str,
+) -> Result<Vec<kimmy_storage::CollectionMeta>, kimmy_storage::StorageError> {
+    let mut out = Vec::new();
+    for coll in engine.list_collections(db)? {
+        if !kimmy_core::is_hidden_name(&coll.name) {
+            out.push(coll);
+            continue;
+        }
+        let logical = kimmy_core::swap::logical_of_stage(&coll.name)
+            .or_else(|| kimmy_core::logical_of_recreation(&coll.name));
+        let Some(logical) = logical else { continue };
+        match engine.resolve(db, logical) {
+            Ok(resolved) if resolved.physical == coll.name => out.push(coll),
+            Ok(_)
+            | Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                ..
+            })) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 pub fn pass_with(engine: &Engine, owners: &Owners, now_ms: u64) -> ExpiryOutcome {
     use kimmy_storage::class_step;
     let mut total = ExpiryOutcome::default();
@@ -117,7 +145,7 @@ pub fn pass_with(engine: &Engine, owners: &Owners, now_ms: u64) -> ExpiryOutcome
     };
 
     for db in databases {
-        let collections = match engine.list_collections(&db.name) {
+        let collections = match answering_collections(engine, &db.name) {
             Ok(cs) => cs,
             Err(e) => {
                 warn!(db = %db.name, error = %e, "expiry pass could not list collections");

@@ -2261,7 +2261,9 @@ fn create_index_stamped(
     // most wants beside `multikey`, and the listing reports the same field.
     // The count walks its run of the index, which can be every document: off
     // the async worker (ADR-199).
-    let meta = state.engine.get_collection(db, coll)?;
+    // Read where the index went: the physical the name answers from, resolved through the register as the door that built it did
+    // (Q6.5-1). By its own name the lookup found nothing once the name had been swapped, after the index was built.
+    let meta = state.engine.resolve(db, coll)?.meta;
     let unkeyed = kimmy_storage::blocking(|| state.engine.unkeyed_count(&meta, index.id))?;
     Ok((index_to_json(&index, unkeyed), index.created))
 }
@@ -2343,7 +2345,7 @@ pub fn list_indexes(
 ) -> Result<Value, ApiError> {
     let _span = op_span("list_indexes", db, Some(coll)).entered();
     authorize(state, auth, Action::Read, db, coll)?;
-    let meta = state.engine.get_collection(db, coll)?;
+    let meta = state.engine.resolve(db, coll)?.meta;
     let mut indexes = Vec::with_capacity(meta.indexes.len());
     // Each count walks its run of the index, which can be every document:
     // off the async worker, once for the listing (ADR-199).

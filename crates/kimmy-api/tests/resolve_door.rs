@@ -12,19 +12,9 @@ const PHYSICAL_BY_NAME: &[(&str, usize, &str)] = &[
     ("webhooks.rs", 1, "the webhook registry: an internal collection"),
     ("dispatch.rs", 5, "the webhook registry and its progress rows: internal collections"),
     (
-        "validator.rs",
-        1,
-        "reads whether a validator was set, after the schema change was addressed by name and authorised",
-    ),
-    (
         "vectors.rs",
         2,
         "the shadow collection and the vector configuration, addressed by derived physical names",
-    ),
-    (
-        "exec.rs",
-        2,
-        "the two index paths, which address the named collection itself (Q6.5 moves them to the register)",
     ),
 ];
 

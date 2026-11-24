@@ -117,7 +117,7 @@ pub async fn remove_validator(
     Path((db, coll)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Ddl, &db, Some(&coll))?;
-    let had = state.engine.get_collection(&db, &coll)?.validator.is_some();
+    let had = state.engine.resolve(&db, &coll)?.meta.validator.is_some();
     kimmy_storage::blocking(|| state.engine.set_validator(&db, &coll, None))?;
     // What this call did, not what it asked for: a removal sent again finds nothing to
     // remove.
