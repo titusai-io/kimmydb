@@ -36,10 +36,20 @@ pub(crate) struct JoinedPost {
     pub(crate) unkeyed_count: u64,
 }
 
-/// What a physical held, as read before it is buried: its metadata (the definitions and the validator) and its index tombstones.
+/// What a join takes from: the definitions of a physical as read before it is buried, or the post-drop row of a name (Q6.5-2, B2). Plain
+/// data, so the one join serves both.
 pub(crate) struct Held {
-    pub(crate) meta: CollectionMeta,
+    /// The database the definitions belong to.
+    pub(crate) db: String,
+    /// The collection they were held by, which the join never merges into itself; `None` for the post-drop row.
+    pub(crate) id: Option<CollectionId>,
+    /// The indexes, each with its creation stamp.
+    pub(crate) indexes: Vec<IndexMeta>,
+    /// The index tombstones: `(index id, stamp of the drop)`.
     pub(crate) tombstones: Vec<(u32, Stamp)>,
+    /// The validator and the stamp of its latest change.
+    pub(crate) validator: Option<kimmy_core::ValidatorSpec>,
+    pub(crate) validator_changed: Option<Stamp>,
 }
 
 impl Engine {
@@ -57,7 +67,14 @@ impl Engine {
     /// Read what `meta`'s physical holds, before it is buried.
     pub(crate) fn read_held(txn: &WriteTxn<'_>, meta: CollectionMeta) -> Result<Held> {
         let tombstones = Self::tombstones_of(txn, meta.id)?;
-        Ok(Held { meta, tombstones })
+        Ok(Held {
+            db: meta.db,
+            id: Some(meta.id),
+            indexes: meta.indexes,
+            tombstones,
+            validator: meta.validator,
+            validator_changed: meta.validator_changed,
+        })
     }
 
     /// Merge what `held` held into the physical named `into` (the one that just became visible), in `txn`. `floor` is the newest logical drop
@@ -69,13 +86,13 @@ impl Engine {
         held: &Held,
         floor: Option<Hlc>,
     ) -> Result<()> {
-        let db = held.meta.db.as_str();
+        let db = held.db.as_str();
         let mut n: CollectionMeta = {
             let collections = txn.open_table(tables::COLLECTIONS)?;
             let Some(row) = collections.get((db, into))? else { return Ok(()) };
             serde_json::from_slice(row.value())?
         };
-        if n.id == held.meta.id {
+        if held.id == Some(n.id) {
             return Ok(());
         }
         let above = |stamp: &Stamp| floor.is_none_or(|f| stamp.hlc > f);
@@ -84,7 +101,7 @@ impl Engine {
             |tombs: &[(u32, Stamp)], id: u32| tombs.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
 
         // every index id either physical holds or has a tombstone for
-        let mut ids: Vec<u32> = held.meta.indexes.iter().map(|i| i.id).collect();
+        let mut ids: Vec<u32> = held.indexes.iter().map(|i| i.id).collect();
         ids.extend(n.indexes.iter().map(|i| i.id));
         ids.extend(held.tombstones.iter().map(|(i, _)| *i));
         ids.extend(n_tombs.iter().map(|(i, _)| *i));
@@ -96,8 +113,9 @@ impl Engine {
         let mut built: Vec<(IndexMeta, Vec<UniqueViolation>)> = Vec::new();
         for id in ids {
             let q_def = held
-                .meta
-                .index_by_id(id)
+                .indexes
+                .iter()
+                .find(|i| i.id == id)
                 .filter(|i| i.created.as_ref().is_none_or(&above))
                 .cloned();
             let q_tomb = tomb_of(&held.tombstones, id).filter(|s| above(s));
@@ -199,10 +217,10 @@ impl Engine {
         }
 
         // the validator goes by the later stamp, a removal included
-        if let Some(q_changed) = held.meta.validator_changed.filter(|s| above(s))
+        if let Some(q_changed) = held.validator_changed.filter(|s| above(s))
             && n.validator_changed.is_none_or(|c| q_changed > c)
         {
-            n.validator = held.meta.validator.clone();
+            n.validator = held.validator.clone();
             n.validator_changed = Some(q_changed);
         }
 
