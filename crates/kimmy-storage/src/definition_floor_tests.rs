@@ -626,6 +626,23 @@ fn entries_of_index(m: &Engine, physical: &str, name: &str) -> usize {
     .len()
 }
 
+/// How many entry rows the index `name` still has under `physical`, whether or not the physical still holds the index's definition
+/// (`entries_of_index` answers 0 for an index that is gone, so it cannot say that the rows went with the definition).
+fn index_rows(m: &Engine, physical: &str, name: &str) -> usize {
+    let coll = m.get_collection(DB, physical).expect("the physical is held");
+    crate::index::scan_range(
+        m,
+        WalkScope::Request,
+        coll.id,
+        IndexMeta::derive_id(name),
+        &[],
+        None,
+        crate::index::Unkeyed::Include,
+    )
+    .expect("the index rows are readable")
+    .len()
+}
+
 /// The first stage's own copy, by hand: three documents and two indexes, `x` at `x_wall` and `kept` above everything.
 fn first_stage_with_a_copy(m: &Engine, w: &World, x_wall: u64) {
     let wall = w.bind_first.stamp.hlc.wall_ms;
@@ -669,7 +686,7 @@ fn a_flip_floors_the_new_physicals_own_copy_at_the_floor_it_was_assigned_even_wi
         !index_on(&m, FIRST),
         "the flip floors the new physical's own copy at the floor it was assigned: x, at T2's own hlc, is gone"
     );
-    assert_eq!(entries_of_index(&m, FIRST, INDEX), 0, "and so are its entries");
+    assert_eq!(index_rows(&m, FIRST, INDEX), 0, "and so are its entries");
     assert!(
         entries_of_index(&m, FIRST, "kept") > 0,
         "an index above the floor stays, with its entries"
@@ -785,7 +802,7 @@ fn stage_copy_and_flip(m: &Engine, w: &World) {
 
 fn the_end_state(m: &Engine, what: &str) {
     assert!(!index_on(m, FIRST), "no x ({what})");
-    assert_eq!(entries_of_index(m, FIRST, INDEX), 0, "and no entries of it ({what})");
+    assert_eq!(index_rows(m, FIRST, INDEX), 0, "and no entries of it ({what})");
     assert!(
         entries_of_index(m, FIRST, "kept") > 0,
         "the index above the floor is present, with entries ({what})"
