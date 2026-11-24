@@ -1026,7 +1026,8 @@ pub(crate) struct WriteTxn<'a> {
     /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
     loss_minted: parking_lot::Mutex<[u64; 6]>,
     /// The bound-out burials the register made in this transaction (ADR-272, decision 5): finished by [`Self::commit`] once the
-    /// inner commit has succeeded (their entry, if any, published; the rows handed to the purger), and by nothing else.
+    /// inner commit has succeeded (their entry, if any, published; the rows handed to the purger; each announced once, under the buried
+    /// physical's name), and by nothing else.
     burials: parking_lot::Mutex<Vec<(String, String, Burial, BuryCause)>>,
     /// The swaps the settle passes of this transaction saw take effect (`kimmy_out_swaps_total`): added to the engine's count by
     /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
@@ -1121,7 +1122,11 @@ impl WriteTxn<'_> {
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // The inner commit landed: the burials the register made are finished (published, handed to the purger)
             for (db, name, burial, cause) in std::mem::take(&mut *self.burials.lock()) {
-                engine.finish_burial(&db, &name, burial);
+                let ids = engine.finish_burial(&db, &name, burial);
+                // ... and announced, under the name of the physical that was buried and with the ids that went with it: a replicated
+                // burial mints no entry, so this is all the vector cache and a stream of the collection are told. The cause is this
+                // member's own, as the count's is, and is added here if a consumer asks for it
+                crate::database_tombstone::Notify::Each.buried(engine, &db, &name, &ids);
                 engine.out_buried[cause as usize]
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5875,12 +5880,23 @@ impl Engine {
             .chain(std::iter::repeat_n(BuryCause::Doomed, doomed.len()));
         let mut row_written = false;
         for (burial, cause) in burials.into_iter().chain(doomed).zip(causes) {
-            let meta = {
+            // The physical, and its vector shadow, which goes with it: a bound-out physical that had a vector configuration would
+            // otherwise leave a shadow standing with no parent. Read as `bury_in_txn` reads it, by the physical's own name
+            let (meta, shadow) = {
                 let collections = txn.open_table(tables::COLLECTIONS)?;
-                match collections.get((db, burial.physical.as_str()))? {
-                    Some(v) => serde_json::from_slice::<CollectionMeta>(v.value())?,
-                    None => continue,
-                }
+                let read = |name: &str| -> Result<Option<CollectionMeta>> {
+                    collections
+                        .get((db, name))?
+                        .map(|v| serde_json::from_slice(v.value()).map_err(Into::into))
+                        .transpose()
+                };
+                let Some(meta) = read(burial.physical.as_str())? else { continue };
+                let shadow = if vector_meta::is_shadow(&burial.physical) {
+                    None
+                } else {
+                    read(&vector_meta::shadow_name(&burial.physical))?
+                };
+                (meta, shadow)
             };
             // The join (rule 3): the physical that is visible now takes what this one held, when this one is the identity or has its own
             // binding or recreation in effect (never one the doomed list names: a stage no event can make visible). What it held is
@@ -5909,7 +5925,7 @@ impl Engine {
                 db,
                 &burial.physical,
                 meta,
-                None,
+                shadow,
                 Some(burial.at),
             )?;
             // The purger leaves its rows alone for the requests that resolved the name before the burial (decision 5); a client's own
