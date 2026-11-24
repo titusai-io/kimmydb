@@ -323,3 +323,254 @@ fn a_flip_between_the_validators_read_and_its_write_ends_on_the_new_physical() {
         "the validator is on the bound stage"
     );
 }
+
+// -- The replicated arms (Q6.5-1, rule 2) -------------------------------------------------------------------------------------------------
+//
+// A definition entry minted by a member that made it to a swapped name is addressed to the logical name. The member that receives it
+// resolves the name as the door does, so the entry lands on the physical the name answers from here, and does not stop the batch as an
+// entry for a collection this member has no record of. (What each member ends with when the entry arrives BEFORE the binding is the
+// join's, Q6.5-2; the tombstones read under the target's id are rule 4's, Q6.5-4. These tests are about members that have flipped.)
+
+/// Two members that both hold the swap (the same two stages, the same binding, each its own `orders` made independently), the binding
+/// of `BOUND` visible on both.
+struct Pair {
+    p: Arc<Engine>,
+    q: Arc<Engine>,
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _author: (Engine, tempfile::TempDir),
+}
+
+fn two_flipped_members() -> Pair {
+    flipped_pair(true)
+}
+
+/// Two members that have made the same binding visible. `rows`: whether the identity each held held a document. A buried identity's rows
+/// are the drop purger's to remove, and a creation of the same name is refused while any remain (`create_collection_marked`), so a member
+/// whose identity held none takes such a creation at once.
+fn flipped_pair(rows: bool) -> Pair {
+    let dir = tempfile::tempdir().unwrap();
+    let author = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    author.create_stage(DB, UNBOUND, MergePolicy::Document, deadline).unwrap();
+    author.create_stage(DB, BOUND, MergePolicy::Document, deadline).unwrap();
+    let creations: Vec<OplogEntry> = everything(&author)
+        .into_iter()
+        .filter(|e| e.kind == OpKind::CreateCollection)
+        .filter(|e| {
+            e.collection == CollectionId::derive(DB, UNBOUND)
+                || e.collection == CollectionId::derive(DB, BOUND)
+        })
+        .collect();
+    let wall =
+        creations.iter().map(|e| e.stamp.hlc.wall_ms).max().unwrap().max(physical_now_ms()) + 1;
+    let bind = bind_of(&author, wall, BOUND);
+    let member = || {
+        let (m, d) = engine();
+        let orders = m.create_collection(DB, "orders").unwrap();
+        if rows {
+            m.insert(&orders, doc! { "_id": 1, "v": 1, "t": 1 }).unwrap();
+        }
+        m.apply_batch(&creations).unwrap();
+        window(&m, std::slice::from_ref(&bind));
+        assert_eq!(
+            m.resolve(DB, "orders").unwrap().physical,
+            BOUND,
+            "premise: the flip is visible"
+        );
+        (m, d)
+    };
+    let (p, dp) = member();
+    let (q, dq) = member();
+    Pair { p, q, _dirs: (dp, dq), _author: (author, dir) }
+}
+
+#[test]
+fn a_replicated_index_creation_addressed_to_a_swapped_name_lands_on_the_bound_physical() {
+    let pair = two_flipped_members();
+    let made = pair
+        .p
+        .create_index(DB, "orders", vec![IndexField::ascending("v")], false, None)
+        .expect("premise: the door of the member that minted it finds the name");
+    let entries = entries_of(&pair.p, OpKind::CreateIndex);
+    assert_eq!(entries.len(), 1, "premise: the one entry the door minted");
+    let outcome = window(&pair.q, &entries);
+    assert!(
+        pair.q.get_collection(DB, BOUND).unwrap().index(&made.name).is_some(),
+        "the entry landed on the bound physical of the member that received it ({outcome:?})"
+    );
+    assert!(
+        pair.q.get_collection(DB, UNBOUND).unwrap().index(&made.name).is_none(),
+        "and not on the unbound stage"
+    );
+}
+
+#[test]
+fn a_replicated_index_drop_addressed_to_a_swapped_name_removes_it_from_the_bound_physical() {
+    // The receiving member's index is made through its own local door (fixed in the commit before), BEFORE the other member makes
+    // and drops its own: so the drop is newer than the index it names and applies, and only the replicated drop arm is under test.
+    let pair = two_flipped_members();
+    let held = pair
+        .q
+        .create_index(DB, "orders", vec![IndexField::ascending("v")], false, None)
+        .expect("premise: the receiving member's own door finds the name");
+    assert!(
+        pair.q.get_collection(DB, BOUND).unwrap().index(&held.name).is_some(),
+        "premise: the index is on the bound physical, so the drop has something to remove"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    pair.p
+        .create_index(DB, "orders", vec![IndexField::ascending("v")], false, None)
+        .expect("premise: the door of the member that drops it finds the name");
+    pair.p.drop_index(DB, "orders", &held.name).expect("premise: the drop door finds it too");
+    let dropped = entries_of(&pair.p, OpKind::DropIndex);
+    assert_eq!(dropped.len(), 1, "premise: the one drop entry");
+    assert!(
+        dropped[0].stamp.hlc > held.created.expect("a stamped index").hlc,
+        "premise: the drop is newer than the index it names"
+    );
+    window(&pair.q, &dropped);
+    let on = pair.q.get_collection(DB, BOUND).unwrap();
+    assert!(
+        on.index(&held.name).is_none(),
+        "the drop applied to the bound physical: {:?}",
+        on.indexes
+    );
+    assert!(
+        pair.q
+            .index_dropped_at(on.id, kimmy_core::IndexMeta::derive_id(&held.name))
+            .unwrap()
+            .is_some(),
+        "and left its tombstone under the target's id"
+    );
+}
+
+#[test]
+fn a_replicated_validator_addressed_to_a_swapped_name_lands_on_the_bound_physical() {
+    let pair = two_flipped_members();
+    pair.p
+        .set_validator(DB, "orders", Some(validator()))
+        .expect("premise: the door finds the name");
+    let entries = entries_of(&pair.p, OpKind::ConfigureValidator);
+    assert_eq!(entries.len(), 1, "premise: the one entry the door minted");
+    window(&pair.q, &entries);
+    assert!(
+        pair.q.get_collection(DB, BOUND).unwrap().validator.is_some(),
+        "the bound physical has it"
+    );
+    assert!(
+        pair.q.get_collection(DB, UNBOUND).unwrap().validator.is_none(),
+        "the unbound one does not"
+    );
+}
+
+#[test]
+fn a_replicated_index_creation_addressed_to_a_stage_lands_on_that_stage() {
+    // The writer's own copy of a definition into the stage it is filling (Q6.7) names the stage's physical: a name with no register
+    // event of its own, found as a physical is. Built by hand here, as nothing mints it yet.
+    let pair = two_flipped_members();
+    let index = kimmy_core::IndexMeta {
+        id: kimmy_core::IndexMeta::derive_id("v_1"),
+        name: "v_1".into(),
+        fields: vec![IndexField::ascending("v")],
+        unique: false,
+        enforcement: Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: None,
+    };
+    let stamp = Stamp::new(Hlc::new(physical_now_ms() + 10, 0), pair.p.node_id(), pair.p.epoch());
+    let entry = crate::engine::ddl_entry(
+        stamp,
+        OpKind::CreateIndex,
+        CollectionId::derive(DB, UNBOUND),
+        &kimmy_core::IndexCreate { db: DB.into(), collection: UNBOUND.into(), index },
+    )
+    .unwrap();
+    window(&pair.q, std::slice::from_ref(&entry));
+    assert!(
+        pair.q.get_collection(DB, UNBOUND).unwrap().index("v_1").is_some(),
+        "the definition addressed to the stage landed on the stage"
+    );
+    assert!(pair.q.get_collection(DB, BOUND).unwrap().index("v_1").is_none(), "and on no other");
+}
+
+#[test]
+fn a_replicated_index_drop_older_than_the_index_it_names_is_declined_on_a_swapped_name() {
+    // The receiving member made its own index AFTER the drop that arrives was minted: the drop belongs to the index of an earlier life,
+    // and does not remove the one standing (ADR-132). The arm reads the standing index on the physical the name answers from here.
+    let pair = two_flipped_members();
+    pair.p
+        .create_index(DB, "orders", vec![IndexField::ascending("v")], false, None)
+        .expect("premise: the door of the member that drops it finds the name");
+    pair.p.drop_index(DB, "orders", "v_1").expect("premise: the drop door finds it too");
+    let dropped = entries_of(&pair.p, OpKind::DropIndex);
+    assert_eq!(dropped.len(), 1, "premise: the one drop entry");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let held = pair
+        .q
+        .create_index(DB, "orders", vec![IndexField::ascending("v")], false, None)
+        .expect("premise: the receiving member's own door finds the name");
+    assert_eq!(held.name, "v_1", "premise: the same index name, so the same derived id");
+    assert!(
+        held.created.expect("a stamped index").hlc > dropped[0].stamp.hlc,
+        "premise: the index was made after the drop was minted"
+    );
+    // The arm declines on its own read of the standing index, before the writer, and the transaction judges again under the writer
+    // (`drop_index_inner`), so the index standing proves nothing about which guard stopped the drop: the writer's would stop it too. The
+    // race hook at the point between them tells them apart: it is reached only by a drop the arm let through, and the writer's decline
+    // is then recorded as absorbed.
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::ReplicatedIndexDrop, || {});
+    let outcome = window(&pair.q, &dropped);
+    assert!(
+        pair.q.get_collection(DB, BOUND).unwrap().index("v_1").is_some(),
+        "the drop is older than the index it names: declined, the index stands ({outcome:?})"
+    );
+    assert!(
+        !crate::sync::race_hooks::was_absorbed(crate::sync::race_hooks::Race::ReplicatedIndexDrop),
+        "the drop was declined by the arm's own read of the index on the physical the name answers from, and not left to the writer's \
+         second judgement ({outcome:?})"
+    );
+    // the hook, armed for the point the arm never reached, is spent here so that it cannot leak into a later test on this thread
+    crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ReplicatedIndexDrop);
+}
+
+#[test]
+fn a_validator_carried_by_a_creation_names_the_collection_that_creation_made_not_the_swapped_name()
+{
+    // A creation of `orders` by a member that never heard of the swap carries a validator and arrives after the flip. The validator is
+    // the new collection's own (a creation names the physical it made), never a definition addressed to the logical name: it must not
+    // land on the stage the name answers from. (What becomes of the creation itself is Q6.5's later units.)
+    // The identity holds no rows: a buried identity's rows are the purger's to remove, and a creation of its name waits for them
+    // (`CollectionPurging`, the batch stops), so with a row the first delivery below would make nothing.
+    let pair = flipped_pair(false);
+    let (x, _dx) = engine();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    x.create_collection_with_validator(DB, "orders", validator()).expect(
+        "premise: the member that never heard of the swap creates the name with a validator",
+    );
+    let creation: Vec<OplogEntry> = entries_of(&x, OpKind::CreateCollection)
+        .into_iter()
+        .filter(|e| e.collection == CollectionId::derive(DB, "orders"))
+        .collect();
+    assert_eq!(creation.len(), 1, "premise: its one creation entry");
+    // The first delivery finds no collection of that name (the identity is buried) and makes one, validator and all, in one transaction.
+    // That never takes the path under test. The creation met again finds the name held, and applies the validator it carries as a change
+    // to the collection that creation made, by name: it must not land on the stage the name answers from.
+    window(&pair.q, &creation);
+    let made = pair
+        .q
+        .get_collection(DB, "orders")
+        .expect("premise: the first delivery made the creation's collection, which the name does not answer from");
+    assert!(made.validator.is_some(), "premise: it holds the validator the creation carried");
+    assert_eq!(
+        pair.q.resolve(DB, "orders").expect("premise: the name still resolves").physical,
+        BOUND,
+        "premise: the name still answers from the stage"
+    );
+    window(&pair.q, &creation);
+    assert!(
+        pair.q.get_collection(DB, BOUND).expect("the stage is held").validator.is_none(),
+        "the creation's validator did not land on the stage the name answers from"
+    );
+}
