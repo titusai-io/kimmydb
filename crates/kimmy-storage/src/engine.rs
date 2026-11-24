@@ -259,6 +259,9 @@ pub struct Engine {
     /// Swaps this member applied live (`kimmy_out_swaps_total`, ADR-272): a binding that took effect in a committed transaction and was
     /// the event the name answered from when the pass ended. Per member, since start, in no state and no digest.
     out_swaps: std::sync::atomic::AtomicU64,
+    /// Replicated vector configurations (and removals of one) this member discarded because a replacing `$out` has swapped the name
+    /// (`kimmy_out_vector_config_discarded_total`, ADR-272, decision 12): one per delivery. Per member, since start, in no state and no digest.
+    out_vector_config_discarded: std::sync::atomic::AtomicU64,
     /// Index backfills run on this engine, counted where one starts, whatever transaction it runs in: what a test reads to assert that a
     /// build ran, or that none did. Per instance, so parallel tests do not share it. Test builds and `test-hooks` only.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1787,6 +1790,7 @@ impl Engine {
             loss_refused: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             conflicts_resolved: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             out_swaps: std::sync::atomic::AtomicU64::new(0),
+            out_vector_config_discarded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             index_builds: std::sync::atomic::AtomicU64::new(0),
             out_buried: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
@@ -2431,6 +2435,12 @@ impl Engine {
     /// none, and the count is this member's own: two members can differ.
     pub fn out_swaps(&self) -> u64 {
         self.out_swaps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replicated vector configurations this member discarded because a replacing `$out` has swapped the name
+    /// (`kimmy_out_vector_config_discarded_total`): one for each delivery, a configuration and a removal alike. This member's own count.
+    pub fn out_vector_config_discarded(&self) -> u64 {
+        self.out_vector_config_discarded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// One burial of a swap's physical, made by a commit that has landed: the only way a burial reaches `kimmy_out_buried_total` outside

@@ -2779,3 +2779,42 @@ fn a_repair_page_for_a_swapped_name_whose_visible_stage_holds_more_than_the_gate
     );
     assert!(!holds(&m, BOUND, "by_t"), "and nothing is built");
 }
+
+#[test]
+fn a_snapshot_page_naming_a_vector_configuration_for_a_swapped_name_is_discarded_and_counted() {
+    // a page is a delivery (ruled): a vector configuration it names for a swapped name is discarded, warned and counted in
+    // `kimmy_out_vector_config_discarded_total`, as an entry's is, and none stands on the visible stage
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    a.configure_vectors(
+        DB,
+        "orders",
+        kimmy_core::VectorConfig {
+            fields: vec!["body".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 8,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        },
+    )
+    .expect("the sender configures vectors");
+    assert!(
+        a.get_collection(DB, "orders").expect("the sender holds it").vector.is_some(),
+        "premise: the page offers a vector configuration"
+    );
+    let before = m.out_vector_config_discarded();
+    apply_the_pages(&m, &a);
+    assert_eq!(
+        m.out_vector_config_discarded(),
+        before + 1,
+        "the page's vector configuration for a swapped name is counted, once"
+    );
+    assert!(
+        m.get_collection(DB, BOUND).expect("the stage is held").vector.is_none(),
+        "and none stands on the visible stage"
+    );
+}

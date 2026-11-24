@@ -712,3 +712,195 @@ fn a_plain_name_configures_and_disables_vectors_as_it_always_did() {
     m.configure_vectors(DB, "orders", a_vector_config()).expect("the control");
     assert!(m.disable_vectors(DB, "orders", false).expect("the control"), "it was on");
 }
+
+// -- The vector arm and the swap (Q6.5-4; ADR-272, decision 12, "swap wins") ---------------------------------------------------------------
+//
+// A replicated `ConfigureVectors` (a configuration or a removal) is applied while the identity is the physical the name answers from,
+// stage held or not, binding parked or not: an abandoned `$out` leaves the configuration where the client put it, on every member. Once
+// the identity is not the visible physical (a binding or a recreation is, or the name is absent under an event in effect) it is history:
+// taken, counted in `kimmy_out_vector_config_discarded_total` (once per delivery), warned, never appended, and no shadow is made.
+
+fn vector_entry(s: &Swap, wall_ms: u64, config: Option<kimmy_core::VectorConfig>) -> OplogEntry {
+    let author = &s._author.0;
+    crate::engine::ddl_entry(
+        Stamp::new(Hlc::new(wall_ms, 0), author.node_id(), author.epoch()),
+        OpKind::ConfigureVectors,
+        CollectionId::derive(DB, "orders"),
+        &kimmy_core::VectorSet { db: DB.into(), collection: "orders".into(), config },
+    )
+    .unwrap()
+}
+
+fn wall_of(s: &Swap) -> u64 {
+    s.bind.stamp.hlc.wall_ms
+}
+
+fn shadow_of(name: &str) -> String {
+    kimmy_core::vector_meta::shadow_name(name)
+}
+
+fn has_vectors(m: &Engine, name: &str) -> bool {
+    m.get_collection(DB, name).is_ok_and(|c| c.vector.is_some())
+}
+
+fn has_shadow(m: &Engine, name: &str) -> bool {
+    m.get_collection(DB, &shadow_of(name)).is_ok()
+}
+
+fn the_stages_creations(s: &Swap) -> Vec<OplogEntry> {
+    entries_of(&s._author.0, OpKind::CreateCollection)
+        .into_iter()
+        .filter(|e| {
+            e.collection == CollectionId::derive(DB, UNBOUND)
+                || e.collection == CollectionId::derive(DB, BOUND)
+        })
+        .collect()
+}
+
+#[test]
+fn a_vector_entry_of_an_abandoned_swap_ends_alike_on_a_member_that_met_the_stage_first_and_one_that_met_it_after()
+ {
+    // the control that kills `is_swapped` as the arm's test: no binding ever arrives
+    for run in ["configure", "disable"] {
+        let s = before_the_flip();
+        let w = wall_of(&s);
+        // the member that met the entry and then the stage's creation
+        let (a, _da) = engine();
+        a.create_collection(DB, "orders").unwrap();
+        let before = (s.m.out_vector_config_discarded(), a.out_vector_config_discarded());
+        let mut entries = vec![vector_entry(&s, w - 20, Some(a_vector_config()))];
+        if run == "disable" {
+            entries.push(vector_entry(&s, w - 10, None));
+        }
+        for member in [&*s.m, &*a] {
+            let outcome = window(member, &entries);
+            assert!(!outcome.stopped(), "the window is not stopped ({run})");
+        }
+        window(&a, &the_stages_creations(&s));
+        for (who, m) in [("met the stage first", &*s.m), ("met it after", &*a)] {
+            assert_eq!(
+                (has_vectors(m, "orders"), has_shadow(m, "orders")),
+                (run == "configure", true),
+                "the configuration stands where the client put it, or is off ({run}, {who}); the kept shadow is there either way"
+            );
+            assert_eq!(
+                m.resolve(DB, "orders").unwrap().physical,
+                "orders",
+                "premise: the identity still answers ({run}, {who})"
+            );
+        }
+        assert_eq!(
+            (s.m.out_vector_config_discarded(), a.out_vector_config_discarded()),
+            before,
+            "nothing is discarded: no binding ever arrived ({run})"
+        );
+    }
+}
+
+#[test]
+fn a_vector_entry_while_the_binding_is_only_parked_is_applied_and_the_release_buries_the_identity_and_its_shadow()
+ {
+    let s = before_the_flip();
+    let w = wall_of(&s);
+    s.m.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    assert_eq!(
+        s.m.resolve(DB, "orders").unwrap().physical,
+        "orders",
+        "premise: the binding is parked and the identity still answers"
+    );
+    let before = s.m.out_vector_config_discarded();
+    window(&s.m, std::slice::from_ref(&vector_entry(&s, w - 10, Some(a_vector_config()))));
+    assert!(has_vectors(&s.m, "orders") && has_shadow(&s.m, "orders"), "the entry is applied");
+    assert_eq!(s.m.out_vector_config_discarded(), before, "and nothing is discarded");
+    window(&s.m, std::slice::from_ref(&s.bind));
+    assert_eq!(
+        s.m.resolve(DB, "orders").unwrap().physical,
+        BOUND,
+        "premise: the release is the flip"
+    );
+    assert!(
+        s.m.get_collection(DB, "orders").is_err() && !has_shadow(&s.m, "orders"),
+        "the identity and its shadow are buried at the release"
+    );
+    assert_eq!(
+        s.m.out_vector_config_discarded(),
+        before,
+        "the entry was applied before the flip and buried by it: nothing is counted at the release"
+    );
+}
+
+#[test]
+fn a_vector_entry_after_the_flip_is_discarded_counted_once_and_makes_no_shadow() {
+    let s = before_the_flip();
+    let w = wall_of(&s);
+    window(&s.m, std::slice::from_ref(&vector_entry(&s, w - 20, Some(a_vector_config()))));
+    assert!(
+        has_vectors(&s.m, "orders") && has_shadow(&s.m, "orders"),
+        "premise: vectors are on the identity"
+    );
+    window(&s.m, std::slice::from_ref(&s.bind));
+    assert_eq!(s.m.resolve(DB, "orders").unwrap().physical, BOUND, "premise: the flip");
+    assert!(!has_shadow(&s.m, "orders"), "premise: the identity's shadow is buried");
+    // below the flip and above it, a configuration and a removal each
+    for (run, wall, config) in [
+        ("configure, below the flip", w - 3, Some(a_vector_config())),
+        ("configure, above the flip", w + 3, Some(a_vector_config())),
+        ("disable, below the flip", w - 2, None),
+        ("disable, above the flip", w + 4, None),
+    ] {
+        let before = s.m.out_vector_config_discarded();
+        let outcome = window(&s.m, std::slice::from_ref(&vector_entry(&s, wall, config)));
+        assert!(
+            !outcome.stopped() && outcome.unknown_collection == 0,
+            "the window is not stopped ({run})"
+        );
+        assert_eq!(
+            s.m.out_vector_config_discarded(),
+            before + 1,
+            "the discard is counted, once ({run})"
+        );
+        assert!(
+            !has_vectors(&s.m, BOUND) && !has_shadow(&s.m, BOUND) && !has_shadow(&s.m, "orders"),
+            "the visible physical has no vector configuration and no shadow is made ({run})"
+        );
+    }
+}
+
+#[test]
+fn the_same_discarded_vector_entry_delivered_twice_is_counted_twice() {
+    let s = flipped();
+    let entry = vector_entry(&s, wall_of(&s) + 3, Some(a_vector_config()));
+    let before = s.m.out_vector_config_discarded();
+    window(&s.m, std::slice::from_ref(&entry));
+    window(&s.m, std::slice::from_ref(&entry));
+    assert_eq!(
+        s.m.out_vector_config_discarded(),
+        before + 2,
+        "a discarded entry is consumed and not appended, so it can be delivered again: the counter counts deliveries"
+    );
+}
+
+#[test]
+fn a_vector_entry_for_a_swapped_name_that_is_absent_is_discarded_and_is_no_unknown_collection() {
+    let s = flipped();
+    let w = wall_of(&s);
+    let author = &s._author.0;
+    let drop = OplogEntry {
+        stamp: Stamp::new(Hlc::new(w + 5, 0), author.node_id(), author.epoch()),
+        kind: OpKind::DropCollection,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: None,
+        body: Some(bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders")).unwrap()),
+        meta: None,
+    };
+    window(&s.m, std::slice::from_ref(&drop));
+    assert!(
+        not_found(s.m.resolve(DB, "orders")),
+        "premise: the name is absent under the drop in effect"
+    );
+    let before = s.m.out_vector_config_discarded();
+    let outcome =
+        window(&s.m, std::slice::from_ref(&vector_entry(&s, w + 8, Some(a_vector_config()))));
+    assert!(!outcome.stopped() && outcome.unknown_collection == 0, "not an unknown collection");
+    assert_eq!(s.m.out_vector_config_discarded(), before + 1, "discarded and counted");
+}
