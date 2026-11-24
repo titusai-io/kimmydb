@@ -403,7 +403,7 @@ fn parked_among(txn: &redb::WriteTransaction, stamps: &[Stamp]) -> Result<Vec<St
 pub(crate) fn release_covered(
     txn: &redb::WriteTransaction,
     released: &[Stamp],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String, Stamp)>> {
     if released.is_empty() {
         return Ok(Vec::new());
     }
@@ -429,7 +429,7 @@ pub(crate) fn release_covered(
             ));
         };
         release(txn, &db, &logical, stamp)?;
-        took_effect.push((db, logical));
+        took_effect.push((db, logical, *stamp));
     }
     Ok(took_effect)
 }

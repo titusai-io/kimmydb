@@ -187,6 +187,13 @@ pub struct StorageReadings {
     /// `conflictResolved` events this member has made since start, by kind (`Engine::conflicts_resolved`): one for each loss entry of its
     /// own that a committed transaction stored. A monotonic count.
     pub conflicts_resolved: Vec<(&'static str, u64)>,
+    /// Swaps this member applied live since start (`Engine::out_swaps`): the series `kimmy_out_swaps_total`.
+    pub out_swaps: u64,
+    /// Burials of a swap's physicals since start, by cause (`Engine::out_buried`): the series `kimmy_out_buried_total{cause}`.
+    pub out_buried: Vec<(&'static str, u64)>,
+    /// Loss records of a swap minted on this member since start, by kind (`Engine::out_loss_records`): the series
+    /// `kimmy_out_loss_records_total{kind}`.
+    pub out_loss_records: Vec<(&'static str, u64)>,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -226,6 +233,13 @@ pub struct OwnershipReading {
     pub catching_up: usize,
     /// What the yield evaluator last decided (ADR-213).
     pub evaluator: YieldReading,
+}
+
+/// The readings `by_label` as an array in the order of `labels`; a label the readings do not carry reads 0.
+fn labelled<const N: usize>(labels: &[&str; N], by_label: &[(&'static str, u64)]) -> [u64; N] {
+    std::array::from_fn(|slot| {
+        by_label.iter().find(|(label, _)| *label == labels[slot]).map_or(0, |(_, n)| *n)
+    })
 }
 
 /// The refusal codes `kimmy_api_refused_total{code}` counts, in the order the series renders them (ADR-272, decision 7).
@@ -401,6 +415,12 @@ pub struct MetricsSnapshot {
     pub loss_records_refused: [u64; 6],
     /// `conflictResolved` events made, in the order of `LossKind::ALL`: the series `kimmy_conflicts_resolved_total{kind}`.
     pub conflicts_resolved: [u64; 6],
+    /// Swaps applied live: the series `kimmy_out_swaps_total`.
+    pub out_swaps: u64,
+    /// Burials of a swap's physicals, in the order of `kimmy_storage::OUT_BURIAL_CAUSES`: the series `kimmy_out_buried_total{cause}`.
+    pub out_buried: [u64; kimmy_storage::OUT_BURIAL_CAUSES.len()],
+    /// Loss records of a swap, in the order of `kimmy_storage::OUT_LOSS_KINDS`: the series `kimmy_out_loss_records_total{kind}`.
+    pub out_loss_records: [u64; kimmy_storage::OUT_LOSS_KINDS.len()],
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1526,6 +1546,9 @@ impl Metrics {
                 }
                 refused
             },
+            out_swaps: readings.out_swaps,
+            out_buried: labelled(&kimmy_storage::OUT_BURIAL_CAUSES, &readings.out_buried),
+            out_loss_records: labelled(&kimmy_storage::OUT_LOSS_KINDS, &readings.out_loss_records),
             conflicts_resolved: {
                 let mut made = [0u64; 6];
                 for (label, n) in &readings.conflicts_resolved {
@@ -1879,6 +1902,15 @@ impl Metrics {
              # HELP kimmy_conflicts_resolved_total `conflictResolved` events this member has made, by the kind of the loss: one for each loss record that entered its state and that it reported (a record older than the retention time by this member's clock is not reported). Per member: two members count one lost write separately, and a write that carries a second kind counts again. `retiredWriter` is reserved and stays 0.\n\
              # TYPE kimmy_conflicts_resolved_total counter\n\
              {conflicts_resolved_lines}\
+             # HELP kimmy_out_swaps_total Swaps this member applied live (ADR-272): replacing `$out` bindings that took effect on this member and were the event the name answered from when the pass ended. A binding that took effect and is not visible, and a swap that arrived inside a snapshot grant, count none. This member's own count: two members that meet the same events in another order can differ. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_out_swaps_total counter\n\
+             kimmy_out_swaps_total {out_swaps}\n\
+             # HELP kimmy_out_loss_records_total Loss records of a replacing `$out` that this member minted, by kind: `late_write` (a write that lost to a swap) and `snapshot_delete` (reserved). Both are 0 until the executor builds the mint. An event on this member, not a count of distinct records. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_out_loss_records_total counter\n\
+             {out_loss_lines}\
+             # HELP kimmy_out_buried_total Physicals of a replacing `$out` that this member buried, by cause: `bound_out` (a later event of the name became visible and the loser rule buried it), `doomed` (a stage no event can make visible, buried with the event that proves it), `orphan` (an abandoned stage; 0 until the abandon is built) and `drop` (a drop of the name or of its database). Counted by the commit that finished the burial, once per physical this member held; a physical it never held counts none. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_out_buried_total counter\n\
+             {out_buried_lines}\
              # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
              # TYPE kimmy_commits counter\n\
              kimmy_commits {commits}\n\
@@ -2393,6 +2425,30 @@ impl Metrics {
                     })
                     .collect::<String>()
             },
+            out_swaps = readings.out_swaps,
+            // Every kind and every cause always has its sample, from the fixed arrays and never from what has been seen
+            out_loss_lines = kimmy_storage::OUT_LOSS_KINDS
+                .iter()
+                .map(|kind| {
+                    let n = readings
+                        .out_loss_records
+                        .iter()
+                        .find(|(label, _)| label == kind)
+                        .map_or(0, |(_, n)| *n);
+                    format!("kimmy_out_loss_records_total{{kind=\"{kind}\"}} {n}\n")
+                })
+                .collect::<String>(),
+            out_buried_lines = kimmy_storage::OUT_BURIAL_CAUSES
+                .iter()
+                .map(|cause| {
+                    let n = readings
+                        .out_buried
+                        .iter()
+                        .find(|(label, _)| label == cause)
+                        .map_or(0, |(_, n)| *n);
+                    format!("kimmy_out_buried_total{{cause=\"{cause}\"}} {n}\n")
+                })
+                .collect::<String>(),
             // Every kind always has its sample, at zero before anything was reported, so a rate over it is defined.
             conflicts_resolved_lines = kimmy_core::merge_state::LossKind::ALL
                 .iter()
@@ -3454,6 +3510,14 @@ mod tests {
                 ("typeClash", 8_105),
                 ("arrayClash", 8_106),
             ],
+            out_swaps: 8_201,
+            out_buried: vec![
+                ("bound_out", 8_211),
+                ("doomed", 8_212),
+                ("orphan", 8_213),
+                ("drop", 8_214),
+            ],
+            out_loss_records: vec![("late_write", 8_221), ("snapshot_delete", 8_222)],
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3557,6 +3621,19 @@ kimmy_conflicts_resolved_total{kind=\"insertLost\"} 8103
 kimmy_conflicts_resolved_total{kind=\"retiredWriter\"} 8104
 kimmy_conflicts_resolved_total{kind=\"typeClash\"} 8105
 kimmy_conflicts_resolved_total{kind=\"arrayClash\"} 8106
+# HELP kimmy_out_swaps_total Swaps this member applied live (ADR-272): replacing `$out` bindings that took effect on this member and were the event the name answered from when the pass ended. A binding that took effect and is not visible, and a swap that arrived inside a snapshot grant, count none. This member's own count: two members that meet the same events in another order can differ. Not part of any state, and not replicated.
+# TYPE kimmy_out_swaps_total counter
+kimmy_out_swaps_total 8201
+# HELP kimmy_out_loss_records_total Loss records of a replacing `$out` that this member minted, by kind: `late_write` (a write that lost to a swap) and `snapshot_delete` (reserved). Both are 0 until the executor builds the mint. An event on this member, not a count of distinct records. Not part of any state, and not replicated.
+# TYPE kimmy_out_loss_records_total counter
+kimmy_out_loss_records_total{kind=\"late_write\"} 8221
+kimmy_out_loss_records_total{kind=\"snapshot_delete\"} 8222
+# HELP kimmy_out_buried_total Physicals of a replacing `$out` that this member buried, by cause: `bound_out` (a later event of the name became visible and the loser rule buried it), `doomed` (a stage no event can make visible, buried with the event that proves it), `orphan` (an abandoned stage; 0 until the abandon is built) and `drop` (a drop of the name or of its database). Counted by the commit that finished the burial, once per physical this member held; a physical it never held counts none. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_out_buried_total counter
+kimmy_out_buried_total{cause=\"bound_out\"} 8211
+kimmy_out_buried_total{cause=\"doomed\"} 8212
+kimmy_out_buried_total{cause=\"orphan\"} 8213
+kimmy_out_buried_total{cause=\"drop\"} 8214
 # HELP kimmy_commits Durable write transactions committed by the storage engine.
 # TYPE kimmy_commits counter
 kimmy_commits 44
@@ -4737,6 +4814,19 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_responses_total{{class=\"2xx\"}} {}\n", s.responses_2xx));
         expect(&format!("kimmy_responses_total{{class=\"4xx\"}} {}\n", s.responses_4xx));
         expect(&format!("kimmy_responses_total{{class=\"5xx\"}} {}\n", s.responses_5xx));
+        expect(&format!("kimmy_out_swaps_total {}\n", s.out_swaps));
+        for (slot, kind) in kimmy_storage::OUT_LOSS_KINDS.iter().enumerate() {
+            expect(&format!(
+                "kimmy_out_loss_records_total{{kind=\"{kind}\"}} {}\n",
+                s.out_loss_records[slot]
+            ));
+        }
+        for (slot, cause) in kimmy_storage::OUT_BURIAL_CAUSES.iter().enumerate() {
+            expect(&format!(
+                "kimmy_out_buried_total{{cause=\"{cause}\"}} {}\n",
+                s.out_buried[slot]
+            ));
+        }
         for (slot, code) in REFUSED_CODES.iter().enumerate() {
             expect(&format!(
                 "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
@@ -5317,6 +5407,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 2
                 // API refusals answered to a client, by code (ADR-272, decision 7).
                 + REFUSED_CODES.len()
+                // The swap count, and the burials and loss records of swaps by cause and kind (ADR-272; Q6.5, C2).
+                + 1
+                + kimmy_storage::OUT_LOSS_KINDS.len()
+                + kimmy_storage::OUT_BURIAL_CAUSES.len()
                 // Peer connections this node failed to serve, by reason.
                 + kimmy_cluster::ServeFailure::COUNT
                 // Accept errors a listener had, by listener.
@@ -6078,6 +6172,35 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             page.matches("kimmy_api_refused_total{").count(),
             3,
             "three series and no `other`"
+        );
+    }
+
+    #[test]
+    fn the_swap_burial_and_loss_series_render_at_zero_for_every_label_before_anything_happened() {
+        // From the fixed arrays and never from what has been seen: a series that appears only once it has moved cannot be told apart from
+        // one that does not exist, and the two that nothing feeds yet (`orphan`, the loss records) must read 0, not be absent.
+        let page = Metrics::default().render_with(&StorageReadings::default());
+        assert!(
+            page.contains("kimmy_out_swaps_total 0\n"),
+            "no `kimmy_out_swaps_total 0` in the page at rest"
+        );
+        for kind in kimmy_storage::OUT_LOSS_KINDS {
+            let line = format!("kimmy_out_loss_records_total{{kind=\"{kind}\"}} 0\n");
+            assert!(page.contains(&line), "no `{line}` in the page at rest");
+        }
+        for cause in kimmy_storage::OUT_BURIAL_CAUSES {
+            let line = format!("kimmy_out_buried_total{{cause=\"{cause}\"}} 0\n");
+            assert!(page.contains(&line), "no `{line}` in the page at rest");
+        }
+        assert_eq!(
+            page.matches("kimmy_out_buried_total{").count(),
+            4,
+            "the four causes and no `other`"
+        );
+        assert_eq!(
+            page.matches("kimmy_out_loss_records_total{").count(),
+            2,
+            "the two kinds and no `other`"
         );
     }
 

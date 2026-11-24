@@ -56,6 +56,20 @@ pub struct RepairsAtOpen {
 /// became visible and the loser rule buried it), `doomed` (a stage that can never be visible, buried with the event that proves it),
 /// `orphan` (an abandoned stage; counted when Q6.7 builds the abandon) and `drop` (a drop of the name or of its database).
 pub const OUT_BURIAL_CAUSES: [&str; 4] = ["bound_out", "doomed", "orphan", "drop"];
+/// Why the settle pass buried a physical: the slot of its cause in [`OUT_BURIAL_CAUSES`]. Read from the pass, never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuryCause {
+    /// The loser rule: a later event of the name is visible and this physical is not the one it serves.
+    BoundOut = 0,
+    /// A stage no event can make visible, buried with the event that proves it.
+    Doomed = 1,
+    /// An abandoned stage (counted when Q6.7 builds the abandon).
+    #[allow(dead_code)]
+    Orphan = 2,
+    /// A logical drop of the name is visible, or a database's drop buried a stage whole.
+    Drop = 3,
+}
+
 /// The kinds of loss record of a swap, in the order `kimmy_out_loss_records_total{kind}` renders them. `snapshot_delete` is reserved.
 pub const OUT_LOSS_KINDS: [&str; 2] = ["late_write", "snapshot_delete"];
 
@@ -1009,7 +1023,10 @@ pub(crate) struct WriteTxn<'a> {
     loss_minted: parking_lot::Mutex<[u64; 6]>,
     /// The bound-out burials the register made in this transaction (ADR-272, decision 5): finished by [`Self::commit`] once the
     /// inner commit has succeeded (their entry, if any, published; the rows handed to the purger), and by nothing else.
-    burials: parking_lot::Mutex<Vec<(String, String, Burial)>>,
+    burials: parking_lot::Mutex<Vec<(String, String, Burial, BuryCause)>>,
+    /// The swaps the settle passes of this transaction saw take effect (`kimmy_out_swaps_total`): added to the engine's count by
+    /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
+    swaps: parking_lot::Mutex<u64>,
 }
 
 impl WriteTxn<'_> {
@@ -1095,8 +1112,15 @@ impl WriteTxn<'_> {
             }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // The inner commit landed: the burials the register made are finished (published, handed to the purger)
-            for (db, name, burial) in std::mem::take(&mut *self.burials.lock()) {
+            for (db, name, burial, cause) in std::mem::take(&mut *self.burials.lock()) {
                 engine.finish_burial(&db, &name, burial);
+                engine.out_buried[cause as usize]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // ... and the swaps their passes saw take effect, counted once, by the commit that made them
+            let swaps = std::mem::take(&mut *self.swaps.lock());
+            if swaps > 0 {
+                engine.out_swaps.fetch_add(swaps, std::sync::atomic::Ordering::Relaxed);
             }
             // The inner commit landed: the loss entries this transaction minted are events this member has made.
             for (kind, minted) in self.loss_minted.lock().iter().enumerate() {
@@ -2365,6 +2389,12 @@ impl Engine {
     /// none, and the count is this member's own: two members can differ.
     pub fn out_swaps(&self) -> u64 {
         self.out_swaps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One burial of a swap's physical, made by a commit that has landed: the only way a burial reaches `kimmy_out_buried_total` outside
+    /// the transaction's own list, for a burial that is made in a transaction of its own.
+    pub(crate) fn count_out_burial(&self, cause: BuryCause) {
+        self.out_buried[cause as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Burials of a swap's physicals since start, by cause, in the order of [`OUT_BURIAL_CAUSES`].
@@ -3953,8 +3983,8 @@ impl Engine {
             let stamps: Vec<Stamp> =
                 covered.iter().filter_map(|key| codec::decode_oplog_key(key).ok()).collect();
             // A binding among them that was only information took effect: the physicals it binds out are buried with it
-            for (db, logical) in crate::register::release_covered(txn, &stamps)? {
-                Self::settle_register_in_txn(txn, &db, &logical)?;
+            for (db, logical, released) in crate::register::release_covered(txn, &stamps)? {
+                Self::settle_register_in_txn(txn, &db, &logical, Some(released))?;
             }
             released |= !covered.is_empty();
             if exhausted {
@@ -4474,6 +4504,7 @@ impl Engine {
             live_counts: Default::default(),
             loss_minted: Default::default(),
             burials: Default::default(),
+            swaps: Default::default(),
         })
     }
 
@@ -5653,7 +5684,7 @@ impl Engine {
                     stamp,
                     kimmy_core::RegisterEvent::Create { physical },
                 )?;
-                Self::settle_register_in_txn(&txn, db, name)?;
+                Self::settle_register_in_txn(&txn, db, name, None)?;
                 txn.commit()?;
                 if let Some(entry) = logged {
                     self.publish(vec![entry]);
@@ -5712,7 +5743,7 @@ impl Engine {
             timeline.events().last().map(|(stamp, _)| *stamp).into_iter().chain(created).max();
         let stamp = self.next_stamp_above(floor);
         crate::register::put(&txn, db, name, stamp, kimmy_core::RegisterEvent::LogicalDrop)?;
-        Self::settle_register_in_txn(&txn, db, name)?;
+        Self::settle_register_in_txn(&txn, db, name, None)?;
         let entry = ddl_entry(
             stamp,
             OpKind::DropCollection,
@@ -5756,12 +5787,16 @@ impl Engine {
         Ok(held)
     }
 
+    /// `took_effect` is the stamp of the register event that has just taken effect in this transaction, when one has: a swap is counted
+    /// (once the transaction commits) when that event is a binding and is the event the name answers from after the pass. The pass runs
+    /// for every event of the name and sees the same visible binding each time, so it cannot say alone whether a swap just happened.
     pub(crate) fn settle_register_in_txn(
         txn: &WriteTxn<'_>,
         db: &str,
         logical: &str,
+        took_effect: Option<Stamp>,
     ) -> Result<()> {
-        use kimmy_core::register_state::Ready;
+        use kimmy_core::register_state::{Ready, Visible};
         let (timeline, mut ready) = Self::register_view_in_txn(txn, db, logical)?;
         // The stages of this name this member holds, with the deadline each creation reads as: what burial by a later event judges
         // (decision 5). A stage has no event of the register until it is bound, so the view above does not name it.
@@ -5771,13 +5806,27 @@ impl Engine {
         }
         let lookup = |p: &str| ready.get(p).copied().unwrap_or(Ready::Buried);
         let visible = timeline.visible(lookup);
+        if let (Some(effect), Visible::Bound { stamp, .. }) = (took_effect, &visible)
+            && *stamp == effect
+        {
+            *txn.swaps.lock() += 1;
+        }
         let burials = timeline.burials(&visible, lookup);
         // Burial by a later event: a stage with no binding in effect whose deadline is strictly below the visible event can never be
         // the visible physical (every valid binding of it is at or below its deadline), so it goes with the event, stamped by it
         let stage_deadlines: Vec<(&str, Hlc)> =
             stages.iter().map(|(physical, deadline)| (physical.as_str(), *deadline)).collect();
         let doomed = timeline.doomed(&visible, lookup, &stage_deadlines);
-        for burial in burials.into_iter().chain(doomed) {
+        // The cause is read from the list a burial came from and the event that is visible: a stage no event can make visible is
+        // `doomed` whatever that event is; a physical the loser rule buried is `bound_out` while a binding or a recreation is visible
+        // and `drop` while a logical drop is
+        let loser_cause = match &visible {
+            Visible::Dropped { .. } => BuryCause::Drop,
+            _ => BuryCause::BoundOut,
+        };
+        let causes = std::iter::repeat_n(loser_cause, burials.len())
+            .chain(std::iter::repeat_n(BuryCause::Doomed, doomed.len()));
+        for (burial, cause) in burials.into_iter().chain(doomed).zip(causes) {
             let meta = {
                 let collections = txn.open_table(tables::COLLECTIONS)?;
                 match collections.get((db, burial.physical.as_str()))? {
@@ -5806,7 +5855,7 @@ impl Engine {
                     }
                 }
             }
-            txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried));
+            txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried, cause));
         }
         // After the pass, before the commit: the point where a transaction that fails must leave every counter as it was
         #[cfg(test)]

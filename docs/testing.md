@@ -756,6 +756,16 @@ to the engine.
   code, `Retry-After: 2`. `kimmy_api_refused_total{code="swap_in_progress"}` counts it once, where
   the answer leaves the member (over HTTP the middleware, over MCP the tool's render), beside
   `stage_collection` and `clock_ahead`; read it from `/metrics`, not from a field.
+- **The counters of a swap.** `kimmy_out_swaps_total`, `kimmy_out_buried_total{cause}` and
+  `kimmy_out_loss_records_total{kind}` are this member's own counts, made by the commit that
+  finished the thing counted: read them from `/metrics` on the member under test, never compare
+  one across members (a member that meets an older binding after a newer one counts the older;
+  one that meets them the other way round counts only the newer), and expect a snapshot grant's
+  swap to count a `bound_out` burial and no swap. `kimmy_out_loss_records_total` and
+  `cause="orphan"` are present at `0` and nothing moves them until Q6.7 builds the mint and the
+  abandon; the tests owed there are `a_late_write_lost_to_a_swap_moves_kimmy_out_loss_records_total_by_one`,
+  `an_abandoned_stage_moves_kimmy_out_buried_total_orphan_by_one` and
+  `a_local_binding_and_a_replicated_one_count_one_swap_each`.
 
 ---
 

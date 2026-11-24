@@ -3527,7 +3527,17 @@ impl Engine {
                         || (put == kimmy_core::register_state::Put::Stored
                             && apply.mode == RegisterMode::Effect)
                     {
-                        Engine::settle_register_in_txn(&txn, &apply.db, &apply.logical)?;
+                        // The event that took effect in this transaction is the one a swap is counted for: not a seed's drop, and
+                        // not an event that was only parked
+                        let took_effect = (put == kimmy_core::register_state::Put::Stored
+                            && apply.mode == RegisterMode::Effect)
+                            .then_some(entry.stamp);
+                        Engine::settle_register_in_txn(
+                            &txn,
+                            &apply.db,
+                            &apply.logical,
+                            took_effect,
+                        )?;
                     }
                 }
                 // Over an existing key, in position, this also releases a mark
@@ -3603,7 +3613,7 @@ impl Engine {
                 crate::register::release(&txn, &db, &logical, &entry.stamp)?;
                 crate::register::check_released_took_effect(&txn, &entry.stamp)?;
                 // ... and it buries the physicals it names out, in the same transaction (Q6.4 item 1)
-                Engine::settle_register_in_txn(&txn, &db, &logical)?;
+                Engine::settle_register_in_txn(&txn, &db, &logical, Some(entry.stamp))?;
             }
             txn.commit()?;
         } else {

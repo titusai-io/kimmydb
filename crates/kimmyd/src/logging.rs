@@ -268,6 +268,57 @@ impl TelemetryGuard {
             "Schema changes refused with 503 clock_ahead: this member's own stamps would be refused by the rest of the cluster. Counted where the answer leaves this member.",
             |s| s.api_refused[2]
         );
+        // `kimmy_out_swaps_total`, `kimmy_out_buried_total{cause}` and `kimmy_out_loss_records_total{kind}` (ADR-272; Q6.5, C2): one
+        // instrument per label value, each reading its own element of one array, in the order of `OUT_BURIAL_CAUSES` and `OUT_LOSS_KINDS`.
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_swaps",
+            "{swap}",
+            "Swaps this member applied live: replacing $out bindings that took effect here and were the event the name answered from. This member's own count.",
+            |s| s.out_swaps
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_buried.bound_out",
+            "{burial}",
+            "Physicals of a replacing $out this member buried because a later event of the name became visible (the loser rule). Counted by the commit that finished the burial.",
+            |s| s.out_buried[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_buried.doomed",
+            "{burial}",
+            "Stages of a replacing $out this member buried because no event can make them visible: buried with the event that proves it. Counted by the commit that finished the burial.",
+            |s| s.out_buried[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_buried.orphan",
+            "{burial}",
+            "Stages of a replacing $out this member buried as abandoned. 0 until the abandon is built. Counted by the commit that finished the burial.",
+            |s| s.out_buried[2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_buried.drop",
+            "{burial}",
+            "Physicals of a replacing $out this member buried because the name or its database was dropped. Counted by the commit that finished the burial.",
+            |s| s.out_buried[3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_loss_records.late_write",
+            "{record}",
+            "Loss records of a replacing $out that this member minted for a write that lost to a swap. 0 until the executor builds the mint.",
+            |s| s.out_loss_records[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_loss_records.snapshot_delete",
+            "{record}",
+            "Loss records of a replacing $out that this member minted for a delete a snapshot carried. Reserved: 0.",
+            |s| s.out_loss_records[1]
+        );
         // `kimmy_conflicts_resolved_total{kind}` (Q7 Step 4, C8): one instrument per kind, in the order of `LossKind::ALL` (the order
         // the snapshot's array is filled in), spelled in snake case as `kimmy.catching_up.*` is.
         observe!(
@@ -3386,6 +3437,32 @@ mod tests {
                 reason.label()
             );
         }
+    }
+
+    #[test]
+    fn each_out_instrument_reads_the_slot_of_its_own_cause_and_kind() {
+        // The stem guard `every_metrics_series_reaches_the_bridge` cannot see a missing label, so each cause and each kind has its own
+        // assertion that its instrument literal is in this file once (`instrument_call` fails on none or two) and reads its slot.
+        for (slot, cause) in kimmy_storage::OUT_BURIAL_CAUSES.iter().enumerate() {
+            let name = format!("kimmy.out_buried.{cause}");
+            let call = instrument_call(&name);
+            let want = format!("|s|s.out_buried[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{cause}`: {call}"
+            );
+        }
+        for (slot, kind) in kimmy_storage::OUT_LOSS_KINDS.iter().enumerate() {
+            let name = format!("kimmy.out_loss_records.{kind}");
+            let call = instrument_call(&name);
+            let want = format!("|s|s.out_loss_records[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{kind}`: {call}"
+            );
+        }
+        let swaps = instrument_call("kimmy.out_swaps");
+        assert!(swaps.ends_with("|s|s.out_swaps"), "kimmy.out_swaps reads the swap count: {swaps}");
     }
 
     #[test]

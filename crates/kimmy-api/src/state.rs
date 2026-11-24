@@ -295,6 +295,10 @@ impl AppState {
             // What the cap and the limits of the loss records dropped, by reason (a counter the engine keeps).
             loss_records_refused: self.engine.loss_records_refused(),
             conflicts_resolved: self.engine.conflicts_resolved(),
+            // Swaps, and the burials and loss records of swaps, this member's own commits made (ADR-272)
+            out_swaps: self.engine.out_swaps(),
+            out_buried: self.engine.out_buried(),
+            out_loss_records: self.engine.out_loss_records(),
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.

@@ -730,10 +730,15 @@ impl Engine {
         // It is buried whole at the drop, whatever it holds. This is the one place every route to a drop passes: the sweep of a
         // database's drop, the replicated collection drop and the snapshot route.
         if meta.stage.is_some() || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+            let a_stage = meta.stage.is_some();
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
             #[cfg(test)]
             crate::sync::race_hooks::before_stage_burial_commit()?;
             txn.commit()?;
+            // Counted by the commit that finished it, here until a later change moves this burial into the settle pass (C3)
+            if a_stage {
+                self.count_out_burial(crate::engine::BuryCause::Drop);
+            }
             let ids = self.finish_burial(db, name, burial);
             notify.buried(self, db, name, &ids);
             return Ok(Dropped::Buried(true));
