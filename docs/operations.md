@@ -1615,6 +1615,29 @@ Writes are unaffected: they are bounded by the fsync. **Build it for a node you
 are diagnosing**, where the question is how much of its resident memory is the
 cache, not for a node serving heavy range reads.
 
+### A replacing `$out` and the definitions of its name
+
+A replacing `$out` ([ADR-272](decisions.md)) makes a new physical collection visible under the name, and the name's
+definitions travel with it. On every member, in the transaction in which the new physical becomes visible, the indexes and
+the validator the old physical held are merged into it with their original stamps, and an index it lacks is built over its
+documents, with the writer held for as long as the build takes (the cost of any `createIndex` on a collection of that
+size, paid inside the flip on every member). A unique index the new documents violate is built in full, and the
+violations are reported once the flip has committed.
+
+Three things an operator can watch:
+
+- **A drop that arrives after a flip removes indexes from a collection that is serving.** A drop of the name made on
+  another member at time `d` reaches this member after it has already made a physical visible that was born above `d`.
+  The indexes and the validator stamped at or before `d` belong to the dropped life: they are removed from the serving
+  collection, with their entries, in the transaction in which the drop takes effect. The documents stay. A member
+  that meets the drop first ends in the same state, which is the point.
+- **A definition of the life a flip replaced is ignored as history on the new physical.** A physical that becomes visible
+  takes the boundary of the life it replaces (its definition floor), so a definition of the replaced life that is served
+  again after the flip does not build on the new physical.
+- **The shadow of a vector configuration goes with its physical.** A configuration is not carried to the new
+  physical; the old physical's shadow is buried in the flip and its rows are purged after the deferral, as the old
+  physical's are.
+
 ### The divergence check
 
 Anti-entropy converges by folding entries into a version vector, and that

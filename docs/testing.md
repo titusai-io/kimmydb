@@ -766,6 +766,14 @@ to the engine.
   abandon; the tests owed there are `a_late_write_lost_to_a_swap_moves_kimmy_out_loss_records_total_by_one`,
   `an_abandoned_stage_moves_kimmy_out_buried_total_orphan_by_one` and
   `a_local_binding_and_a_replicated_one_count_one_swap_each`.
+- **What the flip does to a collection's definitions.** An index or a validator that the old physical held is on the new one with its original stamp, built over the new
+  physical's documents (read the index list, `GET /v1/db/{db}/coll/{coll}/indexes`, on every member); an index the old physical had dropped
+  is not. A definition stamped at or before a logical drop of the name belongs to the dropped life and is not on the
+  physical that becomes visible after it, whichever order the drop and the flip reached the member in (a drop that
+  arrives after the flip removes the index from the serving collection, with its entries, and leaves the documents). A
+  definition of the life a flip replaced, served again after the flip, is ignored as history on the new physical. Assert it on every member: the same set of index names.
+- **A vector configuration does not cross a flip.** The flip buries the old physical's vector shadow with it
+  (the name then holds no vector configuration). A stream on the collection that was replaced is handed the binding's schema change and then ends with `Invalidate{CollectionDropped}`; the stream is told by a notice of the burial, once.
 
 ---
 
