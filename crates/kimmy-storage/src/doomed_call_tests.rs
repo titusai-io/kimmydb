@@ -522,3 +522,65 @@ fn a_tombstone_on_a_stage_never_makes_its_valid_binding_history() {
         );
     }
 }
+
+// -- DOOM and the clock bound (the independent reviewer's out-of-model risk, 2026-11-23) -------------------------------------------
+//
+// DOOM rests on HLC order: a valid binding is stamped at or below the deadline, and the dooming event strictly above it. The model has
+// no clock bound, so it cannot say what a far-future dooming event does. In the product the event is refused until due (U1, decision
+// 14 ruling (c)) before it is witnessed or written, so it is not an event in effect, and nothing is doomed by it until it is.
+
+/// The clock bound the tests run under (`max_clock_skew_secs`, 300 s by default).
+const CLOCK_BOUND_MS: u64 = 300_000;
+
+/// A member holding `orders` and both stages, as `member_that_doomed_s1` starts, with no binding taken.
+fn member_holding_both_stages(w: &World) -> (Engine, tempfile::TempDir) {
+    let (m, d) = with_orders();
+    m.apply_batch(&[w.s1.clone(), w.s2.clone()]).unwrap();
+    assert!(m.get_collection(DB, S1).is_ok(), "premise: S1 is held");
+    (m, d)
+}
+
+#[test]
+fn a_dropping_event_stamped_past_the_bound_dooms_no_stage_until_it_is_due_and_one_inside_the_bound_does()
+ {
+    let w = world();
+    let z = engine().0;
+    let s1_deadline = w.s1.stamp.hlc.wall_ms + 5_000;
+    assert!(s1_deadline < physical_now_ms() + 10_000, "premise: S1's deadline is a few seconds on");
+
+    // The drop of `orders` stamped above S1's deadline and inside the bound: in effect, and it dooms S1 (the control).
+    let (inside, _di) = member_holding_both_stages(&w);
+    let due = drop_of_orders(&z, s1_deadline + 1_000);
+    let outcome = window(&inside, std::slice::from_ref(&due));
+    assert_eq!(outcome.clock_refused, 0, "premise: inside the bound: {outcome:?}");
+    assert!(
+        inside.get_collection(DB, S1).is_err(),
+        "premise: a drop above the deadline, inside the bound, dooms the stage"
+    );
+
+    // The same drop stamped hours ahead: refused until due. It is not witnessed, no register event is written, S1 is not doomed.
+    let (m, _dm) = member_holding_both_stages(&w);
+    let far = drop_of_orders(&z, physical_now_ms() + 10 * 3_600_000);
+    assert!(far.stamp.hlc.wall_ms > s1_deadline, "premise: above S1's deadline");
+    let outcome = window(&m, std::slice::from_ref(&far));
+    assert_eq!(
+        outcome.clock_refused, 1,
+        "the drop is past the bound U1 holds every replicated entry to: {outcome:?}"
+    );
+    assert!(
+        m.get_collection(DB, S1).is_ok(),
+        "S1 is doomed by an event that is refused until due, so by an event that is not in effect"
+    );
+    assert!(
+        m.get_collection(DB, "orders").is_ok(),
+        "the far drop is not applied: `orders` is still held"
+    );
+    assert!(!register_holds_an_event_for_orders(&m), "no event of the far drop is in the register");
+    assert_eq!(held_entries_at(&m, &far.stamp), 0, "nothing is appended on a stamp past the bound");
+    // What the window claimed to have processed is believed up to the bound and no further (the frame check), never to the far stamp.
+    let witnessed = m.witnessed_vector().unwrap().get(far.stamp.origin());
+    assert!(
+        witnessed.wall_ms <= physical_now_ms() + CLOCK_BOUND_MS,
+        "the far drop is not witnessed: the vector reads {witnessed:?} for its origin, past the bound"
+    );
+}
