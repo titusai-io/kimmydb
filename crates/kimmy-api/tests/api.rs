@@ -23919,3 +23919,74 @@ async fn an_out_that_reads_its_own_populated_target_is_still_refused_400_until_q
     let count = server.post("/v1/db/shop/coll/src/count", Some(&token), json!({})).await;
     assert_eq!(count.body["count"], 1, "and nothing was written: {:?}", count.body);
 }
+
+// -- The flip of a replacing `$out` buries a collection's vector shadow and tells the vector cache (ADR-272, decisions 5 and 12; Q6.5-2, B3) --
+//
+// The cache forgets a graph on a notice of a burial that minted no entry, and it derives the shadow from the notice's database and NAME
+// (it ignores the ids), so the notice of a flip must name the physical the flip buried.
+
+/// The binding of `shop.orders` to `physical`, from another member, stamped `after_ms` above `above`.
+fn a_binding_of_orders(
+    physical: &str,
+    above: kimmy_core::Hlc,
+    after_ms: u64,
+) -> kimmy_core::OplogEntry {
+    kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(above.wall_ms + after_ms, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            kimmy_core::Epoch::ZERO,
+        ),
+        kind: kimmy_core::OpKind::BindCollection,
+        collection: kimmy_core::CollectionId::derive("shop", "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                db: "shop".into(),
+                name: "orders".into(),
+                physical: physical.into(),
+            })
+            .unwrap(),
+        ),
+        meta: None,
+    }
+}
+
+/// `shop.orders` with vectors and a built graph, a stage whose binding is stored ahead of its position, the invalidator running.
+#[tokio::test]
+async fn a_flip_that_buries_a_collection_with_vectors_forgets_the_graph_of_its_shadow() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "orders").await;
+    let shadow = build_graph(&server, "shop", "orders");
+    assert_eq!(server.state.vectors.len(), 1, "premise: a graph is cached");
+    assert!(snapshot_of(&server, shadow).is_dir(), "premise: and persisted");
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
+    let stage = "orders.__stg.real";
+    engine.create_stage("shop", stage, kimmy_core::MergePolicy::Document, deadline).unwrap();
+    let bind =
+        a_binding_of_orders(stage, kimmy_core::Hlc::new(kimmy_storage::physical_now_ms(), 0), 10);
+    engine.apply_batch(std::slice::from_ref(&bind)).unwrap();
+    assert_eq!(
+        engine.resolve("shop", "orders").unwrap().physical,
+        "orders",
+        "premise: the binding is known and not yet visible"
+    );
+    // Subscribed before the flip, as the daemon spawns it
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&server.state));
+    tokio::task::yield_now().await;
+
+    let mut granted = kimmy_core::VersionVector::default();
+    granted.observe(bind.stamp);
+    engine.absorb_version_vector(&granted).unwrap();
+    assert_eq!(engine.resolve("shop", "orders").unwrap().physical, stage, "premise: the flip");
+    assert!(engine.get_collection("shop", "orders").is_err(), "premise: the identity is buried");
+
+    assert!(
+        wait_until(|| server.state.vectors.is_empty()).await,
+        "the member kept the graph of a shadow the flip buried"
+    );
+    assert!(!snapshot_of(&server, shadow).exists(), "and kept its snapshot on disk");
+    consumer.abort();
+}

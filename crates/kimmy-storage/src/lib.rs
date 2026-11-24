@@ -164,6 +164,9 @@ mod out_counter_tests;
 mod join_tests;
 
 #[cfg(test)]
+mod shadow_burial_tests;
+
+#[cfg(test)]
 mod carried_drop_tests;
 
 #[cfg(test)]
