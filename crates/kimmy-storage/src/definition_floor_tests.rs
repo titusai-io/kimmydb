@@ -125,6 +125,17 @@ fn world_below() -> World {
 }
 
 fn world_with(stages_first: bool) -> World {
+    build_world(stages_first, false)
+}
+
+/// A world whose FIRST stage is created below the drop at `T` (by another writer, before the life) and whose SECOND stage is created above it
+/// (by the life's author, after the second life): a drop judged against the second one alone is ordinary, and the first one's creation, when it
+/// arrives, is a stage created below the drop.
+fn world_mixed() -> World {
+    build_world(true, true)
+}
+
+fn build_world(stages_first: bool, mixed: bool) -> World {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let a = Engine::open(&dir.path().join("kimmy.redb")).expect("the author's engine opens");
     let stage_author = stages_first.then(|| {
@@ -133,16 +144,26 @@ fn world_with(stages_first: bool) -> World {
             Engine::open(&dir.path().join("kimmy.redb")).expect("the stage author's engine opens");
         (s, dir)
     });
-    let make_stages = |a: &Engine| {
+    let make_stages = |a: &Engine, which: &[&str]| {
         let now = physical_now_ms();
-        a.create_stage(DB, FIRST, MergePolicy::Document, Hlc::new(now + 120_000, 0))
-            .expect("the first stage is created");
-        a.create_stage(DB, SECOND, MergePolicy::Document, Hlc::new(now + 121_000, 0))
-            .expect("the second stage is created");
+        for (n, stage) in which.iter().enumerate() {
+            a.create_stage(
+                DB,
+                stage,
+                MergePolicy::Document,
+                Hlc::new(now + 120_000 + 1_000 * n as u64, 0),
+            )
+            .expect("the stage is created");
+        }
+    };
+    let (before_the_life, after_the_life): (&[&str], &[&str]) = match (stages_first, mixed) {
+        (false, _) => (&[], &[FIRST, SECOND]),
+        (true, false) => (&[FIRST, SECOND], &[]),
+        (true, true) => (&[FIRST], &[SECOND]),
     };
     if let Some((s, _)) = &stage_author {
         // the stages are made by another writer, before the life: they are stamped below the drop, and the life's author never held them
-        make_stages(s);
+        make_stages(s, before_the_life);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let first = a.create_collection(DB, "orders").expect("the first life is created");
@@ -158,9 +179,7 @@ fn world_with(stages_first: bool) -> World {
     a.finish_purges_now().expect("the purge of the first life finishes");
     std::thread::sleep(std::time::Duration::from_millis(5));
     a.create_collection(DB, "orders").expect("the second life is created");
-    if !stages_first {
-        make_stages(&a);
-    }
+    make_stages(&a, after_the_life);
     let now = physical_now_ms();
     let mut all = everything(&a);
     if let Some((s, _)) = &stage_author {
@@ -999,4 +1018,250 @@ fn the_join_builds_and_reports_nothing_for_a_unique_index_at_or_below_the_drop_w
         3,
         "drop above the held floor",
     );
+}
+
+// -- F3 (Q6.5-4): a drop judged ordinary while the name's only events are parked ----------------------------------------------------------
+//
+// The member holds the first life of `orders` (created below the drop at `T`) and the stages (created above `T`: the swap began after the
+// drop ended the life). The binding is known ahead of its position, so no event of the name is in effect, and the drop that arrives next is
+// judged ordinary (a stage above it is no reason to call it logical): it buries the identity whole and leaves its tombstone. When the
+// binding is released the new physical must still be floored at `T` (decision 6): a definition of the first life that is served after the
+// flip is history on it, as it is on a member that met the drop AFTER the binding took effect (a logical drop) or the drop FIRST (the seed).
+
+/// How a parked binding takes effect.
+#[derive(Clone, Copy, Debug)]
+enum Release {
+    /// A window carrying it, in position.
+    Window,
+    /// A snapshot grant that covers it.
+    Grant,
+}
+
+const RELEASES: [Release; 2] = [Release::Window, Release::Grant];
+
+fn granted(stamp: Stamp) -> VersionVector {
+    let mut vector = VersionVector::default();
+    vector.observe(stamp);
+    vector
+}
+
+fn release_bindings(m: &Engine, bindings: &[&OplogEntry], how: Release) {
+    match how {
+        Release::Window => {
+            for bind in bindings {
+                window(m, std::slice::from_ref(bind));
+            }
+        }
+        Release::Grant => {
+            let newest = bindings.iter().map(|b| b.stamp).max().expect("a binding");
+            m.absorb_version_vector(&granted(newest)).expect("the grant is absorbed");
+        }
+    }
+}
+
+/// A member that holds the first life of the name and both stages, and has not met the drop at `T` or the second life.
+fn member_of_the_first_life(w: &World) -> (Arc<Engine>, tempfile::TempDir) {
+    let (m, d) = engine();
+    m.apply_batch(std::slice::from_ref(&w.life[0])).expect("the first life applies");
+    m.apply_batch(&w.stages).expect("the stages apply");
+    let held = m.get_collection(DB, "orders").expect("premise: the first life is held");
+    assert!(held.created < w.t, "premise: the life the drop ends was created below it");
+    for stage in [FIRST, SECOND] {
+        let created = m.get_collection(DB, stage).expect("premise: the stage is held").created;
+        assert!(created > w.t, "premise: the stage {stage} was created above the drop");
+    }
+    (m, d)
+}
+
+/// A copy of the target's definitions on `stage`, by hand (no product route gives a stage one before Q6.7): three documents, `x` stamped in
+/// the drop's own `hlc` (history once the stage is floored at the drop), and `kept` above everything.
+fn copy_on(m: &Engine, w: &World, stage: &str) {
+    let wall = w.bind_first.stamp.hlc.wall_ms;
+    window(
+        m,
+        &[
+            doc_on(w, stage, 201, wall - 8),
+            doc_on(w, stage, 202, wall - 8),
+            doc_on(w, stage, 203, wall - 8),
+            named_index_entry(&w._author.0, stage, INDEX, "t", w.t.wall_ms),
+            named_index_entry(&w._author.0, stage, "kept", "v", wall + 7),
+        ],
+    );
+    assert!(entries_of_index(m, stage, INDEX) > 0, "premise: x is on {stage} with entries");
+    assert!(entries_of_index(m, stage, "kept") > 0, "premise: kept is on {stage} with entries");
+}
+
+/// What the flip leaves of the copy on the physical it makes visible: the flip floors it at the drop, so `x` (at the drop's `hlc`) is gone
+/// with its entries and `kept` stands. The physical's own `definition_floor` is not the observable: it records the floor the join assigned,
+/// and the drop is applied by the flip itself, to the copy, without a field.
+fn the_stage_ends_as_a_floored_one(m: &Engine, stage: &str, what: &str) {
+    assert!(!index_on(m, stage), "x, a definition at the drop, is gone from {stage} ({what})");
+    assert_eq!(entries_of_index(m, stage, INDEX), 0, "and no entries of it ({what})");
+    assert!(
+        entries_of_index(m, stage, "kept") > 0,
+        "the index above the drop is present, with entries ({what})"
+    );
+}
+
+#[test]
+fn a_drop_judged_ordinary_while_the_only_binding_is_parked_still_floors_the_new_physical_when_it_is_released()
+ {
+    for how in RELEASES {
+        let w = world();
+        let (m, _d) = member_of_the_first_life(&w);
+        m.apply_batch(std::slice::from_ref(&w.bind_first)).expect("the binding is stored ahead");
+        assert_eq!(
+            logical_drops_in_effect(&m),
+            0,
+            "premise: nothing of the name is in effect ({how:?})"
+        );
+        window(&m, std::slice::from_ref(&w.life[1]));
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
+        );
+        assert_eq!(
+            m.collection_dropped_at(orders_id()).expect("reads").map(|s| s.hlc),
+            Some(w.t),
+            "premise: the id holds the drop's tombstone ({how:?})"
+        );
+        copy_on(&m, &w, FIRST);
+        release_bindings(&m, &[&w.bind_first], how);
+        assert_eq!(served(&m), FIRST, "premise: the flip ({how:?})");
+        the_stage_ends_as_a_floored_one(&m, FIRST, &format!("{how:?}"));
+    }
+}
+
+#[test]
+fn a_drop_arriving_between_two_parked_bindings_floors_both_physicals() {
+    for how in RELEASES {
+        let w = world();
+        let (m, _d) = member_of_the_first_life(&w);
+        m.apply_batch(std::slice::from_ref(&w.bind_first))
+            .expect("the first binding is stored ahead");
+        window(&m, std::slice::from_ref(&w.life[1]));
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
+        );
+        m.apply_batch(std::slice::from_ref(&w.bind_second))
+            .expect("the second binding is stored ahead");
+        // the only route to the seed here is the park of the second binding: nothing is released yet, and the drop met no event of the name
+        assert_eq!(
+            logical_drops_in_effect(&m),
+            1,
+            "an event parked after the drop seeds it at park time, with the first binding still only parked ({how:?})"
+        );
+        copy_on(&m, &w, SECOND);
+        release_bindings(&m, &[&w.bind_first, &w.bind_second], how);
+        assert_eq!(
+            served(&m),
+            SECOND,
+            "premise: both bindings took effect, the second is served ({how:?})"
+        );
+        the_stage_ends_as_a_floored_one(&m, SECOND, &format!("{how:?}"));
+    }
+}
+
+#[test]
+fn the_drop_first_and_the_binding_parked_after_it_floors_the_new_physical_as_it_always_did() {
+    // the symmetric order: the seed fires when the binding is parked, so the release finds the drop in effect
+    for how in RELEASES {
+        let w = world();
+        let (m, _d) = member_of_the_first_life(&w);
+        window(&m, std::slice::from_ref(&w.life[1]));
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
+        );
+        m.apply_batch(std::slice::from_ref(&w.bind_first)).expect("the binding is stored ahead");
+        copy_on(&m, &w, FIRST);
+        release_bindings(&m, &[&w.bind_first], how);
+        assert_eq!(served(&m), FIRST, "premise: the flip ({how:?})");
+        the_stage_ends_as_a_floored_one(&m, FIRST, &format!("{how:?}"));
+    }
+}
+
+#[test]
+fn a_stage_created_below_a_drop_judged_ordinary_makes_it_logical_when_it_arrives_while_the_names_only_binding_is_parked()
+ {
+    // The seed of the first event of a name is also run by a stage's creation (the arm that carries no event of its own). A name whose only
+    // event is parked has none in effect, so the drop that met it was judged ordinary (its stage is above the drop); the creation of a stage
+    // BELOW the drop, arriving after, is a stage the drop ended the life of, and the drop is logical at once, before the binding is released
+    for how in RELEASES {
+        let w = world_mixed();
+        assert!(
+            w.stages[0].stamp.hlc < w.t && w.t < w.stages[1].stamp.hlc,
+            "premise: the first stage was created below the drop and the second above it ({how:?})"
+        );
+        let (m, _d) = engine();
+        m.apply_batch(std::slice::from_ref(&w.life[0])).expect("the first life applies");
+        m.apply_batch(&w.stages[1..]).expect("the second stage's creation applies");
+        m.apply_batch(std::slice::from_ref(&w.bind_second)).expect("the binding is stored ahead");
+        window(&m, std::slice::from_ref(&w.life[1]));
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
+        );
+        assert_eq!(
+            logical_drops_in_effect(&m),
+            0,
+            "premise: no drop is in effect while the only binding is parked ({how:?})"
+        );
+        window(&m, std::slice::from_ref(&w.stages[0]));
+        assert_eq!(
+            logical_drops_in_effect(&m),
+            1,
+            "a stage created below the drop makes it a logical drop as it arrives ({how:?})"
+        );
+        let met_first = {
+            let (r, _dr) = engine();
+            r.apply_batch(std::slice::from_ref(&w.life[0])).expect("the first life applies");
+            r.apply_batch(&w.stages).expect("both stages' creations apply");
+            r.apply_batch(std::slice::from_ref(&w.bind_second))
+                .expect("the binding is stored ahead");
+            window(&r, std::slice::from_ref(&w.life[1]));
+            assert_eq!(
+                logical_drops_in_effect(&r),
+                1,
+                "premise: a drop that meets a stage below it is logical ({how:?})"
+            );
+            r.get_collection(DB, FIRST).is_err()
+        };
+        assert_eq!(
+            m.get_collection(DB, FIRST).is_err(),
+            met_first,
+            "the stage created below the drop ends as it does on a member that met its creation first ({how:?})"
+        );
+        copy_on(&m, &w, SECOND);
+        release_bindings(&m, &[&w.bind_second], how);
+        assert_eq!(served(&m), SECOND, "premise: the flip ({how:?})");
+        the_stage_ends_as_a_floored_one(&m, SECOND, &format!("{how:?}"));
+    }
+}
+
+#[test]
+fn a_drop_arriving_after_both_bindings_are_parked_floors_the_physical_that_is_served() {
+    // B1, B2, the drop, then the release of both: the drop is judged ordinary (every parked binding names a stage above it), and the seed
+    // runs at the release of the first of them, the only route to it
+    for how in RELEASES {
+        let w = world();
+        let (m, _d) = member_of_the_first_life(&w);
+        m.apply_batch(&[w.bind_first.clone(), w.bind_second.clone()])
+            .expect("both bindings are stored ahead");
+        window(&m, std::slice::from_ref(&w.life[1]));
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: the drop was judged ordinary and buried the identity whole ({how:?})"
+        );
+        assert_eq!(
+            logical_drops_in_effect(&m),
+            0,
+            "premise: no event of the name is in effect, so nothing is seeded before the release ({how:?})"
+        );
+        copy_on(&m, &w, SECOND);
+        release_bindings(&m, &[&w.bind_first, &w.bind_second], how);
+        assert_eq!(served(&m), SECOND, "premise: both bindings took effect ({how:?})");
+        the_stage_ends_as_a_floored_one(&m, SECOND, &format!("{how:?}"));
+    }
 }
