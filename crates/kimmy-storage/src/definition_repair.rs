@@ -43,6 +43,10 @@ pub struct DefinitionRestore {
     pub gone: usize,
     /// The collection holds more live documents than the gate.
     pub too_large: usize,
+    /// The definition went to the post-drop row of a swapped name that a drop in effect made absent, which gives it to the next physical
+    /// that becomes visible: a definition sent on, not one built. **Not a result label of the series**: its label set is fixed, so this
+    /// count is read from the result and is not in [`Self::counts`].
+    pub to_row: usize,
 }
 
 impl DefinitionRestore {

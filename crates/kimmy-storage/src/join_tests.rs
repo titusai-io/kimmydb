@@ -2320,3 +2320,462 @@ fn logical_drops_in_register(m: &Engine) -> usize {
     txn.abort().expect("the read ends");
     drops
 }
+
+// -- The repair and snapshot routes find definitions through the register (ADR-272, decision 6; Q6.5-4) -----------------------------------
+//
+// Both routes read the collection a definition belongs to by its EXACT name (`get_collection(db, name)`), which on a member that swapped the
+// name is the buried identity, or nothing: the repair counted every definition gone, and the snapshot route created the identity again or
+// judged the definition against it. They resolve the name through the register as the arms do (`definition_target`), judge a definition by
+// the one rule, and for a name absent under a drop in effect send it the way the arms send it: history at or below the drop, otherwise
+// into the post-drop row.
+
+/// A member whose bound stage serves over a drop stamped far below the binding and a little below the real clock, so a sender made now is
+/// ABOVE the drop: what such a sender offers is the new life's.
+fn flipped_over_a_drop_below_a_sender(w: &World) -> (Arc<Engine>, tempfile::TempDir, OplogEntry) {
+    let (m, d) = member(w);
+    flip(&m, &w.bind, Route::Window);
+    let drop = drop_below(w, 31_000);
+    window(&m, std::slice::from_ref(&drop));
+    assert_eq!(served(&m), BOUND, "premise: the bound stage still serves over the drop");
+    (m, d, drop)
+}
+
+fn the_page_of_a_repair(m: &Engine, sender: &Engine) -> crate::SnapshotApplied {
+    let mut progress = crate::SnapshotProgress::of_collection_definitions(
+        CollectionId::derive(DB, "orders"),
+        1_000_000,
+    );
+    let page = sender.snapshot_page(None, progress.scope()).expect("the sender's page");
+    m.apply_snapshot_page(sender.node_id(), &mut progress, &page).expect("the repair page applies")
+}
+
+#[test]
+fn a_repair_page_naming_an_index_above_the_drop_that_the_receiver_lacks_builds_it_on_the_visible_stage()
+ {
+    let w = world();
+    let (m, _d, drop) = flipped_over_a_drop_below_a_sender(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let created = a
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .and_then(|i| i.created)
+        .expect("the sender's index carries its stamp");
+    assert!(
+        created.hlc > drop.stamp.hlc,
+        "premise: the sender's index is above the drop: the new life's"
+    );
+    assert!(!holds(&m, BOUND, "by_t"), "premise: the receiver lacks it");
+    let done = the_page_of_a_repair(&m, &a);
+    assert_eq!(
+        done.definitions.built, 1,
+        "the repair finds the visible stage through the name and builds the index there ({:?})",
+        done.definitions
+    );
+    assert!(holds(&m, BOUND, "by_t"), "the index is on the visible stage");
+}
+
+#[test]
+fn a_repair_page_naming_an_index_the_visible_stage_has_a_tombstone_for_counts_it_tombstoned() {
+    let w = world();
+    let (m, _d, _drop) = flipped_over_a_drop_below_a_sender(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let created = a
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .and_then(|i| i.created)
+        .expect("the sender's index carries its stamp");
+    // this member dropped the index after the sender made it: the tombstone is under the physical that stands, never the identity's
+    let at = Stamp::new(
+        Hlc::new(created.hlc.wall_ms + 5_000, 0),
+        author(&w).node_id(),
+        author(&w).epoch(),
+    );
+    let bound = m.get_collection(DB, BOUND).expect("the stage is held").id;
+    m.record_index_drop(bound, kimmy_core::IndexMeta::derive_id("by_t"), at)
+        .expect("the tombstone is recorded");
+    let done = the_page_of_a_repair(&m, &a);
+    assert_eq!(
+        done.definitions.tombstoned, 1,
+        "the tombstone under the standing physical's id is read ({:?})",
+        done.definitions
+    );
+    assert!(!holds(&m, BOUND, "by_t"), "and nothing is built");
+}
+
+#[test]
+fn a_repair_page_for_a_swapped_name_that_is_absent_counts_a_definition_at_or_below_the_drop_history_and_never_gone()
+ {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    window(&m, std::slice::from_ref(&logical_drop(&w, 5)));
+    assert!(absent(&m), "premise: the name is absent under the drop in effect");
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let created = a
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .and_then(|i| i.created)
+        .expect("the sender's index carries its stamp");
+    assert!(
+        created.hlc <= logical_drop(&w, 5).stamp.hlc,
+        "premise: the sender's index is at or below the drop: the dropped life's"
+    );
+    let done = the_page_of_a_repair(&m, &a);
+    assert_eq!(
+        (done.definitions.history, done.definitions.gone),
+        (1, 0),
+        "an absent swapped name judges the definition as the arms do, and is never counted gone ({:?})",
+        done.definitions
+    );
+}
+
+#[test]
+fn a_snapshot_page_of_a_life_newer_than_the_identitys_tombstone_creates_no_identity_beside_a_swapped_name_and_its_index_lands_on_the_visible_stage()
+ {
+    // The identity's rows are still filed under its id (no purger runs in a unit test): the page is not held up by them (the purge gate
+    // skips a swapped name), and it creates no identity.
+    a_newer_life_page_creates_no_identity_and_its_index_lands_on_the_stage(false);
+}
+
+#[test]
+fn the_same_page_when_the_identitys_rows_are_already_purged_creates_no_identity_either() {
+    // With nothing left to wait for, the page would make `orders` again were it not for the swapped branch: the assertion that no identity
+    // is made is reached here (with the rows pending, the old create branch stalls on the purge before it can make one).
+    a_newer_life_page_creates_no_identity_and_its_index_lands_on_the_stage(true);
+}
+
+fn a_newer_life_page_creates_no_identity_and_its_index_lands_on_the_stage(purged: bool) {
+    // AUDIT: `restore_collection` created the page's collection whenever the exact name was absent, so a swapped name whose identity is buried
+    // got an ordinary `orders` again (a sender whose life is newer than the tombstone the burial left), and the index was judged against that.
+    // The tombstone is set by hand: a burial leaves it at the binding's stamp, which is above any sender a test can build.
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    {
+        let low = Stamp::new(Hlc::new(1, 0), author(&w).node_id(), author(&w).epoch());
+        let txn = m.begin_write(crate::WriterHolder::Ddl).expect("a writer");
+        txn.open_table(crate::tables::COLLECTIONS_DROPPED)
+            .expect("the table opens")
+            .insert(CollectionId::derive(DB, "orders").0, crate::codec::oplog_key(&low).as_slice())
+            .expect("the tombstone is lowered");
+        txn.commit().expect("the commit lands");
+    }
+    assert!(
+        a.get_collection(DB, "orders").expect("the sender holds it").index("by_t").is_some(),
+        "premise: the page offers the index"
+    );
+    assert!(m.get_collection(DB, "orders").is_err(), "premise: the identity is buried here");
+    let identity = CollectionId::derive(DB, "orders");
+    if purged {
+        m.purge_dropped_collection(identity).expect("the identity's purge runs");
+        assert!(
+            !m.purge_pending(identity).expect("reads"),
+            "premise: nothing of the identity's is left to purge"
+        );
+    } else {
+        assert!(
+            m.purge_pending(identity).expect("reads"),
+            "premise: the identity's rows are still pending a purge"
+        );
+    }
+    apply_the_pages(&m, &a);
+    assert!(
+        m.get_collection(DB, "orders").is_err(),
+        "no ordinary `orders` is created beside the swapped name"
+    );
+    assert!(
+        holds(&m, BOUND, "by_t"),
+        "the index the page offers lands on the visible stage, through the name"
+    );
+}
+
+/// The index the sender's page is made to name: one this build refuses (an empty partial filter has no meaning), stamped as the sender's
+/// own index is, so it is above the floor and the drop and reaches the build.
+fn an_index_this_build_refuses(sender: &Engine) -> kimmy_core::IndexMeta {
+    let mut index = sender
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .expect("the sender holds the index")
+        .clone();
+    index.name = "pf_empty".into();
+    index.id = kimmy_core::IndexMeta::derive_id("pf_empty");
+    index.partial_filter = Some(bson::doc! {});
+    index
+}
+
+#[test]
+fn a_snapshot_page_offering_an_index_the_visible_stage_refuses_leaves_its_hint_under_the_physical_that_stands_and_the_burial_clears_it()
+ {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let identity = CollectionId::derive(DB, "orders");
+    let bound = CollectionId::derive(DB, BOUND);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let mut progress = crate::SnapshotProgress::of_collection(identity);
+    let mut page = a.snapshot_page(None, progress.scope()).expect("the sender's page");
+    assert_eq!(page.collections.len(), 1, "premise: the page carries the collection");
+    page.collections[0].indexes = vec![an_index_this_build_refuses(&a)];
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty()
+            && m.refusal_hints(bound).expect("reads").is_empty(),
+        "premise: no hint under either id"
+    );
+    let done = m.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the page applies");
+    assert_eq!(done.ddl_refused, 1, "premise: the member refused the index");
+    assert_eq!(
+        m.refusal_hints(bound).expect("reads").len(),
+        1,
+        "the snapshot route's hint is under the physical that stands"
+    );
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty(),
+        "and none is under the identity's id, which nothing clears"
+    );
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(served(&m), UNBOUND, "premise: the second flip buries the first physical");
+    assert!(
+        m.refusal_hints(bound).expect("reads").is_empty(),
+        "the burial clears the snapshot route's hint with the physical"
+    );
+}
+
+#[test]
+fn a_repair_page_offering_an_index_the_visible_stage_refuses_leaves_its_hint_under_the_physical_that_stands()
+ {
+    let w = world();
+    let (m, _d, drop) = flipped_over_a_drop_below_a_sender(&w);
+    let identity = CollectionId::derive(DB, "orders");
+    let bound = CollectionId::derive(DB, BOUND);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let refused = an_index_this_build_refuses(&a);
+    assert!(
+        refused.created.is_some_and(|created| created.hlc > drop.stamp.hlc),
+        "premise: the index is above the drop, so it reaches the build"
+    );
+    let mut progress = crate::SnapshotProgress::of_collection_definitions(identity, 1_000_000);
+    let mut page = a.snapshot_page(None, progress.scope()).expect("the sender's page");
+    assert_eq!(page.collections.len(), 1, "premise: the page carries the collection");
+    page.collections[0].indexes = vec![refused];
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty()
+            && m.refusal_hints(bound).expect("reads").is_empty(),
+        "premise: no hint under either id"
+    );
+    let done =
+        m.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the repair page applies");
+    assert_eq!(
+        done.definitions.refused, 1,
+        "premise: the repair counted the index refused ({:?})",
+        done.definitions
+    );
+    assert_eq!(
+        m.refusal_hints(bound).expect("reads").len(),
+        1,
+        "the repair route's hint is under the physical that stands"
+    );
+    assert!(
+        m.refusal_hints(identity).expect("reads").is_empty(),
+        "and none is under the identity's id, which nothing clears"
+    );
+}
+
+#[test]
+fn the_definition_repair_reads_no_collection_by_its_exact_name() {
+    // a source guard in the manner of `resolve_door.rs`: the repair's reads go through the register's door
+    let source = include_str!("definition_repair.rs");
+    assert!(
+        !source.contains("self.get_collection(&state.db, &state.name)"),
+        "definition_repair.rs finds a collection by `get_collection(db, name)`: use `definition_target`"
+    );
+}
+
+#[test]
+fn a_definition_repair_page_naming_an_index_at_or_below_the_drop_counts_it_history_on_the_recreation()
+ {
+    let w = world();
+    let (m, _d, physical, drop) = recreation_visible_over_the_drop_in_effect(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let created = a
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .expect("the sender holds the index")
+        .created
+        .expect("the index carries its stamp");
+    assert!(created.hlc < drop.stamp.hlc, "premise: the index is the dropped life's");
+    let mut progress = crate::SnapshotProgress::of_collection_definitions(
+        CollectionId::derive(DB, "orders"),
+        1_000_000,
+    );
+    let page = a.snapshot_page(None, progress.scope()).expect("the sender's page");
+    let done =
+        m.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the repair page applies");
+    assert_eq!(
+        done.definitions.history, 1,
+        "the repair judges the definition by the one rule: history on the recreation ({:?})",
+        done.definitions
+    );
+    assert!(!holds(&m, &physical, "by_t"), "and nothing is built on the recreation");
+}
+
+/// A member that holds the stages and an identity, with a logical drop of the name in effect stamped at the real clock: the name is absent,
+/// and a sender made a little later is ABOVE the drop, so what it offers is the new life's.
+fn absent_under_a_drop_below_a_sender(w: &World) -> (Arc<Engine>, tempfile::TempDir, OplogEntry) {
+    let (m, d) = member(w);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let drop = OplogEntry {
+        stamp: Stamp::new(Hlc::new(physical_now_ms(), 0), author(w).node_id(), author(w).epoch()),
+        kind: OpKind::DropCollection,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders"))
+                .expect("the drop encodes"),
+        ),
+        meta: None,
+    };
+    window(&m, std::slice::from_ref(&drop));
+    assert!(absent(&m), "premise: the name is absent under the drop in effect");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    (m, d, drop)
+}
+
+#[test]
+fn a_repair_page_naming_an_index_above_the_drop_for_an_absent_swapped_name_is_written_to_the_row_and_built_when_the_next_physical_is_visible()
+ {
+    let w = world();
+    let (m, _d, drop) = absent_under_a_drop_below_a_sender(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let created = a
+        .get_collection(DB, "orders")
+        .expect("the sender holds it")
+        .index("by_t")
+        .and_then(|i| i.created)
+        .expect("the sender's index carries its stamp");
+    assert!(created.hlc > drop.stamp.hlc, "premise: the sender's index is above the drop");
+    let done = the_page_of_a_repair(&m, &a);
+    assert_eq!(
+        (done.definitions.to_row, done.definitions.gone, done.definitions.built),
+        (1, 0, 0),
+        "an absent swapped name sends it to the post-drop row: not gone, and not built ({:?})",
+        done.definitions
+    );
+    assert_eq!(names(&the_row(&m)), vec!["by_t".to_string()], "the row holds it");
+    m.create_collection(DB, "orders").expect("the name is made again");
+    assert!(holds(&m, &served(&m), "by_t"), "the next physical that becomes visible has it");
+}
+
+#[test]
+fn a_snapshot_page_naming_an_index_above_the_drop_for_an_absent_swapped_name_is_written_to_the_row()
+{
+    let w = world();
+    let (m, _d, drop) = absent_under_a_drop_below_a_sender(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    assert!(
+        a.get_collection(DB, "orders")
+            .expect("the sender holds it")
+            .index("by_t")
+            .and_then(|i| i.created)
+            .is_some_and(|created| created.hlc > drop.stamp.hlc),
+        "premise: the page offers an index above the drop"
+    );
+    apply_the_pages(&m, &a);
+    assert_eq!(names(&the_row(&m)), vec!["by_t".to_string()], "the row holds it");
+    assert!(
+        m.get_collection(DB, "orders").is_err(),
+        "and no identity is made beside the swapped name"
+    );
+}
+
+#[test]
+fn a_snapshot_page_of_an_older_sender_is_judged_per_definition_and_not_refused_whole_by_the_natural_tombstone()
+ {
+    // The commonest page: a sender whose identity predates the flip, against the tombstone the burial left (the binding's stamp). It used to
+    // be refused whole as an older life; the swapped name judges each definition, as the arms do (a behaviour change, intended): the old
+    // identity's index lands on the stage, no ordinary `orders` is made, and the page's documents are history.
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    let sender = a.get_collection(DB, "orders").expect("the sender holds it");
+    a.insert(&sender, doc! { "_id": 901, "t": 1 }).expect("the sender holds a document");
+    assert!(m.get_collection(DB, "orders").is_err(), "premise: the identity is buried here");
+    assert!(
+        m.collection_dropped_at(CollectionId::derive(DB, "orders"))
+            .expect("reads")
+            .is_some_and(|tombstone| sender.created < tombstone.hlc),
+        "premise: the sender's life is older than the tombstone the burial left"
+    );
+    apply_the_pages(&m, &a);
+    assert!(holds(&m, BOUND, "by_t"), "the old identity's index lands on the stage");
+    assert!(m.get_collection(DB, "orders").is_err(), "no ordinary `orders` is made");
+    assert!(!has_doc(&m, BOUND, 901), "the page's documents are history: they are not the stage's");
+}
+
+#[test]
+fn a_snapshot_page_of_a_swapped_name_older_than_its_databases_drop_is_refused_and_leaves_the_tombstone_a_later_entry_needs()
+ {
+    // ADR-229: the early branch for a swapped name must keep the database's refusal the create branch makes, so that the entries which follow
+    // are history and not a stop
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w.bind, Route::Window);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    assert!(m.drop_database(DB).expect("the database drops"), "premise: the database is dropped");
+    {
+        use redb::ReadableDatabase;
+        let txn = m.db().begin_read().expect("a read");
+        assert!(
+            crate::register::is_swapped(&txn, DB, "orders").expect("the register reads"),
+            "premise: the name is still swapped after the drop (its register rows survive the burial), or the page takes the ordinary create branch"
+        );
+    }
+    let dropped = m
+        .database_dropped_at(DB)
+        .expect("reads")
+        .expect("premise: the database holds its tombstone");
+    let id = CollectionId::derive(DB, "orders");
+    assert_ne!(
+        m.collection_dropped_at(id).expect("reads"),
+        Some(dropped),
+        "premise: the name's own tombstone is not yet at the database's drop"
+    );
+    apply_the_pages(&m, &a);
+    assert_eq!(
+        m.collection_dropped_at(id).expect("reads"),
+        Some(dropped),
+        "the refusal leaves the collection's tombstone at the database's drop"
+    );
+}
+
+#[test]
+fn a_repair_page_for_a_swapped_name_whose_visible_stage_holds_more_than_the_gate_is_counted_too_large_and_builds_nothing()
+ {
+    // the live count is read under the physical that stands: the identity's id has no rows, so a count read there would pass the gate
+    let w = world();
+    let (m, _d, _drop) = flipped_over_a_drop_below_a_sender(&w);
+    let (a, _da) = a_sender_with_an_old_index("by_t");
+    assert!(
+        m.count_by_id(m.get_collection(DB, BOUND).expect("the stage is held").id)
+            .expect("the count reads")
+            .is_some_and(|live| live > 1),
+        "premise: the visible stage holds more documents than the gate"
+    );
+    let mut progress =
+        crate::SnapshotProgress::of_collection_definitions(CollectionId::derive(DB, "orders"), 1);
+    let page = a.snapshot_page(None, progress.scope()).expect("the sender's page");
+    let done =
+        m.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the repair page applies");
+    assert_eq!(
+        done.definitions.too_large, 1,
+        "the visible stage's live count is over the gate ({:?})",
+        done.definitions
+    );
+    assert!(!holds(&m, BOUND, "by_t"), "and nothing is built");
+}
