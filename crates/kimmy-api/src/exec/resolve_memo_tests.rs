@@ -15,7 +15,7 @@ fn root() -> Auth {
 }
 
 /// Flip `orders` to a stage on this member, the way a replicated swap does: the stage's creation, then the binding in a window.
-fn flip(state: &SharedState) -> String {
+pub(super) fn flip(state: &SharedState) -> String {
     let stage = "orders.__stg.memo";
     let engine = &state.engine;
     engine
@@ -81,7 +81,7 @@ fn flip(state: &SharedState) -> String {
     stage.to_string()
 }
 
-fn state_with_orders() -> (SharedState, tempfile::TempDir) {
+pub(super) fn state_with_orders() -> (SharedState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let state = live_state(&dir);
     seed_docs(&state, "orders", vec![bson::doc! { "_id": 1, "v": "a" }]);
