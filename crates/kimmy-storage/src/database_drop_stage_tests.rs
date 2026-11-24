@@ -220,7 +220,7 @@ fn pull(into: &Engine, from: &Engine) {
     }
 }
 
-/// The exact order of hardproblems' 1b: the author's staging rows are stamped after the drop D, and its binding after the rows; the dropper
+/// The exact order of case 1b: the author's staging rows are stamped after the drop D, and its binding after the rows; the dropper
 /// and a third member hear the drop first, a fourth holds the stage and its row when the drop reaches it and the binding arrives after
 /// it. On the old code the member that held the row keeps a partial stage, the binding makes it visible, and the repair rounds spread it.
 #[test]
