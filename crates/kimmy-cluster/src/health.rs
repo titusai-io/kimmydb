@@ -194,7 +194,10 @@ impl PeerHealth {
     /// warning clock is kept, so a peer that flaps does not warn on every return. Nothing is recorded for a peer with no
     /// failures.
     pub fn came_up(&mut self, peer: SocketAddr, now: Instant) {
-        let _ = (peer, now); // NOT BUILT: the tests of the change come first and are red on this
+        if let Some(entry) = self.state.get_mut(&peer) {
+            entry.failures = 0;
+            entry.next_attempt = now;
+        }
     }
 
     /// Consecutive failures recorded for a peer.
@@ -220,8 +223,9 @@ pub struct ListedLive {
 impl ListedLive {
     /// Record `live` as this tick's listing and return the addresses in it that the tick before did not list.
     pub fn newly_listed(&mut self, live: &BTreeSet<SocketAddr>) -> Vec<SocketAddr> {
-        let _ = live; // NOT BUILT: the tests of the change come first and are red on this
-        Vec::new()
+        let new = live.difference(&self.listed).copied().collect();
+        self.listed = live.clone();
+        new
     }
 }
 
