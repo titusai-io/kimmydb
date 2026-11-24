@@ -176,6 +176,9 @@ mod carried_drop_tests;
 mod swap_routes_tests;
 
 #[cfg(test)]
+mod backup_register_tests;
+
+#[cfg(test)]
 mod definition_door_tests;
 #[cfg(test)]
 mod recreate_tests;

@@ -567,6 +567,19 @@ pub fn restore_with(
     Ok(BackupInfo { node: Some(node), created_ms, records, bytes })
 }
 
+// A test hook: runs once, on this thread, after every check has passed and before the store is published. Declared here for the tests
+// commit, which only has to compile: nothing in the product calls it until the code commit makes the restore publish a temporary file.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_publish_for_tests(hook: impl FnOnce() + 'static) {
+    BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 fn read_chunk(input: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     input

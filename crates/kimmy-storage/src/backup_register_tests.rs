@@ -1,0 +1,881 @@
+//! The backup carries the register (ADR-272, decisions 4, 6 and 13; Q6.6, unit A). A backup is the logical form of a store: every table that
+//! decides what the store means. REGISTER, REGISTER_INFO, REGISTER_STAGES and the post-drop row decide which physical a swapped name answers
+//! from, what is still only information, and what a name's next physical takes, and none of them was carried: a restored member that had
+//! swapped a name lost the swap (the buried identity was not in the backup and nothing named the stage), or held a stage nothing could bind.
+//!
+//! Each test makes a swap, takes the backup, restores it into a new store and asks what the restored member says. The premises are asserted
+//! before the backup: a restore that "works" on a store with no swap proves nothing.
+
+use std::sync::Arc;
+
+use bson::doc;
+use kimmy_core::{
+    CollectionBind, CollectionId, DocId, Enforcement, Hlc, IndexCreate, IndexField, MergePolicy,
+    OpKind, OplogEntry, Stamp, VersionVector,
+};
+use redb::{ReadableDatabase, ReadableTable};
+
+use crate::{Engine, PeerWindow, SyncOutcome, WalkScope, physical_now_ms};
+
+const DB: &str = "app";
+/// A stage that is never bound.
+const UNBOUND: &str = "orders.__stg.a0";
+const BOUND: &str = "orders.__stg.a1";
+
+fn engine() -> (Arc<Engine>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    (Arc::new(Engine::open(&dir.path().join("kimmy.redb")).expect("an engine opens")), dir)
+}
+
+fn everything(from: &Engine) -> Vec<OplogEntry> {
+    from.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background)
+        .expect("the oplog is readable")
+        .entries
+}
+
+fn window(b: &Engine, entries: &[OplogEntry]) -> SyncOutcome {
+    let mut theirs = VersionVector::default();
+    for entry in entries {
+        theirs.observe(entry.stamp);
+    }
+    let mine = b.witnessed_vector().expect("the vector reads");
+    let mut outcome = SyncOutcome::default();
+    b.apply_peer_window_into(
+        &theirs,
+        Some(&mine),
+        entries,
+        PeerWindow {
+            scanned_to: entries.last().map_or(Hlc::ZERO, |e| e.stamp.hlc),
+            exhausted: true,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    )
+    .expect("the window applies");
+    outcome
+}
+
+fn orders_id() -> CollectionId {
+    CollectionId::derive(DB, "orders")
+}
+
+fn bind_of(by: &Engine, wall_ms: u64, physical: &str) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::BindCollection,
+        collection: orders_id(),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&CollectionBind {
+                db: DB.into(),
+                name: "orders".into(),
+                physical: physical.into(),
+            })
+            .expect("the binding encodes"),
+        ),
+        meta: None,
+    }
+}
+
+fn drop_of(by: &Engine, wall_ms: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::DropCollection,
+        collection: orders_id(),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders"))
+                .expect("the drop encodes"),
+        ),
+        meta: None,
+    }
+}
+
+/// An index made to the logical name `orders` by `by` at `wall_ms`.
+fn index_entry(by: &Engine, name: &str, path: &str, wall_ms: u64) -> OplogEntry {
+    let index = kimmy_core::IndexMeta {
+        id: kimmy_core::IndexMeta::derive_id(name),
+        name: name.into(),
+        fields: vec![IndexField::ascending(path)],
+        unique: false,
+        enforcement: Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: None,
+    };
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::CreateIndex,
+        collection: orders_id(),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&IndexCreate {
+                db: DB.into(),
+                collection: "orders".into(),
+                index,
+            })
+            .expect("the creation body encodes"),
+        ),
+        meta: None,
+    }
+}
+
+/// The author of the swap: both stages' creations and the entries, not yet delivered to anyone.
+struct World {
+    creations: Vec<OplogEntry>,
+    bind: OplogEntry,
+    bind_second: OplogEntry,
+    author: Engine,
+    _dir: tempfile::TempDir,
+}
+
+fn world() -> World {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let author = Engine::open(&dir.path().join("kimmy.redb")).expect("the author's engine opens");
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    author.create_stage(DB, UNBOUND, MergePolicy::Document, deadline).expect("the unbound stage");
+    author.create_stage(DB, BOUND, MergePolicy::Document, deadline).expect("the bound stage");
+    let creations: Vec<OplogEntry> = everything(&author)
+        .into_iter()
+        .filter(|e| e.kind == OpKind::CreateCollection)
+        .filter(|e| {
+            e.collection == CollectionId::derive(DB, UNBOUND)
+                || e.collection == CollectionId::derive(DB, BOUND)
+        })
+        .collect();
+    assert_eq!(creations.len(), 2, "premise: both stages' creations");
+    // far enough above the real clock that no member built in a test is made after the author's stamps (the margin of `join_tests`)
+    let wall = creations
+        .iter()
+        .map(|e| e.stamp.hlc.wall_ms)
+        .max()
+        .expect("two creations")
+        .max(physical_now_ms())
+        + 30_000;
+    let bind = bind_of(&author, wall, BOUND);
+    let bind_second = bind_of(&author, wall + 10, UNBOUND);
+    World { creations, bind, bind_second, author, _dir: dir }
+}
+
+fn at(w: &World, offset: u64) -> u64 {
+    w.bind.stamp.hlc.wall_ms + offset
+}
+
+/// A member holding `orders` with two documents and both stages' creations; the bound stage holds three documents of its own.
+fn member(w: &World) -> (Arc<Engine>, tempfile::TempDir) {
+    let (m, d) = engine();
+    let orders = m.create_collection(DB, "orders").expect("the identity is created");
+    m.insert(&orders, doc! { "_id": 1, "v": 1, "t": 1 }).expect("a document");
+    m.insert(&orders, doc! { "_id": 2, "v": 2, "t": 2 }).expect("a document");
+    m.apply_batch(&w.creations).expect("the stages' creations apply");
+    let stage = m.get_collection(DB, BOUND).expect("premise: the bound stage is held");
+    for id in 10..13 {
+        m.insert(&stage, doc! { "_id": id, "v": id, "t": id }).expect("the job's output");
+    }
+    (m, d)
+}
+
+fn flip(m: &Engine, w: &World) {
+    window(m, std::slice::from_ref(&w.bind));
+    assert_eq!(served(m), BOUND, "premise: the flip is visible");
+}
+
+fn served(m: &Engine) -> String {
+    m.resolve(DB, "orders").expect("the name resolves").physical
+}
+
+/// What the name resolves to, as a value an assertion can compare: a restored member that cannot resolve it fails ON the assertion's message
+/// and not in a helper's `expect`.
+fn resolves(m: &Engine) -> std::result::Result<String, String> {
+    m.resolve(DB, "orders").map(|resolved| resolved.physical).map_err(|e| e.to_string())
+}
+
+/// What the register holds of `orders`: the events in effect, and the ones known ahead of their position.
+fn in_effect(m: &Engine) -> usize {
+    let txn = m.db().begin_read().expect("a read");
+    crate::register::timeline_read(&txn, DB, "orders").expect("the register reads").events().len()
+}
+
+fn parked(m: &Engine) -> usize {
+    let txn = m.db().begin_read().expect("a read");
+    crate::register::parked_read(&txn, DB, "orders").expect("the register reads").events().len()
+}
+
+fn logical_drops(m: &Engine) -> usize {
+    let txn = m.db().begin_read().expect("a read");
+    crate::register::timeline_read(&txn, DB, "orders")
+        .expect("the register reads")
+        .events()
+        .iter()
+        .filter(|(_, event)| event.physical().is_none())
+        .count()
+}
+
+fn backup_of(e: &Engine) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    e.backup_to(&mut bytes, WalkScope::Request).expect("the backup is written");
+    bytes
+}
+
+fn restored(bytes: &[u8]) -> (Engine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    crate::backup::restore(&path, &mut &bytes[..]).expect("the backup restores");
+    (Engine::open(&path).expect("the restored store opens"), dir)
+}
+
+fn has_doc(m: &Engine, physical: &str, id: i64) -> bool {
+    let coll = m.get_collection(DB, physical).expect("the physical is held");
+    m.get(&coll, &DocId::Int64(id)).expect("the physical reads").is_some()
+}
+
+fn holds(m: &Engine, physical: &str, index: &str) -> bool {
+    m.get_collection(DB, physical).is_ok_and(|c| c.index(index).is_some())
+}
+
+// -- Tests 1 to 5: what the restored member says ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_swap_whose_binding_retention_has_collected_resolves_to_the_stage_after_a_restore() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    m.collect_oplog_entry_for_test(&w.bind.stamp);
+    assert!(
+        everything(&m).iter().all(|e| e.stamp != w.bind.stamp),
+        "premise: the binding's entry is no longer in the oplog"
+    );
+    assert_eq!(served(&m), BOUND, "premise: the name still resolves to the stage");
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        resolves(&r),
+        Ok(BOUND.to_string()),
+        "the restored member serves the stage, as the member it came from did"
+    );
+    assert!(has_doc(&r, BOUND, 10), "with the job's documents");
+    assert!(r.get_collection(DB, "orders").is_err(), "and the identity is still buried");
+}
+
+#[test]
+fn a_dropped_swapped_name_reads_absent_after_a_restore_with_the_same_events_and_recreates_as_a_recreation()
+ {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, std::slice::from_ref(&drop_of(&w.author, at(&w, 5))));
+    assert!(m.resolve(DB, "orders").is_err(), "premise: the name reads absent");
+    assert_eq!(
+        (in_effect(&m), logical_drops(&m)),
+        (2, 1),
+        "premise: the register holds the binding and the drop"
+    );
+    let (r, _dr) = restored(&backup_of(&m));
+    assert!(r.resolve(DB, "orders").is_err(), "the restored name reads absent");
+    assert_eq!(
+        (in_effect(&r), logical_drops(&r)),
+        (2, 1),
+        "the restored register holds the same two events"
+    );
+    r.create_collection(DB, "orders").expect("the name is made again");
+    assert!(
+        kimmy_core::is_recreation_name(&served(&r)),
+        "a create of a swapped name that was dropped is a recreation, not an ordinary collection"
+    );
+}
+
+#[test]
+fn a_binding_that_is_only_parked_is_still_parked_and_held_after_a_restore_and_a_window_releases_it()
+{
+    let w = world();
+    let (m, _d) = member(&w);
+    m.apply_batch(std::slice::from_ref(&w.bind)).expect("the binding is stored ahead");
+    assert_eq!(
+        (parked(&m), in_effect(&m)),
+        (1, 0),
+        "premise: the binding is information only, and the identity still answers"
+    );
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        (parked(&r), in_effect(&r)),
+        (1, 0),
+        "still parked after the restore, and not in effect"
+    );
+    assert_eq!(served(&r), "orders", "the identity still answers");
+    window(&r, std::slice::from_ref(&w.bind));
+    assert_eq!(served(&r), BOUND, "a window releases it and the flip happens");
+}
+
+#[test]
+fn the_post_drop_row_survives_a_restore_and_the_next_recreate_takes_it() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, &[index_entry(&w.author, "late_1", "v", at(&w, 7))]);
+    window(&m, std::slice::from_ref(&drop_of(&w.author, at(&w, 5))));
+    assert!(m.resolve(DB, "orders").is_err(), "premise: the name is absent");
+    assert!(
+        crate::register::post_row_for_tests(&m, DB, "orders").expect("readable").is_some(),
+        "premise: the post-drop row exists"
+    );
+    let (r, _dr) = restored(&backup_of(&m));
+    let row = crate::register::post_row_for_tests(&r, DB, "orders").expect("readable");
+    assert!(
+        row.as_ref().is_some_and(|row| row.indexes.iter().any(|i| i.name == "late_1")),
+        "the restored member holds the row with its definition"
+    );
+    r.create_collection(DB, "orders").expect("the name is made again");
+    assert!(holds(&r, &served(&r), "late_1"), "the recreation takes the row's definition");
+}
+
+#[test]
+fn a_drop_the_seed_put_in_the_register_is_carried_and_in_effect_after_a_restore() {
+    let w = world();
+    // the member applied the drop as a plain drop first (it knew of no swap), then met the swap: the seed made the tombstone a logical drop
+    let (m, _d) = engine();
+    m.create_collection(DB, "orders").expect("the identity is created");
+    let drop = drop_of(&w.author, at(&w, 5));
+    window(&m, std::slice::from_ref(&drop));
+    assert_eq!(
+        m.collection_dropped_at(orders_id()).expect("reads"),
+        Some(drop.stamp),
+        "premise: the drop is the identity's tombstone"
+    );
+    m.apply_batch(&w.creations).expect("the stages' creations apply");
+    window(&m, std::slice::from_ref(&w.bind_second));
+    assert_eq!(served(&m), UNBOUND, "premise: the flip over the drop");
+    assert_eq!(
+        logical_drops(&m),
+        1,
+        "premise: the drop is in REGISTER, put there by the seed, at the tombstone's stamp"
+    );
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(logical_drops(&r), 1, "the seeded drop is carried and in effect after the restore");
+    assert_eq!(
+        resolves(&r),
+        Ok(UNBOUND.to_string()),
+        "and the name answers from the stage that flipped over it"
+    );
+}
+
+// -- Test 10: the definition floor across a backup (the manager's addition to unit A; the B4 note's carry line) ----------------------------
+//
+// 10a: a stage that holds a floor, restored, holds the same floor (a pin), and through the restored name a definition at or below it is history.
+// 10b: a name whose post-drop row holds a floor, restored, holds the same floor in the row, and the next physical takes it, and the first
+// life's index delivered after that is history there. Mutant (both): the metadata or the row re-encoded without the field.
+
+/// A flipped member whose bound stage holds the floor `W + 3`.
+fn a_member_whose_stage_holds_a_floor() -> (World, Arc<Engine>, tempfile::TempDir, Hlc) {
+    let w = world();
+    let (m, d) = member(&w);
+    flip(&m, &w);
+    let floor = Hlc::new(at(&w, 3), 0);
+    let mut stage = m.get_collection(DB, BOUND).expect("the stage is held");
+    stage.definition_floor = Some(floor);
+    let txn = m.begin_write(crate::WriterHolder::Ddl).expect("a writer");
+    Engine::put_collection_meta(&txn, &stage).expect("the metadata is written");
+    txn.commit().expect("the commit lands");
+    (w, m, d, floor)
+}
+
+#[test]
+fn a_stages_definition_floor_is_equal_after_a_restore() {
+    // PINS a carry that COLLECTIONS already makes (the field rides in the collection's metadata): green before the register is carried, and
+    // keeps the floor from being lost when the carry is built. What the floor DOES after the restore is the next test, which needs the carry.
+    let (_w, m, _d, floor) = a_member_whose_stage_holds_a_floor();
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        r.get_collection(DB, BOUND).expect("the stage is held").definition_floor,
+        Some(floor),
+        "the restored stage holds the floor it held"
+    );
+}
+
+#[test]
+fn a_definition_at_or_below_a_restored_stages_floor_is_history_through_the_name_and_one_above_it_is_applied()
+ {
+    let (w, m, _d, _floor) = a_member_whose_stage_holds_a_floor();
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        resolves(&r),
+        Ok(BOUND.to_string()),
+        "premise: the restored name resolves to the stage (the register is carried)"
+    );
+    window(
+        &r,
+        &[
+            index_entry(&w.author, "at_floor", "t", at(&w, 3)),
+            index_entry(&w.author, "above_floor", "v", at(&w, 6)),
+        ],
+    );
+    assert!(
+        !holds(&r, BOUND, "at_floor"),
+        "a definition at the floor is history on the restored member"
+    );
+    assert!(
+        holds(&r, BOUND, "above_floor"),
+        "and one above it is applied: the floor is not a wall"
+    );
+}
+
+#[test]
+fn the_post_drop_rows_floor_survives_a_restore() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let floor = Hlc::new(at(&w, 3), 0);
+    {
+        let mut stage = m.get_collection(DB, BOUND).expect("the stage is held");
+        stage.definition_floor = Some(floor);
+        let txn = m.begin_write(crate::WriterHolder::Ddl).expect("a writer");
+        Engine::put_collection_meta(&txn, &stage).expect("the metadata is written");
+        txn.commit().expect("the commit lands");
+    }
+    window(&m, std::slice::from_ref(&drop_of(&w.author, at(&w, 5))));
+    let row = crate::register::post_row_for_tests(&m, DB, "orders").expect("readable");
+    assert_eq!(
+        row.and_then(|row| row.definition_floor),
+        Some(floor),
+        "premise: the burial wrote the stage's floor into the row"
+    );
+    let (r, _dr) = restored(&backup_of(&m));
+    let row = crate::register::post_row_for_tests(&r, DB, "orders").expect("readable");
+    assert_eq!(
+        row.and_then(|row| row.definition_floor),
+        Some(floor),
+        "the restored row carries its floor, and the next physical takes it"
+    );
+    r.create_collection(DB, "orders").expect("the name is made again");
+    let recreation = served(&r);
+    assert_eq!(
+        r.get_collection(DB, &recreation).expect("the recreation is held").definition_floor,
+        Some(floor),
+        "the recreation took the row's floor"
+    );
+    window(&r, &[index_entry(&w.author, "first_life", "t", at(&w, 3))]);
+    assert!(
+        !holds(&r, &recreation, "first_life"),
+        "the first life's index, delivered after the restore, is history on the recreation"
+    );
+}
+
+// -- Test 6: the refusals --------------------------------------------------------------------------------------------------------------
+//
+// A backup is a header and a run of records (tag, key, value), ended by 0xFF. Each refusal edits the records of a good backup and restores
+// it: the restore is refused by the check's own message and writes nothing. The tags of the four register tables are 13 to 16 (never
+// reused). The refusals that need a row the source never held (above the vector, at or below it, a stray stage row) are built by copying a
+// real record under a key of their own: a row's key is the logical name's id (8 bytes, big-endian) then the stamp's key bytes.
+
+const HEADER: usize = 8 + 1 + 16 + 8;
+const T_REGISTER: u8 = 13;
+const T_REGISTER_INFO: u8 = 14;
+const T_REGISTER_STAGES: u8 = 15;
+const T_REGISTER_POST: u8 = 16;
+const T_OPLOG: u8 = 6;
+
+fn records(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+    let mut at = HEADER;
+    let mut out = Vec::new();
+    while bytes[at] != 0xFF {
+        let tag = bytes[at];
+        at += 1;
+        let klen = u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+        at += 4;
+        let key = bytes[at..at + klen].to_vec();
+        at += klen;
+        let vlen = u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+        at += 4;
+        let value = bytes[at..at + vlen].to_vec();
+        at += vlen;
+        out.push((tag, key, value));
+    }
+    out
+}
+
+fn rebuilt(bytes: &[u8], records: &[(u8, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut out = bytes[..HEADER].to_vec();
+    for (tag, key, value) in records {
+        out.push(*tag);
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    out.push(0xFF);
+    out
+}
+
+/// The restore of `bytes`, which must be refused: the error's text, and the proof that nothing was written.
+fn refused(bytes: &[u8]) -> String {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    let error = crate::backup::restore(&path, &mut &bytes[..])
+        .expect_err("the backup is refused")
+        .to_string();
+    assert!(!path.exists(), "a refused restore wrote nothing: no file at the path ({error})");
+    error
+}
+
+fn a_flipped_backup() -> (Vec<u8>, World, Arc<Engine>, tempfile::TempDir) {
+    let w = world();
+    let (m, d) = member(&w);
+    flip(&m, &w);
+    (backup_of(&m), w, m, d)
+}
+
+#[test]
+fn a_register_row_that_does_not_decode_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let row = records
+        .iter_mut()
+        .find(|(tag, _, _)| *tag == T_REGISTER)
+        .expect("premise: the backup carries a REGISTER row");
+    row.2 = vec![0xFF; 3];
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("does not decode"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_binding_without_its_stage_row_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    assert!(
+        records.iter().any(|(tag, _, _)| *tag == T_REGISTER),
+        "premise: the backup carries the binding"
+    );
+    records.retain(|(tag, _, _)| *tag != T_REGISTER_STAGES);
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("binding without its stage row"),
+        "the refusal names the check: {error}"
+    );
+}
+
+#[test]
+fn a_hidden_collection_the_register_does_not_know_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    records.retain(|(tag, _, _)| {
+        ![T_REGISTER, T_REGISTER_INFO, T_REGISTER_STAGES, T_REGISTER_POST].contains(tag)
+    });
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("unknown to the register"),
+        "a stage alive in the backup that the register has no row for: {error}"
+    );
+}
+
+#[test]
+fn a_parked_row_with_no_entry_in_the_backup_refuses_the_restore() {
+    let w = world();
+    let (m, _d) = member(&w);
+    m.apply_batch(std::slice::from_ref(&w.bind)).expect("the binding is stored ahead");
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    assert!(
+        records.iter().any(|(tag, _, _)| *tag == T_REGISTER_INFO),
+        "premise: the backup carries the parked row"
+    );
+    let entry_key = crate::codec::oplog_key(&w.bind.stamp);
+    let before = records.len();
+    records.retain(|(tag, key, _)| !(*tag == T_OPLOG && key.as_slice() == entry_key.as_slice()));
+    assert_eq!(
+        records.len(),
+        before - 1,
+        "premise: the binding's entry was removed from the oplog records"
+    );
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("has no entry"), "the refusal names the check: {error}");
+}
+
+// -- Test 7: the classification --------------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_four_register_tables_are_carried_and_none_is_classed_as_not_carried() {
+    let source = include_str!("backup.rs");
+    let carried = &source[source.find("const CARRIED").expect("the carried list")
+        ..source.find("const NOT_CARRIED").expect("the not-carried list")];
+    let not_carried = &source[source.find("const NOT_CARRIED").expect("the not-carried list")..];
+    let not_carried = &not_carried[..not_carried.find("];").expect("its end")];
+    for table in ["REGISTER", "REGISTER_INFO", "REGISTER_STAGES", "REGISTER_POST"] {
+        let quoted = format!("\"{table}\"");
+        assert!(carried.contains(&quoted), "{table} is in CARRIED");
+        assert!(
+            !not_carried.contains(&format!("({quoted},")),
+            "{table} is not named in NOT_CARRIED, whose reasons said 're-derived' or 'not yet'"
+        );
+    }
+}
+
+/// The `COLLECTIONS` record of `physical` in a backup, as JSON: key `(db, name)` is two length-prefixed parts.
+fn collection_record<'a>(
+    records: &'a mut [(u8, Vec<u8>, Vec<u8>)],
+    physical: &str,
+) -> &'a mut (u8, Vec<u8>, Vec<u8>) {
+    records
+        .iter_mut()
+        .find(|(tag, key, _)| *tag == 3 && key.ends_with(physical.as_bytes()))
+        .expect("premise: the backup carries the collection's record")
+}
+
+#[test]
+fn a_visible_physical_holding_a_definition_at_or_below_its_own_floor_refuses_the_restore_as_damaged()
+ {
+    // consistency check 4 (the tester's finding, ruled): what a flip's floor leaves cannot be below the floor, so a backup that says so was
+    // damaged or hand-made, and is named and refused
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, &[index_entry(&w.author, "x_1", "t", at(&w, 7))]);
+    assert!(holds(&m, BOUND, "x_1"), "premise: the index is on the visible stage");
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    let stage = collection_record(&mut records, BOUND);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&stage.2).expect("the metadata is JSON");
+    meta["definition_floor"] =
+        serde_json::to_value(Hlc::new(at(&w, 9), 0)).expect("the floor encodes");
+    stage.2 = serde_json::to_vec(&meta).expect("the metadata encodes");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("at or below its own floor"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_visible_physical_holding_a_validator_changed_at_or_below_its_own_floor_refuses_the_restore_as_damaged()
+ {
+    // check 4 covers the validator as the flip's floor does: a validator changed at or below the floor is the dropped life's
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let stamp = Stamp::new(Hlc::new(at(&w, 7), 0), w.author.node_id(), w.author.epoch());
+    let entry = crate::engine::ddl_entry(
+        stamp,
+        OpKind::ConfigureValidator,
+        orders_id(),
+        &kimmy_core::ValidatorSet {
+            db: DB.into(),
+            collection: "orders".into(),
+            validator: Some(kimmy_core::ValidatorSpec {
+                schema: doc! { "bsonType": "object" },
+                action: Default::default(),
+                level: Default::default(),
+            }),
+        },
+    )
+    .expect("the validator entry encodes");
+    window(&m, std::slice::from_ref(&entry));
+    assert!(
+        m.get_collection(DB, BOUND).expect("the stage is held").validator.is_some(),
+        "premise: the visible stage holds the validator"
+    );
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    let stage = collection_record(&mut records, BOUND);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&stage.2).expect("the metadata is JSON");
+    meta["definition_floor"] =
+        serde_json::to_value(Hlc::new(at(&w, 9), 0)).expect("the floor encodes");
+    stage.2 = serde_json::to_vec(&meta).expect("the metadata encodes");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("validator changed at or below its own floor"),
+        "the refusal names the check: {error}"
+    );
+}
+
+#[test]
+fn a_post_drop_row_left_while_a_newer_physical_is_visible_refuses_the_restore_as_damaged() {
+    // the next physical that becomes visible takes the row and deletes it in the same transaction, so a row beside a visible physical is damage
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    let row = serde_json::to_vec(&crate::register::PostRow::default()).expect("the row encodes");
+    records.push((T_REGISTER_POST, orders_id().0.to_be_bytes().to_vec(), row));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("post-drop row left while a newer physical is visible"),
+        "the refusal names the check: {error}"
+    );
+}
+
+/// The key of a register row of `orders` stamped `stamp`: the name's id then the stamp's key bytes.
+fn row_key(stamp: &Stamp) -> Vec<u8> {
+    let mut key = orders_id().0.to_be_bytes().to_vec();
+    key.extend_from_slice(&stamp.to_key_bytes());
+    key
+}
+
+#[test]
+fn a_register_row_above_the_carried_vector_refuses_the_restore() {
+    let (bytes, w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let binding = records
+        .iter()
+        .find(|(tag, _, _)| *tag == T_REGISTER)
+        .cloned()
+        .expect("premise: the backup carries the binding's row");
+    // a copy of the binding's event stamped above everything this member had covered of its origin
+    let above = Stamp::new(
+        Hlc::new(w.bind.stamp.hlc.wall_ms + 500, 0),
+        w.author.node_id(),
+        w.author.epoch(),
+    );
+    records.push((T_REGISTER, row_key(&above), binding.2));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("above the carried vector"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_parked_row_at_or_below_the_carried_vector_refuses_the_restore() {
+    let (bytes, w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let binding = records
+        .iter()
+        .find(|(tag, _, _)| *tag == T_REGISTER)
+        .cloned()
+        .expect("premise: the backup carries the binding's row");
+    // information only, yet at a stamp the vector already covers: it would never be released
+    let below =
+        Stamp::new(Hlc::new(w.bind.stamp.hlc.wall_ms - 1, 0), w.author.node_id(), w.author.epoch());
+    records.push((T_REGISTER_INFO, row_key(&below), binding.2));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("at or below the carried vector"),
+        "the refusal names the check: {error}"
+    );
+}
+
+#[test]
+fn a_stage_row_whose_names_derive_another_key_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let stage = records
+        .iter()
+        .find(|(tag, _, value)| *tag == T_REGISTER_STAGES && value.ends_with(BOUND.as_bytes()))
+        .cloned()
+        .expect("premise: the backup carries the bound stage's row");
+    // the binding keeps its own stage row; a second one names the bound stage under an id that is not its own
+    let stray = CollectionId::derive(DB, "orders.__stg.zz").0.to_be_bytes().to_vec();
+    assert_ne!(stray, stage.1, "premise: the key is not the stage's own");
+    records.push((T_REGISTER_STAGES, stray, stage.2));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("derive another key"), "the refusal names the check: {error}");
+}
+
+// -- Tests 8 and 9: what a restore must NOT do ------------------------------------------------------------------------------------------
+//
+// Both are GUARDS for the code commit, green before it (nothing yet carries the register, so nothing yet judges it): they keep the carry from
+// being built with a pass or a purge deferral in it. Test 8 is red on its premise at the parent (it needs a carried stage row); the code
+// commit turns it green. Test 9 is green before the code commit: it keeps the carry from adding a deferral.
+
+#[test]
+fn a_restore_runs_no_settle_pass_a_stage_a_pass_would_bury_is_still_alive() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    // a hand-made backup: the unbound stage's deadline is far below the visible binding's stamp, so a settle pass would bury it as doomed
+    let stage = records
+        .iter_mut()
+        .find(|(tag, _, value)| *tag == T_REGISTER_STAGES && value.ends_with(UNBOUND.as_bytes()))
+        .expect("premise: the backup carries the unbound stage's row");
+    let at = Stamp::KEY_LEN;
+    let low = Hlc::new(1, 0).to_bytes();
+    stage.2[at..at + low.len()].copy_from_slice(&low);
+    let (r, _dr) = restored(&rebuilt(&bytes, &records));
+    assert!(
+        r.get_collection(DB, UNBOUND).is_ok(),
+        "the restore transcribes and does not judge: the stage is still alive"
+    );
+    assert_eq!(served(&r), BOUND, "and the name still answers from the bound stage");
+}
+
+#[test]
+fn a_restore_leaves_no_purge_deferral_whatever_the_source_held() {
+    let w = world();
+    let (m, _d) = member(&w);
+    m.set_purge_deferral(std::time::Duration::from_secs(60));
+    flip(&m, &w);
+    let rows = |e: &Engine| -> usize {
+        let txn = e.db().begin_read().expect("a read");
+        match txn.open_table(crate::tables::PURGE_NOT_BEFORE) {
+            Ok(table) => table.iter().expect("the table reads").count(),
+            Err(_) => 0,
+        }
+    };
+    assert!(rows(&m) > 0, "premise: the source holds a deferral for the identity it buried");
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(rows(&r), 0, "a restore has no request in flight: nothing is deferred");
+}
+
+// -- The restore writes to a temporary path and renames it over the target only after every check has passed (ruled) -----------------------
+
+#[test]
+fn a_backup_cut_mid_way_leaves_no_file_at_the_target_and_no_temporary_file() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let bytes = backup_of(&m);
+    let cut = &bytes[..bytes.len() * 2 / 3];
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    let error = crate::backup::restore(&path, &mut &cut[..]).expect_err("a cut backup is refused");
+    assert!(!path.exists(), "nothing is at the target after a stream cut mid-way: {error}");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("the directory reads").count(),
+        0,
+        "and no temporary file is left beside it ({error})"
+    );
+}
+
+#[test]
+fn a_restore_that_succeeds_leaves_the_store_at_the_target_and_nothing_named_for_the_temporary_path()
+{
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let bytes = backup_of(&m);
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    crate::backup::restore(&path, &mut &bytes[..]).expect("the backup restores");
+    assert!(path.exists(), "the store is at the target");
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("the directory reads")
+        .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("restoring")),
+        "nothing named for the temporary path is left: {names:?}"
+    );
+}
+
+#[test]
+fn a_target_that_appears_between_the_checks_and_the_publish_is_left_untouched_and_nothing_is_left_beside_it()
+ {
+    // the restore never overwrites: the store is published by a hard link, which fails if the target exists, so a concurrent restore (or
+    // anything else) that made the target after the check at the top is not clobbered
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let bytes = backup_of(&m);
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    let target = path.clone();
+    crate::backup::before_publish_for_tests(move || {
+        std::fs::write(&target, b"another restore's store").expect("the target appears");
+    });
+    let error =
+        crate::backup::restore(&path, &mut &bytes[..]).expect_err("the restore does not overwrite");
+    assert_eq!(
+        std::fs::read(&path).expect("the target reads"),
+        b"another restore's store".to_vec(),
+        "the target is untouched ({error})"
+    );
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("the directory reads")
+        .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["kimmy.redb".to_string()], "and no temporary file is left beside it");
+}
