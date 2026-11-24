@@ -52,6 +52,13 @@ pub struct RepairsAtOpen {
     pub rolled_back: u64,
 }
 
+/// Why a swap's physical was buried, in the order `kimmy_out_buried_total{cause}` renders them: `bound_out` (a later event of the name
+/// became visible and the loser rule buried it), `doomed` (a stage that can never be visible, buried with the event that proves it),
+/// `orphan` (an abandoned stage; counted when Q6.7 builds the abandon) and `drop` (a drop of the name or of its database).
+pub const OUT_BURIAL_CAUSES: [&str; 4] = ["bound_out", "doomed", "orphan", "drop"];
+/// The kinds of loss record of a swap, in the order `kimmy_out_loss_records_total{kind}` renders them. `snapshot_delete` is reserved.
+pub const OUT_LOSS_KINDS: [&str; 2] = ["late_write", "snapshot_delete"];
+
 pub struct Engine {
     db: Database,
     /// Whether the storage has hit an I/O error, shared with the backend that
@@ -235,6 +242,15 @@ pub struct Engine {
     /// loss entry of its own it minted, added by the commit that stored it, so a transaction that did not commit adds none. Per member,
     /// since start, in no state and no digest.
     conflicts_resolved: [std::sync::atomic::AtomicU64; 6],
+    /// Swaps this member applied live (`kimmy_out_swaps_total`, ADR-272): a binding that took effect in a committed transaction and was
+    /// the event the name answered from when the pass ended. Per member, since start, in no state and no digest.
+    out_swaps: std::sync::atomic::AtomicU64,
+    /// Burials of a swap's physicals by cause (`kimmy_out_buried_total{cause}`, [`OUT_BURIAL_CAUSES`]): added by the commit that
+    /// finished them, never by the settle pass, which can still abort. Per member, since start, in no state and no digest.
+    out_buried: [std::sync::atomic::AtomicU64; 4],
+    /// Loss records of a swap minted on this member (`kimmy_out_loss_records_total{kind}`, [`OUT_LOSS_KINDS`]). Nothing mints one yet
+    /// (Q6.7), so both stay 0.
+    out_loss_records: [std::sync::atomic::AtomicU64; 2],
     /// The queue for the single writer (ADR-151). Taken before redb's own
     /// writer lock, held for the life of the [`WriteTxn`], and released when
     /// the transaction commits, aborts or is dropped. Two things redb's lock
@@ -1712,6 +1728,9 @@ impl Engine {
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
             loss_refused: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             conflicts_resolved: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            out_swaps: std::sync::atomic::AtomicU64::new(0),
+            out_buried: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            out_loss_records: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_gate: WriterGate::new(),
             writer_hold: Arc::new(crate::writer_hold::WriterHoldWord::new()),
             writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
@@ -2337,6 +2356,35 @@ impl Engine {
                     k.as_str(),
                     self.conflicts_resolved[k.index()].load(std::sync::atomic::Ordering::Relaxed),
                 )
+            })
+            .collect()
+    }
+
+    /// Swaps this member applied live since start (`kimmy_out_swaps_total`): one for each binding that took effect on this member
+    /// and was the visible event when the pass ended. A snapshot join counts none, a binding that is stored and not visible counts
+    /// none, and the count is this member's own: two members can differ.
+    pub fn out_swaps(&self) -> u64 {
+        self.out_swaps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Burials of a swap's physicals since start, by cause, in the order of [`OUT_BURIAL_CAUSES`].
+    pub fn out_buried(&self) -> Vec<(&'static str, u64)> {
+        OUT_BURIAL_CAUSES
+            .iter()
+            .enumerate()
+            .map(|(slot, cause)| {
+                (*cause, self.out_buried[slot].load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .collect()
+    }
+
+    /// Loss records of a swap minted on this member since start, by kind, in the order of [`OUT_LOSS_KINDS`].
+    pub fn out_loss_records(&self) -> Vec<(&'static str, u64)> {
+        OUT_LOSS_KINDS
+            .iter()
+            .enumerate()
+            .map(|(slot, kind)| {
+                (*kind, self.out_loss_records[slot].load(std::sync::atomic::Ordering::Relaxed))
             })
             .collect()
     }
@@ -5760,6 +5808,9 @@ impl Engine {
             }
             txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried));
         }
+        // After the pass, before the commit: the point where a transaction that fails must leave every counter as it was
+        #[cfg(test)]
+        crate::sync::race_hooks::after_settle()?;
         Ok(())
     }
 

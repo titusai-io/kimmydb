@@ -731,6 +731,8 @@ impl Engine {
         // database's drop, the replicated collection drop and the snapshot route.
         if meta.stage.is_some() || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
+            #[cfg(test)]
+            crate::sync::race_hooks::before_stage_burial_commit()?;
             txn.commit()?;
             let ids = self.finish_burial(db, name, burial);
             notify.buried(self, db, name, &ids);

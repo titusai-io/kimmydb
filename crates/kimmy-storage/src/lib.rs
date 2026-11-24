@@ -157,6 +157,9 @@ mod burial_tests;
 mod logical_drop_tests;
 
 #[cfg(test)]
+mod out_counter_tests;
+
+#[cfg(test)]
 mod carried_drop_tests;
 
 #[cfg(test)]
@@ -308,6 +311,7 @@ pub use engine::{
     WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot,
     WriterHolder, WriterWaitSnapshot, blocking, metered_writer_wait, with_write_wait_budget,
 };
+pub use engine::{OUT_BURIAL_CAUSES, OUT_LOSS_KINDS};
 pub use engine::{parse_test_clock_offset_secs, physical_now_ms, set_test_clock_offset_secs};
 pub use error::{Applied, RefusedKind, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};

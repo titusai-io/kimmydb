@@ -3861,6 +3861,59 @@ pub(crate) mod race_hooks {
         /// one, including the batch's single bookkeeping transaction for the
         /// witnessed vector.
         static REPLICATION_WRITES: Cell<u64> = const { Cell::new(0) };
+        /// Settle passes this thread has finished, counted at the end of `settle_register_in_txn` (the point after the pass and
+        /// before the transaction's commit).
+        static SETTLED: Cell<u64> = const { Cell::new(0) };
+        /// Fail the transaction at the end of the next settle pass.
+        static FAIL_AFTER_SETTLE: Cell<bool> = const { Cell::new(false) };
+        /// Stage burials of a database drop that reached the point before their commit.
+        static STAGE_BURIALS_BEFORE_COMMIT: Cell<u64> = const { Cell::new(0) };
+        /// Fail the transaction of the next database-drop stage burial before its commit.
+        static FAIL_STAGE_BURIAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Called at the end of the settle pass, after the pass and before the transaction can commit: records that the pass ran, and fails
+    /// the transaction once if [`fail_after_the_next_settle`] armed it.
+    pub(crate) fn after_settle() -> crate::error::Result<()> {
+        SETTLED.with(|s| s.set(s.get() + 1));
+        if FAIL_AFTER_SETTLE.with(|f| f.replace(false)) {
+            return Err(crate::StorageError::Transaction(
+                "injected: the transaction fails after the settle pass".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fail the transaction at the end of the next settle pass this thread runs.
+    pub(crate) fn fail_after_the_next_settle() {
+        FAIL_AFTER_SETTLE.with(|f| f.set(true));
+    }
+
+    /// Settle passes this thread has finished.
+    pub(crate) fn settle_passes() -> u64 {
+        SETTLED.with(|s| s.get())
+    }
+
+    /// Called by a database drop's stage burial after the burial and before the commit: records that it was reached, and fails the
+    /// transaction once if [`fail_the_next_stage_burial`] armed it.
+    pub(crate) fn before_stage_burial_commit() -> crate::error::Result<()> {
+        STAGE_BURIALS_BEFORE_COMMIT.with(|s| s.set(s.get() + 1));
+        if FAIL_STAGE_BURIAL.with(|f| f.replace(false)) {
+            return Err(crate::StorageError::Transaction(
+                "injected: the stage burial fails before its commit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fail the transaction of the next database-drop stage burial this thread makes, before its commit.
+    pub(crate) fn fail_the_next_stage_burial() {
+        FAIL_STAGE_BURIAL.with(|f| f.set(true));
+    }
+
+    /// Stage burials of a database drop this thread has taken to the point before their commit.
+    pub(crate) fn stage_burials_before_commit() -> u64 {
+        STAGE_BURIALS_BEFORE_COMMIT.with(|s| s.get())
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
