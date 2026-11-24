@@ -743,6 +743,122 @@ pub struct UnkeyedPage {
 /// filed unkeyed with why.
 type Built = (bool, Vec<UniqueViolation>, Vec<(DocId, UnkeyedCause)>);
 
+impl crate::Engine {
+    /// The backfill of a new index: files every document of the collection `coll` under `index`, in the transaction `txn` the caller
+    /// holds. The one backfill there is: a client's or a peer's creation runs it as the transaction that creates the index, and the
+    /// register's join runs it over the transaction of a flip, so a definition built either way is built the same way.
+    ///
+    /// `local`: a client's own creation, which refuses a unique index the documents already violate and a document the index cannot key;
+    /// not local (a peer's creation, a restore, a join) builds in full and reports what it met. Returns whether the existing documents
+    /// already make the index multikey (the backfill is the flag's only chance to see them), for a replicated unique index the keys the
+    /// documents already share, and the documents filed unkeyed with why. The table borrows end with the call, so the caller can abort
+    /// or commit after it.
+    pub(crate) fn backfill_index_in_txn(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        fill: WalkStop<'_>,
+        coll: CollectionId,
+        index: &IndexMeta,
+        local: bool,
+    ) -> Result<Built> {
+        let docs = open_walk_table_in(txn, tables::DOCS, fill)?;
+        let mut entries = open_walk_table_in(txn, tables::INDEX_ENTRIES, fill)?;
+        // What a unique index has filed so far. Locally only the keys
+        // matter, since the first repeat is a refusal; a replicated build
+        // also keeps who holds each key, in scan order, because that is
+        // what it reports — one document key per key more than the local
+        // build pays, and only on the path that needs it.
+        let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
+        let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+            Default::default();
+        let mut observed_multikey = false;
+        let mut unkeyed: Vec<(DocId, UnkeyedCause)> = Vec::new();
+        // A local create over documents the index cannot key lists
+        // them and creates nothing: how many, the first few `_id`s, and
+        // the first one's refusal worded as a write of it would be.
+        let mut refused = LocalRefusals::default();
+
+        for entry in docs.range(crate::engine::doc_range(coll))? {
+            let (raw_key, raw_value) = entry?;
+            let record = crate::codec::decode_doc_record(raw_value.value())?;
+            let Some(doc) = record.document()? else { continue };
+            let (_, doc_key) = raw_key.value();
+
+            // A document holding a `Decimal128` at a filtered path is
+            // decided here like any other (ADR-238): selected, it is
+            // keyed and, for a local unique index, a repeat of its key
+            // refuses the creation below; not selected, it has no keys.
+            let (keys, multikey) = match document_keys(index, &doc)? {
+                DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
+                DocumentKeys::Unkeyed { reason, cause, multikey } => {
+                    // A unique index must be able to key every document
+                    // it covers, and a client creating one is there to be
+                    // told (ADR-020). Replicated, the definition exists on
+                    // a peer and cannot be refused without diverging: it
+                    // is built with the document filed unkeyed, as
+                    // `maintain_remote` files one that arrives later.
+                    if index.unique && local {
+                        self.count_unkeyed_refusal();
+                        return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                            "{reason}; a unique index must be able to key every document \
+                         it covers, so it cannot be created"
+                        ))));
+                    }
+                    if local {
+                        // The reference refuses to build it, and the
+                        // client is there to be told. Nothing is
+                        // filed: the transaction aborts below.
+                        refused.note(index, &doc, cause, &reason);
+                        continue;
+                    }
+                    entries.insert((coll.0, index.id, UNKEYED, doc_key), ())?;
+                    observed_multikey |= multikey;
+                    unkeyed.push((crate::docs::extract_id(&doc)?, cause));
+                    continue;
+                }
+            };
+            observed_multikey |= multikey;
+            for key in keys {
+                if index.unique && local {
+                    // A unique index over data that already violates it
+                    // must not be created *locally* — it would report a
+                    // constraint it does not actually hold.
+                    if !seen_unique.insert(key.clone()) {
+                        return Err(StorageError::Core(CoreError::UniqueViolation {
+                            index: index.name.clone(),
+                            detail: "existing documents already violate it, so it cannot \
+                                 be created"
+                                .into(),
+                        }));
+                    }
+                } else if index.unique {
+                    // Replicated, the build goes on and the collision is
+                    // reported; see the doc comment on this function.
+                    holders_by_key.entry(key.clone()).or_default().push(doc_key.to_vec());
+                }
+                entries.insert((coll.0, index.id, key.as_slice(), doc_key), ())?;
+            }
+        }
+
+        if let Some(refusal) = refused.refusal(index) {
+            self.count_unkeyed_refusal();
+            return Err(refusal);
+        }
+
+        // One violation per shared key, naming every holder, in the order
+        // the scan met them — so the last holder is the document that
+        // revealed the collision, which is what the report names as the
+        // one that was merged.
+        let mut violations: Vec<UniqueViolation> = holders_by_key
+            .into_iter()
+            .filter(|(_, holders)| holders.len() > 1)
+            .map(|(key, holders)| UniqueViolation { index: index.name.clone(), key, holders })
+            .collect();
+        violations.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok((observed_multikey, violations, unkeyed))
+    }
+}
+
 /// What a local create over existing documents collects while it refuses.
 #[derive(Default)]
 struct LocalRefusals {
@@ -1739,112 +1855,20 @@ impl crate::Engine {
                 meta.indexes.retain(|i| i.name != index.name);
             }
 
-            // Scoped in a closure so every table borrow ends before the abort or
+            // The backfill, in a function so every table borrow ends before the abort or
             // commit below, which need to move the transaction. Returns whether the
             // existing documents already make the index multikey — the backfill is
             // the flag's only chance to see them — for a replicated unique index,
             // the keys the existing documents already share, and the documents
             // filed unkeyed with why.
             let build = |index: &IndexMeta| -> Result<Built> {
-                let docs = open_walk_table_in(&txn, tables::DOCS, fill)?;
-                let mut entries = open_walk_table_in(&txn, tables::INDEX_ENTRIES, fill)?;
-                // What a unique index has filed so far. Locally only the keys
-                // matter, since the first repeat is a refusal; a replicated build
-                // also keeps who holds each key, in scan order, because that is
-                // what it reports — one document key per key more than the local
-                // build pays, and only on the path that needs it.
-                let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
-                let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
-                    Default::default();
-                let mut observed_multikey = false;
-                let mut unkeyed: Vec<(DocId, UnkeyedCause)> = Vec::new();
-                // A local create over documents the index cannot key lists
-                // them and creates nothing: how many, the first few `_id`s, and
-                // the first one's refusal worded as a write of it would be.
-                let mut refused = LocalRefusals::default();
-
-                for entry in docs.range(crate::engine::doc_range(meta.id))? {
-                    let (raw_key, raw_value) = entry?;
-                    let record = crate::codec::decode_doc_record(raw_value.value())?;
-                    let Some(doc) = record.document()? else { continue };
-                    let (_, doc_key) = raw_key.value();
-
-                    // A document holding a `Decimal128` at a filtered path is
-                    // decided here like any other (ADR-238): selected, it is
-                    // keyed and, for a local unique index, a repeat of its key
-                    // refuses the creation below; not selected, it has no keys.
-                    let (keys, multikey) = match document_keys(index, &doc)? {
-                        DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
-                        DocumentKeys::Unkeyed { reason, cause, multikey } => {
-                            // A unique index must be able to key every document
-                            // it covers, and a client creating one is there to be
-                            // told (ADR-020). Replicated, the definition exists on
-                            // a peer and cannot be refused without diverging: it
-                            // is built with the document filed unkeyed, as
-                            // `maintain_remote` files one that arrives later.
-                            if index.unique && matches!(origin, CreateOrigin::Local) {
-                                self.count_unkeyed_refusal();
-                                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                                    "{reason}; a unique index must be able to key every document \
-                                 it covers, so it cannot be created"
-                                ))));
-                            }
-                            if matches!(origin, CreateOrigin::Local) {
-                                // The reference refuses to build it, and the
-                                // client is there to be told. Nothing is
-                                // filed: the transaction aborts below.
-                                refused.note(index, &doc, cause, &reason);
-                                continue;
-                            }
-                            entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
-                            observed_multikey |= multikey;
-                            unkeyed.push((crate::docs::extract_id(&doc)?, cause));
-                            continue;
-                        }
-                    };
-                    observed_multikey |= multikey;
-                    for key in keys {
-                        if index.unique && matches!(origin, CreateOrigin::Local) {
-                            // A unique index over data that already violates it
-                            // must not be created *locally* — it would report a
-                            // constraint it does not actually hold.
-                            if !seen_unique.insert(key.clone()) {
-                                return Err(StorageError::Core(CoreError::UniqueViolation {
-                                    index: index.name.clone(),
-                                    detail: "existing documents already violate it, so it cannot \
-                                         be created"
-                                        .into(),
-                                }));
-                            }
-                        } else if index.unique {
-                            // Replicated, the build goes on and the collision is
-                            // reported; see the doc comment on this function.
-                            holders_by_key.entry(key.clone()).or_default().push(doc_key.to_vec());
-                        }
-                        entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
-                    }
-                }
-
-                if let Some(refusal) = refused.refusal(index) {
-                    self.count_unkeyed_refusal();
-                    return Err(refusal);
-                }
-
-                // One violation per shared key, naming every holder, in the order
-                // the scan met them — so the last holder is the document that
-                // revealed the collision, which is what the report names as the
-                // one that was merged.
-                let mut violations: Vec<UniqueViolation> = holders_by_key
-                    .into_iter()
-                    .filter(|(_, holders)| holders.len() > 1)
-                    .map(|(key, holders)| UniqueViolation {
-                        index: index.name.clone(),
-                        key,
-                        holders,
-                    })
-                    .collect();
-                violations.sort_by(|a, b| a.key.cmp(&b.key));
-                Ok((observed_multikey, violations, unkeyed))
+                self.backfill_index_in_txn(
+                    &txn,
+                    fill,
+                    meta.id,
+                    index,
+                    matches!(origin, CreateOrigin::Local),
+                )
             };
 
             let (violations, unkeyed) = match build(&index) {

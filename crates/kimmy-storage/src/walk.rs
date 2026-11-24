@@ -856,7 +856,7 @@ mod tests {
                 let by_id = crate::CandidateOrder::ById { after: None, want: None };
                 candidates(e, c, doc! { "_id": { "$gte": 2, "$lte": 9 } }, by_id)
             }),
-            // covers: index::Engine::create_index_inner
+            // covers: index::Engine::backfill_index_in_txn
             ("a client's index build", |e, _| {
                 let field = crate::IndexField { path: "m".into(), descending: false };
                 e.create_index("shop", "orders", vec![field], false, None).map(drop)

@@ -55,7 +55,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // The pass that completes the violations table, which serves no client.
     "violations_table::Engine::violations_backfill_scan",
     // An index build's fill, and every read of an index's entries.
-    "index::Engine::create_index_inner",
+    "index::Engine::backfill_index_in_txn",
     "index::Engine::index_keyed_entries_after",
     "index::Walk::in_index_order",
     "index::Walk::in_key_order",
@@ -435,6 +435,8 @@ const DELEGATES: &[(&str, &str)] = &[
     ("index::Engine::visit_index_candidates_held", "Engine::visit_index_candidates_versioned_held"),
     ("index::Engine::visit_index_candidates_versioned_held", "Walk::in_index_order"),
     ("index::Engine::create_index_with", "Engine::create_index_inner"),
+    // The build of an index: the one backfill, which the client's and the peer's creation (and the register's join) all call.
+    ("index::Engine::create_index_inner", "Engine::backfill_index_in_txn"),
     // An index's unkeyed run.
     ("index::Engine::unkeyed_count", "holders_of"),
     // A shadow collection's vectors, decoded from its documents.
