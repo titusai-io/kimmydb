@@ -194,6 +194,9 @@ pub struct StorageReadings {
     /// Loss records of a swap minted on this member since start, by kind (`Engine::out_loss_records`): the series
     /// `kimmy_out_loss_records_total{kind}`.
     pub out_loss_records: Vec<(&'static str, u64)>,
+    /// Replicated vector configurations this member discarded for a swapped name since start (`Engine::out_vector_config_discarded`): the
+    /// series `kimmy_out_vector_config_discarded_total`.
+    pub out_vector_config_discarded: u64,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -421,6 +424,8 @@ pub struct MetricsSnapshot {
     pub out_buried: [u64; kimmy_storage::OUT_BURIAL_CAUSES.len()],
     /// Loss records of a swap, in the order of `kimmy_storage::OUT_LOSS_KINDS`: the series `kimmy_out_loss_records_total{kind}`.
     pub out_loss_records: [u64; kimmy_storage::OUT_LOSS_KINDS.len()],
+    /// Replicated vector configurations discarded for a swapped name: the series `kimmy_out_vector_config_discarded_total`.
+    pub out_vector_config_discarded: u64,
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1549,6 +1554,7 @@ impl Metrics {
             out_swaps: readings.out_swaps,
             out_buried: labelled(&kimmy_storage::OUT_BURIAL_CAUSES, &readings.out_buried),
             out_loss_records: labelled(&kimmy_storage::OUT_LOSS_KINDS, &readings.out_loss_records),
+            out_vector_config_discarded: readings.out_vector_config_discarded,
             conflicts_resolved: {
                 let mut made = [0u64; 6];
                 for (label, n) in &readings.conflicts_resolved {
@@ -1911,6 +1917,9 @@ impl Metrics {
              # HELP kimmy_out_buried_total Physicals of a replacing `$out` that this member buried, by cause: `bound_out` (a later event of the name became visible and the loser rule buried it), `doomed` (a stage no event can make visible, buried with the event that proves it), `orphan` (an abandoned stage; 0 until the abandon is built) and `drop` (a drop of the name or of its database). Counted by the commit that finished the burial, once per physical this member held; a physical it never held counts none. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_out_buried_total counter\n\
              {out_buried_lines}\
+             # HELP kimmy_out_vector_config_discarded_total Replicated vector configurations and removals of one that this member discarded because a replacing `$out` has swapped the name (ADR-272, decision 12: a swapped name keeps no vector configuration in this release): one per delivery, so an entry that arrives twice counts twice. A configuration of a name that only has a stage held, or a binding known ahead of its position, is applied and counts none. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_out_vector_config_discarded_total counter\n\
+             kimmy_out_vector_config_discarded_total {out_vector_config_discarded}\n\
              # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
              # TYPE kimmy_commits counter\n\
              kimmy_commits {commits}\n\
@@ -2426,6 +2435,7 @@ impl Metrics {
                     .collect::<String>()
             },
             out_swaps = readings.out_swaps,
+            out_vector_config_discarded = readings.out_vector_config_discarded,
             // Every kind and every cause always has its sample, from the fixed arrays and never from what has been seen
             out_loss_lines = kimmy_storage::OUT_LOSS_KINDS
                 .iter()
@@ -3518,6 +3528,7 @@ mod tests {
                 ("drop", 8_214),
             ],
             out_loss_records: vec![("late_write", 8_221), ("snapshot_delete", 8_222)],
+            out_vector_config_discarded: 8_231,
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3634,6 +3645,9 @@ kimmy_out_buried_total{cause=\"bound_out\"} 8211
 kimmy_out_buried_total{cause=\"doomed\"} 8212
 kimmy_out_buried_total{cause=\"orphan\"} 8213
 kimmy_out_buried_total{cause=\"drop\"} 8214
+# HELP kimmy_out_vector_config_discarded_total Replicated vector configurations and removals of one that this member discarded because a replacing `$out` has swapped the name (ADR-272, decision 12: a swapped name keeps no vector configuration in this release): one per delivery, so an entry that arrives twice counts twice. A configuration of a name that only has a stage held, or a binding known ahead of its position, is applied and counts none. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_out_vector_config_discarded_total counter
+kimmy_out_vector_config_discarded_total 8231
 # HELP kimmy_commits Durable write transactions committed by the storage engine.
 # TYPE kimmy_commits counter
 kimmy_commits 44
@@ -4827,6 +4841,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 s.out_buried[slot]
             ));
         }
+        expect(&format!(
+            "kimmy_out_vector_config_discarded_total {}\n",
+            s.out_vector_config_discarded
+        ));
         for (slot, code) in REFUSED_CODES.iter().enumerate() {
             expect(&format!(
                 "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
@@ -5411,6 +5429,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 1
                 + kimmy_storage::OUT_LOSS_KINDS.len()
                 + kimmy_storage::OUT_BURIAL_CAUSES.len()
+                // The vector configurations discarded for a swapped name (ADR-272, decision 12; Q6.5-4).
+                + 1
                 // Peer connections this node failed to serve, by reason.
                 + kimmy_cluster::ServeFailure::COUNT
                 // Accept errors a listener had, by listener.
@@ -6192,6 +6212,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             let line = format!("kimmy_out_buried_total{{cause=\"{cause}\"}} 0\n");
             assert!(page.contains(&line), "no `{line}` in the page at rest");
         }
+        assert!(
+            page.contains("kimmy_out_vector_config_discarded_total 0\n"),
+            "no `kimmy_out_vector_config_discarded_total 0` in the page at rest"
+        );
         assert_eq!(
             page.matches("kimmy_out_buried_total{").count(),
             4,

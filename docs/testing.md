@@ -766,6 +766,12 @@ to the engine.
   abandon; the tests owed there are `a_late_write_lost_to_a_swap_moves_kimmy_out_loss_records_total_by_one`,
   `an_abandoned_stage_moves_kimmy_out_buried_total_orphan_by_one` and
   `a_local_binding_and_a_replicated_one_count_one_swap_each`.
+- **The discarded vector configurations.** `kimmy_out_vector_config_discarded_total` counts
+  deliveries, not entries: deliver a discarded entry twice and expect two. It moves only once the
+  identity is not the physical the name answers from (a binding or a recreation is visible, or the
+  name is absent under an event in effect); a stage held, or a binding only known ahead of its
+  position, moves nothing and the entry is applied. Read it from `/metrics` on the member under
+  test, per member.
 - **What the flip does to a collection's definitions.** An index or a validator that the old physical held is on the new one with its original stamp, built over the new
   physical's documents (read the index list, `GET /v1/db/{db}/coll/{coll}/indexes`, on every member); an index the old physical had dropped
   is not. A definition stamped at or before a logical drop of the name belongs to the dropped life and is not on the

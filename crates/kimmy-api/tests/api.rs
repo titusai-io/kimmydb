@@ -11977,6 +11977,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_out_buried_total",
         "kimmy_out_buried_total",
         "kimmy_out_buried_total",
+        "kimmy_out_vector_config_discarded_total",
         "kimmy_commits",
         "kimmy_fsyncs",
         "kimmy_commits_grouped_total",

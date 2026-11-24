@@ -319,6 +319,14 @@ impl TelemetryGuard {
             "Loss records of a replacing $out that this member minted for a delete a snapshot carried. Reserved: 0.",
             |s| s.out_loss_records[1]
         );
+        // `kimmy_out_vector_config_discarded_total` (ADR-272, decision 12; Q6.5-4): one count, per delivery.
+        observe!(
+            u64_observable_counter,
+            "kimmy.out_vector_config_discarded",
+            "{entry}",
+            "Replicated vector configurations and removals this member discarded because a replacing $out has swapped the name. One per delivery. This member's own count.",
+            |s| s.out_vector_config_discarded
+        );
         // `kimmy_conflicts_resolved_total{kind}` (Q7 Step 4, C8): one instrument per kind, in the order of `LossKind::ALL` (the order
         // the snapshot's array is filled in), spelled in snake case as `kimmy.catching_up.*` is.
         observe!(
@@ -3463,6 +3471,11 @@ mod tests {
         }
         let swaps = instrument_call("kimmy.out_swaps");
         assert!(swaps.ends_with("|s|s.out_swaps"), "kimmy.out_swaps reads the swap count: {swaps}");
+        let discarded = instrument_call("kimmy.out_vector_config_discarded");
+        assert!(
+            discarded.ends_with("|s|s.out_vector_config_discarded"),
+            "kimmy.out_vector_config_discarded reads the discard count: {discarded}"
+        );
     }
 
     #[test]
