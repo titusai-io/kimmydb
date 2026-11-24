@@ -1770,7 +1770,20 @@ impl Engine {
         }
         let drops =
             [self.collection_dropped_at(standing.id)?, self.database_dropped_at(&standing.db)?];
-        Ok(drops.into_iter().flatten().any(|dropped| stamp.hlc <= dropped.hlc))
+        if drops.into_iter().flatten().any(|dropped| stamp.hlc <= dropped.hlc) {
+            return Ok(true);
+        }
+        // The newest logical drop in effect for the name this physical belongs to (decision 6, rule 4): a stage or a recreation that became
+        // visible has no tombstone of its own and no incarnation floor, and what the register ended is history on it as it was on the
+        // identity. On the `hlc`, a tie being the drop's. A name with no register event has no logical drop: answered as it always was.
+        let logical = kimmy_core::swap::logical_of_stage(&standing.name)
+            .or_else(|| kimmy_core::logical_of_recreation(&standing.name))
+            .unwrap_or(&standing.name);
+        let newest_drop = {
+            let txn = self.db().begin_read()?;
+            crate::register::newest_logical_drop_read(&txn, &standing.db, logical)?
+        };
+        Ok(newest_drop.is_some_and(|drop| stamp.hlc <= drop.hlc))
     }
 }
 
@@ -3034,7 +3047,11 @@ impl Engine {
                         // difference is this refusal (a hint, never a mask). A
                         // failure here fails the batch: the entry is then not
                         // witnessed and is served again, never swallowed.
-                        self.note_refused_index(entry.collection, &target.index, entry.stamp)?;
+                        // under the id of the physical that refused it, which is the one whose burial clears it (the entry names the logical name)
+                        let hinted = self
+                            .definition_target(&target.db, &target.collection)
+                            .map_or(entry.collection, |physical| physical.id);
+                        self.note_refused_index(hinted, &target.index, entry.stamp)?;
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
@@ -3089,7 +3106,7 @@ impl Engine {
                     // for a clock problem that was not there.
                     let index_id = kimmy_core::IndexMeta::derive_id(&target.index);
                     let already_recorded = self
-                        .index_dropped_at(entry.collection, index_id)?
+                        .index_dropped_at(current.id, index_id)?
                         .is_some_and(|seen| seen >= entry.stamp);
                     if already_recorded {
                         debug!(
@@ -3121,7 +3138,7 @@ impl Engine {
                     // name — the comparison above turns that replay away too,
                     // so removing this would not by itself let the earlier
                     // index back.
-                    self.record_index_drop(entry.collection, index_id, entry.stamp)?;
+                    self.record_index_drop(current.id, index_id, entry.stamp)?;
                     return Ok(DdlOutcome::Declined);
                 }
 
@@ -3177,7 +3194,8 @@ impl Engine {
                         // replay of the create — after the collection has
                         // itself been recreated, say — must find the index
                         // already history here. The id is derived from the
-                        // name, which is all a drop carries.
+                        // name, which is all a drop carries (and no physical stands
+                        // here to name another: the entry's id is the logical name's).
                         self.record_index_drop(
                             entry.collection,
                             kimmy_core::IndexMeta::derive_id(&target.index),

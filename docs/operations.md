@@ -1636,6 +1636,8 @@ Three things an operator can watch:
   again after the flip does not build on the new physical.
   This holds whichever of the drop that ended the life and the binding reached the member first, including a drop that
   arrived while the binding was known only ahead of its position.
+  A definition at or below a logical drop of the name that is in effect is the dropped life's on the physical that stands as
+  well, whether that physical is a stage or a recreation that has no floor of its own.
 - **The shadow of a vector configuration goes with its physical.** A configuration is not carried to the new
   physical; the old physical's shadow is buried in the flip and its rows are purged after the deferral, as the old
   physical's are.

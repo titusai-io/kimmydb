@@ -395,6 +395,21 @@ pub(crate) fn timeline_read(
     timeline_read_of(txn, tables::REGISTER, db, logical)
 }
 
+/// The stamp of the newest logical drop of `logical` in effect on this member (a logical drop names no physical): the boundary a
+/// definition of the name must be stamped above to belong to its present life, whichever physical stands (ADR-272, decision 6, rule 4).
+pub(crate) fn newest_logical_drop_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Option<Stamp>> {
+    Ok(timeline_read(txn, db, logical)?
+        .events()
+        .iter()
+        .filter(|(_, event)| event.physical().is_none())
+        .map(|(stamp, _)| *stamp)
+        .max())
+}
+
 /// The register events of `logical` known ahead of their position, read in a read transaction.
 pub(crate) fn parked_read(
     txn: &redb::ReadTransaction,
