@@ -1,0 +1,1480 @@
+bounds min_ms=-377705023201000 max_ms=253402207200999
+offset America/New_York 1800-01-01T00:00:00Z -17762
+offset America/New_York 1850-06-15T12:00:00Z -17762
+offset America/New_York 1883-11-18T16:59:59.999Z -17762
+offset America/New_York 1883-11-18T17:00:00Z -18000
+offset America/New_York 1900-01-01T00:00:00Z -18000
+offset America/New_York 1918-03-31T07:00:00Z -1ms -18000
+offset America/New_York 1918-03-31T07:00:00Z -14400
+offset America/New_York 1945-08-15T12:00:00Z -14400
+offset America/New_York 1969-12-31T23:59:59.999Z -18000
+offset America/New_York 1970-01-01T00:00:00Z -18000
+offset America/New_York 1986-01-01T00:00:00Z -18000
+offset America/New_York 2000-01-01T00:00:00Z -18000
+offset America/New_York 2007-03-11T07:00:00Z -1ms -18000
+offset America/New_York 2007-03-11T07:00:00Z -14400
+offset America/New_York 2011-12-30T10:00:00Z -1ms -18000
+offset America/New_York 2011-12-30T10:00:00Z -18000
+offset America/New_York 2022-03-21T20:30:00Z -1ms -14400
+offset America/New_York 2022-03-21T20:30:00Z -14400
+offset America/New_York 2024-03-10T02:00:00Z -1ms -18000
+offset America/New_York 2024-03-10T02:00:00Z -18000
+offset America/New_York 2024-03-10T07:00:00Z -1ms -18000
+offset America/New_York 2024-03-10T07:00:00Z -14400
+offset America/New_York 2024-03-31T01:00:00Z -1ms -14400
+offset America/New_York 2024-03-31T01:00:00Z -14400
+offset America/New_York 2024-04-06T14:45:00Z -1ms -14400
+offset America/New_York 2024-04-06T14:45:00Z -14400
+offset America/New_York 2024-04-06T15:00:00Z -1ms -14400
+offset America/New_York 2024-04-06T15:00:00Z -14400
+offset America/New_York 2024-04-06T16:00:00Z -1ms -14400
+offset America/New_York 2024-04-06T16:00:00Z -14400
+offset America/New_York 2024-04-14T02:00:00Z -1ms -14400
+offset America/New_York 2024-04-14T02:00:00Z -14400
+offset America/New_York 2024-07-01T00:00:00Z -14400
+offset America/New_York 2024-09-28T14:45:00Z -1ms -14400
+offset America/New_York 2024-09-28T14:45:00Z -14400
+offset America/New_York 2024-10-05T16:00:00Z -1ms -14400
+offset America/New_York 2024-10-05T16:00:00Z -14400
+offset America/New_York 2024-10-06T15:30:00Z -1ms -14400
+offset America/New_York 2024-10-06T15:30:00Z -14400
+offset America/New_York 2024-10-27T01:00:00Z -1ms -14400
+offset America/New_York 2024-10-27T01:00:00Z -14400
+offset America/New_York 2024-11-03T06:00:00Z -1ms -14400
+offset America/New_York 2024-11-03T06:00:00Z -18000
+offset America/New_York 2024-12-31T23:59:59.999Z -18000
+offset America/New_York 2038-01-19T03:14:07.999Z -18000
+offset America/New_York 2050-07-01T12:00:00Z -14400
+offset America/New_York 2099-12-31T23:59:59.999Z -18000
+offset America/New_York 2100-03-14T12:00:00Z -14400
+offset America/New_York 2100-12-31T23:59:59.999Z -18000
+offset America/New_York min_ms -17762
+offset America/New_York min_ms+1 -17762
+offset America/New_York max_ms 0
+offset America/New_York max_ms-1 0
+offset America/New_York i64::MIN -17762
+offset America/New_York i64::MAX 0
+offset America/Sao_Paulo 1800-01-01T00:00:00Z -11188
+offset America/Sao_Paulo 1850-06-15T12:00:00Z -11188
+offset America/Sao_Paulo 1883-11-18T16:59:59.999Z -11188
+offset America/Sao_Paulo 1883-11-18T17:00:00Z -11188
+offset America/Sao_Paulo 1900-01-01T00:00:00Z -11188
+offset America/Sao_Paulo 1918-03-31T07:00:00Z -1ms -10800
+offset America/Sao_Paulo 1918-03-31T07:00:00Z -10800
+offset America/Sao_Paulo 1945-08-15T12:00:00Z -10800
+offset America/Sao_Paulo 1969-12-31T23:59:59.999Z -10800
+offset America/Sao_Paulo 1970-01-01T00:00:00Z -10800
+offset America/Sao_Paulo 1986-01-01T00:00:00Z -7200
+offset America/Sao_Paulo 2000-01-01T00:00:00Z -7200
+offset America/Sao_Paulo 2007-03-11T07:00:00Z -1ms -10800
+offset America/Sao_Paulo 2007-03-11T07:00:00Z -10800
+offset America/Sao_Paulo 2011-12-30T10:00:00Z -1ms -7200
+offset America/Sao_Paulo 2011-12-30T10:00:00Z -7200
+offset America/Sao_Paulo 2022-03-21T20:30:00Z -1ms -10800
+offset America/Sao_Paulo 2022-03-21T20:30:00Z -10800
+offset America/Sao_Paulo 2024-03-10T02:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-03-10T02:00:00Z -10800
+offset America/Sao_Paulo 2024-03-10T07:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-03-10T07:00:00Z -10800
+offset America/Sao_Paulo 2024-03-31T01:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-03-31T01:00:00Z -10800
+offset America/Sao_Paulo 2024-04-06T14:45:00Z -1ms -10800
+offset America/Sao_Paulo 2024-04-06T14:45:00Z -10800
+offset America/Sao_Paulo 2024-04-06T15:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-04-06T15:00:00Z -10800
+offset America/Sao_Paulo 2024-04-06T16:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-04-06T16:00:00Z -10800
+offset America/Sao_Paulo 2024-04-14T02:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-04-14T02:00:00Z -10800
+offset America/Sao_Paulo 2024-07-01T00:00:00Z -10800
+offset America/Sao_Paulo 2024-09-28T14:45:00Z -1ms -10800
+offset America/Sao_Paulo 2024-09-28T14:45:00Z -10800
+offset America/Sao_Paulo 2024-10-05T16:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-10-05T16:00:00Z -10800
+offset America/Sao_Paulo 2024-10-06T15:30:00Z -1ms -10800
+offset America/Sao_Paulo 2024-10-06T15:30:00Z -10800
+offset America/Sao_Paulo 2024-10-27T01:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-10-27T01:00:00Z -10800
+offset America/Sao_Paulo 2024-11-03T06:00:00Z -1ms -10800
+offset America/Sao_Paulo 2024-11-03T06:00:00Z -10800
+offset America/Sao_Paulo 2024-12-31T23:59:59.999Z -10800
+offset America/Sao_Paulo 2038-01-19T03:14:07.999Z -10800
+offset America/Sao_Paulo 2050-07-01T12:00:00Z -10800
+offset America/Sao_Paulo 2099-12-31T23:59:59.999Z -10800
+offset America/Sao_Paulo 2100-03-14T12:00:00Z -10800
+offset America/Sao_Paulo 2100-12-31T23:59:59.999Z -10800
+offset America/Sao_Paulo min_ms -11188
+offset America/Sao_Paulo min_ms+1 -11188
+offset America/Sao_Paulo max_ms 0
+offset America/Sao_Paulo max_ms-1 0
+offset America/Sao_Paulo i64::MIN -11188
+offset America/Sao_Paulo i64::MAX 0
+offset America/St_Johns 1800-01-01T00:00:00Z -12652
+offset America/St_Johns 1850-06-15T12:00:00Z -12652
+offset America/St_Johns 1883-11-18T16:59:59.999Z -12652
+offset America/St_Johns 1883-11-18T17:00:00Z -12652
+offset America/St_Johns 1900-01-01T00:00:00Z -12652
+offset America/St_Johns 1918-03-31T07:00:00Z -1ms -12652
+offset America/St_Johns 1918-03-31T07:00:00Z -12652
+offset America/St_Johns 1945-08-15T12:00:00Z -9000
+offset America/St_Johns 1969-12-31T23:59:59.999Z -12600
+offset America/St_Johns 1970-01-01T00:00:00Z -12600
+offset America/St_Johns 1986-01-01T00:00:00Z -12600
+offset America/St_Johns 2000-01-01T00:00:00Z -12600
+offset America/St_Johns 2007-03-11T07:00:00Z -1ms -9000
+offset America/St_Johns 2007-03-11T07:00:00Z -9000
+offset America/St_Johns 2011-12-30T10:00:00Z -1ms -12600
+offset America/St_Johns 2011-12-30T10:00:00Z -12600
+offset America/St_Johns 2022-03-21T20:30:00Z -1ms -9000
+offset America/St_Johns 2022-03-21T20:30:00Z -9000
+offset America/St_Johns 2024-03-10T02:00:00Z -1ms -12600
+offset America/St_Johns 2024-03-10T02:00:00Z -12600
+offset America/St_Johns 2024-03-10T07:00:00Z -1ms -9000
+offset America/St_Johns 2024-03-10T07:00:00Z -9000
+offset America/St_Johns 2024-03-31T01:00:00Z -1ms -9000
+offset America/St_Johns 2024-03-31T01:00:00Z -9000
+offset America/St_Johns 2024-04-06T14:45:00Z -1ms -9000
+offset America/St_Johns 2024-04-06T14:45:00Z -9000
+offset America/St_Johns 2024-04-06T15:00:00Z -1ms -9000
+offset America/St_Johns 2024-04-06T15:00:00Z -9000
+offset America/St_Johns 2024-04-06T16:00:00Z -1ms -9000
+offset America/St_Johns 2024-04-06T16:00:00Z -9000
+offset America/St_Johns 2024-04-14T02:00:00Z -1ms -9000
+offset America/St_Johns 2024-04-14T02:00:00Z -9000
+offset America/St_Johns 2024-07-01T00:00:00Z -9000
+offset America/St_Johns 2024-09-28T14:45:00Z -1ms -9000
+offset America/St_Johns 2024-09-28T14:45:00Z -9000
+offset America/St_Johns 2024-10-05T16:00:00Z -1ms -9000
+offset America/St_Johns 2024-10-05T16:00:00Z -9000
+offset America/St_Johns 2024-10-06T15:30:00Z -1ms -9000
+offset America/St_Johns 2024-10-06T15:30:00Z -9000
+offset America/St_Johns 2024-10-27T01:00:00Z -1ms -9000
+offset America/St_Johns 2024-10-27T01:00:00Z -9000
+offset America/St_Johns 2024-11-03T06:00:00Z -1ms -12600
+offset America/St_Johns 2024-11-03T06:00:00Z -12600
+offset America/St_Johns 2024-12-31T23:59:59.999Z -12600
+offset America/St_Johns 2038-01-19T03:14:07.999Z -12600
+offset America/St_Johns 2050-07-01T12:00:00Z -9000
+offset America/St_Johns 2099-12-31T23:59:59.999Z -12600
+offset America/St_Johns 2100-03-14T12:00:00Z -9000
+offset America/St_Johns 2100-12-31T23:59:59.999Z -12600
+offset America/St_Johns min_ms -12652
+offset America/St_Johns min_ms+1 -12652
+offset America/St_Johns max_ms 0
+offset America/St_Johns max_ms-1 0
+offset America/St_Johns i64::MIN -12652
+offset America/St_Johns i64::MAX 0
+offset Europe/London 1800-01-01T00:00:00Z -75
+offset Europe/London 1850-06-15T12:00:00Z 0
+offset Europe/London 1883-11-18T16:59:59.999Z 0
+offset Europe/London 1883-11-18T17:00:00Z 0
+offset Europe/London 1900-01-01T00:00:00Z 0
+offset Europe/London 1918-03-31T07:00:00Z -1ms 3600
+offset Europe/London 1918-03-31T07:00:00Z 3600
+offset Europe/London 1945-08-15T12:00:00Z 3600
+offset Europe/London 1969-12-31T23:59:59.999Z 3600
+offset Europe/London 1970-01-01T00:00:00Z 3600
+offset Europe/London 1986-01-01T00:00:00Z 0
+offset Europe/London 2000-01-01T00:00:00Z 0
+offset Europe/London 2007-03-11T07:00:00Z -1ms 0
+offset Europe/London 2007-03-11T07:00:00Z 0
+offset Europe/London 2011-12-30T10:00:00Z -1ms 0
+offset Europe/London 2011-12-30T10:00:00Z 0
+offset Europe/London 2022-03-21T20:30:00Z -1ms 0
+offset Europe/London 2022-03-21T20:30:00Z 0
+offset Europe/London 2024-03-10T02:00:00Z -1ms 0
+offset Europe/London 2024-03-10T02:00:00Z 0
+offset Europe/London 2024-03-10T07:00:00Z -1ms 0
+offset Europe/London 2024-03-10T07:00:00Z 0
+offset Europe/London 2024-03-31T01:00:00Z -1ms 0
+offset Europe/London 2024-03-31T01:00:00Z 3600
+offset Europe/London 2024-04-06T14:45:00Z -1ms 3600
+offset Europe/London 2024-04-06T14:45:00Z 3600
+offset Europe/London 2024-04-06T15:00:00Z -1ms 3600
+offset Europe/London 2024-04-06T15:00:00Z 3600
+offset Europe/London 2024-04-06T16:00:00Z -1ms 3600
+offset Europe/London 2024-04-06T16:00:00Z 3600
+offset Europe/London 2024-04-14T02:00:00Z -1ms 3600
+offset Europe/London 2024-04-14T02:00:00Z 3600
+offset Europe/London 2024-07-01T00:00:00Z 3600
+offset Europe/London 2024-09-28T14:45:00Z -1ms 3600
+offset Europe/London 2024-09-28T14:45:00Z 3600
+offset Europe/London 2024-10-05T16:00:00Z -1ms 3600
+offset Europe/London 2024-10-05T16:00:00Z 3600
+offset Europe/London 2024-10-06T15:30:00Z -1ms 3600
+offset Europe/London 2024-10-06T15:30:00Z 3600
+offset Europe/London 2024-10-27T01:00:00Z -1ms 3600
+offset Europe/London 2024-10-27T01:00:00Z 0
+offset Europe/London 2024-11-03T06:00:00Z -1ms 0
+offset Europe/London 2024-11-03T06:00:00Z 0
+offset Europe/London 2024-12-31T23:59:59.999Z 0
+offset Europe/London 2038-01-19T03:14:07.999Z 0
+offset Europe/London 2050-07-01T12:00:00Z 3600
+offset Europe/London 2099-12-31T23:59:59.999Z 0
+offset Europe/London 2100-03-14T12:00:00Z 0
+offset Europe/London 2100-12-31T23:59:59.999Z 0
+offset Europe/London min_ms -75
+offset Europe/London min_ms+1 -75
+offset Europe/London max_ms 0
+offset Europe/London max_ms-1 0
+offset Europe/London i64::MIN -75
+offset Europe/London i64::MAX 0
+offset Europe/Berlin 1800-01-01T00:00:00Z 3208
+offset Europe/Berlin 1850-06-15T12:00:00Z 3208
+offset Europe/Berlin 1883-11-18T16:59:59.999Z 3208
+offset Europe/Berlin 1883-11-18T17:00:00Z 3208
+offset Europe/Berlin 1900-01-01T00:00:00Z 3600
+offset Europe/Berlin 1918-03-31T07:00:00Z -1ms 3600
+offset Europe/Berlin 1918-03-31T07:00:00Z 3600
+offset Europe/Berlin 1945-08-15T12:00:00Z 10800
+offset Europe/Berlin 1969-12-31T23:59:59.999Z 3600
+offset Europe/Berlin 1970-01-01T00:00:00Z 3600
+offset Europe/Berlin 1986-01-01T00:00:00Z 3600
+offset Europe/Berlin 2000-01-01T00:00:00Z 3600
+offset Europe/Berlin 2007-03-11T07:00:00Z -1ms 3600
+offset Europe/Berlin 2007-03-11T07:00:00Z 3600
+offset Europe/Berlin 2011-12-30T10:00:00Z -1ms 3600
+offset Europe/Berlin 2011-12-30T10:00:00Z 3600
+offset Europe/Berlin 2022-03-21T20:30:00Z -1ms 3600
+offset Europe/Berlin 2022-03-21T20:30:00Z 3600
+offset Europe/Berlin 2024-03-10T02:00:00Z -1ms 3600
+offset Europe/Berlin 2024-03-10T02:00:00Z 3600
+offset Europe/Berlin 2024-03-10T07:00:00Z -1ms 3600
+offset Europe/Berlin 2024-03-10T07:00:00Z 3600
+offset Europe/Berlin 2024-03-31T01:00:00Z -1ms 3600
+offset Europe/Berlin 2024-03-31T01:00:00Z 7200
+offset Europe/Berlin 2024-04-06T14:45:00Z -1ms 7200
+offset Europe/Berlin 2024-04-06T14:45:00Z 7200
+offset Europe/Berlin 2024-04-06T15:00:00Z -1ms 7200
+offset Europe/Berlin 2024-04-06T15:00:00Z 7200
+offset Europe/Berlin 2024-04-06T16:00:00Z -1ms 7200
+offset Europe/Berlin 2024-04-06T16:00:00Z 7200
+offset Europe/Berlin 2024-04-14T02:00:00Z -1ms 7200
+offset Europe/Berlin 2024-04-14T02:00:00Z 7200
+offset Europe/Berlin 2024-07-01T00:00:00Z 7200
+offset Europe/Berlin 2024-09-28T14:45:00Z -1ms 7200
+offset Europe/Berlin 2024-09-28T14:45:00Z 7200
+offset Europe/Berlin 2024-10-05T16:00:00Z -1ms 7200
+offset Europe/Berlin 2024-10-05T16:00:00Z 7200
+offset Europe/Berlin 2024-10-06T15:30:00Z -1ms 7200
+offset Europe/Berlin 2024-10-06T15:30:00Z 7200
+offset Europe/Berlin 2024-10-27T01:00:00Z -1ms 7200
+offset Europe/Berlin 2024-10-27T01:00:00Z 3600
+offset Europe/Berlin 2024-11-03T06:00:00Z -1ms 3600
+offset Europe/Berlin 2024-11-03T06:00:00Z 3600
+offset Europe/Berlin 2024-12-31T23:59:59.999Z 3600
+offset Europe/Berlin 2038-01-19T03:14:07.999Z 3600
+offset Europe/Berlin 2050-07-01T12:00:00Z 7200
+offset Europe/Berlin 2099-12-31T23:59:59.999Z 3600
+offset Europe/Berlin 2100-03-14T12:00:00Z 3600
+offset Europe/Berlin 2100-12-31T23:59:59.999Z 3600
+offset Europe/Berlin min_ms 3208
+offset Europe/Berlin min_ms+1 3208
+offset Europe/Berlin max_ms 0
+offset Europe/Berlin max_ms-1 0
+offset Europe/Berlin i64::MIN 3208
+offset Europe/Berlin i64::MAX 0
+offset Europe/Moscow 1800-01-01T00:00:00Z 9017
+offset Europe/Moscow 1850-06-15T12:00:00Z 9017
+offset Europe/Moscow 1883-11-18T16:59:59.999Z 9017
+offset Europe/Moscow 1883-11-18T17:00:00Z 9017
+offset Europe/Moscow 1900-01-01T00:00:00Z 9017
+offset Europe/Moscow 1918-03-31T07:00:00Z -1ms 9079
+offset Europe/Moscow 1918-03-31T07:00:00Z 9079
+offset Europe/Moscow 1945-08-15T12:00:00Z 10800
+offset Europe/Moscow 1969-12-31T23:59:59.999Z 10800
+offset Europe/Moscow 1970-01-01T00:00:00Z 10800
+offset Europe/Moscow 1986-01-01T00:00:00Z 10800
+offset Europe/Moscow 2000-01-01T00:00:00Z 10800
+offset Europe/Moscow 2007-03-11T07:00:00Z -1ms 10800
+offset Europe/Moscow 2007-03-11T07:00:00Z 10800
+offset Europe/Moscow 2011-12-30T10:00:00Z -1ms 14400
+offset Europe/Moscow 2011-12-30T10:00:00Z 14400
+offset Europe/Moscow 2022-03-21T20:30:00Z -1ms 10800
+offset Europe/Moscow 2022-03-21T20:30:00Z 10800
+offset Europe/Moscow 2024-03-10T02:00:00Z -1ms 10800
+offset Europe/Moscow 2024-03-10T02:00:00Z 10800
+offset Europe/Moscow 2024-03-10T07:00:00Z -1ms 10800
+offset Europe/Moscow 2024-03-10T07:00:00Z 10800
+offset Europe/Moscow 2024-03-31T01:00:00Z -1ms 10800
+offset Europe/Moscow 2024-03-31T01:00:00Z 10800
+offset Europe/Moscow 2024-04-06T14:45:00Z -1ms 10800
+offset Europe/Moscow 2024-04-06T14:45:00Z 10800
+offset Europe/Moscow 2024-04-06T15:00:00Z -1ms 10800
+offset Europe/Moscow 2024-04-06T15:00:00Z 10800
+offset Europe/Moscow 2024-04-06T16:00:00Z -1ms 10800
+offset Europe/Moscow 2024-04-06T16:00:00Z 10800
+offset Europe/Moscow 2024-04-14T02:00:00Z -1ms 10800
+offset Europe/Moscow 2024-04-14T02:00:00Z 10800
+offset Europe/Moscow 2024-07-01T00:00:00Z 10800
+offset Europe/Moscow 2024-09-28T14:45:00Z -1ms 10800
+offset Europe/Moscow 2024-09-28T14:45:00Z 10800
+offset Europe/Moscow 2024-10-05T16:00:00Z -1ms 10800
+offset Europe/Moscow 2024-10-05T16:00:00Z 10800
+offset Europe/Moscow 2024-10-06T15:30:00Z -1ms 10800
+offset Europe/Moscow 2024-10-06T15:30:00Z 10800
+offset Europe/Moscow 2024-10-27T01:00:00Z -1ms 10800
+offset Europe/Moscow 2024-10-27T01:00:00Z 10800
+offset Europe/Moscow 2024-11-03T06:00:00Z -1ms 10800
+offset Europe/Moscow 2024-11-03T06:00:00Z 10800
+offset Europe/Moscow 2024-12-31T23:59:59.999Z 10800
+offset Europe/Moscow 2038-01-19T03:14:07.999Z 10800
+offset Europe/Moscow 2050-07-01T12:00:00Z 10800
+offset Europe/Moscow 2099-12-31T23:59:59.999Z 10800
+offset Europe/Moscow 2100-03-14T12:00:00Z 10800
+offset Europe/Moscow 2100-12-31T23:59:59.999Z 10800
+offset Europe/Moscow min_ms 9017
+offset Europe/Moscow min_ms+1 9017
+offset Europe/Moscow max_ms 0
+offset Europe/Moscow max_ms-1 0
+offset Europe/Moscow i64::MIN 9017
+offset Europe/Moscow i64::MAX 0
+offset Africa/Casablanca 1800-01-01T00:00:00Z -1820
+offset Africa/Casablanca 1850-06-15T12:00:00Z -1820
+offset Africa/Casablanca 1883-11-18T16:59:59.999Z -1820
+offset Africa/Casablanca 1883-11-18T17:00:00Z -1820
+offset Africa/Casablanca 1900-01-01T00:00:00Z -1820
+offset Africa/Casablanca 1918-03-31T07:00:00Z -1ms 0
+offset Africa/Casablanca 1918-03-31T07:00:00Z 0
+offset Africa/Casablanca 1945-08-15T12:00:00Z 3600
+offset Africa/Casablanca 1969-12-31T23:59:59.999Z 0
+offset Africa/Casablanca 1970-01-01T00:00:00Z 0
+offset Africa/Casablanca 1986-01-01T00:00:00Z 0
+offset Africa/Casablanca 2000-01-01T00:00:00Z 0
+offset Africa/Casablanca 2007-03-11T07:00:00Z -1ms 0
+offset Africa/Casablanca 2007-03-11T07:00:00Z 0
+offset Africa/Casablanca 2011-12-30T10:00:00Z -1ms 0
+offset Africa/Casablanca 2011-12-30T10:00:00Z 0
+offset Africa/Casablanca 2022-03-21T20:30:00Z -1ms 3600
+offset Africa/Casablanca 2022-03-21T20:30:00Z 3600
+offset Africa/Casablanca 2024-03-10T02:00:00Z -1ms 3600
+offset Africa/Casablanca 2024-03-10T02:00:00Z 0
+offset Africa/Casablanca 2024-03-10T07:00:00Z -1ms 0
+offset Africa/Casablanca 2024-03-10T07:00:00Z 0
+offset Africa/Casablanca 2024-03-31T01:00:00Z -1ms 0
+offset Africa/Casablanca 2024-03-31T01:00:00Z 0
+offset Africa/Casablanca 2024-04-06T14:45:00Z -1ms 0
+offset Africa/Casablanca 2024-04-06T14:45:00Z 0
+offset Africa/Casablanca 2024-04-06T15:00:00Z -1ms 0
+offset Africa/Casablanca 2024-04-06T15:00:00Z 0
+offset Africa/Casablanca 2024-04-06T16:00:00Z -1ms 0
+offset Africa/Casablanca 2024-04-06T16:00:00Z 0
+offset Africa/Casablanca 2024-04-14T02:00:00Z -1ms 0
+offset Africa/Casablanca 2024-04-14T02:00:00Z 3600
+offset Africa/Casablanca 2024-07-01T00:00:00Z 3600
+offset Africa/Casablanca 2024-09-28T14:45:00Z -1ms 3600
+offset Africa/Casablanca 2024-09-28T14:45:00Z 3600
+offset Africa/Casablanca 2024-10-05T16:00:00Z -1ms 3600
+offset Africa/Casablanca 2024-10-05T16:00:00Z 3600
+offset Africa/Casablanca 2024-10-06T15:30:00Z -1ms 3600
+offset Africa/Casablanca 2024-10-06T15:30:00Z 3600
+offset Africa/Casablanca 2024-10-27T01:00:00Z -1ms 3600
+offset Africa/Casablanca 2024-10-27T01:00:00Z 3600
+offset Africa/Casablanca 2024-11-03T06:00:00Z -1ms 3600
+offset Africa/Casablanca 2024-11-03T06:00:00Z 3600
+offset Africa/Casablanca 2024-12-31T23:59:59.999Z 3600
+offset Africa/Casablanca 2038-01-19T03:14:07.999Z 0
+offset Africa/Casablanca 2050-07-01T12:00:00Z 0
+offset Africa/Casablanca 2099-12-31T23:59:59.999Z 0
+offset Africa/Casablanca 2100-03-14T12:00:00Z 0
+offset Africa/Casablanca 2100-12-31T23:59:59.999Z 0
+offset Africa/Casablanca min_ms -1820
+offset Africa/Casablanca min_ms+1 -1820
+offset Africa/Casablanca max_ms 0
+offset Africa/Casablanca max_ms-1 0
+offset Africa/Casablanca i64::MIN -1820
+offset Africa/Casablanca i64::MAX 0
+offset Asia/Kolkata 1800-01-01T00:00:00Z 21208
+offset Asia/Kolkata 1850-06-15T12:00:00Z 21208
+offset Asia/Kolkata 1883-11-18T16:59:59.999Z 19270
+offset Asia/Kolkata 1883-11-18T17:00:00Z 19270
+offset Asia/Kolkata 1900-01-01T00:00:00Z 19270
+offset Asia/Kolkata 1918-03-31T07:00:00Z -1ms 19800
+offset Asia/Kolkata 1918-03-31T07:00:00Z 19800
+offset Asia/Kolkata 1945-08-15T12:00:00Z 23400
+offset Asia/Kolkata 1969-12-31T23:59:59.999Z 19800
+offset Asia/Kolkata 1970-01-01T00:00:00Z 19800
+offset Asia/Kolkata 1986-01-01T00:00:00Z 19800
+offset Asia/Kolkata 2000-01-01T00:00:00Z 19800
+offset Asia/Kolkata 2007-03-11T07:00:00Z -1ms 19800
+offset Asia/Kolkata 2007-03-11T07:00:00Z 19800
+offset Asia/Kolkata 2011-12-30T10:00:00Z -1ms 19800
+offset Asia/Kolkata 2011-12-30T10:00:00Z 19800
+offset Asia/Kolkata 2022-03-21T20:30:00Z -1ms 19800
+offset Asia/Kolkata 2022-03-21T20:30:00Z 19800
+offset Asia/Kolkata 2024-03-10T02:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-03-10T02:00:00Z 19800
+offset Asia/Kolkata 2024-03-10T07:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-03-10T07:00:00Z 19800
+offset Asia/Kolkata 2024-03-31T01:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-03-31T01:00:00Z 19800
+offset Asia/Kolkata 2024-04-06T14:45:00Z -1ms 19800
+offset Asia/Kolkata 2024-04-06T14:45:00Z 19800
+offset Asia/Kolkata 2024-04-06T15:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-04-06T15:00:00Z 19800
+offset Asia/Kolkata 2024-04-06T16:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-04-06T16:00:00Z 19800
+offset Asia/Kolkata 2024-04-14T02:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-04-14T02:00:00Z 19800
+offset Asia/Kolkata 2024-07-01T00:00:00Z 19800
+offset Asia/Kolkata 2024-09-28T14:45:00Z -1ms 19800
+offset Asia/Kolkata 2024-09-28T14:45:00Z 19800
+offset Asia/Kolkata 2024-10-05T16:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-10-05T16:00:00Z 19800
+offset Asia/Kolkata 2024-10-06T15:30:00Z -1ms 19800
+offset Asia/Kolkata 2024-10-06T15:30:00Z 19800
+offset Asia/Kolkata 2024-10-27T01:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-10-27T01:00:00Z 19800
+offset Asia/Kolkata 2024-11-03T06:00:00Z -1ms 19800
+offset Asia/Kolkata 2024-11-03T06:00:00Z 19800
+offset Asia/Kolkata 2024-12-31T23:59:59.999Z 19800
+offset Asia/Kolkata 2038-01-19T03:14:07.999Z 19800
+offset Asia/Kolkata 2050-07-01T12:00:00Z 19800
+offset Asia/Kolkata 2099-12-31T23:59:59.999Z 19800
+offset Asia/Kolkata 2100-03-14T12:00:00Z 19800
+offset Asia/Kolkata 2100-12-31T23:59:59.999Z 19800
+offset Asia/Kolkata min_ms 21208
+offset Asia/Kolkata min_ms+1 21208
+offset Asia/Kolkata max_ms 0
+offset Asia/Kolkata max_ms-1 0
+offset Asia/Kolkata i64::MIN 21208
+offset Asia/Kolkata i64::MAX 0
+offset Asia/Kathmandu 1800-01-01T00:00:00Z 20476
+offset Asia/Kathmandu 1850-06-15T12:00:00Z 20476
+offset Asia/Kathmandu 1883-11-18T16:59:59.999Z 20476
+offset Asia/Kathmandu 1883-11-18T17:00:00Z 20476
+offset Asia/Kathmandu 1900-01-01T00:00:00Z 20476
+offset Asia/Kathmandu 1918-03-31T07:00:00Z -1ms 20476
+offset Asia/Kathmandu 1918-03-31T07:00:00Z 20476
+offset Asia/Kathmandu 1945-08-15T12:00:00Z 19800
+offset Asia/Kathmandu 1969-12-31T23:59:59.999Z 19800
+offset Asia/Kathmandu 1970-01-01T00:00:00Z 19800
+offset Asia/Kathmandu 1986-01-01T00:00:00Z 20700
+offset Asia/Kathmandu 2000-01-01T00:00:00Z 20700
+offset Asia/Kathmandu 2007-03-11T07:00:00Z -1ms 20700
+offset Asia/Kathmandu 2007-03-11T07:00:00Z 20700
+offset Asia/Kathmandu 2011-12-30T10:00:00Z -1ms 20700
+offset Asia/Kathmandu 2011-12-30T10:00:00Z 20700
+offset Asia/Kathmandu 2022-03-21T20:30:00Z -1ms 20700
+offset Asia/Kathmandu 2022-03-21T20:30:00Z 20700
+offset Asia/Kathmandu 2024-03-10T02:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-03-10T02:00:00Z 20700
+offset Asia/Kathmandu 2024-03-10T07:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-03-10T07:00:00Z 20700
+offset Asia/Kathmandu 2024-03-31T01:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-03-31T01:00:00Z 20700
+offset Asia/Kathmandu 2024-04-06T14:45:00Z -1ms 20700
+offset Asia/Kathmandu 2024-04-06T14:45:00Z 20700
+offset Asia/Kathmandu 2024-04-06T15:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-04-06T15:00:00Z 20700
+offset Asia/Kathmandu 2024-04-06T16:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-04-06T16:00:00Z 20700
+offset Asia/Kathmandu 2024-04-14T02:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-04-14T02:00:00Z 20700
+offset Asia/Kathmandu 2024-07-01T00:00:00Z 20700
+offset Asia/Kathmandu 2024-09-28T14:45:00Z -1ms 20700
+offset Asia/Kathmandu 2024-09-28T14:45:00Z 20700
+offset Asia/Kathmandu 2024-10-05T16:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-10-05T16:00:00Z 20700
+offset Asia/Kathmandu 2024-10-06T15:30:00Z -1ms 20700
+offset Asia/Kathmandu 2024-10-06T15:30:00Z 20700
+offset Asia/Kathmandu 2024-10-27T01:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-10-27T01:00:00Z 20700
+offset Asia/Kathmandu 2024-11-03T06:00:00Z -1ms 20700
+offset Asia/Kathmandu 2024-11-03T06:00:00Z 20700
+offset Asia/Kathmandu 2024-12-31T23:59:59.999Z 20700
+offset Asia/Kathmandu 2038-01-19T03:14:07.999Z 20700
+offset Asia/Kathmandu 2050-07-01T12:00:00Z 20700
+offset Asia/Kathmandu 2099-12-31T23:59:59.999Z 20700
+offset Asia/Kathmandu 2100-03-14T12:00:00Z 20700
+offset Asia/Kathmandu 2100-12-31T23:59:59.999Z 20700
+offset Asia/Kathmandu min_ms 20476
+offset Asia/Kathmandu min_ms+1 20476
+offset Asia/Kathmandu max_ms 0
+offset Asia/Kathmandu max_ms-1 0
+offset Asia/Kathmandu i64::MIN 20476
+offset Asia/Kathmandu i64::MAX 0
+offset Asia/Tehran 1800-01-01T00:00:00Z 12344
+offset Asia/Tehran 1850-06-15T12:00:00Z 12344
+offset Asia/Tehran 1883-11-18T16:59:59.999Z 12344
+offset Asia/Tehran 1883-11-18T17:00:00Z 12344
+offset Asia/Tehran 1900-01-01T00:00:00Z 12344
+offset Asia/Tehran 1918-03-31T07:00:00Z -1ms 12344
+offset Asia/Tehran 1918-03-31T07:00:00Z 12344
+offset Asia/Tehran 1945-08-15T12:00:00Z 12600
+offset Asia/Tehran 1969-12-31T23:59:59.999Z 12600
+offset Asia/Tehran 1970-01-01T00:00:00Z 12600
+offset Asia/Tehran 1986-01-01T00:00:00Z 12600
+offset Asia/Tehran 2000-01-01T00:00:00Z 12600
+offset Asia/Tehran 2007-03-11T07:00:00Z -1ms 12600
+offset Asia/Tehran 2007-03-11T07:00:00Z 12600
+offset Asia/Tehran 2011-12-30T10:00:00Z -1ms 12600
+offset Asia/Tehran 2011-12-30T10:00:00Z 12600
+offset Asia/Tehran 2022-03-21T20:30:00Z -1ms 12600
+offset Asia/Tehran 2022-03-21T20:30:00Z 16200
+offset Asia/Tehran 2024-03-10T02:00:00Z -1ms 12600
+offset Asia/Tehran 2024-03-10T02:00:00Z 12600
+offset Asia/Tehran 2024-03-10T07:00:00Z -1ms 12600
+offset Asia/Tehran 2024-03-10T07:00:00Z 12600
+offset Asia/Tehran 2024-03-31T01:00:00Z -1ms 12600
+offset Asia/Tehran 2024-03-31T01:00:00Z 12600
+offset Asia/Tehran 2024-04-06T14:45:00Z -1ms 12600
+offset Asia/Tehran 2024-04-06T14:45:00Z 12600
+offset Asia/Tehran 2024-04-06T15:00:00Z -1ms 12600
+offset Asia/Tehran 2024-04-06T15:00:00Z 12600
+offset Asia/Tehran 2024-04-06T16:00:00Z -1ms 12600
+offset Asia/Tehran 2024-04-06T16:00:00Z 12600
+offset Asia/Tehran 2024-04-14T02:00:00Z -1ms 12600
+offset Asia/Tehran 2024-04-14T02:00:00Z 12600
+offset Asia/Tehran 2024-07-01T00:00:00Z 12600
+offset Asia/Tehran 2024-09-28T14:45:00Z -1ms 12600
+offset Asia/Tehran 2024-09-28T14:45:00Z 12600
+offset Asia/Tehran 2024-10-05T16:00:00Z -1ms 12600
+offset Asia/Tehran 2024-10-05T16:00:00Z 12600
+offset Asia/Tehran 2024-10-06T15:30:00Z -1ms 12600
+offset Asia/Tehran 2024-10-06T15:30:00Z 12600
+offset Asia/Tehran 2024-10-27T01:00:00Z -1ms 12600
+offset Asia/Tehran 2024-10-27T01:00:00Z 12600
+offset Asia/Tehran 2024-11-03T06:00:00Z -1ms 12600
+offset Asia/Tehran 2024-11-03T06:00:00Z 12600
+offset Asia/Tehran 2024-12-31T23:59:59.999Z 12600
+offset Asia/Tehran 2038-01-19T03:14:07.999Z 12600
+offset Asia/Tehran 2050-07-01T12:00:00Z 12600
+offset Asia/Tehran 2099-12-31T23:59:59.999Z 12600
+offset Asia/Tehran 2100-03-14T12:00:00Z 12600
+offset Asia/Tehran 2100-12-31T23:59:59.999Z 12600
+offset Asia/Tehran min_ms 12344
+offset Asia/Tehran min_ms+1 12344
+offset Asia/Tehran max_ms 0
+offset Asia/Tehran max_ms-1 0
+offset Asia/Tehran i64::MIN 12344
+offset Asia/Tehran i64::MAX 0
+offset Australia/Sydney 1800-01-01T00:00:00Z 36292
+offset Australia/Sydney 1850-06-15T12:00:00Z 36292
+offset Australia/Sydney 1883-11-18T16:59:59.999Z 36292
+offset Australia/Sydney 1883-11-18T17:00:00Z 36292
+offset Australia/Sydney 1900-01-01T00:00:00Z 36000
+offset Australia/Sydney 1918-03-31T07:00:00Z -1ms 36000
+offset Australia/Sydney 1918-03-31T07:00:00Z 36000
+offset Australia/Sydney 1945-08-15T12:00:00Z 36000
+offset Australia/Sydney 1969-12-31T23:59:59.999Z 36000
+offset Australia/Sydney 1970-01-01T00:00:00Z 36000
+offset Australia/Sydney 1986-01-01T00:00:00Z 39600
+offset Australia/Sydney 2000-01-01T00:00:00Z 39600
+offset Australia/Sydney 2007-03-11T07:00:00Z -1ms 39600
+offset Australia/Sydney 2007-03-11T07:00:00Z 39600
+offset Australia/Sydney 2011-12-30T10:00:00Z -1ms 39600
+offset Australia/Sydney 2011-12-30T10:00:00Z 39600
+offset Australia/Sydney 2022-03-21T20:30:00Z -1ms 39600
+offset Australia/Sydney 2022-03-21T20:30:00Z 39600
+offset Australia/Sydney 2024-03-10T02:00:00Z -1ms 39600
+offset Australia/Sydney 2024-03-10T02:00:00Z 39600
+offset Australia/Sydney 2024-03-10T07:00:00Z -1ms 39600
+offset Australia/Sydney 2024-03-10T07:00:00Z 39600
+offset Australia/Sydney 2024-03-31T01:00:00Z -1ms 39600
+offset Australia/Sydney 2024-03-31T01:00:00Z 39600
+offset Australia/Sydney 2024-04-06T14:45:00Z -1ms 39600
+offset Australia/Sydney 2024-04-06T14:45:00Z 39600
+offset Australia/Sydney 2024-04-06T15:00:00Z -1ms 39600
+offset Australia/Sydney 2024-04-06T15:00:00Z 39600
+offset Australia/Sydney 2024-04-06T16:00:00Z -1ms 39600
+offset Australia/Sydney 2024-04-06T16:00:00Z 36000
+offset Australia/Sydney 2024-04-14T02:00:00Z -1ms 36000
+offset Australia/Sydney 2024-04-14T02:00:00Z 36000
+offset Australia/Sydney 2024-07-01T00:00:00Z 36000
+offset Australia/Sydney 2024-09-28T14:45:00Z -1ms 36000
+offset Australia/Sydney 2024-09-28T14:45:00Z 36000
+offset Australia/Sydney 2024-10-05T16:00:00Z -1ms 36000
+offset Australia/Sydney 2024-10-05T16:00:00Z 39600
+offset Australia/Sydney 2024-10-06T15:30:00Z -1ms 39600
+offset Australia/Sydney 2024-10-06T15:30:00Z 39600
+offset Australia/Sydney 2024-10-27T01:00:00Z -1ms 39600
+offset Australia/Sydney 2024-10-27T01:00:00Z 39600
+offset Australia/Sydney 2024-11-03T06:00:00Z -1ms 39600
+offset Australia/Sydney 2024-11-03T06:00:00Z 39600
+offset Australia/Sydney 2024-12-31T23:59:59.999Z 39600
+offset Australia/Sydney 2038-01-19T03:14:07.999Z 39600
+offset Australia/Sydney 2050-07-01T12:00:00Z 36000
+offset Australia/Sydney 2099-12-31T23:59:59.999Z 39600
+offset Australia/Sydney 2100-03-14T12:00:00Z 39600
+offset Australia/Sydney 2100-12-31T23:59:59.999Z 39600
+offset Australia/Sydney min_ms 36292
+offset Australia/Sydney min_ms+1 36292
+offset Australia/Sydney max_ms 0
+offset Australia/Sydney max_ms-1 0
+offset Australia/Sydney i64::MIN 36292
+offset Australia/Sydney i64::MAX 0
+offset Australia/Lord_Howe 1800-01-01T00:00:00Z 38180
+offset Australia/Lord_Howe 1850-06-15T12:00:00Z 38180
+offset Australia/Lord_Howe 1883-11-18T16:59:59.999Z 38180
+offset Australia/Lord_Howe 1883-11-18T17:00:00Z 38180
+offset Australia/Lord_Howe 1900-01-01T00:00:00Z 36000
+offset Australia/Lord_Howe 1918-03-31T07:00:00Z -1ms 36000
+offset Australia/Lord_Howe 1918-03-31T07:00:00Z 36000
+offset Australia/Lord_Howe 1945-08-15T12:00:00Z 36000
+offset Australia/Lord_Howe 1969-12-31T23:59:59.999Z 36000
+offset Australia/Lord_Howe 1970-01-01T00:00:00Z 36000
+offset Australia/Lord_Howe 1986-01-01T00:00:00Z 39600
+offset Australia/Lord_Howe 2000-01-01T00:00:00Z 39600
+offset Australia/Lord_Howe 2007-03-11T07:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2007-03-11T07:00:00Z 39600
+offset Australia/Lord_Howe 2011-12-30T10:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2011-12-30T10:00:00Z 39600
+offset Australia/Lord_Howe 2022-03-21T20:30:00Z -1ms 39600
+offset Australia/Lord_Howe 2022-03-21T20:30:00Z 39600
+offset Australia/Lord_Howe 2024-03-10T02:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-03-10T02:00:00Z 39600
+offset Australia/Lord_Howe 2024-03-10T07:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-03-10T07:00:00Z 39600
+offset Australia/Lord_Howe 2024-03-31T01:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-03-31T01:00:00Z 39600
+offset Australia/Lord_Howe 2024-04-06T14:45:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-04-06T14:45:00Z 39600
+offset Australia/Lord_Howe 2024-04-06T15:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-04-06T15:00:00Z 37800
+offset Australia/Lord_Howe 2024-04-06T16:00:00Z -1ms 37800
+offset Australia/Lord_Howe 2024-04-06T16:00:00Z 37800
+offset Australia/Lord_Howe 2024-04-14T02:00:00Z -1ms 37800
+offset Australia/Lord_Howe 2024-04-14T02:00:00Z 37800
+offset Australia/Lord_Howe 2024-07-01T00:00:00Z 37800
+offset Australia/Lord_Howe 2024-09-28T14:45:00Z -1ms 37800
+offset Australia/Lord_Howe 2024-09-28T14:45:00Z 37800
+offset Australia/Lord_Howe 2024-10-05T16:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-10-05T16:00:00Z 39600
+offset Australia/Lord_Howe 2024-10-06T15:30:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-10-06T15:30:00Z 39600
+offset Australia/Lord_Howe 2024-10-27T01:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-10-27T01:00:00Z 39600
+offset Australia/Lord_Howe 2024-11-03T06:00:00Z -1ms 39600
+offset Australia/Lord_Howe 2024-11-03T06:00:00Z 39600
+offset Australia/Lord_Howe 2024-12-31T23:59:59.999Z 39600
+offset Australia/Lord_Howe 2038-01-19T03:14:07.999Z 39600
+offset Australia/Lord_Howe 2050-07-01T12:00:00Z 37800
+offset Australia/Lord_Howe 2099-12-31T23:59:59.999Z 39600
+offset Australia/Lord_Howe 2100-03-14T12:00:00Z 39600
+offset Australia/Lord_Howe 2100-12-31T23:59:59.999Z 39600
+offset Australia/Lord_Howe min_ms 38180
+offset Australia/Lord_Howe min_ms+1 38180
+offset Australia/Lord_Howe max_ms 0
+offset Australia/Lord_Howe max_ms-1 0
+offset Australia/Lord_Howe i64::MIN 38180
+offset Australia/Lord_Howe i64::MAX 0
+offset Pacific/Apia 1800-01-01T00:00:00Z 45184
+offset Pacific/Apia 1850-06-15T12:00:00Z 45184
+offset Pacific/Apia 1883-11-18T16:59:59.999Z 45184
+offset Pacific/Apia 1883-11-18T17:00:00Z 45184
+offset Pacific/Apia 1900-01-01T00:00:00Z -41216
+offset Pacific/Apia 1918-03-31T07:00:00Z -1ms -41400
+offset Pacific/Apia 1918-03-31T07:00:00Z -41400
+offset Pacific/Apia 1945-08-15T12:00:00Z -41400
+offset Pacific/Apia 1969-12-31T23:59:59.999Z -39600
+offset Pacific/Apia 1970-01-01T00:00:00Z -39600
+offset Pacific/Apia 1986-01-01T00:00:00Z -39600
+offset Pacific/Apia 2000-01-01T00:00:00Z -39600
+offset Pacific/Apia 2007-03-11T07:00:00Z -1ms -39600
+offset Pacific/Apia 2007-03-11T07:00:00Z -39600
+offset Pacific/Apia 2011-12-30T10:00:00Z -1ms -36000
+offset Pacific/Apia 2011-12-30T10:00:00Z 50400
+offset Pacific/Apia 2022-03-21T20:30:00Z -1ms 46800
+offset Pacific/Apia 2022-03-21T20:30:00Z 46800
+offset Pacific/Apia 2024-03-10T02:00:00Z -1ms 46800
+offset Pacific/Apia 2024-03-10T02:00:00Z 46800
+offset Pacific/Apia 2024-03-10T07:00:00Z -1ms 46800
+offset Pacific/Apia 2024-03-10T07:00:00Z 46800
+offset Pacific/Apia 2024-03-31T01:00:00Z -1ms 46800
+offset Pacific/Apia 2024-03-31T01:00:00Z 46800
+offset Pacific/Apia 2024-04-06T14:45:00Z -1ms 46800
+offset Pacific/Apia 2024-04-06T14:45:00Z 46800
+offset Pacific/Apia 2024-04-06T15:00:00Z -1ms 46800
+offset Pacific/Apia 2024-04-06T15:00:00Z 46800
+offset Pacific/Apia 2024-04-06T16:00:00Z -1ms 46800
+offset Pacific/Apia 2024-04-06T16:00:00Z 46800
+offset Pacific/Apia 2024-04-14T02:00:00Z -1ms 46800
+offset Pacific/Apia 2024-04-14T02:00:00Z 46800
+offset Pacific/Apia 2024-07-01T00:00:00Z 46800
+offset Pacific/Apia 2024-09-28T14:45:00Z -1ms 46800
+offset Pacific/Apia 2024-09-28T14:45:00Z 46800
+offset Pacific/Apia 2024-10-05T16:00:00Z -1ms 46800
+offset Pacific/Apia 2024-10-05T16:00:00Z 46800
+offset Pacific/Apia 2024-10-06T15:30:00Z -1ms 46800
+offset Pacific/Apia 2024-10-06T15:30:00Z 46800
+offset Pacific/Apia 2024-10-27T01:00:00Z -1ms 46800
+offset Pacific/Apia 2024-10-27T01:00:00Z 46800
+offset Pacific/Apia 2024-11-03T06:00:00Z -1ms 46800
+offset Pacific/Apia 2024-11-03T06:00:00Z 46800
+offset Pacific/Apia 2024-12-31T23:59:59.999Z 46800
+offset Pacific/Apia 2038-01-19T03:14:07.999Z 46800
+offset Pacific/Apia 2050-07-01T12:00:00Z 46800
+offset Pacific/Apia 2099-12-31T23:59:59.999Z 46800
+offset Pacific/Apia 2100-03-14T12:00:00Z 46800
+offset Pacific/Apia 2100-12-31T23:59:59.999Z 46800
+offset Pacific/Apia min_ms 45184
+offset Pacific/Apia min_ms+1 45184
+offset Pacific/Apia max_ms 0
+offset Pacific/Apia max_ms-1 0
+offset Pacific/Apia i64::MIN 45184
+offset Pacific/Apia i64::MAX 0
+offset Pacific/Chatham 1800-01-01T00:00:00Z 44028
+offset Pacific/Chatham 1850-06-15T12:00:00Z 44028
+offset Pacific/Chatham 1883-11-18T16:59:59.999Z 44100
+offset Pacific/Chatham 1883-11-18T17:00:00Z 44100
+offset Pacific/Chatham 1900-01-01T00:00:00Z 44100
+offset Pacific/Chatham 1918-03-31T07:00:00Z -1ms 44100
+offset Pacific/Chatham 1918-03-31T07:00:00Z 44100
+offset Pacific/Chatham 1945-08-15T12:00:00Z 44100
+offset Pacific/Chatham 1969-12-31T23:59:59.999Z 45900
+offset Pacific/Chatham 1970-01-01T00:00:00Z 45900
+offset Pacific/Chatham 1986-01-01T00:00:00Z 49500
+offset Pacific/Chatham 2000-01-01T00:00:00Z 49500
+offset Pacific/Chatham 2007-03-11T07:00:00Z -1ms 49500
+offset Pacific/Chatham 2007-03-11T07:00:00Z 49500
+offset Pacific/Chatham 2011-12-30T10:00:00Z -1ms 49500
+offset Pacific/Chatham 2011-12-30T10:00:00Z 49500
+offset Pacific/Chatham 2022-03-21T20:30:00Z -1ms 49500
+offset Pacific/Chatham 2022-03-21T20:30:00Z 49500
+offset Pacific/Chatham 2024-03-10T02:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-03-10T02:00:00Z 49500
+offset Pacific/Chatham 2024-03-10T07:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-03-10T07:00:00Z 49500
+offset Pacific/Chatham 2024-03-31T01:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-03-31T01:00:00Z 49500
+offset Pacific/Chatham 2024-04-06T14:45:00Z -1ms 45900
+offset Pacific/Chatham 2024-04-06T14:45:00Z 45900
+offset Pacific/Chatham 2024-04-06T15:00:00Z -1ms 45900
+offset Pacific/Chatham 2024-04-06T15:00:00Z 45900
+offset Pacific/Chatham 2024-04-06T16:00:00Z -1ms 45900
+offset Pacific/Chatham 2024-04-06T16:00:00Z 45900
+offset Pacific/Chatham 2024-04-14T02:00:00Z -1ms 45900
+offset Pacific/Chatham 2024-04-14T02:00:00Z 45900
+offset Pacific/Chatham 2024-07-01T00:00:00Z 45900
+offset Pacific/Chatham 2024-09-28T14:45:00Z -1ms 49500
+offset Pacific/Chatham 2024-09-28T14:45:00Z 49500
+offset Pacific/Chatham 2024-10-05T16:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-10-05T16:00:00Z 49500
+offset Pacific/Chatham 2024-10-06T15:30:00Z -1ms 49500
+offset Pacific/Chatham 2024-10-06T15:30:00Z 49500
+offset Pacific/Chatham 2024-10-27T01:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-10-27T01:00:00Z 49500
+offset Pacific/Chatham 2024-11-03T06:00:00Z -1ms 49500
+offset Pacific/Chatham 2024-11-03T06:00:00Z 49500
+offset Pacific/Chatham 2024-12-31T23:59:59.999Z 49500
+offset Pacific/Chatham 2038-01-19T03:14:07.999Z 49500
+offset Pacific/Chatham 2050-07-01T12:00:00Z 45900
+offset Pacific/Chatham 2099-12-31T23:59:59.999Z 49500
+offset Pacific/Chatham 2100-03-14T12:00:00Z 49500
+offset Pacific/Chatham 2100-12-31T23:59:59.999Z 49500
+offset Pacific/Chatham min_ms 44028
+offset Pacific/Chatham min_ms+1 44028
+offset Pacific/Chatham max_ms 0
+offset Pacific/Chatham max_ms-1 0
+offset Pacific/Chatham i64::MIN 44028
+offset Pacific/Chatham i64::MAX 0
+offset Pacific/Kiritimati 1800-01-01T00:00:00Z -37760
+offset Pacific/Kiritimati 1850-06-15T12:00:00Z -37760
+offset Pacific/Kiritimati 1883-11-18T16:59:59.999Z -37760
+offset Pacific/Kiritimati 1883-11-18T17:00:00Z -37760
+offset Pacific/Kiritimati 1900-01-01T00:00:00Z -37760
+offset Pacific/Kiritimati 1918-03-31T07:00:00Z -1ms -38400
+offset Pacific/Kiritimati 1918-03-31T07:00:00Z -38400
+offset Pacific/Kiritimati 1945-08-15T12:00:00Z -38400
+offset Pacific/Kiritimati 1969-12-31T23:59:59.999Z -38400
+offset Pacific/Kiritimati 1970-01-01T00:00:00Z -38400
+offset Pacific/Kiritimati 1986-01-01T00:00:00Z -36000
+offset Pacific/Kiritimati 2000-01-01T00:00:00Z 50400
+offset Pacific/Kiritimati 2007-03-11T07:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2007-03-11T07:00:00Z 50400
+offset Pacific/Kiritimati 2011-12-30T10:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2011-12-30T10:00:00Z 50400
+offset Pacific/Kiritimati 2022-03-21T20:30:00Z -1ms 50400
+offset Pacific/Kiritimati 2022-03-21T20:30:00Z 50400
+offset Pacific/Kiritimati 2024-03-10T02:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-03-10T02:00:00Z 50400
+offset Pacific/Kiritimati 2024-03-10T07:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-03-10T07:00:00Z 50400
+offset Pacific/Kiritimati 2024-03-31T01:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-03-31T01:00:00Z 50400
+offset Pacific/Kiritimati 2024-04-06T14:45:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-04-06T14:45:00Z 50400
+offset Pacific/Kiritimati 2024-04-06T15:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-04-06T15:00:00Z 50400
+offset Pacific/Kiritimati 2024-04-06T16:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-04-06T16:00:00Z 50400
+offset Pacific/Kiritimati 2024-04-14T02:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-04-14T02:00:00Z 50400
+offset Pacific/Kiritimati 2024-07-01T00:00:00Z 50400
+offset Pacific/Kiritimati 2024-09-28T14:45:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-09-28T14:45:00Z 50400
+offset Pacific/Kiritimati 2024-10-05T16:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-10-05T16:00:00Z 50400
+offset Pacific/Kiritimati 2024-10-06T15:30:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-10-06T15:30:00Z 50400
+offset Pacific/Kiritimati 2024-10-27T01:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-10-27T01:00:00Z 50400
+offset Pacific/Kiritimati 2024-11-03T06:00:00Z -1ms 50400
+offset Pacific/Kiritimati 2024-11-03T06:00:00Z 50400
+offset Pacific/Kiritimati 2024-12-31T23:59:59.999Z 50400
+offset Pacific/Kiritimati 2038-01-19T03:14:07.999Z 50400
+offset Pacific/Kiritimati 2050-07-01T12:00:00Z 50400
+offset Pacific/Kiritimati 2099-12-31T23:59:59.999Z 50400
+offset Pacific/Kiritimati 2100-03-14T12:00:00Z 50400
+offset Pacific/Kiritimati 2100-12-31T23:59:59.999Z 50400
+offset Pacific/Kiritimati min_ms -37760
+offset Pacific/Kiritimati min_ms+1 -37760
+offset Pacific/Kiritimati max_ms 0
+offset Pacific/Kiritimati max_ms-1 0
+offset Pacific/Kiritimati i64::MIN -37760
+offset Pacific/Kiritimati i64::MAX 0
+offset Etc/GMT+5 1800-01-01T00:00:00Z -18000
+offset Etc/GMT+5 1850-06-15T12:00:00Z -18000
+offset Etc/GMT+5 1883-11-18T16:59:59.999Z -18000
+offset Etc/GMT+5 1883-11-18T17:00:00Z -18000
+offset Etc/GMT+5 1900-01-01T00:00:00Z -18000
+offset Etc/GMT+5 1918-03-31T07:00:00Z -1ms -18000
+offset Etc/GMT+5 1918-03-31T07:00:00Z -18000
+offset Etc/GMT+5 1945-08-15T12:00:00Z -18000
+offset Etc/GMT+5 1969-12-31T23:59:59.999Z -18000
+offset Etc/GMT+5 1970-01-01T00:00:00Z -18000
+offset Etc/GMT+5 1986-01-01T00:00:00Z -18000
+offset Etc/GMT+5 2000-01-01T00:00:00Z -18000
+offset Etc/GMT+5 2007-03-11T07:00:00Z -1ms -18000
+offset Etc/GMT+5 2007-03-11T07:00:00Z -18000
+offset Etc/GMT+5 2011-12-30T10:00:00Z -1ms -18000
+offset Etc/GMT+5 2011-12-30T10:00:00Z -18000
+offset Etc/GMT+5 2022-03-21T20:30:00Z -1ms -18000
+offset Etc/GMT+5 2022-03-21T20:30:00Z -18000
+offset Etc/GMT+5 2024-03-10T02:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-03-10T02:00:00Z -18000
+offset Etc/GMT+5 2024-03-10T07:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-03-10T07:00:00Z -18000
+offset Etc/GMT+5 2024-03-31T01:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-03-31T01:00:00Z -18000
+offset Etc/GMT+5 2024-04-06T14:45:00Z -1ms -18000
+offset Etc/GMT+5 2024-04-06T14:45:00Z -18000
+offset Etc/GMT+5 2024-04-06T15:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-04-06T15:00:00Z -18000
+offset Etc/GMT+5 2024-04-06T16:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-04-06T16:00:00Z -18000
+offset Etc/GMT+5 2024-04-14T02:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-04-14T02:00:00Z -18000
+offset Etc/GMT+5 2024-07-01T00:00:00Z -18000
+offset Etc/GMT+5 2024-09-28T14:45:00Z -1ms -18000
+offset Etc/GMT+5 2024-09-28T14:45:00Z -18000
+offset Etc/GMT+5 2024-10-05T16:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-10-05T16:00:00Z -18000
+offset Etc/GMT+5 2024-10-06T15:30:00Z -1ms -18000
+offset Etc/GMT+5 2024-10-06T15:30:00Z -18000
+offset Etc/GMT+5 2024-10-27T01:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-10-27T01:00:00Z -18000
+offset Etc/GMT+5 2024-11-03T06:00:00Z -1ms -18000
+offset Etc/GMT+5 2024-11-03T06:00:00Z -18000
+offset Etc/GMT+5 2024-12-31T23:59:59.999Z -18000
+offset Etc/GMT+5 2038-01-19T03:14:07.999Z -18000
+offset Etc/GMT+5 2050-07-01T12:00:00Z -18000
+offset Etc/GMT+5 2099-12-31T23:59:59.999Z -18000
+offset Etc/GMT+5 2100-03-14T12:00:00Z -18000
+offset Etc/GMT+5 2100-12-31T23:59:59.999Z -18000
+offset Etc/GMT+5 min_ms -18000
+offset Etc/GMT+5 min_ms+1 -18000
+offset Etc/GMT+5 max_ms 0
+offset Etc/GMT+5 max_ms-1 0
+offset Etc/GMT+5 i64::MIN -18000
+offset Etc/GMT+5 i64::MAX 0
+names 598
+name Africa/Abidjan -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Accra -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Addis_Ababa 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Algiers 732 561 0 0 0 0 0 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Asmara 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Asmera 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Bamako -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Bangui 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Banjul -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Bissau -3740 -3740 -3600 -3600 -3600 -3600 -3600 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Blantyre 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Brazzaville 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Bujumbura 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Cairo 7509 7509 7200 7200 7200 7200 10800 7200 10800 7200 7200 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Africa/Casablanca -1820 -1820 0 0 0 0 0 0 0 0 3600 3600 3600 3600 0 0 0 0 0 0 0
+name Africa/Ceuta -1276 -1276 0 0 0 0 0 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Africa/Conakry -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Dakar -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Dar_es_Salaam 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Djibouti 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Douala 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/El_Aaiun -3168 -3168 -3168 -3600 -3600 -3600 -3600 0 0 0 3600 3600 3600 3600 0 0 0 0 0 0 0
+name Africa/Freetown -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Gaborone 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Harare 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Johannesburg 6720 5400 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Juba 7588 7588 7588 7200 7200 7200 10800 7200 10800 10800 10800 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Kampala 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Khartoum 7808 7808 7808 7200 7200 7200 10800 7200 10800 10800 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Kigali 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Kinshasa 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Lagos 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Libreville 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Lome -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Luanda 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Lubumbashi 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Lusaka 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Malabo 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Maputo 7818 7818 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Maseru 6720 5400 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Mbabane 6720 5400 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Mogadishu 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Monrovia -2588 -2588 -2670 -2670 -2670 -2670 -2670 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Nairobi 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Africa/Ndjamena 3612 3612 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Niamey 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Nouakchott -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Ouagadougou -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Porto-Novo 815 815 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Sao_Tome 1616 -2205 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Timbuktu -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Africa/Tripoli 3164 3164 3600 3600 7200 7200 7200 3600 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Africa/Tunis 2444 561 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Africa/Windhoek 4104 5400 7200 7200 7200 7200 7200 7200 3600 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name America/Adak 44002 -42398 -39600 -39600 -39600 -39600 -36000 -36000 -32400 -36000 -32400 -36000 -32400 -32400 -36000 -36000 -36000 -36000 -32400 -32400 -32400
+name America/Anchorage 50424 -35976 -36000 -36000 -36000 -36000 -32400 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/Anguilla -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Antigua -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Araguaina -11568 -11568 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Buenos_Aires -14028 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Catamarca -15788 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/ComodRivadavia -15788 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Cordoba -15408 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Jujuy -15672 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/La_Rioja -16044 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Mendoza -16516 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Rio_Gallegos -16612 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Salta -15700 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/San_Juan -16444 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/San_Luis -15924 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Tucuman -15652 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Argentina/Ushuaia -16392 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Aruba -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Asuncion -13840 -13840 -13840 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Atikokan -19088 -19176 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Atka 44002 -42398 -39600 -39600 -39600 -39600 -36000 -36000 -32400 -36000 -32400 -36000 -32400 -32400 -36000 -36000 -36000 -36000 -32400 -32400 -32400
+name America/Bahia -9244 -9244 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Bahia_Banderas -25260 -25260 -21600 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Barbados -14309 -14309 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Belem -11636 -11636 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Belize -21168 -21168 -21600 -19800 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Blanc-Sablon -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Boa_Vista -14560 -14560 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Bogota -17776 -17776 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Boise -27889 -28800 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name America/Buenos_Aires -14028 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Cambridge_Bay 0 0 -25200 -25200 -25200 -25200 -25200 -25200 -18000 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name America/Campo_Grande -13108 -13108 -14400 -10800 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Cancun -20824 -20824 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Caracas -16064 -16060 -16200 -16200 -14400 -14400 -14400 -14400 -14400 -16200 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Catamarca -15788 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Cayenne -12560 -12560 -14400 -14400 -14400 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Cayman -19088 -19176 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Chicago -21036 -21600 -18000 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Chihuahua -25460 -25460 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Ciudad_Juarez -25556 -25556 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name America/Coral_Harbour -19088 -19176 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Cordoba -15408 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Costa_Rica -20173 -20173 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Coyhaique -17296 -16965 -18000 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Creston -26898 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Cuiaba -13460 -13460 -14400 -10800 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Curacao -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Danmarkshavn -4480 -4480 -10800 -10800 -10800 -10800 -10800 -10800 0 0 0 0 0 0 0 0 0 0 0 0 0
+name America/Dawson -33460 -33460 -32400 -32400 -32400 -32400 -32400 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Dawson_Creek -28856 -28800 -28800 -28800 -28800 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Denver -25196 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name America/Detroit -19931 -19931 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Dominica -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Edmonton -27232 -27232 -25200 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Eirunepe -16768 -16768 -18000 -14400 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/El_Salvador -21408 -21408 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Ensenada -28084 -28084 -25200 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name America/Fort_Nelson -29447 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Fort_Wayne -20678 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Fortaleza -9240 -9240 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Glace_Bay -14388 -14388 -14400 -14400 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name America/Godthab -12416 -12416 -10800 -10800 -10800 -10800 -10800 -10800 -7200 -10800 -7200 -7200 -3600 -3600 -7200 -7200 -7200 -7200 -3600 -3600 -3600
+name America/Goose_Bay -14500 -12652 -12652 -12600 -12600 -12600 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name America/Grand_Turk -17072 -18430 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Grenada -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Guadeloupe -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Guatemala -21724 -21724 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Guayaquil -19160 -18840 -18840 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Guyana -13959 -13959 -13500 -13500 -13500 -13500 -13500 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Halifax -15264 -15264 -10800 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name America/Havana -19768 -19776 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Hermosillo -26632 -26632 -21600 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Indiana/Indianapolis -20678 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indiana/Knox -20790 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Indiana/Marengo -20723 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indiana/Petersburg -20947 -21600 -21600 -21600 -21600 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indiana/Tell_City -20823 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Indiana/Vevay -20416 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indiana/Vincennes -21007 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indiana/Winamac -20785 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Indianapolis -20678 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Inuvik 0 0 0 0 -28800 -28800 -28800 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Iqaluit 0 0 0 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Jamaica -18430 -18430 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Jujuy -15672 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Juneau 54139 -32261 -28800 -28800 -28800 -28800 -25200 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/Kentucky/Louisville -20582 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Kentucky/Monticello -20364 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Knox_IN -20790 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Kralendijk -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/La_Paz -16356 -16356 -16356 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Lima -18492 -18516 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Los_Angeles -28378 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name America/Louisville -20582 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Lower_Princes -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Maceio -8572 -8572 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Managua -20708 -20712 -20712 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Manaus -14404 -14404 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Marigot -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Martinique -14660 -14660 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Matamoros -23400 -23400 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Mazatlan -25540 -25540 -21600 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Mendoza -16516 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Menominee -21027 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Merida -21508 -21508 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Metlakatla 54822 -31578 -28800 -28800 -28800 -28800 -25200 -28800 -28800 -28800 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/Mexico_City -23796 -23796 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Miquelon -13480 -13480 -14400 -14400 -14400 -14400 -14400 -10800 -7200 -10800 -7200 -10800 -7200 -7200 -10800 -10800 -10800 -10800 -7200 -7200 -7200
+name America/Moncton -15548 -18000 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name America/Monterrey -24076 -24076 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Montevideo -13491 -13491 -12600 -10800 -10800 -10800 -10800 -7200 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Montreal -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Montserrat -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Nassau -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/New_York -17762 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Nipigon -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Nome 46702 -39698 -39600 -39600 -39600 -39600 -36000 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/Noronha -7780 -7780 -7200 -3600 -7200 -7200 -7200 -3600 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200
+name America/North_Dakota/Beulah -24427 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/North_Dakota/Center -24312 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/North_Dakota/New_Salem -24339 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Nuuk -12416 -12416 -10800 -10800 -10800 -10800 -10800 -10800 -7200 -10800 -7200 -7200 -3600 -3600 -7200 -7200 -7200 -7200 -3600 -3600 -3600
+name America/Ojinaga -25060 -25060 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -25200 -21600 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Panama -19088 -19176 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Pangnirtung 0 0 0 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Paramaribo -13240 -13240 -13252 -12600 -12600 -12600 -12600 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Phoenix -26898 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Port-au-Prince -17360 -17340 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Port_of_Spain -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Porto_Acre -16272 -16272 -18000 -14400 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Porto_Velho -15336 -15336 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Puerto_Rico -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Punta_Arenas -17020 -16965 -18000 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Rainy_River -23316 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Rankin_Inlet 0 0 0 0 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Recife -8376 -8376 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Regina -25116 -25116 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Resolute 0 0 0 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name America/Rio_Branco -16272 -16272 -18000 -14400 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Rosario -15408 -15408 -14400 -10800 -14400 -14400 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Santa_Isabel -28084 -28084 -25200 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name America/Santarem -13128 -13128 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Santiago -16965 -16965 -18000 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -14400 -10800 -10800 -10800 -10800 -14400 -14400 -14400
+name America/Santo_Domingo -16776 -16800 -16800 -18000 -18000 -18000 -18000 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Sao_Paulo -11188 -11188 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name America/Scoresbysund -5272 -5272 -7200 -7200 -7200 -7200 -7200 -3600 0 -3600 0 -3600 -3600 -3600 -7200 -7200 -7200 -7200 -3600 -3600 -3600
+name America/Shiprock -25196 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name America/Sitka 53927 -32473 -28800 -28800 -28800 -28800 -25200 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/St_Barthelemy -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/St_Johns -12652 -12652 -9052 -12600 -12600 -12600 -9000 -12600 -9000 -12600 -9000 -12600 -9000 -9000 -12600 -12600 -12600 -12600 -9000 -9000 -9000
+name America/St_Kitts -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/St_Lucia -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/St_Thomas -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/St_Vincent -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Swift_Current -25880 -25880 -25200 -25200 -25200 -25200 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Tegucigalpa -20932 -20932 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name America/Thule -16508 -16508 -14400 -14400 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name America/Thunder_Bay -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Tijuana -28084 -28084 -25200 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name America/Toronto -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name America/Tortola -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Vancouver -29548 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Virgin -15865 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name America/Whitehorse -32412 -32412 -32400 -32400 -32400 -28800 -28800 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name America/Winnipeg -23316 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name America/Yakutat 52865 -33535 -32400 -32400 -32400 -32400 -28800 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name America/Yellowknife -27232 -27232 -25200 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name Antarctica/Casey 0 0 0 0 0 0 28800 28800 28800 39600 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Antarctica/Davis 0 0 0 0 0 0 25200 25200 25200 18000 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Antarctica/DumontDUrville 35320 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Antarctica/Macquarie 0 36000 0 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Antarctica/Mawson 0 0 0 0 21600 21600 21600 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Antarctica/McMurdo 41944 41400 41400 43200 43200 43200 43200 46800 43200 46800 43200 46800 43200 43200 46800 46800 46800 46800 43200 43200 43200
+name Antarctica/Palmer 0 0 0 0 -14400 -14400 -10800 -10800 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name Antarctica/Rothera 0 0 0 0 0 0 0 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name Antarctica/South_Pole 41944 41400 41400 43200 43200 43200 43200 46800 43200 46800 43200 46800 43200 43200 46800 46800 46800 46800 43200 43200 43200
+name Antarctica/Syowa 11212 11212 11212 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Antarctica/Troll 0 0 0 0 0 0 0 0 0 0 7200 0 7200 7200 0 0 0 0 7200 7200 7200
+name Antarctica/Vostok 0 0 0 0 25200 25200 25200 25200 25200 25200 25200 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Arctic/Longyearbyen 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Asia/Aden 11212 11212 11212 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Almaty 18468 18468 21600 21600 21600 21600 21600 21600 25200 21600 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Amman 8624 8624 8624 7200 7200 7200 7200 7200 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Anadyr 42596 42596 46800 46800 46800 46800 46800 43200 46800 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Asia/Aqtau 12064 12064 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Aqtobe 13720 13720 18000 18000 18000 18000 18000 18000 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Ashgabat 14012 14012 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Ashkhabad 14012 14012 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Atyrau 12464 12464 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Baghdad 10660 10656 10800 10800 10800 10800 10800 10800 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Bahrain 12368 12368 14400 14400 14400 14400 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Baku 11964 11964 10800 10800 14400 14400 14400 14400 18000 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Asia/Bangkok 24124 24124 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Barnaul 20100 20100 25200 25200 25200 25200 25200 25200 25200 21600 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Beirut 8520 7200 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Bishkek 17904 17904 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Brunei 26480 26480 27000 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Calcutta 21208 19270 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800
+name Asia/Chita 27232 27232 32400 32400 32400 32400 32400 32400 36000 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Choibalsan 25652 25652 25200 25200 25200 25200 25200 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Chongqing 29143 29143 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Chungking 29143 29143 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Colombo 19164 19172 19800 19800 19800 19800 19800 19800 21600 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800
+name Asia/Dacca 21700 21200 21200 23400 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Damascus 8712 8712 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Dhaka 21700 21200 21200 23400 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Dili 30140 30140 28800 32400 32400 32400 32400 28800 28800 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Dubai 13272 13272 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Asia/Dushanbe 16512 16512 21600 21600 21600 21600 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Famagusta 8148 8148 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Gaza 8272 8272 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Harbin 29143 29143 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Hebron 8423 8423 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Ho_Chi_Minh 25590 25590 25200 28800 28800 28800 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Hong_Kong 27402 27402 28800 28800 28800 28800 32400 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Hovd 21996 21996 21600 21600 21600 21600 21600 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Irkutsk 25025 25025 28800 28800 28800 28800 28800 28800 32400 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Istanbul 6952 7016 7200 7200 7200 7200 7200 7200 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Jakarta 25632 25632 26400 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Jayapura 33768 33768 33768 34200 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Jerusalem 8454 8440 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Kabul 16608 14400 14400 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200 16200
+name Asia/Kamchatka 38076 38076 43200 43200 43200 43200 43200 43200 46800 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Asia/Karachi 16092 16092 19800 19800 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Kashgar 21020 21020 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Kathmandu 20476 20476 19800 19800 19800 19800 19800 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700
+name Asia/Katmandu 20476 20476 19800 19800 19800 19800 19800 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700 20700
+name Asia/Khandyga 32533 32533 32400 32400 32400 32400 32400 32400 36000 36000 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Kolkata 21208 19270 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800 19800
+name Asia/Krasnoyarsk 22286 22286 25200 25200 25200 25200 25200 25200 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Kuala_Lumpur 24925 24925 25200 27000 27000 27000 27000 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Kuching 26480 26480 27000 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Kuwait 11212 11212 11212 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Macao 27250 27250 28800 28800 28800 28800 32400 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Macau 27250 27250 28800 28800 28800 28800 32400 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Magadan 36192 36192 39600 39600 39600 39600 39600 39600 43200 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Asia/Makassar 28656 28656 28656 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Manila 29032 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Muscat 13272 13272 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Asia/Nicosia 8008 8008 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Novokuznetsk 20928 20928 25200 25200 25200 25200 25200 25200 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Novosibirsk 19900 19900 25200 25200 25200 25200 25200 25200 25200 21600 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Omsk 17610 17610 21600 21600 21600 21600 21600 21600 25200 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Oral 12324 12324 18000 18000 18000 18000 18000 14400 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Phnom_Penh 24124 24124 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Pontianak 26240 26240 26240 28800 28800 28800 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Pyongyang 30180 30180 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Qatar 12368 12368 14400 14400 14400 14400 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Qostanay 15268 15268 18000 18000 18000 18000 18000 18000 21600 21600 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Qyzylorda 15712 15712 18000 18000 18000 18000 18000 18000 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Rangoon 23087 23087 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400
+name Asia/Riyadh 11212 11212 11212 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Asia/Saigon 25590 25590 25200 28800 28800 28800 28800 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Sakhalin 34248 34248 32400 39600 39600 39600 39600 39600 39600 36000 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Asia/Samarkand 16073 16073 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Seoul 30472 30472 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Shanghai 29143 29143 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Singapore 24925 24925 25200 27000 27000 27000 27000 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Srednekolymsk 36892 36892 39600 39600 39600 39600 39600 39600 43200 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Asia/Taipei 29160 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Tashkent 16631 16631 21600 21600 21600 21600 21600 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Tbilisi 10751 10751 10800 10800 14400 14400 14400 14400 18000 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Asia/Tehran 12344 12344 12344 12600 12600 12600 12600 12600 16200 12600 16200 12600 12600 12600 12600 12600 12600 12600 12600 12600 12600
+name Asia/Tel_Aviv 8454 8440 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Asia/Thimbu 21516 21516 21516 19800 19800 19800 19800 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Thimphu 21516 21516 21516 19800 19800 19800 19800 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Tokyo 33539 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Tomsk 20391 20391 25200 25200 25200 25200 25200 25200 28800 21600 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Ujung_Pandang 28656 28656 28656 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Ulaanbaatar 25652 25652 25200 25200 25200 25200 25200 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Ulan_Bator 25652 25652 25200 25200 25200 25200 25200 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Asia/Urumqi 21020 21020 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Asia/Ust-Nera 34374 34374 32400 32400 32400 32400 32400 39600 43200 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Asia/Vientiane 24124 24124 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Asia/Vladivostok 31651 31651 36000 36000 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Asia/Yakutsk 31138 31138 32400 32400 32400 32400 32400 32400 36000 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Asia/Yangon 23087 23087 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400
+name Asia/Yekaterinburg 14553 14553 18000 18000 18000 18000 18000 18000 21600 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Asia/Yerevan 10680 10680 10800 10800 14400 14400 14400 14400 18000 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Atlantic/Azores -6160 -6872 -7200 -7200 -7200 -7200 -3600 -3600 0 -3600 0 -3600 0 0 -3600 -3600 -3600 -3600 0 0 0
+name Atlantic/Bermuda -15558 -15558 -14400 -14400 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name Atlantic/Canary -3696 -3696 -3600 0 0 0 0 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Atlantic/Cape_Verde -5644 -5644 -7200 -7200 -7200 -7200 -7200 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600
+name Atlantic/Faeroe -1624 -1624 0 0 0 0 0 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Atlantic/Faroe -1624 -1624 0 0 0 0 0 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Atlantic/Jan_Mayen 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Atlantic/Madeira -4056 -4056 -3600 -3600 -3600 -3600 0 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Atlantic/Reykjavik -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Atlantic/South_Georgia -8768 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200
+name Atlantic/St_Helena -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Atlantic/Stanley -13884 -13884 -14400 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name Australia/ACT 36292 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/Adelaide 33260 34200 34200 34200 34200 34200 34200 37800 34200 37800 34200 37800 34200 34200 37800 37800 37800 37800 34200 34200 34200
+name Australia/Brisbane 36728 36000 36000 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Australia/Broken_Hill 33948 34200 34200 34200 34200 34200 34200 37800 34200 37800 34200 37800 34200 34200 37800 37800 37800 37800 34200 34200 34200
+name Australia/Canberra 36292 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/Currie 35356 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/Darwin 31400 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200
+name Australia/Eucla 30928 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500 31500
+name Australia/Hobart 35356 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/LHI 38180 36000 36000 36000 36000 36000 36000 39600 37800 39600 37800 39600 37800 37800 39600 39600 39600 39600 37800 37800 37800
+name Australia/Lindeman 35756 36000 36000 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Australia/Lord_Howe 38180 36000 36000 36000 36000 36000 36000 39600 37800 39600 37800 39600 37800 37800 39600 39600 39600 39600 37800 37800 37800
+name Australia/Melbourne 34792 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/NSW 36292 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/North 31400 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200 34200
+name Australia/Perth 27804 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Australia/Queensland 36728 36000 36000 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Australia/South 33260 34200 34200 34200 34200 34200 34200 37800 34200 37800 34200 37800 34200 34200 37800 37800 37800 37800 34200 34200 34200
+name Australia/Sydney 36292 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/Tasmania 35356 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/Victoria 34792 36000 36000 36000 36000 36000 36000 39600 36000 39600 36000 39600 36000 36000 39600 39600 39600 39600 36000 36000 36000
+name Australia/West 27804 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Australia/Yancowinna 33948 34200 34200 34200 34200 34200 34200 37800 34200 37800 34200 37800 34200 34200 37800 37800 37800 37800 34200 34200 34200
+name Brazil/Acre -16272 -16272 -18000 -14400 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name Brazil/DeNoronha -7780 -7780 -7200 -3600 -7200 -7200 -7200 -3600 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200
+name Brazil/East -11188 -11188 -10800 -7200 -10800 -10800 -10800 -7200 -10800 -7200 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name Brazil/West -14404 -14404 -14400 -10800 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name CET 1050 0 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name CST6CDT -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name Canada/Atlantic -15264 -15264 -10800 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -10800 -10800 -14400 -14400 -14400 -14400 -10800 -10800 -10800
+name Canada/Central -23316 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name Canada/Eastern -19052 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name Canada/Mountain -27232 -27232 -25200 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name Canada/Newfoundland -12652 -12652 -9052 -12600 -12600 -12600 -9000 -12600 -9000 -12600 -9000 -12600 -9000 -9000 -12600 -12600 -12600 -12600 -9000 -9000 -9000
+name Canada/Pacific -29548 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name Canada/Saskatchewan -25116 -25116 -21600 -25200 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name Canada/Yukon -32412 -32412 -32400 -32400 -32400 -28800 -28800 -28800 -25200 -28800 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name Chile/Continental -16965 -16965 -18000 -14400 -14400 -14400 -14400 -10800 -14400 -10800 -14400 -10800 -14400 -14400 -10800 -10800 -10800 -10800 -14400 -14400 -14400
+name Chile/EasterIsland -26248 -26248 -26248 -25200 -25200 -25200 -25200 -18000 -21600 -18000 -21600 -18000 -21600 -21600 -18000 -18000 -18000 -18000 -21600 -21600 -21600
+name Cuba -19768 -19776 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name EET 5692 5692 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name EST -19088 -19176 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name EST5EDT -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name Egypt 7509 7509 7200 7200 7200 7200 10800 7200 10800 7200 7200 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Eire -1521 -1521 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Etc/GMT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/GMT+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/GMT+1 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600 -3600
+name Etc/GMT+10 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Etc/GMT+11 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name Etc/GMT+12 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200 -43200
+name Etc/GMT+2 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200 -7200
+name Etc/GMT+3 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800 -10800
+name Etc/GMT+4 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400 -14400
+name Etc/GMT+5 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name Etc/GMT+6 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name Etc/GMT+7 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name Etc/GMT+8 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800
+name Etc/GMT+9 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400
+name Etc/GMT-0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/GMT-1 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600 3600
+name Etc/GMT-10 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Etc/GMT-11 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Etc/GMT-12 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Etc/GMT-13 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Etc/GMT-14 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400
+name Etc/GMT-2 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Etc/GMT-3 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Etc/GMT-4 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Etc/GMT-5 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Etc/GMT-6 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Etc/GMT-7 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Etc/GMT-8 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Etc/GMT-9 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Etc/GMT0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/Greenwich 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/UCT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/UTC 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/Universal 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Etc/Zulu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Europe/Amsterdam 1050 0 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Andorra 364 364 0 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Astrakhan 11532 11532 14400 14400 14400 14400 14400 10800 14400 10800 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Europe/Athens 5692 5692 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Belfast 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Belgrade 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Berlin 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Bratislava 3464 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Brussels 1050 0 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Bucharest 6264 6264 6264 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Budapest 4580 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Busingen 2048 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Chisinau 6920 6900 6264 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Copenhagen 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Dublin -1521 -1521 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Gibraltar -1284 0 3600 0 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Guernsey 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Helsinki 5989 5989 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Isle_of_Man 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Istanbul 6952 7016 7200 7200 7200 7200 7200 7200 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Jersey 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Kaliningrad 4920 3600 3600 10800 10800 10800 10800 7200 10800 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name Europe/Kiev 7324 7324 10800 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Kirov 11928 11928 14400 14400 14400 14400 14400 10800 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Kyiv 7324 7324 10800 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Lisbon -2205 -2205 0 0 0 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Ljubljana 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/London 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Europe/Luxembourg 1050 0 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Madrid -884 -884 0 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Malta 3484 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Mariehamn 5989 5989 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Minsk 6616 6600 10800 10800 10800 10800 10800 10800 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Monaco 561 561 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Moscow 9017 9017 10800 10800 10800 10800 10800 10800 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Nicosia 8008 8008 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Oslo 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Paris 561 561 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Podgorica 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Prague 3464 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Riga 5794 5794 7200 10800 10800 10800 10800 7200 7200 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Rome 2996 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Samara 12020 12020 14400 14400 14400 14400 14400 10800 18000 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Europe/San_Marino 2996 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Sarajevo 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Saratov 11058 11058 14400 14400 14400 14400 14400 10800 14400 10800 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Europe/Simferopol 8184 8160 10800 10800 10800 10800 10800 10800 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Skopje 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Sofia 5596 7200 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Stockholm 3208 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Tallinn 5940 5940 7200 10800 10800 10800 10800 7200 7200 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Tirane 4760 4760 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Tiraspol 6920 6900 6264 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Ulyanovsk 11616 11616 14400 14400 14400 14400 14400 10800 14400 10800 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Europe/Uzhgorod 7324 7324 10800 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Vaduz 2048 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Vatican 2996 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Vienna 3921 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Vilnius 6076 5040 3600 10800 10800 10800 10800 7200 7200 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Volgograd 10660 10660 14400 14400 14400 14400 14400 10800 14400 10800 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Europe/Warsaw 5040 5040 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Zagreb 4920 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Europe/Zaporozhye 7324 7324 10800 10800 10800 10800 10800 10800 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Europe/Zurich 2048 3600 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Factory 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name GB 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name GB-Eire 0 0 3600 0 3600 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name GMT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name GMT+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name GMT-0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name GMT0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Greenwich 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name HST -37886 -37800 -37800 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Hongkong 27402 27402 28800 28800 28800 28800 32400 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Iceland -968 -968 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Indian/Antananarivo 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Indian/Chagos 17380 17380 18000 18000 18000 18000 18000 18000 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600 21600
+name Indian/Christmas 24124 24124 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200 25200
+name Indian/Cocos 23087 23087 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400 23400
+name Indian/Comoro 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Indian/Kerguelen 17640 17640 17640 17640 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Indian/Mahe 13272 13272 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Indian/Maldives 17640 17640 17640 17640 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000 18000
+name Indian/Mauritius 13800 13800 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Indian/Mayotte 8836 8836 9000 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name Indian/Reunion 13272 13272 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400 14400
+name Iran 12344 12344 12344 12600 12600 12600 12600 12600 16200 12600 16200 12600 12600 12600 12600 12600 12600 12600 12600 12600 12600
+name Israel 8454 8440 7200 7200 7200 7200 7200 7200 10800 7200 10800 7200 10800 10800 7200 7200 7200 7200 10800 10800 10800
+name Jamaica -18430 -18430 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000 -18000
+name Japan 33539 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Kwajalein 40160 40160 39600 39600 39600 39600 -43200 -43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Libya 3164 3164 3600 3600 7200 7200 7200 3600 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200 7200
+name MET 1050 0 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name MST -26898 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name MST7MDT -25200 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name Mexico/BajaNorte -28084 -28084 -25200 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name Mexico/BajaSur -25540 -25540 -21600 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name Mexico/General -23796 -23796 -21600 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name NZ 41944 41400 41400 43200 43200 43200 43200 46800 43200 46800 43200 46800 43200 43200 46800 46800 46800 46800 43200 43200 43200
+name NZ-CHAT 44028 44100 44100 45900 45900 45900 45900 49500 45900 49500 45900 49500 45900 45900 49500 49500 49500 49500 45900 45900 45900
+name Navajo -25196 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name PRC 29143 29143 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name PST8PDT -28800 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name Pacific/Apia 45184 -41216 -41400 -39600 -39600 -39600 -39600 -39600 -39600 -39600 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Pacific/Auckland 41944 41400 41400 43200 43200 43200 43200 46800 43200 46800 43200 46800 43200 43200 46800 46800 46800 46800 43200 43200 43200
+name Pacific/Bougainville 37336 36000 36000 36000 36000 36000 36000 36000 36000 36000 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Chatham 44028 44100 44100 45900 45900 45900 45900 49500 45900 49500 45900 49500 45900 45900 49500 49500 49500 49500 45900 45900 45900
+name Pacific/Chuuk 35320 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Pacific/Easter -26248 -26248 -26248 -25200 -25200 -25200 -25200 -18000 -21600 -18000 -21600 -18000 -21600 -21600 -18000 -18000 -18000 -18000 -21600 -21600 -21600
+name Pacific/Efate 40396 40396 39600 39600 39600 39600 39600 43200 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Enderbury 0 0 0 -43200 -43200 -43200 -43200 -39600 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Pacific/Fakaofo -41096 -41096 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Pacific/Fiji 42944 42944 43200 43200 43200 43200 43200 43200 43200 46800 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Funafuti 41524 41524 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Galapagos -21504 -21504 -21504 -18000 -18000 -18000 -18000 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600 -21600
+name Pacific/Gambier -32388 -32388 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400 -32400
+name Pacific/Guadalcanal 38388 38388 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Guam 34740 34740 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Pacific/Honolulu -37886 -37800 -37800 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Pacific/Johnston -37886 -37800 -37800 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Pacific/Kanton 0 0 0 -43200 -43200 -43200 -43200 -39600 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Pacific/Kiritimati -37760 -37760 -38400 -38400 -38400 -38400 -38400 -36000 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400 50400
+name Pacific/Kosrae 39116 39116 39600 39600 39600 39600 43200 43200 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Kwajalein 40160 40160 39600 39600 39600 39600 -43200 -43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Majuro 41524 41524 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Marquesas -33480 -33480 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200 -34200
+name Pacific/Midway 45432 -40968 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name Pacific/Nauru 40060 40060 41400 41400 41400 41400 41400 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Niue -40780 -40780 -40780 -40780 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name Pacific/Norfolk 40312 40312 40320 40320 41400 41400 41400 41400 41400 41400 39600 43200 39600 39600 43200 43200 43200 43200 39600 39600 39600
+name Pacific/Noumea 39948 39948 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Pago_Pago 45432 -40968 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name Pacific/Palau 32276 32276 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Pacific/Pitcairn -31220 -31220 -30600 -30600 -30600 -30600 -30600 -30600 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800 -28800
+name Pacific/Pohnpei 38388 38388 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Ponape 38388 38388 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600 39600
+name Pacific/Port_Moresby 35320 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Pacific/Rarotonga 48056 -38344 -38344 -38344 -37800 -37800 -37800 -34200 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Pacific/Saipan 34740 34740 36000 36000 36000 36000 39600 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Pacific/Samoa 45432 -40968 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name Pacific/Tahiti -35896 -35896 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name Pacific/Tarawa 41524 41524 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Tongatapu 44352 44352 44352 44400 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800 46800
+name Pacific/Truk 35320 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Pacific/Wake 41524 41524 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Wallis 41524 41524 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200 43200
+name Pacific/Yap 35320 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000 36000
+name Poland 5040 5040 3600 3600 3600 3600 3600 3600 7200 3600 7200 3600 7200 7200 3600 3600 3600 3600 7200 7200 7200
+name Portugal -2205 -2205 0 0 0 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name ROC 29160 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name ROK 30472 30472 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400 32400
+name Singapore 24925 24925 25200 27000 27000 27000 27000 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800 28800
+name Turkey 6952 7016 7200 7200 7200 7200 7200 7200 10800 7200 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name UCT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name US/Alaska 50424 -35976 -36000 -36000 -36000 -36000 -32400 -32400 -28800 -32400 -28800 -32400 -28800 -28800 -32400 -32400 -32400 -32400 -28800 -28800 -28800
+name US/Aleutian 44002 -42398 -39600 -39600 -39600 -39600 -36000 -36000 -32400 -36000 -32400 -36000 -32400 -32400 -36000 -36000 -36000 -36000 -32400 -32400 -32400
+name US/Arizona -26898 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200 -25200
+name US/Central -21036 -21600 -18000 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name US/East-Indiana -20678 -21600 -21600 -21600 -18000 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name US/Eastern -17762 -18000 -14400 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name US/Hawaii -37886 -37800 -37800 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000 -36000
+name US/Indiana-Starke -20790 -21600 -21600 -21600 -21600 -21600 -18000 -21600 -18000 -21600 -18000 -21600 -18000 -18000 -21600 -21600 -21600 -21600 -18000 -18000 -18000
+name US/Michigan -19931 -19931 -18000 -18000 -18000 -18000 -18000 -18000 -14400 -18000 -14400 -18000 -14400 -14400 -18000 -18000 -18000 -18000 -14400 -14400 -14400
+name US/Mountain -25196 -25200 -25200 -25200 -25200 -25200 -21600 -25200 -21600 -25200 -21600 -25200 -21600 -21600 -25200 -25200 -25200 -25200 -21600 -21600 -21600
+name US/Pacific -28378 -28800 -28800 -28800 -28800 -28800 -25200 -28800 -25200 -28800 -25200 -28800 -25200 -25200 -28800 -28800 -28800 -28800 -25200 -25200 -25200
+name US/Samoa 45432 -40968 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600 -39600
+name UTC 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name Universal 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+name W-SU 9017 9017 10800 10800 10800 10800 10800 10800 14400 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800 10800
+name WET -2205 -2205 0 0 0 0 3600 0 3600 0 3600 0 3600 3600 0 0 0 0 3600 3600 3600
+name Zulu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
