@@ -573,6 +573,59 @@ pub(crate) fn stage_is_held(txn: &redb::ReadTransaction, db: &str, logical: &str
     stage_of_the_name_is_held(&txn.open_table(tables::COLLECTIONS)?, db, logical)
 }
 
+/// Whether the name has a stage created below `stamp`: one this member holds, or one that a binding known ahead of its position names.
+/// An event known ahead of its position that names no stage (a recreation, a drop) counts as well: it is the swap's history, and
+/// what it is judged against is a drop it was stamped before. A stage whose creation row is missing counts: the member cannot say it
+/// is not older, and takes the drop as it always did.
+///
+/// The test of a replicated drop of a name (ADR-272, decision 6): **a past drop of a name is a logical drop only if a stage of the
+/// name was created below it.** A stage created above the drop is one the drop never concerned, whatever order the two arrived in.
+pub(crate) fn a_stage_is_older_than(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+    stamp: &Stamp,
+) -> Result<bool> {
+    let stages = txn.open_table(tables::REGISTER_STAGES)?;
+    let older = |physical: &str| -> Result<bool> {
+        Ok(stage_in(&stages, CollectionId::derive(db, physical))?
+            .is_none_or(|stage| stage.created < *stamp))
+    };
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let prefix = format!("{logical}{}", kimmy_core::swap::STAGE_NAME_MARK);
+    for row in collections.range((db, prefix.as_str())..=(db, "\u{10FFFF}"))? {
+        let physical = row?.0.value().1.to_string();
+        if !physical.starts_with(&prefix) {
+            break;
+        }
+        if older(&physical)? {
+            return Ok(true);
+        }
+    }
+    let parked =
+        rows_in(&txn.open_table(tables::REGISTER_INFO)?, CollectionId::derive(db, logical))?;
+    for (_, event) in parked {
+        match event {
+            RegisterEvent::Bind { physical } => {
+                if older(&physical)? {
+                    return Ok(true);
+                }
+            }
+            RegisterEvent::Create { .. } | RegisterEvent::LogicalDrop => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the name has a register event in effect on this member: not the events known ahead of their position.
+pub(crate) fn has_events_in_effect(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<bool> {
+    Ok(!rows_in(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))?.is_empty())
+}
+
 /// Whether the name has been swapped as far as this member can tell: it has a register event, in effect or ahead of its
 /// position, or it holds a stage of the name (Q6.4 item 1b). The drop of such a name is a logical drop.
 pub(crate) fn is_swapped(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
