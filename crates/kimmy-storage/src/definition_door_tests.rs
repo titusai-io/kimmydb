@@ -77,6 +77,8 @@ struct Swap {
     m: Arc<Engine>,
     _dm: tempfile::TempDir,
     bind: OplogEntry,
+    /// The deadline both stages were made with.
+    deadline: Hlc,
     _author: (Engine, tempfile::TempDir),
 }
 
@@ -102,7 +104,7 @@ fn before_the_flip() -> Swap {
     let wall =
         creations.iter().map(|e| e.stamp.hlc.wall_ms).max().unwrap().max(physical_now_ms()) + 1;
     let bind = bind_of(&author, wall, BOUND);
-    Swap { m, _dm: dm, bind, _author: (author, dir) }
+    Swap { m, _dm: dm, bind, deadline, _author: (author, dir) }
 }
 
 /// The same member after the binding of `BOUND` took effect: the identity is buried, the bound stage serves, the other stage is held.
@@ -573,4 +575,140 @@ fn a_validator_carried_by_a_creation_names_the_collection_that_creation_made_not
         pair.q.get_collection(DB, BOUND).expect("the stage is held").validator.is_none(),
         "the creation's validator did not land on the stage the name answers from"
     );
+}
+
+// -- The vector door and the swap (Q6.5-1; ADR-272, decision 12, ruled 2026-11-23) -------------------------------------------------------
+//
+// A name with a register event of its own, in effect or only known ahead of its position, keeps no vector configuration in this release:
+// both doors refuse it with a 400. A name that only has a stage held, inside its deadline on this member's clock, is mid-`$out`: both
+// doors refuse it with a retryable 503. A held stage past its deadline is an orphan and must not block the name for ever. The register
+// event decides before the held stage is asked.
+
+fn a_vector_config() -> kimmy_core::VectorConfig {
+    kimmy_core::VectorConfig {
+        fields: vec!["body".into()],
+        provider: kimmy_core::ProviderConfig::Byo {},
+        dim: 8,
+        metric: Default::default(),
+        document_prefix: None,
+        query_prefix: None,
+        chunk: Default::default(),
+    }
+}
+
+fn the_400(verb: &str) -> String {
+    format!(
+        "vectors cannot be {verb} `app`.`orders`: a replacing `$out` has swapped this name, and a swapped name keeps no vector \
+         configuration in this release (ADR-272, decision 12)"
+    )
+}
+
+fn refused_400(result: crate::Result<impl std::fmt::Debug>, verb: &str, door: &str) {
+    // The sentence is the whole of the refusal (the API gives it a 400 of its own, without a prefix; that is pinned where the class
+    // is, in kimmy-api's error tests): it is neither the 503 of a swap in flight nor a failure of anything else.
+    match result {
+        Err(error) => {
+            assert_eq!(error.to_string(), the_400(verb), "{door}: the sentence");
+            assert!(
+                !error.to_string().contains("in progress"),
+                "{door}: a register event is not the retryable refusal"
+            );
+        }
+        other => panic!("{door}: expected the 400 refusal of a swapped name, got {other:?}"),
+    }
+}
+
+#[test]
+fn both_vector_doors_refuse_a_name_with_a_register_event_in_effect_with_the_400() {
+    // `flipped()` also holds an unbound stage inside its deadline: the register event decides before the held stage is asked, so the
+    // answer is the 400 and never the 503 (the precedence).
+    let s = flipped();
+    refused_400(
+        s.m.configure_vectors(DB, "orders", a_vector_config()),
+        "configured on",
+        "configure",
+    );
+    refused_400(s.m.disable_vectors(DB, "orders", false), "removed from", "disable");
+}
+
+#[test]
+fn both_vector_doors_refuse_a_name_whose_only_register_event_is_known_ahead_of_its_position_with_the_400()
+ {
+    // The binding is known and not in effect (no window behind it): `is_swapped` counts it, on purpose, and a stage is held inside its
+    // deadline as well, so this is the precedence again.
+    let s = before_the_flip();
+    s.m.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    assert_eq!(
+        s.m.resolve(DB, "orders").unwrap().physical,
+        "orders",
+        "premise: the binding is not in effect, the name still answers from the identity"
+    );
+    refused_400(
+        s.m.configure_vectors(DB, "orders", a_vector_config()),
+        "configured on",
+        "configure",
+    );
+    refused_400(s.m.disable_vectors(DB, "orders", false), "removed from", "disable");
+}
+
+fn the_503_text(deadline_ms: u64) -> String {
+    let at = bson::DateTime::from_millis(deadline_ms as i64).try_to_rfc3339_string().unwrap();
+    format!(
+        "`app`.`orders` has a replacing `$out` in progress (its staging collection is held here until {at}); its vector configuration \
+         cannot change until the swap completes or is abandoned: retry after it"
+    )
+}
+
+#[test]
+fn both_vector_doors_answer_the_retryable_503_for_a_stage_held_inside_its_deadline() {
+    let s = before_the_flip();
+    assert!(s.m.get_collection(DB, BOUND).is_ok(), "premise: a stage of the name is held");
+    let expected = the_503_text(s.deadline.wall_ms);
+    for (door, result) in [
+        ("configure", s.m.configure_vectors(DB, "orders", a_vector_config()).map(|_| ())),
+        ("disable", s.m.disable_vectors(DB, "orders", false).map(|_| ())),
+    ] {
+        let error = result.expect_err("a stage held inside its deadline refuses");
+        assert!(
+            !matches!(error, crate::StorageError::Core(_)),
+            "{door}: the retryable refusal is not a 400: {error:?}"
+        );
+        assert_eq!(error.to_string(), expected, "{door}: the sentence");
+    }
+}
+
+#[test]
+fn a_stage_held_past_its_deadline_does_not_block_the_vector_doors() {
+    // An orphan: its writer vanished, and it stays held until a later event of the name removes it. A deadline before its own creation
+    // reads as the creation's, which is past on this member's clock a moment later.
+    let (m, _dm) = engine();
+    let orders = m.create_collection(DB, "orders").unwrap();
+    m.insert(&orders, doc! { "_id": 1, "body": "text" }).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let author = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    author.create_stage(DB, BOUND, MergePolicy::Document, Hlc::new(1, 0)).unwrap();
+    let creation: Vec<OplogEntry> = everything(&author)
+        .into_iter()
+        .filter(|e| {
+            e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive(DB, BOUND)
+        })
+        .collect();
+    m.apply_batch(&creation).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(m.get_collection(DB, BOUND).is_ok(), "premise: the stage is held");
+    assert!(
+        creation[0].stamp.hlc.wall_ms < physical_now_ms(),
+        "premise: its effective deadline (its creation, the deadline being before it) is below this member's clock"
+    );
+    m.configure_vectors(DB, "orders", a_vector_config()).expect("an orphaned stage blocks nothing");
+    m.disable_vectors(DB, "orders", false).expect("nor the disable");
+}
+
+#[test]
+fn a_plain_name_configures_and_disables_vectors_as_it_always_did() {
+    let (m, _d) = engine();
+    let orders = m.create_collection(DB, "orders").unwrap();
+    m.insert(&orders, doc! { "_id": 1, "body": "text" }).unwrap();
+    m.configure_vectors(DB, "orders", a_vector_config()).expect("the control");
+    assert!(m.disable_vectors(DB, "orders", false).expect("the control"), "it was on");
 }
