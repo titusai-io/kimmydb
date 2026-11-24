@@ -1031,6 +1031,10 @@ pub(crate) struct WriteTxn<'a> {
     /// The swaps the settle passes of this transaction saw take effect (`kimmy_out_swaps_total`): added to the engine's count by
     /// [`Self::commit`] once the inner commit has succeeded, and by nothing else, so an aborted or dropped transaction adds none.
     swaps: parking_lot::Mutex<u64>,
+    /// What the joins of this transaction's flips leave for after the commit (ADR-272, rule 3): the violations their index builds found,
+    /// the `unkeyedDocument` entries they appended and how many documents they filed unkeyed. Taken by [`Self::commit`] once the inner
+    /// commit has succeeded, and by nothing else, so a transaction that aborts reports and counts none.
+    pub(crate) joined: parking_lot::Mutex<crate::join::JoinedPost>,
 }
 
 impl WriteTxn<'_> {
@@ -1121,6 +1125,15 @@ impl WriteTxn<'_> {
                 engine.out_buried[cause as usize]
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            // ... and what the joins of their flips found: published and counted now, the violations reported once the writer is let go
+            let joined = std::mem::take(&mut *self.joined.lock());
+            if joined.unkeyed_count > 0 {
+                engine.count_unkeyed(joined.unkeyed_count);
+            }
+            if !joined.unkeyed.is_empty() {
+                engine.publish(joined.unkeyed);
+            }
+            let join_violations = joined.violations;
             // ... and the swaps their passes saw take effect, counted once, by the commit that made them
             let swaps = std::mem::take(&mut *self.swaps.lock());
             if swaps > 0 {
@@ -1148,6 +1161,18 @@ impl WriteTxn<'_> {
             // The writer is free from here: what follows is the barrier,
             // whose leader opens a transaction of its own (ADR-088).
             self.release();
+            // The violations a join's build found are reported now: durable, and the writer free, because recording one is a transaction
+            // of its own. The index is committed, so a failure is logged and never fails the flip, which is not delivered again.
+            for (coll, violations) in join_violations {
+                if let Err(e) = engine.report_index_backfill_violations(&coll, &violations) {
+                    tracing::error!(
+                        db = %coll.db,
+                        collection = %coll.name,
+                        error = %e,
+                        "could not record the violations of an index built by a flip's join; the index stands"
+                    );
+                }
+            }
             #[cfg(test)]
             barrier_hooks::reach(barrier_hooks::Point::Released);
             if coalesced {
@@ -4517,6 +4542,7 @@ impl Engine {
             loss_minted: Default::default(),
             burials: Default::default(),
             swaps: Default::default(),
+            joined: Default::default(),
         })
     }
 
@@ -5846,6 +5872,25 @@ impl Engine {
                     None => continue,
                 }
             };
+            // The join (rule 3): the physical that is visible now takes what this one held, when this one is the identity or has its own
+            // binding or recreation in effect (never one the doomed list names: a stage no event can make visible). What it held is
+            // READ BEFORE the burial, which removes the definition and leaves the tombstones.
+            let join_into = match (&visible, cause) {
+                (
+                    Visible::Bound { physical, .. } | Visible::Created { physical, .. },
+                    BuryCause::BoundOut,
+                ) => Some(physical.clone()),
+                _ => None,
+            };
+            let has_own_event = burial.physical == logical
+                || timeline
+                    .events()
+                    .iter()
+                    .any(|(_, event)| event.physical() == Some(burial.physical.as_str()));
+            let held = match &join_into {
+                Some(_) if has_own_event => Some(Self::read_held(txn, meta.clone())?),
+                _ => None,
+            };
             let buried = txn.engine.bury_standing_in_txn(
                 txn,
                 db,
@@ -5866,6 +5911,17 @@ impl Engine {
                         rows.insert(id.0, not_before)?;
                     }
                 }
+            }
+            if let (Some(into), Some(held)) = (&join_into, &held) {
+                let floor = timeline
+                    .events()
+                    .iter()
+                    .filter(|(_, event)| {
+                        event.physical().is_none() // a logical drop names no physical
+                    })
+                    .map(|(stamp, _)| stamp.hlc)
+                    .max();
+                txn.engine.join_definitions_in_txn(txn, into, held, floor)?;
             }
             txn.burials.lock().push((db.to_string(), burial.physical.clone(), buried, cause));
         }

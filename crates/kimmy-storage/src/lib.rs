@@ -40,6 +40,7 @@ mod field_write;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
+mod join;
 #[cfg(feature = "lab-hooks")]
 pub mod lab_hooks;
 mod late_drop;
