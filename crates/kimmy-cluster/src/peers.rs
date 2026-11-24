@@ -3324,6 +3324,44 @@ mod tests {
         looping.abort();
     }
 
+    /// **A peer membership has listed all along keeps backing off while its rounds fail.** The reset is for a peer that is listed
+    /// again, not for one that is listed: a peer SWIM still lists as live, whose rounds fail every time, is dialled on its
+    /// backoff (up to the cap), not on every tick. Five ticks, a minute apart: the backoff skips at least two of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_membership_has_listed_all_along_keeps_backing_off_while_its_rounds_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let members = Members::default();
+        members.insert_for_test(dead, kimmy_core::NodeId::generate());
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(600);
+        config.members = Some(members);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+
+        let mut dials = 0;
+        for tick in 0..5 {
+            let report = rx.recv().await.unwrap();
+            assert_eq!(report.peers_known, 1, "tick {tick}: {report:?}");
+            dials += report.failed;
+        }
+        looping.abort();
+        assert!(dials >= 1, "premise: the peer was dialled and failed");
+        assert!(
+            dials <= 3,
+            "five ticks of a peer listed all along and failing: {dials} dials. Its backoff doubles (0 s, 60 s, 120 s, 240 s), so it is dialled at the first tick, \
+             the second and the fourth at most; every tick means the listing reset it"
+        );
+    }
+
     /// The bound: a member with no peers at all makes the first tick and four
     /// early ones, and then ticks only on its interval. A minute's interval and
     /// thirty seconds of virtual time: five reports, no more.
