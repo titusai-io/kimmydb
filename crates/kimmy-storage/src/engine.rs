@@ -2443,6 +2443,11 @@ impl Engine {
         self.out_vector_config_discarded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// One replicated vector configuration discarded for a swapped name, counted where the arm consumes it: per delivery.
+    pub(crate) fn record_vector_config_discarded(&self) {
+        self.out_vector_config_discarded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// One burial of a swap's physical, made by a commit that has landed: the only way a burial reaches `kimmy_out_buried_total` outside
     /// the transaction's own list, for a burial that is made in a transaction of its own.
     pub(crate) fn count_out_burial(&self, cause: BuryCause) {

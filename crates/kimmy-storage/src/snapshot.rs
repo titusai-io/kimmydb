@@ -3304,6 +3304,17 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
     ) -> Result<usize> {
+        // A page is a delivery: the vector configuration it names for a swapped name is discarded, warned and counted, as an entry's is
+        // (decision 12, "the swap wins"), once per page that names one
+        if state.vector_changed.is_some() {
+            self.record_vector_config_discarded();
+            warn!(
+                db = %state.db,
+                collection = %state.name,
+                "discarded the vector configuration a snapshot page named for a swapped name: a swapped name keeps no vector \
+                 configuration in this release; counted in kimmy_out_vector_config_discarded_total"
+            );
+        }
         let Some(standing) = Self::unless_gone(self.definition_target(&state.db, &state.name))?
         else {
             for index in &state.indexes {

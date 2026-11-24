@@ -3229,6 +3229,23 @@ impl Engine {
             }
             OpKind::ConfigureVectors => {
                 let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
+                // A swapped name keeps no vector configuration in this release (decision 12, "swap wins"): once the identity is not the
+                // physical the name answers from, the entry is history on every member, whatever order it met the swap in. Taken, counted
+                // (once per delivery: it is consumed and not appended, so it can arrive again), warned, and no shadow is made. While the
+                // identity still answers (a stage held, a binding only known ahead of its position) it is applied as it always was, so an
+                // abandoned `$out` leaves the configuration where the client put it.
+                if self.vector_entry_is_for_a_swapped_name(&target.db, &target.collection)? {
+                    self.record_vector_config_discarded();
+                    warn!(
+                        db = %target.db,
+                        collection = %target.collection,
+                        configured = target.config.is_some(),
+                        "discarded a replicated vector configuration: a replacing $out has swapped this name, and a swapped name keeps no \
+                         vector configuration in this release; counted in kimmy_out_vector_config_discarded_total"
+                    );
+                    self.release_ddl_mark_if_held(&entry.stamp, position)?;
+                    return Ok(DdlOutcome::Applied);
+                }
                 let refused_config = target.config.clone();
                 let applied = match target.config {
                     Some(config) => settle(self.configure_vectors_inner(
@@ -3365,6 +3382,20 @@ impl Engine {
             position,
             register.as_ref(),
         )
+    }
+
+    /// Whether a replicated vector entry for `db.name` is for a name a replacing `$out` has swapped away from its identity: a binding or a
+    /// recreation is the physical the name answers from, or the name is absent while an event of it is in effect. A name that only has a
+    /// stage held, or a binding known ahead of its position, still answers from the identity, and the entry is applied to it.
+    fn vector_entry_is_for_a_swapped_name(&self, db: &str, name: &str) -> Result<bool> {
+        match self.resolve(db, name) {
+            Ok(resolved) => Ok(resolved.visible.is_some()),
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
+                let txn = self.db().begin_read()?;
+                crate::register::has_events_in_effect(&txn, db, name)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Whether the replicated drop `entry` of `target` is a logical drop (ADR-272, decision 6): a drop is a logical drop of the name
