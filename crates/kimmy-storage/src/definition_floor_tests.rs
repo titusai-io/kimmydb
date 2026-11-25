@@ -1497,3 +1497,30 @@ fn a_definition_floor_is_adopted_with_a_collection_the_receiver_creates_and_its_
         "the clock passed the floor: a definition minted after the join is not history"
     );
 }
+
+#[test]
+fn a_page_floor_floors_a_validator_the_receiver_holds_at_or_below_it_and_keeps_one_above() {
+    for (above_ms, floored) in [(0u64, true), (3u64, false)] {
+        let w = world();
+        let (m, _d) = member(&w);
+        let mut stage = m.get_collection(DB, FIRST).expect("the stage is held");
+        stage.validator = Some(kimmy_core::ValidatorSpec {
+            schema: doc! { "bsonType": "object" },
+            action: Default::default(),
+            level: Default::default(),
+        });
+        let (node, epoch) = (w._author.0.node_id(), w._author.0.epoch());
+        let changed = Hlc::new(w.t.wall_ms + above_ms, 0);
+        stage.validator_changed = Some(Stamp::new(changed, node, epoch));
+        put_meta(&m, &stage);
+        let (s, _ds) = a_sender_whose_stage_holds_a_floor(&w, w.t);
+        let page = s.snapshot_page(None, Some(the_stage_id())).expect("the sender's page");
+        apply_the_page(&m, &s, the_stage_id(), &page);
+        let held = m.get_collection(DB, FIRST).expect("the stage is held");
+        assert_eq!(
+            held.validator.is_none(),
+            floored,
+            "a validator is floored only at or below the adopted floor ({above_ms} ms above it)"
+        );
+    }
+}
