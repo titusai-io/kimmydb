@@ -602,7 +602,17 @@ pub struct SnapshotApplied {
     /// a stop, never a skip: the same page is asked for again in a later round and applies once the
     /// document is due. Not an error, because the peer is not at fault.
     pub clock_refused: Option<crate::clock_bound::ClockStop>,
+    /// On a whole-database pull: the last page found a stage its sender lists as not alive, created within the grant, that this member's
+    /// own tests did not bury (held and alive after the passes, or held none of) while the carry holds an event of the stage's name
+    /// stamped above the grant: the sender buried the stage after the first page read it, by an event the grant does not cover. The page
+    /// was rolled back whole (no carry, no grant, no burial), the progress is reset to page one, and the pull asks again from the
+    /// first page (ADR-272, decision 9; Q6.6, unit E). 1 on that page and 0 on every other. Read by the puller, which counts it.
+    pub restarts: usize,
 }
+
+/// What a test's hook on a sender's page reader is called with: the engine, and the cursor the page is asked after.
+#[cfg(any(test, feature = "test-hooks"))]
+pub type SnapshotReaderHook = dyn Fn(&Engine, Option<&SnapshotCursor>) + Send + Sync;
 
 /// The register a whole-database snapshot carries on its LAST page (ADR-272, decisions 4 and 6; Q6.6, unit C2b): the sender's events in
 /// effect, every stage row and the post-drop rows, as the tables hold them (raw, by id: a register row does not carry its name). Never
@@ -1178,6 +1188,40 @@ impl Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_snapshot_room_for_test(&self, bytes: Option<usize>) {
         self.snapshot_room_for_test.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Call `hook` at the start of every snapshot page this member serves, with the cursor the page is asked after (`None` for page
+    /// one), before anything of the page is read; `None` takes it off. For a test that does to a sender what a client does between two
+    /// pages of a join (Q6.6, unit E).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_snapshot_reader_hook_for_test(
+        &self,
+        hook: Option<std::sync::Arc<SnapshotReaderHook>>,
+    ) {
+        *self.snapshot_reader_hook_for_test.lock() = hook;
+    }
+
+    /// The stages this member has restarted a whole-database join with `peer` for, and so does not restart it for again; empty once the
+    /// join completes (Q6.6, unit E).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn snapshot_restarted_for_test(&self, _peer: NodeId) -> Vec<CollectionId> {
+        Vec::new()
+    }
+
+    /// Record that this member already restarted a join with `peer` for `stages`, as a restart does (Q6.6, unit E).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn note_restarted_for_test(&self, _peer: NodeId, _stages: &[CollectionId]) {}
+
+    /// Whole-database joins this member restarted since start (`kimmy_snapshot_join_restarts_total`): the sender buried a stage after
+    /// the first page read it, by an event the first page's grant does not cover (Q6.6, unit E).
+    pub fn snapshot_join_restarts(&self) -> u64 {
+        0
+    }
+
+    /// Stages a completed join's last page listed as not alive at the sender that this member left standing, or held none of, and did not
+    /// restart for (`kimmy_snapshot_listed_stages_left_total`): the sender's burial of them is not a fact this member has (Q6.6, unit E).
+    pub fn snapshot_listed_stages_left(&self) -> u64 {
+        0
     }
 
     /// Lift the caps a client write is held to (ADR-250) for this engine, so a test
@@ -1994,6 +2038,7 @@ impl Engine {
                 sender_dropped: false,
                 purge_pending: None,
                 clock_refused: None,
+                restarts: 0,
             }),
         }
     }

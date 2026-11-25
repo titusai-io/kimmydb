@@ -227,6 +227,12 @@ pub struct Engine {
     /// it (`snapshot::SNAPSHOT_PAGE_BYTES`); 0 for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize,
+    /// A test's hook on the page reader of this member as a SENDER: called at the start of every `snapshot_page`, with the cursor the
+    /// page is asked after, before anything of the page is read (Q6.6, unit E). Lets a test do to the sender what a client does
+    /// between two pages of a join (bury a stage).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) snapshot_reader_hook_for_test:
+        Mutex<Option<Arc<crate::snapshot::SnapshotReaderHook>>>,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1795,6 +1801,8 @@ impl Engine {
             snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            snapshot_reader_hook_for_test: Mutex::new(None),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]

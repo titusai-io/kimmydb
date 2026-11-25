@@ -9233,6 +9233,201 @@ mod tests {
         assert_eq!(mine.behind(&last_vector), Some(Hlc::new(3_000, 0)));
     }
 
+    /// A join whose last page the receiver refused (the sender buried a stage after the first page read it, by an event that page's grant
+    /// does not cover: ADR-272, decision 9; Q6.6, unit E) is asked for again from page one by this loop, and ends: the restart is the
+    /// pull's progress, the stage restarts it once, and the second pass completes with the newer stage whole.
+    #[tokio::test]
+    async fn a_join_the_last_page_restarts_asks_again_from_page_one_and_ends() {
+        use kimmy_core::{CollectionBind, MergePolicy, OpKind, OplogEntry, Stamp};
+        use tokio::io::DuplexStream;
+
+        const DB: &str = "shop";
+        const STAGES: [&str; 2] = ["orders.__stg.p1", "orders.__stg.p2"];
+        fn open() -> (Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+        }
+        fn window(m: &Engine, entries: &[OplogEntry]) {
+            let mut theirs = VersionVector::default();
+            for entry in entries {
+                theirs.observe(entry.stamp);
+            }
+            let mine = m.witnessed_vector().unwrap();
+            let end = kimmy_storage::PeerWindow {
+                scanned_to: entries.last().map_or(Hlc::ZERO, |e| e.stamp.hlc),
+                exhausted: true,
+                passed_through: None,
+                asked_partial: false,
+            };
+            m.apply_peer_window_into(
+                &theirs,
+                Some(&mine),
+                entries,
+                end,
+                &mut SyncOutcome::default(),
+            )
+            .unwrap();
+        }
+        fn bind(by: &Engine, physical: &str, wall: u64) -> OplogEntry {
+            OplogEntry {
+                stamp: Stamp::new(Hlc::new(wall, 0), by.node_id(), by.epoch()),
+                kind: OpKind::BindCollection,
+                collection: CollectionId::derive(DB, "orders"),
+                doc_id: None,
+                body: Some(
+                    bson::serialize_to_vec(&CollectionBind {
+                        db: DB.into(),
+                        name: "orders".into(),
+                        physical: physical.into(),
+                    })
+                    .unwrap(),
+                ),
+                meta: None,
+            }
+        }
+        fn served(m: &Engine) -> String {
+            m.resolve(DB, "orders").unwrap().physical
+        }
+
+        // the author of two stages (six documents each), the author of the bindings, and the sender that serves the first stage
+        let (a, _da) = open();
+        let (b, _db) = open();
+        let (sender, _ds) = open();
+        let deadline = Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
+        for (k, name) in STAGES.iter().enumerate() {
+            let stage = a.create_stage(DB, name, MergePolicy::Document, deadline).unwrap();
+            for i in 1..=6 {
+                let id = i64::try_from(k).unwrap() * 10 + i;
+                a.insert(&stage, bson::doc! { "_id": id, "v": "x".repeat(40) }).unwrap();
+            }
+        }
+        let entries_of = |name: &str| -> Vec<OplogEntry> {
+            let id = CollectionId::derive(DB, name);
+            let all = a.entries_for_peer(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background);
+            all.unwrap().entries.into_iter().filter(|entry| entry.collection == id).collect()
+        };
+        let orders = sender.create_collection(DB, "orders").unwrap();
+        sender.insert(&orders, bson::doc! { "_id": 1, "v": "old" }).unwrap();
+        sender.apply_batch(&entries_of(STAGES[0])).unwrap();
+        let second = entries_of(STAGES[1]);
+        let base = second
+            .iter()
+            .map(|entry| entry.stamp.hlc.wall_ms)
+            .chain([
+                sender.get_collection(DB, "orders").unwrap().created.wall_ms,
+                kimmy_storage::physical_now_ms(),
+            ])
+            .max()
+            .unwrap()
+            + 1;
+        window(&sender, &[bind(&b, STAGES[0], base)]);
+        assert_eq!(served(&sender), STAGES[0], "premise: the sender serves the first stage");
+        // the second swap, made by the sender's page reader before the second page of the first pass
+        let swap = (second, bind(&b, STAGES[1], base + 10));
+        let page_ones = std::sync::atomic::AtomicUsize::new(0);
+        let made = std::sync::atomic::AtomicBool::new(false);
+        sender.set_snapshot_room_for_test(Some(1_500));
+        let hook = move |engine: &Engine, after: Option<&kimmy_storage::SnapshotCursor>| {
+            use std::sync::atomic::Ordering::SeqCst;
+            if after.is_none() {
+                page_ones.fetch_add(1, SeqCst);
+            } else if page_ones.load(SeqCst) == 1 && !made.swap(true, SeqCst) {
+                engine.apply_batch(&swap.0).unwrap();
+                window(engine, std::slice::from_ref(&swap.1));
+            }
+        };
+        sender.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(hook)));
+        let sender = std::sync::Arc::new(sender);
+
+        /// The peer: its vectors, `BeyondHorizon` to the entries, then the snapshot pages it is asked for, read from the sender as they
+        /// are asked; what it was asked after, in order.
+        async fn serving_peer(
+            mut stream: DuplexStream,
+            sender: std::sync::Arc<Engine>,
+        ) -> Vec<Option<String>> {
+            let mut asked = Vec::new();
+            while let Ok(message) = read_frame(&mut stream).await {
+                match message {
+                    Message::AskVersions { .. } => {
+                        let theirs = sender.version_vector().unwrap();
+                        let answer = Message::Vectors {
+                            servable: theirs.clone(),
+                            witnessed: theirs,
+                            facts: None,
+                            facts_gen: None,
+                            echo: None,
+                            replay_from: None,
+                        };
+                        write_frame(&mut stream, &answer).await.unwrap();
+                    }
+                    Message::AskEntries { .. } => {
+                        write_frame(&mut stream, &Message::BeyondHorizon {}).await.unwrap();
+                    }
+                    Message::AskSnapshot { after, collection } => {
+                        asked.push(after.as_ref().map(ToString::to_string));
+                        let page = sender.snapshot_page(after, collection).unwrap();
+                        write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+                    }
+                    Message::AskDivergence { .. } => {
+                        let divergence = Message::Divergence {
+                            collections: Vec::new(),
+                            probe_count: None,
+                            incarnations: Vec::new(),
+                            digests: None,
+                            digest_busy: false,
+                            definitions: None,
+                        };
+                        write_frame(&mut stream, &divergence).await.unwrap();
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            asked
+        }
+
+        let (j, _dj) = open();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        let (mut ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(serving_peer(peer_end, sender.clone()));
+        let outcome = sync_round(
+            &j,
+            &mut ours,
+            addr,
+            sender.node_id(),
+            None,
+            &mut stalls,
+            ample(),
+            &RoundClock::default(),
+        )
+        .await
+        .unwrap();
+        drop(ours);
+        let asked = peer.await.unwrap();
+        assert_eq!(
+            asked.iter().filter(|after| after.is_none()).count(),
+            2,
+            "page one was asked for twice: the join restarted once: {asked:?}"
+        );
+        assert!(asked[0].is_none() && asked.last().unwrap().is_some(), "{asked:?}");
+        assert!(
+            outcome.exhausted,
+            "the join completed, and the round reached the tail: {outcome:?}"
+        );
+        assert!(
+            !stalls.snapshot_pending(None),
+            "nothing is left to resume: the second pass completed"
+        );
+        assert_eq!(j.snapshot_join_restarts(), 1, "the restart was counted once");
+        assert_eq!(served(&j), STAGES[1], "the name is served from the newer stage");
+        let newer = j.get_collection(DB, STAGES[1]).unwrap();
+        assert_eq!(
+            j.count(&newer, kimmy_storage::WalkScope::Request).unwrap(),
+            6,
+            "with every document of it"
+        );
+    }
+
     /// A scoped snapshot repair whose page waits for this node's drop purger
     /// (ADR-189) waits for as many rounds as the purge takes: it is not
     /// counted as stalled, so it is not abandoned at `REPAIR_ATTEMPTS`, and

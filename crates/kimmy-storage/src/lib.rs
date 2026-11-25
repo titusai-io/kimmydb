@@ -353,6 +353,8 @@ pub use open_progress::{
 pub use own_clock::OwnStampRefusal;
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use snapshot::SnapshotReaderHook;
 pub use snapshot::{
     CollectionState, LEFT_IDS_NAMED, RegisterCarry, SNAPSHOT_PAGE, SNAPSHOT_PAGE_BYTES,
     ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy,

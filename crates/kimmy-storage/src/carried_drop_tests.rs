@@ -2377,3 +2377,460 @@ fn the_carrys_measure_counts_the_list_of_stages_not_alive() {
         "the list is in the measure, so the cap and the gauge count it"
     );
 }
+
+// -- Unit E (D-4): a join across a burial restarts ----------------------------------------------------------------------------------------
+
+const F: [&str; 3] = ["orders.__stg.f1", "orders.__stg.f2", "orders.__stg.f3"];
+
+/// The room of a page for rows: two documents of these tests (a row costs 631 bytes of it) and not three, and the carry of three swaps
+/// (about 1,100 bytes) beside them or alone, as a page that carries it must (`SnapshotRegisterCarryTooLarge`).
+const TWO_ROWS_A_PAGE: usize = 1_500;
+
+/// A sender that swaps `orders` again while a member joins from it. It holds six documents in each stage and has made the binding of
+/// the first stage visible (`orders` is served by it) before the first page of the join is read. Its page reader (the hook) makes the
+/// next swap, `later` of them, before the SECOND page of each pass is read: the stage's creation and documents, then a binding of it
+/// above the grant the pass was given (the first page's vector was read before). So the stage the pass saw alive on page one is buried
+/// by an event the grant does not cover, before its documents are walked: the case of decision 9. Two documents to a page.
+struct Across {
+    sender: Engine,
+    creations: Vec<OplogEntry>,
+    /// How many pages with a cursor the sender's page reader has been asked for.
+    cursor_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+/// The premise every test that drives a swap through the page reader has: the reader ran with a cursor, so the join had a page after the
+/// first and the swap was made (a join of one page fails here, on its real cause, and not on a later premise).
+fn the_reader_ran(w: &Across) {
+    assert!(
+        w.cursor_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "premise: the sender's page reader ran at least once with a cursor"
+    );
+}
+
+fn a_sender_that_swaps_again_during_the_join(later: usize) -> Across {
+    let (a, da) = engine();
+    let (b, db) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    for (k, name) in F[..=later].iter().enumerate() {
+        let stage = a.create_stage(DB, name, MergePolicy::Document, deadline).unwrap();
+        for i in 1..=6 {
+            let id = i64::try_from(k).unwrap() * 10 + i;
+            a.insert(&stage, doc! { "_id": id, "v": "x".repeat(40) }).unwrap();
+        }
+    }
+    let entries_of = |name: &str| -> Vec<OplogEntry> {
+        let id = CollectionId::derive(DB, name);
+        everything(&a).into_iter().filter(|entry| entry.collection == id).collect()
+    };
+    let creations: Vec<OplogEntry> = F[..=later].iter().map(|name| creation_of(&a, name)).collect();
+    let (sender, ds) = with_orders();
+    // documents beside the stages, so that the rows exceed a page whatever a stage's rows are or are not walked
+    let filler = sender.create_collection(DB, "filler").unwrap();
+    for i in 1..=20 {
+        sender.insert(&filler, doc! { "_id": i, "v": "x".repeat(40) }).unwrap();
+    }
+    sender.apply_batch(&entries_of(F[0])).unwrap();
+    let base = creations
+        .iter()
+        .map(|creation| creation.stamp.hlc.wall_ms)
+        .chain([life_wall(&sender), physical_now_ms()])
+        .max()
+        .unwrap()
+        + 1;
+    window(&sender, std::slice::from_ref(&bind_of(&b, F[0], base)));
+    assert_eq!(
+        served_by(&sender),
+        Ok(F[0].to_string()),
+        "premise: the sender serves the first stage"
+    );
+    let swaps: Vec<(Vec<OplogEntry>, OplogEntry)> = (1..=later)
+        .map(|k| (entries_of(F[k]), bind_of(&b, F[k], base + 10 * u64::try_from(k).unwrap())))
+        .collect();
+    let (page_ones, made) =
+        (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+    sender.set_snapshot_room_for_test(Some(TWO_ROWS_A_PAGE));
+    // read before the hook is set, so that it does not count this page
+    assert!(
+        sender.snapshot_page(None, None).unwrap().next.is_some(),
+        "premise: page one is not the last, so a page with a cursor is asked for"
+    );
+    let cursor_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = cursor_calls.clone();
+    let hook = move |engine: &Engine, after: Option<&crate::SnapshotCursor>| {
+        use std::sync::atomic::Ordering::SeqCst;
+        if after.is_none() {
+            page_ones.fetch_add(1, SeqCst);
+            return;
+        }
+        counted.fetch_add(1, SeqCst);
+        // before the second page of pass n: the n-th swap, once
+        let due = made.load(SeqCst);
+        if due < swaps.len() && page_ones.load(SeqCst) == due + 1 {
+            made.fetch_add(1, SeqCst);
+            let (entries, bind) = &swaps[due];
+            engine.apply_batch(entries).unwrap();
+            window(engine, std::slice::from_ref(bind));
+            assert_eq!(
+                served_by(engine),
+                Ok(F[due + 1].to_string()),
+                "premise: the sender serves the newer stage, and has buried the one the pass read"
+            );
+        }
+    };
+    sender.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(hook)));
+    Across { sender, creations, cursor_calls, _dirs: vec![da, db, ds] }
+}
+
+/// What a join came to, page by page, as `pull_snapshot`'s loop would drive it.
+struct Joined {
+    progress: SnapshotProgress,
+    /// `SnapshotApplied::restarts` of each page, in order.
+    restarts: Vec<usize>,
+}
+
+fn join_by_pages(joiner: &Engine, sender: &Engine) -> Joined {
+    join_by_pages_patched(joiner, sender, &|_| {})
+}
+
+fn join_by_pages_patched(joiner: &Engine, sender: &Engine, patch: Patch<'_>) -> Joined {
+    let mut progress = SnapshotProgress::whole_database();
+    let mut restarts = Vec::new();
+    for _ in 0..60 {
+        if progress.is_complete() {
+            return Joined { progress, restarts };
+        }
+        let mut page = sender.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        patch(&mut page);
+        let done = joiner.apply_snapshot_page(sender.node_id(), &mut progress, &page).unwrap();
+        restarts.push(done.restarts);
+    }
+    panic!("the join did not complete in 60 pages: a restart that does not end");
+}
+
+/// Pages of the join applied until one restarts it (or the join completes); the page that did.
+fn join_until_it_restarts(joiner: &Engine, sender: &Engine) -> SnapshotProgress {
+    let mut progress = SnapshotProgress::whole_database();
+    for _ in 0..60 {
+        let page = sender.snapshot_page(progress.after().cloned(), None).unwrap();
+        let done = joiner.apply_snapshot_page(sender.node_id(), &mut progress, &page).unwrap();
+        if done.restarts > 0 {
+            return progress;
+        }
+        assert!(!progress.is_complete(), "premise: the join restarts before it completes");
+    }
+    panic!("premise: the join restarts within 60 pages");
+}
+
+#[test]
+fn the_senders_page_reader_hook_runs_before_each_page_with_the_cursor_asked_for() {
+    let (sender, _ds) = engine();
+    let orders = sender.create_collection(DB, "orders").unwrap();
+    for i in 1..=20 {
+        sender.insert(&orders, doc! { "_id": i, "v": "x".repeat(40) }).unwrap();
+    }
+    sender.set_snapshot_room_for_test(Some(TWO_ROWS_A_PAGE));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let log = seen.clone();
+    let hook = move |_: &Engine, after: Option<&crate::SnapshotCursor>| {
+        log.lock().unwrap().push(after.map(ToString::to_string));
+    };
+    sender.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(hook)));
+    let (j, _dj) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let mut asked = Vec::new();
+    while !progress.is_complete() {
+        asked.push(progress.after().map(ToString::to_string));
+        let page = sender.snapshot_page(progress.after().cloned(), None).unwrap();
+        j.apply_snapshot_page(sender.node_id(), &mut progress, &page).unwrap();
+        assert!(asked.len() < 20, "premise: the snapshot ends");
+    }
+    assert!(asked.len() >= 3, "premise: the snapshot has several pages");
+    assert_eq!(*seen.lock().unwrap(), asked, "the hook saw each page's cursor, in order, once");
+    sender.set_snapshot_reader_hook_for_test(None);
+    sender.snapshot_page(None, None).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), asked.len(), "a hook taken off is not called");
+}
+
+#[test]
+fn a_stage_buried_by_an_event_above_the_grant_is_listed_and_the_carry_holds_the_event() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let stage = CollectionId::derive(DB, F[0]);
+    let first = w.sender.snapshot_page(None, None).unwrap();
+    assert!(first.next.is_some(), "premise: page one is not the last");
+    assert!(w.sender.get_collection(DB, F[0]).is_ok(), "premise: page one is read before the swap");
+    let origin = w.creations[0].stamp.origin();
+    assert!(
+        first.versions.get(origin) >= w.creations[0].stamp.hlc,
+        "premise: the grant of page one covers the stage's creation"
+    );
+    let (mut cursor, mut last) = (first.next.clone(), None);
+    while let Some(after) = cursor {
+        let page = w.sender.snapshot_page(Some(after), None).unwrap();
+        cursor = page.next.clone();
+        last = Some(page);
+    }
+    let last = last.expect("premise: there is a page after the first");
+    assert!(listed_not_alive(&last).contains(&stage.0), "the last page lists the buried stage");
+    let logical = CollectionId::derive(DB, "orders").0.to_be_bytes();
+    let above = last.register.as_ref().expect("the last page carries the register").events.iter();
+    let above = above.filter(|(key, _)| key[..8] == logical).any(|(key, _)| {
+        let stamp = Stamp::from_key_bytes(key[8..].try_into().unwrap());
+        stamp.hlc > first.versions.get(stamp.origin())
+    });
+    assert!(above, "and the carry holds an event of the name above the first page's grant");
+    the_reader_ran(&w);
+}
+
+#[test]
+fn a_join_across_a_swap_above_its_grant_restarts_once_and_serves_the_newer_stage_whole() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let (j, _dj) = engine();
+    let joined = join_by_pages(&j, &w.sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        1,
+        "it restarted once: {:?}",
+        joined.restarts
+    );
+    assert_eq!(served_by(&j), Ok(F[1].to_string()), "and the name is served from the newer stage");
+    let newer = j.get_collection(DB, F[1]).unwrap();
+    assert_eq!(j.count(&newer, WalkScope::Request).unwrap(), 6, "with every document of it");
+    assert!(j.get_collection(DB, F[0]).is_err(), "the stage the first pass held partly is buried");
+    assert_stage_invariant(&j);
+    assert_eq!(
+        the_events_of_orders(&j),
+        the_events_of_orders(&w.sender),
+        "the member's register is the sender's"
+    );
+    assert_eq!(j.snapshot_join_restarts(), 1, "counted once");
+    assert_eq!(
+        j.snapshot_restarted_for_test(w.sender.node_id()),
+        Vec::<CollectionId>::new(),
+        "and what it remembered of the restart is forgotten with the join"
+    );
+    the_reader_ran(&w);
+}
+
+#[test]
+fn the_page_that_restarts_the_join_commits_nothing_of_its_carry_and_grants_nothing() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let (j, _dj) = engine();
+    let progress = join_until_it_restarts(&j, &w.sender);
+    assert_eq!(progress, SnapshotProgress::whole_database(), "the progress is back at page one");
+    assert_eq!(
+        j.snapshot_restarted_for_test(w.sender.node_id()),
+        vec![CollectionId::derive(DB, F[0])],
+        "the stage that restarted the join is remembered, so that it restarts it once"
+    );
+    let origin = w.creations[0].stamp.origin();
+    assert!(
+        j.witnessed_vector().unwrap().get(origin) < w.creations[1].stamp.hlc,
+        "no grant was absorbed: the member still asks for what the newer stage's creation covers"
+    );
+    assert!(the_events_of_orders(&j).is_empty(), "no event of the carry was stored");
+    assert_eq!(
+        j.collection_dropped_at(CollectionId::derive(DB, F[0])).unwrap(),
+        None,
+        "and no tombstone was recorded for the stage the first pass held"
+    );
+    assert!(j.get_collection(DB, F[0]).is_ok(), "the pages before it stay applied");
+    the_reader_ran(&w);
+}
+
+#[test]
+fn the_progress_a_restart_leaves_is_the_progress_a_superseding_pull_starts_from() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let (j, _dj) = engine();
+    let peer = w.sender.node_id();
+    let mut progress = SnapshotProgress::whole_database();
+    loop {
+        let page = w.sender.snapshot_page(progress.after().cloned(), None).unwrap();
+        let before = progress.clone();
+        let done = j.apply_snapshot_page(peer, &mut progress, &page).unwrap();
+        if done.restarts > 0 {
+            assert_ne!(before, SnapshotProgress::whole_database(), "premise: it was under way");
+            break;
+        }
+        assert!(progress.pages() < 50, "premise: the join restarts");
+    }
+    // the same fields as a fresh progress, which is what the puller replaces a superseded one with
+    assert_eq!(
+        progress,
+        SnapshotProgress::whole_database(),
+        "the restart's reset is the supersede's"
+    );
+    assert!(
+        !j.snapshot_progress_recorded(peer, None).unwrap(),
+        "and the cursor the earlier pages persisted is gone with it"
+    );
+    the_reader_ran(&w);
+}
+
+#[test]
+fn a_stage_held_none_of_restarts_the_join_when_an_event_of_its_name_is_above_the_grant() {
+    // the stage the first pass would have read was buried before page one by a plain drop, so no page defines it and this member never
+    // holds it: it is `left`, and the swap the reader makes after page one is above the grant
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    assert!(w.sender.bury_collection(DB, F[0], None).unwrap().is_some(), "premise: buried first");
+    let (j, _dj) = engine();
+    let joined = join_by_pages(&j, &w.sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        1,
+        "it restarted once: {:?}",
+        joined.restarts
+    );
+    assert_eq!(served_by(&j), Ok(F[1].to_string()), "and the name is served from the newer stage");
+    assert_stage_invariant(&j);
+    assert_eq!(j.snapshot_listed_stages_left(), 0, "nothing is left standing by the second pass");
+    the_reader_ran(&w);
+}
+
+#[test]
+fn a_stage_that_already_restarted_the_join_completes_it_the_second_time_and_is_counted() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let (j, _dj) = engine();
+    j.note_restarted_for_test(w.sender.node_id(), &[CollectionId::derive(DB, F[0])]);
+    let joined = join_by_pages(&j, &w.sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(joined.restarts.iter().sum::<usize>(), 0, "without a restart: the stage had one");
+    assert_eq!(j.snapshot_join_restarts(), 0, "none counted");
+    assert_eq!(j.snapshot_listed_stages_left(), 1, "and the stage it left is counted");
+    assert!(
+        j.snapshot_restarted_for_test(w.sender.node_id()).is_empty(),
+        "what it remembered is forgotten with the join"
+    );
+    the_reader_ran(&w);
+}
+
+#[test]
+fn two_stages_buried_during_a_join_give_exactly_two_restarts_and_the_last_serves_the_name() {
+    let w = a_sender_that_swaps_again_during_the_join(2);
+    let (j, _dj) = engine();
+    let joined = join_by_pages(&j, &w.sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(joined.restarts.iter().sum::<usize>(), 2, "{:?}", joined.restarts);
+    assert_eq!(served_by(&j), Ok(F[2].to_string()), "the name is served from the last stage");
+    let last = j.get_collection(DB, F[2]).unwrap();
+    assert_eq!(j.count(&last, WalkScope::Request).unwrap(), 6, "with every document of it");
+    assert_eq!(j.snapshot_join_restarts(), 2, "both counted");
+    assert_stage_invariant(&j);
+    the_reader_ran(&w);
+}
+
+#[test]
+fn a_listed_stage_whose_creation_is_above_the_grant_does_not_restart_the_join() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let below = w.creations[0].stamp.hlc.predecessor();
+    let origin = w.creations[0].stamp.origin();
+    let (j, _dj) = engine();
+    let joined = join_by_pages_patched(&j, &w.sender, &|page| {
+        page.versions.insert(origin, below);
+    });
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        0,
+        "a creation above the grant is not this join's: no restart"
+    );
+    the_reader_ran(&w);
+}
+
+#[test]
+fn a_stage_this_members_own_test_buries_does_not_restart_the_join() {
+    let w = a_sender_that_doomed_a_stage();
+    let (j, _dj) = engine();
+    j.apply_batch(std::slice::from_ref(&w.creations[0])).unwrap();
+    let joined = join_by_pages(&j, &w.sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        0,
+        "and does not restart: the pass buried it"
+    );
+    assert_stage_invariant(&j);
+}
+
+#[test]
+fn a_stage_below_a_database_drop_this_member_holds_gets_its_own_tombstone_and_no_restart() {
+    let (a, _da) = engine();
+    let (d, _dd) = engine();
+    d.create_collection(DB, "orders").unwrap();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, F[0], MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, F[0]);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(d.drop_database(DB).unwrap(), "premise: the database is dropped");
+    let (sender, _ds) = engine();
+    window(&sender, std::slice::from_ref(&creation));
+    assert!(sender.get_collection(DB, F[0]).is_ok(), "premise: the sender held the stage alive");
+    window(&sender, &everything(&d));
+    assert!(sender.get_collection(DB, F[0]).is_err(), "premise: the drop buried it at the sender");
+    assert!(the_stage_row_of(&sender, F[0]).is_some(), "premise: the sender holds its stage row");
+    let (j, _dj) = engine();
+    window(&j, &everything(&d));
+    let dropped = j.database_dropped_at(DB).unwrap().expect("premise: this member holds the drop");
+    let joined = join_by_pages(&j, &sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(joined.restarts.iter().sum::<usize>(), 0, "and does not restart");
+    assert_eq!(
+        j.collection_dropped_at(CollectionId::derive(DB, F[0])).unwrap(),
+        Some(dropped),
+        "this member's own tombstone, at the stamp of the database's drop it holds"
+    );
+    assert_stage_invariant(&j);
+    assert_eq!(j.snapshot_listed_stages_left(), 0, "and it is not a stage left standing");
+}
+
+#[test]
+fn a_stage_row_only_with_no_event_above_the_grant_completes_the_join_and_is_counted() {
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, F[0], MergePolicy::Document, deadline).unwrap();
+    let (sender, _ds) = with_orders();
+    sender.apply_batch(std::slice::from_ref(&creation_of(&a, F[0]))).unwrap();
+    assert!(sender.bury_collection(DB, F[0], None).unwrap().is_some(), "premise: buried by a drop");
+    let id = CollectionId::derive(DB, F[0]);
+    let (j, _dj) = engine();
+    let joined = join_by_pages(&j, &sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(joined.restarts.iter().sum::<usize>(), 0, "and does not restart: no event says why");
+    assert_eq!(j.snapshot_listed_stages_left(), 1, "the stage it left is counted");
+    // the one state `assert_stage_invariant` does not hold in, named: a stage row with no collection and no tombstone, which no event
+    // above the grant and no database drop explains
+    assert!(the_stage_row_of(&j, F[0]).is_some(), "it holds the stage row");
+    assert!(j.get_collection(DB, F[0]).is_err(), "and no collection of it");
+    assert_eq!(j.collection_dropped_at(id).unwrap(), None, "and no tombstone for it");
+}
+
+#[test]
+fn an_event_exactly_at_the_grant_is_not_above_it() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, F[0], MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, F[0]);
+    let (sender, _ds) = with_orders();
+    sender.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    let wall = creation.stamp.hlc.wall_ms.max(life_wall(&sender)).max(physical_now_ms()) + 1;
+    let bind = bind_of(&b, F[0], wall);
+    window(&sender, std::slice::from_ref(&bind));
+    assert!(sender.bury_collection(DB, F[0], None).unwrap().is_some(), "premise: buried by a drop");
+    let first = sender.snapshot_page(None, None).unwrap();
+    assert_eq!(
+        first.versions.get(bind.stamp.origin()),
+        bind.stamp.hlc,
+        "premise: the binding is exactly at the grant of the first page"
+    );
+    let (j, _dj) = engine();
+    let joined = join_by_pages(&j, &sender);
+    assert!(joined.progress.is_complete(), "the join completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        0,
+        "an event at the grant is covered by it: no restart"
+    );
+}
