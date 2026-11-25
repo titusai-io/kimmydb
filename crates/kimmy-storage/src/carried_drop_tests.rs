@@ -244,3 +244,172 @@ fn a_converging_repair_never_applies_the_senders_burial() {
         "nothing was carried into the register's drop path"
     );
 }
+
+// -- Unit B (Q6.6): a tombstone the register owns, for an id this member holds no collection under ----------------------------------------
+//
+// The held branch above defers the burial of a collection the register judges. A member that holds NO collection under the carried id used
+// to record the sender's tombstone without asking: for a stage whose row it keeps (the creation is known, the collection is gone) or the
+// identity of a name whose binding is only parked here, that tombstone is the register's to decide, and a recorded one refuses what the
+// register would have served. The register is asked by id; if it owns the id, nothing is recorded and the deferral is counted.
+
+/// Whether this member keeps the creation row of the stage `physical`.
+fn holds_a_stage_row(m: &Engine, physical: CollectionId) -> bool {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    crate::register::stage_row_named_read(&txn, physical).unwrap().is_some()
+}
+
+/// Whether the name `orders` has register events here and none in effect: its binding is known ahead of its position.
+fn the_binding_is_parked_only(m: &Engine) -> bool {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    crate::register::has_events(&txn, DB, "orders").unwrap()
+        && !crate::register::has_events_in_effect(&txn, DB, "orders").unwrap()
+}
+
+/// A receiver that knows the creation of `STAGE1` and holds no collection of it, and the whole-database page of a sender that has gone
+/// on to a second swap (so the page carries the burial of `STAGE1`, the identity's, and a plain collection's).
+struct Known {
+    j: Engine,
+    s: Swap,
+    page: crate::SnapshotPage,
+    _dj: tempfile::TempDir,
+}
+
+fn a_page_that_buries_a_stage_the_receiver_knows() -> Known {
+    let (j, dj) = engine();
+    let s = swap(&[]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    s.a.create_stage(DB, STAGE2, MergePolicy::Document, deadline).unwrap();
+    let creation2 = creation_of(&s.a, STAGE2);
+    let wall = creation2.stamp.hlc.wall_ms.max(s.bind.stamp.hlc.wall_ms) + 1;
+    let bind2 = bind_of(&s.a, STAGE2, wall);
+    s.sender.apply_batch(std::slice::from_ref(&creation2)).unwrap();
+    window(&s.sender, std::slice::from_ref(&bind2));
+    s.sender.create_collection(DB, "plain").unwrap();
+    assert!(s.sender.drop_collection(DB, "plain").unwrap());
+    // by hand: the stage's row stays, its collection and its tombstone go (the state of a member whose tombstone was collected)
+    j.forget_collection_leaving_rows(DB, STAGE1).unwrap();
+    let page = s.sender.snapshot_page(None, None).unwrap();
+    Known { j, s, page, _dj: dj }
+}
+
+#[test]
+fn a_carried_burial_of_a_stage_the_receiver_knows_but_holds_no_collection_of_is_not_recorded() {
+    let k = a_page_that_buries_a_stage_the_receiver_knows();
+    let stage1 = CollectionId::derive(DB, STAGE1);
+    assert!(
+        holds_a_stage_row(&k.j, stage1),
+        "premise: the receiver keeps the stage's creation row"
+    );
+    assert!(k.j.get_collection(DB, STAGE1).is_err(), "premise: and holds no collection of it");
+    assert!(
+        k.j.collection_dropped_at(stage1).unwrap().is_none(),
+        "premise: and no tombstone of it"
+    );
+    assert!(
+        k.page.dropped_collections.iter().any(|(id, _)| *id == stage1),
+        "premise: the page carries the stage's tombstone"
+    );
+    k.j.apply_snapshot_page(k.s.sender.node_id(), &mut SnapshotProgress::whole_database(), &k.page)
+        .unwrap();
+    assert_eq!(
+        k.j.collection_dropped_at(stage1).unwrap(),
+        None,
+        "no tombstone is recorded under the stage's id: the register decides its burial"
+    );
+    assert_eq!(k.j.register_carried_drops_deferred(), 1, "and the deferral is counted");
+}
+
+#[test]
+fn a_carried_burial_of_a_plain_collection_on_the_same_page_is_recorded_as_it_always_was() {
+    let k = a_page_that_buries_a_stage_the_receiver_knows();
+    let plain = CollectionId::derive(DB, "plain");
+    assert!(
+        k.page.dropped_collections.iter().any(|(id, _)| *id == plain),
+        "premise: the page carries the plain collection's tombstone"
+    );
+    k.j.apply_snapshot_page(k.s.sender.node_id(), &mut SnapshotProgress::whole_database(), &k.page)
+        .unwrap();
+    assert!(
+        k.j.collection_dropped_at(plain).unwrap().is_some(),
+        "the plain collection's tombstone is recorded"
+    );
+}
+
+#[test]
+fn a_scoped_burial_of_the_identity_whose_binding_is_only_parked_here_is_not_recorded() {
+    // Route R6 (a scoped pull, which grants nothing: nothing is released while the page applies). The receiver never held `orders`; it
+    // knows the stage's creation and holds the binding ahead of its position.
+    let (j, _dj) = engine();
+    let s = swap(&[]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    j.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    let id = CollectionId::derive(DB, "orders");
+    let page = s.sender.snapshot_page(None, Some(id)).unwrap();
+    assert!(j.get_collection(DB, "orders").is_err(), "premise: the identity is not held here");
+    assert!(
+        page.dropped == Some(s.bind.stamp),
+        "premise: the page carries the identity's burial at the binding"
+    );
+    assert!(the_binding_is_parked_only(&j), "premise: the binding is known ahead of its position");
+    j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+        .unwrap();
+    assert_eq!(
+        j.collection_dropped_at(id).unwrap(),
+        None,
+        "no tombstone is recorded under the identity of a name whose binding is parked"
+    );
+    assert_eq!(j.register_carried_drops_deferred(), 1, "and the deferral is counted");
+}
+
+// -- The count is per delivery: a deferral records no tombstone, so a page delivered again is deferred (and counted) again -------------------
+
+#[test]
+fn a_whole_database_page_delivered_twice_defers_the_stage_twice_and_records_no_tombstone() {
+    let k = a_page_that_buries_a_stage_the_receiver_knows();
+    let stage1 = CollectionId::derive(DB, STAGE1);
+    for delivery in 1..=2u64 {
+        k.j.apply_snapshot_page(
+            k.s.sender.node_id(),
+            &mut SnapshotProgress::whole_database(),
+            &k.page,
+        )
+        .unwrap();
+        assert_eq!(
+            k.j.register_carried_drops_deferred(),
+            delivery,
+            "the deferral is counted per delivery: the page came {delivery} time(s)"
+        );
+        assert_eq!(
+            k.j.collection_dropped_at(stage1).unwrap(),
+            None,
+            "and still no tombstone is recorded under the stage's id (delivery {delivery})"
+        );
+    }
+}
+
+#[test]
+fn a_scoped_page_delivered_twice_defers_the_identity_twice_and_records_no_tombstone() {
+    let (j, _dj) = engine();
+    let s = swap(&[]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    j.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    let id = CollectionId::derive(DB, "orders");
+    let page = s.sender.snapshot_page(None, Some(id)).unwrap();
+    for delivery in 1..=2u64 {
+        j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        assert_eq!(
+            j.register_carried_drops_deferred(),
+            delivery,
+            "the deferral is counted per delivery: the page came {delivery} time(s)"
+        );
+        assert_eq!(
+            j.collection_dropped_at(id).unwrap(),
+            None,
+            "and still no tombstone is recorded under the identity's id (delivery {delivery})"
+        );
+    }
+}
