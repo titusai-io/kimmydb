@@ -861,6 +861,17 @@ impl SnapshotProgress {
         self.complete = true;
     }
 
+    /// This progress after the join it is of restarts (Q6.6, unit E): page one again, no grant, nothing counted, and the kind of pull it was,
+    /// which is what a superseding pull starts from (`PeerStalls::snapshot_progress` makes the same fresh one).
+    pub(crate) fn restarted(&self) -> Self {
+        SnapshotProgress {
+            policy: self.policy,
+            cut: self.cut.clone(),
+            max_index_documents: self.max_index_documents,
+            ..Self::new(self.scope)
+        }
+    }
+
     fn new(scope: Option<CollectionId>) -> Self {
         SnapshotProgress {
             policy: SnapshotPolicy::All,
@@ -971,6 +982,15 @@ impl Engine {
         after: Option<SnapshotCursor>,
         scope: Option<CollectionId>,
     ) -> Result<SnapshotPage> {
+        // A test's doing to this sender what a client does between two pages (Q6.6, unit E): before anything of the page is read, so
+        // what it did is what the page is read from. Taken out of the lock first, so a hook may take the engine's writer.
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let hook = self.snapshot_reader_hook_for_test.lock().clone();
+            if let Some(hook) = hook {
+                hook(self, after.as_ref());
+            }
+        }
         // Read before the documents, on every page. The receiver adopts the
         // first page's vector once the snapshot completes, and the order is
         // what makes that safe: a document committed before this read is at
@@ -1204,24 +1224,30 @@ impl Engine {
     /// The stages this member has restarted a whole-database join with `peer` for, and so does not restart it for again; empty once the
     /// join completes (Q6.6, unit E).
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn snapshot_restarted_for_test(&self, _peer: NodeId) -> Vec<CollectionId> {
-        Vec::new()
+    pub fn snapshot_restarted_for_test(&self, peer: NodeId) -> Vec<CollectionId> {
+        self.snapshot_restarted
+            .lock()
+            .get(&peer)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Record that this member already restarted a join with `peer` for `stages`, as a restart does (Q6.6, unit E).
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn note_restarted_for_test(&self, _peer: NodeId, _stages: &[CollectionId]) {}
+    pub fn note_restarted_for_test(&self, peer: NodeId, stages: &[CollectionId]) {
+        self.snapshot_restarted.lock().entry(peer).or_default().extend(stages.iter().copied());
+    }
 
     /// Whole-database joins this member restarted since start (`kimmy_snapshot_join_restarts_total`): the sender buried a stage after
     /// the first page read it, by an event the first page's grant does not cover (Q6.6, unit E).
     pub fn snapshot_join_restarts(&self) -> u64 {
-        0
+        self.snapshot_join_restarts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Stages a completed join's last page listed as not alive at the sender that this member left standing, or held none of, and did not
     /// restart for (`kimmy_snapshot_listed_stages_left_total`): the sender's burial of them is not a fact this member has (Q6.6, unit E).
     pub fn snapshot_listed_stages_left(&self) -> u64 {
-        0
+        self.snapshot_listed_stages_left.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Lift the caps a client write is held to (ADR-250) for this engine, so a test
@@ -1937,11 +1963,33 @@ impl Engine {
                 if let Some(carry) = &page.register {
                     let listed =
                         Engine::tombstone_listed_stages_in_txn(&txn, &carry.not_alive, granted)?;
-                    wrote |= !listed.buried.is_empty();
-                    if !listed.left.is_empty() {
-                        debug!(
-                            stages = listed.left.len(),
-                            "listed stages this member holds none of and its own tests do not bury"
+                    wrote |= !listed.buried.is_empty() || !listed.refused.is_empty();
+                    // The sender buried a stage after the first page read it, by an event the grant does not cover: this member holds the
+                    // stage partly filled, or not at all, and the pass cannot bury it, because the event is parked above the grant (Q6.6,
+                    // unit E). The page is abandoned whole and the join asks again from page one, whose grant covers the event. A stage
+                    // that already restarted a join does not restart it again: the join completes and says what it left.
+                    let across =
+                        Self::listed_stages_buried_above_the_grant(&txn, carry, &listed, granted)?;
+                    let (repeated, fresh): (Vec<_>, Vec<_>) = {
+                        let remembered = self.snapshot_restarted.lock();
+                        let seen = remembered.get(&peer);
+                        across.iter().partition(|id| seen.is_some_and(|seen| seen.contains(*id)))
+                    };
+                    if !fresh.is_empty() {
+                        let fresh: Vec<CollectionId> = fresh.into_iter().copied().collect();
+                        txn.abort()?;
+                        return self.restart_join(peer, progress, &fresh);
+                    }
+                    let standing = listed.held.len() + listed.left.len();
+                    if standing > 0 {
+                        self.snapshot_listed_stages_left
+                            .fetch_add(standing as u64, std::sync::atomic::Ordering::Relaxed);
+                        warn!(
+                            stages = standing,
+                            restarted_before = repeated.len(),
+                            "the sender lists stages as not alive that this member holds, or holds none of, and its own tests do not \
+                             bury; the join completes and leaves them (a stage that already restarted this join is not restarted for \
+                             again)"
                         );
                     }
                 }
@@ -2004,6 +2052,9 @@ impl Engine {
             self.forget_snapshot_progress(peer, progress.scope)?;
         }
         if complete {
+            if progress.scope.is_none() {
+                self.snapshot_restarted.lock().remove(&peer);
+            }
             match progress.scope {
                 None => info!(
                     pages = progress.pages,
@@ -3122,6 +3173,58 @@ impl Engine {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// The listed stages (held here after the passes, or held none of) whose name the carry holds an event of stamped ABOVE the grant:
+    /// the ones the sender buried by an event the first page's grant does not cover (ADR-272, decision 9; Q6.6, unit E). A stage whose
+    /// creation is above the grant is not in `listed` at all.
+    fn listed_stages_buried_above_the_grant(
+        txn: &crate::engine::WriteTxn<'_>,
+        carry: &RegisterCarry,
+        listed: &crate::engine::ListedStages,
+        granted: &VersionVector,
+    ) -> Result<Vec<CollectionId>> {
+        let mut across = Vec::new();
+        for id in listed.held.iter().chain(&listed.left) {
+            let Some(stage) = crate::register::stage_row_named(txn, *id)? else { continue };
+            let Some(logical) = kimmy_core::swap::logical_of_stage(&stage.physical) else {
+                continue;
+            };
+            let name = CollectionId::derive(&stage.db, logical).0.to_be_bytes();
+            let above = carry.events.iter().any(|(key, _)| {
+                let Ok(rest) = <[u8; Stamp::KEY_LEN]>::try_from(key.get(8..).unwrap_or_default())
+                else {
+                    return false;
+                };
+                let stamp = Stamp::from_key_bytes(rest);
+                key[..8] == name && stamp.hlc > granted.get(stamp.origin())
+            });
+            if above {
+                across.push(*id);
+            }
+        }
+        Ok(across)
+    }
+
+    /// The join with `peer` restarts for `stages`: they are remembered (a stage restarts a join once), the cursor the earlier pages
+    /// persisted is forgotten in a transaction of its own, and the progress is the one a superseding pull starts from. The page that found
+    /// them was abandoned whole by the caller (Q6.6, unit E).
+    fn restart_join(
+        &self,
+        peer: NodeId,
+        progress: &mut SnapshotProgress,
+        stages: &[CollectionId],
+    ) -> Result<SnapshotApplied> {
+        self.forget_snapshot_progress(peer, progress.scope)?;
+        self.snapshot_restarted.lock().entry(peer).or_default().extend(stages.iter().copied());
+        *progress = progress.restarted();
+        self.snapshot_join_restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            stages = stages.len(),
+            "the sender buried a stage after the first page of this snapshot read it, by an event the grant of that page does not cover: \
+             the last page was not applied and the snapshot restarts from its first page, whose grant covers the event"
+        );
+        Ok(SnapshotApplied { restarts: 1, ..Default::default() })
     }
 
     /// Whether the burial of `current` that a snapshot carries is the register's to judge: `current` is a stage of a swap, or a

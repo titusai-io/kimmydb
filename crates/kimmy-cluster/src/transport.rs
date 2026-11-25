@@ -6464,6 +6464,15 @@ where
             pages += 1;
         }
         let applied = applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
+        // The last page found a stage the sender buried after the first page read it, by an event that page's grant does not cover: it
+        // was not applied, and the progress is back at page one, so this loop asks again from the start (ADR-272, decision 9; Q6.6, unit
+        // E). The restart is the pull's progress, so a stall run starts again, and it ends: a stage restarts a join once
+        // (`Engine::snapshot_restarted`), so the restarts are bounded by the stages the sender buries while the join runs.
+        if applied.restarts > 0 {
+            stalls.snapshot_advanced(node);
+            debug!(%peer, "the snapshot restarts from its first page");
+            continue;
+        }
         match policy {
             kimmy_storage::SnapshotPolicy::Converge => stalls.converge_page_applied(node, &applied),
             kimmy_storage::SnapshotPolicy::Definitions => {

@@ -2445,6 +2445,21 @@ impl TelemetryGuard {
             "Resolutions of a swapped name answered from the register's events because the stored visibility row was stale. 0 on a healthy member.",
             register_resolve_fallback
         );
+        // Whole-database snapshots restarted from their first page, and listed stages one left standing (ADR-272; Q6.6, unit E).
+        observe!(
+            u64_observable_counter,
+            "kimmy.snapshot.join_restarts",
+            "{snapshot}",
+            "Whole-database snapshots this member restarted from their first page because the sender buried a stage after the first page read it, by an event that page's grant does not cover. 0 on a quiet cluster.",
+            snapshot_join_restart
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.snapshot.listed_stages_left",
+            "{stage}",
+            "Stages a snapshot's last page listed as not alive at the sender that this member left standing and did not restart the snapshot for. 0 on a healthy member.",
+            snapshot_listed_stage_left
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
@@ -3486,6 +3501,17 @@ mod tests {
             call.ends_with("register_resolve_fallback"),
             "kimmy.register.resolve_fallback reads the stale-row count: {call}"
         );
+    }
+
+    #[test]
+    fn the_snapshot_restart_counters_read_their_own_fields() {
+        for (name, field) in [
+            ("kimmy.snapshot.join_restarts", "snapshot_join_restart"),
+            ("kimmy.snapshot.listed_stages_left", "snapshot_listed_stage_left"),
+        ] {
+            let call = instrument_call(name);
+            assert!(call.ends_with(field), "{name} reads {field}: {call}");
+        }
     }
 
     #[test]

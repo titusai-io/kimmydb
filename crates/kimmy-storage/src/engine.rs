@@ -227,6 +227,16 @@ pub struct Engine {
     /// it (`snapshot::SNAPSHOT_PAGE_BYTES`); 0 for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize,
+    /// The stages this member has restarted a whole-database join for, by the sender it was joining from (Q6.6, unit E): a stage that
+    /// already restarted a join does not restart it again, so the restarts of a join are bounded by the stages that caused one whatever
+    /// the sender does. In memory only, and forgotten when the join completes.
+    pub(crate) snapshot_restarted:
+        Mutex<std::collections::HashMap<NodeId, std::collections::BTreeSet<CollectionId>>>,
+    /// Whole-database joins this member restarted since start (`kimmy_snapshot_join_restarts_total`).
+    pub(crate) snapshot_join_restarts: std::sync::atomic::AtomicU64,
+    /// Stages a join's last page listed as not alive that this member left standing or held none of, and did not restart for
+    /// (`kimmy_snapshot_listed_stages_left_total`).
+    pub(crate) snapshot_listed_stages_left: std::sync::atomic::AtomicU64,
     /// A test's hook on the page reader of this member as a SENDER: called at the start of every `snapshot_page`, with the cursor the
     /// page is asked after, before anything of the page is read (Q6.6, unit E). Lets a test do to the sender what a client does
     /// between two pages of a join (bury a stage).
@@ -1847,6 +1857,9 @@ impl Engine {
             snapshot_register_carry_bytes: std::sync::atomic::AtomicU64::new(0),
             register_carry_warnings: std::sync::atomic::AtomicU64::new(0),
             register_resolve_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            snapshot_restarted: Mutex::new(std::collections::HashMap::new()),
+            snapshot_join_restarts: std::sync::atomic::AtomicU64::new(0),
+            snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -6173,7 +6186,27 @@ impl Engine {
             let Some(logical) = kimmy_core::swap::logical_of_stage(&stage.physical) else {
                 continue;
             };
-            if held || tombstoned {
+            if tombstoned {
+                continue;
+            }
+            // held here: the pass's, which keeps it (its events say so) or buries it; what is left standing is the join's to judge (unit E)
+            if held {
+                out.held.push(id);
+                continue;
+            }
+            // a creation this member's database tombstone refuses is history here, as the creation arm of a page judges it (record the
+            // tombstone of the stage at the database drop's stamp): the sender's burial of it needs no event
+            let database_drop = txn
+                .open_table(tables::COLLECTIONS_DROPPED)?
+                .get(kimmy_core::database_drop_id(&stage.db).0)?
+                .map(|held| codec::decode_oplog_key(held.value()))
+                .transpose()?;
+            if let Some(dropped) =
+                database_drop.filter(|dropped| stage.meta.created.hlc <= dropped.hlc)
+            {
+                let mut table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                table.insert(id.0, codec::oplog_key(&dropped).as_slice())?;
+                out.refused.push(id);
                 continue;
             }
             // the pass's own inputs, built as the pass builds them (`settle_register_in_txn`): the view of the events, then each stage this
@@ -7095,10 +7128,15 @@ impl Engine {
 }
 
 /// What a join did with the stages a snapshot listed as not alive at its sender (Q6.6, unit D): the ones this member's own tests buried (it
-/// recorded its own tombstone), and the ones it holds no collection of that its tests do not bury.
+/// recorded its own tombstone), the ones its database tombstone refuses, the ones it holds a collection of, and the ones it holds no
+/// collection of that its tests do not bury.
 #[derive(Debug, Default)]
 pub(crate) struct ListedStages {
     pub(crate) buried: Vec<CollectionId>,
+    /// Stages whose creation this member's database tombstone refuses: it recorded its own tombstone at the database drop's stamp.
+    pub(crate) refused: Vec<CollectionId>,
+    /// Stages this member holds a collection of (alive after the passes), listed at the sender as not alive.
+    pub(crate) held: Vec<CollectionId>,
     pub(crate) left: Vec<CollectionId>,
 }
 

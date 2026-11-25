@@ -179,6 +179,12 @@ pub struct StorageReadings {
     /// Resolutions of a swapped name that found the stored visibility row stale (`Engine::register_resolve_fallbacks`): the series
     /// `kimmy_register_resolve_fallback_total`. A monotonic count; expected 0.
     pub register_resolve_fallbacks: u64,
+    /// Whole-database snapshots this member restarted from their first page (`Engine::snapshot_join_restarts`): the series
+    /// `kimmy_snapshot_join_restarts_total`. A monotonic count; expected 0.
+    pub snapshot_join_restarts: u64,
+    /// Stages a snapshot's last page listed as not alive that this member left standing and did not restart for
+    /// (`Engine::snapshot_listed_stages_left`): the series `kimmy_snapshot_listed_stages_left_total`. A monotonic count; expected 0.
+    pub snapshot_listed_stages_left: u64,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -659,6 +665,10 @@ pub struct MetricsSnapshot {
     pub register_carried_drop_deferred: u64,
     /// `kimmy_register_resolve_fallback_total`: resolutions of a swapped name answered from the events because the stored row was stale.
     pub register_resolve_fallback: u64,
+    /// `kimmy_snapshot_join_restarts_total`: whole-database snapshots restarted from their first page.
+    pub snapshot_join_restart: u64,
+    /// `kimmy_snapshot_listed_stages_left_total`: listed stages a snapshot left standing and did not restart for.
+    pub snapshot_listed_stage_left: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1715,6 +1725,8 @@ impl Metrics {
             register_waiting_for_stage: readings.register_waiting.iter().map(|(_, n)| *n).sum(),
             register_carried_drop_deferred: readings.register_carried_drops_deferred,
             register_resolve_fallback: readings.register_resolve_fallbacks,
+            snapshot_join_restart: readings.snapshot_join_restarts,
+            snapshot_listed_stage_left: readings.snapshot_listed_stages_left,
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -2200,6 +2212,12 @@ impl Metrics {
              # HELP kimmy_register_resolve_fallback_total Resolutions of a swapped name that found the stored visibility row stale, and answered from the register's events instead: the row named a collection this member does not hold, or the newest event in effect is not the one the row was decided against. The answer is right and slower until the next settle pass rewrites the row. Expected to read 0 on every member: a value that rises names a transaction that changed what a name serves without running the pass for it. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_register_resolve_fallback_total counter\n\
              kimmy_register_resolve_fallback_total {register_resolve_fallback}\n\
+             # HELP kimmy_snapshot_join_restarts_total Whole-database snapshots this member restarted from their first page. A snapshot's last page found a stage the sender buried after the first page read it, by an event the first page's grant does not cover, so the member held the stage partly filled and its own tests could not bury it; the last page was not applied and the snapshot asked again from page one, whose grant covers the event. A stage restarts a snapshot once, so the restarts of one snapshot are bounded by the stages the sender buries while it runs. Expected to read 0 on a quiet cluster; a value that keeps rising names a sender that swaps a name faster than a snapshot of it is read. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_snapshot_join_restarts_total counter\n\
+             kimmy_snapshot_join_restarts_total {snapshot_join_restart}\n\
+             # HELP kimmy_snapshot_listed_stages_left_total Stages a snapshot's last page listed as not alive at the sender that this member left standing, or holds none of, and did not restart the snapshot for: no event above the grant says why the sender buried them (a plain drop of a hidden collection, or a stage that already restarted this snapshot), and this member's own tests do not bury them. The snapshot completes; the stage row is kept, with no collection and no tombstone. Expected to read 0. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_snapshot_listed_stages_left_total counter\n\
+             kimmy_snapshot_listed_stages_left_total {snapshot_listed_stage_left}\n\
              # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_documents_skipped_total counter\n\
              {snapshot_skip_lines}\
@@ -2456,6 +2474,8 @@ impl Metrics {
             },
             register_carried_drop_deferred = readings.register_carried_drops_deferred,
             register_resolve_fallback = readings.register_resolve_fallbacks,
+            snapshot_join_restart = readings.snapshot_join_restarts,
+            snapshot_listed_stage_left = readings.snapshot_listed_stages_left,
             register_waiting_lines = if readings.register_waiting.is_empty() {
                 "kimmy_register_waiting_for_stage{origin=\"other\"} 0\n".to_string()
             } else {
@@ -3550,6 +3570,8 @@ mod tests {
             ],
             register_carried_drops_deferred: 98,
             register_resolve_fallbacks: 8_261,
+            snapshot_join_restarts: 8_262,
+            snapshot_listed_stages_left: 8_263,
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4387,6 +4409,12 @@ kimmy_register_carried_drop_deferred_total 98
 # HELP kimmy_register_resolve_fallback_total Resolutions of a swapped name that found the stored visibility row stale, and answered from the register's events instead: the row named a collection this member does not hold, or the newest event in effect is not the one the row was decided against. The answer is right and slower until the next settle pass rewrites the row. Expected to read 0 on every member: a value that rises names a transaction that changed what a name serves without running the pass for it. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_register_resolve_fallback_total counter
 kimmy_register_resolve_fallback_total 8261
+# HELP kimmy_snapshot_join_restarts_total Whole-database snapshots this member restarted from their first page. A snapshot's last page found a stage the sender buried after the first page read it, by an event the first page's grant does not cover, so the member held the stage partly filled and its own tests could not bury it; the last page was not applied and the snapshot asked again from page one, whose grant covers the event. A stage restarts a snapshot once, so the restarts of one snapshot are bounded by the stages the sender buries while it runs. Expected to read 0 on a quiet cluster; a value that keeps rising names a sender that swaps a name faster than a snapshot of it is read. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_snapshot_join_restarts_total counter
+kimmy_snapshot_join_restarts_total 8262
+# HELP kimmy_snapshot_listed_stages_left_total Stages a snapshot's last page listed as not alive at the sender that this member left standing, or holds none of, and did not restart the snapshot for: no event above the grant says why the sender buried them (a plain drop of a hidden collection, or a stage that already restarted this snapshot), and this member's own tests do not bury them. The snapshot completes; the stage row is kept, with no collection and no tombstone. Expected to read 0. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_snapshot_listed_stages_left_total counter
+kimmy_snapshot_listed_stages_left_total 8263
 # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_snapshot_documents_skipped_total counter
 kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
@@ -5463,6 +5491,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             + 1
             // Since ADR-272 (Q6.6, the resolve row), the scalar `kimmy_register_resolve_fallback_total`.
             + 1
+            // Since ADR-272 (Q6.6, unit E), the scalars `kimmy_snapshot_join_restarts_total` and
+            // `kimmy_snapshot_listed_stages_left_total`.
+            + 2
             // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
             + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()
             // Since ADR-272 (Q6.6, C2d), the gauge `kimmy_snapshot_register_carry_bytes`.
@@ -5813,6 +5844,31 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         let readings = StorageReadings { register_resolve_fallbacks: 4, ..Default::default() };
         assert!(m.render_with(&readings).contains("kimmy_register_resolve_fallback_total 4\n"));
         assert_eq!(m.snapshot_with(&readings).register_resolve_fallback, 4);
+    }
+
+    /// ADR-272 (Q6.6, unit E): a snapshot restarted from its first page, and a listed stage a snapshot left standing, render as plain
+    /// counters present at 0, and reach the snapshot the OTLP bridge reads.
+    #[test]
+    fn the_snapshot_restart_counters_are_plain_counters_present_at_zero() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        for series in
+            ["kimmy_snapshot_join_restarts_total", "kimmy_snapshot_listed_stages_left_total"]
+        {
+            assert!(empty.contains(&format!("# TYPE {series} counter\n")), "{series} has its type");
+            assert!(empty.contains(&format!("{series} 0\n")), "{series} is present at 0");
+        }
+        let readings = StorageReadings {
+            snapshot_join_restarts: 3,
+            snapshot_listed_stages_left: 5,
+            ..Default::default()
+        };
+        let page = m.render_with(&readings);
+        assert!(page.contains("kimmy_snapshot_join_restarts_total 3\n"));
+        assert!(page.contains("kimmy_snapshot_listed_stages_left_total 5\n"));
+        let snapshot = m.snapshot_with(&readings);
+        assert_eq!(snapshot.snapshot_join_restart, 3);
+        assert_eq!(snapshot.snapshot_listed_stage_left, 5);
     }
 
     #[test]

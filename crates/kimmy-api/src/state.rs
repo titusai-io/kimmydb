@@ -289,6 +289,8 @@ impl AppState {
             // The snapshot drops of a swapped name deferred for the register's events (ADR-272).
             register_carried_drops_deferred: self.engine.register_carried_drops_deferred(),
             register_resolve_fallbacks: self.engine.register_resolve_fallbacks(),
+            snapshot_join_restarts: self.engine.snapshot_join_restarts(),
+            snapshot_listed_stages_left: self.engine.snapshot_listed_stages_left(),
             // How far this member's own clock leads its physical clock, and how long a peer still refuses its entries for
             // theirs, in whole seconds rounded up (U1's guard on schema changes reads the same two).
             clock_hlc_lead_seconds: self.engine.clock_lead_ms().div_ceil(1000),
