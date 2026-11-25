@@ -228,7 +228,13 @@ fn only_this_module_opens_the_register_tables() {
     let mut offenders = Vec::new();
     for file in files {
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
-        if name == "register.rs" || name == "tables.rs" || name == "register_tests.rs" {
+        // `register_growth_bench.rs` is an ignored, test-only bench that opens the tables to report their row counts; it writes
+        // through the register's own door
+        if name == "register.rs"
+            || name == "tables.rs"
+            || name == "register_tests.rs"
+            || name == "register_growth_bench.rs"
+        {
             continue;
         }
         let text = std::fs::read_to_string(&file).unwrap();

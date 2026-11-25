@@ -185,6 +185,8 @@ mod backup_register_tests;
 mod definition_door_tests;
 #[cfg(test)]
 mod recreate_tests;
+#[cfg(test)]
+mod register_growth_bench;
 
 #[cfg(test)]
 mod d10_tests;
