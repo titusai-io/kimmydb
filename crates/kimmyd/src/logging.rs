@@ -2442,7 +2442,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.register.resolve_fallback",
             "{resolution}",
-            "Resolutions of a swapped name answered from the register's events because the stored visibility row was stale. 0 on a healthy member.",
+            "Resolutions of a swapped name answered from the register's events because the stored visibility row was stale or missing. 0 on a healthy member.",
             register_resolve_fallback
         );
         // Whole-database snapshots restarted from their first page, and listed stages one left standing (ADR-272; Q6.6, unit E).

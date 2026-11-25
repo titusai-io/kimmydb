@@ -939,9 +939,12 @@ fn a_join_buries_the_identity_the_binding_binds_out_whether_or_not_it_is_counted
     );
 }
 
-// This is the case that no real member is in: every name that has an event also has a stage row (a binding needs its stage's, and stage
-// rows outlive their collections and ride every page and backup), so a name can be named whenever it has events. The resolve row's
-// property test keeps it as an explicit operation (`an event with no stage row`) so that the answers stay proven right if that is wrong.
+// This is the case that no real cluster is known to be in, and the engine does not forbid it: a name's events can be taken with no stage
+// row (a recreation's `Create` and a drop taken by a window name the name on their own, see the probe below), and it is the order the
+// entries arrive in that keeps a cluster out of it: the stage's creation reaches a member, and writes its row, before the events that
+// follow it, and a page and a backup carry the rows beside the events. A joiner that gets such events cannot name them, and the test of a
+// fresh one below says what it holds. The resolve row's property test keeps it as an explicit operation (`an event with no stage row`)
+// so that the answers stay proven right.
 #[test]
 fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() {
     let s = swap(&[]);
@@ -2089,10 +2092,11 @@ fn a_joiner_refuses_a_stage_with_no_stage_information_and_the_name_stays_dropped
 /// A probe of events of a name with no stage row among members of the current version, not by an older page: A
 /// authors a stage, B takes the SCOPED page of it (the stage and its row, no coverage), B's client drops `orders` and makes it again
 /// (and, with `dropped_again`, drops it once more), and C, below A's creation, takes a window from B. C holds the name's events and no
-/// stage row at all. A stale D that still holds the identity `orders` then joins from C by a whole-database pull.
+/// stage row at all. A stale D that still holds the identity `orders` then joins from C by a whole-database pull. Returns C, D and the
+/// stage's creation, which A made and C has not met.
 fn a_stale_member_joins_from_one_whose_events_have_no_stage_row(
     dropped_again: bool,
-) -> (Engine, Engine, [tempfile::TempDir; 4]) {
+) -> (Engine, Engine, OplogEntry, [tempfile::TempDir; 4]) {
     let (a, da) = engine();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
@@ -2139,12 +2143,13 @@ fn a_stale_member_joins_from_one_whose_events_have_no_stage_row(
         crate::register::carried_rows(&txn, crate::register::Carried::Stages).unwrap().len()
     };
     assert_eq!(stage_rows, 0, "premise: and no stage row at all");
-    (c, d, [da, db, dc, dd])
+    (c, d, creation, [da, db, dc, dd])
 }
 
 #[test]
 fn a_stale_member_holding_the_identity_buries_it_when_it_joins_from_events_with_no_stage_row() {
-    let (c, d, _dirs) = a_stale_member_joins_from_one_whose_events_have_no_stage_row(true);
+    let (c, d, _creation, _dirs) =
+        a_stale_member_joins_from_one_whose_events_have_no_stage_row(true);
     assert!(d.get_collection(DB, "orders").is_ok(), "premise: D still holds the identity");
     let (progress, result) = pull_patched(&d, &c, &|_| {});
     result.expect("the pull applies");
@@ -2160,6 +2165,32 @@ fn a_stale_member_holding_the_identity_buries_it_when_it_joins_from_events_with_
     );
     assert!(d.resolve(DB, "orders").is_err(), "the name is absent");
     assert_eq!(d.register_resolve_fallbacks(), 0, "from the row: no fallback");
+}
+
+/// A FRESH joiner holds nothing to name the events from (the identity, or a hidden collection of the name), so it stores them by id, runs
+/// no pass and holds no row: each resolve of the name is answered by the computation, correctly, and counted as a fallback. It heals at
+/// the name's next event: the stage's creation, taken by a window, writes its row and runs the pass.
+#[test]
+fn a_fresh_joiner_from_events_with_no_stage_row_counts_a_fallback_until_the_stage_arrives() {
+    let (c, _d, creation, _dirs) =
+        a_stale_member_joins_from_one_whose_events_have_no_stage_row(true);
+    let (j, _dj) = engine();
+    pull(&j, &c);
+    assert!(!the_events_of_orders(&j).is_empty(), "premise: the joiner holds the name's events");
+    assert!(the_row(&j).is_none(), "the joiner holds no row: it holds nothing to name them from");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "premise: nothing has resolved the name yet");
+    assert!(j.resolve(DB, "orders").is_err(), "the name is absent");
+    assert!(j.resolve(DB, "orders").is_err(), "and still");
+    assert_eq!(j.register_resolve_fallbacks(), 2, "each resolve is answered by the computation");
+    window(&j, std::slice::from_ref(&creation));
+    assert!(the_stage_row_of(&j, STAGE1).is_some(), "the stage's creation writes its row");
+    assert_eq!(
+        the_row(&j).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Dropped),
+        "and the pass it runs writes the name's row"
+    );
+    assert!(j.resolve(DB, "orders").is_err(), "the name is still absent");
+    assert_eq!(j.register_resolve_fallbacks(), 2, "and is answered from the row: no new fallback");
 }
 
 #[test]
