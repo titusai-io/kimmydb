@@ -403,6 +403,28 @@ pub(crate) fn major_minor(version: &str) -> Option<(u64, u64)> {
     }
 }
 
+/// The collections of the store in `txn` whose names this build reserves (a stage's or a recreation's, ADR-272), as `db.name`, for the
+/// refusal of a store of an older schema to list. Best effort: a table that cannot be read gives none.
+pub(crate) fn reserved_names_in(txn: &redb::ReadTransaction) -> Vec<String> {
+    use redb::ReadableTable;
+    let Ok(collections) = txn.open_table(tables::COLLECTIONS) else { return Vec::new() };
+    let Ok(rows) = collections.iter() else { return Vec::new() };
+    rows.filter_map(|row| row.ok())
+        .filter_map(|(key, _)| {
+            let (db, name) = key.value();
+            kimmy_core::is_hidden_name(name).then(|| format!("{db}.{name}"))
+        })
+        .collect()
+}
+
+/// [`reserved_names_in`] for the store at `database`, opened read-only and not written: none if it cannot be opened that way (a store
+/// that needs repair, or one another process holds).
+fn reserved_names_of_file(database: &Path) -> Vec<String> {
+    let Ok(db) = redb::Builder::new().open_read_only(database) else { return Vec::new() };
+    let Ok(txn) = db.begin_read() else { return Vec::new() };
+    reserved_names_in(&txn)
+}
+
 fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> Result<()> {
     // Schema 0 is what a first open writes before any schema exists
     // (`stamp(0)`, ahead of redb laying the file out): a stop between that and
@@ -418,7 +440,7 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
                 sidecar.written_by,
                 sidecar.schema,
                 build.schema,
-                crate::migrate::no_upgrade()
+                crate::migrate::no_upgrade_for(&reserved_names_of_file(database))
             ),
         ));
     }
@@ -545,9 +567,9 @@ pub(crate) fn redb_panicked(panic: &(dyn std::any::Any + Send)) -> String {
 fn read_only_fallback(database: &Path, build: &BuildVersions, zero_sidecar: bool) -> Result<Prior> {
     match redb::Builder::new().open_read_only(database) {
         Ok(db) => {
-            let (schema, redb) = {
+            let (schema, redb, reserved) = {
                 let txn = db.begin_read()?;
-                match txn.open_table(tables::META) {
+                let (schema, redb) = match txn.open_table(tables::META) {
                     Ok(meta) => {
                         let schema = meta
                             .get(tables::META_FORMAT_VERSION)?
@@ -559,7 +581,14 @@ fn read_only_fallback(database: &Path, build: &BuildVersions, zero_sidecar: bool
                     }
                     Err(redb::TableError::TableDoesNotExist(_)) => (None, None),
                     Err(e) => return Err(e.into()),
-                }
+                };
+                // an older store is read for the names it holds that this build reserves, for its refusal to list (nothing is written)
+                let reserved = if schema.is_some_and(|found| found < build.schema) {
+                    reserved_names_in(&txn)
+                } else {
+                    Vec::new()
+                };
+                (schema, redb, reserved)
             };
             drop(db);
             if let Some(schema) = schema
@@ -572,7 +601,7 @@ fn read_only_fallback(database: &Path, build: &BuildVersions, zero_sidecar: bool
                         "{} with storage schema {schema} (this build: {}). {}",
                         who_wrote(zero_sidecar),
                         build.schema,
-                        crate::migrate::no_upgrade()
+                        crate::migrate::no_upgrade_for(&reserved)
                     ),
                 ));
             }

@@ -69,10 +69,31 @@ pub(crate) fn no_upgrade() -> String {
     )
 }
 
-/// What a refusal of a store of an older schema tells the operator, with the collections of the store whose names this build reserves
-/// (ADR-272): none listed yet.
-pub(crate) fn no_upgrade_for(_reserved: &[String]) -> String {
-    no_upgrade()
+/// How many reserved names a refusal lists before it says how many more there are.
+const RESERVED_LISTED: usize = 20;
+
+/// What a refusal of a store of an older schema tells the operator, with the collections the store holds under names this build reserves
+/// (ADR-272): a name that carries `.__stg.` or `.__rc.` is the hidden collection of a replacing `$out`, no client can make one here, and
+/// the reseed would refuse it. 0.61.0 has no rename, so what to do about each is done there, before the wipe. A store with none is told
+/// what it always was.
+pub(crate) fn no_upgrade_for(reserved: &[String]) -> String {
+    if reserved.is_empty() {
+        return no_upgrade();
+    }
+    let listed =
+        reserved.iter().take(RESERVED_LISTED).map(String::as_str).collect::<Vec<_>>().join(", ");
+    let more = match reserved.len().checked_sub(RESERVED_LISTED) {
+        Some(left) if left > 0 => format!(", and {left} more"),
+        _ => String::new(),
+    };
+    format!(
+        "{} This store also holds {} collection(s) whose names this build reserves ({listed}{more}): a name that contains `.__stg.` or \
+         `.__rc.` is the hidden collection of a replacing `$out` in {}, and a client cannot make one, so the reseed would refuse it. 0.61.0 \
+         has no rename: copy each collection to a new name and drop the original on 0.61.0 before you wipe.",
+        no_upgrade(),
+        reserved.len(),
+        kimmy_core::build::SCHEMA_12_RELEASE
+    )
 }
 
 /// Stamp a fresh database, or refuse one of another schema. `raise` records in
@@ -92,13 +113,13 @@ pub(crate) fn run(
         Some(SCHEMA_VERSION) => Ok(()),
         // Unreachable through `Engine::open`, which refuses any other schema in
         // `refuse_other_schema` first; kept as a guard for a caller that does not.
-        Some(found) => Err(refuse_schema(found, path)),
+        Some(found) => Err(refuse_schema(found, path, &[])),
     }
 }
 
 /// The refusal of a store whose schema is `found`, not this build's, read from
 /// its META: the sidecar that names the writing build is not there to read.
-fn refuse_schema(found: u8, path: &std::path::Path) -> StorageError {
+fn refuse_schema(found: u8, path: &std::path::Path, reserved: &[String]) -> StorageError {
     if found > SCHEMA_VERSION {
         return StorageError::UnsupportedFormat { found, expected: SCHEMA_VERSION };
     }
@@ -108,7 +129,7 @@ fn refuse_schema(found: u8, path: &std::path::Path) -> StorageError {
             "{} was written by a build that left no kimmy.format, with storage schema {found} \
              (this build: {SCHEMA_VERSION}). {}",
             path.display(),
-            no_upgrade()
+            no_upgrade_for(reserved)
         ),
     }
 }
@@ -204,7 +225,12 @@ pub(crate) fn refuse_other_schema(
 ) -> Result<()> {
     match stored_version(db)? {
         Some(found) if found != SCHEMA_VERSION => {
-            return Err(refuse_schema(found, path));
+            // an older store is read for the names it holds that this build reserves, in a read transaction: nothing is written
+            let reserved = match db.begin_read() {
+                Ok(txn) if found < SCHEMA_VERSION => crate::format::reserved_names_in(&txn),
+                _ => Vec::new(),
+            };
+            return Err(refuse_schema(found, path, &reserved));
         }
         _ => {}
     }

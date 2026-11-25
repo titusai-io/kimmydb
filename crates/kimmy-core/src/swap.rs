@@ -92,6 +92,25 @@ pub fn recreation_stamp(name: &str) -> Option<Stamp> {
     Some(Stamp::from_key_bytes(key))
 }
 
+/// Why a creation of `name` is refused where it arrives from another member (ADR-272): it carries a mark the swap reserves, and nothing
+/// that makes it the swap's. A stage's creation carries the stage's information (`has_stage_info`), and a recreation's name ends in the
+/// hex of its event's stamp. A client cannot make either name (the doors of the API and the engine refuse it on the name alone), so one
+/// that arrives without is from a member whose own check was bypassed, and would stand as a hidden collection that the register knows
+/// nothing of. `None` for every other name, and for each of those two made as it should be.
+pub fn reserved_name_without_its_marks(name: &str, has_stage_info: bool) -> Option<&'static str> {
+    if is_stage_name(name) && !has_stage_info {
+        return Some(
+            "the mark `.__stg.` is reserved for a stage, and this creation carries no stage",
+        );
+    }
+    if is_recreation_name(name) && recreation_stamp(name).is_none() {
+        return Some(
+            "the mark `.__rc.` is reserved for the physical collection of a recreated name, and this name carries no stamp",
+        );
+    }
+    None
+}
+
 /// Whether `name` is a physical name no client can address: a stage's or a recreation's. Such a name is never listed or served
 /// as itself, and a schema change addressed to it is refused on the name alone.
 pub fn is_hidden_name(name: &str) -> bool {
@@ -436,5 +455,34 @@ mod tests {
         assert_eq!(RegisterEvent::Bind { physical: "a".into() }.physical(), Some("a"));
         assert_eq!(RegisterEvent::Create { physical: "b".into() }.physical(), Some("b"));
         assert_eq!(RegisterEvent::LogicalDrop.physical(), None);
+    }
+
+    #[test]
+    fn a_reserved_name_is_refused_unless_it_carries_what_makes_it_the_swaps() {
+        let stamp = Stamp::new(Hlc::new(5, 0), NodeId::from_bytes([7; 16]), Epoch::ZERO);
+        let recreation = recreation_name("orders", &stamp);
+        assert_eq!(reserved_name_without_its_marks("orders", false), None, "an ordinary name");
+        assert_eq!(
+            reserved_name_without_its_marks("orders.__stg.zz", true),
+            None,
+            "a stage with its information"
+        );
+        assert!(
+            reserved_name_without_its_marks("orders.__stg.zz", false).is_some(),
+            "a stage name with none"
+        );
+        assert_eq!(
+            reserved_name_without_its_marks(&recreation, false),
+            None,
+            "a recreation with its stamp"
+        );
+        assert!(
+            reserved_name_without_its_marks("orders.__rc.zz", false).is_some(),
+            "a recreation name with no stamp"
+        );
+        assert!(
+            reserved_name_without_its_marks("orders.__rc.", true).is_some(),
+            "stage information does not make a recreation name the swap's"
+        );
     }
 }

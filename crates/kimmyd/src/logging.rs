@@ -2476,6 +2476,14 @@ impl TelemetryGuard {
             "Standing lives the register buried by a replicated drop: a life of a name made after a drop of it, which the drop buried because a stage of the name was created below it. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
             |s| s.register_life_burials[1]
         );
+        // Creations under a reserved name of no swap that were refused (ADR-272).
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.reserved_names_refused",
+            "{creation}",
+            "Creations of a collection refused because the name is one the atomic `$out` swap reserves and nothing makes it the swap's, from a member whose own check was bypassed. 0 on a healthy cluster.",
+            sync_reserved_names_refused
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
@@ -3516,6 +3524,15 @@ mod tests {
         assert!(
             call.ends_with("register_resolve_fallback"),
             "kimmy.register.resolve_fallback reads the stale-row count: {call}"
+        );
+    }
+
+    #[test]
+    fn the_reserved_name_refusal_counter_reads_its_own_field() {
+        let call = instrument_call("kimmy.sync.reserved_names_refused");
+        assert!(
+            call.ends_with("sync_reserved_names_refused"),
+            "kimmy.sync.reserved_names_refused reads the refusal count: {call}"
         );
     }
 

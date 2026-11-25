@@ -61,6 +61,7 @@ pub use swap::{
     CollectionBind, MAX_PHYSICAL_NAME_LEN, OutLoss, RECREATE_NAME_MARK, RegisterDecodeError,
     RegisterEvent, STAGE_NAME_MARK, StageAbandon, StageInfo, StageMeta, is_hidden_name,
     is_recreation_name, is_stage_name, logical_of_recreation, recreation_name, recreation_stamp,
+    reserved_name_without_its_marks,
 };
 pub use validator::{ValidationAction, ValidationLevel, ValidatorSpec};
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};

@@ -3422,6 +3422,17 @@ impl Engine {
         carried: Option<Stamp>,
         granted: Option<&VersionVector>,
     ) -> Result<usize> {
+        // A definition under a name the swap reserves with nothing to make it the swap's is not made (ADR-272): the page is its sender's
+        // current state, and a stage carries its information and a recreation its stamp, so this is a member whose own check was bypassed.
+        // Refused, counted and warned of, and the rest of the page goes on.
+        if self.refuse_a_reserved_name_of_no_swap(
+            &state.db,
+            &state.name,
+            state.stage.is_some(),
+            "a snapshot page's definition",
+        ) {
+            return Ok(0);
+        }
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
         self.witness_covered_hlc(state.created, versions);

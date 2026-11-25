@@ -2618,6 +2618,19 @@ impl Engine {
                     return Ok(DdlOutcome::Applied);
                 }
 
+                // A name the swap reserves (ADR-272) is made by the swap alone: a stage's creation carries the stage's information and a
+                // recreation's name carries the stamp of its event, and a client cannot make either. One that arrives with neither is from
+                // a member whose own check was bypassed, and would stand as a hidden collection the register knows nothing of (a backup
+                // refuses it as damaged). Refused where it arrives, loudly, and what follows it in the window goes on.
+                if self.refuse_a_reserved_name_of_no_swap(
+                    &target.db,
+                    &target.name,
+                    target.stage.is_some(),
+                    "a replicated creation",
+                ) {
+                    return Ok(DdlOutcome::Refused);
+                }
+
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
                 // the drop would recreate the collection on rejoining. A tie on

@@ -188,6 +188,9 @@ pub struct StorageReadings {
     /// Standing lives the register buried, by the route that buried them (`Engine::register_life_burials`): the series
     /// `kimmy_register_life_burials_total{by}`. A monotonic count; expected 0.
     pub register_life_burials: Vec<(&'static str, u64)>,
+    /// Creations under a reserved name with nothing to make it the swap's that this member refused (`Engine::sync_reserved_names_refused`):
+    /// the series `kimmy_sync_reserved_names_refused_total`. A monotonic count; expected 0.
+    pub sync_reserved_names_refused: u64,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -675,6 +678,8 @@ pub struct MetricsSnapshot {
     /// Standing lives the register buried, in the order of `kimmy_storage::LIFE_BURIAL_LABELS`: the series
     /// `kimmy_register_life_burials_total{by}` (lost and reported).
     pub register_life_burials: [u64; kimmy_storage::LIFE_BURIAL_LABELS.len()],
+    /// `kimmy_sync_reserved_names_refused_total`: creations under a reserved name of no swap that were refused.
+    pub sync_reserved_names_refused: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1737,6 +1742,7 @@ impl Metrics {
                 &kimmy_storage::LIFE_BURIAL_LABELS,
                 &readings.register_life_burials,
             ),
+            sync_reserved_names_refused: readings.sync_reserved_names_refused,
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -2231,6 +2237,9 @@ impl Metrics {
              # HELP kimmy_register_life_burials_total Standing lives the register buried, by the route that buried them (ADR-272 decision 6). A member that dropped a name, or met its drop, before it knew of a swap may make the name again; when the swap's stage, created below that drop, reaches it, the drop is the swap's, as it is on every member that knew of the swap first, and the life it made is buried with its documents. The route `seed` is the member meeting the stage after the drop (the drop it holds as a tombstone becomes a logical drop of the name over the life); the route `drop` is the member holding the stage first and meeting the drop after the life was made. Both are the loss the ADR names, lost and reported: the count and the warning that carries the drop's stamp and the life's creation are the report. A life made after a database's drop is never buried this way. Expected to read 0 on a cluster whose members all know of a swap before a client makes its name again; a value that rises names a name made again by a member the swap had not reached. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_register_life_burials_total counter\n\
              {register_life_burial_lines}\
+             # HELP kimmy_sync_reserved_names_refused_total Creations of a collection that this member refused because the name is one the atomic `$out` swap reserves and nothing makes it the swap's: a name that carries `.__stg.` and a creation with no stage's information, or one that carries `.__rc.` and no parseable recreation stamp. A client cannot make either name, so one that arrives, in a replicated entry or in a snapshot page's definition, is from a member whose own check was bypassed; it would stand as a hidden collection the register knows nothing of. It is refused where it arrives, with a warning that names the collection and where it came from, and what follows it in the window or the page goes on. Expected to read 0. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_sync_reserved_names_refused_total counter\n\
+             kimmy_sync_reserved_names_refused_total {sync_reserved_names_refused}\n\
              # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_documents_skipped_total counter\n\
              {snapshot_skip_lines}\
@@ -2489,6 +2498,7 @@ impl Metrics {
             register_resolve_fallback = readings.register_resolve_fallbacks,
             snapshot_join_restart = readings.snapshot_join_restarts,
             snapshot_listed_stage_left = readings.snapshot_listed_stages_left,
+            sync_reserved_names_refused = readings.sync_reserved_names_refused,
             register_life_burial_lines = kimmy_storage::LIFE_BURIAL_LABELS
                 .iter()
                 .map(|by| {
@@ -3597,6 +3607,7 @@ mod tests {
             snapshot_join_restarts: 8_262,
             snapshot_listed_stages_left: 8_263,
             register_life_burials: vec![("seed", 8_264), ("drop", 8_265)],
+            sync_reserved_names_refused: 8_266,
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4444,6 +4455,9 @@ kimmy_snapshot_listed_stages_left_total 8263
 # TYPE kimmy_register_life_burials_total counter
 kimmy_register_life_burials_total{by=\"seed\"} 8264
 kimmy_register_life_burials_total{by=\"drop\"} 8265
+# HELP kimmy_sync_reserved_names_refused_total Creations of a collection that this member refused because the name is one the atomic `$out` swap reserves and nothing makes it the swap's: a name that carries `.__stg.` and a creation with no stage's information, or one that carries `.__rc.` and no parseable recreation stamp. A client cannot make either name, so one that arrives, in a replicated entry or in a snapshot page's definition, is from a member whose own check was bypassed; it would stand as a hidden collection the register knows nothing of. It is refused where it arrives, with a warning that names the collection and where it came from, and what follows it in the window or the page goes on. Expected to read 0. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_sync_reserved_names_refused_total counter
+kimmy_sync_reserved_names_refused_total 8266
 # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_snapshot_documents_skipped_total counter
 kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
@@ -4968,6 +4982,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 s.register_life_burials[slot]
             ));
         }
+        expect(&format!(
+            "kimmy_sync_reserved_names_refused_total {}\n",
+            s.sync_reserved_names_refused
+        ));
         for (slot, label) in kimmy_storage::SNAPSHOT_SKIP_LABELS.iter().enumerate() {
             expect(&format!(
                 "kimmy_snapshot_documents_skipped_total{{within_grant=\"{label}\"}} {}\n",
@@ -5531,6 +5549,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             + 2
             // Since ADR-272 (decision 6), the two `by` samples of `kimmy_register_life_burials_total`.
             + kimmy_storage::LIFE_BURIAL_LABELS.len()
+            // Since ADR-272, the scalar `kimmy_sync_reserved_names_refused_total`.
+            + 1
             // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
             + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()
             // Since ADR-272 (Q6.6, C2d), the gauge `kimmy_snapshot_register_carry_bytes`.
@@ -5881,6 +5901,19 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         let readings = StorageReadings { register_resolve_fallbacks: 4, ..Default::default() };
         assert!(m.render_with(&readings).contains("kimmy_register_resolve_fallback_total 4\n"));
         assert_eq!(m.snapshot_with(&readings).register_resolve_fallback, 4);
+    }
+
+    /// ADR-272: a refused creation under a reserved name renders as a plain counter, present at 0, and reaches the snapshot the OTLP bridge
+    /// reads.
+    #[test]
+    fn reserved_name_refusals_are_a_plain_counter_present_at_zero() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(empty.contains("# TYPE kimmy_sync_reserved_names_refused_total counter\n"));
+        assert!(empty.contains("kimmy_sync_reserved_names_refused_total 0\n"));
+        let readings = StorageReadings { sync_reserved_names_refused: 3, ..Default::default() };
+        assert!(m.render_with(&readings).contains("kimmy_sync_reserved_names_refused_total 3\n"));
+        assert_eq!(m.snapshot_with(&readings).sync_reserved_names_refused, 3);
     }
 
     /// ADR-272 (decision 6): a standing life the register buried renders as a counter per route, each present at 0, and reaches the

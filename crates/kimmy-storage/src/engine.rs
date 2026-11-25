@@ -241,6 +241,9 @@ pub struct Engine {
     /// Stages a join's last page listed as not alive that this member left standing or held none of, and did not restart for
     /// (`kimmy_snapshot_listed_stages_left_total`).
     pub(crate) snapshot_listed_stages_left: std::sync::atomic::AtomicU64,
+    /// Creations under a reserved name with nothing to make it the swap's that this member refused since start
+    /// (`kimmy_sync_reserved_names_refused_total`).
+    pub(crate) sync_reserved_names_refused: std::sync::atomic::AtomicU64,
     /// Standing lives the register buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
     /// (`kimmy_register_life_burials_total{by}`, ADR-272, decision 6).
     pub(crate) register_life_burials: [std::sync::atomic::AtomicU64; 2],
@@ -1888,6 +1891,7 @@ impl Engine {
             snapshot_join_restarts: std::sync::atomic::AtomicU64::new(0),
             snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
             register_life_burials: Default::default(),
+            sync_reserved_names_refused: std::sync::atomic::AtomicU64::new(0),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1981,7 +1985,30 @@ impl Engine {
     /// no recreation's stamp to make the name its own, and that this member refused (`kimmy_sync_reserved_names_refused_total`).
     /// Expected 0.
     pub fn sync_reserved_names_refused(&self) -> u64 {
-        0
+        self.sync_reserved_names_refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Refuse the creation of `name` in `db` if the name carries a mark the swap reserves and nothing that makes it the swap's (a stage
+    /// with no stage's information, a recreation with no stamp): counted and warned of, loudly, and the caller goes on with what is
+    /// behind it. `from` says where it arrived. Whether it was refused.
+    pub(crate) fn refuse_a_reserved_name_of_no_swap(
+        &self,
+        db: &str,
+        name: &str,
+        has_stage_info: bool,
+        from: &'static str,
+    ) -> bool {
+        let Some(why) = kimmy_core::reserved_name_without_its_marks(name, has_stage_info) else {
+            return false;
+        };
+        self.sync_reserved_names_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            db = %db,
+            collection = %name,
+            from,
+            "refused the creation of a collection under a name this build reserves for the atomic `$out` swap, which is not the swap's: {why}"
+        );
+        true
     }
 
     /// Standing lives the register has buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
