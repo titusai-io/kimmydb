@@ -873,17 +873,73 @@ fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() 
 fn a_post_drop_row_is_taken_only_for_a_name_that_reads_dropped() {
     let s = swap(&[]);
     let (j, _dj) = engine();
+    let patched = std::cell::Cell::new(false);
     let patch = |page: &mut crate::SnapshotPage| {
         let row = serde_json::to_vec(&crate::register::PostRow::default()).unwrap();
         let key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
         if let Some(carry) = &mut page.register {
             carry.posts.push((serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(row)));
+            patched.set(true);
         }
     };
     let (_, result) = pull_patched(&j, &s.sender, &patch);
     result.expect("the pull applies");
+    assert!(
+        patched.get(),
+        "premise: the last page carried the register and the patch pushed the row"
+    );
     let row = crate::register::post_row_for_tests(&j, DB, "orders").unwrap();
     assert!(row.is_none(), "a post-drop row beside a visible physical is not taken");
+}
+
+#[test]
+fn a_post_drop_row_is_taken_for_a_name_that_reads_dropped() {
+    // The page carries a logical drop above the binding and a post-drop row holding an index made
+    // after the drop (both at or below the grant): the name reads dropped on the receiver, so the
+    // row is taken. The burial of the stage writes a post-drop row of its own in the same
+    // transaction, so the row's CONTENT shows that the carried one was taken: the index the stage
+    // never held.
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let wall = s.bind.stamp.hlc.wall_ms;
+    let at = |ms: u64| Stamp::new(Hlc::new(wall + ms, 0), s.a.node_id(), s.a.epoch());
+    let (dropped, made) = (at(5), at(9));
+    let index = kimmy_core::IndexMeta {
+        id: kimmy_core::IndexMeta::derive_id("carried_ix"),
+        name: "carried_ix".into(),
+        fields: vec![kimmy_core::IndexField::ascending("t")],
+        unique: false,
+        enforcement: kimmy_core::Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: Some(made),
+    };
+    let carried = crate::register::PostRow { indexes: vec![index], ..Default::default() };
+    let patched = std::cell::Cell::new(false);
+    let patch = |page: &mut crate::SnapshotPage| {
+        page.versions.observe(made);
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&dropped, &kimmy_core::RegisterEvent::LogicalDrop));
+            let key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
+            let row = serde_json::to_vec(&carried).unwrap();
+            carry.posts.push((serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(row)));
+            patched.set(true);
+        }
+    };
+    let (progress, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    assert!(progress.is_complete(), "the pull completes");
+    assert!(
+        patched.get(),
+        "premise: the last page carried the register and the patch pushed the drop and the row"
+    );
+    assert!(j.resolve(DB, "orders").is_err(), "premise: the name reads dropped on the receiver");
+    let row = crate::register::post_row_for_tests(&j, DB, "orders").unwrap();
+    assert!(
+        row.is_some_and(|row| row.indexes.iter().any(|i| i.name == "carried_ix")),
+        "a post-drop row for a name that reads dropped is taken, with its index"
+    );
 }
 
 #[test]
