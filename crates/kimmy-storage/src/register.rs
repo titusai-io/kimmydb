@@ -971,7 +971,8 @@ pub(crate) enum SeedAsk {
 /// - **The identity standing** (a life created after the drop, or the remains the drop kept): judged by the stage's stamp alone, for a
 ///   stage's creation and for a binding: the stage created below the drop, the swap began below it and the life is the one the drop
 ///   hides on every member that knew of the swap. An event that names no stage never seeds on a standing identity. A life lost this way
-///   is a life a member made without knowing of the swap (lost and reported).
+///   is a life a member made without knowing of the swap (lost and reported): the seed notes it ([`note_seed_burial`]), and the
+///   transaction that commits it counts it and warns, with both stamps.
 /// - **The database guard.** The tombstone a database's drop leaves on a collection (its stamp is the database's drop) is not a drop of a
 ///   life made after it: such a life stands over the tombstone, the drop never ended it, and no stage met late makes it the swap's. It is
 ///   never seeded over. What the database's drop DID end and keep (the remains it re-dated, `created` its successor) is still the
@@ -1002,8 +1003,11 @@ pub(crate) fn seed_from_the_tombstone(
         None => None,
     };
     let began_below = stage_created.is_some_and(|created| created < dropped);
+    let remains_of_this_drop = standing
+        .as_ref()
+        .is_some_and(|meta| meta.is_redated() && meta.created == dropped.hlc.successor());
     let seeds = match &standing {
-        Some(meta) => {
+        Some(_) => {
             // the database guard: over the tombstone of a database's drop only the remains that very drop re-dated are its to bury
             let by_the_database = txn
                 .open_table(tables::COLLECTIONS_DROPPED)?
@@ -1011,7 +1015,6 @@ pub(crate) fn seed_from_the_tombstone(
                 .map(|held| crate::codec::decode_oplog_key(held.value()))
                 .transpose()?
                 .is_some_and(|database| database == dropped);
-            let remains_of_this_drop = meta.is_redated() && meta.created == dropped.hlc.successor();
             began_below && (remains_of_this_drop || !by_the_database)
         }
         None => match ask {
@@ -1022,8 +1025,52 @@ pub(crate) fn seed_from_the_tombstone(
     if !seeds {
         return Ok(false);
     }
-    Ok(store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?
-        == Put::Stored)
+    let wrote = store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?
+        == Put::Stored;
+    if let (true, Some(meta)) = (wrote, &standing) {
+        note_seed_burial(SeedBurial {
+            db: db.to_string(),
+            logical: logical.to_string(),
+            dropped,
+            life_created: meta.created,
+            remains_of_the_drop: remains_of_this_drop,
+        });
+    }
+    Ok(wrote)
+}
+
+/// A standing life a seed buried (ADR-272, decision 6): the drop it was buried by, and the life.
+pub(crate) struct SeedBurial {
+    pub(crate) db: String,
+    pub(crate) logical: String,
+    /// The tombstone's stamp, the drop the seed put in the register.
+    pub(crate) dropped: Stamp,
+    /// When the life that stood was created.
+    pub(crate) life_created: Hlc,
+    /// Whether the life was the remains that very drop re-dated (it kept writes stamped after the drop), and not a life made after it.
+    pub(crate) remains_of_the_drop: bool,
+}
+
+thread_local! {
+    /// The standing lives the seeds of this thread's open transaction have buried, until the transaction commits (and counts them) or ends
+    /// (and forgets them). The seed is a function of the register, which holds no engine, so what it buried is noted here and the
+    /// transaction that commits is the one that counts it, as it counts the swaps its passes saw.
+    static SEED_BURIALS: std::cell::RefCell<Vec<SeedBurial>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Note a standing life a seed buried, for the commit of the transaction that made the seed.
+fn note_seed_burial(burial: SeedBurial) {
+    SEED_BURIALS.with(|noted| noted.borrow_mut().push(burial));
+}
+
+/// What the seeds of this thread's transaction buried, taken by its commit. Nothing else takes them.
+pub(crate) fn take_seed_burials() -> Vec<SeedBurial> {
+    SEED_BURIALS.with(|noted| std::mem::take(&mut *noted.borrow_mut()))
+}
+
+/// Forget what a transaction that did not commit noted: every writer begins with none.
+pub(crate) fn forget_seed_burials() {
+    SEED_BURIALS.with(|noted| noted.borrow_mut().clear());
 }
 
 /// Whether the register owns the collection id `id`: a stage row is kept under it (a stage this member has the creation of, whether or

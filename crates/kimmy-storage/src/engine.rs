@@ -1138,6 +1138,8 @@ impl WriteTxn<'_> {
         let engine = self.engine;
         let coalesced = self.coalesced;
         let is_write = self.holder == WriterHolder::Write;
+        // The standing lives this transaction's seeds buried: counted and reported once the inner commit has landed, and by nothing else
+        let seed_burials = crate::register::take_seed_burials();
         // A burial by the register changes the catalogue from a window or a grant, which are not DDL transactions
         let changes_collections =
             self.holder == WriterHolder::Ddl || !self.burials.lock().is_empty();
@@ -1182,6 +1184,19 @@ impl WriteTxn<'_> {
             let swaps = std::mem::take(&mut *self.swaps.lock());
             if swaps > 0 {
                 engine.out_swaps.fetch_add(swaps, std::sync::atomic::Ordering::Relaxed);
+            }
+            // ... and the lives their seeds buried (lost and reported, ADR-272, decision 6), counted and warned of with both stamps
+            for burial in &seed_burials {
+                engine.register_seed_burials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    db = %burial.db,
+                    collection = %burial.logical,
+                    dropped = ?burial.dropped,
+                    life_created = ?burial.life_created,
+                    remains_of_the_drop = burial.remains_of_the_drop,
+                    "a stage of this name was created below a drop of it, and this member's life of the name is buried by the drop, as it is on \
+                     every member that knew of the swap"
+                );
             }
             // The inner commit landed: the loss entries this transaction minted are events this member has made.
             for (kind, minted) in self.loss_minted.lock().iter().enumerate() {
@@ -4636,6 +4651,8 @@ impl Engine {
                 .expect("no persistent savepoint was touched in a fresh transaction");
         }
         self.writer_hold.publish(holder);
+        // a writer begins with no seed burial noted: one a transaction that did not commit left is not this one's
+        crate::register::forget_seed_burials();
         Ok(WriteTxn {
             txn: Some(txn),
             engine: self,

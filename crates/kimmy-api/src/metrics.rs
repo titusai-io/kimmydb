@@ -185,6 +185,9 @@ pub struct StorageReadings {
     /// Stages a snapshot's last page listed as not alive that this member left standing and did not restart for
     /// (`Engine::snapshot_listed_stages_left`): the series `kimmy_snapshot_listed_stages_left_total`. A monotonic count; expected 0.
     pub snapshot_listed_stages_left: u64,
+    /// Standing lives a seed of the register buried (`Engine::register_seed_burials`): the series `kimmy_register_seed_burials_total`.
+    /// A monotonic count; expected 0.
+    pub register_seed_burials: u64,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -669,6 +672,8 @@ pub struct MetricsSnapshot {
     pub snapshot_join_restart: u64,
     /// `kimmy_snapshot_listed_stages_left_total`: listed stages a snapshot left standing and did not restart for.
     pub snapshot_listed_stage_left: u64,
+    /// `kimmy_register_seed_burials_total`: standing lives a seed of the register buried (lost and reported).
+    pub register_seed_burial: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1727,6 +1732,7 @@ impl Metrics {
             register_resolve_fallback: readings.register_resolve_fallbacks,
             snapshot_join_restart: readings.snapshot_join_restarts,
             snapshot_listed_stage_left: readings.snapshot_listed_stages_left,
+            register_seed_burial: readings.register_seed_burials,
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -2218,6 +2224,9 @@ impl Metrics {
              # HELP kimmy_snapshot_listed_stages_left_total Stages a snapshot's last page listed as not alive at the sender that this member left standing, or holds none of, and did not restart the snapshot for: no event above the grant says why the sender buried them (a plain drop of a hidden collection, or a stage that already restarted this snapshot), and this member's own tests do not bury them. The snapshot completes; the stage row is kept, with no collection and no tombstone. Expected to read 0. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_listed_stages_left_total counter\n\
              kimmy_snapshot_listed_stages_left_total {snapshot_listed_stage_left}\n\
+             # HELP kimmy_register_seed_burials_total Standing lives a seed of the register buried: this member made a life of a name, or held one, over a drop of the name, and then met a stage of the name that was created below the drop. The drop is the swap's, as it is on every member that knew of the swap before the drop reached it, so the life is buried and its documents with it (lost and reported, ADR-272 decision 6). A life a database's drop did not end is never buried this way. The warning that goes with each burial carries the drop's stamp and the life's creation. Expected to read 0 on a cluster whose members all know of a swap before a client makes its name again; a value that rises names a name that was made again by a member the swap had not reached. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_register_seed_burials_total counter\n\
+             kimmy_register_seed_burials_total {register_seed_burial}\n\
              # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_documents_skipped_total counter\n\
              {snapshot_skip_lines}\
@@ -2476,6 +2485,7 @@ impl Metrics {
             register_resolve_fallback = readings.register_resolve_fallbacks,
             snapshot_join_restart = readings.snapshot_join_restarts,
             snapshot_listed_stage_left = readings.snapshot_listed_stages_left,
+            register_seed_burial = readings.register_seed_burials,
             register_waiting_lines = if readings.register_waiting.is_empty() {
                 "kimmy_register_waiting_for_stage{origin=\"other\"} 0\n".to_string()
             } else {
@@ -3572,6 +3582,7 @@ mod tests {
             register_resolve_fallbacks: 8_261,
             snapshot_join_restarts: 8_262,
             snapshot_listed_stages_left: 8_263,
+            register_seed_burials: 8_264,
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4415,6 +4426,9 @@ kimmy_snapshot_join_restarts_total 8262
 # HELP kimmy_snapshot_listed_stages_left_total Stages a snapshot's last page listed as not alive at the sender that this member left standing, or holds none of, and did not restart the snapshot for: no event above the grant says why the sender buried them (a plain drop of a hidden collection, or a stage that already restarted this snapshot), and this member's own tests do not bury them. The snapshot completes; the stage row is kept, with no collection and no tombstone. Expected to read 0. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_snapshot_listed_stages_left_total counter
 kimmy_snapshot_listed_stages_left_total 8263
+# HELP kimmy_register_seed_burials_total Standing lives a seed of the register buried: this member made a life of a name, or held one, over a drop of the name, and then met a stage of the name that was created below the drop. The drop is the swap's, as it is on every member that knew of the swap before the drop reached it, so the life is buried and its documents with it (lost and reported, ADR-272 decision 6). A life a database's drop did not end is never buried this way. The warning that goes with each burial carries the drop's stamp and the life's creation. Expected to read 0 on a cluster whose members all know of a swap before a client makes its name again; a value that rises names a name that was made again by a member the swap had not reached. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_register_seed_burials_total counter
+kimmy_register_seed_burials_total 8264
 # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_snapshot_documents_skipped_total counter
 kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
@@ -5494,6 +5508,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // Since ADR-272 (Q6.6, unit E), the scalars `kimmy_snapshot_join_restarts_total` and
             // `kimmy_snapshot_listed_stages_left_total`.
             + 2
+            // Since ADR-272 (decision 6), the scalar `kimmy_register_seed_burials_total`.
+            + 1
             // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
             + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()
             // Since ADR-272 (Q6.6, C2d), the gauge `kimmy_snapshot_register_carry_bytes`.
@@ -5844,6 +5860,19 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         let readings = StorageReadings { register_resolve_fallbacks: 4, ..Default::default() };
         assert!(m.render_with(&readings).contains("kimmy_register_resolve_fallback_total 4\n"));
         assert_eq!(m.snapshot_with(&readings).register_resolve_fallback, 4);
+    }
+
+    /// ADR-272 (decision 6): a standing life a seed buried renders as a plain counter, present at 0, and reaches the snapshot the OTLP
+    /// bridge reads.
+    #[test]
+    fn the_seed_burials_are_a_plain_counter_present_at_zero() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(empty.contains("# TYPE kimmy_register_seed_burials_total counter\n"));
+        assert!(empty.contains("kimmy_register_seed_burials_total 0\n"));
+        let readings = StorageReadings { register_seed_burials: 2, ..Default::default() };
+        assert!(m.render_with(&readings).contains("kimmy_register_seed_burials_total 2\n"));
+        assert_eq!(m.snapshot_with(&readings).register_seed_burial, 2);
     }
 
     /// ADR-272 (Q6.6, unit E): a snapshot restarted from its first page, and a listed stage a snapshot left standing, render as plain

@@ -2460,6 +2460,14 @@ impl TelemetryGuard {
             "Stages a snapshot's last page listed as not alive at the sender that this member left standing and did not restart the snapshot for. 0 on a healthy member.",
             snapshot_listed_stage_left
         );
+        // Standing lives a seed of the register buried: lost and reported (ADR-272, decision 6).
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.seed_burials",
+            "{life}",
+            "Standing lives a seed of the register buried: a life of a name made over a drop of it, then a stage of the name created below the drop. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
+            register_seed_burial
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(
@@ -3500,6 +3508,15 @@ mod tests {
         assert!(
             call.ends_with("register_resolve_fallback"),
             "kimmy.register.resolve_fallback reads the stale-row count: {call}"
+        );
+    }
+
+    #[test]
+    fn the_seed_burial_counter_reads_its_own_field() {
+        let call = instrument_call("kimmy.register.seed_burials");
+        assert!(
+            call.ends_with("register_seed_burial"),
+            "kimmy.register.seed_burials reads the seed burial count: {call}"
         );
     }
 

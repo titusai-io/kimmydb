@@ -553,6 +553,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         register_resolve_fallbacks: 0,
         snapshot_join_restarts: 0,
         snapshot_listed_stages_left: 0,
+        register_seed_burials: 0,
         loss_records_refused: Vec::new(),
         conflicts_resolved: Vec::new(),
         out_swaps: 0,
