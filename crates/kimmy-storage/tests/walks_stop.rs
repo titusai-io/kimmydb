@@ -132,6 +132,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the four register tables of ONE member, read whole in the read transaction of a backup (`kimmyd backup`, which serves no client): one row per event of a swapped name and per stage the member has met, bounded by the member's own register (ADR-272; Q6.6, unit A)",
     ),
     (
+        "register::owned_ids",
+        "the register's stage rows and REGISTER, read whole in the read transaction of a whole-database snapshot page (once per page, as its other lists are): one row per stage and per event of a swapped name the member has met, bounded by the member's own register, which the carry measures too (ADR-272; Q6.6, unit C3)",
+    ),
+    (
         "register::raw_rows",
         "a register table of the temporary store a restore has just written, which no node has opened: one row per event and per stage of the backup, read inside the restore's own write transaction (ADR-272; Q6.6, unit A)",
     ),

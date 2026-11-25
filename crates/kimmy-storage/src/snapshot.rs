@@ -950,8 +950,18 @@ impl Engine {
         // scoped route names its one collection in `dropped` above. On every
         // page, so a drop that lands mid-transfer is carried (ADR-152's lesson,
         // ADR-162's application of it).
-        let dropped_collections =
-            if scope.is_none() { self.collections_dropped()? } else { Vec::new() };
+        // The register's ids are left out (ADR-272, decisions 4 and 6; Q6.6, unit C3): a bound-out identity's, a stage's and a recreation's
+        // burial is carried by the register's events, which a bare tombstone cannot say the meaning of (the receiver's own deferral,
+        // `defers_a_carried_burial_the_register_owns`, is the second line).
+        let dropped_collections = if scope.is_none() {
+            let owned = {
+                let txn = self.db().begin_read()?;
+                crate::register::owned_ids(&txn)?
+            };
+            self.collections_dropped()?.into_iter().filter(|(id, _)| !owned.contains(id)).collect()
+        } else {
+            Vec::new()
+        };
         // And the indexes it has dropped, on both routes (ADR-225): all of them for
         // the whole database, the one collection's for a repair.
         let dropped_indexes = self.indexes_dropped(scope)?;

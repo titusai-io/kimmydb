@@ -763,6 +763,50 @@ pub(crate) fn owns_id(txn: &redb::ReadTransaction, id: CollectionId) -> Result<b
     Ok(!(events.is_empty() && parked.is_empty()))
 }
 
+/// The collection ids the register owns, for the drops a sender carries on a whole-database page (ADR-272, decisions 4 and 6; Q6.6, unit
+/// C3): the id of every stage row (a stage whose creation this member has, alive or buried), the identity's id of every name that has a row
+/// in REGISTER (an event in effect, a binding or a drop: the burial of the identity is the register's to decide, and the events carry it),
+/// and the id of each recreation a `Create` event names, whose database is found through the name's stage rows. **Not** the identity of a name
+/// whose events are only parked (REGISTER_INFO): its drop, if it has one, is only in the tombstone, and leaving that out would leave a
+/// receiver holding the identity for good. A recreation of a name that has no stage row cannot be named here (its database is not in
+/// the row); the receiver's own deferral is the second line for it.
+pub(crate) fn owned_ids(
+    txn: &redb::ReadTransaction,
+) -> Result<std::collections::HashSet<CollectionId>> {
+    let mut owned = std::collections::HashSet::new();
+    let mut dbs: std::collections::HashMap<CollectionId, String> = Default::default();
+    let stages = txn.open_table(tables::REGISTER_STAGES)?;
+    for row in stages.iter()? {
+        let (key, _) = row?;
+        let key: [u8; 8] =
+            key.value().try_into().map_err(|_| corrupt("a stage row key is not eight bytes"))?;
+        let id = CollectionId(u64::from_be_bytes(key));
+        owned.insert(id);
+        if let Some(named) = named_in(&stages, id)?
+            && let Some(logical) = kimmy_core::swap::logical_of_stage(&named.physical)
+        {
+            dbs.insert(CollectionId::derive(&named.db, logical), named.db.clone());
+        }
+    }
+    let events = txn.open_table(tables::REGISTER)?;
+    for row in events.iter()? {
+        let (key, value) = row?;
+        let key = key.value();
+        if key.len() != ROW_KEY_LEN {
+            return Err(corrupt("a register row key is the wrong length"));
+        }
+        let logical = CollectionId(u64::from_be_bytes(key[..8].try_into().expect("8 bytes")));
+        owned.insert(logical);
+        let event = RegisterEvent::decode(value.value()).map_err(|e| corrupt(&e.to_string()))?;
+        if let RegisterEvent::Create { physical } = event
+            && let Some(db) = dbs.get(&logical)
+        {
+            owned.insert(CollectionId::derive(db, &physical));
+        }
+    }
+    Ok(owned)
+}
+
 /// Whether the name has a register event on this member, in effect or ahead of its position.
 pub(crate) fn has_events(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
