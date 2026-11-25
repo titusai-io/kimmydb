@@ -237,6 +237,8 @@ pub struct Engine {
     /// Stages a join's last page listed as not alive that this member left standing or held none of, and did not restart for
     /// (`kimmy_snapshot_listed_stages_left_total`).
     pub(crate) snapshot_listed_stages_left: std::sync::atomic::AtomicU64,
+    /// Standing lives a seed of the register buried since start (`kimmy_register_seed_burials_total`, ADR-272, decision 6).
+    pub(crate) register_seed_burials: std::sync::atomic::AtomicU64,
     /// A test's hook on the page reader of this member as a SENDER: called at the start of every `snapshot_page`, with the cursor the
     /// page is asked after, before anything of the page is read (Q6.6, unit E). Lets a test do to the sender what a client does
     /// between two pages of a join (bury a stage).
@@ -1860,6 +1862,7 @@ impl Engine {
             snapshot_restarted: Mutex::new(std::collections::HashMap::new()),
             snapshot_join_restarts: std::sync::atomic::AtomicU64::new(0),
             snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
+            register_seed_burials: std::sync::atomic::AtomicU64::new(0),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1947,6 +1950,13 @@ impl Engine {
     /// (`kimmy_register_resolve_fallback_total`). Expected 0.
     pub fn register_resolve_fallbacks(&self) -> u64 {
         self.register_resolve_fallbacks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Standing lives a seed of the register has buried since start (`kimmy_register_seed_burials_total`): a life this member made, or
+    /// held, over a drop of its name that a stage created below the drop turned out to be the swap's. Lost and reported (ADR-272,
+    /// decision 6); expected 0 on a cluster whose members all know of every swap before they re-create a name.
+    pub fn register_seed_burials(&self) -> u64 {
+        self.register_seed_burials.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.

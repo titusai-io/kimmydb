@@ -605,6 +605,7 @@ fn a_stage_created_below_a_database_drop_seeds_no_drop_over_a_life_made_after_th
     assert!(register_events(&m).is_empty(), "no drop was seeded for the stage's creation");
     assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
     assert_eq!(documents_kept(&m), 1, "with its document");
+    assert_eq!(m.register_seed_burials(), 0, "and no seed counts a burial: none was made");
 }
 
 #[test]
@@ -697,6 +698,11 @@ fn a_drop_that_kept_later_writes_is_seeded_by_the_stage_creation_alone() {
     me.sort();
     assert_eq!(ke, vec![drop.stamp], "premise: the member that knew holds the drop alone");
     assert_eq!(me, ke, "the same register events as the member that knew");
+    assert_eq!(
+        (k.register_seed_burials(), m.register_seed_burials()),
+        (0, 1),
+        "the seed that ended the remains the drop kept is counted; the member that knew buried them by the drop, which is no seed"
+    );
     assert!(absent(&k) && absent(&m), "the name is dropped on both");
     assert!(
         k.get_collection(DB, "orders").is_err() && m.get_collection(DB, "orders").is_err(),

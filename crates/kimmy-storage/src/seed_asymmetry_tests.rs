@@ -135,6 +135,9 @@ struct Ends {
     /// The member that made `orders` again (S in probe 1, T in probe 2).
     other_served: Result<String, String>,
     other_drops: Vec<Stamp>,
+    /// The standing lives the seed buried on each (`Engine::register_seed_burials`).
+    m_burials: u64,
+    other_burials: u64,
 }
 
 /// Probe 1: the drop, then a stage above it, then a life made after it.
@@ -172,6 +175,8 @@ fn drop_first_stage_above_then_a_create() -> Ends {
         m_drops: the_logical_drops_of_orders(&m),
         other_served: served_by(&s),
         other_drops: the_logical_drops_of_orders(&s),
+        m_burials: m.register_seed_burials(),
+        other_burials: s.register_seed_burials(),
         drop,
     }
 }
@@ -212,6 +217,8 @@ fn stage_below_then_a_drop_and_a_create() -> Ends {
         m_drops: the_logical_drops_of_orders(&m),
         other_served: served_by(&t),
         other_drops: the_logical_drops_of_orders(&t),
+        m_burials: m.register_seed_burials(),
+        other_burials: t.register_seed_burials(),
         drop,
     }
 }
@@ -223,6 +230,7 @@ fn a_stage_above_a_drop_does_not_hide_the_life_made_after_it_on_the_member_that_
     assert_eq!(e.other_served, Ok("orders".to_string()), "S serves it");
     assert!(e.m_drops.is_empty(), "no drop was seeded: the stage began above it");
     assert!(e.other_drops.is_empty(), "and S holds none");
+    assert_eq!((e.m_burials, e.other_burials), (0, 0), "and no life was buried by a seed");
 }
 
 #[test]
@@ -236,4 +244,19 @@ fn a_stage_below_a_drop_ends_the_life_made_after_it_on_every_member() {
     );
     assert_eq!(e.m_drops, vec![e.drop.stamp], "M holds the drop");
     assert_eq!(e.other_drops, vec![e.drop.stamp], "and T holds the same drop");
+}
+
+#[test]
+fn the_life_a_seed_buries_is_counted_on_the_member_that_made_it_and_only_there() {
+    let e = stage_below_then_a_drop_and_a_create();
+    assert!(
+        e.other_served.is_err(),
+        "premise: the seed buried the life T made: {:?}",
+        e.other_served
+    );
+    assert_eq!(e.other_burials, 1, "T counts the life its seed buried");
+    assert_eq!(
+        e.m_burials, 0,
+        "M's identity was absent when its seed was made: no life was buried"
+    );
 }
