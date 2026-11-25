@@ -489,3 +489,34 @@ fn three_members_that_met_a_drop_a_database_drop_and_a_new_life_agree_in_every_o
         }
     }
 }
+
+/// Whatever order the three members meet in, the disagreement of the test above is counted where it happens: a member that answers NOT FOUND
+/// has taken a creation its register hides, once, and a member that serves has taken none; and no life was buried, by a seed or by a drop.
+/// It asserts the counter, not agreement, so it holds in 0.62.
+#[test]
+fn in_every_order_each_member_that_answers_not_found_counts_one_hidden_creation() {
+    const ORDERS: [[usize; 2]; 2] = [[0, 1], [1, 0]];
+    for run in 0..8usize {
+        let pick = |member: usize| -> [usize; 2] {
+            let others: Vec<usize> = (0..3).filter(|o| *o != member).collect();
+            let order = ORDERS[(run >> member) & 1];
+            [others[order[0]], others[order[1]]]
+        };
+        let meets = [pick(0), pick(1), pick(2)];
+        let apart = three_members_who_have_not_met();
+        three_members_meet(&apart, meets);
+        for (member, m) in apart.members().into_iter().enumerate() {
+            let expected = u64::from(served_by(m).is_err());
+            assert_eq!(
+                m.register_hidden_creations(),
+                expected,
+                "member {member} counts one hidden creation when it answers NOT FOUND and none when it serves, meeting in {meets:?}"
+            );
+            assert_eq!(
+                (life_burials(m, "seed"), life_burials(m, "drop")),
+                (0, 0),
+                "member {member} buried no life, meeting in {meets:?}"
+            );
+        }
+    }
+}
