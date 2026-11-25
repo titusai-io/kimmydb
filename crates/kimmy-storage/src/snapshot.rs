@@ -409,7 +409,7 @@ impl From<CollectionMeta> for CollectionState {
             redated_from,
             incarnation_floor: meta.incarnation_floor,
             definition_floor: meta.definition_floor,
-            stage: None,
+            stage: meta.stage,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,
@@ -2862,6 +2862,28 @@ impl Engine {
         Ok(owned)
     }
 
+    /// The creation arm's judgement for a stage this page has just made (ADR-272, decision 6; Q6.6, unit C2a): the first thing the
+    /// register learns of a name may be this stage, with the name's drop already held here as the identity's tombstone, and then the
+    /// drop is a logical drop at its stamp, as it is when the creation arrives as an entry (review of items 6 and 6b, F1). The stamp
+    /// the seed asks of a standing identity is the stage's creation. A seed that put a drop in effect ends the remains of the identity
+    /// now, by the settle pass, in the same transaction.
+    fn judge_a_stage_a_page_made(&self, state: &CollectionState) -> Result<()> {
+        let Some(stage) = state.stage else { return Ok(()) };
+        let Some(logical) = kimmy_core::swap::logical_of_stage(&state.name) else { return Ok(()) };
+        let txn = self.begin_write(crate::WriterHolder::Ddl)?;
+        let seeded = crate::register::seed_from_the_tombstone(
+            &txn,
+            &state.db,
+            logical,
+            Some(stage.created),
+        )?;
+        if seeded {
+            Self::settle_register_in_txn(&txn, &state.db, logical, None)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Whether the burial of `current` that a snapshot carries is the register's to judge: `current` is a stage of a swap, or a
     /// name that was swapped (it has register events, in effect or ahead of their position, or a stage of it is held).
     fn carried_burial_is_the_registers(
@@ -3153,9 +3175,13 @@ impl Engine {
                 state.merge_policy,
                 state.join_retention_ms,
                 state.loss_limits,
-                None,
+                // a stage is made with its creation and its row in this one transaction, as the creation arm makes it
+                state.stage.map(|stage| crate::engine::StageArg {
+                    info: stage.info,
+                    created: Some(stage.created),
+                }),
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => self.judge_a_stage_a_page_made(state)?,
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
@@ -3198,6 +3224,20 @@ impl Engine {
                     held.loss_limits,
                     state.join_retention_ms,
                     state.loss_limits
+                ))));
+            }
+        }
+        // A stage has one creation. A held stage whose creation is not the page's is an inconsistent sender, refused by name as two
+        // join retentions for one creation are (Q6.6, unit C2a).
+        {
+            let held = self.get_collection(&state.db, &state.name)?;
+            if let (Some(own), Some(theirs)) = (held.stage, state.stage)
+                && own != theirs
+            {
+                return Err(crate::StorageError::Core(kimmy_core::Error::Unsupported(format!(
+                    "a stage cannot have two creations: {}.{} holds {own:?} and the page carries \
+                     {theirs:?}",
+                    state.db, state.name
                 ))));
             }
         }
