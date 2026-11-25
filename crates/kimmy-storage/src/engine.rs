@@ -6039,6 +6039,37 @@ impl Engine {
         Ok(())
     }
 
+    /// The settle pass for a name a snapshot's register carry put events in (Q6.6, unit C2b; D2). The pass is told what the carry stored:
+    /// the stamp of the visible event when the carry stored it (so the physical it makes visible is floored as a flip floors it), and the
+    /// stamp of the newest logical drop it stored otherwise (so a drop that takes effect below a stage a stale receiver already serves
+    /// floors what that stage holds). A join counts no swap: this member never served what the binding replaced, so what the pass counted
+    /// is put back; the burials it does here are counted.
+    pub(crate) fn settle_carried_in_txn(
+        txn: &WriteTxn<'_>,
+        db: &str,
+        logical: &str,
+        stored: &[Stamp],
+    ) -> Result<()> {
+        use kimmy_core::register_state::Ready;
+        let (timeline, mut ready) = Self::register_view_in_txn(txn, db, logical)?;
+        for (physical, _) in &Self::held_stages_in_txn(txn, db, logical)? {
+            ready.entry(physical.clone()).or_insert(Ready::Alive);
+        }
+        let visible = timeline.visible(|p| ready.get(p).copied().unwrap_or(Ready::Buried));
+        let visible_stored = visible.stamp().copied().filter(|stamp| stored.contains(stamp));
+        let newest_drop_stored = timeline
+            .events()
+            .iter()
+            .rev()
+            .find(|(stamp, event)| event.physical().is_none() && stored.contains(stamp))
+            .map(|(stamp, _)| *stamp);
+        let took_effect = visible_stored.or(newest_drop_stored);
+        let swaps = *txn.swaps.lock();
+        Self::settle_register_in_txn(txn, db, logical, took_effect)?;
+        *txn.swaps.lock() = swaps;
+        Ok(())
+    }
+
     /// The physical collection the logical name `name` resolves to on this member: the register's visible physical, or the
     /// identity (the collection of that name) when no event is in effect (ADR-272, decisions 5 and 7; Q6.4 item 0). The ONE door
     /// from a logical name to a collection that the API and the MCP use; [`Self::get_collection`] stays for physicals and for

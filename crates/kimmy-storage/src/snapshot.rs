@@ -1013,6 +1013,10 @@ impl Engine {
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
+        // The register rides the LAST page of a whole-database snapshot, read after `versions` (the order is what makes the carry safe: an
+        // event applied between the two reads has a stamp above `versions`, which the receiver drops) (Q6.6, unit C2b)
+        let register =
+            if scope.is_none() && next.is_none() { Some(self.register_carry()?) } else { None };
         Ok(SnapshotPage {
             collections,
             documents,
@@ -1023,7 +1027,27 @@ impl Engine {
             deleted_documents,
             dropped_indexes,
             tombstone_horizon,
-            register: None,
+            register,
+        })
+    }
+
+    /// The sender's register as the last page carries it: the events in effect, every stage row and the post-drop rows, raw, in one read
+    /// transaction. Never the events ahead of their position.
+    fn register_carry(&self) -> Result<RegisterCarry> {
+        use crate::register::Carried;
+        let txn = self.db().begin_read()?;
+        let rows = |which: Carried| -> Result<Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>> {
+            Ok(crate::register::carried_rows(&txn, which)?
+                .into_iter()
+                .map(|(key, value)| {
+                    (serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(value))
+                })
+                .collect())
+        };
+        Ok(RegisterCarry {
+            events: rows(Carried::Register)?,
+            stages: rows(Carried::Stages)?,
+            posts: rows(Carried::Post)?,
         })
     }
 
@@ -1571,6 +1595,14 @@ impl Engine {
         self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
         let mut withheld: Vec<Stamp> = Vec::new();
+        // What a stage's creation arm may seed against: on a whole-database pull, the grant (the
+        // first page's vector, which is this page's own on the first page); none on a collection's
+        // own pull
+        let seed_grant = match (progress.scope, progress.pages) {
+            (Some(_), _) => None,
+            (None, 0) => Some(page.versions.clone()),
+            (None, _) => progress.granted.clone(),
+        };
         for state in &page.collections {
             // The sender's tombstone for this id, which a whole page carries
             // (ADR-162): the burial of a life the arriving one followed is named
@@ -1582,7 +1614,7 @@ impl Engine {
                     page.dropped_collections.iter().find(|(c, _)| *c == id).map(|(_, s)| *s)
                 }
             };
-            match self.restore_collection(state, &page.versions, carried) {
+            match self.restore_collection(state, &page.versions, carried, seed_grant.as_ref()) {
                 Ok(refused) => {
                     ddl_refused += refused;
                     if progress.scope.is_none() {
@@ -1739,8 +1771,20 @@ impl Engine {
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
             let mut wrote = !pending.is_empty() || recorded > 0 || state_moved > 0;
+            // The register the last page carries, put in effect BEFORE the grant is absorbed and settled AFTER it, in this one
+            // transaction (ADR-272, decision 4; Q6.6, unit C2b): the grant releases the parked events of this member it covers, and the
+            // pass then sees every event of the name. A damaged carry fails the page: nothing is applied and the progress does not move.
+            let mut carried = Vec::new();
+            if let (Some(carry), Some(granted)) = (&page.register, &grant) {
+                let applied = crate::register::apply_carried(&txn, carry, granted)?;
+                wrote |= applied.wrote;
+                carried = applied.names;
+            }
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
+                for name in &carried {
+                    Engine::settle_carried_in_txn(&txn, &name.db, &name.logical, &name.stored)?;
+                }
                 // And the sender's forgetting with it: a member that was behind forgets
                 // what the sender has forgotten, and serves on with that horizon.
                 if let Some(sender) = page.tombstone_horizon {
@@ -2887,10 +2931,24 @@ impl Engine {
     /// register learns of a name may be this stage, with the name's drop already held here as the identity's tombstone, and then the
     /// drop is a logical drop at its stamp, as it is when the creation arrives as an entry (review of items 6 and 6b, F1). The stamp
     /// the seed asks of a standing identity is the stage's creation. A seed that put a drop in effect ends the remains of the identity
-    /// now, by the settle pass, in the same transaction.
-    fn judge_a_stage_a_page_made(&self, state: &CollectionState) -> Result<()> {
+    /// now, by the settle pass, in the same transaction. On a whole-database pull a tombstone at or
+    /// below the grant is the sender's to have judged (it holds the drop in its register if the
+    /// swap began below it, and the last page carries it), so it is not seeded here: that would put
+    /// in this register a drop the sender's does not hold (Q6.6, unit C2b; D1).
+    fn judge_a_stage_a_page_made(
+        &self,
+        state: &CollectionState,
+        granted: Option<&VersionVector>,
+    ) -> Result<()> {
         let Some(stage) = state.stage else { return Ok(()) };
         let Some(logical) = kimmy_core::swap::logical_of_stage(&state.name) else { return Ok(()) };
+        if let Some(granted) = granted
+            && let Some(dropped) =
+                self.collection_dropped_at(CollectionId::derive(&state.db, logical))?
+            && dropped.hlc <= granted.get(dropped.origin())
+        {
+            return Ok(());
+        }
         let txn = self.begin_write(crate::WriterHolder::Ddl)?;
         let seeded = crate::register::seed_from_the_tombstone(
             &txn,
@@ -3097,6 +3155,7 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
         carried: Option<Stamp>,
+        granted: Option<&VersionVector>,
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
@@ -3202,7 +3261,7 @@ impl Engine {
                     created: Some(stage.created),
                 }),
             ) {
-                Ok(Some(_)) => self.judge_a_stage_a_page_made(state)?,
+                Ok(Some(_)) => self.judge_a_stage_a_page_made(state, granted)?,
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
@@ -9159,7 +9218,7 @@ mod tests {
 
                 let definitions = |b: &Engine| {
                     for state in &page.collections {
-                        b.restore_collection(state, &page.versions, None).unwrap();
+                        b.restore_collection(state, &page.versions, None, None).unwrap();
                     }
                 };
                 if drops_first {

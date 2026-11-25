@@ -807,6 +807,214 @@ pub(crate) fn owned_ids(
     Ok(owned)
 }
 
+/// What a snapshot's register carry did (Q6.6, unit C2b): the names it touched, and whether it wrote
+/// anything at all. A page this member already holds writes nothing, and the page's transaction
+/// then commits nothing.
+pub(crate) struct CarryApplied {
+    pub(crate) names: Vec<CarriedName>,
+    pub(crate) wrote: bool,
+}
+
+/// An event of a carry, held to the grant: its stamp, the decoded event, and the raw row it came in (key and value).
+type CarriedEvent<'a> = (Stamp, RegisterEvent, &'a [u8], &'a [u8]);
+
+/// What a snapshot's register carry did for one name it could name (Q6.6, unit C2b): the names, and the stamps of the events it put in
+/// effect, which the settle pass is told.
+pub(crate) struct CarriedName {
+    pub(crate) db: String,
+    pub(crate) logical: String,
+    pub(crate) stored: Vec<Stamp>,
+}
+
+/// The names and the key of a stage row as a page carries it: the same shape check a restore makes, so a damaged carry is refused by name.
+fn stage_row_names(
+    key: &[u8],
+    value: &[u8],
+) -> std::result::Result<(String, String), &'static str> {
+    if key.len() != 8 || value.len() < STAGE_ROW_FIXED + 2 {
+        return Err("a stage row of the wrong shape");
+    }
+    let db_len = u16::from_be_bytes([value[STAGE_ROW_FIXED], value[STAGE_ROW_FIXED + 1]]) as usize;
+    if value.len() < STAGE_ROW_FIXED + 2 + db_len {
+        return Err("a stage row of the wrong shape");
+    }
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| "a stage row with a name that is not text")
+    };
+    let db = text(&value[STAGE_ROW_FIXED + 2..STAGE_ROW_FIXED + 2 + db_len])?;
+    let physical = text(&value[STAGE_ROW_FIXED + 2 + db_len..])?;
+    if CollectionId::derive(&db, &physical).0.to_be_bytes().as_slice() != key {
+        return Err("a stage row whose names derive another key than its own");
+    }
+    Ok((db, physical))
+}
+
+/// Seed the name's drop from the receiver's own tombstone for the identity, but only when that tombstone is ABOVE the grant for its
+/// origin (Q6.6, unit C2b; D1): one the sender could not have judged. A tombstone at or below the grant is the sender's to have used, and
+/// seeding from it would put in this register a drop the sender's register does not hold.
+fn seed_above_the_grant(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    granted: &kimmy_core::VersionVector,
+) -> Result<bool> {
+    let id = CollectionId::derive(db, logical);
+    let own = {
+        let table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        match table.get(id.0)? {
+            Some(raw) => Some(crate::codec::decode_oplog_key(raw.value())?),
+            None => None,
+        }
+    };
+    match own {
+        Some(stamp) if stamp.hlc > granted.get(stamp.origin()) => {
+            seed_from_the_tombstone(txn, db, logical, None)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Put what a snapshot's last page carries of the sender's register into effect, in the last page's transaction (ADR-272, decisions 4
+/// and 6; Q6.6, unit C2b). The stage rows first (the door judges every binding by them); then, for each name, the events through the
+/// one door with no seed of their own (one seed per name, before them, from the receiver's own tombstone, and only above the grant: D1),
+/// a timeline built once per name; then the post-drop rows, only for a name that reads dropped (D3). Every event and every definition of a
+/// post-drop row is held to the grant the page's first vector gave: above it, it is dropped and arrives by windows. A binding the door
+/// refuses (an unknown stage, one above its deadline) is a damaged page and fails it. A name the receiver cannot name (no stage row) has its
+/// rows stored by id and nothing else. The caller absorbs the grant and settles the returned names.
+pub(crate) fn apply_carried(
+    txn: &redb::WriteTransaction,
+    carry: &crate::snapshot::RegisterCarry,
+    granted: &kimmy_core::VersionVector,
+) -> Result<CarryApplied> {
+    let damaged = |what: &str| {
+        StorageError::Corrupt(format!("a snapshot page's register is damaged: {what}"))
+    };
+    let mut wrote = false;
+    let mut fresh: std::collections::BTreeSet<u64> = Default::default();
+    let mut names: std::collections::BTreeMap<u64, (String, String)> = Default::default();
+    {
+        let mut stages = txn.open_table(tables::REGISTER_STAGES)?;
+        for (key, value) in &carry.stages {
+            let (db, physical) = stage_row_names(key, value).map_err(damaged)?;
+            let held = stages.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+            if held.is_none() {
+                stages.insert(key.as_slice(), value.as_slice())?;
+                wrote = true;
+            }
+            if let Some(logical) = kimmy_core::swap::logical_of_stage(&physical) {
+                let id = CollectionId::derive(&db, logical).0;
+                if held.is_none() {
+                    fresh.insert(id);
+                }
+                names.insert(id, (db, logical.to_string()));
+            }
+        }
+    }
+    let mut events: std::collections::BTreeMap<u64, Vec<CarriedEvent<'_>>> = Default::default();
+    for (key, value) in &carry.events {
+        if key.len() != ROW_KEY_LEN {
+            return Err(damaged("a register row key of the wrong length"));
+        }
+        let id = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+        let stamp = crate::codec::decode_oplog_key(&key[8..])?;
+        let event = RegisterEvent::decode(value).map_err(|e| damaged(&e.to_string()))?;
+        // above the grant: not taken, it arrives by windows; the sender is not trusted to filter
+        if stamp.hlc > granted.get(stamp.origin()) {
+            continue;
+        }
+        events.entry(id).or_default().push((stamp, event, key.as_slice(), value.as_slice()));
+    }
+    let mut named = Vec::new();
+    for (id, mut group) in events {
+        group.sort_by_key(|(stamp, ..)| *stamp);
+        let Some((db, logical)) = names.get(&id) else {
+            let mut table = txn.open_table(tables::REGISTER)?;
+            for (_, _, key, value) in &group {
+                if table.insert(*key, *value)?.is_none_or(|old| old.value() != *value) {
+                    wrote = true;
+                }
+            }
+            continue;
+        };
+        let seeded = seed_above_the_grant(txn, db, logical, granted)?;
+        wrote |= seeded;
+        let mut timeline = timeline_of(txn, tables::REGISTER, db, logical)?;
+        let mut stored = Vec::new();
+        let mut table = txn.open_table(tables::REGISTER)?;
+        for (stamp, event, key, value) in &group {
+            let stage = stage_of(txn, db, event)?;
+            let stage = stage.as_ref().map(|s| (&s.created, &s.info));
+            match timeline.insert(*stamp, event.clone(), stage) {
+                Put::Stored => {
+                    table.insert(*key, *value)?;
+                    stored.push(*stamp);
+                    wrote = true;
+                }
+                Put::Duplicate => {}
+                Put::UnknownStage => {
+                    let what = format!("a binding of a stage with no row: {event:?}");
+                    return Err(damaged(&what));
+                }
+                Put::InvalidBinding => {
+                    let what = format!("a binding above its stage's deadline: {event:?}");
+                    return Err(damaged(&what));
+                }
+            }
+        }
+        drop(table);
+        // a name the carry changed nothing of needs no pass: a page this member holds commits nothing
+        if seeded || !stored.is_empty() || fresh.contains(&id) {
+            named.push(CarriedName { db: db.clone(), logical: logical.clone(), stored });
+        }
+    }
+    for (key, value) in &carry.posts {
+        if key.len() != 8 {
+            return Err(damaged("a post-drop row key of the wrong length"));
+        }
+        let id = CollectionId(u64::from_be_bytes(key[..8].try_into().expect("8 bytes")));
+        // only for a name that reads dropped: its newest event in effect is a logical drop, which is always applicable
+        let held_events = rows_in(&txn.open_table(tables::REGISTER)?, id)?;
+        let Some((drop_at, RegisterEvent::LogicalDrop)) = held_events.last().cloned() else {
+            continue;
+        };
+        let mut row: PostRow = serde_json::from_slice(value)
+            .map_err(|_| damaged("a post-drop row that does not decode"))?;
+        row.indexes.retain(|i| i.created.is_none_or(|c| c.hlc <= granted.get(c.origin())));
+        row.tombstones.retain(|(_, s)| s.hlc <= granted.get(s.origin()));
+        if row.validator_changed.is_some_and(|c| c.hlc > granted.get(c.origin())) {
+            row.validator = None;
+            row.validator_changed = None;
+        }
+        let mut table = txn.open_table(tables::REGISTER_POST)?;
+        let held = table.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+        let before = held.clone();
+        let merged = match held {
+            Some(held) => {
+                let mut held: PostRow = serde_json::from_slice(&held)?;
+                let floor = Some(drop_at.hlc);
+                held.merge(
+                    &row.indexes,
+                    &row.tombstones,
+                    row.validator_changed.map(|changed| (&row.validator, changed)),
+                    floor,
+                );
+                held.definition_floor =
+                    [held.definition_floor, row.definition_floor].into_iter().flatten().max();
+                held
+            }
+            None => row,
+        };
+        let bytes = serde_json::to_vec(&merged)?;
+        if before.as_deref() != Some(bytes.as_slice()) {
+            table.insert(key.as_slice(), bytes.as_slice())?;
+            wrote = true;
+        }
+    }
+    Ok(CarryApplied { names: named, wrote })
+}
+
 /// Whether the name has a register event on this member, in effect or ahead of its position.
 pub(crate) fn has_events(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
