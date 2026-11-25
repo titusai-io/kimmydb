@@ -1760,3 +1760,67 @@ fn a_stage_creation_delivered_by_a_window_leaves_the_name_with_no_row() {
     );
     assert_eq!(the_row(&m), None, "a name with no event has no row, whatever ran the pass");
 }
+
+// -- The resolve row, R2: the newest logical drop in effect is read from the row (rule 4) ------------------------------------------------
+
+/// A member that swapped, dropped the name and made it again: a recreation holds the name, and the row says what the newest drop was.
+fn a_swapped_name_dropped_and_made_again() -> (Swap, Stamp, crate::meta::CollectionMeta) {
+    let s = swap(&[]);
+    assert!(
+        s.sender.drop_collection(DB, "orders").unwrap(),
+        "premise: the swapped name is dropped"
+    );
+    s.sender.create_collection(DB, "orders").unwrap();
+    let served = served_by(&s.sender).unwrap();
+    assert!(kimmy_core::is_recreation_name(&served), "premise: a recreation holds the name");
+    let drop = the_row(&s.sender)
+        .and_then(|row| row.newest_drop)
+        .expect("premise: the row holds the newest logical drop in effect");
+    let standing = s.sender.get_collection(DB, &served).unwrap();
+    (s, drop, standing)
+}
+
+#[test]
+fn rule_four_reads_the_newest_drop_from_the_row_and_no_register_row() {
+    let (s, drop, standing) = a_swapped_name_dropped_and_made_again();
+    let above = Stamp::new(drop.hlc.successor(), drop.node, drop.epoch);
+    let at = Stamp::new(drop.hlc, drop.node, drop.epoch);
+    let before = crate::register::rows_read_for_tests();
+    assert!(
+        !s.sender.definition_of_an_ended_life(&standing, above).unwrap(),
+        "a definition above the drop belongs to the present life"
+    );
+    assert!(
+        s.sender.definition_of_an_ended_life(&standing, at).unwrap(),
+        "one at the drop is the drop's: a tie goes to the drop"
+    );
+    assert_eq!(
+        crate::register::rows_read_for_tests(),
+        before,
+        "and the row answered: no event of the name was read"
+    );
+    assert_eq!(s.sender.register_resolve_fallbacks(), 0, "nothing fell back");
+}
+
+#[test]
+fn rule_four_with_a_stale_row_is_computed_and_counted() {
+    let s = swap(&[]);
+    let stage = s.sender.get_collection(DB, STAGE1).unwrap();
+    assert!(the_row(&s.sender).is_some(), "premise: the name has its row, with no drop in it");
+    let stamp = Stamp::new(Hlc::new(s.bind.stamp.hlc.wall_ms + 5, 0), s.a.node_id(), s.a.epoch());
+    let txn = s.sender.begin_write(crate::WriterHolder::Ddl).unwrap();
+    let put =
+        crate::register::put(&txn, DB, "orders", stamp, kimmy_core::RegisterEvent::LogicalDrop);
+    assert_eq!(put.unwrap(), kimmy_core::register_state::Put::Stored, "premise: it is stored");
+    txn.commit().unwrap();
+    assert_eq!(
+        the_row(&s.sender).and_then(|row| row.newest_drop),
+        None,
+        "premise: no pass ran, so the row knows of no drop"
+    );
+    assert!(
+        s.sender.definition_of_an_ended_life(&stage, stamp).unwrap(),
+        "a definition at the drop that is stored is the drop's, whatever the stale row says"
+    );
+    assert_eq!(s.sender.register_resolve_fallbacks(), 1, "and the stale row is counted");
+}

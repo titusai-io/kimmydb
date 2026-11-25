@@ -259,6 +259,48 @@ fn a_swap_whose_binding_retention_has_collected_resolves_to_the_stage_after_a_re
 }
 
 #[test]
+fn a_restore_rebuilds_the_names_row_as_the_source_member_held_it() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let source = crate::register::visible_row_for_tests(&m, DB, "orders").expect("the row reads");
+    assert!(source.is_some(), "premise: the source member's pass wrote the name's row");
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        crate::register::visible_row_for_tests(&r, DB, "orders").expect("the row reads"),
+        source,
+        "the restore wrote the row from what it computed, and it is the source's"
+    );
+    assert_eq!(r.register_resolve_fallbacks(), 0, "premise: nothing has fallen back yet");
+    assert_eq!(resolves(&r), Ok(BOUND.to_string()), "the restored member answers from the row");
+    assert_eq!(r.register_resolve_fallbacks(), 0, "and it did not fall back to compute it");
+}
+
+#[test]
+fn a_restore_of_a_name_with_only_a_stage_row_and_no_event_writes_no_row() {
+    // `check_restored` names every nameable name (the stage rows name it) and writes the row from what it computes; a name with no event
+    // has nothing to cache, so the writer keeps no row for it, whichever route asks
+    let w = world();
+    let (m, _d) = member(&w);
+    {
+        let txn = m.db().begin_read().expect("a read");
+        let stage = crate::register::stage_row_named_read(&txn, CollectionId::derive(DB, BOUND));
+        let row = stage.expect("the row reads");
+        assert!(row.is_some(), "premise: the register holds the stage's row");
+    }
+    assert_eq!(in_effect(&m), 0, "premise: the name has no event in effect");
+    assert_eq!(parked(&m), 0, "premise: and none ahead of its position");
+    let (r, _dr) = restored(&backup_of(&m));
+    assert_eq!(
+        crate::register::visible_row_for_tests(&r, DB, "orders").expect("the row reads"),
+        None,
+        "the restore wrote no row for a name with no event"
+    );
+    assert_eq!(resolves(&r), Ok("orders".to_string()), "and the name answers as the identity does");
+    assert_eq!(r.register_resolve_fallbacks(), 0, "with no fallback: there was no row to be stale");
+}
+
+#[test]
 fn a_dropped_swapped_name_reads_absent_after_a_restore_with_the_same_events_and_recreates_as_a_recreation()
  {
     let w = world();
