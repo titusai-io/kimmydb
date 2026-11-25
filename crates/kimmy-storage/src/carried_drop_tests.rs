@@ -2834,3 +2834,155 @@ fn an_event_exactly_at_the_grant_is_not_above_it() {
         "an event at the grant is covered by it: no restart"
     );
 }
+
+// -- Unit E, pinned: a seed the restart keeps, which the sender never made ----------------------------------------------------------------
+//
+// Page one of the first pass makes a stage of `orders` and seeds the name's logical drop from this member's own identity tombstone, which
+// is above the first grant (`judge_a_stage_a_page_made`). The restart does not undo that seed: it is this member's own judgement, it may
+// have buried what it concerned already, and nothing removes a register row. Before the second pass the sender takes that same drop as an
+// ORDINARY one (the stage of the name was created above it, and no event of the name is in effect there), so the sender holds no event of
+// the name and this member holds the logical drop. Today's truth, pinned: the two read the name absent, and the registers end EQUAL once
+// the next event of the name reaches both, because the sender seeds the drop from its own tombstone when it judges that event.
+//
+// The restart itself is caused by another name's swap (`items`), made by the sender's page reader between the first two pages, as in the
+// tests above, so that the name under test has no event on the sender when the second pass starts.
+
+const SEEDED_STAGE: &str = "orders.__stg.g1";
+const ITEMS_STAGES: [&str; 2] = ["items.__stg.v1", "items.__stg.v2"];
+
+fn bind_of_name(by: &Engine, name: &str, physical: &str, wall_ms: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::BindCollection,
+        collection: CollectionId::derive(DB, name),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&CollectionBind {
+                db: DB.into(),
+                name: name.into(),
+                physical: physical.into(),
+            })
+            .unwrap(),
+        ),
+        meta: None,
+    }
+}
+
+#[test]
+fn a_seed_the_restart_keeps_and_the_sender_never_made_ends_equal_at_the_names_next_event() {
+    let (r, _dr) = engine();
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (sender, _ds) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    let orders_id = CollectionId::derive(DB, "orders");
+
+    // the receiver's own life of `orders`, which the sender holds too, and which the receiver then drops: its tombstone at t
+    r.create_collection(DB, "orders").unwrap();
+    sender.apply_batch(&everything(&r)).unwrap();
+    assert!(r.drop_collection(DB, "orders").unwrap(), "premise: the receiver dropped its identity");
+    let t = r.collection_dropped_at(orders_id).unwrap().expect("premise: the receiver's tombstone");
+    let drop_entry = everything(&r)
+        .into_iter()
+        .find(|entry| entry.kind == OpKind::DropCollection && entry.collection == orders_id)
+        .expect("premise: the receiver's drop is an entry");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // the stage of `orders` the first page makes, created above t, held alive by the sender; and the swap of `items` that causes the restart
+    a.create_stage(DB, SEEDED_STAGE, MergePolicy::Document, deadline).unwrap();
+    for (k, name) in ITEMS_STAGES.iter().enumerate() {
+        let stage = a.create_stage(DB, name, MergePolicy::Document, deadline).unwrap();
+        for i in 1..=30 {
+            let id = i64::try_from(k).unwrap() * 100 + i;
+            a.insert(&stage, doc! { "_id": id, "v": "x".repeat(40) }).unwrap();
+        }
+    }
+    let entries_of = |name: &str| -> Vec<OplogEntry> {
+        let id = CollectionId::derive(DB, name);
+        everything(&a).into_iter().filter(|entry| entry.collection == id).collect()
+    };
+    let seeded_creation = creation_of(&a, SEEDED_STAGE);
+    assert!(seeded_creation.stamp > t, "premise: the stage of `orders` was created above the drop");
+    sender.apply_batch(&entries_of(SEEDED_STAGE)).unwrap();
+    sender.apply_batch(&entries_of(ITEMS_STAGES[0])).unwrap();
+    let wall = [seeded_creation.stamp.hlc.wall_ms, t.hlc.wall_ms, physical_now_ms()]
+        .into_iter()
+        .max()
+        .unwrap()
+        + 1;
+    window(&sender, std::slice::from_ref(&bind_of_name(&b, "items", ITEMS_STAGES[0], wall)));
+    assert!(sender.get_collection(DB, "orders").is_ok(), "premise: the sender holds the identity");
+    assert!(the_events_of_orders(&sender).is_empty(), "premise: and no event of `orders`");
+
+    // the sender's page reader, before the second page of the first pass: the drop reaches it and is taken as an ordinary one, and `items`
+    // is swapped again
+    let swap = (entries_of(ITEMS_STAGES[1]), bind_of_name(&b, "items", ITEMS_STAGES[1], wall + 10));
+    let (page_ones, made) =
+        (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicBool::new(false));
+    sender.set_snapshot_room_for_test(Some(3_000));
+    // read before the hook is set, so that it does not count this page
+    assert!(
+        sender.snapshot_page(None, None).unwrap().next.is_some(),
+        "premise: page one is not the last, so a page with a cursor is asked for"
+    );
+    let with_a_cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cursor_calls = with_a_cursor.clone();
+    let hook = move |engine: &Engine, after: Option<&crate::SnapshotCursor>| {
+        use std::sync::atomic::Ordering::SeqCst;
+        if after.is_none() {
+            page_ones.fetch_add(1, SeqCst);
+        } else {
+            cursor_calls.fetch_add(1, SeqCst);
+        }
+        if after.is_some() && page_ones.load(SeqCst) == 1 && !made.swap(true, SeqCst) {
+            window(engine, std::slice::from_ref(&drop_entry));
+            engine.apply_batch(&swap.0).unwrap();
+            window(engine, std::slice::from_ref(&swap.1));
+        }
+    };
+    sender.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(hook)));
+
+    let joined = join_by_pages(&r, &sender);
+    assert!(
+        with_a_cursor.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "premise: the sender's page reader ran at least once with a cursor"
+    );
+    assert!(joined.progress.is_complete(), "the second pass completes");
+    assert_eq!(
+        joined.restarts.iter().sum::<usize>(),
+        1,
+        "premise: the join restarted once, for `items`: {:?}",
+        joined.restarts
+    );
+    assert_eq!(
+        sender.collection_dropped_at(orders_id).unwrap(),
+        Some(t),
+        "premise: the sender took the drop, at the receiver's stamp"
+    );
+    assert!(
+        sender.get_collection(DB, "orders").is_err(),
+        "premise: as an ordinary drop of the identity"
+    );
+
+    // today's truth: the receiver holds the drop its own tombstone seeded, the sender holds no event of the name, and both read it absent
+    assert_eq!(
+        the_events_of_orders(&r),
+        vec![(t, kimmy_core::RegisterEvent::LogicalDrop)],
+        "the receiver holds the logical drop its page-one seed made, and the restart kept it"
+    );
+    assert!(the_events_of_orders(&sender).is_empty(), "the sender holds no event of the name");
+    assert!(served_by(&r).is_err(), "the receiver reads the name absent");
+    assert!(served_by(&sender).is_err(), "and so does the sender");
+
+    // the next event of the name, a binding of the stage, reaches both
+    let bind = bind_of(&b, SEEDED_STAGE, wall + 100);
+    window(&r, std::slice::from_ref(&bind));
+    window(&sender, std::slice::from_ref(&bind));
+    assert_eq!(served_by(&r), Ok(SEEDED_STAGE.to_string()), "the receiver serves the stage");
+    assert_eq!(served_by(&sender), Ok(SEEDED_STAGE.to_string()), "and so does the sender");
+    assert_eq!(
+        the_events_of_orders(&r),
+        the_events_of_orders(&sender),
+        "and the two registers are equal: the sender seeds the drop from its own tombstone when it judges the binding"
+    );
+}
