@@ -1746,6 +1746,94 @@ mod tests {
         );
     }
 
+    /// A closed store that holds a stage of `orders`: a collection whose name this build reserves (ADR-272).
+    fn a_store_with_a_stage() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            engine
+                .create_stage(
+                    "shop",
+                    "orders.__stg.q1",
+                    kimmy_core::MergePolicy::Document,
+                    kimmy_core::Hlc::new(crate::physical_now_ms() + 60_000, 0),
+                )
+                .unwrap();
+        }
+        (dir, path)
+    }
+
+    /// What the refusal of an older store says of the collections it holds under reserved names.
+    fn assert_it_lists_the_reserved_names(why: &str, what: &str) {
+        assert!(
+            why.contains(&crate::migrate::no_upgrade()),
+            "{what}: the wipe advice stays: {why}"
+        );
+        assert!(why.contains("shop.orders.__stg.q1"), "{what}: the reserved name is listed: {why}");
+        assert!(why.contains("0.61.0 has no rename"), "{what}: it says there is no rename: {why}");
+        assert!(
+            why.contains(
+                "copy each collection to a new name and drop the original on 0.61.0 before you wipe"
+            ),
+            "{what}: it says what to do on 0.61.0: {why}"
+        );
+    }
+
+    #[test]
+    fn an_older_store_with_no_sidecar_is_refused_naming_the_collections_held_under_reserved_names()
+    {
+        let (_dir, path) = a_store_with_a_stage();
+        std::fs::remove_file(sidecar_path(&path)).unwrap();
+        let ahead =
+            BuildVersions { schema: crate::migrate::SCHEMA_VERSION + 1, ..BuildVersions::ours() };
+        let before = snapshot(&path);
+        let why = older_refusal(&path, "no sidecar", &ahead);
+        assert_it_lists_the_reserved_names(&why, "no sidecar");
+        assert!(snapshot(&path) == before, "the scan wrote nothing");
+    }
+
+    #[test]
+    fn an_older_store_with_a_sidecar_is_refused_naming_the_collections_held_under_reserved_names() {
+        let (_dir, path) = a_store_with_a_stage();
+        let schema = crate::migrate::SCHEMA_VERSION;
+        with_sidecar(&path, |s| {
+            s.schema = schema - 1;
+            s.written_by = "0.61.0".into();
+        });
+        let before = snapshot(&path);
+        let why = older_refusal(&path, "sidecar", &BuildVersions::ours());
+        assert_it_lists_the_reserved_names(&why, "sidecar");
+        assert!(snapshot(&path) == before, "the scan wrote nothing");
+    }
+
+    #[test]
+    fn a_store_of_this_schema_that_holds_a_stage_is_not_refused() {
+        // A 0.62 store holds hidden collections of its own (a stage, a recreation): the names are reserved for them, and a store of this
+        // schema is never scanned or refused for them.
+        let (_dir, path) = a_store_with_a_stage();
+        let engine = Engine::open(&path).expect("a store of this schema opens with its stage");
+        assert!(engine.get_collection("shop", "orders.__stg.q1").is_ok(), "and holds it");
+    }
+
+    #[test]
+    fn the_names_a_refusal_lists_are_capped_and_counted() {
+        let names: Vec<String> = (0..25).map(|i| format!("shop.c{i:02}.__stg.x")).collect();
+        let note = crate::migrate::no_upgrade_for(&names);
+        assert!(note.contains("25 collection"), "it counts them all: {note}");
+        assert!(
+            note.contains("shop.c00.__stg.x") && note.contains("shop.c19.__stg.x"),
+            "it lists the first twenty: {note}"
+        );
+        assert!(!note.contains("shop.c20.__stg.x"), "and stops there: {note}");
+        assert!(note.contains("and 5 more"), "and says how many it left out: {note}");
+        assert!(
+            crate::migrate::no_upgrade_for(&[]) == crate::migrate::no_upgrade(),
+            "a store with none is told what it always was"
+        );
+    }
+
     #[test]
     fn the_refusal_of_an_older_backup_reads_whole() {
         let (_dir, path) = a_store();

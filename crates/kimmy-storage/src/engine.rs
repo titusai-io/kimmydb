@@ -1977,6 +1977,13 @@ impl Engine {
         self.register_resolve_fallbacks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Creations of a collection under a name this build reserves that a peer sent or a snapshot carried, with no stage's information or
+    /// no recreation's stamp to make the name its own, and that this member refused (`kimmy_sync_reserved_names_refused_total`).
+    /// Expected 0.
+    pub fn sync_reserved_names_refused(&self) -> u64 {
+        0
+    }
+
     /// Standing lives the register has buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
     /// (`kimmy_register_life_burials_total{by}`): a life made over a drop of its name that a stage created below the drop turned out
     /// to be the swap's (`seed`), and a life made after a replicated drop that the drop then buried (`drop`). Lost and reported (ADR-272,

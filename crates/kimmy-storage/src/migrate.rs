@@ -69,6 +69,12 @@ pub(crate) fn no_upgrade() -> String {
     )
 }
 
+/// What a refusal of a store of an older schema tells the operator, with the collections of the store whose names this build reserves
+/// (ADR-272): none listed yet.
+pub(crate) fn no_upgrade_for(_reserved: &[String]) -> String {
+    no_upgrade()
+}
+
 /// Stamp a fresh database, or refuse one of another schema. `raise` records in
 /// the store's sidecar that its schema is about to be written (ADR-190),
 /// before a fresh store's version is written. `path` is the store's file.
@@ -317,6 +323,36 @@ mod tests {
             Ok(_) => panic!("opened a schema 5 store"),
         }
         assert!(snapshot(&path) == before, "the store or its sidecar changed");
+    }
+
+    /// The refusal that follows redb's open (a dirty store with no sidecar) lists the collections the store holds under reserved names too.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn the_refusal_after_the_open_names_the_collections_held_under_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            engine
+                .create_stage(
+                    "shop",
+                    "orders.__stg.q1",
+                    kimmy_core::MergePolicy::Document,
+                    kimmy_core::Hlc::new(crate::physical_now_ms() + 60_000, 0),
+                )
+                .unwrap();
+        }
+        let db = Database::create(&path).unwrap();
+        write_version(&db, SCHEMA_VERSION - 1).unwrap();
+        match refuse_other_schema(&db, &path, &crate::format::BuildVersions::ours()) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(why.contains(&no_upgrade()), "{why}");
+                assert!(why.contains("shop.orders.__stg.q1"), "{why}");
+                assert!(why.contains("0.61.0 has no rename"), "{why}");
+            }
+            other => panic!("refused with the wrong answer: {other:?}"),
+        }
     }
 
     /// The store 0.57.0 wrote (schema 6) holds index entries derived under the

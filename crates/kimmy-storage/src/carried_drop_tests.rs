@@ -1998,9 +1998,29 @@ fn rule_four_with_a_stale_row_is_computed_and_counted() {
 
 // -- Unit C2e: a name is nameable from the hidden collections the receiver holds, not only from the carry's stage rows ---------------------
 
-/// A member `m` made by a page from an OLDER sender: it holds the stage's collection and no stage row for it (the page had no `stage`
-/// field and carried no register), and then met the logical drop of the name by a window, which it stored (the name is swapped: a
-/// collection `orders.__stg.*` is held). Returns the author, the member and the drop.
+/// The state a page from an OLDER sender left, made by hand: the stage's collection held with no stage row and no stage information in its
+/// definition (the page had no `stage` field and carried no register). No route reaches it now: a definition of a stage's name with no
+/// stage information is refused where it arrives (`refuse_a_reserved_name_of_no_swap`), and a stage's row is written with its collection.
+/// The state is made by writing the row and the field away (the test hook for the row, and the definition rewritten under the writer).
+fn leave_the_stage_as_an_older_page_did(m: &Engine, physical: &str) {
+    use redb::ReadableTable;
+    crate::register::remove_stage_row_for_test(m, CollectionId::derive(DB, physical));
+    let txn = m.begin_write(crate::WriterHolder::Ddl).unwrap();
+    {
+        let mut collections = txn.open_table(crate::tables::COLLECTIONS).unwrap();
+        let mut meta: crate::meta::CollectionMeta = {
+            let held = collections.get((DB, physical)).unwrap().expect("the stage is held");
+            serde_json::from_slice(held.value()).unwrap()
+        };
+        meta.stage = None;
+        collections.insert((DB, physical), serde_json::to_vec(&meta).unwrap().as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// A member `m` that holds the stage's collection and no stage row for it (see [`leave_the_stage_as_an_older_page_did`]), and then met the
+/// logical drop of the name by a window, which it stored (the name is swapped: a collection `orders.__stg.*` is held). Returns the author,
+/// the member and the drop.
 fn a_member_with_a_stage_and_no_stage_row_that_met_the_drop()
 -> (Engine, Engine, OplogEntry, [tempfile::TempDir; 2]) {
     let (a, da) = engine();
@@ -2009,19 +2029,21 @@ fn a_member_with_a_stage_and_no_stage_row_that_met_the_drop()
     let mut page = a.snapshot_page(None, None).unwrap();
     let has_the_stage = page.collections.iter().any(|state| state.stage.is_some());
     assert!(has_the_stage, "premise: the page has the stage");
-    for state in &mut page.collections {
-        state.stage = None;
-    }
     page.register = None;
     let (m, dm) = engine();
     m.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(
+        the_stage_row_of(&m, STAGE1).is_some(),
+        "premise: the page made the stage with its row"
+    );
+    leave_the_stage_as_an_older_page_did(&m, STAGE1);
     let drop = drop_of_orders(&a, physical_now_ms() + 5_000);
     window(&m, std::slice::from_ref(&drop));
     (a, m, drop, [da, dm])
 }
 
 #[test]
-fn a_name_whose_only_hidden_collection_has_no_stage_row_is_named_from_that_collection() {
+fn a_joiner_refuses_a_stage_with_no_stage_information_and_the_name_stays_dropped() {
     let (_a, m, drop, _dirs) = a_member_with_a_stage_and_no_stage_row_that_met_the_drop();
     assert!(m.get_collection(DB, STAGE1).is_ok(), "premise: the source member holds the stage");
     assert!(the_stage_row_of(&m, STAGE1).is_none(), "premise: and no stage row for it");
@@ -2038,20 +2060,29 @@ fn a_name_whose_only_hidden_collection_has_no_stage_row_is_named_from_that_colle
     );
     let (j, _dj) = engine();
     pull(&j, &m);
-    assert!(j.get_collection(DB, STAGE1).is_ok(), "premise: the joiner holds the stage as well");
-    assert!(the_stage_row_of(&j, STAGE1).is_none(), "premise: and no stage row, as the source");
+    // The source's page defines the stage with no stage's information (the state was made by hand above), and a definition of a reserved
+    // name with nothing to make it the swap's is refused where it arrives (`refuse_a_reserved_name_of_no_swap`), so the joiner does not
+    // hold the stage. No route of 0.62 makes the source's state: an older store is not upgraded (wipe and reseed), and a page of this
+    // version carries a stage's information with its definition.
+    assert_eq!(j.sync_reserved_names_refused(), 1, "its definition was refused, and counted once");
+    assert!(j.get_collection(DB, STAGE1).is_err(), "so the joiner does not hold the stage");
+    assert!(the_stage_row_of(&j, STAGE1).is_none(), "and it holds no stage row for it");
     assert_eq!(
         the_events_of_orders(&j).iter().map(|(stamp, _)| *stamp).collect::<Vec<_>>(),
         vec![drop.stamp],
         "the joiner holds the drop"
     );
-    assert_eq!(the_row(&j), source_row, "and the row the pass wrote for it is the source's");
+    // The joiner cannot name the id of a name whose events arrive with no stage row (`apply_carried` stores such rows by id: it holds no
+    // collection of the name to name it from), so no pass ran for it and it holds no row. The answer is right and it is counted: the
+    // resolution is computed from the events and reads as a fallback. It heals at the name's next event, and is fixed with the id to name
+    // table of the next wire bump.
+    assert!(the_row(&j).is_none(), "the joiner holds no row for the name: it could not name it");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "premise: nothing has resolved the name yet");
     assert!(j.resolve(DB, "orders").is_err(), "the name is absent, as on the source");
-    assert_eq!(j.register_resolve_fallbacks(), 0, "and the row answered: no fallback");
-    assert_eq!(
-        j.get_collection(DB, STAGE1).is_ok(),
-        m.get_collection(DB, STAGE1).is_ok(),
-        "the stage is in the state the source holds it in (no pass buries a stage with no row, on either)"
+    assert_eq!(j.register_resolve_fallbacks(), 1, "answered by the computation, and counted");
+    assert!(
+        m.get_collection(DB, STAGE1).is_ok() && j.get_collection(DB, STAGE1).is_err(),
+        "the source holds the stage and the joiner refused it: the two differ by it, as designed"
     );
 }
 
@@ -3190,4 +3221,89 @@ fn a_name_with_no_event_opens_the_register_once() {
         1,
         "premise: a name with events is answered by its row after the one probe"
     );
+}
+
+// -- A name the swap reserves, made with nothing to make it the swap's, is refused loudly and nothing stalls (ADR-272) --------------------------
+//
+// A stage's creation carries its stage's information and a recreation's name carries the stamp of its event; a client cannot make either
+// name (the client's doors refuse it on the name alone). A creation under such a name with neither, from a member whose own check was
+// bypassed, would stand as a hidden collection the register knows nothing of: a backup refuses it as damaged and the pass mistakes it.
+// It is refused where it arrives, in a window and in a snapshot's page, with a warning and a count, and what follows it goes on.
+
+/// The creation of `name` by a member whose own check is bypassed: no stage's information, whatever the name carries.
+fn a_creation_that_bypassed_the_check(by: &Engine, name: &str) -> OplogEntry {
+    by.create_collection_marked(
+        DB,
+        name,
+        true,
+        None,
+        &|_| false,
+        None,
+        None,
+        None,
+        MergePolicy::Document,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let id = CollectionId::derive(DB, name);
+    everything(by)
+        .into_iter()
+        .find(|e| e.kind == OpKind::CreateCollection && e.collection == id)
+        .expect("premise: the member logged the creation")
+}
+
+#[test]
+fn a_replicated_creation_under_a_reserved_name_of_no_swap_is_refused_and_the_window_goes_on() {
+    let (peer, _dp) = engine();
+    let stage_like = a_creation_that_bypassed_the_check(&peer, "orders.__stg.zz");
+    let recreation_like = a_creation_that_bypassed_the_check(&peer, "orders.__rc.zz");
+    let ordinary = a_creation_that_bypassed_the_check(&peer, "items");
+    let (m, _dm) = engine();
+    let outcome = window(&m, &[stage_like.clone(), recreation_like.clone(), ordinary]);
+    assert!(m.get_collection(DB, "orders.__stg.zz").is_err(), "the stage-like name is not made");
+    assert!(m.get_collection(DB, "orders.__rc.zz").is_err(), "nor the recreation-like name");
+    assert!(
+        m.get_collection(DB, "items").is_ok(),
+        "and the creation behind them in the window is applied: nothing stalled"
+    );
+    assert_eq!(outcome.ddl_refused, 2, "both are refused, and counted as refused entries");
+    assert_eq!(
+        outcome.refused_at,
+        vec![stage_like.stamp, recreation_like.stamp],
+        "at their stamps"
+    );
+    assert_eq!(m.sync_reserved_names_refused(), 2, "and by the count of reserved names refused");
+}
+
+#[test]
+fn a_stage_made_with_its_information_is_not_a_reserved_name_refused() {
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let (m, _dm) = engine();
+    let outcome = window(&m, std::slice::from_ref(&creation_of(&a, STAGE1)));
+    assert!(m.get_collection(DB, STAGE1).is_ok(), "the stage is made");
+    assert_eq!(
+        (outcome.ddl_refused, m.sync_reserved_names_refused()),
+        (0, 0),
+        "and nothing is refused"
+    );
+}
+
+#[test]
+fn a_snapshot_page_defining_a_reserved_name_of_no_swap_does_not_make_it_and_the_pull_goes_on() {
+    let (peer, _dp) = engine();
+    a_creation_that_bypassed_the_check(&peer, "orders.__stg.zz");
+    a_creation_that_bypassed_the_check(&peer, "orders.__rc.zz");
+    peer.create_collection(DB, "items").unwrap();
+    let (j, _dj) = engine();
+    let (progress, result) = pull_patched(&j, &peer, &|_| {});
+    result.expect("the pull applies");
+    assert!(progress.is_complete(), "the pull completes");
+    assert!(j.get_collection(DB, "orders.__stg.zz").is_err(), "the stage-like name is not made");
+    assert!(j.get_collection(DB, "orders.__rc.zz").is_err(), "nor the recreation-like name");
+    assert!(j.get_collection(DB, "items").is_ok(), "and the collection beside them is");
+    assert_eq!(j.sync_reserved_names_refused(), 2, "both refusals are counted");
 }
