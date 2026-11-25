@@ -361,6 +361,12 @@ pub struct CollectionState {
     /// replaced nothing, and from a sender that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_floor: Option<Hlc>,
+    /// The creation of a stage (`CollectionMeta::stage`: the stamp of its creation entry and its deadline; ADR-272, decisions 4 and 9;
+    /// Q6.6, unit C2). A receiver that makes the collection from this state writes the stage's row in the same transaction as the
+    /// collection, as the creation arm does, so no member holds a stage it has no creation row for. `None` for an ordinary collection,
+    /// and from a sender that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<kimmy_core::StageMeta>,
     /// The collection's validator (`CollectionMeta::validator`, ADR-257), absent when it
     /// has none. Absent on a page from a sender that never had one, and also when the
     /// sender removed it: `validator_changed` says which.
@@ -403,6 +409,7 @@ impl From<CollectionMeta> for CollectionState {
             redated_from,
             incarnation_floor: meta.incarnation_floor,
             definition_floor: meta.definition_floor,
+            stage: None,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,

@@ -506,3 +506,119 @@ fn an_identity_dropped_while_its_binding_is_only_parked_is_still_listed_and_buri
         .unwrap();
     assert!(j.get_collection(DB, "orders").is_err(), "and the receiver's identity is buried by it");
 }
+
+// -- Unit C2a: a stage arrives by a snapshot page with its creation and its row ---------------------------------------------------------------
+
+fn the_stage_row_of(m: &Engine, physical: &str) -> Option<kimmy_core::StageMeta> {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    crate::register::stage_row_named_read(&txn, CollectionId::derive(DB, physical))
+        .unwrap()
+        .map(|row| row.meta)
+}
+
+fn covered_through(stamp: Stamp) -> VersionVector {
+    let mut vector = VersionVector::default();
+    vector.observe(stamp);
+    vector
+}
+
+fn the_logical_drops_of_orders(m: &Engine) -> usize {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    let timeline = crate::register::timeline_read(&txn, DB, "orders").unwrap();
+    timeline.events().iter().filter(|(_, event)| event.physical().is_none()).count()
+}
+
+/// The scoped page of `STAGE1` that the sender serves, and the sender's own creation of it.
+fn the_page_of_the_stage(s: &Swap) -> (CollectionId, crate::SnapshotPage, kimmy_core::StageMeta) {
+    let id = CollectionId::derive(DB, STAGE1);
+    let page = s.sender.snapshot_page(None, Some(id)).unwrap();
+    let stage = s.sender.get_collection(DB, STAGE1).unwrap().stage;
+    (id, page, stage.expect("premise: the sender's stage holds its creation"))
+}
+
+#[test]
+fn a_stage_a_page_made_holds_its_creation_and_its_row_after_a_reopen() {
+    let s = swap(&[]);
+    let (j, dj) = engine();
+    let (id, page, theirs) = the_page_of_the_stage(&s);
+    j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+        .unwrap();
+    let path = dj.path().join("kimmy.redb");
+    drop(j);
+    let j = Engine::open(&path).unwrap();
+    assert_eq!(
+        j.get_collection(DB, STAGE1).unwrap().stage,
+        Some(theirs),
+        "the stage holds the creation the page carried, after a reopen"
+    );
+    assert_eq!(
+        the_stage_row_of(&j, STAGE1),
+        Some(theirs),
+        "and its row, written with the collection"
+    );
+}
+
+#[test]
+fn a_binding_of_a_stage_a_page_made_takes_effect_when_it_arrives_in_a_window() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let (id, page, _) = the_page_of_the_stage(&s);
+    j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+        .unwrap();
+    // the grant covers the creation, so no entry will ever write the row: the page's own is the only one
+    j.absorb_version_vector(&covered_through(s.creation.stamp)).unwrap();
+    window(&j, std::slice::from_ref(&s.bind));
+    let served = j.resolve(DB, "orders").map(|resolved| resolved.physical);
+    assert_eq!(
+        served.map_err(|e| e.to_string()),
+        Ok(STAGE1.to_string()),
+        "the binding takes effect: the page gave the stage its row"
+    );
+}
+
+#[test]
+fn a_held_stage_whose_creation_differs_from_the_pages_refuses_the_page_by_name() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    let (id, mut page, theirs) = the_page_of_the_stage(&s);
+    let other = Stamp::new(Hlc::new(theirs.created.hlc.wall_ms + 1, 0), s.a.node_id(), s.a.epoch());
+    page.collections[0].stage = Some(kimmy_core::StageMeta { created: other, ..theirs });
+    let outcome =
+        j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page);
+    let error = outcome.expect_err("an inconsistent sender's page is refused").to_string();
+    assert!(error.contains("two creations"), "a stage cannot have two creations: {error}");
+}
+
+#[test]
+fn a_stage_a_page_made_below_a_drop_the_member_holds_as_a_tombstone_is_judged_as_the_creation_arm_judges_it()
+ {
+    // the creation arm seeds the name's drop from the identity's tombstone when the first thing the register learns is a stage created
+    // below it (review of items 6 and 6b, F1); a stage made by a page is judged the same way
+    let s = swap(&[]);
+    let (j, _dj) = with_orders();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(j.drop_collection(DB, "orders").unwrap(), "premise: the identity is dropped here");
+    let tombstone = j.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap();
+    assert!(tombstone.is_some(), "premise: the member holds the identity's tombstone");
+    assert_eq!(
+        the_logical_drops_of_orders(&j),
+        0,
+        "premise: the register holds no drop of the name yet"
+    );
+    let (id, page, _) = the_page_of_the_stage(&s);
+    let passes = crate::sync::race_hooks::settle_passes();
+    j.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+        .unwrap();
+    assert!(
+        crate::sync::race_hooks::settle_passes() > passes,
+        "the seed's drop ends the identity's remains by the settle pass, in the same transaction"
+    );
+    assert_eq!(
+        the_logical_drops_of_orders(&j),
+        1,
+        "the stage's creation is judged: the tombstone above it is the name's logical drop"
+    );
+}

@@ -8994,6 +8994,7 @@ mod tests {
                 redated_from: None,
                 incarnation_floor: None,
                 definition_floor: None,
+                stage: None,
                 validator: None,
                 validator_changed: None,
                 merge_policy: kimmy_core::MergePolicy::Document,
