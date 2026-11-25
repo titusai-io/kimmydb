@@ -617,6 +617,10 @@ pub struct RegisterCarry {
     pub stages: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
     /// `REGISTER_POST` rows: key = the logical name's id (8), value = the row.
     pub posts: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
+    /// The ids (8 bytes each) of the stage rows above whose collection is NOT alive on the sender (ADR-272, decision 9; Q6.6, unit D): a
+    /// stage it buried, or never held. The receiver asks its own tests about each, and takes nothing else from the sender.
+    #[serde(default)]
+    pub not_alive: Vec<serde_bytes::ByteBuf>,
 }
 
 /// What a row of the carry costs on the wire besides its key and value: the array that holds the pair and the two binary headers. A bound,
@@ -634,7 +638,8 @@ impl RegisterCarry {
         let rows = |rows: &[(serde_bytes::ByteBuf, serde_bytes::ByteBuf)]| -> usize {
             rows.iter().map(|(key, value)| key.len() + value.len() + CARRY_ROW_FRAME).sum()
         };
-        CARRY_FRAME + rows(&self.events) + rows(&self.stages) + rows(&self.posts)
+        let ids: usize = self.not_alive.iter().map(|id| id.len() + CARRY_ROW_FRAME).sum();
+        CARRY_FRAME + rows(&self.events) + rows(&self.stages) + rows(&self.posts) + ids
     }
 }
 
@@ -1092,6 +1097,8 @@ impl Engine {
             events: rows(Carried::Register)?,
             stages: rows(Carried::Stages)?,
             posts: rows(Carried::Post)?,
+            // SCAFFOLD (unit D tests): the list is filled by the code commit
+            not_alive: Vec::new(),
         };
         self.note_register_carry(&carry);
         Ok(carry)

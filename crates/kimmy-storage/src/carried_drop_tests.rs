@@ -372,6 +372,44 @@ fn a_page_that_buries_a_stage_the_receiver_knows() -> Known {
     Known { j, s, page, _dj: dj }
 }
 
+/// `page` with the tombstone it carries for `stage` moved one tick below the stamp the sender holds it at, and that stamp: so that a
+/// tombstone this member records under the stage's id can be told from the sender's, whatever the sender's stamp and this member's own
+/// judgement (the loser is buried at the binding's stamp, on both) have in common.
+fn with_the_stage_tombstone_one_tick_lower(
+    page: &crate::SnapshotPage,
+    stage: CollectionId,
+) -> (crate::SnapshotPage, Stamp) {
+    let mut lowered = page.clone();
+    let entry = lowered.dropped_collections.iter_mut().find(|(id, _)| *id == stage);
+    let (_, stamp) = entry.expect("premise: the page carries the stage's tombstone");
+    stamp.hlc = stamp.hlc.predecessor();
+    let carried = *stamp;
+    (lowered, carried)
+}
+
+/// What a tombstone under the stage's id may be after the join (Q6.6, unit D): none, or this member's OWN, the loser rule asked of its own
+/// events (a stage that no later binding keeps), recorded at the stamp of the event visible here, and never the stamp the sender carried.
+/// The register still decides the burial; it now decides it from this member's events, and records its own tombstone.
+fn assert_the_tombstone_is_this_members_own(
+    j: &Engine,
+    stage: CollectionId,
+    carried: Stamp,
+    when: &str,
+) {
+    let visible = j.resolve(DB, "orders").unwrap().visible;
+    assert!(visible.is_some(), "premise: a binding is visible here ({when})");
+    assert_ne!(
+        j.collection_dropped_at(stage).unwrap(),
+        Some(carried),
+        "the sender's carried stamp is not recorded under the stage's id ({when})"
+    );
+    assert_eq!(
+        j.collection_dropped_at(stage).unwrap(),
+        visible,
+        "any tombstone under the stage's id is this member's own, at the stamp of the event visible here ({when})"
+    );
+}
+
 #[test]
 fn a_carried_burial_of_a_stage_the_receiver_knows_but_holds_no_collection_of_is_not_recorded() {
     let k = a_page_that_buries_a_stage_the_receiver_knows();
@@ -389,13 +427,10 @@ fn a_carried_burial_of_a_stage_the_receiver_knows_but_holds_no_collection_of_is_
         k.page.dropped_collections.iter().any(|(id, _)| *id == stage1),
         "premise: the page carries the stage's tombstone"
     );
-    k.j.apply_snapshot_page(k.s.sender.node_id(), &mut SnapshotProgress::whole_database(), &k.page)
+    let (page, carried) = with_the_stage_tombstone_one_tick_lower(&k.page, stage1);
+    k.j.apply_snapshot_page(k.s.sender.node_id(), &mut SnapshotProgress::whole_database(), &page)
         .unwrap();
-    assert_eq!(
-        k.j.collection_dropped_at(stage1).unwrap(),
-        None,
-        "no tombstone is recorded under the stage's id: the register decides its burial"
-    );
+    assert_the_tombstone_is_this_members_own(&k.j, stage1, carried, "the register decides");
     assert_eq!(k.j.register_carried_drops_deferred(), 1, "and the deferral is counted");
 }
 
@@ -445,13 +480,17 @@ fn a_scoped_burial_of_the_identity_whose_binding_is_only_parked_here_is_not_reco
 
 #[test]
 fn a_whole_database_page_delivered_twice_defers_the_stage_twice_and_records_no_tombstone() {
+    // the page of a sender before the register's carry (as `join` makes it): nothing of this member's own tests runs, so no tombstone is
+    // ever recorded and each delivery meets the carried burial again, which is deferred and counted again
     let k = a_page_that_buries_a_stage_the_receiver_knows();
     let stage1 = CollectionId::derive(DB, STAGE1);
+    let mut page = k.page.clone();
+    page.register = None;
     for delivery in 1..=2u64 {
         k.j.apply_snapshot_page(
             k.s.sender.node_id(),
             &mut SnapshotProgress::whole_database(),
-            &k.page,
+            &page,
         )
         .unwrap();
         assert_eq!(
@@ -464,6 +503,32 @@ fn a_whole_database_page_delivered_twice_defers_the_stage_twice_and_records_no_t
             None,
             "and still no tombstone is recorded under the stage's id (delivery {delivery})"
         );
+    }
+}
+
+#[test]
+fn a_page_with_the_carry_delivered_twice_defers_once_and_keeps_the_members_own_tombstone() {
+    // With the carry, delivery 1 defers the carried burial and the receiver's own tests bury the stage (unit D): its own tombstone is
+    // recorded at the stamp of its visible event. On delivery 2 the carried burial is not above that tombstone, and a drop at or below
+    // the one held is skipped before the register is asked (`apply_carried_drops`), so it is not deferred: counting a no-op as deferred
+    // would be wrong.
+    let k = a_page_that_buries_a_stage_the_receiver_knows();
+    let stage1 = CollectionId::derive(DB, STAGE1);
+    let (page, carried) = with_the_stage_tombstone_one_tick_lower(&k.page, stage1);
+    for delivery in 1..=2u64 {
+        k.j.apply_snapshot_page(
+            k.s.sender.node_id(),
+            &mut SnapshotProgress::whole_database(),
+            &page,
+        )
+        .unwrap();
+        assert_eq!(
+            k.j.register_carried_drops_deferred(),
+            1,
+            "deferred once, by the first delivery, and not again by the second (delivery {delivery})"
+        );
+        let when = format!("delivery {delivery}");
+        assert_the_tombstone_is_this_members_own(&k.j, stage1, carried, &when);
     }
 }
 
@@ -2102,4 +2167,213 @@ fn a_hand_built_recreation_with_no_stage_row_is_named_from_its_collection_and_jo
     assert_eq!(the_row(&j), source_row, "and the row the pass wrote for the name is the source's");
     assert_eq!(served_by(&j), served_by(&m), "the name is served by the same recreation");
     assert_eq!(j.register_resolve_fallbacks(), 0, "from the row: no fallback");
+}
+
+// -- Unit D (D-1): a doomed burial is never taken from another member; the receiver asks its own tests --------------------------------------
+
+const DOOMED: &str = "orders.__stg.d0";
+const LIVE1: &str = "orders.__stg.d1";
+const LIVE2: &str = "orders.__stg.d2";
+
+/// A sender that doomed a stage: `a` authors three stages (the first with a deadline one second out, the other two a minute), `b` (another
+/// origin) authors two bindings, the first of the second stage and the later of the third. The first binding makes the first stage doomed
+/// (it has no binding and its deadline is below the visible event) and the second buries the second as a loser. The sender holds
+/// the third alone, and the stage rows of all three.
+struct Doomed {
+    a: Engine,
+    sender: Engine,
+    creations: Vec<OplogEntry>,
+    bind1: OplogEntry,
+    bind2: OplogEntry,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+fn a_sender_that_doomed_a_stage() -> Doomed {
+    let (a, da) = engine();
+    let (b, db) = engine();
+    let now = physical_now_ms();
+    a.create_stage(DB, DOOMED, MergePolicy::Document, Hlc::new(now + 1_000, 0)).unwrap();
+    a.create_stage(DB, LIVE1, MergePolicy::Document, Hlc::new(now + 60_000, 0)).unwrap();
+    a.create_stage(DB, LIVE2, MergePolicy::Document, Hlc::new(now + 60_000, 0)).unwrap();
+    let creations: Vec<OplogEntry> =
+        [DOOMED, LIVE1, LIVE2].iter().map(|name| creation_of(&a, name)).collect();
+    let (sender, ds) = engine();
+    sender.apply_batch(&creations).unwrap();
+    let wall = now + 5_000;
+    let bind1 = bind_of(&b, LIVE1, wall);
+    let bind2 = bind_of(&b, LIVE2, wall + 10);
+    window(&sender, std::slice::from_ref(&bind1));
+    window(&sender, std::slice::from_ref(&bind2));
+    assert_eq!(
+        served_by(&sender),
+        Ok(LIVE2.to_string()),
+        "premise: the sender serves the last stage"
+    );
+    assert!(
+        sender.get_collection(DB, DOOMED).is_err(),
+        "premise: the sender doomed the first stage"
+    );
+    assert!(sender.get_collection(DB, LIVE1).is_err(), "premise: and buried the second as a loser");
+    assert!(
+        the_stage_row_of(&sender, DOOMED).is_some(),
+        "premise: the sender still holds its stage row"
+    );
+    Doomed { a, sender, creations, bind1, bind2, _dirs: vec![da, db, ds] }
+}
+
+/// The ids a page lists as not alive at its sender.
+fn listed_not_alive(page: &crate::SnapshotPage) -> Vec<u64> {
+    let carry = page.register.as_ref().expect("premise: the last page carries the register");
+    carry
+        .not_alive
+        .iter()
+        .map(|id| u64::from_be_bytes(id.as_slice().try_into().expect("an id is eight bytes")))
+        .collect()
+}
+
+/// After a join, every stage row this member holds has a live collection or a tombstone under its id (outside an unfinished join, a
+/// member that knows a stage's creation holds the stage alive or holds its own tombstone for it).
+fn assert_stage_invariant(m: &Engine) {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    let rows = crate::register::carried_rows(&txn, crate::register::Carried::Stages).unwrap();
+    assert!(!rows.is_empty(), "premise: the member holds stage rows");
+    for (key, _) in rows {
+        let id = CollectionId(u64::from_be_bytes(key.as_slice().try_into().unwrap()));
+        let row = crate::register::stage_row_named_read(&txn, id).unwrap().unwrap();
+        let alive = m.get_collection(&row.db, &row.physical).is_ok();
+        let tombstone = m.collection_dropped_at(id).unwrap().is_some();
+        assert!(
+            alive || tombstone,
+            "the stage {} has no live collection and no tombstone",
+            row.physical
+        );
+    }
+}
+
+#[test]
+fn a_doomed_stage_this_member_holds_is_buried_at_the_stamp_of_its_own_visible_event() {
+    let w = a_sender_that_doomed_a_stage();
+    let (j, _dj) = engine();
+    j.apply_batch(std::slice::from_ref(&w.creations[0])).unwrap();
+    assert!(
+        j.get_collection(DB, DOOMED).is_ok(),
+        "premise: the receiver holds the doomed stage alive"
+    );
+    pull(&j, &w.sender);
+    assert!(j.get_collection(DB, DOOMED).is_err(), "the receiver buried it by its own test");
+    assert_eq!(
+        j.collection_dropped_at(CollectionId::derive(DB, DOOMED)).unwrap(),
+        Some(w.bind2.stamp),
+        "at the stamp of its own visible event"
+    );
+    let doomed = j.out_buried().into_iter().find(|(cause, _)| *cause == "doomed");
+    assert!(doomed.is_some_and(|(_, n)| n >= 1), "and the burial is counted as doomed");
+    assert_stage_invariant(&j);
+}
+
+#[test]
+fn a_doomed_stage_held_nowhere_here_gets_its_own_tombstone_at_the_stamp_of_its_visible_event() {
+    let w = a_sender_that_doomed_a_stage();
+    let (j, _dj) = engine();
+    let doomed = CollectionId::derive(DB, DOOMED);
+    let page = w.sender.snapshot_page(None, None).unwrap();
+    assert!(
+        listed_not_alive(&page).contains(&doomed.0),
+        "premise: the sender lists the doomed stage"
+    );
+    assert!(
+        j.get_collection(DB, DOOMED).is_err(),
+        "premise: the receiver holds no collection of it"
+    );
+    assert_eq!(j.collection_dropped_at(doomed).unwrap(), None, "premise: and no tombstone");
+    assert_ne!(
+        w.bind1.stamp, w.bind2.stamp,
+        "premise: two events were visible in turn on the sender"
+    );
+    pull(&j, &w.sender);
+    assert_eq!(
+        j.collection_dropped_at(doomed).unwrap(),
+        Some(w.bind2.stamp),
+        "its own tombstone, at the stamp of the event visible after the join, not the sender's"
+    );
+    assert_stage_invariant(&j);
+}
+
+#[test]
+fn a_stage_alive_at_the_sender_is_not_listed_and_is_not_buried_by_the_listing() {
+    let w = a_sender_that_doomed_a_stage();
+    let live = CollectionId::derive(DB, LIVE2);
+    let page = w.sender.snapshot_page(None, None).unwrap();
+    assert!(
+        !listed_not_alive(&page).contains(&live.0),
+        "a stage alive at the sender is not listed"
+    );
+    assert!(
+        listed_not_alive(&page).contains(&CollectionId::derive(DB, DOOMED).0),
+        "premise: the list is not empty: it names the stage the sender doomed"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &w.sender);
+    assert!(j.get_collection(DB, LIVE2).is_ok(), "the receiver holds the live stage");
+    assert_eq!(j.collection_dropped_at(live).unwrap(), None, "and holds no tombstone for it");
+}
+
+#[test]
+fn a_listed_stage_whose_creation_is_above_the_grant_is_left_alone_and_the_join_completes() {
+    let w = a_sender_that_doomed_a_stage();
+    let doomed = CollectionId::derive(DB, DOOMED);
+    let below = w.creations[0].stamp.hlc.predecessor();
+    let patch = |page: &mut crate::SnapshotPage| {
+        // the grant for the author of the stages is below the doomed stage's creation: the creation is not this join's
+        page.versions.insert(w.a.origin(), below);
+    };
+    let page = w.sender.snapshot_page(None, None).unwrap();
+    assert!(
+        listed_not_alive(&page).contains(&doomed.0),
+        "premise: the sender lists the doomed stage"
+    );
+    let (j, _dj) = engine();
+    let (progress, result) = pull_patched(&j, &w.sender, &patch);
+    result.expect("the join completes");
+    assert!(progress.is_complete(), "the pull completes");
+    assert_eq!(
+        j.collection_dropped_at(doomed).unwrap(),
+        None,
+        "a stage whose creation is above the grant is not this join's: no tombstone"
+    );
+}
+
+#[test]
+fn a_listed_id_this_member_has_no_stage_row_for_is_skipped() {
+    let w = a_sender_that_doomed_a_stage();
+    let ghost = CollectionId::derive(DB, "orders.__stg.zz");
+    let patch = |page: &mut crate::SnapshotPage| {
+        if let Some(carry) = &mut page.register {
+            carry.not_alive.push(serde_bytes::ByteBuf::from(ghost.0.to_be_bytes().to_vec()));
+        }
+    };
+    let (j, _dj) = engine();
+    let (progress, result) = pull_patched(&j, &w.sender, &patch);
+    result.expect("the join completes");
+    assert!(progress.is_complete(), "the pull completes");
+    assert_eq!(
+        j.collection_dropped_at(ghost).unwrap(),
+        None,
+        "an id with no stage row gets no tombstone"
+    );
+}
+
+#[test]
+fn the_carrys_measure_counts_the_list_of_stages_not_alive() {
+    let w = a_sender_that_doomed_a_stage();
+    let page = w.sender.snapshot_page(None, None).unwrap();
+    let carry = page.register.expect("the last page carries the register");
+    assert!(!carry.not_alive.is_empty(), "premise: the list is not empty");
+    let mut without = carry.clone();
+    without.not_alive.clear();
+    assert!(
+        carry.encoded_len() >= without.encoded_len() + 8 * carry.not_alive.len(),
+        "the list is in the measure, so the cap and the gauge count it"
+    );
 }
