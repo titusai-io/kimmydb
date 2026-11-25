@@ -1295,3 +1295,87 @@ fn a_document_with_no_collection_that_the_grant_does_not_cover_is_counted_false_
     let (j, _dj) = pull_documents_that_have_no_collection(false);
     assert_eq!(j.snapshot_documents_skipped(), vec![("true", 0), ("false", 1)]);
 }
+
+// -- Unit C2a, the stage's stamp in the seed: an identity that stands as the remains of the drop ----------------------------------------------
+
+/// A `DropCollection` of `orders` stamped at `wall_ms` by `by`.
+fn drop_of_orders(by: &Engine, wall_ms: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::DropCollection,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: None,
+        body: Some(bson::serialize_to_vec(&kimmy_core::CollectionRef::new(DB, "orders")).unwrap()),
+        meta: None,
+    }
+}
+
+/// The creation of `orders` and one write stamped a few milliseconds above it, both made on a third member.
+fn a_life_and_a_later_write() -> (Vec<OplogEntry>, tempfile::TempDir) {
+    let (s, d) = engine();
+    let orders = s.create_collection(DB, "orders").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    s.insert(&orders, doc! { "_id": 1, "v": "after the drop" }).unwrap();
+    (everything(&s), d)
+}
+
+#[test]
+fn a_stage_a_page_makes_is_judged_by_its_creation_against_the_drop_the_identity_stands_as_the_remains_of()
+ {
+    // The seed reads the stage's creation only when the identity STANDS as the remains of the drop (a write stamped above the drop
+    // kept it, and the survivors path re-dated it): the swap began below the drop, and the drop is the name's, or it began above it,
+    // and the drop was an ordinary one of an earlier life. (a) the stage is created below the drop: the seed writes the logical drop
+    // and the remains are ended in the page's transaction. (b) above it: nothing is seeded and the identity goes on serving.
+    for (stage_below_the_drop, seeded) in [(true, 1usize), (false, 0usize)] {
+        let (s, life, _ds) = if stage_below_the_drop {
+            let s = swap(&[]);
+            let (life, ds) = a_life_and_a_later_write();
+            (s, life, ds)
+        } else {
+            let (life, ds) = a_life_and_a_later_write();
+            (swap(&[]), life, ds)
+        };
+        let created = life
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection)
+            .expect("the life's creation")
+            .stamp
+            .hlc
+            .wall_ms;
+        let drop = drop_of_orders(&s.a, created + 1);
+        let write = life.iter().find(|e| e.kind == OpKind::Insert).expect("the write");
+        assert!(write.stamp.hlc > drop.stamp.hlc, "premise: the write is stamped after the drop");
+        assert_eq!(
+            s.creation.stamp < drop.stamp,
+            stage_below_the_drop,
+            "premise: the stage was created below the drop in case (a) and above it in case (b)"
+        );
+        let (m, _dm) = engine();
+        window(&m, &life);
+        window(&m, std::slice::from_ref(&drop));
+        let kept = m.get_collection(DB, "orders").expect("premise: the identity stands");
+        assert!(
+            kept.is_redated(),
+            "premise: the drop that the write survived re-dated the identity"
+        );
+        assert_eq!(
+            kept.created,
+            drop.stamp.hlc.successor(),
+            "premise: its creation is the successor of the drop"
+        );
+        assert_eq!(the_logical_drops_of_orders(&m), 0, "premise: the register holds no drop yet");
+        let (id, page, _) = the_page_of_the_stage(&s);
+        m.apply_snapshot_page(s.sender.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        assert_eq!(
+            the_logical_drops_of_orders(&m),
+            seeded,
+            "the drop is the name's logical drop only when the stage was created below it"
+        );
+        assert_eq!(
+            m.get_collection(DB, "orders").is_ok(),
+            seeded == 0,
+            "the remains of the drop are ended with the seed, and the identity serves without it"
+        );
+    }
+}
