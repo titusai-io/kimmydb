@@ -879,3 +879,105 @@ fn a_target_that_appears_between_the_checks_and_the_publish_is_left_untouched_an
         .collect();
     assert_eq!(names, vec!["kimmy.redb".to_string()], "and no temporary file is left beside it");
 }
+
+// -- The refusals no other test reaches, and the stale temporary file (a guard commit: the code is unchanged) --------------------------------
+
+#[test]
+fn a_register_row_whose_key_is_the_wrong_length_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let row = records
+        .iter_mut()
+        .find(|(tag, _, _)| *tag == T_REGISTER)
+        .expect("premise: the backup carries a REGISTER row");
+    row.1.pop();
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("wrong length"),
+        "a register row key of the wrong length is refused by its own check: {error}"
+    );
+}
+
+#[test]
+fn a_stage_row_of_the_wrong_shape_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let stage = records(&bytes)
+        .into_iter()
+        .find(|(tag, _, value)| *tag == T_REGISTER_STAGES && value.ends_with(BOUND.as_bytes()))
+        .expect("premise: the backup carries the bound stage's row");
+    let fixed = Stamp::KEY_LEN + kimmy_core::HLC_ENCODED_LEN;
+    let mut overrun = stage.2.clone();
+    overrun[fixed..fixed + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+    let cases = [
+        ("a key that is not eight bytes", stage.1[..7].to_vec(), stage.2.clone()),
+        ("a value that ends before its names", stage.1.clone(), stage.2[..fixed].to_vec()),
+        ("a database name longer than the row", stage.1.clone(), overrun),
+    ];
+    for (what, key, value) in cases {
+        let mut records = records(&bytes);
+        records.retain(|(tag, k, _)| *tag != T_REGISTER_STAGES || *k != stage.1);
+        records.push((T_REGISTER_STAGES, key, value));
+        let error = refused(&rebuilt(&bytes, &records));
+        assert!(
+            error.contains("a stage row does not decode"),
+            "a stage row of the wrong shape is refused by its own check ({what}): {error}"
+        );
+    }
+}
+
+#[test]
+fn a_binding_whose_stage_row_names_another_logical_id_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let row = records
+        .iter_mut()
+        .find(|(tag, _, _)| *tag == T_REGISTER)
+        .expect("premise: the backup carries the binding's row");
+    // the binding's row is filed under another name's id: its stage's names derive `orders`, not that
+    let elsewhere = CollectionId::derive(DB, "elsewhere").0.to_be_bytes();
+    row.1[..8].copy_from_slice(&elsewhere);
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("binding without its stage row"),
+        "a binding whose stage row names another logical id is refused as having none: {error}"
+    );
+}
+
+#[test]
+fn a_hidden_recreation_the_register_has_no_row_for_refuses_the_restore() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, std::slice::from_ref(&drop_of(&w.author, at(&w, 5))));
+    m.create_collection(DB, "orders").expect("the name is made again");
+    let recreation = served(&m);
+    assert!(kimmy_core::is_recreation_name(&recreation), "premise: a recreation holds the name");
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    records.retain(|(tag, _, _)| *tag != T_REGISTER);
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains(&recreation),
+        "a hidden recreation the register has no row for is refused, by name: {error}"
+    );
+}
+
+#[test]
+fn a_stale_temporary_file_from_an_earlier_crash_does_not_stop_a_restore() {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    let bytes = backup_of(&m);
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    let stale = dir.path().join("kimmy.redb.restoring");
+    std::fs::write(&stale, b"half of an earlier restore").expect("the stale file is made");
+    crate::backup::restore(&path, &mut &bytes[..])
+        .expect("a stale temporary file from an earlier crash does not stop a restore");
+    assert!(!stale.exists(), "the stale temporary file is gone after the restore");
+    let r = Engine::open(&path).expect("the restored store opens");
+    assert!(
+        resolves(&r) == Ok(BOUND.to_string()),
+        "the restored store answers as the member it came from did"
+    );
+}
