@@ -124,8 +124,24 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside a replicated window's write transaction, which does not stop (ADR-192): one row per held mark, the table `held_marks_covered_by` already reads whole on every pull (ADR-172); drops a mark only where the servable vector already covers it",
     ),
     (
-        "backup::restore_with",
-        "`kimmyd restore`, which writes a new store offline before any node opens it: the held marks are derived from the oplog it just wrote (ADR-244)",
+        "backup::restore_to_temp",
+        "`kimmyd restore`, which writes a new store to a temporary file beside the target offline, before any node opens it: the held marks are derived from the oplog it just wrote (ADR-244), and the register's rows are copied from the one backup stream it reads (ADR-272; Q6.6, unit A)",
+    ),
+    (
+        "register::carried_rows",
+        "the four register tables of ONE member, read whole in the read transaction of a backup (`kimmyd backup`, which serves no client): one row per event of a swapped name and per stage the member has met, bounded by the member's own register (ADR-272; Q6.6, unit A)",
+    ),
+    (
+        "register::raw_rows",
+        "a register table of the temporary store a restore has just written, which no node has opened: one row per event and per stage of the backup, read inside the restore's own write transaction (ADR-272; Q6.6, unit A)",
+    ),
+    (
+        "register::check_restored",
+        "the consistency check of a restore, inside its write transaction on a temporary store no node has opened: reads the carried version vector, the register's tables and the collections table once, bounded by the backup's own contents, with nothing waiting on it (ADR-272; Q6.6, unit A)",
+    ),
+    (
+        "backup_register_tests::a_restore_leaves_no_purge_deferral_whatever_the_source_held",
+        "test code counting the rows of a table in a store it wrote itself",
     ),
     (
         "database_tombstone::Engine::record_database_tombstone_in",
