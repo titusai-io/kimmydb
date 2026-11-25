@@ -1200,6 +1200,7 @@ impl WriteTxn<'_> {
                     db = %burial.db,
                     collection = %burial.logical,
                     by = LIFE_BURIAL_LABELS[burial.by as usize],
+                    asker = burial.asker,
                     dropped = ?burial.dropped,
                     life_created = ?burial.life_created,
                     remains_of_the_drop = burial.remains_of_the_drop,

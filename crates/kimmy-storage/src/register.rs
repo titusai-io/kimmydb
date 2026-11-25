@@ -808,7 +808,13 @@ pub(crate) fn release(
     // whether an event is in effect, which this one is about to be: once, here, for both of the ways a parked event is released (a window
     // that carries it, `release_ddl_mark_with_effect`, and a grant that covers it, `release_covered`), whose callers settle the name after.
     seed_for_event(txn, db, logical, &event)?;
-    store(txn, tables::REGISTER, db, logical, *stamp, event).map(Some)
+    let is_a_drop = matches!(event, RegisterEvent::LogicalDrop);
+    let put = store(txn, tables::REGISTER, db, logical, *stamp, event)?;
+    // A drop that was only information takes effect: over a life made after it, it buries it, and that is the loss of the decision
+    if is_a_drop && put == Put::Stored {
+        note_drop_burial(txn, db, logical, *stamp)?;
+    }
+    Ok(Some(put))
 }
 
 /// The stamps of the information rows (events known ahead of their position) that are among `stamps`.
@@ -954,7 +960,11 @@ pub(crate) enum SeedAsk {
 impl SeedAsk {
     /// The asker in the words of the warning that reports a life a seed buried.
     pub(crate) fn label(self) -> &'static str {
-        ""
+        match self {
+            SeedAsk::StageCreation => "stage_creation",
+            SeedAsk::Binding => "binding",
+            SeedAsk::NoStage => "event_without_a_stage",
+        }
     }
 }
 
@@ -1037,6 +1047,7 @@ pub(crate) fn seed_from_the_tombstone(
     if let (true, Some(meta)) = (wrote, &standing) {
         note_life_burial(LifeBurial {
             by: LifeBurialBy::Seed,
+            asker: ask.label(),
             db: db.to_string(),
             logical: logical.to_string(),
             dropped,
@@ -1059,6 +1070,9 @@ pub(crate) enum LifeBurialBy {
 /// A standing life the register buried (ADR-272, decision 6): the route, the drop it was buried by, and the life.
 pub(crate) struct LifeBurial {
     pub(crate) by: LifeBurialBy,
+    /// Who asked for the drop that buried it, for the warning: the seed's asker (a stage's creation, a binding), or `drop` for a logical
+    /// drop taking effect. An ordinary `$out` replacement reads as the first; the loss of a life made without knowing of one, as either.
+    pub(crate) asker: &'static str,
     pub(crate) db: String,
     pub(crate) logical: String,
     /// The drop's stamp: the tombstone the seed put in the register, or the replicated drop that took effect.
@@ -1098,6 +1112,7 @@ pub(crate) fn note_drop_burial(
     if standing.created > dropped.hlc {
         note_life_burial(LifeBurial {
             by: LifeBurialBy::Drop,
+            asker: "drop",
             db: db.to_string(),
             logical: logical.to_string(),
             dropped,
@@ -1408,6 +1423,10 @@ pub(crate) fn apply_carried(
                     table.insert(*key, *value)?;
                     stored.push(*stamp);
                     wrote = true;
+                    // a drop in the carry takes effect over a life this member made after it: the pass buries it, and it is counted
+                    if matches!(event, RegisterEvent::LogicalDrop) {
+                        note_drop_burial(txn, db, logical, *stamp)?;
+                    }
                 }
                 Put::Duplicate => {}
                 Put::UnknownStage => {
