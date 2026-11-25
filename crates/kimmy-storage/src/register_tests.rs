@@ -309,3 +309,28 @@ fn a_stage_row_of_the_form_before_it_named_its_stage_is_refused_with_the_wipe() 
         "the refusal names what it is and the wipe: {refused}"
     );
 }
+
+/// The standing lives the register buries are noted for the commit in a list of the thread that made them (`register::note_drop_burial`
+/// and the seed), and read back by the same thread: that holds only if a write transaction cannot move between threads. `WriteTxn` holds
+/// the writer's gate, a guard that is not `Send`; `WriteTxn: Send` would make this ambiguous and fail to compile.
+#[test]
+fn a_write_transaction_cannot_move_between_threads() {
+    // an associated const and not a function: the source scan of `no_write_path_mints_a_stamp_before_it_takes_the_writer` reads a one-line
+    // `fn x() {}` of a file with no test module as a function that never closes
+    trait AmbiguousIfSend<A> {
+        const CHECK: () = ();
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    let () = <crate::engine::WriteTxn<'static> as AmbiguousIfSend<_>>::CHECK;
+}
+
+/// The asker of a seed is named in the warning that reports a life it buried: a stage's creation, a binding, or an event that names no
+/// stage, so that an operator can tell an ordinary `$out` replacement from the loss of a life made without knowing of one.
+#[test]
+fn the_asker_of_a_seed_is_named_in_its_own_words() {
+    use crate::register::SeedAsk;
+    assert_eq!(SeedAsk::StageCreation.label(), "stage_creation");
+    assert_eq!(SeedAsk::Binding.label(), "binding");
+    assert_eq!(SeedAsk::NoStage.label(), "event_without_a_stage");
+}

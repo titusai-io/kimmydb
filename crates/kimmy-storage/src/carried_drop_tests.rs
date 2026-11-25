@@ -14,6 +14,7 @@ use kimmy_core::{
     CollectionBind, CollectionId, Hlc, MergePolicy, OpKind, OplogEntry, Stamp, VersionVector,
 };
 
+use crate::seed_asymmetry_tests::life_burials;
 use crate::{Engine, PeerWindow, SnapshotProgress, SyncOutcome, WalkScope, physical_now_ms};
 
 const DB: &str = "app";
@@ -3060,6 +3061,41 @@ fn a_stage_above_the_receivers_drop_seeds_none_and_the_ends_equal_at_the_names_n
         the_events_of_orders(&r),
         the_events_of_orders(&sender),
         "and the two registers are equal: the sender seeds the drop from its own tombstone when it judges the binding"
+    );
+}
+
+// -- A life a logical drop in a snapshot's carry buries is counted too (ADR-272, decision 6) ------------------------------------------
+
+#[test]
+fn a_logical_drop_in_a_snapshots_carry_over_a_life_made_after_it_counts_the_life_it_buried() {
+    // The sender swapped `orders`, and its register holds a drop of the name just above the binding. The joiner made the name again after
+    // that drop, on its own, and meets the carry: the drop takes effect over the life it made and buries it, and the burial is counted by
+    // the drop route as it is when the drop arrives in a window or is released.
+    let s = swap(&[]);
+    let drop_at = Stamp::new(s.bind.stamp.hlc.successor(), s.a.node_id(), s.a.epoch());
+    let (j, _dj) = engine();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let orders = j.create_collection(DB, "orders").unwrap();
+    j.insert(&orders, doc! { "_id": 1, "v": "made after the drop" }).unwrap();
+    assert!(orders.created > drop_at.hlc, "premise: the life was made after the drop");
+    assert!(served_by(&j).is_ok(), "premise: the joiner serves the life it made");
+    let patch = |page: &mut crate::SnapshotPage| {
+        page.versions.observe(drop_at);
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&drop_at, &kimmy_core::RegisterEvent::LogicalDrop));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    assert!(
+        the_events_of_orders(&j).iter().any(|(stamp, _)| *stamp == drop_at),
+        "premise: the carried drop is in effect on the joiner"
+    );
+    assert!(served_by(&j).is_err(), "the life the joiner made is buried: the name is dropped");
+    assert_eq!(
+        (life_burials(&j, "drop"), life_burials(&j, "seed")),
+        (1, 0),
+        "the carry counts the life its drop buried, by the drop route"
     );
 }
 

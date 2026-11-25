@@ -130,6 +130,19 @@ pub(crate) fn life_burials(e: &Engine, by: &str) -> u64 {
         .expect("the route is a label of the count")
 }
 
+/// What `e` holds: every collection, hidden ones included, as (database, name, id), in order. Two members that agree on what the name
+/// answers must also agree on this, or anti-entropy keeps planning repairs between them.
+fn held(e: &Engine) -> Vec<(String, String, u64)> {
+    let mut held: Vec<_> = e
+        .all_collections()
+        .unwrap()
+        .into_iter()
+        .map(|meta| (meta.db, meta.name, meta.id.0))
+        .collect();
+    held.sort();
+    held
+}
+
 fn a_pause() {
     std::thread::sleep(std::time::Duration::from_millis(5));
 }
@@ -146,6 +159,9 @@ struct Ends {
     /// The standing lives the seed buried on each (`life_burials(_, "seed")`).
     m_burials: u64,
     other_burials: u64,
+    /// What each holds (`held`).
+    m_held: Vec<(String, String, u64)>,
+    other_held: Vec<(String, String, u64)>,
 }
 
 /// Probe 1: the drop, then a stage above it, then a life made after it.
@@ -185,6 +201,8 @@ fn drop_first_stage_above_then_a_create() -> Ends {
         other_drops: the_logical_drops_of_orders(&s),
         m_burials: life_burials(&m, "seed"),
         other_burials: life_burials(&s, "seed"),
+        m_held: held(&m),
+        other_held: held(&s),
         drop,
     }
 }
@@ -227,6 +245,8 @@ fn stage_below_then_a_drop_and_a_create() -> Ends {
         other_drops: the_logical_drops_of_orders(&t),
         m_burials: life_burials(&m, "seed"),
         other_burials: life_burials(&t, "seed"),
+        m_held: held(&m),
+        other_held: held(&t),
         drop,
     }
 }
@@ -239,6 +259,7 @@ fn a_stage_above_a_drop_does_not_hide_the_life_made_after_it_on_the_member_that_
     assert!(e.m_drops.is_empty(), "no drop was seeded: the stage began above it");
     assert!(e.other_drops.is_empty(), "and S holds none");
     assert_eq!((e.m_burials, e.other_burials), (0, 0), "and no life was buried by a seed");
+    assert_eq!(e.m_held, e.other_held, "and M and S hold the same collections, with the same ids");
 }
 
 #[test]
@@ -252,6 +273,25 @@ fn a_stage_below_a_drop_ends_the_life_made_after_it_on_every_member() {
     );
     assert_eq!(e.m_drops, vec![e.drop.stamp], "M holds the drop");
     assert_eq!(e.other_drops, vec![e.drop.stamp], "and T holds the same drop");
+    // What each holds differs by one collection, and it is accepted for 0.62 (ruled): T's life was buried by its seed, so T holds none; M met
+    // the stage first, and T's creation of `orders` arrived after M's seed put the drop in effect, so M holds an empty identity that its name
+    // answers NOT FOUND for (the register's drop hides it, and nothing settles the name after a creation of the identity). Both answer NOT
+    // FOUND; apart from that collection the two hold the same, with the same ids. Anti-entropy does not heal it, and the check found how it
+    // behaves: T, the member without the collection, reads `divergent_collections` 1 on every check from its second tick and plans one count
+    // repair per cooldown (`REPAIR_COOLDOWN_ROUNDS`, 60 contacts) that never clears it; M reports nothing; nothing is client-visible. It is
+    // fixed with the database-drop unit after 0.62.
+    assert!(
+        e.m_held.iter().any(|(_, name, _)| name == "orders"),
+        "M holds the hidden, empty identity: {:?}",
+        e.m_held
+    );
+    assert!(
+        !e.other_held.iter().any(|(_, name, _)| name == "orders"),
+        "T holds none: {:?}",
+        e.other_held
+    );
+    let apart: Vec<_> = e.m_held.iter().filter(|(_, name, _)| name != "orders").cloned().collect();
+    assert_eq!(apart, e.other_held, "and apart from it M and T hold the same, with the same ids");
 }
 
 #[test]
@@ -267,4 +307,83 @@ fn the_life_a_seed_buries_is_counted_on_the_member_that_made_it_and_only_there()
         e.m_burials, 0,
         "M's identity was absent when its seed was made: no life was buried"
     );
+}
+
+/// What each member answers for the name, and what it holds (`held`), in the order A, B, L.
+type MemberAnswers = Vec<(Result<String, String>, Vec<(String, String, u64)>)>;
+
+/// Three members and the entries each would send: A made a stage of `orders`; B, which held `orders` and did not know the stage, dropped
+/// the name after it; and L, which had heard neither, dropped the DATABASE after that and made the name again. `meets[m]` is the order in
+/// which member `m` (A, B, L) meets the other two, and then every member meets every other once more, as anti-entropy would. What each
+/// answers for the name, and what each holds, in the order A, B, L.
+fn three_members_that_meet_in(meets: [[usize; 2]; 3]) -> MemberAnswers {
+    let (b, _db) = with_orders();
+    let (a, _da) = engine();
+    let (l, _dl) = engine();
+    window(&a, &everything(&b));
+    window(&l, &everything(&b));
+    assert!(
+        a.get_collection(DB, "orders").is_ok() && l.get_collection(DB, "orders").is_ok(),
+        "premise: A and L follow B"
+    );
+    a_pause();
+    let creation = a_stage(&a);
+    a_pause();
+    assert!(
+        b.drop_collection(DB, "orders").unwrap(),
+        "premise: B's client drops orders, not knowing the stage"
+    );
+    let drop = the_drop_of_orders(&b);
+    assert!(creation.stamp.hlc < drop.stamp.hlc, "premise: the stage is created below B's drop");
+    a_pause();
+    assert!(l.drop_database(DB).unwrap(), "premise: L drops the database, having heard neither");
+    a_pause();
+    l.create_collection(DB, "orders").unwrap();
+    assert_eq!(served_by(&l), Ok("orders".to_string()), "premise: L serves the life it made");
+    let members = [&a, &b, &l];
+    let sent = [everything(&a), everything(&b), everything(&l)];
+    for (member, order) in meets.iter().enumerate() {
+        for other in order {
+            window(members[member], &sent[*other]);
+        }
+    }
+    for member in 0..3 {
+        for other in (0..3).filter(|other| *other != member) {
+            window(members[member], &everything(members[other]));
+        }
+    }
+    members.iter().map(|m| (served_by(m), held(m))).collect()
+}
+
+// A KNOWN LIMITATION for 0.62 (ADR-272, decision 5), pre-existing (it diverges the same at 10317639, before the seed rule): a database drop
+// that races a swap. A member that holds the stage when the name's ordinary drop arrives takes it as a logical drop, and that drop (and the
+// ordinary drop of the name that the database's drop writes just above itself) hides a life made after the database's drop; a member whose
+// database drop reached it first refuses the stage as history, never learns of the swap, and serves that life. The members disagree for
+// good, and the one that answers NOT FOUND still holds the collection, so anti-entropy has nothing to find. The body asserts convergence,
+// so that the unit that fixes it, after 0.62, is told when it has: remove the `ignore` there. The disagreement is counted where it
+// happens (`kimmy_register_hidden_creations_total`).
+#[test]
+#[ignore = "known limitation for 0.62, a database drop racing a swap (decision 5): fixed as its own unit after 0.62"]
+fn three_members_that_met_a_drop_a_database_drop_and_a_new_life_agree_in_every_order() {
+    const ORDERS: [[usize; 2]; 2] = [[0, 1], [1, 0]];
+    // A meets B and L, B meets A and L, L meets A and B: each in either order, so eight runs
+    for run in 0..8usize {
+        let pick = |member: usize| -> [usize; 2] {
+            let others: Vec<usize> = (0..3).filter(|o| *o != member).collect();
+            let order = ORDERS[(run >> member) & 1];
+            [others[order[0]], others[order[1]]]
+        };
+        let meets = [pick(0), pick(1), pick(2)];
+        let ends = three_members_that_meet_in(meets);
+        for (member, (answer, holds)) in ends.iter().enumerate().skip(1) {
+            assert_eq!(
+                answer, &ends[0].0,
+                "member {member} answers as A does, meeting in {meets:?}"
+            );
+            assert_eq!(
+                holds, &ends[0].1,
+                "member {member} holds what A holds, meeting in {meets:?}"
+            );
+        }
+    }
 }

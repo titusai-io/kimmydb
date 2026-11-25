@@ -951,6 +951,13 @@ pub(crate) enum SeedAsk {
     NoStage,
 }
 
+impl SeedAsk {
+    /// The asker in the words of the warning that reports a life a seed buried.
+    pub(crate) fn label(self) -> &'static str {
+        ""
+    }
+}
+
 /// The first event of a name seeds the register from the identity's drop (Q6.4 item 1b): a member that applied a drop of the
 /// name before it knew of any swap holds that drop only as the identity's tombstone, and the event that arrives afterwards
 /// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name

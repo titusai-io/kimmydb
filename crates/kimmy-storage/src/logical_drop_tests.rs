@@ -912,6 +912,52 @@ fn a_held_stage_whose_creation_row_is_gone_counts_as_older_than_the_drop() {
 }
 
 #[test]
+fn a_drop_known_ahead_of_its_position_and_released_buries_the_life_made_after_it_and_counts_it() {
+    // The route of a drop that is information first: the stage is held, the drop below which it was created is known ahead of its
+    // position (parked), the life of the name made after it arrives from another member (a client's own creation of a name with a drop
+    // known ahead of its position is a recreation, which the drop does not bury), and then a window carries the drop and releases it. It
+    // takes effect over the life made after it and buries it, as it does when it arrives in position, and the burial is counted too.
+    let w = world();
+    let (x, _dx) = engine();
+    let drop = drop_of(&x, w.creation.stamp.hlc.wall_ms + 1);
+    assert!(w.creation.stamp < drop.stamp, "premise: the stage is created below the drop");
+    let (m, _dm) = engine();
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap(); // the stage is held
+    m.apply_batch(std::slice::from_ref(&drop)).unwrap(); // known ahead of its position
+    assert_eq!(
+        parked_events(&m),
+        vec![drop.stamp],
+        "premise: the drop is known ahead of its position"
+    );
+    let (p, _dp) = engine();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let orders = p.create_collection(DB, "orders").unwrap();
+    assert!(orders.created > drop.stamp.hlc, "premise: the life was made after the drop");
+    let life = everything(&p)
+        .into_iter()
+        .find(|e| {
+            e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive(DB, "orders")
+        })
+        .expect("premise: the member logged the creation");
+    m.apply_batch(std::slice::from_ref(&life)).unwrap();
+    assert!(serves_the_identity(&m), "premise: the life serves while the drop is only information");
+    assert_eq!(
+        (life_burials(&m, "drop"), life_burials(&m, "seed")),
+        (0, 0),
+        "premise: nothing is counted yet"
+    );
+    window(&m, std::slice::from_ref(&drop));
+    assert!(parked_events(&m).is_empty(), "the drop is released: it is no longer only information");
+    assert_eq!(register_events(&m), vec![drop.stamp], "and it is in effect");
+    assert!(!serves_the_identity(&m), "the life made after the drop is buried by it");
+    assert_eq!(
+        (life_burials(&m, "drop"), life_burials(&m, "seed")),
+        (1, 0),
+        "the release counts the life it buried, by the drop route"
+    );
+}
+
+#[test]
 fn a_drop_below_the_stage_is_logical_when_a_drop_known_ahead_of_its_position_is_all_that_is_in_the_way()
  {
     // The stage is held and a later drop of the name is known ahead of its position (a parked LogicalDrop): an event of the swap's own
