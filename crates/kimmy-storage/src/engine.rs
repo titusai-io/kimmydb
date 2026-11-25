@@ -6293,49 +6293,67 @@ impl Engine {
     fn resolve_in(&self, txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
         use crate::register::VisibleKind;
         let newest = crate::register::newest_stored_event_read(txn, db, name)?;
-        if newest.is_some() {
-            let row = crate::register::visible_row_read(txn, db, name)?;
-            if let Some(row) = row.filter(|row| row.newest_event == newest) {
-                let not_found = || -> StorageError {
-                    CoreError::CollectionNotFound {
-                        db: db.to_string(),
-                        collection: name.to_string(),
-                    }
+        // No event is in effect for the name: the timeline is empty and shows the identity (`Timeline::visible`), so the identity
+        // answers or the name is absent, as the computation says, without opening the register again or building a timeline. There is no
+        // row either: it is read only for a name with events.
+        if newest.is_none() {
+            return Self::resolve_identity(txn, db, name);
+        }
+        let row = crate::register::visible_row_read(txn, db, name)?;
+        if let Some(row) = row.filter(|row| row.newest_event == newest) {
+            let not_found = || -> StorageError {
+                CoreError::CollectionNotFound { db: db.to_string(), collection: name.to_string() }
                     .into()
-                };
-                let collections = txn.open_table(tables::COLLECTIONS)?;
-                let alive = |physical: &str| -> Result<Option<CollectionMeta>> {
-                    match collections.get((db, physical))? {
-                        Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
-                        None => Ok(None),
-                    }
-                };
-                match row.kind {
-                    VisibleKind::Dropped => return Err(not_found()),
-                    VisibleKind::Identity => {
-                        // No event makes a physical visible, so the identity answers; with none, the name is absent, as the
-                        // computation says. The row stays right: a collection that arrives deletes it (`forget_visible_row`)
-                        return match alive(name)? {
-                            Some(meta) => {
-                                Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
-                            }
-                            None => Err(not_found()),
-                        };
-                    }
-                    VisibleKind::Bound | VisibleKind::Created => {
-                        if let Some(meta) = alive(&row.physical)? {
-                            return Ok(Resolved {
-                                physical: row.physical.clone(),
-                                meta,
-                                visible: row.event,
-                            });
+            };
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let alive = |physical: &str| -> Result<Option<CollectionMeta>> {
+                match collections.get((db, physical))? {
+                    Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+                    None => Ok(None),
+                }
+            };
+            match row.kind {
+                VisibleKind::Dropped => return Err(not_found()),
+                VisibleKind::Identity => {
+                    // No event makes a physical visible, so the identity answers; with none, the name is absent, as the
+                    // computation says. The row stays right: a collection that arrives deletes it (`forget_visible_row`)
+                    return match alive(name)? {
+                        Some(meta) => {
+                            Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
                         }
+                        None => Err(not_found()),
+                    };
+                }
+                VisibleKind::Bound | VisibleKind::Created => {
+                    if let Some(meta) = alive(&row.physical)? {
+                        return Ok(Resolved {
+                            physical: row.physical.clone(),
+                            meta,
+                            visible: row.event,
+                        });
                     }
                 }
             }
-            self.register_resolve_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        self.register_resolve_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::resolve_computed(txn, db, name)
+    }
+
+    /// The answer for a name with no event in effect: the collection of that name, or [`CoreError::CollectionNotFound`]. What
+    /// [`Self::resolve_computed`] answers of an empty timeline.
+    fn resolve_identity(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        match collections.get((db, name))? {
+            Some(v) => {
+                let meta: CollectionMeta = serde_json::from_slice(v.value())?;
+                Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
+            }
+            None => Err(CoreError::CollectionNotFound {
+                db: db.to_string(),
+                collection: name.to_string(),
+            }
+            .into()),
+        }
     }
 
     /// The resolution computed from the name's events and the collections that are alive: the truth the stored row is a cache of.
