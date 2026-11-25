@@ -713,7 +713,7 @@ pub(crate) fn put_seeding(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<(Put, bool)> {
-    let seeded = seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
+    let seeded = seed_for_event(txn, db, logical, &event)?;
     Ok((store(txn, tables::REGISTER, db, logical, stamp, event)?, seeded))
 }
 
@@ -737,7 +737,7 @@ pub(crate) fn park_seeding(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<(Put, bool)> {
-    let seeded = seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
+    let seeded = seed_for_event(txn, db, logical, &event)?;
     if timeline(txn, db, logical)?.events().iter().any(|(held, _)| *held == stamp) {
         return Ok((Put::Duplicate, seeded));
     }
@@ -752,6 +752,21 @@ fn stage_created_by(
     event: &RegisterEvent,
 ) -> Result<Option<Stamp>> {
     Ok(stage_of(txn, db, event)?.map(|stage| stage.created))
+}
+
+/// The seed an event asks for: a binding asks as a binding, with the creation of the stage it names; a recreation or a drop names no
+/// stage and asks as such ([`SeedAsk`]).
+fn seed_for_event(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    event: &RegisterEvent,
+) -> Result<bool> {
+    let ask = match event {
+        RegisterEvent::Bind { .. } => SeedAsk::Binding,
+        RegisterEvent::Create { .. } | RegisterEvent::LogicalDrop => SeedAsk::NoStage,
+    };
+    seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, event)?, ask)
 }
 
 fn store(
@@ -792,7 +807,7 @@ pub(crate) fn release(
     // register, so the event takes effect with no drop below it and the physical it makes visible would have no floor (F3). The seed asks
     // whether an event is in effect, which this one is about to be: once, here, for both of the ways a parked event is released (a window
     // that carries it, `release_ddl_mark_with_effect`, and a grant that covers it, `release_covered`), whose callers settle the name after.
-    seed_from_the_tombstone(txn, db, logical, stage_created_by(txn, db, &event)?)?;
+    seed_for_event(txn, db, logical, &event)?;
     store(txn, tables::REGISTER, db, logical, *stamp, event).map(Some)
 }
 
@@ -925,27 +940,48 @@ pub(crate) fn event_target(
     }
 }
 
+/// Who asks the seed (ADR-272, decision 6): the creation of a stage, a binding, or an event that names no stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeedAsk {
+    /// The creation of a stage of the name: an entry in a window, or a stage a snapshot page made.
+    StageCreation,
+    /// A binding (put, parked or released), with the creation of the stage it names.
+    Binding,
+    /// A recreation's `Create`, a logical drop, or a restart's seed: no stage is named.
+    NoStage,
+}
+
 /// The first event of a name seeds the register from the identity's drop (Q6.4 item 1b): a member that applied a drop of the
-/// name before it knew of any swap holds that drop only as the identity's tombstone, and the binding that arrives afterwards
+/// name before it knew of any swap holds that drop only as the identity's tombstone, and the event that arrives afterwards
 /// has to be judged against it, as it is on a member that knew of the swap when the drop arrived. With no event of the name
 /// in effect (one that is only ahead of its position does not count, F3), a tombstone is a logical drop at its stamp, and a binding stamped above it is not touched by it
 /// while one below it is buried by it, as on every other member. Returns whether it wrote the row, so that the caller settles
 /// the name: the seeded drop is in effect, and what it ends is buried in the same transaction, whatever became of the event
 /// that brought the seed (a first event that is only parked, or a binding judged invalid, included).
 ///
-/// The rule behind it: **a past drop of a name is a logical drop only if a stage of the name was created below it.** The
-/// identity not standing, the drop took it whole and the first event that arrives is judged against the drop as it is (no life
-/// is left for the seed to bury). The identity standing, a tombstone is also what an ordinary re-create leaves behind (the
-/// creation reads it for its floor and never removes it) and what a database's drop leaves on a life it spared, so the
-/// seed buries a standing life only when it is the remains this very drop re-dated (it keeps writes stamped after the drop,
-/// ADR-231, and its `created` is the drop's successor: a life created after the drop is not what the drop ended) and
-/// the swap began below the drop (`stage_created`, the creation of the stage the first event names, is below it). `None`
-/// is an event that names no stage, which never seeds on a standing identity.
+/// The rule behind it: **a past drop of a name is a logical drop only if a stage of the name was created below it.** What the
+/// stage's stamp alone cannot answer is a binding of a stage created ABOVE the drop on a member whose identity is gone: the drop has
+/// to be in the register below the binding all the same (it floors what the binding makes visible, F3), and the binding does not
+/// hide a later life, because the binding buries the identity whatever its age.
+///
+/// - **The identity absent** (the drop took it whole, and no life is left for the seed to bury): a stage's creation seeds only when
+///   the stage was created below the drop (a stage above it is one the drop never concerned, and a later life that a member made
+///   without knowing of the swap would be hidden by a drop no member that met the creation after it would hold); a binding seeds
+///   whatever the stage's stamp (F3); an event that names no stage seeds (the recreation's `Create`, Q6.6 unit C2e).
+/// - **The identity standing** (a life created after the drop, or the remains the drop kept): judged by the stage's stamp alone, for a
+///   stage's creation and for a binding: the stage created below the drop, the swap began below it and the life is the one the drop
+///   hides on every member that knew of the swap. An event that names no stage never seeds on a standing identity. A life lost this way
+///   is a life a member made without knowing of the swap (lost and reported).
+/// - **The database guard.** The tombstone a database's drop leaves on a collection (its stamp is the database's drop) is not a drop of a
+///   life made after it: such a life stands over the tombstone, the drop never ended it, and no stage met late makes it the swap's. It is
+///   never seeded over. What the database's drop DID end and keep (the remains it re-dated, `created` its successor) is still the
+///   drop's, and is buried by a swap that began below it as it is by a collection's drop.
 pub(crate) fn seed_from_the_tombstone(
     txn: &redb::WriteTransaction,
     db: &str,
     logical: &str,
     stage_created: Option<Stamp>,
+    ask: SeedAsk,
 ) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
     // only an event IN EFFECT keeps the seed away: an event that is still ahead of its position judged no drop, and a drop that arrived
@@ -965,12 +1001,26 @@ pub(crate) fn seed_from_the_tombstone(
         Some(raw) => Some(serde_json::from_slice::<crate::meta::CollectionMeta>(raw.value())?),
         None => None,
     };
-    if let Some(meta) = standing {
-        let remains_of_this_drop = meta.is_redated() && meta.created == dropped.hlc.successor();
-        let began_below = stage_created.is_some_and(|created| created < dropped);
-        if !(remains_of_this_drop && began_below) {
-            return Ok(false);
+    let began_below = stage_created.is_some_and(|created| created < dropped);
+    let seeds = match &standing {
+        Some(meta) => {
+            // the database guard: over the tombstone of a database's drop only the remains that very drop re-dated are its to bury
+            let by_the_database = txn
+                .open_table(tables::COLLECTIONS_DROPPED)?
+                .get(kimmy_core::database_drop_id(db).0)?
+                .map(|held| crate::codec::decode_oplog_key(held.value()))
+                .transpose()?
+                .is_some_and(|database| database == dropped);
+            let remains_of_this_drop = meta.is_redated() && meta.created == dropped.hlc.successor();
+            began_below && (remains_of_this_drop || !by_the_database)
         }
+        None => match ask {
+            SeedAsk::StageCreation => began_below,
+            SeedAsk::Binding | SeedAsk::NoStage => true,
+        },
+    };
+    if !seeds {
+        return Ok(false);
     }
     Ok(store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?
         == Put::Stored)
@@ -1096,7 +1146,7 @@ fn seed_above_the_grant(
     };
     match own {
         Some(stamp) if stamp.hlc > granted.get(stamp.origin()) => {
-            seed_from_the_tombstone(txn, db, logical, None)
+            seed_from_the_tombstone(txn, db, logical, None, SeedAsk::NoStage)
         }
         _ => Ok(false),
     }

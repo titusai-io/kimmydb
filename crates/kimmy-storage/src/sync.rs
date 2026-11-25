@@ -3401,18 +3401,16 @@ impl Engine {
         }
     }
 
-    /// Whether the replicated drop `entry` of `target` is a logical drop (ADR-272, decision 6): a drop is a logical drop of the name
-    /// only if a stage of the name was created below it, so the drop buries what the swap made of the name and a stage the drop
-    /// never concerned is left alone, whichever of the two a member met first.
+    /// Whether the replicated drop `entry` of `target` is a logical drop of the name (ADR-272, decision 6): **a past drop of a name
+    /// is a logical drop only if a stage of the name was created below it**, so the drop buries what the swap made of the name and a
+    /// stage the drop never concerned is left alone, whichever of the two a member met first.
     ///
     /// With an event of the name in effect it is one, as it always was. With none in effect, the name has been swapped here if a
     /// stage of it is held or a binding of it is known ahead of its position, and the drop is then a logical drop when one of
-    /// those stages was created below it; the stage is above it when the swap began after the drop ended the life, and a member
-    /// that took the drop as a plain drop keeps the writes stamped after it and keeps the name. A name with no event of its own
-    /// whose identity stands and was created above the drop is a drop aimed at a life that ended before it, which the incarnation
-    /// rule judges as it always did (ADR-148). With the identity absent the answer is yes whatever the stage's stamp: the first
-    /// event of the name is judged against the drop as it stands (the seed of `register::seed_from_the_tombstone` does the same),
-    /// and no life is left for the drop to bury.
+    /// those stages was created below it, **whether or not the identity stands**. A stage above the drop is one the swap began
+    /// after, and the drop is an ordinary one. A life of the identity made after the drop by a member that did not know of the swap
+    /// is the drop's to bury once a stage below it is known, as it is on every member that knew (lost and reported); the seed of
+    /// `register::seed_from_the_tombstone` asks the same question of the same stamps.
     fn drop_is_a_logical_drop(
         &self,
         target: &kimmy_core::CollectionRef,
@@ -3429,11 +3427,9 @@ impl Engine {
             crate::register::a_stage_is_older_than(&txn, &target.db, &target.name, &entry.stamp)?;
         drop(txn);
         match self.get_collection(&target.db, &target.name) {
-            Ok(current) => {
-                Ok(older_stage && !aims_at_a_previous_incarnation(&current, entry.stamp.hlc))
-            }
+            Ok(_) => Ok(older_stage),
             Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
-                Ok(true)
+                Ok(older_stage)
             }
             Err(e) => Err(e),
         }
@@ -3590,6 +3586,7 @@ impl Engine {
                                 &apply.db,
                                 &apply.logical,
                                 Some(entry.stamp),
+                                crate::register::SeedAsk::StageCreation,
                             )?;
                             (kimmy_core::register_state::Put::Stored, seeded)
                         }

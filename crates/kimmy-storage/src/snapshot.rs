@@ -3167,6 +3167,7 @@ impl Engine {
             &state.db,
             logical,
             Some(stage.created),
+            crate::register::SeedAsk::StageCreation,
         )?;
         if seeded {
             Self::settle_register_in_txn(&txn, &state.db, logical, None)?;
