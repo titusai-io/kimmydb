@@ -2566,6 +2566,9 @@ impl Engine {
             self.collections_dropped()?.into_iter().collect();
 
         let mut to_record = Vec::new();
+        // One read of the register for every id this member holds nothing under, opened when the first is met (a page whose ids are all
+        // held reads nothing).
+        let mut register: Option<redb::ReadTransaction> = None;
         for (id, dropped) in &page.dropped_collections {
             // A peer may only deny what its own coverage names (ADR-163).
             if dropped.hlc > page.versions.get(dropped.origin()) {
@@ -2592,6 +2595,15 @@ impl Engine {
             if held.get(id).is_some_and(|existing| dropped <= existing) {
                 continue;
             }
+            // Not recorded when the register owns the id (Q6.6, unit B): this list is where a whole-database page's tombstone for an id
+            // this member holds nothing under is recorded, and `restore_collection_drop` is never reached for it.
+            if register.is_none() {
+                register = Some(self.db().begin_read()?);
+            }
+            let txn = register.as_ref().expect("opened just above");
+            if self.defers_a_carried_burial_the_register_owns(txn, *id, *dropped)? {
+                continue;
+            }
             debug!(
                 collection = %id,
                 stamp = ?dropped,
@@ -2602,6 +2614,7 @@ impl Engine {
         // One transaction for the list rather than one per tombstone. The
         // first page of a catch-up records the sender's whole list, and
         // `record_collection_drop` takes the writer and fsyncs for each.
+        drop(register);
         self.record_collection_drops(&to_record)
     }
 
@@ -2765,6 +2778,12 @@ impl Engine {
                 }
             }
         } else {
+            // This member holds no collection under the id, and the register may still own it (see
+            // `defers_a_carried_burial_the_register_owns`): the burial is its to judge, as the held branch above judges it.
+            let txn = self.db().begin_read()?;
+            if self.defers_a_carried_burial_the_register_owns(&txn, id, dropped)? {
+                return Ok(());
+            }
             // `debug`, not `warn`. On the scoped route this is one line for the
             // one collection the pull is about. On the whole-database route
             // (ADR-162) it is the ORDINARY case for most of the sender's
@@ -2783,6 +2802,35 @@ impl Engine {
         // held the collection still needs one. The pair `sync::apply_ddl`'s
         // drop arm writes, for its reasons.
         self.record_collection_drop(id, dropped)
+    }
+
+    /// Whether the register owns `id` although this member holds no collection under it, in which case the carried burial is NOT recorded:
+    /// a stage whose creation this member knows (its row stays when the collection goes) or the identity of a name whose events it holds,
+    /// in effect or ahead of their position. A recorded tombstone would refuse what the register serves (ADR-272, decision 6; Q6.6,
+    /// unit B). The deferral is counted and warned, as the held branch's is. Asked by id: a register row does not carry its name. Both
+    /// routes that record a sender's tombstone for an id this member holds nothing under ask it: a scoped pull
+    /// (`restore_collection_drop`) and the whole-database list (`apply_carried_drops`, which records the list in one transaction and
+    /// never reaches `restore_collection_drop` for an id that is not live). Read through the caller's transaction, so the whole-database
+    /// list, where an id this member never held is the ordinary case, reads the register once for all of them. Counted per delivery: a
+    /// deferral records no tombstone, so a page delivered again is deferred and counted again.
+    fn defers_a_carried_burial_the_register_owns(
+        &self,
+        txn: &redb::ReadTransaction,
+        id: CollectionId,
+        dropped: Stamp,
+    ) -> Result<bool> {
+        let owned = crate::register::owns_id(txn, id)?;
+        if owned {
+            self.count_register_carried_drop_deferred();
+            warn!(
+                collection = %id,
+                stamp = ?dropped,
+                "a snapshot carried the burial of a stage, or of the identity of a swapped name, that this member holds no \
+                 collection of and the register owns, and it was not recorded: the register decides it \
+                 (kimmy_register_carried_drop_deferred_total)"
+            );
+        }
+        Ok(owned)
     }
 
     /// Whether the burial of `current` that a snapshot carries is the register's to judge: `current` is a stage of a swap, or a

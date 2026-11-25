@@ -750,6 +750,19 @@ pub(crate) fn seed_from_the_tombstone(
         == Put::Stored)
 }
 
+/// Whether the register owns the collection id `id`: a stage row is kept under it (a stage this member has the creation of, whether or
+/// not it still holds the collection), or register rows are kept under it (the identity of a name this member has events of, in effect
+/// or ahead of their position). By id and never by name, because a register row does not carry its name. A stage this member has no
+/// creation row for is not recognised by id; the snapshot's stage rows (Q6.6, unit D) cover it.
+pub(crate) fn owns_id(txn: &redb::ReadTransaction, id: CollectionId) -> Result<bool> {
+    if txn.open_table(tables::REGISTER_STAGES)?.get(id.0.to_be_bytes().as_slice())?.is_some() {
+        return Ok(true);
+    }
+    let events = rows_in(&txn.open_table(tables::REGISTER)?, id)?;
+    let parked = rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?;
+    Ok(!(events.is_empty() && parked.is_empty()))
+}
+
 /// Whether the name has a register event on this member, in effect or ahead of its position.
 pub(crate) fn has_events(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
