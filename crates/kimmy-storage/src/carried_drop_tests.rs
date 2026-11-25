@@ -873,6 +873,9 @@ fn a_join_buries_the_identity_the_binding_binds_out_whether_or_not_it_is_counted
     );
 }
 
+// This is the case that no real member is in: every name that has an event also has a stage row (a binding needs its stage's, and stage
+// rows outlive their collections and ride every page and backup), so a name can be named whenever it has events. The resolve row's
+// property test keeps it as an explicit operation (`an event with no stage row`) so that the answers stay proven right if that is wrong.
 #[test]
 fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() {
     let s = swap(&[]);

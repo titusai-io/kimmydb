@@ -173,6 +173,9 @@ mod definition_floor_tests;
 mod carried_drop_tests;
 
 #[cfg(test)]
+mod resolve_row_property_tests;
+
+#[cfg(test)]
 mod swap_routes_tests;
 
 #[cfg(test)]

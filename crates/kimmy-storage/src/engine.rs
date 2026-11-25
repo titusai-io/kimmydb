@@ -6232,7 +6232,11 @@ impl Engine {
     }
 
     /// The resolution computed from the name's events and the collections that are alive: the truth the stored row is a cache of.
-    fn resolve_computed(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
+    pub(crate) fn resolve_computed(
+        txn: &redb::ReadTransaction,
+        db: &str,
+        name: &str,
+    ) -> Result<Resolved> {
         use kimmy_core::register_state::{Ready, Visible};
         let timeline = crate::register::timeline_read(txn, db, name)?;
         let collections = txn.open_table(tables::COLLECTIONS)?;
