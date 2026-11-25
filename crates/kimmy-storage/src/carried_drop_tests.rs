@@ -1420,9 +1420,24 @@ fn a_stage_a_page_makes_is_judged_by_its_creation_against_the_drop_the_identity_
 
 // -- Unit C2d: the carry's measure, where it rides, and its cap ------------------------------------------------------------------------------
 
+/// The name of the plain collection the carry-shape tests use: the first of `plain0`, `plain1`, ... whose id is among the highest the
+/// hash gives. The walk visits collections in id order and an early end resumes after the last row it sent, so the collection that
+/// holds the row must be the LAST one visited, or the cursor of the early end points at an empty collection's start and a wrong cursor
+/// is not seen (the mutant that clears it changes nothing there).
+fn plain_name() -> String {
+    (0u32..)
+        .map(|n| format!("plain{n}"))
+        .find(|name| CollectionId::derive(DB, name).0 > u64::MAX - (1 << 52))
+        .expect("a name with a high id")
+}
+
+fn plain_id() -> CollectionId {
+    CollectionId::derive(DB, &plain_name())
+}
+
 /// A plain collection holding one document on `sender`: a row the walk sends, whatever the swap did.
 fn with_a_plain_document(sender: &Engine) {
-    let plain = sender.create_collection(DB, "plain").unwrap();
+    let plain = sender.create_collection(DB, &plain_name()).unwrap();
     sender.insert(&plain, doc! { "_id": 1, "v": "a document the walk sends" }).unwrap();
 }
 
@@ -1433,7 +1448,7 @@ fn with_a_plain_document(sender: &Engine) {
 fn a_sender_and_the_size_of_its_carry() -> (Swap, usize, String) {
     let s = swap(&[]);
     with_a_plain_document(&s.sender);
-    let plain = CollectionId::derive(DB, "plain");
+    let plain = plain_id();
     let mut last = STAGE1.to_string();
     let mut previous = s.bind.stamp.hlc.wall_ms;
     let mut swaps = 1;
@@ -1464,6 +1479,12 @@ fn a_sender_and_the_size_of_its_carry() -> (Swap, usize, String) {
         previous = wall;
         last = stage;
     };
+    let highest = s.sender.all_collections().unwrap().iter().map(|meta| meta.id.0).max();
+    assert_eq!(
+        highest,
+        Some(plain.0),
+        "premise: the plain collection is the last one the walk visits"
+    );
     (s, size, last)
 }
 
@@ -1485,7 +1506,7 @@ fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
     let (s, size, last) = a_sender_and_the_size_of_its_carry();
     // room for the carry alone, and for the row, but not for both
     s.sender.set_snapshot_room_for_test(Some(size + 1));
-    let probe = s.sender.snapshot_page(None, Some(CollectionId::derive(DB, "plain"))).unwrap();
+    let probe = s.sender.snapshot_page(None, Some(plain_id())).unwrap();
     assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
     let first = s.sender.snapshot_page(None, None).unwrap();
     assert_eq!(first.documents.len(), 1, "premise: the row fits the room");
@@ -1497,6 +1518,11 @@ fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
         second.documents.is_empty() && second.collections.is_empty(),
         "the carry rides a page with nothing else on it, and no row is sent twice"
     );
+    assert_eq!(
+        first.documents.len() + second.documents.len(),
+        1,
+        "the two pages together hold the source's one row: none lost, none sent twice"
+    );
     assert!(second.register.is_some() && second.next.is_none(), "which is the last page");
     // and the pull completes with the register applied
     let (j, _dj) = engine();
@@ -1506,7 +1532,7 @@ fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
         Ok(last),
         "the joiner took the register: the last stage the sender bound serves"
     );
-    assert!(j.get_collection(DB, "plain").is_ok(), "and the row came with it");
+    assert!(j.get_collection(DB, &plain_name()).is_ok(), "and the row came with it");
 }
 
 #[test]
@@ -1515,7 +1541,7 @@ fn a_carry_that_does_not_fit_a_page_of_its_own_is_refused_not_cut() {
     s.sender.set_snapshot_room_for_test(Some(size - 1));
     // the same walk of the row alone, on a page with no carry (a scoped one, whose cursor reserves more): it fits the room, so the walk of
     // the whole database exhausts on its page and only the carry, which does not fit a page of its own, can refuse
-    let probe = s.sender.snapshot_page(None, Some(CollectionId::derive(DB, "plain"))).unwrap();
+    let probe = s.sender.snapshot_page(None, Some(plain_id())).unwrap();
     assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
     match s.sender.snapshot_page(None, None) {
         Err(crate::StorageError::SnapshotRegisterCarryTooLarge { bytes, cap }) => {
