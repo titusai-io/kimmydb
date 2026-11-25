@@ -56,6 +56,10 @@ pub struct RepairsAtOpen {
 /// became visible and the loser rule buried it), `doomed` (a stage that can never be visible, buried with the event that proves it),
 /// `orphan` (an abandoned stage; counted when Q6.7 builds the abandon) and `drop` (a drop of the name or of its database).
 pub const OUT_BURIAL_CAUSES: [&str; 4] = ["bound_out", "doomed", "orphan", "drop"];
+/// The values of the `within_grant` label of `kimmy_snapshot_documents_skipped_total`, in the order it
+/// renders them: whether the stamp of a document a snapshot page carried and this member skipped is at
+/// or below the snapshot's grant.
+pub const SNAPSHOT_SKIP_LABELS: [&str; 2] = ["true", "false"];
 /// Why the settle pass buried a physical: the slot of its cause in [`OUT_BURIAL_CAUSES`]. Read from the pass, never stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BuryCause {
@@ -331,6 +335,10 @@ pub struct Engine {
     /// Snapshot drops of a swapped name (or of a stage) this member did not apply, waiting for the register events that carry
     /// them (`kimmy_register_carried_drop_deferred_total`, ADR-272, Q6.4 item 1b).
     register_carried_drops_deferred: std::sync::atomic::AtomicU64,
+    /// Documents a snapshot page carried that this member skipped, for want of a collection to put them
+    /// in (`kimmy_snapshot_documents_skipped_total{within_grant}`, [`SNAPSHOT_SKIP_LABELS`]). Per
+    /// member, since start.
+    snapshot_documents_skipped: [std::sync::atomic::AtomicU64; 2],
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
     /// How long the writer was held, as a histogram over
@@ -1817,6 +1825,7 @@ impl Engine {
             replay_read_hook: parking_lot::Mutex::new(None),
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
             register_carried_drops_deferred: std::sync::atomic::AtomicU64::new(0),
+            snapshot_documents_skipped: Default::default(),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
@@ -1880,6 +1889,17 @@ impl Engine {
     /// Zero on every member once the snapshot carries the register's events (Q6.6): each one is a carried drop waiting for them.
     pub fn register_carried_drops_deferred(&self) -> u64 {
         self.register_carried_drops_deferred.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Documents a snapshot page carried that this member skipped since start, by `within_grant`, in
+    /// the order of [`SNAPSHOT_SKIP_LABELS`] (`kimmy_snapshot_documents_skipped_total`).
+    pub fn snapshot_documents_skipped(&self) -> Vec<(&'static str, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        SNAPSHOT_SKIP_LABELS
+            .iter()
+            .zip(&self.snapshot_documents_skipped)
+            .map(|(label, count)| (*label, count.load(Relaxed)))
+            .collect()
     }
 
     /// Count one carried drop that was deferred ([`Self::register_carried_drops_deferred`]).

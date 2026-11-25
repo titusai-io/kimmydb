@@ -556,6 +556,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         out_buried: Vec::new(),
         out_loss_records: Vec::new(),
         out_vector_config_discarded: 0,
+        snapshot_documents_skipped: Vec::new(),
         databases: 1,
         collections: 2,
         unique_violations: 3,

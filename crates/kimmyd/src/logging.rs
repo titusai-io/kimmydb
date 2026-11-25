@@ -3448,6 +3448,21 @@ mod tests {
     }
 
     #[test]
+    fn each_snapshot_skip_instrument_reads_the_slot_of_its_own_label() {
+        // As for the causes of `kimmy_out_buried_total`: one instrument per value of `within_grant`, each reading its own slot of
+        // `MetricsSnapshot::snapshot_documents_skipped`, in the order of `SNAPSHOT_SKIP_LABELS`.
+        for (slot, label) in kimmy_storage::SNAPSHOT_SKIP_LABELS.iter().enumerate() {
+            let name = format!("kimmy.snapshot_documents_skipped.{label}");
+            let call = instrument_call(&name);
+            let want = format!("|s|s.snapshot_documents_skipped[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{label}`: {call}"
+            );
+        }
+    }
+
+    #[test]
     fn each_out_instrument_reads_the_slot_of_its_own_cause_and_kind() {
         // The stem guard `every_metrics_series_reaches_the_bridge` cannot see a missing label, so each cause and each kind has its own
         // assertion that its instrument literal is in this file once (`instrument_call` fails on none or two) and reads its slot.

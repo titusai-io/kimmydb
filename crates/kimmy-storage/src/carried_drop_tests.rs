@@ -103,11 +103,17 @@ struct Swap {
 }
 
 fn swap(joiners: &[&Engine]) -> Swap {
+    swap_over(joiners, &|_| {})
+}
+
+/// [`swap`] over a sender that `before_the_swap` has written to first (an index made on `orders`, say): the binding is stamped above it.
+fn swap_over(joiners: &[&Engine], before_the_swap: &dyn Fn(&Engine)) -> Swap {
     let (a, da) = engine();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
     let creation = creation_of(&a, STAGE1);
     let (sender, ds) = with_orders();
+    before_the_swap(&sender);
     let wall = joiners
         .iter()
         .map(|m| life_wall(m))
@@ -700,6 +706,11 @@ fn pull_patched(
 fn pull(joiner: &Engine, sender: &Engine) {
     let (progress, result) = pull_patched(joiner, sender, &|_| {});
     result.expect("every page applies");
+    assert_eq!(
+        joiner.snapshot_documents_skipped(),
+        vec![("true", 0), ("false", 0)],
+        "no document of the pull was skipped for want of its collection"
+    );
     assert!(progress.is_complete(), "the pull completes");
 }
 
@@ -1110,4 +1121,177 @@ fn a_binding_the_joiner_held_parked_takes_effect_in_the_page_that_covers_it_thou
         j.get_collection(DB, STAGE1).is_err(),
         "the stage the second binding replaced is buried in the page's own transaction"
     );
+}
+
+// -- Unit C2c: a restored index is logged under the logical name; a document with no collection is counted when it is skipped --------------
+
+/// The `CreateIndex` entry at `stamp` in `m`'s oplog.
+fn the_index_entry_at(m: &Engine, stamp: &Stamp) -> Option<OplogEntry> {
+    everything(m).into_iter().find(|e| e.kind == OpKind::CreateIndex && e.stamp == *stamp)
+}
+
+/// The sender's own `CreateIndex` entry of the index `x` made on `orders` before the swap.
+fn the_index_entry(m: &Engine) -> OplogEntry {
+    everything(m)
+        .into_iter()
+        .find(|e| e.kind == OpKind::CreateIndex)
+        .expect("premise: the sender logged the creation of its index")
+}
+
+fn make_x_on_orders(sender: &Engine) {
+    sender
+        .create_index(
+            DB,
+            "orders",
+            vec![kimmy_core::IndexField::ascending("v")],
+            false,
+            Some("x".into()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_index_of_a_stage_a_page_restored_is_logged_under_the_logical_name_as_the_origin_logged_it() {
+    // The index the client made on `orders` is copied to the stage at the flip, and a member that joins builds it on the stage from the
+    // page: the entry it logs for it is the entry at the index's stamp, which must be the bytes the origin logged (addressed to
+    // `orders`), not an entry addressed to the stage, which a peer that never held the stage cannot place.
+    let s = swap_over(&[], &make_x_on_orders);
+    let original = the_index_entry(&s.sender);
+    assert_eq!(
+        original.collection,
+        CollectionId::derive(DB, "orders"),
+        "premise: the origin's entry is addressed to the logical name"
+    );
+    assert!(
+        s.sender.get_collection(DB, STAGE1).unwrap().index("x").is_some(),
+        "premise: the sender's stage holds the index"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &s.sender);
+    assert!(
+        j.get_collection(DB, STAGE1).unwrap().index("x").is_some(),
+        "premise: the joined member built the index on the stage"
+    );
+    let joined = the_index_entry_at(&j, &original.stamp)
+        .expect("premise: the joined member logged an entry at the index's stamp");
+    assert_eq!(
+        joined.collection, original.collection,
+        "the entry is addressed to the logical name"
+    );
+    assert_eq!(joined.body, original.body, "and its body is the origin's, byte for byte");
+}
+
+#[test]
+fn the_index_of_a_recreation_a_page_restored_is_logged_under_the_logical_name_too() {
+    // The same for a recreation: the name was swapped, dropped and made again, and the index was made on the name after that. The origin
+    // logged it for `orders`; the member that joins builds it on the recreation, whose own name carries a stamp, and logs the same entry.
+    let s = swap(&[]);
+    assert!(
+        s.sender.drop_collection(DB, "orders").unwrap(),
+        "premise: the swapped name is dropped"
+    );
+    s.sender.create_collection(DB, "orders").unwrap();
+    let recreation = s.sender.resolve(DB, "orders").unwrap().physical;
+    assert!(
+        kimmy_core::is_recreation_name(&recreation),
+        "premise: a recreation holds the name on the sender"
+    );
+    make_x_on_orders(&s.sender);
+    let original = the_index_entry(&s.sender);
+    assert_eq!(
+        original.collection,
+        CollectionId::derive(DB, "orders"),
+        "premise: the origin's entry is addressed to the logical name"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &s.sender);
+    assert!(
+        j.get_collection(DB, &recreation).unwrap().index("x").is_some(),
+        "premise: the joined member built the index on the recreation"
+    );
+    let joined = the_index_entry_at(&j, &original.stamp)
+        .expect("premise: the joined member logged an entry at the index's stamp");
+    assert_eq!(
+        joined.collection, original.collection,
+        "the entry is addressed to the logical name"
+    );
+    assert_eq!(joined.body, original.body, "and its body is the origin's, byte for byte");
+}
+
+#[test]
+fn a_peer_that_never_held_the_stage_takes_the_joined_members_index_entry_without_stopping() {
+    let s = swap_over(&[], &make_x_on_orders);
+    let stamp = the_index_entry(&s.sender).stamp;
+    let (j, _dj) = engine();
+    pull(&j, &s.sender);
+    let joined = the_index_entry_at(&j, &stamp)
+        .expect("premise: the joined member logged an entry at the index's stamp");
+    let (k, _dk) = engine();
+    k.create_collection(DB, "orders").unwrap();
+    assert!(k.get_collection(DB, STAGE1).is_err(), "premise: the peer never held the stage");
+    let outcome = window(&k, std::slice::from_ref(&joined));
+    assert!(
+        !outcome.stopped() && outcome.unknown_collection == 0,
+        "the entry does not address a physical the peer cannot place"
+    );
+    assert!(
+        k.get_collection(DB, "orders").unwrap().index("x").is_some(),
+        "and the peer took the index on the name it holds"
+    );
+}
+
+#[test]
+fn the_restored_index_of_an_ordinary_collection_is_logged_as_the_origin_logged_it() {
+    let (a, _da) = with_orders();
+    make_x_on_orders(&a);
+    let original = the_index_entry(&a);
+    let (j, _dj) = engine();
+    pull(&j, &a);
+    assert!(
+        j.get_collection(DB, "orders").unwrap().index("x").is_some(),
+        "premise: the joined member built the index"
+    );
+    let joined = the_index_entry_at(&j, &original.stamp)
+        .expect("premise: the joined member logged an entry at the index's stamp");
+    assert_eq!(joined.collection, original.collection, "the entry is addressed to the collection");
+    assert_eq!(joined.body, original.body, "and its body is the origin's, byte for byte");
+}
+
+/// A pull of a sender's one collection whose definition the page leaves out, so that its documents have no collection here and no
+/// tombstone to say why. With `covered` the page's vector covers their stamps (the grant), without it nothing does.
+fn pull_documents_that_have_no_collection(covered: bool) -> (Engine, tempfile::TempDir) {
+    let (sender, _ds) = with_orders();
+    let (j, dj) = engine();
+    let patched = std::cell::Cell::new(0usize);
+    let patch = |page: &mut crate::SnapshotPage| {
+        patched.set(patched.get() + page.documents.len());
+        page.collections.retain(|state| state.name != "orders");
+        if !covered {
+            page.versions = VersionVector::default();
+        }
+    };
+    let (progress, result) = pull_patched(&j, &sender, &patch);
+    result.expect("the page applies: a skipped document does not fail it");
+    assert!(progress.is_complete(), "the pull completes");
+    assert!(patched.get() > 0, "premise: the page carried documents");
+    assert!(j.get_collection(DB, "orders").is_err(), "premise: no collection was made for them");
+    assert_eq!(
+        j.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap(),
+        None,
+        "premise: and no tombstone says it is gone"
+    );
+    (j, dj)
+}
+
+#[test]
+fn a_document_with_no_collection_that_the_grant_covers_is_counted_true_and_the_page_applies() {
+    let (j, _dj) = pull_documents_that_have_no_collection(true);
+    assert_eq!(j.snapshot_documents_skipped(), vec![("true", 1), ("false", 0)]);
+}
+
+#[test]
+fn a_document_with_no_collection_that_the_grant_does_not_cover_is_counted_false_and_the_page_applies()
+ {
+    let (j, _dj) = pull_documents_that_have_no_collection(false);
+    assert_eq!(j.snapshot_documents_skipped(), vec![("true", 0), ("false", 1)]);
 }

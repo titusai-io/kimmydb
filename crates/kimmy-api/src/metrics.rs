@@ -197,6 +197,10 @@ pub struct StorageReadings {
     /// Replicated vector configurations this member discarded for a swapped name since start (`Engine::out_vector_config_discarded`): the
     /// series `kimmy_out_vector_config_discarded_total`.
     pub out_vector_config_discarded: u64,
+    /// Documents a snapshot page carried that this member skipped, by `within_grant`
+    /// (`Engine::snapshot_documents_skipped`): the series
+    /// `kimmy_snapshot_documents_skipped_total{within_grant}`.
+    pub snapshot_documents_skipped: Vec<(&'static str, u64)>,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -426,6 +430,9 @@ pub struct MetricsSnapshot {
     pub out_loss_records: [u64; kimmy_storage::OUT_LOSS_KINDS.len()],
     /// Replicated vector configurations discarded for a swapped name: the series `kimmy_out_vector_config_discarded_total`.
     pub out_vector_config_discarded: u64,
+    /// Documents a snapshot page carried that this member skipped, in the order of `kimmy_storage::SNAPSHOT_SKIP_LABELS`: the series
+    /// `kimmy_snapshot_documents_skipped_total{within_grant}`.
+    pub snapshot_documents_skipped: [u64; kimmy_storage::SNAPSHOT_SKIP_LABELS.len()],
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1555,6 +1562,10 @@ impl Metrics {
             out_buried: labelled(&kimmy_storage::OUT_BURIAL_CAUSES, &readings.out_buried),
             out_loss_records: labelled(&kimmy_storage::OUT_LOSS_KINDS, &readings.out_loss_records),
             out_vector_config_discarded: readings.out_vector_config_discarded,
+            snapshot_documents_skipped: labelled(
+                &kimmy_storage::SNAPSHOT_SKIP_LABELS,
+                &readings.snapshot_documents_skipped,
+            ),
             conflicts_resolved: {
                 let mut made = [0u64; 6];
                 for (label, n) in &readings.conflicts_resolved {
@@ -3529,6 +3540,7 @@ mod tests {
             ],
             out_loss_records: vec![("late_write", 8_221), ("snapshot_delete", 8_222)],
             out_vector_config_discarded: 8_231,
+            snapshot_documents_skipped: vec![("true", 8_241), ("false", 8_242)],
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -4334,6 +4346,10 @@ kimmy_register_waiting_for_stage{origin=\"other\"} 97
 # HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.
 # TYPE kimmy_register_carried_drop_deferred_total counter
 kimmy_register_carried_drop_deferred_total 98
+# HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_snapshot_documents_skipped_total counter
+kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
+kimmy_snapshot_documents_skipped_total{within_grant=\"false\"} 8242
 # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.
 # TYPE kimmy_clock_hlc_lead_seconds gauge
 kimmy_clock_hlc_lead_seconds 7001
@@ -4845,6 +4861,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_out_vector_config_discarded_total {}\n",
             s.out_vector_config_discarded
         ));
+        for (slot, label) in kimmy_storage::SNAPSHOT_SKIP_LABELS.iter().enumerate() {
+            expect(&format!(
+                "kimmy_snapshot_documents_skipped_total{{within_grant=\"{label}\"}} {}\n",
+                s.snapshot_documents_skipped[slot]
+            ));
+        }
         for (slot, code) in REFUSED_CODES.iter().enumerate() {
             expect(&format!(
                 "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
@@ -6215,6 +6237,16 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         assert!(
             page.contains("kimmy_out_vector_config_discarded_total 0\n"),
             "no `kimmy_out_vector_config_discarded_total 0` in the page at rest"
+        );
+        for label in kimmy_storage::SNAPSHOT_SKIP_LABELS {
+            let line =
+                format!("kimmy_snapshot_documents_skipped_total{{within_grant=\"{label}\"}} 0\n");
+            assert!(page.contains(&line), "no `{line}` in the page at rest");
+        }
+        assert_eq!(
+            page.matches("kimmy_snapshot_documents_skipped_total{").count(),
+            2,
+            "the two values of the label and no other"
         );
         assert_eq!(
             page.matches("kimmy_out_buried_total{").count(),
