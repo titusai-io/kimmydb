@@ -1260,7 +1260,8 @@ fn raw_rows(txn: &redb::WriteTransaction, which: Carried) -> Result<Vec<(Vec<u8>
 /// The consistency check of a restore, in the restore's own transaction and by id (a register row does not carry its name). A backup is one
 /// read transaction, so its register and its collections agree by construction: this is for a damaged or hand-made backup, and a future
 /// build's mistake. It refuses by the check's own message, in this order: every row decodes; a stage row's names derive its own key; every
-/// binding has its stage row; every hidden collection is known to the register; no row of REGISTER is above the carried vector; no row of
+/// binding has its stage row; every hidden collection is known to the register (a recreation with no `Create` event is known when its
+/// stamp, which its name carries, is above the carried vector); no row of REGISTER is above the carried vector; no row of
 /// REGISTER_INFO is at or below it, and each has its entry; and what a flip leaves cannot be below its own floor (check 4).
 pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
     use kimmy_core::register_state::{Ready, Visible};
@@ -1358,9 +1359,15 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
             let known = if kimmy_core::swap::is_stage_name(name) {
                 stages.iter().any(|(d, p)| d == db && p == name)
             } else {
-                events.iter().any(|(_, _, _, event)| {
+                // a recreation is known by its `Create` event, or by a stamp above the carried vector:
+                // made after it, its event arrives by a window (a backup taken mid-way, a join).
+                // One the vector covers has its event, or it is damaged.
+                let has_its_event = events.iter().any(|(_, _, _, event)| {
                     matches!(event, RegisterEvent::Create { physical } if physical == name)
-                })
+                });
+                let made_after_the_vector = kimmy_core::recreation_stamp(name)
+                    .is_some_and(|stamp| stamp.hlc > vector.get(stamp.origin()));
+                has_its_event || made_after_the_vector
             };
             if !known {
                 return Err(damaged(&format!(

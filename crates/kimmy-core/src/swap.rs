@@ -74,9 +74,22 @@ pub fn recreation_name(logical: &str, stamp: &Stamp) -> String {
 /// The stamp of the event that made the recreation `name`, read back from the name: the inverse of
 /// [`recreation_name`]. `None` for a name that is not a recreation's and for one whose stamp does
 /// not parse (not exactly `2 * Stamp::KEY_LEN` lowercase hex digits).
-// scaffold: the tests of Q6.6 unit C2b-2 fail on this until the parse lands in the next commit
-pub fn recreation_stamp(_name: &str) -> Option<Stamp> {
-    None
+pub fn recreation_stamp(name: &str) -> Option<Stamp> {
+    let (_, digits) = name.split_once(RECREATE_NAME_MARK)?;
+    if digits.len() != 2 * Stamp::KEY_LEN {
+        return None;
+    }
+    let nibble = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let mut key = [0u8; Stamp::KEY_LEN];
+    let (pairs, _) = digits.as_bytes().as_chunks::<2>();
+    for (byte, pair) in key.iter_mut().zip(pairs) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(Stamp::from_key_bytes(key))
 }
 
 /// Whether `name` is a physical name no client can address: a stage's or a recreation's. Such a name is never listed or served
