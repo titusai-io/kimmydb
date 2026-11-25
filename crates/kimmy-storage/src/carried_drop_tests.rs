@@ -2911,14 +2911,15 @@ fn an_event_exactly_at_the_grant_is_not_above_it() {
     );
 }
 
-// -- Unit E, pinned: a seed the restart keeps, which the sender never made ----------------------------------------------------------------
+// -- Unit E, pinned: a stage above the receiver's own drop seeds nothing, so the restart has no seed of the receiver's to keep -----------
 //
-// Page one of the first pass makes a stage of `orders` and seeds the name's logical drop from this member's own identity tombstone, which
-// is above the first grant (`judge_a_stage_a_page_made`). The restart does not undo that seed: it is this member's own judgement, it may
-// have buried what it concerned already, and nothing removes a register row. Before the second pass the sender takes that same drop as an
-// ORDINARY one (the stage of the name was created above it, and no event of the name is in effect there), so the sender holds no event of
-// the name and this member holds the logical drop. Today's truth, pinned: the two read the name absent, and the registers end EQUAL once
-// the next event of the name reaches both, because the sender seeds the drop from its own tombstone when it judges that event.
+// Page one of the first pass makes a stage of `orders`, created ABOVE this member's own identity tombstone, which is above the first grant
+// (`judge_a_stage_a_page_made`). A stage created above a drop is one the drop never concerned (ADR-272, decision 6), so the page seeds no
+// logical drop for it, and the restart that follows has none of the receiver's to keep: nothing of the name's register is the receiver's
+// own judgement that the sender never made. Before the second pass the sender takes that same drop as an ORDINARY one (the stage of the
+// name was created above it, and no event of the name is in effect there), so neither holds an event of the name, the two read the name
+// absent, and the registers end EQUAL once the next event of the name reaches both: each seeds the drop from its own tombstone when it
+// judges that event, a binding, which asks as one.
 //
 // The restart itself is caused by another name's swap (`items`), made by the sender's page reader between the first two pages, as in the
 // tests above, so that the name under test has no event on the sender when the second pass starts.
@@ -2945,7 +2946,7 @@ fn bind_of_name(by: &Engine, name: &str, physical: &str, wall_ms: u64) -> OplogE
 }
 
 #[test]
-fn a_seed_the_restart_keeps_and_the_sender_never_made_ends_equal_at_the_names_next_event() {
+fn a_stage_above_the_receivers_drop_seeds_none_and_the_ends_equal_at_the_names_next_event() {
     let (r, _dr) = engine();
     let (a, _da) = engine();
     let (b, _db) = engine();
@@ -3040,11 +3041,10 @@ fn a_seed_the_restart_keeps_and_the_sender_never_made_ends_equal_at_the_names_ne
         "premise: as an ordinary drop of the identity"
     );
 
-    // today's truth: the receiver holds the drop its own tombstone seeded, the sender holds no event of the name, and both read it absent
-    assert_eq!(
-        the_events_of_orders(&r),
-        vec![(t, kimmy_core::RegisterEvent::LogicalDrop)],
-        "the receiver holds the logical drop its page-one seed made, and the restart kept it"
+    // neither holds an event of the name: the stage is above the drop, so page one seeded none, and both read the name absent
+    assert!(
+        the_events_of_orders(&r).is_empty(),
+        "the receiver holds no event of the name: a stage above its drop seeded none"
     );
     assert!(the_events_of_orders(&sender).is_empty(), "the sender holds no event of the name");
     assert!(served_by(&r).is_err(), "the receiver reads the name absent");

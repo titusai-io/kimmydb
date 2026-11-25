@@ -533,8 +533,10 @@ fn a_binding_met_after_a_re_create_over_a_database_drop_seeds_no_drop_over_the_n
     // meets the stage's creation (history under the database's drop, its row written) and the binding. The tombstone the new life
     // carries is the database's, not a drop of the life: the seed must not read it as one and bury what the drop did not end.
     //
-    // Pins the rule before C3. With C3 and P2 (Chris, 2026-11-23: lost and reported) the seed buries this life and the register holds
-    // the drop and the binding: Q65-model-rows C3-6, database form. This test, and mutant M2 of the seed's list, change there.
+    // The database guard (ADR-272, decision 6): a stage created below a PLAIN drop of the name, met after a life made after the drop,
+    // ends that life, as it does on every member (`seed_asymmetry_tests`); the tombstone a database's drop leaves is not a drop of the
+    // life made after it, which the drop never ended, and seeds nothing over it. Without the guard the member that is late to the swap
+    // reads the name absent where the member that knew serves it.
     let w = world();
     let (x, _dx) = engine();
     let drop = a_database_drop(&x, w.bind.stamp.hlc.wall_ms + 5);
@@ -576,7 +578,31 @@ fn a_binding_met_after_a_re_create_over_a_database_drop_seeds_no_drop_over_the_n
     // and when the binding's turn comes it is the one event of the name
     window(&m, std::slice::from_ref(&w.bind));
     assert_eq!(register_events(&m), vec![w.bind.stamp], "the binding alone");
-    // the state in which this member and the one that knew agree today, and the one that changes with C3
+    assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
+    assert_eq!(documents_kept(&m), 1, "with its document");
+}
+
+#[test]
+fn a_stage_created_below_a_database_drop_seeds_no_drop_over_a_life_made_after_the_drop() {
+    // The stage's creation alone, the route that asks as a creation (the test above ends with the binding, which asks as one): a member
+    // that applied the database's drop, made the name again, and then meets the stage the swap began with, below the drop.
+    let w = world();
+    let (x, _dx) = engine();
+    let drop = a_database_drop(&x, w.bind.stamp.hlc.wall_ms + 5);
+    assert!(w.creation.stamp < drop.stamp, "premise: the stage is created below the drop");
+    let (m, _dm) = engine();
+    window(&m, std::slice::from_ref(&drop));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let orders = m.create_collection(DB, "orders").unwrap();
+    m.insert(&orders, doc! { "_id": 1, "v": "made after the database's drop" }).unwrap();
+    assert!(orders.created > drop.stamp.hlc, "premise: the life was made after the drop");
+    assert_eq!(
+        buried_at(&m, CollectionId::derive(DB, "orders")),
+        Some(drop.stamp),
+        "premise: the tombstone the life stands over is the database's drop, at its stamp"
+    );
+    m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
+    assert!(register_events(&m).is_empty(), "no drop was seeded for the stage's creation");
     assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
     assert_eq!(documents_kept(&m), 1, "with its document");
 }
@@ -816,14 +842,12 @@ fn an_older_drop_that_arrives_while_only_a_binding_is_known_ahead_of_its_positio
 }
 
 #[test]
-fn a_drop_aimed_at_a_life_that_ended_before_the_identity_stands_even_with_a_stage_created_below_it()
-{
+fn a_drop_below_a_stage_buries_the_life_a_member_made_after_it_and_the_register_holds_the_drop() {
     // The twin of `a_drop_aimed_at_a_life_that_ended_before_the_identity_is_the_old_rules_even_with_a_stage_held`, whose drop is far
-    // below the stage: there the stage clause fails and the test passes whatever the incarnation rule does. Here the stage is created
-    // BELOW the drop, so the stage clause holds, and the identity is made above the drop: only the incarnation rule keeps it.
-    //
-    // Pins the rule before P2. With P2 (Chris, 2026-11-23: lost and reported) the member that did not know of the swap and made the
-    // name again ends with the life buried and the register holding the drop: Q65-model-rows, C3's set. This drop becomes logical there.
+    // below the stage: there the stage fails the test of a logical drop and the drop is an ordinary one. Here the stage is created BELOW
+    // the drop, and the identity is made above the drop by a member that did not know of the swap (Chris, 2026-11-23: lost and reported).
+    // The drop is the swap's on every member that knows the stage, whether or not a life stands, so that members that meet the stage and
+    // the drop in different orders end alike: the life is buried and the register holds the drop.
     let w = world();
     let (x, _dx) = engine();
     let drop = drop_of(&x, w.creation.stamp.hlc.wall_ms + 1);
@@ -835,12 +859,13 @@ fn a_drop_aimed_at_a_life_that_ended_before_the_identity_stands_even_with_a_stag
     assert!(orders.created > drop.stamp.hlc, "premise: the identity is made above the drop");
     assert!(w.creation.stamp < drop.stamp, "premise: the stage is created below the drop");
     window(&m, std::slice::from_ref(&drop));
-    assert!(
-        register_events(&m).is_empty(),
-        "a drop of a life that ended before this one is no register event"
+    assert_eq!(
+        register_events(&m),
+        vec![drop.stamp],
+        "the drop is a register event of the name: a stage was created below it"
     );
-    assert!(serves_the_identity(&m), "the life that stands is not what the drop ended");
-    assert_eq!(documents_kept(&m), 1, "with its document");
+    assert!(!serves_the_identity(&m), "the life made after the drop is buried by it");
+    assert!(m.get_collection(DB, "orders").is_err(), "and the identity is gone");
 }
 
 // -- The three answers of the stage test that are kept on purpose ---------------------------------------------------------------------------
@@ -913,10 +938,9 @@ fn a_drop_of_a_name_whose_identity_is_absent_and_whose_stage_is_held_is_a_logica
 }
 
 #[test]
-fn a_drop_below_a_held_stage_of_a_name_whose_identity_is_absent_is_a_logical_drop_whatever_the_stages_stamp()
- {
-    // The twin of the test above, with the stage created ABOVE the drop: the stage clause is false, and only the identity's absence
-    // answers yes. The first event of the name is judged against the drop as it stands (the identity-absent seed does the same).
+fn a_drop_below_a_held_stage_of_a_name_whose_identity_is_absent_is_an_ordinary_drop() {
+    // The twin of the test above, with the stage created ABOVE the drop: a stage created above a drop is one the drop never concerned,
+    // whether or not the identity stands, so the drop is an ordinary one and no event of the name is in effect.
     let w = world();
     let (x, _dx) = engine();
     let drop = drop_of(&x, w.creation.stamp.hlc.wall_ms - 1);
@@ -925,5 +949,5 @@ fn a_drop_below_a_held_stage_of_a_name_whose_identity_is_absent_is_a_logical_dro
     m.apply_batch(std::slice::from_ref(&w.creation)).unwrap();
     assert!(m.get_collection(DB, "orders").is_err(), "premise: no identity on this member");
     window(&m, std::slice::from_ref(&drop));
-    assert_eq!(register_events(&m), vec![drop.stamp], "the drop is a register event of the name");
+    assert!(register_events(&m).is_empty(), "no register event: the stage is above the drop");
 }

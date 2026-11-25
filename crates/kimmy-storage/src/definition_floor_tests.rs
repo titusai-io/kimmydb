@@ -310,16 +310,28 @@ fn the_floor_is_carried_from_a_physical_that_had_taken_it_to_the_next_flip() {
 #[test]
 fn the_floor_includes_the_tombstone_the_old_id_held_before_its_burial_and_not_the_bindings_stamp() {
     // the identity has no incarnation floor and holds a tombstone of its own id: a drop that this life survived
-    // Is there a product route that leaves a tombstone on a standing identity with NO incarnation floor? The one I found by reading: a replicated
-    // drop aimed at a previous incarnation is ignored and its tombstone is still recorded (sync.rs:2884-2892, `record_collection_drop`),
-    // without a floor, on a life created above it. The tombstone it leaves is below the life's `created`, so the term can only return a value
-    // under the life's own creation: this test sets a tombstone above `created` by hand, which that route does not leave. The term is therefore
-    // close to DEFENSIVE (nothing in a product state needs it to decide); it stays a live mutant on this test.
+    // The state is the one a product route leaves: a replicated drop aimed at a previous incarnation is ignored and its tombstone is still
+    // recorded (sync.rs `record_collection_drop`), without a floor, on a life created ABOVE it. So the tombstone is set BELOW the life's
+    // `created`, and below the stages' creations: a stage created above a drop is one the drop never concerned, and seeds nothing (ADR-272,
+    // decision 6). An earlier form of this test set the tombstone above `created` by hand, which no route leaves; under the seed rule as
+    // ruled that state has the stages below the drop over a standing identity, which the seed buries, and what it does is pinned by the
+    // seed's own tests. The term is still close to DEFENSIVE (the value it returns is under the life's own creation); it stays a live
+    // mutant on this test.
     let w = world();
     let (m, _d) = engine();
-    m.create_collection(DB, "orders").expect("the identity is created");
-    let tombstone =
-        Stamp::new(Hlc::new(w.bind_first.stamp.hlc.wall_ms - 5, 0), m.node_id(), m.epoch());
+    let life = m.create_collection(DB, "orders").expect("the identity is created");
+    let lowest = w
+        .stages
+        .iter()
+        .map(|entry| entry.stamp.hlc.wall_ms)
+        .chain([life.created.wall_ms])
+        .min()
+        .expect("a stage and a life");
+    let tombstone = Stamp::new(Hlc::new(lowest - 1, 0), m.node_id(), m.epoch());
+    assert!(
+        tombstone.hlc < life.created && w.stages.iter().all(|entry| tombstone < entry.stamp),
+        "premise: the tombstone is below the life and below every stage, as a drop a life survived leaves it"
+    );
     m.record_collection_drops(&[(orders_id(), tombstone)]).expect("the tombstone is recorded");
     m.apply_batch(&w.stages).expect("the stages apply");
     assert_eq!(
@@ -950,9 +962,10 @@ fn shapes_end_as_the_flip_first_member(w: &World, below: bool) {
         }
         if below {
             // The stages were created below the drop: the swap began before it. What the register holds records which mechanism closes
-            // the shape. B: the seed writes the logical drop at `T` (the drop leaves the life it re-dated and the swap began below it); A: a
-            // plain recreation, so there is no seed and the end state is the new flip floor's alone.
-            let want = if matches!(shape, Shape::B) { 1 } else { 0 };
+            // the shape. In both, the seed writes the logical drop at `T`: a standing identity is judged by the stage's stamp alone (ADR-272,
+            // decision 6), and the stages were created below the drop, so the swap began below it, whether the life is the remains the drop
+            // re-dated (B) or a life made after the ordinary drop (A). The end state is the same.
+            let want = 1;
             assert_eq!(
                 after, want,
                 "the register's logical drops after the flip ({shape:?}, stages below the drop; before the flip: {before})"
@@ -980,8 +993,8 @@ fn a_member_that_met_the_ordinary_drop_before_the_stages_ends_as_one_that_met_th
 
 #[test]
 fn the_same_with_the_stages_created_below_the_drop_records_which_mechanism_closes_each_shape() {
-    // B: the swap began before the drop, the life is kept, so the seed writes the logical drop (register.rs:723); A: a plain recreation, no
-    // seed, and x is absent only because the flip floors the new physical itself
+    // The swap began before the drop, so the seed writes the logical drop in both shapes: B, the life is kept and re-dated; A, a life made after
+    // the ordinary drop, which a standing identity judged by the stage's stamp alone does not spare (ADR-272, decision 6)
     shapes_end_as_the_flip_first_member(&world_below(), true);
 }
 
