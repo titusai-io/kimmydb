@@ -995,6 +995,8 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         // A snapshot page's row no page can carry: about the row, never an
         // apply's (ADR-249).
         E::SnapshotRowTooLarge { .. } => false,
+        // The register a snapshot carries does not fit a page: about the sender's own state, never an apply's (Q6.6, unit C2d).
+        E::SnapshotRegisterCarryTooLarge { .. } => false,
     }
 }
 
@@ -1501,7 +1503,10 @@ where
                     // A row no page can carry (a document larger than a frame):
                     // the requester is told which, rather than left with a
                     // connection that closed.
-                    Err(e @ kimmy_storage::StorageError::SnapshotRowTooLarge { .. }) => {
+                    Err(
+                        e @ (kimmy_storage::StorageError::SnapshotRowTooLarge { .. }
+                        | kimmy_storage::StorageError::SnapshotRegisterCarryTooLarge { .. }),
+                    ) => {
                         // The row is asked for again every round: said once per
                         // interval and row, and the text names an `_id` by a prefix.
                         use crate::said_once::SaidOnce;

@@ -204,6 +204,15 @@ pub enum StorageError {
          has {room} bytes for its rows: it cannot cross on a page until it is smaller"
     )]
     SnapshotRowTooLarge { what: String, bytes: usize, room: usize },
+
+    /// The register a whole-database snapshot carries on its last page does not fit a page that holds nothing else
+    /// (`snapshot::SNAPSHOT_PAGE_BYTES`, ADR-272, decisions 4 and 6; Q6.6, unit C2d). The carry is never truncated: a truncated register
+    /// is a silently wrong one, so the sender answers the page's request with this reason, and the limit is in docs/operations.md.
+    #[error(
+        "the register a snapshot carries is {bytes} bytes, which does not fit the {cap} bytes a \
+         page has for it: it cannot be sent until it is compacted"
+    )]
+    SnapshotRegisterCarryTooLarge { bytes: usize, cap: usize },
 }
 
 /// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).

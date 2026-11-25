@@ -1414,3 +1414,142 @@ fn a_stage_a_page_makes_is_judged_by_its_creation_against_the_drop_the_identity_
         );
     }
 }
+
+// -- Unit C2d: the carry's measure, where it rides, and its cap ------------------------------------------------------------------------------
+
+/// A plain collection holding one document on `sender`: a row the walk sends, whatever the swap did.
+fn with_a_plain_document(sender: &Engine) {
+    let plain = sender.create_collection(DB, "plain").unwrap();
+    sender.insert(&plain, doc! { "_id": 1, "v": "a document the walk sends" }).unwrap();
+}
+
+/// A sender with a plain document and as many swaps as it takes for its carry to be larger than the row: the size of that carry, the sender
+/// (the page it builds is the whole snapshot) and the last stage it bound. Measured, not computed: a row costs its bytes, the overhead of
+/// a row and the cursor the page would cut at it, and the room hook the tests use must hold the row when it holds the carry and not both,
+/// so swaps are added (at most 32) until a scoped snapshot of the row alone fits a room one byte under the carry.
+fn a_sender_and_the_size_of_its_carry() -> (Swap, usize, String) {
+    let s = swap(&[]);
+    with_a_plain_document(&s.sender);
+    let plain = CollectionId::derive(DB, "plain");
+    let mut last = STAGE1.to_string();
+    let mut previous = s.bind.stamp.hlc.wall_ms;
+    let mut swaps = 1;
+    let size = loop {
+        let whole = s.sender.snapshot_page(None, None).unwrap();
+        assert_eq!(whole.documents.len(), 1, "premise: the page carries the plain document");
+        let carry = whole
+            .register
+            .expect("premise: the one page that exhausts the walk carries the register");
+        let size = carry.encoded_len();
+        s.sender.set_snapshot_room_for_test(Some(size - 1));
+        let probe = s.sender.snapshot_page(None, Some(plain)).unwrap();
+        s.sender.set_snapshot_room_for_test(None);
+        if probe.documents.len() == 1 {
+            break size;
+        }
+        assert!(swaps < 32, "premise: {swaps} swaps make the carry larger than the row");
+        swaps += 1;
+        let stage = format!("orders.__stg.a{swaps}");
+        let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+        s.a.create_stage(DB, &stage, MergePolicy::Document, deadline).unwrap();
+        let creation = creation_of(&s.a, &stage);
+        let wall = creation.stamp.hlc.wall_ms.max(previous) + 1;
+        let bind = bind_of(&s.a, &stage, wall);
+        s.sender.apply_batch(std::slice::from_ref(&creation)).unwrap();
+        window(&s.sender, std::slice::from_ref(&bind));
+        assert_eq!(served_by(&s.sender), Ok(stage.clone()), "premise: the sender swapped again");
+        previous = wall;
+        last = stage;
+    };
+    (s, size, last)
+}
+
+#[test]
+fn a_carry_that_fits_rides_the_page_that_walks_the_last_row() {
+    let (s, size, _) = a_sender_and_the_size_of_its_carry();
+    let page = s.sender.snapshot_page(None, None).unwrap();
+    assert_eq!(page.documents.len(), 1, "premise: the page holds the row");
+    assert!(page.next.is_none(), "the snapshot ends on the page that walks its last row");
+    assert_eq!(
+        page.register.as_ref().map(|carry| carry.encoded_len()),
+        Some(size),
+        "and that page carries the register"
+    );
+}
+
+#[test]
+fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
+    let (s, size, last) = a_sender_and_the_size_of_its_carry();
+    // room for the carry alone, and for the row, but not for both
+    s.sender.set_snapshot_room_for_test(Some(size + 1));
+    let probe = s.sender.snapshot_page(None, Some(CollectionId::derive(DB, "plain"))).unwrap();
+    assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
+    let first = s.sender.snapshot_page(None, None).unwrap();
+    assert_eq!(first.documents.len(), 1, "premise: the row fits the room");
+    assert!(first.register.is_none(), "the carry is not on the page that cannot hold it");
+    let cursor = first.next.clone();
+    assert!(cursor.is_some(), "the page ends early, after its last row, and the walk goes on");
+    let second = s.sender.snapshot_page(cursor, None).unwrap();
+    assert!(
+        second.documents.is_empty() && second.collections.is_empty(),
+        "the carry rides a page with nothing else on it, and no row is sent twice"
+    );
+    assert!(second.register.is_some() && second.next.is_none(), "which is the last page");
+    // and the pull completes with the register applied
+    let (j, _dj) = engine();
+    pull(&j, &s.sender);
+    assert_eq!(
+        served_by(&j),
+        Ok(last),
+        "the joiner took the register: the last stage the sender bound serves"
+    );
+    assert!(j.get_collection(DB, "plain").is_ok(), "and the row came with it");
+}
+
+#[test]
+fn a_carry_that_does_not_fit_a_page_of_its_own_is_refused_not_cut() {
+    let (s, size, _) = a_sender_and_the_size_of_its_carry();
+    s.sender.set_snapshot_room_for_test(Some(size - 1));
+    // the same walk of the row alone, on a page with no carry (a scoped one, whose cursor reserves more): it fits the room, so the walk of
+    // the whole database exhausts on its page and only the carry, which does not fit a page of its own, can refuse
+    let probe = s.sender.snapshot_page(None, Some(CollectionId::derive(DB, "plain"))).unwrap();
+    assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
+    match s.sender.snapshot_page(None, None) {
+        Err(crate::StorageError::SnapshotRegisterCarryTooLarge { bytes, cap }) => {
+            assert_eq!((bytes, cap), (size, size - 1), "the error names the size and the room");
+        }
+        other => panic!("a carry no page can hold is refused, never cut: {other:?}"),
+    }
+}
+
+#[test]
+fn the_gauge_reads_the_size_of_the_carry_last_built_and_zero_before_any() {
+    let (e, _d) = engine();
+    assert_eq!(e.snapshot_register_carry_bytes(), 0, "premise: nothing built a carry yet");
+    let page = e.snapshot_page(None, None).unwrap();
+    let empty = page.register.expect("the last page carries the register").encoded_len();
+    assert_eq!(e.snapshot_register_carry_bytes() as usize, empty, "an empty register has a size");
+    let (s, size, _) = a_sender_and_the_size_of_its_carry();
+    assert_eq!(s.sender.snapshot_register_carry_bytes() as usize, size, "the measure of the swaps");
+    assert!(size > empty, "premise: a swap makes the carry larger");
+}
+
+#[test]
+fn the_warning_fires_at_half_the_cap_and_at_most_once_an_hour() {
+    // no document on the sender: with a cap this small a row would end the first page before the carry is reached
+    let s = swap(&[]);
+    let whole = s.sender.snapshot_page(None, None).unwrap();
+    assert!(whole.documents.is_empty(), "premise: the sender has no row to send");
+    let size = whole.register.expect("premise: the page carries the register").encoded_len();
+    assert_eq!(s.sender.register_carry_warnings(), 0, "premise: no warning so far");
+    // a cap four times the carry: half of it is twice the carry
+    s.sender.set_snapshot_page_bytes_for_test(Some(4 * size));
+    assert!(s.sender.snapshot_page(None, None).is_ok(), "premise: the page is served");
+    assert_eq!(s.sender.register_carry_warnings(), 0, "below half the cap: no warning");
+    // a cap just above the carry: the carry is more than half of it
+    s.sender.set_snapshot_page_bytes_for_test(Some(size + 1));
+    let _ = s.sender.snapshot_page(None, None);
+    assert_eq!(s.sender.register_carry_warnings(), 1, "at half the cap or more: one warning");
+    let _ = s.sender.snapshot_page(None, None);
+    assert_eq!(s.sender.register_carry_warnings(), 1, "and not again within the hour");
+}

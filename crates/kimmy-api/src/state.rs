@@ -301,6 +301,7 @@ impl AppState {
             out_loss_records: self.engine.out_loss_records(),
             out_vector_config_discarded: self.engine.out_vector_config_discarded(),
             snapshot_documents_skipped: self.engine.snapshot_documents_skipped(),
+            snapshot_register_carry_bytes: self.engine.snapshot_register_carry_bytes(),
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.

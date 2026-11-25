@@ -557,6 +557,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         out_loss_records: Vec::new(),
         out_vector_config_discarded: 0,
         snapshot_documents_skipped: Vec::new(),
+        snapshot_register_carry_bytes: 0,
         databases: 1,
         collections: 2,
         unique_violations: 3,
@@ -1063,4 +1064,18 @@ fn every_table_in_the_documentation_keeps_its_rows() {
          move whatever was added between them and their table:\n  {}",
         cut_off.join("\n  ")
     );
+}
+
+// The size of the register a snapshot carries is bounded by one page, and the limit is the operator's to know with its number (ADR-272,
+// Q6.6, unit C2d): the row of the gauge says it, so that the day a snapshot refuses with the error that names the size, the table
+// already told them what it meant and how far away it was.
+#[test]
+fn the_row_of_the_register_carry_gauge_names_its_limit_with_the_number() {
+    let row = OPERATIONS
+        .lines()
+        .find(|line| line.starts_with("| `kimmy_snapshot_register_carry_bytes`"))
+        .expect("the metrics table has a row for the size of the register carry");
+    for number in ["63 MiB", "180,000", "365"] {
+        assert!(row.contains(number), "the row does not name `{number}`: {row}");
+    }
 }

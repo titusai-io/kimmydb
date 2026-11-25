@@ -201,6 +201,9 @@ pub struct StorageReadings {
     /// (`Engine::snapshot_documents_skipped`): the series
     /// `kimmy_snapshot_documents_skipped_total{within_grant}`.
     pub snapshot_documents_skipped: Vec<(&'static str, u64)>,
+    /// The size of the register carry this member last built for a snapshot's last page
+    /// (`Engine::snapshot_register_carry_bytes`): the gauge `kimmy_snapshot_register_carry_bytes`.
+    pub snapshot_register_carry_bytes: u64,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -433,6 +436,8 @@ pub struct MetricsSnapshot {
     /// Documents a snapshot page carried that this member skipped, in the order of `kimmy_storage::SNAPSHOT_SKIP_LABELS`: the series
     /// `kimmy_snapshot_documents_skipped_total{within_grant}`.
     pub snapshot_documents_skipped: [u64; kimmy_storage::SNAPSHOT_SKIP_LABELS.len()],
+    /// The size of the register carry last built for a snapshot's last page: the gauge `kimmy_snapshot_register_carry_bytes`.
+    pub snapshot_register_carry_bytes: u64,
     pub commits: u64,
     pub fsyncs: u64,
     pub commits_grouped: u64,
@@ -1566,6 +1571,7 @@ impl Metrics {
                 &kimmy_storage::SNAPSHOT_SKIP_LABELS,
                 &readings.snapshot_documents_skipped,
             ),
+            snapshot_register_carry_bytes: readings.snapshot_register_carry_bytes,
             conflicts_resolved: {
                 let mut made = [0u64; 6];
                 for (label, n) in &readings.conflicts_resolved {
@@ -3557,6 +3563,7 @@ mod tests {
             out_loss_records: vec![("late_write", 8_221), ("snapshot_delete", 8_222)],
             out_vector_config_discarded: 8_231,
             snapshot_documents_skipped: vec![("true", 8_241), ("false", 8_242)],
+            snapshot_register_carry_bytes: 8_251,
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -4366,6 +4373,9 @@ kimmy_register_carried_drop_deferred_total 98
 # TYPE kimmy_snapshot_documents_skipped_total counter
 kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
 kimmy_snapshot_documents_skipped_total{within_grant=\"false\"} 8242
+# HELP kimmy_snapshot_register_carry_bytes The size, in bytes, of the register carry this member last built for the last page of a snapshot it served: the sender's events in effect, its stage rows and its post-drop rows. The carry rides one page whole, and a page holds 63 MiB, which is about 180,000 swaps cluster-wide at about 365 bytes each: past that a snapshot cannot be served, and the answer is an error naming the size. A warning at half of that is logged at most once an hour. 0 on a member that has served no snapshot. This member's own measure, not part of any state and not replicated.
+# TYPE kimmy_snapshot_register_carry_bytes gauge
+kimmy_snapshot_register_carry_bytes 8251
 # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.
 # TYPE kimmy_clock_hlc_lead_seconds gauge
 kimmy_clock_hlc_lead_seconds 7001
@@ -4883,6 +4893,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 s.snapshot_documents_skipped[slot]
             ));
         }
+        expect(&format!(
+            "kimmy_snapshot_register_carry_bytes {}\n",
+            s.snapshot_register_carry_bytes
+        ));
         for (slot, code) in REFUSED_CODES.iter().enumerate() {
             expect(&format!(
                 "kimmy_api_refused_total{{code=\"{}\"}} {}\n",
@@ -6265,6 +6279,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             page.matches("kimmy_snapshot_documents_skipped_total{").count(),
             2,
             "the two values of the label and no other"
+        );
+        assert!(
+            page.contains("kimmy_snapshot_register_carry_bytes 0\n"),
+            "no `kimmy_snapshot_register_carry_bytes 0` in the page at rest"
         );
         assert_eq!(
             page.matches("kimmy_out_buried_total{").count(),

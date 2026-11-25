@@ -339,6 +339,11 @@ pub struct Engine {
     /// in (`kimmy_snapshot_documents_skipped_total{within_grant}`, [`SNAPSHOT_SKIP_LABELS`]). Per
     /// member, since start.
     snapshot_documents_skipped: [std::sync::atomic::AtomicU64; 2],
+    /// The size of the register carry this member last built for a snapshot's last page, in bytes
+    /// (`kimmy_snapshot_register_carry_bytes`): 0 on a member that has served no snapshot.
+    snapshot_register_carry_bytes: std::sync::atomic::AtomicU64,
+    /// Warnings the carry's size has raised (half the page's cap, at most one an hour).
+    register_carry_warnings: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
     /// How long the writer was held, as a histogram over
@@ -1826,6 +1831,8 @@ impl Engine {
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
             register_carried_drops_deferred: std::sync::atomic::AtomicU64::new(0),
             snapshot_documents_skipped: Default::default(),
+            snapshot_register_carry_bytes: std::sync::atomic::AtomicU64::new(0),
+            register_carry_warnings: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
@@ -1900,6 +1907,17 @@ impl Engine {
             .zip(&self.snapshot_documents_skipped)
             .map(|(label, count)| (*label, count.load(Relaxed)))
             .collect()
+    }
+
+    /// The size, in bytes, of the register carry this member last built for a snapshot page
+    /// (`kimmy_snapshot_register_carry_bytes`).
+    pub fn snapshot_register_carry_bytes(&self) -> u64 {
+        self.snapshot_register_carry_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.
+    pub fn register_carry_warnings(&self) -> u64 {
+        self.register_carry_warnings.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Count one page document skipped for want of a collection ([`Self::snapshot_documents_skipped`]).

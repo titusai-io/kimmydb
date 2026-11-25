@@ -12207,6 +12207,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_register_carried_drop_deferred_total",
         "kimmy_snapshot_documents_skipped_total",
         "kimmy_snapshot_documents_skipped_total",
+        "kimmy_snapshot_register_carry_bytes",
         // Since U1's guard on schema changes, the two gauges that follow it.
         "kimmy_clock_hlc_lead_seconds",
         "kimmy_clock_own_stamps_refused_seconds",

@@ -3464,6 +3464,15 @@ mod tests {
     }
 
     #[test]
+    fn the_register_carry_gauge_reads_its_own_field() {
+        let call = instrument_call("kimmy.snapshot_register_carry_bytes");
+        assert!(
+            call.ends_with("|s|s.snapshot_register_carry_bytes"),
+            "kimmy.snapshot_register_carry_bytes reads the carry's size: {call}"
+        );
+    }
+
+    #[test]
     fn each_snapshot_skip_instrument_reads_the_slot_of_its_own_label() {
         // As for the causes of `kimmy_out_buried_total`: one instrument per value of `within_grant`, each reading its own slot of
         // `MetricsSnapshot::snapshot_documents_skipped`, in the order of `SNAPSHOT_SKIP_LABELS`.

@@ -619,6 +619,23 @@ pub struct RegisterCarry {
     pub posts: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
 }
 
+/// What a row of the carry costs on the wire besides its key and value: the array that holds the pair and the two binary headers. A bound,
+/// as [`DOCUMENT_OVERHEAD`] is for a document.
+const CARRY_ROW_FRAME: usize = 32;
+/// What the carry costs besides its rows: its three lists and the field that holds it.
+const CARRY_FRAME: usize = 64;
+
+impl RegisterCarry {
+    /// The bytes the carry takes on a page, as the sender measures it: the length of every key and value, a frame for each row and one
+    /// for the carry (Q6.6, unit C2d).
+    pub fn encoded_len(&self) -> usize {
+        let rows = |rows: &[(serde_bytes::ByteBuf, serde_bytes::ByteBuf)]| -> usize {
+            rows.iter().map(|(key, value)| key.len() + value.len() + CARRY_ROW_FRAME).sum()
+        };
+        CARRY_FRAME + rows(&self.events) + rows(&self.stages) + rows(&self.posts)
+    }
+}
+
 /// One page of a snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotPage {
