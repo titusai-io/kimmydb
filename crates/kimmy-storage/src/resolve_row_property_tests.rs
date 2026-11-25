@@ -14,7 +14,7 @@
 //! 4. after an operation that runs the settle pass (a binding or a drop delivered by a window, a local drop or a recreation, a restore,
 //!    a snapshot join, the pass itself) the row of a name that has a stage row is current: a pass site that forgot to write it is the
 //!    finding, and the fallback would hide it from (1) alone. A name with an event and no stage row (`ghost`, made by hand through the
-//!    door, a state no member should reach) cannot be named by a page or a restore, so it is held to (1) to (3) only.
+//!    door, a state only a narrow route makes) cannot be named by a page or a restore, so it is held to (1) to (3) only.
 //!
 //! The case and operation counts are fixed (`SEQUENCES`, `STEPS`; `RESOLVE_ROW_SEQUENCES` overrides the first), and a failure names the
 //! seed and prints the steps so that it replays.
@@ -349,9 +349,11 @@ impl World {
                 None => ("forget (no stage)".into(), false),
             },
             11 => {
-                // The state no member should be in: an event for a name that has no stage row (the door called by hand). It is kept as an
-                // explicit operation so that, if the claim that no production path stores one is ever wrong, the answers are still proven
-                // right: the row path equals the computation, the fallback is counted on every resolve, and no row is demanded.
+                // A state only a narrow route makes: an event for a name that has no stage row (the
+                // door called by hand; a restored member reading its own writes back before its
+                // pull is the one route known to make it). It is kept as an explicit operation so
+                // that the answers in it are proven right: the row path equals the computation, the
+                // fallback is counted on every resolve, and no row is demanded.
                 self.tried("an event with no stage row");
                 let wall = self.next_wall();
                 let (node, epoch) = (self.author.node_id(), self.author.epoch());

@@ -939,12 +939,18 @@ fn a_join_buries_the_identity_the_binding_binds_out_whether_or_not_it_is_counted
     );
 }
 
-// This is the case that no real cluster is known to be in, and the engine does not forbid it: a name's events can be taken with no stage
-// row (a recreation's `Create` and a drop taken by a window name the name on their own, see the probe below), and it is the order the
-// entries arrive in that keeps a cluster out of it: the stage's creation reaches a member, and writes its row, before the events that
-// follow it, and a page and a backup carry the rows beside the events. A joiner that gets such events cannot name them, and the test of a
-// fresh one below says what it holds. The resolve row's property test keeps it as an explicit operation (`an event with no stage row`)
-// so that the answers stay proven right.
+// This is a narrow case, and the engine does not forbid it: a name's events can be taken with no
+// stage row (a recreation's `Create` and a drop taken by a window name the name on their own, see
+// the probe below). One route to it is known, from reading the code and not yet run: a member whose
+// store went back to before the stage's creation reads its own lost writes back (a drop, a
+// recreation and a second drop of the name) with `apply_batch`, before its pull, and holds the
+// events with no stage row until the stage's creation arrives, and a third member that lacks the
+// stage's creation and pulls a window from it can then take the events with no stage row. No other
+// route is known: by a window, a push or a snapshot a stage's creation reaches a member, and writes
+// its row, before the events that follow it, and a page and a backup carry the rows beside the
+// events. A joiner that gets such events cannot name them, and the test of a fresh one below says
+// what it holds. The resolve row's property test keeps it as an explicit operation (`an event with
+// no stage row`) so that the answers stay proven right.
 #[test]
 fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() {
     let s = swap(&[]);

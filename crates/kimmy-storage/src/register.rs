@@ -1640,7 +1640,13 @@ pub(crate) fn has_events_in(txn: &redb::WriteTransaction, db: &str, logical: &st
 }
 
 /// Test only: remove a stage's creation row, to make a member that holds a stage's collection, or a name's events, with no row for it.
-/// No route does: a backup carries all four register tables, and a page carries the stage rows beside the events.
+/// A backup carries all four register tables and a page carries the stage rows beside the events,
+/// so neither makes this state. The hook makes a stage's collection with no stage row; a member
+/// whose store went back to before the stage's creation makes the events with no stage row too: it
+/// reads its own lost writes back (a drop, a recreation and a second drop of the name) with
+/// `apply_batch` before its pull, parks a recreation and seeds a drop in effect, and holds no stage
+/// row until the stage's creation arrives (and a third member that lacks the stage's creation and
+/// pulls a window from it can then take the events with no stage row).
 #[cfg(test)]
 pub(crate) fn remove_stage_row_for_test(engine: &crate::Engine, physical: CollectionId) {
     let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
