@@ -34,7 +34,6 @@ fn corrupt(what: &str) -> StorageError {
 /// What the settle pass decided for a name, as the stored visibility row keeps it (ADR-272; Q6.6, the resolve row): which kind of answer, the
 /// stamp of the event that is visible, the physical it names, the newest logical drop in effect (what rule 4 needs), and the newest event
 /// stored for the name when the pass decided (what a reader checks the row is still current against).
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VisibleKind {
     Identity,
@@ -43,7 +42,6 @@ pub(crate) enum VisibleKind {
     Dropped,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VisibleRow {
     pub(crate) kind: VisibleKind,
@@ -53,14 +51,166 @@ pub(crate) struct VisibleRow {
     pub(crate) newest_event: Option<Stamp>,
 }
 
-/// The stored visibility row of `logical`, read outside any write transaction. Test builds only. SCAFFOLD: nothing writes the row yet.
+impl VisibleRow {
+    /// The row for what the pass decided: `visible` over the name's events, `newest_drop` in effect and `newest_event` stored.
+    pub(crate) fn decided(
+        visible: &kimmy_core::register_state::Visible,
+        newest_drop: Option<Stamp>,
+        newest_event: Option<Stamp>,
+    ) -> Self {
+        use kimmy_core::register_state::Visible;
+        let (kind, event, physical) = match visible {
+            Visible::Identity => (VisibleKind::Identity, None, String::new()),
+            Visible::Bound { physical, stamp } => {
+                (VisibleKind::Bound, Some(*stamp), physical.clone())
+            }
+            Visible::Created { physical, stamp } => {
+                (VisibleKind::Created, Some(*stamp), physical.clone())
+            }
+            Visible::Dropped { stamp } => (VisibleKind::Dropped, Some(*stamp), String::new()),
+        };
+        Self { kind, event, physical, newest_drop, newest_event }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let kind = match self.kind {
+            VisibleKind::Identity => 0u8,
+            VisibleKind::Bound => 1,
+            VisibleKind::Created => 2,
+            VisibleKind::Dropped => 3,
+        };
+        let flags = u8::from(self.event.is_some())
+            | (u8::from(self.newest_drop.is_some()) << 1)
+            | (u8::from(self.newest_event.is_some()) << 2);
+        let mut out = vec![kind, flags];
+        for stamp in [self.event, self.newest_drop, self.newest_event].into_iter().flatten() {
+            out.extend_from_slice(&stamp.to_key_bytes());
+        }
+        out.extend_from_slice(self.physical.as_bytes());
+        out
+    }
+
+    /// `None` for bytes that are not a row: a derived row that does not decode is a row that is not there.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&kind, rest) = bytes.split_first()?;
+        let (&flags, mut rest) = rest.split_first()?;
+        let kind = match kind {
+            0 => VisibleKind::Identity,
+            1 => VisibleKind::Bound,
+            2 => VisibleKind::Created,
+            3 => VisibleKind::Dropped,
+            _ => return None,
+        };
+        let mut stamp = |present: bool| -> Option<Option<Stamp>> {
+            if !present {
+                return Some(None);
+            }
+            let (head, tail) = rest.split_at_checked(Stamp::KEY_LEN)?;
+            rest = tail;
+            Some(Some(Stamp::from_key_bytes(head.try_into().ok()?)))
+        };
+        let event = stamp(flags & 1 != 0)?;
+        let newest_drop = stamp(flags & 2 != 0)?;
+        let newest_event = stamp(flags & 4 != 0)?;
+        let physical = String::from_utf8(rest.to_vec()).ok()?;
+        Some(Self { kind, event, physical, newest_drop, newest_event })
+    }
+}
+
+fn visible_key(db: &str, logical: &str) -> [u8; 8] {
+    CollectionId::derive(db, logical).0.to_be_bytes()
+}
+
+/// The stored visibility row of `logical`, if there is one that decodes.
+pub(crate) fn visible_row_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Option<VisibleRow>> {
+    let table = txn.open_table(tables::REGISTER_VISIBLE)?;
+    let found = table.get(visible_key(db, logical).as_slice())?;
+    Ok(found.and_then(|raw| VisibleRow::decode(raw.value())))
+}
+
+/// The stamp of the newest event stored for `logical` in `REGISTER`, by one reverse range read: what a stored row is checked current against.
+pub(crate) fn newest_stored_event_read(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Option<Stamp>> {
+    newest_event_of(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))
+}
+
+/// [`newest_stored_event_read`] inside a write transaction (the pass).
+pub(crate) fn newest_stored_event(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+) -> Result<Option<Stamp>> {
+    newest_event_of(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))
+}
+
+fn newest_event_of(
+    rows: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: CollectionId,
+) -> Result<Option<Stamp>> {
+    let lo = row_key(id, &Stamp::from_key_bytes([0; Stamp::KEY_LEN]));
+    let hi = row_key(id, &Stamp::from_key_bytes([0xFF; Stamp::KEY_LEN]));
+    match rows.range(lo.as_slice()..=hi.as_slice())?.next_back() {
+        Some(row) => Ok(Some(crate::codec::decode_oplog_key(&row?.0.value()[8..])?)),
+        None => Ok(None),
+    }
+}
+
+/// Keep what was decided for `logical` (the settle pass in its own transaction, a restore from what it computes). A row that is already
+/// what was decided is not written again, so a pass that decides nothing new dirties no page. **A name with no stored event has no row**:
+/// a row whose `newest_event` is `None` is not written and removes any row there, so every writer obeys the rule and none can leave a
+/// row for a name that has nothing to cache (a stage's creation runs the pass with no event; a restore names every nameable name).
+pub(crate) fn write_visible_row(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    row: &VisibleRow,
+) -> Result<()> {
+    let mut table = txn.open_table(tables::REGISTER_VISIBLE)?;
+    let key = visible_key(db, logical);
+    if row.newest_event.is_none() {
+        table.remove(key.as_slice())?;
+        return Ok(());
+    }
+    let bytes = row.encode();
+    let same = table.get(key.as_slice())?.is_some_and(|held| held.value() == bytes.as_slice());
+    if !same {
+        table.insert(key.as_slice(), bytes.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Delete the visibility row of the name a collection named `physical` belongs to (the name itself, or the logical name of a stage or a
+/// recreation), in the transaction that makes the collection arrive or leave: a row that may be stale is never left. A missing row is a
+/// counted fallback to the computation, which is always right; the pass, where it runs, writes the row again.
+pub(crate) fn forget_visible_row(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    physical: &str,
+) -> Result<()> {
+    let logical = kimmy_core::swap::logical_of_stage(physical)
+        .or_else(|| kimmy_core::logical_of_recreation(physical))
+        .unwrap_or(physical);
+    txn.open_table(tables::REGISTER_VISIBLE)?.remove(visible_key(db, logical).as_slice())?;
+    Ok(())
+}
+
+/// The stored visibility row of `logical`, read outside any write transaction. Test builds only.
 #[cfg(test)]
 pub(crate) fn visible_row_for_tests(
-    _engine: &crate::Engine,
-    _db: &str,
-    _logical: &str,
+    engine: &crate::Engine,
+    db: &str,
+    logical: &str,
 ) -> Result<Option<VisibleRow>> {
-    Ok(None)
+    use redb::ReadableDatabase;
+    let txn = engine.db().begin_read()?;
+    visible_row_read(&txn, db, logical)
 }
 
 #[cfg(test)]
@@ -80,6 +230,7 @@ pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
     let _ = txn.open_table(tables::REGISTER_INFO)?;
     let _ = txn.open_table(tables::REGISTER_STAGES)?;
     let _ = txn.open_table(tables::REGISTER_POST)?;
+    let _ = txn.open_table(tables::REGISTER_VISIBLE)?;
     Ok(())
 }
 

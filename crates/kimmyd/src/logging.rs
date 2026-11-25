@@ -2437,6 +2437,14 @@ impl TelemetryGuard {
             "Size of the register carry this member last built for a snapshot's last page: the events in effect, the stage rows and the post-drop rows. A page holds 63 MiB, about 180,000 swaps cluster-wide.",
             |s| s.snapshot_register_carry_bytes
         );
+        // Resolutions of a swapped name that found the stored visibility row stale and computed the answer (ADR-272; Q6.6, the resolve row).
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.resolve_fallback",
+            "{resolution}",
+            "Resolutions of a swapped name answered from the register's events because the stored visibility row was stale. 0 on a healthy member.",
+            register_resolve_fallback
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(

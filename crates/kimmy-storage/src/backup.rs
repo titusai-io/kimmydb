@@ -776,6 +776,10 @@ mod tests {
         ),
         ("UNIQUE_VIOLATIONS", "derived from the oplog"),
         (
+            "REGISTER_VISIBLE",
+            "derived from the register by the settle pass (ADR-272, the resolve row): a restored member answers by the computation until a pass writes it again",
+        ),
+        (
             "PURGE_NOT_BEFORE",
             "this member's own clock and requests (ADR-272, decision 5): a restore starts with no request in flight, so there is nothing to defer for",
         ),

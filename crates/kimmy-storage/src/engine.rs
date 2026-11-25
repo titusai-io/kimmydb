@@ -5634,6 +5634,9 @@ impl Engine {
             // incarnation starts with no digest row, so the old one's highest
             // stamps do not make it look busy (B3 design 2.1).
             crate::live_digest::reset(txn, id)?;
+            // A collection arrives: the stored visibility row of its name may no longer be what the name serves (a stage whose binding is
+            // in effect, made alive after it), so it goes, and the pass writes it again where it runs (ADR-272; Q6.6, the resolve row)
+            crate::register::forget_visible_row(txn, db, name)?;
             // A life created over its database's tombstone takes a tombstone of its
             // own at the database's drop, with its shadow's, which is what the
             // database's sweep gives every life it leaves standing (ADR-229 item 4).
@@ -6090,6 +6093,12 @@ impl Engine {
             }
             Visible::Dropped { .. } | Visible::Identity => {}
         }
+        // What the pass decided is kept, in this transaction (ADR-272; Q6.6, the resolve row), so a resolution reads it and never the events
+        // of a name refreshed a thousand times
+        // (a name with no stored event has nothing to cache, and the writer keeps no row for it: a stage's creation runs the pass with none)
+        let newest_event = crate::register::newest_stored_event(txn, db, logical)?;
+        let row = crate::register::VisibleRow::decided(&visible, newest_drop, newest_event);
+        crate::register::write_visible_row(txn, db, logical, &row)?;
         // After the pass, before the commit: the point where a transaction that fails must leave every counter as it was
         #[cfg(test)]
         crate::sync::race_hooks::after_settle()?;
@@ -6135,7 +6144,7 @@ impl Engine {
     /// event is `get_collection` exactly.
     pub fn resolve(&self, db: &str, name: &str) -> Result<Resolved> {
         let txn = self.db.begin_read()?;
-        Self::resolve_in(&txn, db, name)
+        self.resolve_in(&txn, db, name)
     }
 
     /// [`Self::resolve`] for a WRITE (ADR-272, decision 7; D10): the same resolution, refused with
@@ -6144,7 +6153,7 @@ impl Engine {
     /// One read transaction, so the refusal is judged against the state the resolution saw.
     pub fn resolve_for_write(&self, db: &str, name: &str) -> Result<Resolved> {
         let txn = self.db.begin_read()?;
-        let resolved = Self::resolve_in(&txn, db, name)?;
+        let resolved = self.resolve_in(&txn, db, name)?;
         match crate::register::refusal_read(&txn, db, name, &resolved.physical)? {
             Some(refusal) => Err(StorageError::NameSuperseded {
                 logical: name.to_string(),
@@ -6170,7 +6179,60 @@ impl Engine {
         Ok(self.resolve(db, logical)?.meta)
     }
 
-    fn resolve_in(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
+    /// A resolution reads the row the settle pass kept for the name when there is one that is still current (ADR-272; Q6.6, the resolve
+    /// row): the physical it names is alive and the newest event of the name is the one the row was decided against. Anything else is a
+    /// stale row, or a name with events and no row, and is answered by the computation from the events, which is always right, and
+    /// counted (`kimmy_register_resolve_fallback_total`, expected 0). A name with no event has no row and is not a fallback.
+    fn resolve_in(&self, txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
+        use crate::register::VisibleKind;
+        let newest = crate::register::newest_stored_event_read(txn, db, name)?;
+        if newest.is_some() {
+            let row = crate::register::visible_row_read(txn, db, name)?;
+            if let Some(row) = row.filter(|row| row.newest_event == newest) {
+                let not_found = || -> StorageError {
+                    CoreError::CollectionNotFound {
+                        db: db.to_string(),
+                        collection: name.to_string(),
+                    }
+                    .into()
+                };
+                let collections = txn.open_table(tables::COLLECTIONS)?;
+                let alive = |physical: &str| -> Result<Option<CollectionMeta>> {
+                    match collections.get((db, physical))? {
+                        Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+                        None => Ok(None),
+                    }
+                };
+                match row.kind {
+                    VisibleKind::Dropped => return Err(not_found()),
+                    VisibleKind::Identity => {
+                        // No event makes a physical visible, so the identity answers; with none, the name is absent, as the
+                        // computation says. The row stays right: a collection that arrives deletes it (`forget_visible_row`)
+                        return match alive(name)? {
+                            Some(meta) => {
+                                Ok(Resolved { physical: meta.name.clone(), meta, visible: None })
+                            }
+                            None => Err(not_found()),
+                        };
+                    }
+                    VisibleKind::Bound | VisibleKind::Created => {
+                        if let Some(meta) = alive(&row.physical)? {
+                            return Ok(Resolved {
+                                physical: row.physical.clone(),
+                                meta,
+                                visible: row.event,
+                            });
+                        }
+                    }
+                }
+            }
+            self.register_resolve_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self::resolve_computed(txn, db, name)
+    }
+
+    /// The resolution computed from the name's events and the collections that are alive: the truth the stored row is a cache of.
+    fn resolve_computed(txn: &redb::ReadTransaction, db: &str, name: &str) -> Result<Resolved> {
         use kimmy_core::register_state::{Ready, Visible};
         let timeline = crate::register::timeline_read(txn, db, name)?;
         let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -6545,6 +6607,8 @@ impl Engine {
             }
             collections.range((db, "")..=(db, "\u{10FFFF}"))?.next().is_none()
         };
+        // A collection leaves: the stored visibility row of its name goes with it (the reader also checks the physical is alive)
+        crate::register::forget_visible_row(txn, db, name)?;
         // A database exists while it has collections — creation is implicit
         // in the first one, so removal is implicit in the last. Decided here,
         // inside the drop, because drops replicate and database rows do not:
@@ -6935,9 +6999,19 @@ impl Engine {
         txn: &redb::WriteTransaction,
         meta: &CollectionMeta,
     ) -> Result<()> {
-        let mut collections = txn.open_table(tables::COLLECTIONS)?;
-        collections
-            .insert((meta.db.as_str(), meta.name.as_str()), serde_json::to_vec(meta)?.as_slice())?;
+        let created = {
+            let mut collections = txn.open_table(tables::COLLECTIONS)?;
+            collections
+                .insert(
+                    (meta.db.as_str(), meta.name.as_str()),
+                    serde_json::to_vec(meta)?.as_slice(),
+                )?
+                .is_none()
+        };
+        // A write of metadata that made the collection arrive is an arrival like any other
+        if created {
+            crate::register::forget_visible_row(txn, &meta.db, &meta.name)?;
+        }
         Ok(())
     }
 }

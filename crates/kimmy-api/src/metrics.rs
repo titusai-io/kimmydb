@@ -2197,6 +2197,9 @@ impl Metrics {
              # HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.\n\
              # TYPE kimmy_register_carried_drop_deferred_total counter\n\
              kimmy_register_carried_drop_deferred_total {register_carried_drop_deferred}\n\
+             # HELP kimmy_register_resolve_fallback_total Resolutions of a swapped name that found the stored visibility row stale, and answered from the register's events instead: the row named a collection this member does not hold, or the newest event in effect is not the one the row was decided against. The answer is right and slower until the next settle pass rewrites the row. Expected to read 0 on every member: a value that rises names a transaction that changed what a name serves without running the pass for it. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_register_resolve_fallback_total counter\n\
+             kimmy_register_resolve_fallback_total {register_resolve_fallback}\n\
              # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_documents_skipped_total counter\n\
              {snapshot_skip_lines}\
@@ -2452,6 +2455,7 @@ impl Metrics {
                     .collect::<String>()
             },
             register_carried_drop_deferred = readings.register_carried_drops_deferred,
+            register_resolve_fallback = readings.register_resolve_fallbacks,
             register_waiting_lines = if readings.register_waiting.is_empty() {
                 "kimmy_register_waiting_for_stage{origin=\"other\"} 0\n".to_string()
             } else {
@@ -5456,6 +5460,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // Since ADR-272, the one `origin="other"` sample of `kimmy_register_waiting_for_stage`, and the scalar
             // `kimmy_register_carried_drop_deferred_total`.
             + 1
+            + 1
+            // Since ADR-272 (Q6.6, the resolve row), the scalar `kimmy_register_resolve_fallback_total`.
             + 1
             // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
             + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()

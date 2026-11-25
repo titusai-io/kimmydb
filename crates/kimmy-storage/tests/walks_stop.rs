@@ -116,6 +116,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "a prefix range of the collections table that reads at most its first row: the first collection whose name begins with the stage mark of one logical name, asked inside the transaction of a drop (ADR-272, decision 6)",
     ),
     (
+        "register::newest_event_of",
+        "one logical name's newest row of the register: a reverse range read of the 8-byte id's prefix that takes its LAST row and no other, what a stored visibility row is checked current against, in a read transaction of one resolution or in the write transaction of the settle pass (ADR-272; Q6.6, the resolve row)",
+    ),
+    (
         "register::rows_in",
         "one logical name's rows of the register, a prefix range of the 8-byte id: the swap events of one name inside tombstone retention, read inside the write transaction of the entry that carries one of them (ADR-272)",
     ),

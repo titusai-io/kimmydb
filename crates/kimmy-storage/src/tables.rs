@@ -436,6 +436,16 @@ pub const REGISTER_STAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// `crate::register`. Member-local state, not carried by a backup until Q6.6 does.
 pub const REGISTER_POST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_post");
 
+/// `logical collection id (8) -> what the settle pass decided for the name` (`register::VisibleRow`): which kind of answer the name gives,
+/// the stamp of the event that is visible, the physical it names, the newest logical drop in effect and the newest event stored for the
+/// name when the pass decided (ADR-272; Q6.6, the resolve row). DERIVED, never a second source of truth: the events and the stage rows are
+/// the truth, a resolution reads this row and checks it is still current (the physical it names is alive, the newest event is the one it
+/// was decided against) and computes the answer from the events when it is not, counting it. Written by the settle pass in the pass's own
+/// transaction and deleted by every transaction that makes a collection arrive or leave. Not carried by a backup or a snapshot: rebuilt.
+/// Written only by `crate::register`.
+pub const REGISTER_VISIBLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("register_visible");
+
 /// `buried physical collection id -> this member's wall clock, in milliseconds, before which the purger leaves its rows alone`
 /// (ADR-272, decision 5): the burial's wall time plus `server.request_timeout_secs`, written in the burial's own transaction, so a
 /// request that resolved the name before the swap finishes reading what it resolved. **Member-local, never replicated and not

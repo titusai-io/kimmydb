@@ -531,6 +531,7 @@ impl Engine {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             dropped.remove(meta.id.0)?;
         }
+        crate::register::forget_visible_row(&txn, db, name)?;
         txn.commit()?;
         Ok(meta.id)
     }
