@@ -31,6 +31,49 @@ fn corrupt(what: &str) -> StorageError {
     StorageError::Corrupt(format!("the register: {what}"))
 }
 
+/// What the settle pass decided for a name, as the stored visibility row keeps it (ADR-272; Q6.6, the resolve row): which kind of answer, the
+/// stamp of the event that is visible, the physical it names, the newest logical drop in effect (what rule 4 needs), and the newest event
+/// stored for the name when the pass decided (what a reader checks the row is still current against).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisibleKind {
+    Identity,
+    Bound,
+    Created,
+    Dropped,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VisibleRow {
+    pub(crate) kind: VisibleKind,
+    pub(crate) event: Option<Stamp>,
+    pub(crate) physical: String,
+    pub(crate) newest_drop: Option<Stamp>,
+    pub(crate) newest_event: Option<Stamp>,
+}
+
+/// The stored visibility row of `logical`, read outside any write transaction. Test builds only. SCAFFOLD: nothing writes the row yet.
+#[cfg(test)]
+pub(crate) fn visible_row_for_tests(
+    _engine: &crate::Engine,
+    _db: &str,
+    _logical: &str,
+) -> Result<Option<VisibleRow>> {
+    Ok(None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `REGISTER` rows this thread has read through [`rows_in`], for a test of what a resolution costs.
+#[cfg(test)]
+pub(crate) fn rows_read_for_tests() -> usize {
+    ROWS_READ.with(std::cell::Cell::get)
+}
+
 /// Create the register's tables, so a read of them never meets a missing table.
 pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
     let _ = txn.open_table(tables::REGISTER)?;
@@ -366,6 +409,8 @@ fn rows_in(
         let event = RegisterEvent::decode(value.value()).map_err(|e| corrupt(&e.to_string()))?;
         held.push((stamp, event));
     }
+    #[cfg(test)]
+    ROWS_READ.with(|n| n.set(n.get() + held.len()));
     Ok(held)
 }
 

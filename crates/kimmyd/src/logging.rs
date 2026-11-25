@@ -3472,6 +3472,15 @@ mod tests {
     }
 
     #[test]
+    fn the_resolve_fallback_counter_reads_its_own_field() {
+        let call = instrument_call("kimmy.register.resolve_fallback");
+        assert!(
+            call.ends_with("register_resolve_fallback"),
+            "kimmy.register.resolve_fallback reads the stale-row count: {call}"
+        );
+    }
+
+    #[test]
     fn the_register_carry_gauge_reads_its_own_field() {
         let call = instrument_call("kimmy.snapshot_register_carry_bytes");
         assert!(

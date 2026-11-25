@@ -1553,3 +1553,210 @@ fn the_warning_fires_at_half_the_cap_and_at_most_once_an_hour() {
     let _ = s.sender.snapshot_page(None, None);
     assert_eq!(s.sender.register_carry_warnings(), 1, "and not again within the hour");
 }
+
+// -- The resolve row: what the settle pass decided is kept, and a resolution reads it (ADR-272; Q6.6) --------------------------------------
+
+fn the_row(m: &Engine) -> Option<crate::register::VisibleRow> {
+    crate::register::visible_row_for_tests(m, DB, "orders").unwrap()
+}
+
+#[test]
+fn the_pass_writes_the_row_it_decided_for_a_flip() {
+    let s = swap(&[]);
+    assert_eq!(served_by(&s.sender), Ok(STAGE1.to_string()), "premise: the flip is visible");
+    assert_eq!(
+        the_row(&s.sender),
+        Some(crate::register::VisibleRow {
+            kind: crate::register::VisibleKind::Bound,
+            event: Some(s.bind.stamp),
+            physical: STAGE1.to_string(),
+            newest_drop: None,
+            newest_event: Some(s.bind.stamp),
+        }),
+        "the row names the visible binding, its stage and the newest event it was decided against"
+    );
+}
+
+#[test]
+fn a_logical_drop_in_effect_is_a_dropped_row_and_the_name_is_absent() {
+    let s = swap(&[]);
+    let drop = drop_of_orders(&s.a, s.bind.stamp.hlc.wall_ms + 5);
+    window(&s.sender, std::slice::from_ref(&drop));
+    assert!(s.sender.resolve(DB, "orders").is_err(), "premise: the name reads absent");
+    assert_eq!(s.sender.register_resolve_fallbacks(), 0, "the row answered: nothing fell back");
+    assert_eq!(
+        the_row(&s.sender),
+        Some(crate::register::VisibleRow {
+            kind: crate::register::VisibleKind::Dropped,
+            event: Some(drop.stamp),
+            physical: String::new(),
+            newest_drop: Some(drop.stamp),
+            newest_event: Some(drop.stamp),
+        }),
+        "the row says dropped, at the drop's stamp, which is also the newest drop in effect"
+    );
+}
+
+#[test]
+fn a_resolution_with_a_current_row_reads_no_register_row() {
+    use redb::ReadableDatabase;
+    let s = swap(&[]);
+    assert!(the_row(&s.sender).is_some(), "premise: the name has its row");
+    let before = crate::register::rows_read_for_tests();
+    s.sender.resolve(DB, "orders").unwrap();
+    assert_eq!(
+        crate::register::rows_read_for_tests(),
+        before,
+        "the row answers: no event of the name is read"
+    );
+    assert_eq!(s.sender.register_resolve_fallbacks(), 0, "and nothing fell back");
+    // the counter counts: the full computation reads the name's events
+    let txn = s.sender.db().begin_read().unwrap();
+    crate::register::timeline_read(&txn, DB, "orders").unwrap();
+    assert!(
+        crate::register::rows_read_for_tests() > before,
+        "premise: reading the timeline moves the counter, so a 0 above is a measurement"
+    );
+}
+
+#[test]
+fn a_row_naming_a_collection_that_is_gone_falls_back_to_the_events_and_counts_it() {
+    let s = swap(&[]);
+    assert!(the_row(&s.sender).is_some(), "premise: the name has its row");
+    assert_eq!(s.sender.register_resolve_fallbacks(), 0, "premise: nothing has fallen back");
+    // a burial the pass did not run: the stage's collection removed by hand
+    let txn = s.sender.begin_write(crate::WriterHolder::Ddl).unwrap();
+    {
+        let mut collections = txn.open_table(crate::tables::COLLECTIONS).unwrap();
+        let removed = collections.remove((DB, STAGE1)).unwrap();
+        assert!(removed.is_some(), "premise: the stage's collection was held");
+    }
+    txn.commit().unwrap();
+    assert_eq!(
+        the_row(&s.sender).map(|row| row.physical),
+        Some(STAGE1.to_string()),
+        "premise: the row still names the stage, so it is stale"
+    );
+    let before = crate::register::rows_read_for_tests();
+    let answered = s.sender.resolve(DB, "orders");
+    assert!(
+        answered.is_err(),
+        "the answer is the computation's: neither the stage nor the identity is held"
+    );
+    assert!(crate::register::rows_read_for_tests() > before, "it was computed from the events");
+    assert_eq!(s.sender.register_resolve_fallbacks(), 1, "and the fallback is counted");
+}
+
+#[test]
+fn a_name_with_no_event_has_no_row_and_resolves_as_get_collection_does() {
+    let (m, _dm) = with_orders();
+    assert_eq!(the_row(&m), None, "a name with no event has no row");
+    let resolved = m.resolve(DB, "orders").unwrap();
+    let held = m.get_collection(DB, "orders").unwrap();
+    assert_eq!((resolved.physical.as_str(), resolved.meta.id), ("orders", held.id));
+    assert_eq!(resolved.visible, None, "no event made it visible");
+    assert_eq!(m.register_resolve_fallbacks(), 0, "and it is not a fallback: no row was stale");
+}
+
+#[test]
+fn an_event_stored_without_the_pass_makes_the_row_stale_and_the_name_is_computed() {
+    let s = swap(&[]);
+    assert_eq!(
+        the_row(&s.sender).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Bound),
+        "premise: the name has its row, and it says the binding is visible"
+    );
+    let stamp = Stamp::new(Hlc::new(s.bind.stamp.hlc.wall_ms + 5, 0), s.a.node_id(), s.a.epoch());
+    let txn = s.sender.begin_write(crate::WriterHolder::Ddl).unwrap();
+    let put =
+        crate::register::put(&txn, DB, "orders", stamp, kimmy_core::RegisterEvent::LogicalDrop);
+    assert_eq!(put.unwrap(), kimmy_core::register_state::Put::Stored, "premise: it is stored");
+    txn.commit().unwrap();
+    assert_eq!(
+        the_row(&s.sender).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Bound),
+        "premise: no pass ran, so the row still says the binding is visible"
+    );
+    assert!(s.sender.resolve(DB, "orders").is_err(), "the name reads dropped, as the events say");
+    assert_eq!(s.sender.register_resolve_fallbacks(), 1, "and the stale row is counted");
+}
+
+#[test]
+fn a_collection_that_arrives_deletes_the_names_row_in_its_transaction() {
+    let s = swap(&[]);
+    assert!(the_row(&s.sender).is_some(), "premise: the name has its row");
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    s.sender.create_stage(DB, "orders.__stg.a9", MergePolicy::Document, deadline).unwrap();
+    assert_eq!(the_row(&s.sender), None, "a collection of the name arrived: no stale row is left");
+    assert_eq!(served_by(&s.sender), Ok(STAGE1.to_string()), "the name still answers, computed");
+    assert_eq!(s.sender.register_resolve_fallbacks(), 1, "and a name with events, no row, counts");
+}
+
+#[test]
+fn forgetting_a_collection_leaving_its_rows_deletes_the_names_row() {
+    let s = swap(&[]);
+    assert!(the_row(&s.sender).is_some(), "premise: the name has its row");
+    s.sender.forget_collection_leaving_rows(DB, STAGE1).unwrap();
+    assert!(
+        s.sender.get_collection(DB, STAGE1).is_err(),
+        "premise: the stage's definition is gone"
+    );
+    assert_eq!(the_row(&s.sender), None, "and the name's row went with it");
+}
+
+#[test]
+fn a_name_bound_to_a_stage_the_member_no_longer_holds_answers_not_found_from_its_row() {
+    // The visible answer skips an event whose physical is not alive, down to the identity, and with no identity the name is absent: the
+    // pass writes an `Identity` row, and that row is CORRECT (the computation says not found). The reader must use it, with no fallback
+    // and no count. It cannot go stale: a collection that arrives (the identity, a stage, a recreation of the name) deletes the row in
+    // its own transaction (`forget_visible_row` maps a stage's or a recreation's name to the logical name).
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, STAGE1);
+    let (m, _dm) = engine();
+    m.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    let wall = physical_now_ms() + 5_000;
+    window(&m, std::slice::from_ref(&bind_of(&a, STAGE1, wall)));
+    m.forget_collection_leaving_rows(DB, STAGE1).unwrap();
+    let second = bind_of(&a, STAGE1, wall + 2);
+    window(&m, std::slice::from_ref(&second));
+    assert!(m.get_collection(DB, STAGE1).is_err(), "premise: the member no longer holds the stage");
+    assert!(m.get_collection(DB, "orders").is_err(), "premise: and it holds no identity");
+    assert_eq!(the_events_of_orders(&m).len(), 2, "premise: both bindings are in effect");
+    assert_eq!(
+        the_row(&m),
+        Some(crate::register::VisibleRow {
+            kind: crate::register::VisibleKind::Identity,
+            event: None,
+            physical: String::new(),
+            newest_drop: None,
+            newest_event: Some(second.stamp),
+        }),
+        "premise: the pass decided the identity, against the newest event"
+    );
+    assert_eq!(m.register_resolve_fallbacks(), 0, "premise: nothing has fallen back");
+    assert!(m.resolve(DB, "orders").is_err(), "the name is absent, as the computation says");
+    assert_eq!(m.register_resolve_fallbacks(), 0, "and the row said so: no fallback, no count");
+}
+
+#[test]
+fn a_stage_creation_delivered_by_a_window_leaves_the_name_with_no_row() {
+    // The creation of a stage that arrives in a window runs the settle pass for its name (it is judged at once against an event above its
+    // deadline), with no event stored: the pass must not write a row for a name that has none (the row is a cache of the events).
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, STAGE1);
+    let (m, _dm) = engine();
+    let passes = crate::sync::race_hooks::settle_passes();
+    window(&m, std::slice::from_ref(&creation));
+    assert!(m.get_collection(DB, STAGE1).is_ok(), "premise: the member holds the stage");
+    assert!(the_stage_row_of(&m, STAGE1).is_some(), "premise: the register holds its creation");
+    assert!(the_events_of_orders(&m).is_empty(), "premise: the name has no event in effect");
+    assert!(
+        crate::sync::race_hooks::settle_passes() > passes,
+        "premise: the creation ran the settle pass for the name"
+    );
+    assert_eq!(the_row(&m), None, "a name with no event has no row, whatever ran the pass");
+}

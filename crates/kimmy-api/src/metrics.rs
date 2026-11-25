@@ -176,6 +176,9 @@ pub struct StorageReadings {
     /// Snapshot drops of a swapped name or of a stage that this member deferred (`Engine::register_carried_drops_deferred`,
     /// ADR-272): a monotonic count, 0 once the snapshot carries the register.
     pub register_carried_drops_deferred: u64,
+    /// Resolutions of a swapped name that found the stored visibility row stale (`Engine::register_resolve_fallbacks`): the series
+    /// `kimmy_register_resolve_fallback_total`. A monotonic count; expected 0.
+    pub register_resolve_fallbacks: u64,
     /// How far this member's logical clock leads its physical clock, in whole seconds rounded up (`Engine::clock_lead_ms`): 0 when it does not.
     pub clock_hlc_lead_seconds: u64,
     /// How long a live peer is still known to refuse this member's entries for their clock, in whole seconds rounded up
@@ -654,6 +657,8 @@ pub struct MetricsSnapshot {
     pub register_waiting_for_stage: u64,
     /// `kimmy_register_carried_drop_deferred_total`: snapshot drops of a swapped name deferred (ADR-272).
     pub register_carried_drop_deferred: u64,
+    /// `kimmy_register_resolve_fallback_total`: resolutions of a swapped name answered from the events because the stored row was stale.
+    pub register_resolve_fallback: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -1709,6 +1714,7 @@ impl Metrics {
             sync_entries_skipped_clock_refused: self.get(&self.sync_entries_skipped_clock_refused),
             register_waiting_for_stage: readings.register_waiting.iter().map(|(_, n)| *n).sum(),
             register_carried_drop_deferred: readings.register_carried_drops_deferred,
+            register_resolve_fallback: readings.register_resolve_fallbacks,
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             clock_hlc_lead_seconds: readings.clock_hlc_lead_seconds,
@@ -3539,6 +3545,7 @@ mod tests {
                 ("other".to_string(), 97),
             ],
             register_carried_drops_deferred: 98,
+            register_resolve_fallbacks: 8_261,
             clock_hlc_lead_seconds: 7_001,
             own_stamps_refused_seconds: 7_002,
             loss_records_refused: vec![
@@ -4373,6 +4380,9 @@ kimmy_register_waiting_for_stage{origin=\"other\"} 97
 # HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.
 # TYPE kimmy_register_carried_drop_deferred_total counter
 kimmy_register_carried_drop_deferred_total 98
+# HELP kimmy_register_resolve_fallback_total Resolutions of a swapped name that found the stored visibility row stale, and answered from the register's events instead: the row named a collection this member does not hold, or the newest event in effect is not the one the row was decided against. The answer is right and slower until the next settle pass rewrites the row. Expected to read 0 on every member: a value that rises names a transaction that changed what a name serves without running the pass for it. This member's own count. Not part of any state, and not replicated.
+# TYPE kimmy_register_resolve_fallback_total counter
+kimmy_register_resolve_fallback_total 8261
 # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.
 # TYPE kimmy_snapshot_documents_skipped_total counter
 kimmy_snapshot_documents_skipped_total{within_grant=\"true\"} 8241
@@ -5784,6 +5794,19 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             m.render_with(&readings).contains("kimmy_register_carried_drop_deferred_total 3\n")
         );
         assert_eq!(m.snapshot_with(&readings).register_carried_drop_deferred, 3);
+    }
+
+    /// ADR-272: a resolution that found the stored visibility row stale renders as a plain counter, present at 0, and reaches the snapshot
+    /// the OTLP bridge reads.
+    #[test]
+    fn stale_resolve_rows_are_a_plain_counter_present_at_zero() {
+        let m = Metrics::default();
+        let empty = m.render_with(&StorageReadings::default());
+        assert!(empty.contains("# TYPE kimmy_register_resolve_fallback_total counter\n"));
+        assert!(empty.contains("kimmy_register_resolve_fallback_total 0\n"));
+        let readings = StorageReadings { register_resolve_fallbacks: 4, ..Default::default() };
+        assert!(m.render_with(&readings).contains("kimmy_register_resolve_fallback_total 4\n"));
+        assert_eq!(m.snapshot_with(&readings).register_resolve_fallback, 4);
     }
 
     #[test]

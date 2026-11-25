@@ -12205,6 +12205,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_register_waiting_for_stage",
         // Since ADR-272: the scalar count of snapshot drops of a swapped name deferred for the register's events.
         "kimmy_register_carried_drop_deferred_total",
+        "kimmy_register_resolve_fallback_total",
         "kimmy_snapshot_documents_skipped_total",
         "kimmy_snapshot_documents_skipped_total",
         "kimmy_snapshot_register_carry_bytes",

@@ -344,6 +344,9 @@ pub struct Engine {
     pub(crate) snapshot_register_carry_bytes: std::sync::atomic::AtomicU64,
     /// Warnings the carry's size has raised (half the page's cap, at most one an hour).
     pub(crate) register_carry_warnings: std::sync::atomic::AtomicU64,
+    /// Resolutions of a swapped name that found the stored visibility row stale and computed the answer from the events
+    /// (`kimmy_register_resolve_fallback_total`). Expected 0.
+    pub(crate) register_resolve_fallbacks: std::sync::atomic::AtomicU64,
     /// When the warning last fired (wall clock, ms; 0 before the first): at most one an hour.
     pub(crate) register_carry_warned_ms: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
@@ -1835,6 +1838,7 @@ impl Engine {
             snapshot_documents_skipped: Default::default(),
             snapshot_register_carry_bytes: std::sync::atomic::AtomicU64::new(0),
             register_carry_warnings: std::sync::atomic::AtomicU64::new(0),
+            register_resolve_fallbacks: std::sync::atomic::AtomicU64::new(0),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1916,6 +1920,12 @@ impl Engine {
     /// (`kimmy_snapshot_register_carry_bytes`).
     pub fn snapshot_register_carry_bytes(&self) -> u64 {
         self.snapshot_register_carry_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolutions of a swapped name since start that found the stored visibility row stale and answered from the register's events
+    /// (`kimmy_register_resolve_fallback_total`). Expected 0.
+    pub fn register_resolve_fallbacks(&self) -> u64 {
+        self.register_resolve_fallbacks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.

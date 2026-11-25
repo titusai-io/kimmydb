@@ -235,6 +235,7 @@ fn only_this_module_opens_the_register_tables() {
         for table in [
             "tables::REGISTER_STAGES",
             "tables::REGISTER_POST",
+            "tables::REGISTER_VISIBLE",
             "tables::REGISTER_INFO",
             "tables::REGISTER;",
             "tables::REGISTER)",
