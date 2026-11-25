@@ -2413,6 +2413,22 @@ impl TelemetryGuard {
             "Snapshot drops of a swapped name, or of one of its stages, that this member did not apply for want of the register's events; 0 once the snapshot carries them.",
             register_carried_drop_deferred
         );
+        // `kimmy_snapshot_documents_skipped_total{within_grant}` (ADR-272; Q6.6, C2c): one instrument per label value, each reading its own
+        // element of one array, in the order of `SNAPSHOT_SKIP_LABELS`.
+        observe!(
+            u64_observable_counter,
+            "kimmy.snapshot_documents_skipped.true",
+            "{document}",
+            "Documents a snapshot page carried that this member skipped for want of a collection, whose stamp the snapshot's grant covers: nothing will serve them again. 0 on a join.",
+            |s| s.snapshot_documents_skipped[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.snapshot_documents_skipped.false",
+            "{document}",
+            "Documents a snapshot page carried that this member skipped for want of a collection, whose stamp is above the snapshot's grant: the entries route serves them. 0 on a join.",
+            |s| s.snapshot_documents_skipped[1]
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(

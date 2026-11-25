@@ -1713,14 +1713,22 @@ impl Engine {
                     // refused to recreate over one — is history, exactly as
                     // it is in `sync::apply_one`. Without one it means a
                     // truncated or reordered snapshot: the definition should
-                    // have arrived on the first page.
+                    // have arrived on the first page. Not a failure of the
+                    // page (a physical of a swapped name this member never
+                    // held, or a vector shadow whose parent was buried, is
+                    // covered by the grant and skipped, and failing would
+                    // stall a join for good), but loud and counted, by
+                    // whether the grant covers the document.
                     if self.memo_dropped_at(&mut memo, document.collection)?.is_some() {
                         superseded += 1;
                         continue;
                     }
-                    debug!(
+                    let granted = progress.granted.as_ref().unwrap_or(&page.versions);
+                    let within_grant = document.stamp.hlc <= granted.get(document.stamp.origin());
+                    self.count_snapshot_document_skipped(within_grant);
+                    warn!(
                         collection = document.collection.0,
-                        "snapshot document has no collection"
+                        within_grant, "snapshot document has no collection: skipped"
                     );
                     continue;
                 };

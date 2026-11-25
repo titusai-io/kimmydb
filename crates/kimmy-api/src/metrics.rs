@@ -2185,6 +2185,9 @@ impl Metrics {
              # HELP kimmy_register_carried_drop_deferred_total Snapshot drops of a swapped name (a replacing `$out`, ADR-272), or of one of its stages, that this member did not apply because the page cannot say whether the burial it carries is a drop or the loser of a swap: the register's events travel with the snapshot, and the drop is judged by them. Expected to read 0 on every member once they do; a value that rises names a join or a repair that left a swapped name as it was.\n\
              # TYPE kimmy_register_carried_drop_deferred_total counter\n\
              kimmy_register_carried_drop_deferred_total {register_carried_drop_deferred}\n\
+             # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
+             # TYPE kimmy_snapshot_documents_skipped_total counter\n\
+             {snapshot_skip_lines}\
              # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.\n\
              # TYPE kimmy_clock_hlc_lead_seconds gauge\n\
              kimmy_clock_hlc_lead_seconds {clock_hlc_lead_seconds}\n\
@@ -2457,6 +2460,19 @@ impl Metrics {
                         .find(|(label, _)| label == kind)
                         .map_or(0, |(_, n)| *n);
                     format!("kimmy_out_loss_records_total{{kind=\"{kind}\"}} {n}\n")
+                })
+                .collect::<String>(),
+            snapshot_skip_lines = kimmy_storage::SNAPSHOT_SKIP_LABELS
+                .iter()
+                .map(|label| {
+                    let n = readings
+                        .snapshot_documents_skipped
+                        .iter()
+                        .find(|(held, _)| held == label)
+                        .map_or(0, |(_, n)| *n);
+                    format!(
+                        "kimmy_snapshot_documents_skipped_total{{within_grant=\"{label}\"}} {n}\n"
+                    )
                 })
                 .collect::<String>(),
             out_buried_lines = kimmy_storage::OUT_BURIAL_CAUSES
@@ -5413,6 +5429,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             // `kimmy_register_carried_drop_deferred_total`.
             + 1
             + 1
+            // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
+            + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()
             // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
             + 6
             // Since Q7 Step 4 (C8), `kimmy_conflicts_resolved_total` and its six kinds.

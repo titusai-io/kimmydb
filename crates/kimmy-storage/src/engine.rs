@@ -1902,6 +1902,12 @@ impl Engine {
             .collect()
     }
 
+    /// Count one page document skipped for want of a collection ([`Self::snapshot_documents_skipped`]).
+    pub(crate) fn count_snapshot_document_skipped(&self, within_grant: bool) {
+        let slot = usize::from(!within_grant);
+        self.snapshot_documents_skipped[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Count one carried drop that was deferred ([`Self::register_carried_drops_deferred`]).
     pub fn count_register_carried_drop_deferred(&self) {
         self.register_carried_drops_deferred.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

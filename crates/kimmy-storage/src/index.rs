@@ -1219,17 +1219,31 @@ fn logged_definition(db: &str, collection: &str, index: &IndexMeta) -> kimmy_cor
     }
 }
 
+/// The name an index entry of `collection` is logged under, and its id: the collection's own, except for a hidden physical (a stage, a
+/// recreation), whose entry is the one its origin logged for the LOGICAL name (the index was made on `orders` and copied to the
+/// physical), so that the entry under one stamp is the same bytes on every member and names a collection every peer can place
+/// (ADR-272, decision 6; Q6.6, unit C2c).
+fn logged_collection<'a>(db: &str, collection: &'a str) -> (&'a str, CollectionId) {
+    let name = kimmy_core::swap::logical_of_stage(collection)
+        .or_else(|| kimmy_core::logical_of_recreation(collection))
+        .unwrap_or(collection);
+    (name, CollectionId::derive(db, name))
+}
+
 /// Append, in `txn`, the entry behind a definition a snapshot restored at
-/// `created` (ADR-180) — the entry, when it was appended.
+/// `created` (ADR-180) — the entry, when it was appended. Logged under the
+/// logical name when `collection` is a hidden physical ([`logged_collection`]).
 fn relog_restored(
     txn: &crate::engine::WriteTxn<'_>,
-    collection: CollectionId,
-    body: &kimmy_core::IndexCreate,
+    db: &str,
+    collection: &str,
+    index: &IndexMeta,
     created: Stamp,
 ) -> Result<Option<kimmy_core::OplogEntry>> {
+    let (name, id) = logged_collection(db, collection);
+    let body = logged_definition(db, name, index);
     debug_assert_eq!(body.index.created, Some(created), "the body names the stamp it is logged at");
-    let entry =
-        crate::engine::ddl_entry(created, kimmy_core::OpKind::CreateIndex, collection, body)?;
+    let entry = crate::engine::ddl_entry(created, kimmy_core::OpKind::CreateIndex, id, &body)?;
     Ok(crate::engine::relog(txn, &entry)?.then_some(entry))
 }
 
@@ -1661,8 +1675,7 @@ impl crate::Engine {
                                     txn.abort()?;
                                     return Ok((IndexCreated::Older, Vec::new()));
                                 }
-                                let body = logged_definition(db, collection, &index);
-                                match relog_restored(&txn, meta.id, &body, created)? {
+                                match relog_restored(&txn, db, collection, &index, created)? {
                                     Some(entry) => {
                                         txn.commit()?;
                                         self.relogged(entry);
@@ -1722,12 +1735,9 @@ impl crate::Engine {
                         // A restored definition's entry, with the stamp it settles
                         // on, in the stamp's own commit (ADR-180).
                         let relogged = match origin {
-                            CreateOrigin::Restored(created) => relog_restored(
-                                &txn,
-                                meta.id,
-                                &logged_definition(db, collection, &index),
-                                created,
-                            )?,
+                            CreateOrigin::Restored(created) => {
+                                relog_restored(&txn, db, collection, &index, created)?
+                            }
                             // The arriving entry, which settled the stamp, in the
                             // stamp's own commit: a new key, since its stamp is
                             // the one that won.
@@ -1941,12 +1951,9 @@ impl crate::Engine {
                 }
                 // In the transaction that builds the definition, so the entry and
                 // the state it describes commit together or not at all (ADR-180).
-                CreateOrigin::Restored(created) => relog_restored(
-                    &txn,
-                    meta.id,
-                    &logged_definition(db, collection, &index),
-                    created,
-                )?,
+                CreateOrigin::Restored(created) => {
+                    relog_restored(&txn, db, collection, &index, created)?
+                }
             };
             txn.commit()?;
             if let Some(entry) = logged {
