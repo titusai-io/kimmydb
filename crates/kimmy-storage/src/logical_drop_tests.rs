@@ -12,6 +12,7 @@ use kimmy_core::{
     VersionVector,
 };
 
+use crate::seed_asymmetry_tests::life_burials;
 use crate::{Engine, PeerWindow, SyncOutcome, WalkScope, WriterHolder, physical_now_ms};
 
 const DB: &str = "app";
@@ -605,7 +606,8 @@ fn a_stage_created_below_a_database_drop_seeds_no_drop_over_a_life_made_after_th
     assert!(register_events(&m).is_empty(), "no drop was seeded for the stage's creation");
     assert!(serves_the_identity(&m), "the life made after the database's drop still serves");
     assert_eq!(documents_kept(&m), 1, "with its document");
-    assert_eq!(m.register_seed_burials(), 0, "and no seed counts a burial: none was made");
+    assert_eq!(life_burials(&m, "seed"), 0, "and no seed counts a burial: none was made");
+    assert_eq!(life_burials(&m, "drop"), 0, "nor does a drop");
 }
 
 #[test]
@@ -699,9 +701,14 @@ fn a_drop_that_kept_later_writes_is_seeded_by_the_stage_creation_alone() {
     assert_eq!(ke, vec![drop.stamp], "premise: the member that knew holds the drop alone");
     assert_eq!(me, ke, "the same register events as the member that knew");
     assert_eq!(
-        (k.register_seed_burials(), m.register_seed_burials()),
+        (life_burials(&k, "seed"), life_burials(&m, "seed")),
         (0, 1),
         "the seed that ended the remains the drop kept is counted; the member that knew buried them by the drop, which is no seed"
+    );
+    assert_eq!(
+        (life_burials(&k, "drop"), life_burials(&m, "drop")),
+        (0, 0),
+        "and no member buried a life made after the drop: the life that stood was made before it"
     );
     assert!(absent(&k) && absent(&m), "the name is dropped on both");
     assert!(
@@ -872,6 +879,11 @@ fn a_drop_below_a_stage_buries_the_life_a_member_made_after_it_and_the_register_
     );
     assert!(!serves_the_identity(&m), "the life made after the drop is buried by it");
     assert!(m.get_collection(DB, "orders").is_err(), "and the identity is gone");
+    assert_eq!(
+        (life_burials(&m, "drop"), life_burials(&m, "seed")),
+        (1, 0),
+        "the drop counts the life it buried (lost and reported), and no seed was made"
+    );
 }
 
 // -- The three answers of the stage test that are kept on purpose ---------------------------------------------------------------------------
@@ -941,6 +953,7 @@ fn a_drop_of_a_name_whose_identity_is_absent_and_whose_stage_is_held_is_a_logica
     assert!(m.get_collection(DB, "orders").is_err(), "premise: no identity on this member");
     window(&m, std::slice::from_ref(&drop));
     assert_eq!(register_events(&m), vec![drop.stamp], "the drop is a register event of the name");
+    assert_eq!(life_burials(&m, "drop"), 0, "no life stood to be buried by it");
 }
 
 #[test]

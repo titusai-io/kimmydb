@@ -122,6 +122,14 @@ fn served_by(m: &Engine) -> Result<String, String> {
     m.resolve(DB, "orders").map(|resolved| resolved.physical).map_err(|e| e.to_string())
 }
 
+/// What `e` has counted as standing lives the register buried by the route `by` (`seed` or `drop`).
+pub(crate) fn life_burials(e: &Engine, by: &str) -> u64 {
+    e.register_life_burials()
+        .into_iter()
+        .find_map(|(label, n)| (label == by).then_some(n))
+        .expect("the route is a label of the count")
+}
+
 fn a_pause() {
     std::thread::sleep(std::time::Duration::from_millis(5));
 }
@@ -135,7 +143,7 @@ struct Ends {
     /// The member that made `orders` again (S in probe 1, T in probe 2).
     other_served: Result<String, String>,
     other_drops: Vec<Stamp>,
-    /// The standing lives the seed buried on each (`Engine::register_seed_burials`).
+    /// The standing lives the seed buried on each (`life_burials(_, "seed")`).
     m_burials: u64,
     other_burials: u64,
 }
@@ -175,8 +183,8 @@ fn drop_first_stage_above_then_a_create() -> Ends {
         m_drops: the_logical_drops_of_orders(&m),
         other_served: served_by(&s),
         other_drops: the_logical_drops_of_orders(&s),
-        m_burials: m.register_seed_burials(),
-        other_burials: s.register_seed_burials(),
+        m_burials: life_burials(&m, "seed"),
+        other_burials: life_burials(&s, "seed"),
         drop,
     }
 }
@@ -217,8 +225,8 @@ fn stage_below_then_a_drop_and_a_create() -> Ends {
         m_drops: the_logical_drops_of_orders(&m),
         other_served: served_by(&t),
         other_drops: the_logical_drops_of_orders(&t),
-        m_burials: m.register_seed_burials(),
-        other_burials: t.register_seed_burials(),
+        m_burials: life_burials(&m, "seed"),
+        other_burials: life_burials(&t, "seed"),
         drop,
     }
 }

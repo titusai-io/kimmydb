@@ -1974,6 +1974,14 @@ impl Engine {
         self.register_seed_burials.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Standing lives the register buried by the route that buried them, in the order of the labels `seed` and `drop`
+    /// (`kimmy_register_life_burials_total{by}`): a life made over a drop of its name that a stage created below the drop turned out
+    /// to be the swap's (`seed`), and a life made after a replicated drop that the drop then buried (`drop`). Lost and reported (ADR-272,
+    /// decision 6).
+    pub fn register_life_burials(&self) -> Vec<(&'static str, u64)> {
+        vec![("seed", self.register_seed_burials()), ("drop", 0)]
+    }
+
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.
     pub fn register_carry_warnings(&self) -> u64 {
         self.register_carry_warnings.load(std::sync::atomic::Ordering::Relaxed)
