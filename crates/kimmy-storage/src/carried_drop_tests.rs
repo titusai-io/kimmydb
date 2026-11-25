@@ -1052,3 +1052,62 @@ fn a_drop_the_page_carries_below_the_stage_a_stale_receiver_serves_floors_what_t
     assert_eq!(index_rows(&j, STAGE1, "x"), 0, "no entry row of x is left under the stage's id");
     assert_eq!(index_rows(&j, STAGE1, "z"), 1, "z keeps its row");
 }
+
+#[test]
+fn a_binding_the_joiner_held_parked_takes_effect_in_the_page_that_covers_it_though_the_carry_adds_nothing()
+ {
+    // The joiner serves stage 1 and holds the second binding only as information (its stage row is
+    // held, the binding is ahead of the joiner's position). The page's grant covers the binding,
+    // and the carry's events for the name are all held already, so the carry changes nothing and
+    // names nothing: the grant's release of the parked binding is what puts it in effect, and the
+    // settle pass that release runs is what buries stage 1, in the page's own transaction.
+    let (j, _dj) = with_orders();
+    let s = swap(&[&j]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    window(&j, std::slice::from_ref(&s.bind));
+    assert_eq!(served_by(&j), Ok(STAGE1.to_string()), "premise: the joiner serves stage 1");
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    s.a.create_stage(DB, STAGE2, MergePolicy::Document, deadline).unwrap();
+    let creation2 = creation_of(&s.a, STAGE2);
+    let bind2 =
+        bind_of(&s.a, STAGE2, creation2.stamp.hlc.wall_ms.max(s.bind.stamp.hlc.wall_ms) + 1);
+    j.apply_batch(std::slice::from_ref(&creation2)).unwrap();
+    j.apply_batch(std::slice::from_ref(&bind2)).unwrap();
+    s.sender.apply_batch(std::slice::from_ref(&creation2)).unwrap();
+    window(&s.sender, std::slice::from_ref(&bind2));
+    assert_eq!(served_by(&s.sender), Ok(STAGE2.to_string()), "premise: the sender went on");
+    let held: Vec<Stamp> = the_events_of_orders(&j).iter().map(|(stamp, _)| *stamp).collect();
+    assert_eq!(held, vec![s.bind.stamp], "premise: the joiner holds only the first binding");
+    assert_eq!(
+        served_by(&j),
+        Ok(STAGE1.to_string()),
+        "premise: the second binding is not in effect"
+    );
+    let parked = {
+        use redb::ReadableDatabase;
+        let txn = j.db().begin_read().unwrap();
+        crate::register::parked_read(&txn, DB, "orders").unwrap().events().len()
+    };
+    assert_eq!(parked, 1, "premise: the second binding is held as information only");
+    assert!(j.get_collection(DB, STAGE2).is_ok(), "premise: the joiner holds the second stage");
+    assert!(j.get_collection(DB, STAGE1).is_ok(), "premise: the joiner holds stage 1");
+    let kept = std::cell::Cell::new(0usize);
+    let patch = |page: &mut crate::SnapshotPage| {
+        if let Some(carry) = &mut page.register {
+            carry
+                .events
+                .retain(|(key, _)| held.iter().any(|stamp| key[8..] == stamp.to_key_bytes()));
+            kept.set(carry.events.len());
+        }
+    };
+    let (progress, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    assert!(progress.is_complete(), "the pull completes");
+    assert_eq!(kept.get(), 1, "premise: the carry's events for the name are the one already held");
+    assert_eq!(served_by(&j), Ok(STAGE2.to_string()), "the name answers from the second stage");
+    assert!(j.get_collection(DB, STAGE2).is_ok(), "and the member holds the physical it serves");
+    assert!(
+        j.get_collection(DB, STAGE1).is_err(),
+        "the stage the second binding replaced is buried in the page's own transaction"
+    );
+}
