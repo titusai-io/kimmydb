@@ -2429,6 +2429,14 @@ impl TelemetryGuard {
             "Documents a snapshot page carried that this member skipped for want of a collection, whose stamp is above the snapshot's grant: the entries route serves them. 0 on a join.",
             |s| s.snapshot_documents_skipped[1]
         );
+        // `kimmy_snapshot_register_carry_bytes` (ADR-272; Q6.6, C2d): the size of the register carry last built for a snapshot's last page.
+        observe!(
+            u64_observable_gauge,
+            "kimmy.snapshot_register_carry_bytes",
+            "By",
+            "Size of the register carry this member last built for a snapshot's last page: the events in effect, the stage rows and the post-drop rows. A page holds 63 MiB, about 180,000 swaps cluster-wide.",
+            |s| s.snapshot_register_carry_bytes
+        );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
         observe!(

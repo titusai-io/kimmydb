@@ -622,6 +622,8 @@ pub struct RegisterCarry {
 /// What a row of the carry costs on the wire besides its key and value: the array that holds the pair and the two binary headers. A bound,
 /// as [`DOCUMENT_OVERHEAD`] is for a document.
 const CARRY_ROW_FRAME: usize = 32;
+/// How often the warning that the carry is over half a page may be logged: an hour.
+const REGISTER_CARRY_WARN_EVERY_MS: u64 = 60 * 60 * 1000;
 /// What the carry costs besides its rows: its three lists and the field that holds it.
 const CARRY_FRAME: usize = 64;
 
@@ -934,6 +936,13 @@ impl SnapshotProgress {
 /// What a `Converge` page counts of the deletes it carries: the rows left (this member holds
 /// nothing for them), the tombstones it replaced at the finding's cut (progress), and the
 /// cut itself.
+/// What a page's rows left of the page: the bytes they used of the room and, when the walk is exhausted, the cursor after the last row they
+/// sent, which an early end resumes after (Q6.6, unit C2d).
+struct RowsWalk {
+    used: usize,
+    end: Option<SnapshotCursor>,
+}
+
 struct ConvergeTombstones<'a> {
     left: &'a mut usize,
     replaced_at_cut: &'a mut usize,
@@ -1025,15 +1034,33 @@ impl Engine {
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
-        let (documents, deleted_documents, next) =
-            self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
+        let rows_room = self.snapshot_rows_room(fixed);
+        let (documents, deleted_documents, mut next, walk) =
+            self.snapshot_rows(after, scope, rows_room, first)?;
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
         // The register rides the LAST page of a whole-database snapshot, read after `versions` (the order is what makes the carry safe: an
         // event applied between the two reads has a stamp above `versions`, which the receiver drops) (Q6.6, unit C2b)
-        let register =
-            if scope.is_none() && next.is_none() { Some(self.register_carry()?) } else { None };
+        // It is measured once, here, on the page that exhausts the walk. With the rows it fits one page, and nothing changes. If it does not,
+        // this page ends early, after its last row, and the carry rides the next page, which has nothing else on it and the whole room; and
+        // one that does not fit even that is refused by name, never cut (a truncated register is a silently wrong one) (Q6.6, unit C2d).
+        let mut register = None;
+        if scope.is_none() && next.is_none() {
+            let carry = self.register_carry()?;
+            let bytes = carry.encoded_len();
+            let has_rows = !documents.is_empty() || !deleted_documents.is_empty();
+            if walk.used + bytes <= rows_room {
+                register = Some(carry);
+            } else if bytes <= rows_room && has_rows && walk.end.is_some() {
+                next = walk.end;
+            } else {
+                return Err(crate::StorageError::SnapshotRegisterCarryTooLarge {
+                    bytes,
+                    cap: rows_room,
+                });
+            }
+        }
         Ok(SnapshotPage {
             collections,
             documents,
@@ -1061,11 +1088,51 @@ impl Engine {
                 })
                 .collect())
         };
-        Ok(RegisterCarry {
+        let carry = RegisterCarry {
             events: rows(Carried::Register)?,
             stages: rows(Carried::Stages)?,
             posts: rows(Carried::Post)?,
-        })
+        };
+        self.note_register_carry(&carry);
+        Ok(carry)
+    }
+
+    /// What a page can hold: [`SNAPSHOT_PAGE_BYTES`], or a test's own budget.
+    fn snapshot_carry_cap(&self) -> usize {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let set = self.snapshot_page_bytes_for_test.load(std::sync::atomic::Ordering::Relaxed);
+            if set != 0 {
+                return set;
+            }
+        }
+        SNAPSHOT_PAGE_BYTES
+    }
+
+    /// The carry's size is the gauge `kimmy_snapshot_register_carry_bytes`, set each time a carry is built; and at half of what a page can
+    /// hold it is a warning, once an hour, that names what the register has grown to and that its compaction is due (Q6.6, unit C2d).
+    fn note_register_carry(&self, carry: &RegisterCarry) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = carry.encoded_len();
+        self.snapshot_register_carry_bytes.store(bytes as u64, Relaxed);
+        let cap = self.snapshot_carry_cap();
+        if bytes.saturating_mul(2) < cap {
+            return;
+        }
+        let now = crate::physical_now_ms();
+        let last = self.register_carry_warned_ms.load(Relaxed);
+        if last != 0 && now.saturating_sub(last) < REGISTER_CARRY_WARN_EVERY_MS {
+            return;
+        }
+        self.register_carry_warned_ms.store(now, Relaxed);
+        self.register_carry_warnings.fetch_add(1, Relaxed);
+        warn!(
+            bytes,
+            cap,
+            stage_rows = carry.stages.len(),
+            events = carry.events.len(),
+            "the register a snapshot carries is over half of what a page can hold: its compaction is due in the next release"
+        );
     }
 
     /// What a page's rows have of [`SNAPSHOT_PAGE_BYTES`] once its other parts,
@@ -1162,7 +1229,7 @@ impl Engine {
         scope: Option<CollectionId>,
         room: usize,
         first: bool,
-    ) -> Result<(Vec<SnapshotDoc>, Vec<SnapshotTombstone>, Option<SnapshotCursor>)> {
+    ) -> Result<(Vec<SnapshotDoc>, Vec<SnapshotTombstone>, Option<SnapshotCursor>, RowsWalk)> {
         use std::ops::Bound;
 
         /// A document or a tombstone a page sends, once it is known to fit.
@@ -1233,7 +1300,7 @@ impl Engine {
             // not a row: the first standing collection id, from the set above.
             None => match live.iter().next() {
                 Some(lowest) => (*lowest, None),
-                None => return Ok((out, deleted, None)),
+                None => return Ok((out, deleted, None, RowsWalk { used: 0, end: None })),
             },
             Some(cursor) => (cursor.collection.0, Some(cursor.after_key)),
         };
@@ -1274,7 +1341,7 @@ impl Engine {
                         // page; the cursor names the last row sent. Looking one
                         // row ahead is what lets a snapshot of exactly a page's
                         // worth end here rather than with an empty page after it.
-                        return Ok((out, deleted, resumed(&resume)));
+                        return Ok((out, deleted, resumed(&resume), RowsWalk { used, end: None }));
                     }
                     let record = codec::decode_doc_record_with_meta(value.value())?;
                     // A tombstone travels by KEY (ADR-167): it has no `_id` to
@@ -1337,7 +1404,7 @@ impl Engine {
                             });
                         }
                         // Not on this page: first on the next.
-                        return Ok((out, deleted, resumed(&resume)));
+                        return Ok((out, deleted, resumed(&resume), RowsWalk { used, end: None }));
                     }
                     used += bytes;
                     match item {
@@ -1350,7 +1417,9 @@ impl Engine {
             // The collection's rows are done: on to the next.
             match next_after(id) {
                 Some(next) => at = (next, None),
-                None => return Ok((out, deleted, None)),
+                None => {
+                    return Ok((out, deleted, None, RowsWalk { used, end: resumed(&resume) }));
+                }
             }
         }
     }

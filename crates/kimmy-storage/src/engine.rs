@@ -341,9 +341,11 @@ pub struct Engine {
     snapshot_documents_skipped: [std::sync::atomic::AtomicU64; 2],
     /// The size of the register carry this member last built for a snapshot's last page, in bytes
     /// (`kimmy_snapshot_register_carry_bytes`): 0 on a member that has served no snapshot.
-    snapshot_register_carry_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) snapshot_register_carry_bytes: std::sync::atomic::AtomicU64,
     /// Warnings the carry's size has raised (half the page's cap, at most one an hour).
-    register_carry_warnings: std::sync::atomic::AtomicU64,
+    pub(crate) register_carry_warnings: std::sync::atomic::AtomicU64,
+    /// When the warning last fired (wall clock, ms; 0 before the first): at most one an hour.
+    pub(crate) register_carry_warned_ms: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
     /// How long the writer was held, as a histogram over
@@ -1833,6 +1835,7 @@ impl Engine {
             snapshot_documents_skipped: Default::default(),
             snapshot_register_carry_bytes: std::sync::atomic::AtomicU64::new(0),
             register_carry_warnings: std::sync::atomic::AtomicU64::new(0),
+            register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))

@@ -2194,6 +2194,9 @@ impl Metrics {
              # HELP kimmy_snapshot_documents_skipped_total Documents a snapshot page carried that this member skipped because it holds no collection for them and has no tombstone to say the collection is gone, by `within_grant`: `true` when the document's stamp is at or below the snapshot's grant (nothing will serve it again: a physical of a swapped name this member never held, or a vector shadow whose parent was buried, are the known cases), `false` when it is above the grant (the entries route serves it). The page still applies. Expected to read 0 on a join; a value that rises names a snapshot whose documents arrived without their collection. This member's own count. Not part of any state, and not replicated.\n\
              # TYPE kimmy_snapshot_documents_skipped_total counter\n\
              {snapshot_skip_lines}\
+             # HELP kimmy_snapshot_register_carry_bytes The size, in bytes, of the register carry this member last built for the last page of a snapshot it served: the sender's events in effect, its stage rows and its post-drop rows. The carry rides one page whole, and a page holds 63 MiB, which is about 180,000 swaps cluster-wide at about 365 bytes each: past that a snapshot cannot be served, and the answer is an error naming the size. A warning at half of that is logged at most once an hour. 0 on a member that has served no snapshot. This member's own measure, not part of any state and not replicated.\n\
+             # TYPE kimmy_snapshot_register_carry_bytes gauge\n\
+             kimmy_snapshot_register_carry_bytes {snapshot_register_carry_bytes}\n\
              # HELP kimmy_clock_hlc_lead_seconds How far this member's logical clock leads its own physical clock, in whole seconds rounded up; 0 when it does not. A gauge, read at scrape. Replication cannot push it past max_clock_skew_secs, so a value above that is a member whose own clock ran ahead: every other member holds back its entries, and its schema changes and replacing $out requests are refused with 503 clock_ahead, until the lead is gone. Fix the clock; if the lead is long, wipe the member and rejoin it.\n\
              # TYPE kimmy_clock_hlc_lead_seconds gauge\n\
              kimmy_clock_hlc_lead_seconds {clock_hlc_lead_seconds}\n\
@@ -2468,6 +2471,7 @@ impl Metrics {
                     format!("kimmy_out_loss_records_total{{kind=\"{kind}\"}} {n}\n")
                 })
                 .collect::<String>(),
+            snapshot_register_carry_bytes = readings.snapshot_register_carry_bytes,
             snapshot_skip_lines = kimmy_storage::SNAPSHOT_SKIP_LABELS
                 .iter()
                 .map(|label| {
@@ -5445,6 +5449,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             + 1
             // Since ADR-272 (Q6.6, C2c), the two `within_grant` samples of `kimmy_snapshot_documents_skipped_total`.
             + kimmy_storage::SNAPSHOT_SKIP_LABELS.len()
+            // Since ADR-272 (Q6.6, C2d), the gauge `kimmy_snapshot_register_carry_bytes`.
+            + 1
             // Since Q7 Step 4, `kimmy_loss_records_refused_total` and its six reasons.
             + 6
             // Since Q7 Step 4 (C8), `kimmy_conflicts_resolved_total` and its six kinds.
