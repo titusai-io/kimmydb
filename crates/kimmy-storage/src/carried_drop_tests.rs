@@ -3062,3 +3062,96 @@ fn a_seed_the_restart_keeps_and_the_sender_never_made_ends_equal_at_the_names_ne
         "and the two registers are equal: the sender seeds the drop from its own tombstone when it judges the binding"
     );
 }
+
+// -- A name with no register event resolves through the identity alone (the common case, an unswapped name) ----------------------------------
+
+/// `resolve_computed` for `name`, in a read transaction of its own: the truth the answer of a name with no event must equal.
+fn computed(m: &Engine, name: &str) -> crate::Result<crate::Resolved> {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    Engine::resolve_computed(&txn, DB, name)
+}
+
+/// What an answer says, in a form two answers compare by: the physical, the collection's id and the visible stamp, or the error's text.
+fn said(answer: crate::Result<crate::Resolved>) -> Result<(String, u64, Option<Stamp>), String> {
+    answer.map(|r| (r.physical, r.meta.id.0, r.visible)).map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_name_with_no_event_whose_collection_is_held_answers_what_the_computation_answers() {
+    let (m, _dm) = with_orders();
+    assert!(the_events_of_orders(&m).is_empty(), "premise: the name has no event");
+    assert!(
+        computed(&m, "orders").is_ok(),
+        "premise: the identity is held, so the computation answers it"
+    );
+    assert_eq!(said(m.resolve(DB, "orders")), said(computed(&m, "orders")));
+    assert_eq!(m.register_resolve_fallbacks(), 0, "and it is not a fallback");
+}
+
+#[test]
+fn a_name_with_no_event_and_no_collection_answers_what_the_computation_answers() {
+    let (m, _dm) = with_orders();
+    assert!(computed(&m, "ghost").is_err(), "premise: the computation finds the name absent");
+    let answer = said(m.resolve(DB, "ghost"));
+    assert!(answer.is_err(), "the name is absent: {answer:?}");
+    assert_eq!(answer, said(computed(&m, "ghost")), "with the computation's own error");
+    assert_eq!(said(m.resolve_for_write(DB, "ghost")), answer, "and a write is refused the same");
+    assert_eq!(m.register_resolve_fallbacks(), 0, "and it is not a fallback");
+}
+
+#[test]
+fn a_name_whose_only_event_is_parked_answers_as_the_computation_does() {
+    let s = swap(&[]);
+    let (parked_here, _dp) = engine();
+    parked_here.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    parked_here.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    assert!(
+        the_binding_is_parked_only(&parked_here),
+        "premise: the binding is known only ahead of its position"
+    );
+    assert_eq!(said(parked_here.resolve(DB, "orders")), said(computed(&parked_here, "orders")));
+    assert!(
+        parked_here.resolve(DB, "orders").is_err(),
+        "the name is absent: a parked event moves nothing"
+    );
+}
+
+#[test]
+fn a_name_with_no_event_opens_the_register_once() {
+    let (m, _dm) = with_orders();
+    let before = crate::register::register_opened_for_tests();
+    m.resolve(DB, "orders").unwrap();
+    assert_eq!(
+        crate::register::register_opened_for_tests() - before,
+        1,
+        "a name with no event is answered by the one probe for its newest event, with no timeline read"
+    );
+    let before = crate::register::register_opened_for_tests();
+    assert!(m.resolve(DB, "ghost").is_err());
+    assert_eq!(
+        crate::register::register_opened_for_tests() - before,
+        1,
+        "and so is an absent name"
+    );
+    // the counter counts: the computation opens the register for the timeline, and a name with events reads its row after the probe
+    let before = crate::register::register_opened_for_tests();
+    computed(&m, "orders").unwrap();
+    assert_eq!(
+        crate::register::register_opened_for_tests() - before,
+        1,
+        "premise: the computation's timeline read moves the counter"
+    );
+    let s = swap(&[]);
+    let before = crate::register::register_opened_for_tests();
+    assert_eq!(
+        s.sender.resolve(DB, "orders").unwrap().physical,
+        STAGE1,
+        "a swapped name answers its stage"
+    );
+    assert_eq!(
+        crate::register::register_opened_for_tests() - before,
+        1,
+        "premise: a name with events is answered by its row after the one probe"
+    );
+}

@@ -138,6 +138,8 @@ pub(crate) fn newest_stored_event_read(
     db: &str,
     logical: &str,
 ) -> Result<Option<Stamp>> {
+    #[cfg(test)]
+    REGISTER_OPENED.with(|n| n.set(n.get() + 1));
     newest_event_of(&txn.open_table(tables::REGISTER)?, CollectionId::derive(db, logical))
 }
 
@@ -222,6 +224,18 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn rows_read_for_tests() -> usize {
     ROWS_READ.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static REGISTER_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has opened `REGISTER` to read one name's events (the newest-event probe and the timeline), for a test of what
+/// a resolution costs.
+#[cfg(test)]
+pub(crate) fn register_opened_for_tests() -> usize {
+    REGISTER_OPENED.with(std::cell::Cell::get)
 }
 
 /// Create the register's tables, so a read of them never meets a missing table.
@@ -588,6 +602,8 @@ pub(crate) fn timeline_read(
     db: &str,
     logical: &str,
 ) -> Result<Timeline> {
+    #[cfg(test)]
+    REGISTER_OPENED.with(|n| n.set(n.get() + 1));
     timeline_read_of(txn, tables::REGISTER, db, logical)
 }
 
