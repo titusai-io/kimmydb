@@ -1086,6 +1086,65 @@ fn seed_above_the_grant(
     }
 }
 
+/// D1 for an id that stays unnamed (Q6.6, unit C2e): when the receiver holds a tombstone for it ABOVE the grant and `REGISTER` holds no row
+/// for it, the tombstone is the name's drop (one the sender could not have judged), stored by id as `seed_above_the_grant` stores it for a
+/// name: no name is needed to write the row.
+fn seed_by_id_above_the_grant(
+    txn: &redb::WriteTransaction,
+    id: u64,
+    granted: &kimmy_core::VersionVector,
+) -> Result<bool> {
+    if !rows_in(&txn.open_table(tables::REGISTER)?, CollectionId(id))?.is_empty() {
+        return Ok(false);
+    }
+    let own = {
+        let table = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        match table.get(id)? {
+            Some(raw) => Some(crate::codec::decode_oplog_key(raw.value())?),
+            None => None,
+        }
+    };
+    match own {
+        Some(stamp) if stamp.hlc > granted.get(stamp.origin()) => {
+            let key = row_key(CollectionId(id), &stamp);
+            let row = RegisterEvent::LogicalDrop.encode();
+            txn.open_table(tables::REGISTER)?.insert(key.as_slice(), row.as_slice())?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Name the ids in `unnamed` that a collection this member holds belongs to: a hidden collection (a stage, a recreation), whose logical
+/// name is the part of its physical name before the mark, or the collection itself, which IS the name (the identity of a swapped name that
+/// a stale member still holds). The id derives from the database and the name (a register row does not carry its name).
+fn name_from_held_collections(
+    txn: &redb::WriteTransaction,
+    unnamed: &std::collections::BTreeSet<u64>,
+    names: &mut std::collections::BTreeMap<u64, (String, String)>,
+) -> Result<()> {
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    for row in collections.iter()? {
+        let (key, _) = row?;
+        let (db, physical) = key.value();
+        // the collection IS the name: the identity of a swapped name, which a stale member still holds
+        let plain = CollectionId::derive(db, physical).0;
+        if unnamed.contains(&plain) {
+            names.insert(plain, (db.to_string(), physical.to_string()));
+        }
+        let Some(logical) = kimmy_core::swap::logical_of_stage(physical)
+            .or_else(|| kimmy_core::logical_of_recreation(physical))
+        else {
+            continue;
+        };
+        let id = CollectionId::derive(db, logical).0;
+        if unnamed.contains(&id) {
+            names.insert(id, (db.to_string(), logical.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Put what a snapshot's last page carries of the sender's register into effect, in the last page's transaction (ADR-272, decisions 4
 /// and 6; Q6.6, unit C2b). The stage rows first (the door judges every binding by them); then, for each name, the events through the
 /// one door with no seed of their own (one seed per name, before them, from the receiver's own tombstone, and only above the grant: D1),
@@ -1136,10 +1195,23 @@ pub(crate) fn apply_carried(
         }
         events.entry(id).or_default().push((stamp, event, key.as_slice(), value.as_slice()));
     }
+    // A name the carry's stage rows do not name may still be named by a hidden collection this member holds (Q6.6, unit C2e): a stage or a
+    // recreation of it that a page from an older sender made with no stage row. The member's own collections are what the join's earlier
+    // pages created, so this covers a join of several pages as the page's own collection states would, and a name found here goes
+    // through the same door, pass and row as any other.
+    let unnamed: std::collections::BTreeSet<u64> =
+        events.keys().filter(|id| !names.contains_key(id)).copied().collect();
+    if !unnamed.is_empty() {
+        name_from_held_collections(txn, &unnamed, &mut names)?;
+    }
     let mut named = Vec::new();
     for (id, mut group) in events {
         group.sort_by_key(|(stamp, ..)| *stamp);
         let Some((db, logical)) = names.get(&id) else {
+            // an id nothing names: its events are stored by id, and D1 seeds its drop by id from the receiver's own tombstone
+            if seed_by_id_above_the_grant(txn, id, granted)? {
+                wrote = true;
+            }
             let mut table = txn.open_table(tables::REGISTER)?;
             for (_, _, key, value) in &group {
                 if table.insert(*key, *value)?.is_none_or(|old| old.value() != *value) {
