@@ -9024,6 +9024,7 @@ mod tests {
             dropped_collections: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            register: None,
             deleted_documents: Vec::new(),
         }
     }

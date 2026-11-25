@@ -604,6 +604,21 @@ pub struct SnapshotApplied {
     pub clock_refused: Option<crate::clock_bound::ClockStop>,
 }
 
+/// The register a whole-database snapshot carries on its LAST page (ADR-272, decisions 4 and 6; Q6.6, unit C2b): the sender's events in
+/// effect, every stage row and the post-drop rows, as the tables hold them (raw, by id: a register row does not carry its name). Never
+/// the events ahead of their position (REGISTER_INFO): a parked event is above the sender's own coverage, and no page names an entry
+/// above its sender's coverage. The receiver holds every event to the grant it recorded from the first page and puts the rest in effect in
+/// the last page's transaction, in the order the register's door needs (stage rows, events, post-drop rows, the grant, the settle pass).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RegisterCarry {
+    /// `REGISTER` rows: key = the logical name's id (8) then the stamp's key (44), value = the event.
+    pub events: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
+    /// `REGISTER_STAGES` rows: key = the stage's id (8), value as the table stores it.
+    pub stages: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
+    /// `REGISTER_POST` rows: key = the logical name's id (8), value = the row.
+    pub posts: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
+}
+
 /// One page of a snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotPage {
@@ -712,6 +727,10 @@ pub struct SnapshotPage {
     /// row it holds nothing for is `left`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
+    /// The sender's register, on the last page of a whole-database snapshot only (see [`RegisterCarry`]); `None` on every other page, on
+    /// a scoped one, and from a sender that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register: Option<RegisterCarry>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -985,6 +1004,7 @@ impl Engine {
             deleted_documents: Vec::new(),
             dropped_indexes: dropped_indexes.clone(),
             tombstone_horizon: None,
+            register: None,
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
@@ -1003,6 +1023,7 @@ impl Engine {
             deleted_documents,
             dropped_indexes,
             tombstone_horizon,
+            register: None,
         })
     }
 
@@ -5681,6 +5702,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            register: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -5747,6 +5769,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            register: None,
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -6236,6 +6259,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            register: None,
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -7326,6 +7350,7 @@ mod tests {
             }],
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            register: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

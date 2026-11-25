@@ -140,9 +140,14 @@ fn with_the_registers_tombstones(
     page
 }
 
-/// The sender's whole-database page, applied to `joiner`.
+/// The sender's whole-database page, applied to `joiner`: the page of a sender before the
+/// register's carry, which lists the register's tombstones and carries no register (the receiver's
+/// own deferral is what these tests pin). With the carry, the joiner takes the swap from the
+/// register, and the identity or the stage it served is replaced as on the sender.
 fn join(joiner: &Engine, sender: &Engine) {
-    let page = with_the_registers_tombstones(sender, sender.snapshot_page(None, None).unwrap());
+    let mut page = sender.snapshot_page(None, None).unwrap();
+    page.register = None;
+    let page = with_the_registers_tombstones(sender, page);
     assert!(
         page.dropped_collections.iter().any(|(id, _)| *id == CollectionId::derive(DB, "orders")),
         "premise: the page carries the burial of the identity"
@@ -204,6 +209,51 @@ fn a_carried_burial_of_the_stage_a_member_serves_is_not_applied() {
     );
     assert_eq!(j.resolve(DB, "orders").unwrap().physical, STAGE1, "and the name still answers");
     assert_eq!(j.register_carried_drops_deferred(), 1);
+}
+
+/// What the name answers on `j` after a pull, as a value an assertion can compare.
+fn served_by(j: &Engine) -> Result<String, String> {
+    j.resolve(DB, "orders").map(|resolved| resolved.physical).map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_joiner_that_held_the_identity_serves_the_stage_the_carry_binds_and_holds_it() {
+    // With the carry the joiner takes the swap from the register: the binding its window never
+    // delivered makes the stage visible and binds the identity out, as on the sender. The name is
+    // served throughout, by a physical the member holds.
+    let (j, _dj) = with_orders();
+    let s = swap(&[&j]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    pull(&j, &s.sender);
+    assert_eq!(
+        served_by(&j),
+        Ok(STAGE1.to_string()),
+        "the name answers from the stage the sender serves"
+    );
+    assert!(j.get_collection(DB, STAGE1).is_ok(), "and the member holds the physical it serves");
+}
+
+#[test]
+fn a_joiner_that_served_the_first_stage_serves_the_second_the_carry_binds_and_holds_it() {
+    // The joiner served stage 1; the sender went on to stage 2. The second binding is covered by
+    // the grant and no window serves it, so the carry is what delivers it: the name is served by
+    // stage 2, which the page made here with its creation and its row.
+    let (j, _dj) = with_orders();
+    let s = swap(&[&j]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    window(&j, std::slice::from_ref(&s.bind));
+    assert_eq!(served_by(&j), Ok(STAGE1.to_string()), "premise: the joiner serves stage 1");
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    s.a.create_stage(DB, STAGE2, MergePolicy::Document, deadline).unwrap();
+    let creation2 = creation_of(&s.a, STAGE2);
+    let bind2 =
+        bind_of(&s.a, STAGE2, creation2.stamp.hlc.wall_ms.max(s.bind.stamp.hlc.wall_ms) + 1);
+    s.sender.apply_batch(std::slice::from_ref(&creation2)).unwrap();
+    window(&s.sender, std::slice::from_ref(&bind2));
+    assert_eq!(served_by(&s.sender), Ok(STAGE2.to_string()), "premise: the sender went on");
+    pull(&j, &s.sender);
+    assert_eq!(served_by(&j), Ok(STAGE2.to_string()), "the name answers from the second stage");
+    assert!(j.get_collection(DB, STAGE2).is_ok(), "and the member holds the physical it serves");
 }
 
 #[test]
@@ -621,4 +671,241 @@ fn a_stage_a_page_made_below_a_drop_the_member_holds_as_a_tombstone_is_judged_as
         1,
         "the stage's creation is judged: the tombstone above it is the name's logical drop"
     );
+}
+
+// -- Unit C2b: the register travels on the last page, held to the grant, and takes effect in the last page's transaction -----------------------
+
+type Patch<'a> = &'a dyn Fn(&mut crate::SnapshotPage);
+
+/// A whole-database pull of `sender` into `joiner`, each page patched by `patch` before it is applied, until it completes or a page fails.
+fn pull_patched(
+    joiner: &Engine,
+    sender: &Engine,
+    patch: Patch<'_>,
+) -> (SnapshotProgress, crate::Result<()>) {
+    let mut progress = SnapshotProgress::whole_database();
+    for _ in 0..50 {
+        if progress.is_complete() {
+            return (progress, Ok(()));
+        }
+        let mut page = sender.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        patch(&mut page);
+        if let Err(e) = joiner.apply_snapshot_page(sender.node_id(), &mut progress, &page) {
+            return (progress, Err(e));
+        }
+    }
+    panic!("the pull did not complete in 50 pages");
+}
+
+fn pull(joiner: &Engine, sender: &Engine) {
+    let (progress, result) = pull_patched(joiner, sender, &|_| {});
+    result.expect("every page applies");
+    assert!(progress.is_complete(), "the pull completes");
+}
+
+fn the_events_of_orders(m: &Engine) -> Vec<(Stamp, kimmy_core::RegisterEvent)> {
+    use redb::ReadableDatabase;
+    let txn = m.db().begin_read().unwrap();
+    crate::register::timeline_read(&txn, DB, "orders").unwrap().events().to_vec()
+}
+
+/// A `REGISTER` row of `orders` as a page carries it.
+fn an_event_row(
+    stamp: &Stamp,
+    event: &kimmy_core::RegisterEvent,
+) -> (serde_bytes::ByteBuf, serde_bytes::ByteBuf) {
+    let mut key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
+    key.extend_from_slice(&stamp.to_key_bytes());
+    (serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(event.encode()))
+}
+
+fn bind_event() -> kimmy_core::RegisterEvent {
+    kimmy_core::RegisterEvent::Bind { physical: STAGE1.into() }
+}
+
+#[test]
+fn a_fresh_member_that_joins_after_a_swap_holds_the_senders_register_and_serves_the_stage() {
+    let s = swap(&[]);
+    s.sender.collect_oplog_entry_for_test(&s.bind.stamp);
+    assert!(
+        everything(&s.sender).iter().all(|entry| entry.stamp != s.bind.stamp),
+        "premise: the sender's oplog no longer holds the binding"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &s.sender);
+    let served = j.resolve(DB, "orders").map(|resolved| resolved.physical);
+    assert_eq!(
+        served.map_err(|e| e.to_string()),
+        Ok(STAGE1.to_string()),
+        "the joined member serves the stage"
+    );
+    assert_eq!(
+        the_events_of_orders(&j),
+        vec![(s.bind.stamp, bind_event())],
+        "and its register holds exactly the sender's events"
+    );
+    assert_eq!(
+        j.register_carried_drops_deferred(),
+        0,
+        "no carried burial was deferred: the sender no longer lists what the register owns"
+    );
+}
+
+#[test]
+fn an_event_above_the_grant_is_not_taken_and_one_at_it_is() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let origin = s.a.origin();
+    let above = |page: &crate::SnapshotPage| {
+        Stamp::new(page.versions.get(origin).successor(), s.a.node_id(), s.a.epoch())
+    };
+    let patch = |page: &mut crate::SnapshotPage| {
+        let stamp = above(page);
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&stamp, &kimmy_core::RegisterEvent::LogicalDrop));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    let events = the_events_of_orders(&j);
+    assert_eq!(events.len(), 1, "the event above the grant is not taken (it arrives by windows)");
+    assert_eq!(events[0].0, s.bind.stamp, "and the one at the grant, the binding, is");
+}
+
+#[test]
+fn a_senders_parked_event_is_not_on_the_page_and_never_takes_effect() {
+    let s = swap(&[]);
+    let (parked_here, _dp) = engine();
+    parked_here.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    parked_here.apply_batch(std::slice::from_ref(&s.bind)).unwrap();
+    assert!(
+        the_binding_is_parked_only(&parked_here),
+        "premise: the sender holds the binding only ahead of its position"
+    );
+    let page = parked_here.snapshot_page(None, None).unwrap();
+    let carry = page.register.clone().expect("the last page carries the register");
+    assert!(carry.events.is_empty(), "a parked event is not carried");
+    assert!(!carry.stages.is_empty(), "though the stage's row is");
+    let (j, _dj) = engine();
+    pull(&j, &parked_here);
+    assert!(!the_binding_is_parked_only(&j), "nothing of it is parked on the joined member");
+    assert!(the_events_of_orders(&j).is_empty(), "and nothing of it is in effect there");
+}
+
+#[test]
+fn a_binding_of_a_stage_the_page_does_not_know_fails_the_page_and_moves_nothing() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let before = j.witnessed_vector().unwrap();
+    let patch = |page: &mut crate::SnapshotPage| {
+        let earlier = Hlc::new(s.bind.stamp.hlc.wall_ms - 1, 0);
+        let stamp = Stamp::new(earlier, s.a.node_id(), s.a.epoch());
+        let unknown = kimmy_core::RegisterEvent::Bind { physical: "orders.__stg.zz".into() };
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&stamp, &unknown));
+        }
+    };
+    let (progress, result) = pull_patched(&j, &s.sender, &patch);
+    assert!(result.is_err(), "a binding of a stage no row names fails the page");
+    assert!(!progress.is_complete(), "the progress did not move to complete");
+    assert!(the_events_of_orders(&j).is_empty(), "nothing of the register was applied");
+    assert_eq!(j.witnessed_vector().unwrap(), before, "and the grant was not absorbed");
+}
+
+#[test]
+fn a_binding_above_its_stages_deadline_fails_the_page() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let deadline = s.sender.get_collection(DB, STAGE1).unwrap().stage.unwrap().info.deadline;
+    let late = Stamp::new(Hlc::new(deadline.wall_ms + 1, 0), s.a.node_id(), s.a.epoch());
+    let patch = |page: &mut crate::SnapshotPage| {
+        page.versions.observe(late);
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&late, &bind_event()));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    assert!(result.is_err(), "a binding above its stage's deadline fails the page");
+    assert!(the_events_of_orders(&j).is_empty(), "and nothing of the register was applied");
+}
+
+#[test]
+fn a_join_buries_what_the_binding_binds_out_and_counts_no_swap() {
+    let s = swap(&[]);
+    let (j, _dj) = with_orders();
+    pull(&j, &s.sender);
+    assert_eq!(
+        j.out_swaps(),
+        0,
+        "a join counts no swap: this member never served what it replaced"
+    );
+    let buried = j.out_buried().into_iter().find(|(cause, _)| *cause == "bound_out");
+    assert!(buried.is_some_and(|(_, n)| n >= 1), "but the burial happened here, and is counted");
+    assert!(
+        j.get_collection(DB, "orders").is_err(),
+        "the identity the binding binds out is buried"
+    );
+}
+
+#[test]
+fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let ghost = CollectionId::derive(DB, "ghost");
+    let stamp = Stamp::new(s.bind.stamp.hlc.predecessor(), s.a.node_id(), s.a.epoch());
+    let patch = |page: &mut crate::SnapshotPage| {
+        let mut key = ghost.0.to_be_bytes().to_vec();
+        key.extend_from_slice(&stamp.to_key_bytes());
+        let row = serde_bytes::ByteBuf::from(kimmy_core::RegisterEvent::LogicalDrop.encode());
+        if let Some(carry) = &mut page.register {
+            carry.events.push((serde_bytes::ByteBuf::from(key), row));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    use redb::ReadableDatabase;
+    let txn = j.db().begin_read().unwrap();
+    let stored = crate::register::has_events(&txn, DB, "ghost").unwrap();
+    assert!(stored, "the rows of a name no stage row names are stored by id");
+}
+
+#[test]
+fn a_post_drop_row_is_taken_only_for_a_name_that_reads_dropped() {
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let patch = |page: &mut crate::SnapshotPage| {
+        let row = serde_json::to_vec(&crate::register::PostRow::default()).unwrap();
+        let key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
+        if let Some(carry) = &mut page.register {
+            carry.posts.push((serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(row)));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    let row = crate::register::post_row_for_tests(&j, DB, "orders").unwrap();
+    assert!(row.is_none(), "a post-drop row beside a visible physical is not taken");
+}
+
+#[test]
+fn the_receivers_own_tombstone_seeds_a_drop_only_above_the_grant() {
+    for (above, seeded) in [(true, 1usize), (false, 0usize)] {
+        let s = swap(&[]);
+        let (j, _dj) = engine();
+        let id = CollectionId::derive(DB, "orders");
+        let stamp = if above {
+            Stamp::new(Hlc::new(s.bind.stamp.hlc.wall_ms + 5, 0), j.node_id(), j.epoch())
+        } else {
+            Stamp::new(s.bind.stamp.hlc.predecessor(), s.a.node_id(), s.a.epoch())
+        };
+        j.record_collection_drops(&[(id, stamp)]).unwrap();
+        pull(&j, &s.sender);
+        let drops = the_events_of_orders(&j)
+            .iter()
+            .filter(|(_, event)| matches!(event, kimmy_core::RegisterEvent::LogicalDrop))
+            .count();
+        assert_eq!(
+            drops, seeded,
+            "a tombstone is seeded as a drop only when it is above the grant"
+        );
+    }
 }

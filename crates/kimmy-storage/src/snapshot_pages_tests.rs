@@ -388,6 +388,7 @@ fn the_row_overheads_bound_the_encoding() {
         deleted_documents: Vec::new(),
         dropped_indexes: Vec::new(),
         tombstone_horizon: None,
+        register: None,
     };
     let size = |page: &SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
     let base = size(&bare);

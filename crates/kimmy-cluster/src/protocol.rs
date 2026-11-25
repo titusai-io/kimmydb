@@ -1611,6 +1611,7 @@ mod tests {
                 deleted_documents: Vec::new(),
                 dropped_indexes: Vec::new(),
                 tombstone_horizon: None,
+                register: None,
             })),
         )
         .await
@@ -1716,6 +1717,7 @@ mod tests {
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),
+            register: None,
         };
         let message = Message::Snapshot(Box::new(page.clone()));
         let whole = written_document(&message).await;
