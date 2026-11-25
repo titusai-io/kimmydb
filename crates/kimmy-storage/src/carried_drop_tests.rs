@@ -126,9 +126,23 @@ fn swap(joiners: &[&Engine]) -> Swap {
     Swap { a, sender, creation, bind, _dirs: vec![da, ds] }
 }
 
+/// The page of a sender that lists every tombstone it holds, the register-owned ones too: what a sender before the register's carry
+/// sends (its tombstones are put back into the page by hand), which the receiver's own deferral still has to meet.
+fn with_the_registers_tombstones(
+    sender: &Engine,
+    mut page: crate::SnapshotPage,
+) -> crate::SnapshotPage {
+    for (id, stamp) in sender.collections_dropped().unwrap() {
+        if !page.dropped_collections.iter().any(|(listed, _)| *listed == id) {
+            page.dropped_collections.push((id, stamp));
+        }
+    }
+    page
+}
+
 /// The sender's whole-database page, applied to `joiner`.
 fn join(joiner: &Engine, sender: &Engine) {
-    let page = sender.snapshot_page(None, None).unwrap();
+    let page = with_the_registers_tombstones(sender, sender.snapshot_page(None, None).unwrap());
     assert!(
         page.dropped_collections.iter().any(|(id, _)| *id == CollectionId::derive(DB, "orders")),
         "premise: the page carries the burial of the identity"
@@ -276,10 +290,9 @@ struct Known {
     _dj: tempfile::TempDir,
 }
 
-fn a_page_that_buries_a_stage_the_receiver_knows() -> Known {
-    let (j, dj) = engine();
+/// A sender that flipped to `STAGE1`, went on to a second swap (`STAGE2`, which buries `STAGE1`), and dropped a plain collection.
+fn a_sender_that_went_on_to_a_second_swap() -> Swap {
     let s = swap(&[]);
-    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     s.a.create_stage(DB, STAGE2, MergePolicy::Document, deadline).unwrap();
     let creation2 = creation_of(&s.a, STAGE2);
@@ -289,9 +302,17 @@ fn a_page_that_buries_a_stage_the_receiver_knows() -> Known {
     window(&s.sender, std::slice::from_ref(&bind2));
     s.sender.create_collection(DB, "plain").unwrap();
     assert!(s.sender.drop_collection(DB, "plain").unwrap());
+    s
+}
+
+fn a_page_that_buries_a_stage_the_receiver_knows() -> Known {
+    let (j, dj) = engine();
+    let s = a_sender_that_went_on_to_a_second_swap();
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
     // by hand: the stage's row stays, its collection and its tombstone go (the state of a member whose tombstone was collected)
     j.forget_collection_leaving_rows(DB, STAGE1).unwrap();
-    let page = s.sender.snapshot_page(None, None).unwrap();
+    let page =
+        with_the_registers_tombstones(&s.sender, s.sender.snapshot_page(None, None).unwrap());
     Known { j, s, page, _dj: dj }
 }
 
@@ -412,4 +433,76 @@ fn a_scoped_page_delivered_twice_defers_the_identity_twice_and_records_no_tombst
             "and still no tombstone is recorded under the identity's id (delivery {delivery})"
         );
     }
+}
+
+// -- Unit C3: the sender leaves out of its carried drops every id the register owns --------------------------------------------------------
+
+fn ids_of(page: &crate::SnapshotPage) -> Vec<CollectionId> {
+    page.dropped_collections.iter().map(|(id, _)| *id).collect()
+}
+
+#[test]
+fn a_page_lists_a_plain_collections_tombstone_and_none_the_register_owns() {
+    let s = a_sender_that_went_on_to_a_second_swap();
+    let (identity, stage1) = (CollectionId::derive(DB, "orders"), CollectionId::derive(DB, STAGE1));
+    let plain = CollectionId::derive(DB, "plain");
+    let held: Vec<CollectionId> =
+        s.sender.collections_dropped().unwrap().into_iter().map(|(id, _)| id).collect();
+    assert!(
+        [identity, stage1, plain].iter().all(|id| held.contains(id)),
+        "premise: the sender holds a tombstone for each of the three"
+    );
+    let page = s.sender.snapshot_page(None, None).unwrap();
+    let listed = ids_of(&page);
+    assert!(!listed.contains(&identity), "the bound-out identity's tombstone is not listed");
+    assert!(!listed.contains(&stage1), "nor the buried stage's");
+    assert!(listed.contains(&plain), "and the plain collection's is");
+}
+
+#[test]
+fn a_buried_recreations_tombstone_is_not_listed_either() {
+    let s = swap(&[]);
+    assert!(s.sender.drop_collection(DB, "orders").unwrap(), "premise: a logical drop of the name");
+    s.sender.create_collection(DB, "orders").expect("the name is made again");
+    let recreation = s.sender.resolve(DB, "orders").unwrap().physical;
+    assert!(kimmy_core::is_recreation_name(&recreation), "premise: a recreation holds the name");
+    assert!(s.sender.drop_collection(DB, "orders").unwrap(), "the second drop buries it");
+    let id = CollectionId::derive(DB, &recreation);
+    let held = s.sender.collections_dropped().unwrap();
+    assert!(
+        held.iter().any(|(held, _)| *held == id),
+        "premise: the sender holds the recreation's tombstone"
+    );
+    let page = s.sender.snapshot_page(None, None).unwrap();
+    assert!(!ids_of(&page).contains(&id), "the buried recreation's tombstone is not listed");
+}
+
+#[test]
+fn an_identity_dropped_while_its_binding_is_only_parked_is_still_listed_and_buries_the_receivers() {
+    // The state F3 made: the drop is only in the tombstone (REGISTER holds nothing of the name; the binding is parked in REGISTER_INFO), so
+    // leaving it out would leave a receiver that holds the identity holding it for good.
+    let (j, _dj) = with_orders();
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, STAGE1);
+    let (sender, _ds) = engine();
+    sender.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    let wall = creation.stamp.hlc.wall_ms.max(physical_now_ms()) + 10;
+    sender.apply_batch(std::slice::from_ref(&bind_of(&a, STAGE1, wall))).unwrap();
+    assert!(
+        the_binding_is_parked_only(&sender),
+        "premise: the sender's binding is known ahead of its position"
+    );
+    // by hand, at a stamp the sender's own coverage names (the creation's) and above the receiver's identity
+    let identity = CollectionId::derive(DB, "orders");
+    sender.record_collection_drops(&[(identity, creation.stamp)]).unwrap();
+    let page = sender.snapshot_page(None, None).unwrap();
+    assert!(
+        ids_of(&page).contains(&identity),
+        "the identity's tombstone is listed: only parked events do not own it"
+    );
+    j.apply_snapshot_page(sender.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .unwrap();
+    assert!(j.get_collection(DB, "orders").is_err(), "and the receiver's identity is buried by it");
 }
