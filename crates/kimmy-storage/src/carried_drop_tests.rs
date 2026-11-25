@@ -859,6 +859,21 @@ fn a_join_buries_what_the_binding_binds_out_and_counts_no_swap() {
 }
 
 #[test]
+fn a_join_buries_the_identity_the_binding_binds_out_whether_or_not_it_is_counted() {
+    // The state, asserted alone: the test above reads the counter first, and a mutant that skips the burial dies there before it
+    // reaches the identity. Here nothing is read before the identity.
+    let s = swap(&[]);
+    let (j, _dj) = with_orders();
+    assert!(j.get_collection(DB, "orders").is_ok(), "premise: the joiner holds the identity");
+    pull(&j, &s.sender);
+    assert_eq!(served_by(&j), Ok(STAGE1.to_string()), "premise: the stage serves the name");
+    assert!(
+        j.get_collection(DB, "orders").is_err(),
+        "the identity the binding binds out is buried by the join"
+    );
+}
+
+#[test]
 fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() {
     let s = swap(&[]);
     let (j, _dj) = engine();
