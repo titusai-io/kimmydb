@@ -6136,6 +6136,72 @@ impl Engine {
         Ok(())
     }
 
+    /// A doomed burial is never taken from another member (ADR-272, decision 9; Q6.6, unit D). The last page of a whole-database snapshot
+    /// lists the sender's stage rows whose collection is not alive there; in the transaction that records the grant, after the grant's events
+    /// took effect and the carried names were settled, this asks THIS member's own tests about each one it knows the creation of (its stage row
+    /// is here), holds no collection of and holds no tombstone for: the loser rule and the burial by a later event, the stage counted as
+    /// held, and when either names it, this member records its own tombstone at the stamp it gives, the stamp of the event visible HERE. A
+    /// stage created above the grant is not this join's, an id with no stage row here is skipped, and a stage held here is the pass's. What
+    /// the member's tests do not bury is returned, for the join that must restart across a burial (unit E).
+    pub(crate) fn tombstone_listed_stages_in_txn(
+        txn: &WriteTxn<'_>,
+        listed: &[serde_bytes::ByteBuf],
+        granted: &kimmy_core::VersionVector,
+    ) -> Result<ListedStages> {
+        use kimmy_core::register_state::Ready;
+        let mut out = ListedStages::default();
+        for raw in listed {
+            let Ok(raw) = <[u8; 8]>::try_from(raw.as_slice()) else { continue };
+            let id = CollectionId(u64::from_be_bytes(raw));
+            let Some(stage) = crate::register::stage_row_named(txn, id)? else { continue };
+            if stage.meta.created.hlc > granted.get(stage.meta.created.origin()) {
+                continue;
+            }
+            let held = txn
+                .open_table(tables::COLLECTIONS)?
+                .get((stage.db.as_str(), stage.physical.as_str()))?
+                .is_some();
+            let tombstoned = txn.open_table(tables::COLLECTIONS_DROPPED)?.get(id.0)?.is_some();
+            let Some(logical) = kimmy_core::swap::logical_of_stage(&stage.physical) else {
+                continue;
+            };
+            if held || tombstoned {
+                continue;
+            }
+            // the pass's own inputs, built as the pass builds them (`settle_register_in_txn`): the view of the events, then each stage this
+            // member holds counted alive without overriding what the view said, and the held stages' deadlines; and then, the one thing this
+            // adds, the listed stage counted as held, which it is not
+            let (timeline, mut ready) = Self::register_view_in_txn(txn, &stage.db, logical)?;
+            let mut stages = Self::held_stages_in_txn(txn, &stage.db, logical)?;
+            for (physical, _) in &stages {
+                ready.entry(physical.clone()).or_insert(Ready::Alive);
+            }
+            ready.insert(stage.physical.clone(), Ready::Alive);
+            stages.push((
+                stage.physical.clone(),
+                stage.meta.info.effective_deadline(&stage.meta.created),
+            ));
+            let lookup = |p: &str| ready.get(p).copied().unwrap_or(Ready::Buried);
+            let visible = timeline.visible(lookup);
+            let deadlines: Vec<(&str, Hlc)> =
+                stages.iter().map(|(physical, deadline)| (physical.as_str(), *deadline)).collect();
+            let buried = timeline
+                .burials(&visible, lookup)
+                .into_iter()
+                .chain(timeline.doomed(&visible, lookup, &deadlines))
+                .find(|burial| burial.physical == stage.physical);
+            match buried {
+                Some(burial) => {
+                    let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                    dropped.insert(id.0, codec::oplog_key(&burial.at).as_slice())?;
+                    out.buried.push(id);
+                }
+                None => out.left.push(id),
+            }
+        }
+        Ok(out)
+    }
+
     /// The physical collection the logical name `name` resolves to on this member: the register's visible physical, or the
     /// identity (the collection of that name) when no event is in effect (ADR-272, decisions 5 and 7; Q6.4 item 0). The ONE door
     /// from a logical name to a collection that the API and the MCP use; [`Self::get_collection`] stays for physicals and for
@@ -7018,6 +7084,14 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// What a join did with the stages a snapshot listed as not alive at its sender (Q6.6, unit D): the ones this member's own tests buried (it
+/// recorded its own tombstone), and the ones it holds no collection of that its tests do not bury.
+#[derive(Debug, Default)]
+pub(crate) struct ListedStages {
+    pub(crate) buried: Vec<CollectionId>,
+    pub(crate) left: Vec<CollectionId>,
 }
 
 /// What a logical name resolves to on a member (ADR-272, Q6.4 item 0): the collection to read or write, its physical name, and the

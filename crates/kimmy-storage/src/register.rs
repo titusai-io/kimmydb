@@ -1086,6 +1086,23 @@ fn seed_above_the_grant(
     }
 }
 
+/// The ids of the stage rows this member holds whose collection is NOT alive here (a stage it doomed or buried, or never held): what a
+/// whole-database snapshot's last page lists (ADR-272, decision 9; Q6.6, unit D). Read in the same read transaction as the carry's tables, so
+/// that a stage buried between two reads is not listed with its row and flagged alive.
+pub(crate) fn not_alive_stage_ids(txn: &redb::ReadTransaction) -> Result<Vec<Vec<u8>>> {
+    let stages = txn.open_table(tables::REGISTER_STAGES)?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut out = Vec::new();
+    for row in stages.iter()? {
+        let (key, value) = row?;
+        let (db, physical) = stage_row_names(key.value(), value.value()).map_err(corrupt)?;
+        if collections.get((db.as_str(), physical.as_str()))?.is_none() {
+            out.push(key.value().to_vec());
+        }
+    }
+    Ok(out)
+}
+
 /// D1 for an id that stays unnamed (Q6.6, unit C2e): when the receiver holds a tombstone for it ABOVE the grant and `REGISTER` holds no row
 /// for it, the tombstone is the name's drop (one the sender could not have judged), stored by id as `seed_above_the_grant` stores it for a
 /// name: no name is needed to write the row.

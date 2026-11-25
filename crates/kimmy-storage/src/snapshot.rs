@@ -1097,8 +1097,10 @@ impl Engine {
             events: rows(Carried::Register)?,
             stages: rows(Carried::Stages)?,
             posts: rows(Carried::Post)?,
-            // SCAFFOLD (unit D tests): the list is filled by the code commit
-            not_alive: Vec::new(),
+            not_alive: crate::register::not_alive_stage_ids(&txn)?
+                .into_iter()
+                .map(serde_bytes::ByteBuf::from)
+                .collect(),
         };
         self.note_register_carry(&carry);
         Ok(carry)
@@ -1885,6 +1887,19 @@ impl Engine {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
                 for name in &carried {
                     Engine::settle_carried_in_txn(&txn, &name.db, &name.logical, &name.stored)?;
+                }
+                // The stages the sender lists as not alive, after the grant's events took effect and the passes ran: each is asked of this
+                // member's own tests, and a tombstone is recorded for the ones they bury and this member holds no collection of (D-1)
+                if let Some(carry) = &page.register {
+                    let listed =
+                        Engine::tombstone_listed_stages_in_txn(&txn, &carry.not_alive, granted)?;
+                    wrote |= !listed.buried.is_empty();
+                    if !listed.left.is_empty() {
+                        debug!(
+                            stages = listed.left.len(),
+                            "listed stages this member holds none of and its own tests do not bury"
+                        );
+                    }
                 }
                 // And the sender's forgetting with it: a member that was behind forgets
                 // what the sender has forgotten, and serves on with that horizon.

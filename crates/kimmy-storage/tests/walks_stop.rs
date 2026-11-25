@@ -116,6 +116,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "a prefix range of the collections table that reads at most its first row: the first collection whose name begins with the stage mark of one logical name, asked inside the transaction of a drop (ADR-272, decision 6)",
     ),
     (
+        "register::not_alive_stage_ids",
+        "the stage rows of ONE member, read whole in the same read transaction as the carry's tables, in a whole-database snapshot's last page: one row per stage the member has met, bounded by its own register, which the carry measures too (ADR-272; Q6.6, unit D)",
+    ),
+    (
         "register::name_from_held_collections",
         "the member's own collections table, read whole in the write transaction of a snapshot's last page and only when the carry has an event no stage row names: one row per collection of the member, bounded by its catalogue, the scan `check_restored` makes of the same table (ADR-272; Q6.6, unit C2e)",
     ),
