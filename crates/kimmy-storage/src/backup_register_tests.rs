@@ -473,6 +473,7 @@ const T_REGISTER_INFO: u8 = 14;
 const T_REGISTER_STAGES: u8 = 15;
 const T_REGISTER_POST: u8 = 16;
 const T_OPLOG: u8 = 6;
+const T_OPLOG_VERSIONS: u8 = 10;
 
 fn records(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
     let mut at = HEADER;
@@ -534,7 +535,10 @@ fn a_register_row_that_does_not_decode_refuses_the_restore() {
         .expect("premise: the backup carries a REGISTER row");
     row.2 = vec![0xFF; 3];
     let error = refused(&rebuilt(&bytes, &records));
-    assert!(error.contains("does not decode"), "the refusal names the check: {error}");
+    assert!(
+        error.contains("a register row does not decode"),
+        "a register row that does not decode is refused by its own check, not a later one: {error}"
+    );
 }
 
 #[test]
@@ -979,5 +983,43 @@ fn a_stale_temporary_file_from_an_earlier_crash_does_not_stop_a_restore() {
     assert!(
         resolves(&r) == Ok(BOUND.to_string()),
         "the restored store answers as the member it came from did"
+    );
+}
+
+#[test]
+fn the_visible_physical_is_the_newest_binding_whose_collection_is_alive_in_the_backup() {
+    // check 4 judges the physical the name resolves to, which is the newest binding whose collection is ALIVE: here the newest binding names
+    // a stage whose collection is not in the backup, so the older one is visible and its floor is judged
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, &[index_entry(&w.author, "x_1", "t", at(&w, 7))]);
+    assert!(holds(&m, BOUND, "x_1"), "premise: the index is on the visible stage");
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    let newer = Stamp::new(Hlc::new(at(&w, 20), 0), w.author.node_id(), w.author.epoch());
+    records.retain(|(tag, key, _)| !(*tag == 3 && key.ends_with(UNBOUND.as_bytes())));
+    let event = kimmy_core::RegisterEvent::Bind { physical: UNBOUND.into() };
+    records.push((T_REGISTER, row_key(&newer), event.encode()));
+    for (_, _, value) in records.iter_mut().filter(|(tag, _, _)| *tag == T_OPLOG_VERSIONS) {
+        let covered = Hlc::from_bytes(value.as_slice().try_into().expect("a stamp"));
+        *value = covered.max(newer.hlc).to_bytes().to_vec();
+    }
+    // the control: a dead newest binding is accepted, and the older stage answers
+    let (r, _dr) = restored(&rebuilt(&bytes, &records));
+    assert!(
+        resolves(&r) == Ok(BOUND.to_string()),
+        "premise: the older stage answers while the newest binding's collection is not alive"
+    );
+    let stage = collection_record(&mut records, BOUND);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&stage.2).expect("the metadata is JSON");
+    meta["definition_floor"] =
+        serde_json::to_value(Hlc::new(at(&w, 9), 0)).expect("the floor encodes");
+    stage.2 = serde_json::to_vec(&meta).expect("the metadata encodes");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("at or below its own floor"),
+        "the older, alive stage is the visible physical, and its floor is judged: {error}"
     );
 }
