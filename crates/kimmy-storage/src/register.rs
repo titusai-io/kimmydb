@@ -593,17 +593,31 @@ pub(crate) fn timeline_read(
 
 /// The stamp of the newest logical drop of `logical` in effect on this member (a logical drop names no physical): the boundary a
 /// definition of the name must be stamped above to belong to its present life, whichever physical stands (ADR-272, decision 6, rule 4).
+///
+/// Read from the name's stored visibility row when it is current, that is when the newest event of the name is the one the row was decided
+/// against (ADR-272; Q6.6, the resolve row), and computed from the events when it is not. The second answer says whether the row was stale
+/// (the name has events and the row is missing or not current), so the caller counts it; the answer is right either way. A name with no
+/// event has no drop.
 pub(crate) fn newest_logical_drop_read(
     txn: &redb::ReadTransaction,
     db: &str,
     logical: &str,
-) -> Result<Option<Stamp>> {
-    Ok(timeline_read(txn, db, logical)?
+) -> Result<(Option<Stamp>, bool)> {
+    let Some(newest) = newest_stored_event_read(txn, db, logical)? else {
+        return Ok((None, false));
+    };
+    if let Some(row) = visible_row_read(txn, db, logical)?
+        && row.newest_event == Some(newest)
+    {
+        return Ok((row.newest_drop, false));
+    }
+    let computed = timeline_read(txn, db, logical)?
         .events()
         .iter()
         .filter(|(_, event)| event.physical().is_none())
         .map(|(stamp, _)| *stamp)
-        .max())
+        .max();
+    Ok((computed, true))
 }
 
 /// The register events of `logical` known ahead of their position, read in a read transaction.
@@ -1459,6 +1473,7 @@ fn raw_rows(txn: &redb::WriteTransaction, which: Carried) -> Result<Vec<(Vec<u8>
 /// binding has its stage row; every hidden collection is known to the register (a recreation with no `Create` event is known when its
 /// stamp, which its name carries, is above the carried vector); no row of REGISTER is above the carried vector; no row of
 /// REGISTER_INFO is at or below it, and each has its entry; and what a flip leaves cannot be below its own floor (check 4).
+/// It also writes the visibility row of every name it can name, from what check 4 computes (the row is derived and not carried).
 pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
     use kimmy_core::register_state::{Ready, Visible};
 
@@ -1619,6 +1634,17 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
             }
             timeline.visible(|physical| ready.get(physical).copied().unwrap_or(Ready::Buried))
         };
+        // The name's visibility row is derived and not carried, so it is written here, from what has just been computed: a restored
+        // member answers a swapped name from the row, as the member it came from did (ADR-272; Q6.6, the resolve row)
+        let newest_drop = timeline
+            .events()
+            .iter()
+            .filter(|(_, event)| event.physical().is_none())
+            .map(|(stamp, _)| *stamp)
+            .max();
+        let newest_event = newest_stored_event(txn, db, logical)?;
+        let row = VisibleRow::decided(&visible, newest_drop, newest_event);
+        write_visible_row(txn, db, logical, &row)?;
         let physical = match &visible {
             Visible::Bound { physical, .. } | Visible::Created { physical, .. } => physical,
             Visible::Identity | Visible::Dropped { .. } => continue,

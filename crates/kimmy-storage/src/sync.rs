@@ -1779,10 +1779,13 @@ impl Engine {
         let logical = kimmy_core::swap::logical_of_stage(&standing.name)
             .or_else(|| kimmy_core::logical_of_recreation(&standing.name))
             .unwrap_or(&standing.name);
-        let newest_drop = {
+        let (newest_drop, stale) = {
             let txn = self.db().begin_read()?;
             crate::register::newest_logical_drop_read(&txn, &standing.db, logical)?
         };
+        if stale {
+            self.register_resolve_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(newest_drop.is_some_and(|drop| stamp.hlc <= drop.hlc))
     }
 }
