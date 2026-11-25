@@ -335,6 +335,43 @@ impl Engine {
         Ok(Absent::Written)
     }
 
+    /// Adopt the definition floor `floor` a snapshot page carries, which the caller has held to what the sender's coverage names (ADR-163;
+    /// Q6.6, unit C1). The clock passes it first, as it passes an incarnation floor: a definition this member minted below an adopted floor
+    /// would be history here and on no other member. Then, in one transaction, the physical's definition floor is raised to it if it is
+    /// higher than the one held (never lowered, never the incarnation floor), and what the physical already holds at or below it is floored
+    /// as the flip floors a new physical: the index definitions, with their entry rows, and a validator. No index tombstone is written: the
+    /// floor itself makes an entry at or below it history (`definition_of_an_ended_life`). Nothing is done for a physical this member does not
+    /// hold (the caller restores it first) or one whose floor is already at or above `floor`.
+    pub(crate) fn adopt_definition_floor(
+        &self,
+        db: &str,
+        physical: &str,
+        floor: Hlc,
+    ) -> Result<()> {
+        self.witness_hlc(floor);
+        let txn = self.begin_write(crate::engine::WriterHolder::Ddl)?;
+        let held: Option<CollectionMeta> = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            collections
+                .get((db, physical))?
+                .map(|row| serde_json::from_slice(row.value()))
+                .transpose()?
+        };
+        let Some(mut meta) = held else {
+            txn.abort()?;
+            return Ok(());
+        };
+        if meta.definition_floor.is_some_and(|own| own >= floor) {
+            txn.abort()?;
+            return Ok(());
+        }
+        meta.definition_floor = Some(floor);
+        Self::put_collection_meta(&txn, &meta)?;
+        self.floor_definitions_in_txn(&txn, db, physical, floor, None)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// A physical that becomes visible keeps of its own definitions only what is stamped above the newest logical drop in effect: a stage
     /// created below the drop and bound above it carries a copy of the dropped life's definitions, which are not the new life's (model A3).
     pub(crate) fn floor_definitions_in_txn(

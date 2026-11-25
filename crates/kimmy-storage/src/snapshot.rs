@@ -402,7 +402,7 @@ impl From<CollectionMeta> for CollectionState {
             vector_changed: meta.vector_changed,
             redated_from,
             incarnation_floor: meta.incarnation_floor,
-            definition_floor: None,
+            definition_floor: meta.definition_floor,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,
@@ -1431,10 +1431,15 @@ impl Engine {
             stamps.extend(state.vector_changed);
             stamps.extend(state.validator_changed);
             stamps.extend(
-                [state.merge_policy_at, state.redated_from, state.incarnation_floor]
-                    .into_iter()
-                    .flatten()
-                    .map(named),
+                [
+                    state.merge_policy_at,
+                    state.redated_from,
+                    state.incarnation_floor,
+                    state.definition_floor,
+                ]
+                .into_iter()
+                .flatten()
+                .map(named),
             );
         }
         let (bound, now) = (self.clock_bound(), self.clock_bound_now_ms());
@@ -3188,6 +3193,14 @@ impl Engine {
                 state.loss_limits,
                 policy_at,
             )?;
+        }
+
+        // The definition floor the page carries, when its coverage names it (ADR-163): adopted into the physical's definition floor, and
+        // never into its incarnation floor, which refuses documents. The collection is held here by now, made by this page or held before,
+        // and the definitions judged below see the floor (Q6.6, unit C1).
+        let adopted = state.definition_floor.filter(|floor| hlc_is_named(*floor, versions));
+        if let Some(floor) = adopted {
+            self.adopt_definition_floor(&state.db, &state.name, floor)?;
         }
 
         // A page can name a life of the collection this node has seen dropped
