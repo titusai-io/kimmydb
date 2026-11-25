@@ -355,6 +355,12 @@ pub struct CollectionState {
     /// evidence, so nothing is buried.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incarnation_floor: Option<Hlc>,
+    /// The sender's definition floor for this physical (`CollectionMeta::definition_floor`; ADR-272, decision 6; Q6.6, unit C): the `hlc` at or
+    /// below which a definition belongs to an earlier life of the name. A receiver adopts it only when the sender's coverage names it
+    /// (ADR-163), into its own definition floor and never into the incarnation floor, which refuses documents. `None` for a physical that
+    /// replaced nothing, and from a sender that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_floor: Option<Hlc>,
     /// The collection's validator (`CollectionMeta::validator`, ADR-257), absent when it
     /// has none. Absent on a page from a sender that never had one, and also when the
     /// sender removed it: `validator_changed` says which.
@@ -396,6 +402,7 @@ impl From<CollectionMeta> for CollectionState {
             vector_changed: meta.vector_changed,
             redated_from,
             incarnation_floor: meta.incarnation_floor,
+            definition_floor: None,
             validator: meta.validator,
             validator_changed: meta.validator_changed,
             merge_policy: meta.merge_policy,

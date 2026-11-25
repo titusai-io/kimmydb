@@ -8993,6 +8993,7 @@ mod tests {
                 vector_changed: None,
                 redated_from: None,
                 incarnation_floor: None,
+                definition_floor: None,
                 validator: None,
                 validator_changed: None,
                 merge_policy: kimmy_core::MergePolicy::Document,

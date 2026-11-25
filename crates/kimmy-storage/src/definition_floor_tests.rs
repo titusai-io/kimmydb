@@ -1317,3 +1317,183 @@ fn a_drop_arriving_after_both_bindings_are_parked_floors_the_physical_that_is_se
         the_stage_ends_as_a_floored_one(&m, SECOND, &format!("{how:?}"));
     }
 }
+
+// -- Q6.6 unit C1: the definition floor travels in a snapshot page ---------------------------------------------------------------------------
+//
+// A page's collection state carries the sender's definition floor. The receiver adopts it only inside the coverage the page names
+// (ADR-163), into its own definition floor and never into the incarnation floor, passes its clock over it, and floors what it already holds
+// at or below it, entry rows and all.
+
+fn the_stage_id() -> CollectionId {
+    CollectionId::derive(DB, FIRST)
+}
+
+fn the_stage_holds(m: &Engine, name: &str) -> bool {
+    m.get_collection(DB, FIRST).expect("the stage is held").index(name).is_some()
+}
+
+/// A sender that holds the stages, so its page carries their states, and whose `FIRST` holds the definition floor `floor`.
+fn a_sender_whose_stage_holds_a_floor(w: &World, floor: Hlc) -> (Arc<Engine>, tempfile::TempDir) {
+    let (s, d) = engine();
+    s.apply_batch(&w.stages).expect("the stages apply");
+    let mut stage = s.get_collection(DB, FIRST).expect("the sender holds the stage");
+    stage.definition_floor = Some(floor);
+    put_meta(&s, &stage);
+    (s, d)
+}
+
+fn apply_the_page(m: &Engine, sender: &Engine, id: CollectionId, page: &crate::SnapshotPage) {
+    let mut progress = crate::SnapshotProgress::of_collection(id);
+    m.apply_snapshot_page(sender.node_id(), &mut progress, page).expect("the page applies");
+}
+
+/// A vector that names the author's stamps up to `wall_ms` and nothing above.
+fn coverage_to(w: &World, wall_ms: u64) -> VersionVector {
+    let mut vector = VersionVector::default();
+    vector.observe(Stamp::new(Hlc::new(wall_ms, 0), w._author.0.node_id(), w._author.0.epoch()));
+    vector
+}
+
+#[test]
+fn a_definition_floor_named_by_the_senders_coverage_is_adopted_and_judges_what_arrives_after() {
+    let w = world();
+    let (m, _d) = member(&w);
+    let (s, _ds) = a_sender_whose_stage_holds_a_floor(&w, w.t);
+    let page = s.snapshot_page(None, Some(the_stage_id())).expect("the sender's page");
+    assert!(page.collections.len() == 1, "premise: the page carries the stage");
+    assert_eq!(
+        page.collections[0].definition_floor,
+        Some(w.t),
+        "premise: the page carries the stage's definition floor"
+    );
+    assert_eq!(floor_of(&m, FIRST), None, "premise: the receiver's stage holds no floor");
+    apply_the_page(&m, &s, the_stage_id(), &page);
+    assert_eq!(floor_of(&m, FIRST), Some(w.t), "the receiver adopts the floor the page names");
+    assert_eq!(
+        m.get_collection(DB, FIRST).expect("held").incarnation_floor,
+        None,
+        "and never as its incarnation floor"
+    );
+    let at_the_floor = named_index_entry(&w._author.0, FIRST, "at_floor", "t", w.t.wall_ms);
+    let above = named_index_entry(&w._author.0, FIRST, "above_floor", "v", w.t.wall_ms + 3);
+    window(&m, &[at_the_floor, above]);
+    assert!(!the_stage_holds(&m, "at_floor"), "a definition at the floor is history on the stage");
+    assert!(
+        the_stage_holds(&m, "above_floor"),
+        "and one above it is applied: the floor is not a wall"
+    );
+}
+
+#[test]
+fn a_definition_floor_the_senders_coverage_does_not_name_is_not_adopted() {
+    let w = world();
+    let (m, _d) = member(&w);
+    let (s, _ds) = a_sender_whose_stage_holds_a_floor(&w, w.t);
+    let mut page = s.snapshot_page(None, Some(the_stage_id())).expect("the sender's page");
+    assert_eq!(
+        page.collections[0].definition_floor,
+        Some(w.t),
+        "premise: the page carries the stage's definition floor"
+    );
+    page.versions = coverage_to(&w, w.t.wall_ms - 1);
+    apply_the_page(&m, &s, the_stage_id(), &page);
+    assert_eq!(
+        floor_of(&m, FIRST),
+        None,
+        "a floor the sender's coverage does not name is not adopted"
+    );
+    assert_eq!(
+        m.get_collection(DB, FIRST).expect("held").incarnation_floor,
+        None,
+        "and is not the incarnation floor either"
+    );
+    let at_the_floor = named_index_entry(&w._author.0, FIRST, "at_floor", "t", w.t.wall_ms);
+    window(&m, &[at_the_floor]);
+    assert!(
+        the_stage_holds(&m, "at_floor"),
+        "nothing was floored: a definition at that floor is applied"
+    );
+}
+
+#[test]
+fn a_page_floor_floors_the_copy_the_receiver_already_holds_entry_rows_and_all() {
+    let w = world();
+    let (m, _d) = member(&w);
+    copy_on(&m, &w, FIRST);
+    let (s, _ds) = a_sender_whose_stage_holds_a_floor(&w, w.t);
+    let page = s.snapshot_page(None, Some(the_stage_id())).expect("the sender's page");
+    assert_eq!(
+        page.collections[0].definition_floor,
+        Some(w.t),
+        "premise: the page carries the stage's definition floor"
+    );
+    apply_the_page(&m, &s, the_stage_id(), &page);
+    assert!(
+        !the_stage_holds(&m, INDEX),
+        "x, a definition at the floor, is gone from the stage the receiver holds"
+    );
+    assert_eq!(index_rows(&m, FIRST, INDEX), 0, "and none of its entry rows remain");
+    assert!(
+        entries_of_index(&m, FIRST, "kept") > 0,
+        "kept, above the floor, stands with its entries"
+    );
+    assert_eq!(floor_of(&m, FIRST), Some(w.t), "and the stage holds the floor");
+}
+
+#[test]
+fn a_page_floor_above_the_floor_the_receiver_holds_raises_it_and_floors_the_copy() {
+    let w = world();
+    let (m, _d) = member(&w);
+    let mut stage = m.get_collection(DB, FIRST).expect("the stage is held");
+    stage.definition_floor = Some(Hlc::new(w.t.wall_ms - 5, 0));
+    put_meta(&m, &stage);
+    copy_on(&m, &w, FIRST);
+    assert!(index_rows(&m, FIRST, INDEX) > 0, "premise: x is on the stage with entry rows");
+    let (s, _ds) = a_sender_whose_stage_holds_a_floor(&w, w.t);
+    let page = s.snapshot_page(None, Some(the_stage_id())).expect("the sender's page");
+    apply_the_page(&m, &s, the_stage_id(), &page);
+    assert_eq!(
+        floor_of(&m, FIRST),
+        Some(w.t),
+        "the floor is raised to the page's: a lower held floor does not stay"
+    );
+    assert_eq!(
+        index_rows(&m, FIRST, INDEX),
+        0,
+        "and the copy at the new floor is gone, entry rows and all"
+    );
+}
+
+#[test]
+fn a_definition_floor_is_adopted_with_a_collection_the_receiver_creates_and_its_clock_passes_it() {
+    let (s, _ds) = engine();
+    s.create_collection(DB, "plain").expect("the sender's collection");
+    let id = CollectionId::derive(DB, "plain");
+    // above the clock, so a clock that did not pass it would mint below it
+    let floor = Hlc::new(physical_now_ms() + 5_000, 0);
+    let mut meta = s.get_collection(DB, "plain").expect("the sender holds it");
+    meta.definition_floor = Some(floor);
+    put_meta(&s, &meta);
+    let mut page = s.snapshot_page(None, Some(id)).expect("the sender's page");
+    assert_eq!(
+        page.collections[0].definition_floor,
+        Some(floor),
+        "premise: the page carries the collection's definition floor"
+    );
+    page.versions.observe(Stamp::new(floor, s.node_id(), s.epoch()));
+    let (m, _d) = engine();
+    apply_the_page(&m, &s, id, &page);
+    assert_eq!(
+        m.get_collection(DB, "plain").expect("created").definition_floor,
+        Some(floor),
+        "the receiver's new collection holds the floor"
+    );
+    let local = vec![IndexField::ascending("t")];
+    m.create_index(DB, "plain", local, false, Some("local_1".into())).expect("a local index");
+    let held = m.get_collection(DB, "plain").expect("held");
+    let made = held.index("local_1").and_then(|i| i.created);
+    assert!(
+        made.is_some_and(|created| created.hlc > floor),
+        "the clock passed the floor: a definition minted after the join is not history"
+    );
+}

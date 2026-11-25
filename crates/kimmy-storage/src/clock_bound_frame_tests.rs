@@ -347,6 +347,27 @@ fn a_page_that_defines_a_collection_created_past_the_bound_is_a_stop_until_due()
 }
 
 #[test]
+fn a_page_whose_definition_floor_is_past_the_bound_is_a_stop_until_due() {
+    let d = donor();
+    let (b, _db) = engine();
+    let mut page = d.engine.snapshot_page(None, None).unwrap();
+    page.collections[0].definition_floor = Some(Hlc::new(physical_now_ms() + 3_600_000, 0));
+    let mut progress = SnapshotProgress::whole_database();
+
+    let applied = b.apply_snapshot_page(d.engine.node_id(), &mut progress, &page).unwrap();
+
+    let stop = applied.clock_refused.expect("a floor past the bound is a stop of the page");
+    assert_eq!(stop.reason, crate::ClockRefusal::Stamp);
+    assert!(b.get_collection("shop", "orders").is_err(), "nothing on the page was applied");
+    assert_eq!(b.clock_refusals().len(), 1, "counted: {:?}", b.clock_refusals());
+
+    page.collections[0].definition_floor = None;
+    let applied = b.apply_snapshot_page(d.engine.node_id(), &mut progress, &page).unwrap();
+    assert!(applied.clock_refused.is_none(), "the same page, due, applies");
+    assert!(b.get_collection("shop", "orders").is_ok());
+}
+
+#[test]
 fn a_page_that_carries_a_drop_past_the_bound_is_a_stop_until_due_on_either_route() {
     let d = donor();
     let (b, _db) = engine();

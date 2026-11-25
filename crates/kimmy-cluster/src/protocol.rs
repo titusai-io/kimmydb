@@ -1589,6 +1589,7 @@ mod tests {
             vector_changed: None,
             redated_from: Some(Hlc::new(100, 0)),
             incarnation_floor: Some(Hlc::new(200, 0)),
+            definition_floor: None,
             validator: None,
             validator_changed: None,
             merge_policy: kimmy_core::MergePolicy::Document,
@@ -1631,6 +1632,7 @@ mod tests {
         let plain = kimmy_storage::CollectionState {
             redated_from: None,
             incarnation_floor: None,
+            definition_floor: None,
             ..state.clone()
         };
         let doc = bson::serialize_to_document(&plain).unwrap();
@@ -1646,6 +1648,41 @@ mod tests {
         let read: kimmy_storage::CollectionState =
             bson::deserialize_from_document(without).unwrap();
         assert_eq!(read.incarnation_floor, None);
+    }
+
+    /// The definition floor (ADR-272, decision 6; Q6.6, unit C): carried when set, absent when unset, and none from a sender that
+    /// predates it, so a page of a physical that replaced nothing is byte-for-byte what it was.
+    #[test]
+    fn a_definition_floor_is_carried_when_set_and_reads_as_none_from_a_sender_that_predates_it() {
+        let state = kimmy_storage::CollectionState {
+            db: "shop".into(),
+            name: "orders.__stg.s1".into(),
+            indexes: Vec::new(),
+            vector: None,
+            created: Hlc::new(900, 0),
+            vector_changed: None,
+            redated_from: None,
+            incarnation_floor: None,
+            definition_floor: Some(Hlc::new(400, 0)),
+            validator: None,
+            validator_changed: None,
+            merge_policy: kimmy_core::MergePolicy::Document,
+            merge_policy_at: None,
+            join_retention_ms: None,
+            loss_limits: None,
+        };
+        let carried = bson::serialize_to_document(&state).unwrap();
+        assert!(carried.contains_key("definition_floor"), "carried when set: {carried}");
+        let read: kimmy_storage::CollectionState =
+            bson::deserialize_from_document(carried.clone()).unwrap();
+        assert_eq!(read.definition_floor, Some(Hlc::new(400, 0)));
+        let mut before = carried;
+        before.remove("definition_floor");
+        let read: kimmy_storage::CollectionState = bson::deserialize_from_document(before).unwrap();
+        assert_eq!(read.definition_floor, None, "a sender that predates the field carries none");
+        let plain = kimmy_storage::CollectionState { definition_floor: None, ..state };
+        let doc = bson::serialize_to_document(&plain).unwrap();
+        assert!(!doc.contains_key("definition_floor"), "absent when unset: {doc}");
     }
 
     /// A snapshot page's lists are required, and the collected-through horizon is an
