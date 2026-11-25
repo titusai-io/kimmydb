@@ -2476,6 +2476,14 @@ impl TelemetryGuard {
             "Standing lives the register buried by a replicated drop: a life of a name made after a drop of it, which the drop buried because a stage of the name was created below it. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
             |s| s.register_life_burials[1]
         );
+        // Creations taken from a peer that the register then hid on this member (ADR-272, decision 5).
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.hidden_creations",
+            "{creation}",
+            "Creations of a collection taken from a peer whose name the register then hides: the name answers NOT FOUND here while a member that did not meet a swap in this order serves it (a database drop that raced a swap). Does not heal by itself. 0 on a healthy cluster.",
+            register_hidden_creations
+        );
         // Creations under a reserved name of no swap that were refused (ADR-272).
         observe!(
             u64_observable_counter,
@@ -3524,6 +3532,15 @@ mod tests {
         assert!(
             call.ends_with("register_resolve_fallback"),
             "kimmy.register.resolve_fallback reads the stale-row count: {call}"
+        );
+    }
+
+    #[test]
+    fn the_hidden_creation_counter_reads_its_own_field() {
+        let call = instrument_call("kimmy.register.hidden_creations");
+        assert!(
+            call.ends_with("register_hidden_creations"),
+            "kimmy.register.hidden_creations reads the hidden creation count: {call}"
         );
     }
 

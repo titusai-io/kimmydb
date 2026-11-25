@@ -2761,6 +2761,14 @@ impl Engine {
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                                // A drop of the name in effect here can hide the collection just made (ADR-272, decision 5):
+                                // counted and warned of, where the members that serve it cannot see it.
+                                self.report_a_creation_the_register_hides(
+                                    &target.db,
+                                    &target.name,
+                                    entry.stamp.hlc,
+                                    "a replicated creation",
+                                );
                             }
                             Ok(None) => {
                                 #[cfg(test)]

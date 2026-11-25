@@ -292,6 +292,7 @@ impl AppState {
             snapshot_join_restarts: self.engine.snapshot_join_restarts(),
             snapshot_listed_stages_left: self.engine.snapshot_listed_stages_left(),
             register_life_burials: self.engine.register_life_burials(),
+            register_hidden_creations: self.engine.register_hidden_creations(),
             sync_reserved_names_refused: self.engine.sync_reserved_names_refused(),
             // How far this member's own clock leads its physical clock, and how long a peer still refuses its entries for
             // theirs, in whole seconds rounded up (U1's guard on schema changes reads the same two).

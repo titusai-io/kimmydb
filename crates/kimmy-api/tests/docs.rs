@@ -554,6 +554,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         snapshot_join_restarts: 0,
         snapshot_listed_stages_left: 0,
         register_life_burials: Vec::new(),
+        register_hidden_creations: 0,
         sync_reserved_names_refused: 0,
         loss_records_refused: Vec::new(),
         conflicts_resolved: Vec::new(),

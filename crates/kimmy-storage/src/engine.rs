@@ -244,6 +244,8 @@ pub struct Engine {
     /// Creations under a reserved name with nothing to make it the swap's that this member refused since start
     /// (`kimmy_sync_reserved_names_refused_total`).
     pub(crate) sync_reserved_names_refused: std::sync::atomic::AtomicU64,
+    /// Creations taken from a peer whose name the register then hid since start (`kimmy_register_hidden_creations_total`).
+    pub(crate) register_hidden_creations: std::sync::atomic::AtomicU64,
     /// Standing lives the register buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
     /// (`kimmy_register_life_burials_total{by}`, ADR-272, decision 6).
     pub(crate) register_life_burials: [std::sync::atomic::AtomicU64; 2],
@@ -1892,6 +1894,7 @@ impl Engine {
             snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
             register_life_burials: Default::default(),
             sync_reserved_names_refused: std::sync::atomic::AtomicU64::new(0),
+            register_hidden_creations: std::sync::atomic::AtomicU64::new(0),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -2029,7 +2032,61 @@ impl Engine {
     /// (`kimmy_register_hidden_creations_total`, ADR-272, decision 5). A member that answers so while another serves the collection
     /// has counted it here. Expected 0.
     pub fn register_hidden_creations(&self) -> u64 {
-        0
+        self.register_hidden_creations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A creation of `name` in `db`, stamped `created`, that this member has just taken: if the register hides it (the name answers
+    /// NOT FOUND for the collection just made, because an event of the name in effect here is above it), count it and warn, with the
+    /// stamp of the newest logical drop of the name, the event that hides it. `from` says where the creation arrived.
+    ///
+    /// A name no client can address (a stage's, a recreation's) is never asked, and a name with no event in effect is served as the
+    /// collection it is, so neither reads more than the table's first row. The reading is a diagnosis: one that fails is logged and
+    /// the creation, which is made, stands.
+    pub(crate) fn report_a_creation_the_register_hides(
+        &self,
+        db: &str,
+        name: &str,
+        created: Hlc,
+        from: &'static str,
+    ) {
+        if kimmy_core::is_hidden_name(name) {
+            return;
+        }
+        // Whether it is hidden, and the stamp of the newest logical drop of the name
+        let read = || -> Result<(bool, Option<Stamp>)> {
+            let txn = self.db.begin_read()?;
+            if !crate::register::has_events_in_effect(&txn, db, name)? {
+                return Ok((false, None));
+            }
+            match Self::resolve_computed(&txn, db, name) {
+                Ok(_) => Ok((false, None)),
+                Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => {
+                    Ok((true, crate::register::newest_logical_drop_read(&txn, db, name)?.0))
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match read() {
+            Ok((false, _)) => {}
+            Ok((true, hidden_by)) => {
+                self.register_hidden_creations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    db = %db,
+                    collection = %name,
+                    created = ?created,
+                    hidden_by = ?hidden_by,
+                    from,
+                    "took the creation of a collection that the register hides: the name answers NOT FOUND here, and members that did \
+                     not meet the swap in this order serve it"
+                );
+            }
+            Err(e) => warn!(
+                db = %db,
+                collection = %name,
+                error = %e,
+                "could not tell whether the register hides a creation just taken"
+            ),
+        }
     }
 
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.
