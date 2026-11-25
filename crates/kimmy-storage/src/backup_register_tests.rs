@@ -966,6 +966,101 @@ fn a_hidden_recreation_the_register_has_no_row_for_refuses_the_restore() {
     );
 }
 
+/// The records of a backup: tag, key, value.
+type Records = Vec<(u8, Vec<u8>, Vec<u8>)>;
+
+/// A backup of a member that dropped a swapped name and made it again: the bytes, the records, the
+/// recreation's name, and the stamp of the `Create` event that made it (read from its `REGISTER`
+/// row, which the caller removes).
+fn a_backup_with_a_recreation() -> (Vec<u8>, Records, String, Stamp) {
+    let w = world();
+    let (m, _d) = member(&w);
+    flip(&m, &w);
+    window(&m, std::slice::from_ref(&drop_of(&w.author, at(&w, 5))));
+    m.create_collection(DB, "orders").expect("the name is made again");
+    let recreation = served(&m);
+    assert!(kimmy_core::is_recreation_name(&recreation), "premise: a recreation holds the name");
+    let bytes = backup_of(&m);
+    let records = records(&bytes);
+    let created = records
+        .iter()
+        .filter(|(tag, _, _)| *tag == T_REGISTER)
+        .find(|(_, _, value)| {
+            matches!(
+                kimmy_core::RegisterEvent::decode(value),
+                Ok(kimmy_core::RegisterEvent::Create { physical }) if physical == recreation
+            )
+        })
+        .map(|(_, key, _)| Stamp::from_key_bytes(key[8..].try_into().expect("a stamp's key")))
+        .expect("premise: the backup carries the recreation's Create event");
+    (bytes, records, recreation, created)
+}
+
+/// The versions the backup carries, with the one of `origin` set to `hlc`.
+fn with_the_version_of(
+    records: &mut [(u8, Vec<u8>, Vec<u8>)],
+    origin: kimmy_core::Origin,
+    hlc: Hlc,
+) {
+    let mut set = 0;
+    for (_, key, value) in records.iter_mut().filter(|(tag, _, _)| *tag == T_OPLOG_VERSIONS) {
+        if key.as_slice() == origin.to_bytes().as_slice() {
+            *value = hlc.to_bytes().to_vec();
+            set += 1;
+        }
+    }
+    assert_eq!(set, 1, "premise: the backup carries one version for the recreation's origin");
+}
+
+#[test]
+fn a_hidden_recreation_with_no_create_event_restores_when_the_carried_vector_does_not_cover_its_stamp()
+ {
+    // A backup taken mid-way, or a join: the recreation was made after the vector, so the register
+    // does not hold its event yet and the event will arrive by a window. The check that every
+    // hidden collection is known to the register must not refuse it.
+    let (bytes, mut records, recreation, created) = a_backup_with_a_recreation();
+    records.retain(|(tag, _, _)| *tag != T_REGISTER);
+    with_the_version_of(&mut records, created.origin(), created.hlc.predecessor());
+    let (r, _dr) = restored(&rebuilt(&bytes, &records));
+    assert!(
+        r.get_collection(DB, &recreation).is_ok(),
+        "the recreation is alive in the restored store, as the backup held it"
+    );
+}
+
+#[test]
+fn a_hidden_recreation_with_no_create_event_is_refused_when_the_vector_covers_its_stamp_exactly() {
+    // the boundary: a vector AT the stamp covers it, so the register must hold the event
+    let (bytes, mut records, recreation, created) = a_backup_with_a_recreation();
+    records.retain(|(tag, _, _)| *tag != T_REGISTER);
+    with_the_version_of(&mut records, created.origin(), created.hlc);
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("unknown to the register") && error.contains(&recreation),
+        "a recreation the vector covers has its event in the register, or it is damaged: {error}"
+    );
+}
+
+#[test]
+fn a_hidden_recreation_whose_name_carries_no_stamp_is_refused_whatever_the_vector_says() {
+    let (bytes, mut records, recreation, created) = a_backup_with_a_recreation();
+    records.retain(|(tag, _, _)| *tag != T_REGISTER);
+    with_the_version_of(&mut records, created.origin(), created.hlc.predecessor());
+    // the record is filed under a name with the mark and a stamp that is not one: too short
+    let renamed = "orders.__rc.0a1b";
+    let record = collection_record(&mut records, &recreation);
+    record.1.clear();
+    for part in [DB, renamed] {
+        record.1.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        record.1.extend_from_slice(part.as_bytes());
+    }
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(
+        error.contains("unknown to the register") && error.contains(renamed),
+        "a name whose stamp does not parse is unknown, below the vector or not: {error}"
+    );
+}
+
 #[test]
 fn a_stale_temporary_file_from_an_earlier_crash_does_not_stop_a_restore() {
     let w = world();

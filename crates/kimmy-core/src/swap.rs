@@ -71,6 +71,14 @@ pub fn recreation_name(logical: &str, stamp: &Stamp) -> String {
     name
 }
 
+/// The stamp of the event that made the recreation `name`, read back from the name: the inverse of
+/// [`recreation_name`]. `None` for a name that is not a recreation's and for one whose stamp does
+/// not parse (not exactly `2 * Stamp::KEY_LEN` lowercase hex digits).
+// scaffold: the tests of Q6.6 unit C2b-2 fail on this until the parse lands in the next commit
+pub fn recreation_stamp(_name: &str) -> Option<Stamp> {
+    None
+}
+
 /// Whether `name` is a physical name no client can address: a stage's or a recreation's. Such a name is never listed or served
 /// as itself, and a schema change addressed to it is refused on the name alone.
 pub fn is_hidden_name(name: &str) -> bool {
@@ -383,6 +391,31 @@ mod tests {
         assert_eq!(RECREATE_NAME_MARK, ".__rc.");
         assert!(!is_recreation_name("__rc.orders") && !is_recreation_name("orders.rc.x"));
         assert!(is_hidden_name("orders.__stg.a") && !is_hidden_name("orders"));
+    }
+
+    #[test]
+    fn a_recreations_stamp_is_read_back_from_its_name() {
+        let stamp = Stamp::new(
+            Hlc::new(1_700_000_000_123, 4),
+            crate::NodeId::from_bytes([7; 16]),
+            crate::Epoch::ZERO,
+        );
+        let name = recreation_name("orders", &stamp);
+        assert_eq!(recreation_stamp(&name), Some(stamp), "the name carries the stamp that made it");
+        let other = Stamp::new(Hlc::new(1_700_000_000_123, 5), stamp.node, stamp.epoch);
+        assert_eq!(recreation_stamp(&recreation_name("a.b", &other)), Some(other));
+        // names that are not a recreation's, and ones whose stamp does not parse
+        assert_eq!(recreation_stamp("orders"), None);
+        assert_eq!(recreation_stamp("orders.__stg.a1"), None);
+        assert_eq!(recreation_stamp("orders.__rc."), None, "no digits");
+        assert_eq!(recreation_stamp(&name[..name.len() - 2]), None, "one byte short");
+        assert_eq!(recreation_stamp(&format!("{name}00")), None, "one byte long");
+        let digits = &name[name.len() - 2 * Stamp::KEY_LEN..];
+        let upper = format!("orders{RECREATE_NAME_MARK}{}", digits.to_uppercase());
+        assert_ne!(upper, name, "premise: the digits include letters");
+        assert_eq!(recreation_stamp(&upper), None, "only lowercase hex is a name this build made");
+        let not_hex = format!("{}zz", &name[..name.len() - 2]);
+        assert_eq!(recreation_stamp(&not_hex), None, "a digit that is not hex");
     }
 
     #[test]

@@ -909,3 +909,90 @@ fn the_receivers_own_tombstone_seeds_a_drop_only_above_the_grant() {
         );
     }
 }
+
+// -- Unit C2b-2: a drop the page carries below the stage a stale receiver already serves (D2) -----
+
+/// How many entry rows the index `name` has under `physical`, counted by the collection's id and
+/// the index's id, whether or not the physical still holds the definition (a count through the
+/// definition answers 0 for an index that is gone).
+fn index_rows(m: &Engine, physical: &str, name: &str) -> usize {
+    let coll = m.get_collection(DB, physical).unwrap();
+    crate::index::scan_range(
+        m,
+        WalkScope::Request,
+        coll.id,
+        kimmy_core::IndexMeta::derive_id(name),
+        &[],
+        None,
+        crate::index::Unkeyed::Include,
+    )
+    .unwrap()
+    .len()
+}
+
+/// An index on `physical` made by hand at `wall_ms`, by the origin of `by`: through the restored-
+/// definition door, which asks nothing of the register, and the rows of the documents already there
+/// are built under it.
+fn index_by_hand(m: &Engine, by: &Engine, physical: &str, name: &str, wall_ms: u64) {
+    let created = Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch());
+    m.create_index_inner(
+        DB,
+        physical,
+        vec![kimmy_core::IndexField::ascending("t")],
+        false,
+        kimmy_core::Enforcement::Local,
+        Some(name.into()),
+        None,
+        None,
+        crate::index::CreateOrigin::Restored(created),
+        &|_, _| Ok(false),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_drop_the_page_carries_below_the_stage_a_stale_receiver_serves_floors_what_the_stage_holds() {
+    // The receiver applied the stage's creation and the binding and serves the stage; it never
+    // heard of the two logical drops that the sender's register holds below the binding. Each index
+    // it holds on the stage was made at a stamp: `y` below both drops, `x` between them, `z` above
+    // both. The page's drops take effect in the receiver's last-page transaction: nothing buries
+    // the stage, so the pass is told the NEWEST drop it stored and floors the stage there, and `y`
+    // and `x` go with their entry rows while `z` stays.
+    let (j, _dj) = with_orders();
+    let s = swap(&[&j]);
+    j.apply_batch(std::slice::from_ref(&s.creation)).unwrap();
+    window(&j, std::slice::from_ref(&s.bind));
+    assert_eq!(j.resolve(DB, "orders").unwrap().physical, STAGE1, "premise: the receiver serves");
+    let stage = j.get_collection(DB, STAGE1).unwrap();
+    j.insert(&stage, doc! { "_id": 1, "t": 1 }).unwrap();
+    let wall = s.bind.stamp.hlc.wall_ms;
+    for (name, below_bind_by) in [("y", 5), ("x", 3), ("z", 1)] {
+        index_by_hand(&j, &s.a, STAGE1, name, wall - below_bind_by);
+        assert_eq!(index_rows(&j, STAGE1, name), 1, "premise: {name} is on the stage with a row");
+    }
+    let first = Stamp::new(Hlc::new(wall - 4, 0), s.a.node_id(), s.a.epoch());
+    let second = Stamp::new(Hlc::new(wall - 2, 0), s.a.node_id(), s.a.epoch());
+    let patch = |page: &mut crate::SnapshotPage| {
+        if let Some(carry) = &mut page.register {
+            for drop in [first, second] {
+                carry.events.push(an_event_row(&drop, &kimmy_core::RegisterEvent::LogicalDrop));
+            }
+        }
+    };
+    let (progress, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    assert!(progress.is_complete(), "the pull completes");
+    assert_eq!(
+        the_events_of_orders(&j).iter().map(|(stamp, _)| *stamp).collect::<Vec<_>>(),
+        vec![first, second, s.bind.stamp],
+        "premise: the receiver holds both drops, below the binding it already had"
+    );
+    assert_eq!(j.resolve(DB, "orders").unwrap().physical, STAGE1, "the stage still serves");
+    let stage = j.get_collection(DB, STAGE1).unwrap();
+    assert!(stage.index("y").is_none(), "y, below both drops, is not on the stage");
+    assert!(stage.index("x").is_none(), "x, below the newest drop, is not on the stage");
+    assert!(stage.index("z").is_some(), "z, above both, is");
+    assert_eq!(index_rows(&j, STAGE1, "y"), 0, "no entry row of y is left under the stage's id");
+    assert_eq!(index_rows(&j, STAGE1, "x"), 0, "no entry row of x is left under the stage's id");
+    assert_eq!(index_rows(&j, STAGE1, "z"), 1, "z keeps its row");
+}
