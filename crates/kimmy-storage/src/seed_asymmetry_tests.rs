@@ -159,6 +159,9 @@ struct Ends {
     /// The standing lives the seed buried on each (`life_burials(_, "seed")`).
     m_burials: u64,
     other_burials: u64,
+    /// The creations each took that its register hides (`register_hidden_creations`).
+    m_hidden: u64,
+    other_hidden: u64,
     /// What each holds (`held`).
     m_held: Vec<(String, String, u64)>,
     other_held: Vec<(String, String, u64)>,
@@ -201,6 +204,8 @@ fn drop_first_stage_above_then_a_create() -> Ends {
         other_drops: the_logical_drops_of_orders(&s),
         m_burials: life_burials(&m, "seed"),
         other_burials: life_burials(&s, "seed"),
+        m_hidden: m.register_hidden_creations(),
+        other_hidden: s.register_hidden_creations(),
         m_held: held(&m),
         other_held: held(&s),
         drop,
@@ -245,6 +250,8 @@ fn stage_below_then_a_drop_and_a_create() -> Ends {
         other_drops: the_logical_drops_of_orders(&t),
         m_burials: life_burials(&m, "seed"),
         other_burials: life_burials(&t, "seed"),
+        m_hidden: m.register_hidden_creations(),
+        other_hidden: t.register_hidden_creations(),
         m_held: held(&m),
         other_held: held(&t),
         drop,
@@ -309,17 +316,27 @@ fn the_life_a_seed_buries_is_counted_on_the_member_that_made_it_and_only_there()
     );
 }
 
-/// What each member answers for the name, and what it holds (`held`), in the order A, B, L.
-type MemberAnswers = Vec<(Result<String, String>, Vec<(String, String, u64)>)>;
+/// Three members, before any has met another, and the entries each would send: A made a stage of `orders`; B, which held `orders` and did
+/// not know the stage, dropped the name after it; and L, which had heard neither, dropped the DATABASE after that and made the name again.
+struct Apart {
+    a: Engine,
+    b: Engine,
+    l: Engine,
+    /// What A, B and L would send, taken before any of them met another.
+    sent: [Vec<OplogEntry>; 3],
+    _dirs: [tempfile::TempDir; 3],
+}
 
-/// Three members and the entries each would send: A made a stage of `orders`; B, which held `orders` and did not know the stage, dropped
-/// the name after it; and L, which had heard neither, dropped the DATABASE after that and made the name again. `meets[m]` is the order in
-/// which member `m` (A, B, L) meets the other two, and then every member meets every other once more, as anti-entropy would. What each
-/// answers for the name, and what each holds, in the order A, B, L.
-fn three_members_that_meet_in(meets: [[usize; 2]; 3]) -> MemberAnswers {
-    let (b, _db) = with_orders();
-    let (a, _da) = engine();
-    let (l, _dl) = engine();
+impl Apart {
+    fn members(&self) -> [&Engine; 3] {
+        [&self.a, &self.b, &self.l]
+    }
+}
+
+fn three_members_who_have_not_met() -> Apart {
+    let (b, db) = with_orders();
+    let (a, da) = engine();
+    let (l, dl) = engine();
     window(&a, &everything(&b));
     window(&l, &everything(&b));
     assert!(
@@ -340,11 +357,17 @@ fn three_members_that_meet_in(meets: [[usize; 2]; 3]) -> MemberAnswers {
     a_pause();
     l.create_collection(DB, "orders").unwrap();
     assert_eq!(served_by(&l), Ok("orders".to_string()), "premise: L serves the life it made");
-    let members = [&a, &b, &l];
     let sent = [everything(&a), everything(&b), everything(&l)];
+    Apart { a, b, l, sent, _dirs: [da, db, dl] }
+}
+
+/// `meets[m]` is the order in which member `m` (A, B, L) meets the other two, and then every member meets every other once more, as
+/// anti-entropy would.
+fn three_members_meet(apart: &Apart, meets: [[usize; 2]; 3]) {
+    let members = apart.members();
     for (member, order) in meets.iter().enumerate() {
         for other in order {
-            window(members[member], &sent[*other]);
+            window(members[member], &apart.sent[*other]);
         }
     }
     for member in 0..3 {
@@ -352,7 +375,86 @@ fn three_members_that_meet_in(meets: [[usize; 2]; 3]) -> MemberAnswers {
             window(members[member], &everything(members[other]));
         }
     }
-    members.iter().map(|m| (served_by(m), held(m))).collect()
+}
+
+/// The order of the first run of the probe: each member meets the others in ascending order of member.
+const RUN_ZERO: [[usize; 2]; 3] = [[1, 2], [0, 2], [0, 1]];
+
+/// What each member answers for the name, and what it holds (`held`), in the order A, B, L.
+type MemberAnswers = Vec<(Result<String, String>, Vec<(String, String, u64)>)>;
+
+/// What each answers for the name, and what each holds, in the order A, B, L.
+fn three_members_that_meet_in(meets: [[usize; 2]; 3]) -> MemberAnswers {
+    let apart = three_members_who_have_not_met();
+    three_members_meet(&apart, meets);
+    apart.members().iter().map(|m| (served_by(m), held(m))).collect()
+}
+
+#[test]
+fn a_creation_the_register_hides_is_counted_where_it_is_hidden_and_not_where_served() {
+    let apart = three_members_who_have_not_met();
+    three_members_meet(&apart, RUN_ZERO);
+    let answers = apart.members().map(served_by);
+    assert!(
+        answers[0].is_err() && answers[1].is_err() && answers[2].is_ok(),
+        "premise: A and B answer NOT FOUND and L serves: {answers:?}"
+    );
+    assert_eq!(
+        apart.members().map(Engine::register_hidden_creations),
+        [1, 1, 0],
+        "A and B each took L's creation once and hide it; L serves the one it made"
+    );
+}
+
+#[test]
+fn the_warning_for_a_hidden_creation_names_the_creation_and_the_event_that_hides_it() {
+    let apart = three_members_who_have_not_met();
+    window(&apart.a, &apart.sent[1]);
+    let logs = crate::log_capture::logs_of(|| {
+        window(&apart.a, &apart.sent[2]);
+    });
+    assert_eq!(apart.a.register_hidden_creations(), 1, "premise: A counted the creation");
+    let created = the_creation_of_orders_after(&apart.l, &the_drop_of_orders(&apart.b));
+    let hiding = everything(&apart.l)
+        .into_iter()
+        .rfind(|e| {
+            e.kind == OpKind::DropCollection && e.collection == CollectionId::derive(DB, "orders")
+        })
+        .expect("premise: L logged the ordinary drop its database drop writes");
+    assert!(logs.contains("answers NOT FOUND"), "it says what the name answers: {logs}");
+    assert!(logs.contains("collection=orders"), "it names the name: {logs}");
+    assert!(
+        logs.contains(&format!("{:?}", created.stamp.hlc)),
+        "it gives the creation's stamp {:?}: {logs}",
+        created.stamp.hlc
+    );
+    assert!(
+        logs.contains(&format!("{:?}", hiding.stamp)),
+        "it gives the stamp of the event that hides it {:?}: {logs}",
+        hiding.stamp
+    );
+    assert!(logs.contains("a replicated creation"), "and where it came from: {logs}");
+}
+
+#[test]
+fn the_creation_a_seeded_drop_hides_is_counted_on_the_member_that_hides_it_only() {
+    let e = stage_below_then_a_drop_and_a_create();
+    assert!(e.m_served.is_err(), "premise: M answers NOT FOUND: {:?}", e.m_served);
+    assert_eq!(
+        e.m_hidden, 1,
+        "M took T's creation and its seeded drop hides it; the stage's creation is not counted"
+    );
+    assert_eq!(
+        e.other_hidden, 0,
+        "T made its life itself and a seed buried it: a burial, not a hidden creation"
+    );
+}
+
+#[test]
+fn a_creation_the_name_serves_is_not_counted() {
+    let e = drop_first_stage_above_then_a_create();
+    assert_eq!(e.m_served, Ok("orders".to_string()), "premise: M serves the life S made");
+    assert_eq!((e.m_hidden, e.other_hidden), (0, 0), "nothing was hidden, and nothing is counted");
 }
 
 // A KNOWN LIMITATION for 0.62 (ADR-272, decision 5), pre-existing (it diverges the same at 10317639, before the seed rule): a database drop

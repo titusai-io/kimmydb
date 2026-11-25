@@ -2024,6 +2024,14 @@ impl Engine {
             .collect()
     }
 
+    /// Creations of a collection that this member took from a peer and that its register hides: the name answers NOT FOUND for the
+    /// collection just made, because an event of the name in effect here (a logical drop) is above it
+    /// (`kimmy_register_hidden_creations_total`, ADR-272, decision 5). A member that answers so while another serves the collection
+    /// has counted it here. Expected 0.
+    pub fn register_hidden_creations(&self) -> u64 {
+        0
+    }
+
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.
     pub fn register_carry_warnings(&self) -> u64 {
         self.register_carry_warnings.load(std::sync::atomic::Ordering::Relaxed)
