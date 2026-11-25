@@ -584,9 +584,13 @@ fn a_binding_met_after_a_re_create_over_a_database_drop_seeds_no_drop_over_the_n
 }
 
 #[test]
-fn a_stage_created_below_a_database_drop_seeds_no_drop_over_a_life_made_after_the_drop() {
-    // The stage's creation alone, the route that asks as a creation (the test above ends with the binding, which asks as one): a member
-    // that applied the database's drop, made the name again, and then meets the stage the swap began with, below the drop.
+fn a_stage_created_below_a_database_drop_is_history_and_seeds_nothing_over_a_life_made_after_it() {
+    // The stage's creation alone: a member that applied the database's drop, made the name again, and then meets the stage the swap began
+    // with, below the drop. A creation below a database's drop is history here and is refused before the register is asked (the arm that
+    // judges it, `database_refusal`), so this route never reaches the seed, with the database guard or without it; what it pins is that
+    // the life made after the drop is left alone by it. The guard is reached by the BINDING of such a stage (the test above, whose
+    // binding asks as a binding over the stage row the refused creation still leaves), and by no other route: a snapshot page's definition
+    // below the database's drop is refused the same way, and an event that names no stage never seeds on a standing identity.
     let w = world();
     let (x, _dx) = engine();
     let drop = a_database_drop(&x, w.bind.stamp.hlc.wall_ms + 5);
