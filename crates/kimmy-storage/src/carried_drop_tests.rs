@@ -963,6 +963,82 @@ fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() 
     assert!(stored, "the rows of a name no stage row names are stored by id");
 }
 
+// A stage row the carry holds is named by the shape check `stage_row_names` makes (a restore has a loop of its own that refuses a damaged
+// row first, so only a page reaches this one). A row whose key is not eight bytes, or whose value ends before its names, fails the page by
+// name, and nothing of it is applied.
+
+/// What a test makes of a carried stage row: the key and the value that take the place of the row's own.
+type ReShape = dyn Fn(&[u8], &[u8]) -> (Vec<u8>, Vec<u8>);
+
+/// A pull of the swap's sender into a fresh member, the carry's first stage row replaced by what `shape` makes of its key and value. Asserts
+/// the premises (the sender's snapshot is one page; the unpatched row is of the right shape and the unpatched pull applies; the patch ran and
+/// changed the row) and that the page failed with the carry's transaction moved nothing; returns the text of its error. The stage row the
+/// receiver holds afterwards is the one its page's own definition made, in the collection's transaction before the carry's (an earlier
+/// transaction of the same page): it equals the row the unpatched pull took.
+fn the_error_of_a_carried_stage_row_shaped(shape: &ReShape) -> String {
+    let s = swap(&[]);
+    assert!(
+        s.sender.snapshot_page(None, None).unwrap().next.is_none(),
+        "premise: the sender's snapshot is one page, so the definitions and the carry ride the same page"
+    );
+    let (whole, _dw) = engine();
+    pull(&whole, &s.sender);
+    assert!(
+        holds_a_stage_row(&whole, CollectionId::derive(DB, STAGE1)),
+        "premise: a pull that is not patched takes the stage row"
+    );
+    let (j, _dj) = engine();
+    let before = j.witnessed_vector().unwrap();
+    let patched = std::cell::Cell::new(false);
+    let patch = |page: &mut crate::SnapshotPage| {
+        if let Some(carry) = &mut page.register {
+            let (key, value) = carry.stages[0].clone();
+            assert!(key.len() == 8, "premise: the row the carry holds has a key of eight bytes");
+            let (key2, value2) = shape(&key, &value);
+            assert!(
+                (key2.as_slice(), value2.as_slice()) != (key.as_slice(), value.as_slice()),
+                "premise: the row was changed"
+            );
+            carry.stages[0] =
+                (serde_bytes::ByteBuf::from(key2), serde_bytes::ByteBuf::from(value2));
+            patched.set(true);
+        }
+    };
+    let (progress, result) = pull_patched(&j, &s.sender, &patch);
+    assert!(patched.get(), "premise: the carry's page was patched");
+    let error = result.expect_err("a stage row of the wrong shape fails the page").to_string();
+    assert!(!progress.is_complete(), "the progress did not move to complete");
+    assert_eq!(
+        the_stage_row_of(&j, STAGE1),
+        the_stage_row_of(&whole, STAGE1),
+        "the stage row held is the one the page's definition made, equal to the sender's, and not the damaged one"
+    );
+    assert!(the_events_of_orders(&j).is_empty(), "nothing of the register was applied");
+    assert_eq!(j.witnessed_vector().unwrap(), before, "and the grant was not absorbed");
+    error
+}
+
+#[test]
+fn a_carried_stage_row_whose_key_is_not_eight_bytes_fails_the_page_by_name() {
+    let error =
+        the_error_of_a_carried_stage_row_shaped(&|key, value| (key[..7].to_vec(), value.to_vec()));
+    assert!(
+        error.contains("a stage row of the wrong shape"),
+        "refused by the shape check: {error}"
+    );
+}
+
+#[test]
+fn a_carried_stage_row_whose_value_ends_before_its_names_fails_the_page_by_name() {
+    let error = the_error_of_a_carried_stage_row_shaped(&|key, value| {
+        (key.to_vec(), value[..value.len().min(40)].to_vec())
+    });
+    assert!(
+        error.contains("a stage row of the wrong shape"),
+        "refused by the shape check: {error}"
+    );
+}
+
 /// A post-drop row of `orders` holding one index, `carried_ix`, made at `made`.
 fn a_post_row_with_an_index(made: Stamp) -> crate::register::PostRow {
     let index = kimmy_core::IndexMeta {
