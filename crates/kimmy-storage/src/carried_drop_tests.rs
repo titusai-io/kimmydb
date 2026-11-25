@@ -2034,3 +2034,46 @@ fn an_id_no_hidden_collection_names_is_stored_by_id_with_no_pass_and_no_row() {
         "and no pass ran for it, so no row"
     );
 }
+
+#[test]
+fn a_hand_built_recreation_with_no_stage_row_is_named_from_its_collection_and_joins_as_its_source_holds_it()
+ {
+    // A STATE BUILT BY HAND, not one a product path makes (the stage's row removed by the test hook): the name's only collection is a
+    // recreation, and its events are a logical drop and the recreation's `Create`. It is here for the half of the scan that names an id
+    // from a RECREATION's physical name, which the stage half does not exercise.
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let (m, _dm) = with_orders();
+    m.apply_batch(std::slice::from_ref(&creation_of(&a, STAGE1))).unwrap();
+    assert!(m.drop_collection(DB, "orders").unwrap(), "premise: the swapped name is dropped");
+    m.create_collection(DB, "orders").unwrap();
+    let recreation = served_by(&m).unwrap();
+    assert!(kimmy_core::is_recreation_name(&recreation), "premise: a recreation holds the name");
+    // the stage's collection and its row are taken away, and the pass runs once so that the source holds the row it would
+    m.forget_collection_leaving_rows(DB, STAGE1).unwrap();
+    crate::register::remove_stage_row_for_test(&m, CollectionId::derive(DB, STAGE1));
+    let txn = m.begin_write(crate::WriterHolder::Ddl).unwrap();
+    crate::Engine::settle_register_in_txn(&txn, DB, "orders", None).unwrap();
+    txn.commit().unwrap();
+    assert!(m.get_collection(DB, STAGE1).is_err(), "premise: the source holds no stage");
+    assert!(the_stage_row_of(&m, STAGE1).is_none(), "premise: and no stage row of the name");
+    assert_eq!(the_events_of_orders(&m).len(), 2, "premise: the drop and the recreation's Create");
+    let source_row = the_row(&m);
+    assert_eq!(
+        source_row.as_ref().map(|row| row.kind),
+        Some(crate::register::VisibleKind::Created),
+        "premise: the source's row says the recreation is visible"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &m);
+    assert!(j.get_collection(DB, &recreation).is_ok(), "premise: the joiner holds the recreation");
+    assert_eq!(
+        the_events_of_orders(&j),
+        the_events_of_orders(&m),
+        "the joiner holds the source's events, the Create among them"
+    );
+    assert_eq!(the_row(&j), source_row, "and the row the pass wrote for the name is the source's");
+    assert_eq!(served_by(&j), served_by(&m), "the name is served by the same recreation");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "from the row: no fallback");
+}
