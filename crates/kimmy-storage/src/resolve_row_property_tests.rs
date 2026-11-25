@@ -182,6 +182,8 @@ struct World {
     /// How many times each kind of operation TOOK EFFECT (changed the member's state), so that the run can prove it exercised every
     /// transition and not only attempted it.
     effective: std::collections::BTreeMap<&'static str, usize>,
+    /// How many times the two transitions that can be refused were attempted, to read beside how many took effect.
+    attempted: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl World {
@@ -192,8 +194,23 @@ impl World {
         // far enough above the real clock that no stamp made here is made after the author's, and below every stage's deadline
         let wall = physical_now_ms() + 5_000;
         let (stages, steps) = (Vec::new(), Vec::new());
-        let effective = std::collections::BTreeMap::new();
-        Self { author, _author_dir, member, _member_dir, stages, wall, steps, seed, effective }
+        let (effective, attempted) = Default::default();
+        Self {
+            author,
+            _author_dir,
+            member,
+            _member_dir,
+            stages,
+            wall,
+            steps,
+            seed,
+            effective,
+            attempted,
+        }
+    }
+
+    fn tried(&mut self, kind: &'static str) {
+        *self.attempted.entry(kind).or_default() += 1;
     }
 
     fn took(&mut self, kind: &'static str) {
@@ -286,6 +303,7 @@ impl World {
                 let Some(k) = self.pick(rng) else {
                     return ("alive after bind (no stage)".into(), false);
                 };
+                self.tried("alive after bind");
                 let name = self.stages[k].name.clone();
                 let had_events = self.newest().is_some();
                 let txn = self.member.begin_write(crate::WriterHolder::Ddl).unwrap();
@@ -334,6 +352,7 @@ impl World {
                 // The state no member should be in: an event for a name that has no stage row (the door called by hand). It is kept as an
                 // explicit operation so that, if the claim that no production path stores one is ever wrong, the answers are still proven
                 // right: the row path equals the computation, the fallback is counted on every resolve, and no row is demanded.
+                self.tried("an event with no stage row");
                 let wall = self.next_wall();
                 let (node, epoch) = (self.author.node_id(), self.author.epoch());
                 let stamp = Stamp::new(Hlc::new(wall, 0), node, epoch);
@@ -474,6 +493,7 @@ fn the_row_is_the_pure_function_after_every_operation_of_every_sequence() {
         .unwrap_or(SEQUENCES);
     let mut touched_a_row = 0usize;
     let mut effective: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut attempted: std::collections::BTreeMap<&'static str, usize> = Default::default();
     for index in 0..sequences {
         let seed = 0x5EED_0000 + index;
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -490,6 +510,9 @@ fn the_row_is_the_pure_function_after_every_operation_of_every_sequence() {
         for (kind, n) in &world.effective {
             *effective.entry(*kind).or_default() += n;
         }
+        for (kind, n) in &world.attempted {
+            *attempted.entry(*kind).or_default() += n;
+        }
     }
     assert!(
         touched_a_row > sequences as usize,
@@ -499,6 +522,19 @@ fn the_row_is_the_pure_function_after_every_operation_of_every_sequence() {
     for kind in KINDS {
         let n = effective.get(kind).copied().unwrap_or(0);
         assert!(n > 0, "premise: the {kind} step took effect {n} times in {sequences} sequences");
+    }
+    // the counts, on success as well (stderr: shown with `--no-capture`)
+    eprintln!(
+        "resolve-row property: {sequences} sequences x {STEPS} steps, {touched_a_row} states with a row for `orders`"
+    );
+    for kind in KINDS {
+        let took = effective.get(kind).copied().unwrap_or(0);
+        match attempted.get(kind) {
+            Some(tried) => {
+                eprintln!("resolve-row property: {kind}: took effect {took}, attempted {tried}");
+            }
+            None => eprintln!("resolve-row property: {kind}: took effect {took}"),
+        }
     }
 }
 

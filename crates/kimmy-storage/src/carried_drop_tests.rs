@@ -1827,3 +1827,210 @@ fn rule_four_with_a_stale_row_is_computed_and_counted() {
     );
     assert_eq!(s.sender.register_resolve_fallbacks(), 1, "and the stale row is counted");
 }
+
+// -- Unit C2e: a name is nameable from the hidden collections the receiver holds, not only from the carry's stage rows ---------------------
+
+/// A member `m` made by a page from an OLDER sender: it holds the stage's collection and no stage row for it (the page had no `stage`
+/// field and carried no register), and then met the logical drop of the name by a window, which it stored (the name is swapped: a
+/// collection `orders.__stg.*` is held). Returns the author, the member and the drop.
+fn a_member_with_a_stage_and_no_stage_row_that_met_the_drop()
+-> (Engine, Engine, OplogEntry, [tempfile::TempDir; 2]) {
+    let (a, da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    let has_the_stage = page.collections.iter().any(|state| state.stage.is_some());
+    assert!(has_the_stage, "premise: the page has the stage");
+    for state in &mut page.collections {
+        state.stage = None;
+    }
+    page.register = None;
+    let (m, dm) = engine();
+    m.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    let drop = drop_of_orders(&a, physical_now_ms() + 5_000);
+    window(&m, std::slice::from_ref(&drop));
+    (a, m, drop, [da, dm])
+}
+
+#[test]
+fn a_name_whose_only_hidden_collection_has_no_stage_row_is_named_from_that_collection() {
+    let (_a, m, drop, _dirs) = a_member_with_a_stage_and_no_stage_row_that_met_the_drop();
+    assert!(m.get_collection(DB, STAGE1).is_ok(), "premise: the source member holds the stage");
+    assert!(the_stage_row_of(&m, STAGE1).is_none(), "premise: and no stage row for it");
+    assert_eq!(
+        the_events_of_orders(&m).iter().map(|(stamp, _)| *stamp).collect::<Vec<_>>(),
+        vec![drop.stamp],
+        "premise: the source member stored the logical drop"
+    );
+    let source_row = the_row(&m);
+    assert_eq!(
+        source_row.as_ref().map(|row| row.kind),
+        Some(crate::register::VisibleKind::Dropped),
+        "premise: the source member's pass wrote the dropped row"
+    );
+    let (j, _dj) = engine();
+    pull(&j, &m);
+    assert!(j.get_collection(DB, STAGE1).is_ok(), "premise: the joiner holds the stage as well");
+    assert!(the_stage_row_of(&j, STAGE1).is_none(), "premise: and no stage row, as the source");
+    assert_eq!(
+        the_events_of_orders(&j).iter().map(|(stamp, _)| *stamp).collect::<Vec<_>>(),
+        vec![drop.stamp],
+        "the joiner holds the drop"
+    );
+    assert_eq!(the_row(&j), source_row, "and the row the pass wrote for it is the source's");
+    assert!(j.resolve(DB, "orders").is_err(), "the name is absent, as on the source");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "and the row answered: no fallback");
+    assert_eq!(
+        j.get_collection(DB, STAGE1).is_ok(),
+        m.get_collection(DB, STAGE1).is_ok(),
+        "the stage is in the state the source holds it in (no pass buries a stage with no row, on either)"
+    );
+}
+
+/// A probe of events of a name with no stage row among members of the current version, not by an older page: A
+/// authors a stage, B takes the SCOPED page of it (the stage and its row, no coverage), B's client drops `orders` and makes it again
+/// (and, with `dropped_again`, drops it once more), and C, below A's creation, takes a window from B. C holds the name's events and no
+/// stage row at all. A stale D that still holds the identity `orders` then joins from C by a whole-database pull.
+fn a_stale_member_joins_from_one_whose_events_have_no_stage_row(
+    dropped_again: bool,
+) -> (Engine, Engine, [tempfile::TempDir; 4]) {
+    let (a, da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, STAGE1);
+    let (b, db) = with_orders();
+    let (c, dc) = engine();
+    let (d, dd) = engine();
+    window(&c, &everything(&b));
+    window(&d, &everything(&b));
+    assert!(
+        c.get_collection(DB, "orders").is_ok() && d.get_collection(DB, "orders").is_ok(),
+        "premise: C and D hold the identity by B's creation"
+    );
+    let id = CollectionId::derive(DB, STAGE1);
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
+    assert!(the_stage_row_of(&b, STAGE1).is_some(), "premise: B holds the stage row");
+    assert!(
+        b.witnessed_vector().unwrap().get(creation.stamp.origin()) < creation.stamp.hlc,
+        "premise: B's vector does not cover the stage's creation"
+    );
+    assert!(b.drop_collection(DB, "orders").unwrap(), "premise: B's client drops the name");
+    b.create_collection(DB, "orders").unwrap();
+    if dropped_again {
+        assert!(b.drop_collection(DB, "orders").unwrap(), "premise: and drops it again");
+    }
+    let held = c.witnessed_vector().unwrap();
+    let mine = b.version_vector().unwrap();
+    assert_eq!(b.serve_verdict(&held).unwrap(), crate::ServeVerdict::Serve, "premise: B serves C");
+    let from = held.behind(&mine).expect("B is ahead of C");
+    let w = b.entries_for_peer_holding(from, 10_000, Some(&held), WalkScope::Background).unwrap();
+    let mut outcome = SyncOutcome::default();
+    let window = PeerWindow {
+        scanned_to: w.scanned_to,
+        exhausted: w.exhausted,
+        passed_through: None,
+        asked_partial: false,
+    };
+    c.apply_peer_window_into(&mine, Some(&held), &w.entries, window, &mut outcome).unwrap();
+    assert!(!the_events_of_orders(&c).is_empty(), "premise: C holds register events of the name");
+    let stage_rows = {
+        use redb::ReadableDatabase;
+        let txn = c.db().begin_read().unwrap();
+        crate::register::carried_rows(&txn, crate::register::Carried::Stages).unwrap().len()
+    };
+    assert_eq!(stage_rows, 0, "premise: and no stage row at all");
+    (c, d, [da, db, dc, dd])
+}
+
+#[test]
+fn a_stale_member_holding_the_identity_buries_it_when_it_joins_from_events_with_no_stage_row() {
+    let (c, d, _dirs) = a_stale_member_joins_from_one_whose_events_have_no_stage_row(true);
+    assert!(d.get_collection(DB, "orders").is_ok(), "premise: D still holds the identity");
+    let (progress, result) = pull_patched(&d, &c, &|_| {});
+    result.expect("the pull applies");
+    assert!(progress.is_complete(), "the pull completes");
+    assert!(
+        d.get_collection(DB, "orders").is_err(),
+        "the identity is buried in the join's transaction, as the name's drop says"
+    );
+    assert_eq!(
+        the_row(&d).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Dropped),
+        "and the dropped row is written"
+    );
+    assert!(d.resolve(DB, "orders").is_err(), "the name is absent");
+    assert_eq!(d.register_resolve_fallbacks(), 0, "from the row: no fallback");
+}
+
+#[test]
+fn an_unnamed_id_the_receiver_holds_a_tombstone_for_above_the_grant_is_seeded_by_id() {
+    // D1 for an id that no stage row and no collection of the receiver names: the receiver's own tombstone, above the grant, is the
+    // name's drop, written by id. The carried event is below the grant and below the tombstone.
+    let (s, _ds) = engine();
+    let (j, _dj) = engine();
+    j.create_collection(DB, "orders").unwrap();
+    assert!(j.drop_collection(DB, "orders").unwrap(), "premise: the receiver dropped the name");
+    let tombstone = j
+        .collection_dropped_at(CollectionId::derive(DB, "orders"))
+        .unwrap()
+        .expect("premise: the receiver holds the identity's tombstone");
+    assert!(j.get_collection(DB, "orders").is_err(), "premise: it holds no collection of the name");
+    let carried = Stamp::new(Hlc::new(tombstone.hlc.wall_ms - 1_000, 0), s.node_id(), s.epoch());
+    let patch = |page: &mut crate::SnapshotPage| {
+        page.versions.observe(carried);
+        let mut key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
+        key.extend_from_slice(&carried.to_key_bytes());
+        let event = kimmy_core::RegisterEvent::Create { physical: "orders.__rc.x".into() };
+        if let Some(carry) = &mut page.register {
+            let row = (serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(event.encode()));
+            carry.events.push(row);
+        }
+    };
+    let grant = std::cell::Cell::new(None);
+    let (_, result) = pull_patched(&j, &s, &|page| {
+        patch(page);
+        grant.set(Some(page.versions.get(tombstone.origin())));
+    });
+    result.expect("the pull applies");
+    let above = grant.get().is_some_and(|granted| tombstone.hlc > granted);
+    assert!(above, "premise: the tombstone is above the grant");
+    let events = the_events_of_orders(&j);
+    assert!(
+        events.iter().any(|(stamp, event)| *stamp == tombstone
+            && matches!(event, kimmy_core::RegisterEvent::LogicalDrop)),
+        "the receiver's tombstone is the name's drop, stored by id: {events:?}"
+    );
+    assert!(
+        events.iter().any(|(stamp, _)| *stamp == carried),
+        "and the carried event is stored too: {events:?}"
+    );
+}
+
+#[test]
+fn an_id_no_hidden_collection_names_is_stored_by_id_with_no_pass_and_no_row() {
+    // the scan of the receiver's own hidden collections runs (it holds the swap's stage) and finds no collection of `ghost`
+    let s = swap(&[]);
+    let (j, _dj) = engine();
+    let ghost = CollectionId::derive(DB, "ghost");
+    let stamp = Stamp::new(s.bind.stamp.hlc.predecessor(), s.a.node_id(), s.a.epoch());
+    let patch = |page: &mut crate::SnapshotPage| {
+        let mut key = ghost.0.to_be_bytes().to_vec();
+        key.extend_from_slice(&stamp.to_key_bytes());
+        let row = serde_bytes::ByteBuf::from(kimmy_core::RegisterEvent::LogicalDrop.encode());
+        if let Some(carry) = &mut page.register {
+            carry.events.push((serde_bytes::ByteBuf::from(key), row));
+        }
+    };
+    let (_, result) = pull_patched(&j, &s.sender, &patch);
+    result.expect("the pull applies");
+    assert!(j.get_collection(DB, STAGE1).is_ok(), "premise: the receiver holds a stage");
+    use redb::ReadableDatabase;
+    let txn = j.db().begin_read().unwrap();
+    assert!(crate::register::has_events(&txn, DB, "ghost").unwrap(), "stored by id");
+    assert_eq!(
+        crate::register::visible_row_read(&txn, DB, "ghost").unwrap(),
+        None,
+        "and no pass ran for it, so no row"
+    );
+}
