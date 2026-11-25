@@ -923,3 +923,267 @@ pub(crate) fn write_old_form_stage_row_for_test(engine: &crate::Engine, physical
         .unwrap();
     txn.commit().unwrap();
 }
+
+// -- The backup (ADR-272, decisions 4 and 13; Q6.6, unit A) -------------------------------------------------------------------------------
+
+/// The four tables a backup carries: no other module opens them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Carried {
+    Register,
+    Info,
+    Stages,
+    Post,
+}
+
+impl Carried {
+    fn table(self) -> redb::TableDefinition<'static, &'static [u8], &'static [u8]> {
+        match self {
+            Carried::Register => tables::REGISTER,
+            Carried::Info => tables::REGISTER_INFO,
+            Carried::Stages => tables::REGISTER_STAGES,
+            Carried::Post => tables::REGISTER_POST,
+        }
+    }
+}
+
+/// The rows of one carried table, as stored (key and value): a backup copies them whole. The tables are small (a row for each event of a
+/// swapped name, and a stage row for each stage the member has met).
+pub(crate) fn carried_rows(
+    txn: &redb::ReadTransaction,
+    which: Carried,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let table = match txn.open_table(which.table()) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut rows = Vec::new();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        rows.push((key.value().to_vec(), value.value().to_vec()));
+    }
+    Ok(rows)
+}
+
+/// One row of a backup, written as it was read. The restore transcribes and never judges: [`check_restored`] judges the whole.
+pub(crate) fn restore_row(
+    txn: &redb::WriteTransaction,
+    which: Carried,
+    key: &[u8],
+    value: &[u8],
+) -> Result<()> {
+    txn.open_table(which.table())?.insert(key, value)?;
+    Ok(())
+}
+
+fn damaged(what: &str) -> StorageError {
+    StorageError::Database(format!(
+        "the backup is refused as damaged: {what}; nothing was restored"
+    ))
+}
+
+fn raw_rows(txn: &redb::WriteTransaction, which: Carried) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let table = txn.open_table(which.table())?;
+    let mut rows = Vec::new();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        rows.push((key.value().to_vec(), value.value().to_vec()));
+    }
+    Ok(rows)
+}
+
+/// The consistency check of a restore, in the restore's own transaction and by id (a register row does not carry its name). A backup is one
+/// read transaction, so its register and its collections agree by construction: this is for a damaged or hand-made backup, and a future
+/// build's mistake. It refuses by the check's own message, in this order: every row decodes; a stage row's names derive its own key; every
+/// binding has its stage row; every hidden collection is known to the register; no row of REGISTER is above the carried vector; no row of
+/// REGISTER_INFO is at or below it, and each has its entry; and what a flip leaves cannot be below its own floor (check 4).
+pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
+    use kimmy_core::register_state::{Ready, Visible};
+
+    // the vector the backup carries
+    let vector = {
+        let mut vector = kimmy_core::VersionVector::new();
+        let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+        for row in versions.iter()? {
+            let (node, hlc) = row?;
+            let origin: [u8; kimmy_core::Origin::LEN] = node
+                .value()
+                .try_into()
+                .map_err(|_| damaged("a version vector key is not an origin"))?;
+            let hlc: [u8; HLC_ENCODED_LEN] = hlc
+                .value()
+                .try_into()
+                .map_err(|_| damaged("a version vector value is not a stamp"))?;
+            vector.insert(kimmy_core::Origin::from_bytes(origin), Hlc::from_bytes(hlc));
+        }
+        vector
+    };
+
+    // every row decodes
+    let mut events: Vec<(bool, CollectionId, Stamp, RegisterEvent)> = Vec::new();
+    for (parked, which) in [(false, Carried::Register), (true, Carried::Info)] {
+        for (key, value) in raw_rows(txn, which)? {
+            if key.len() != ROW_KEY_LEN {
+                return Err(damaged("a register row does not decode: its key is the wrong length"));
+            }
+            let id = CollectionId(u64::from_be_bytes(key[..8].try_into().expect("8 bytes")));
+            let stamp = crate::codec::decode_oplog_key(&key[8..])
+                .map_err(|_| damaged("a register row does not decode: its stamp"))?;
+            let event = RegisterEvent::decode(&value)
+                .map_err(|e| damaged(&format!("a register row does not decode: {e}")))?;
+            events.push((parked, id, stamp, event));
+        }
+    }
+
+    // a stage row's database and name derive its own key (and a row of the wrong shape does not decode)
+    let mut stages: Vec<(String, String)> = Vec::new();
+    for (key, value) in raw_rows(txn, Carried::Stages)? {
+        if key.len() != 8 || value.len() < STAGE_ROW_FIXED + 2 {
+            return Err(damaged("a stage row does not decode"));
+        }
+        let db_len =
+            u16::from_be_bytes([value[STAGE_ROW_FIXED], value[STAGE_ROW_FIXED + 1]]) as usize;
+        if value.len() < STAGE_ROW_FIXED + 2 + db_len {
+            return Err(damaged("a stage row does not decode"));
+        }
+        let text = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .map(str::to_string)
+                .map_err(|_| damaged("a stage row does not decode: a name that is not text"))
+        };
+        let db = text(&value[STAGE_ROW_FIXED + 2..STAGE_ROW_FIXED + 2 + db_len])?;
+        let physical = text(&value[STAGE_ROW_FIXED + 2 + db_len..])?;
+        if CollectionId::derive(&db, &physical).0.to_be_bytes().as_slice() != key.as_slice() {
+            return Err(damaged(&format!(
+                "a stage row whose names derive another key than its own: {db}.{physical}"
+            )));
+        }
+        stages.push((db, physical));
+    }
+
+    // every binding has its stage row: found by the physical's name, and its names must derive the binding's own logical id
+    for (_, id, _, event) in &events {
+        if let RegisterEvent::Bind { physical } = event {
+            let found = stages.iter().any(|(db, name)| {
+                name == physical
+                    && kimmy_core::swap::logical_of_stage(name)
+                        .is_some_and(|logical| CollectionId::derive(db, logical) == *id)
+            });
+            if !found {
+                return Err(damaged(&format!("a binding without its stage row: {physical}")));
+            }
+        }
+    }
+
+    // every hidden collection alive in the backup is known to the register; the names of the swapped names are collected on the way
+    let mut names: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for (db, physical) in &stages {
+        if let Some(logical) = kimmy_core::swap::logical_of_stage(physical) {
+            names.insert((db.clone(), logical.to_string()));
+        }
+    }
+    {
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        for row in collections.iter()? {
+            let (key, _) = row?;
+            let (db, name) = key.value();
+            if !kimmy_core::is_hidden_name(name) {
+                continue;
+            }
+            let known = if kimmy_core::swap::is_stage_name(name) {
+                stages.iter().any(|(d, p)| d == db && p == name)
+            } else {
+                events.iter().any(|(_, _, _, event)| {
+                    matches!(event, RegisterEvent::Create { physical } if physical == name)
+                })
+            };
+            if !known {
+                return Err(damaged(&format!(
+                    "a hidden collection unknown to the register: {db}.{name}"
+                )));
+            }
+            if let Some(logical) = kimmy_core::logical_of_recreation(name) {
+                names.insert((db.to_string(), logical.to_string()));
+            }
+        }
+    }
+
+    // against the vector the backup carries, then against its oplog
+    {
+        let oplog = txn.open_table(tables::OPLOG)?;
+        for (parked, _, stamp, _) in &events {
+            let covered = stamp.hlc <= vector.get(stamp.origin());
+            if !*parked && !covered {
+                return Err(damaged(&format!(
+                    "a REGISTER row above the carried vector: {stamp:?}"
+                )));
+            }
+            if *parked {
+                if covered {
+                    return Err(damaged(&format!(
+                        "a REGISTER_INFO row at or below the carried vector, which nothing would release: {stamp:?}"
+                    )));
+                }
+                if oplog.get(crate::codec::oplog_key(stamp).as_slice())?.is_none() {
+                    return Err(damaged(&format!(
+                        "a REGISTER_INFO row has no entry in the carried oplog: {stamp:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // check 4: what a flip leaves cannot be below its own floor, and a post-drop row does not stay beside a visible physical
+    let post = raw_rows(txn, Carried::Post)?;
+    for (db, logical) in &names {
+        let timeline = timeline_of(txn, tables::REGISTER, db, logical)?;
+        let visible = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let mut ready: std::collections::HashMap<String, Ready> = Default::default();
+            for (_, event) in timeline.events() {
+                if let Some(physical) = event.physical() {
+                    let alive = collections.get((db.as_str(), physical))?.is_some();
+                    ready.insert(
+                        physical.to_string(),
+                        if alive { Ready::Alive } else { Ready::Buried },
+                    );
+                }
+            }
+            timeline.visible(|physical| ready.get(physical).copied().unwrap_or(Ready::Buried))
+        };
+        let physical = match &visible {
+            Visible::Bound { physical, .. } | Visible::Created { physical, .. } => physical,
+            Visible::Identity | Visible::Dropped { .. } => continue,
+        };
+        let meta = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let raw = collections.get((db.as_str(), physical.as_str()))?;
+            match raw {
+                Some(raw) => {
+                    Some(serde_json::from_slice::<crate::meta::CollectionMeta>(raw.value())?)
+                }
+                None => None,
+            }
+        };
+        if let Some(meta) = meta
+            && let Some(floor) = meta.definition_floor
+        {
+            if meta.indexes.iter().any(|i| i.created.is_none_or(|c| c.hlc <= floor)) {
+                return Err(damaged(&format!(
+                    "a visible physical holds a definition at or below its own floor: {db}.{physical}"
+                )));
+            }
+            if meta.validator.is_some() && meta.validator_changed.is_none_or(|c| c.hlc <= floor) {
+                return Err(damaged(&format!(
+                    "a visible physical holds a validator changed at or below its own floor: {db}.{physical}"
+                )));
+            }
+        }
+        if post.iter().any(|(key, _)| key.as_slice() == post_key(db, logical).as_slice()) {
+            return Err(damaged(&format!(
+                "a post-drop row left while a newer physical is visible: {db}.{logical}"
+            )));
+        }
+    }
+    Ok(())
+}

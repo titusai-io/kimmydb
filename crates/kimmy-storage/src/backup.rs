@@ -86,6 +86,12 @@ const T_COLLECTIONS_DROPPED: u8 = 9;
 const T_OPLOG_VERSIONS: u8 = 10;
 const T_INDEXES_DROPPED: u8 = 11;
 const T_MISSING_THROUGH: u8 = 12;
+// The register (Q6.6, unit A): the events in effect and the ones ahead of their position, the stage rows and the post-drop rows, copied as
+// stored and checked together at the restore.
+const T_REGISTER: u8 = 13;
+const T_REGISTER_INFO: u8 = 14;
+const T_REGISTER_STAGES: u8 = 15;
+const T_REGISTER_POST: u8 = 16;
 
 /// What a backup or restore moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,6 +210,19 @@ impl Engine {
             out
         });
 
+        // The register, by the one module that opens its tables: a restored member answers for a swapped name as this one did (Q6.6, unit A).
+        for (tag, which) in [
+            (T_REGISTER, crate::register::Carried::Register),
+            (T_REGISTER_INFO, crate::register::Carried::Info),
+            (T_REGISTER_STAGES, crate::register::Carried::Stages),
+            (T_REGISTER_POST, crate::register::Carried::Post),
+        ] {
+            for (key, value) in crate::register::carried_rows(&txn, which)? {
+                bytes += write_record(out, tag, &key, &value)?;
+                records += 1;
+            }
+        }
+
         // Value types that are not `&[u8]` need their own arm.
         if let Some(t) = open_walk_table_if_exists(&txn, tables::OPLOG_ARRIVAL_SEQ, walk)? {
             for entry in t.iter()? {
@@ -287,7 +306,61 @@ pub fn restore_with(
             path.display()
         )));
     }
+    // Written to a temporary path beside the target and published at it (a hard link, which never replaces an existing target) after every
+    // check has passed: on any error, a stream cut mid-way or a backup a check refuses, the temporary file is removed and the target never
+    // exists half-written.
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".restoring");
+    let temp = path.with_file_name(name);
+    let _ = std::fs::remove_file(&temp);
+    let outcome = restore_to_temp(path, &temp, input, build);
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    outcome
+}
 
+/// Publish the restored store at `path`: a hard link of the temporary file, which fails if `path` exists (a rename would replace it), so a
+/// target that appeared since the check at the top of the restore, a concurrent restore's, is never overwritten. The temporary name is
+/// removed once the link is made. On a link failure the error is returned and the caller removes the temporary file. A file system that
+/// cannot make a hard link in the data directory cannot publish a restore: the error says where.
+fn publish(temp: &Path, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    {
+        let hook = BEFORE_PUBLISH.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    std::fs::hard_link(temp, path).map_err(|e| {
+        StorageError::Database(format!(
+            "publishing the restored store at {}: {e}; nothing was restored",
+            path.display()
+        ))
+    })?;
+    // the temporary name has done its work; a leftover link is removed by the next restore's start and is never the store
+    let _ = std::fs::remove_file(temp);
+    Ok(())
+}
+
+// A test hook: runs once, on this thread, after every check has passed and before the store is published.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_publish_for_tests(hook: impl FnOnce() + 'static) {
+    BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn restore_to_temp(
+    path: &Path,
+    temp: &Path,
+    input: &mut impl Read,
+    build: &crate::format::BuildVersions,
+) -> Result<BackupInfo> {
     let io = |e: std::io::Error| StorageError::Database(format!("reading a backup: {e}"));
 
     // The magic is checked before anything else is read, and separately, so
@@ -371,7 +444,7 @@ pub fn restore_with(
 
     // A new file, which no check before it could read (ADR-190).
     #[allow(clippy::disallowed_methods)]
-    let db = Database::create(path)?;
+    let db = Database::create(temp)?;
     let mut records = 0usize;
     let mut bytes = header.len();
     let mut marked = 0usize;
@@ -393,6 +466,7 @@ pub fn restore_with(
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
             let mut missing = txn.open_table(tables::MISSING_THROUGH)?;
+            crate::register::open_tables(&txn)?;
 
             loop {
                 let (tag, key, value) = match pending.pop_front() {
@@ -491,6 +565,30 @@ pub fn restore_with(
                         let index_id = u32::from_be_bytes(rest.try_into().expect("4 bytes"));
                         indexes_dropped.insert((coll, index_id), value.as_slice())?;
                     }
+                    T_REGISTER => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Register,
+                        &key,
+                        &value,
+                    )?,
+                    T_REGISTER_INFO => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Info,
+                        &key,
+                        &value,
+                    )?,
+                    T_REGISTER_STAGES => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Stages,
+                        &key,
+                        &value,
+                    )?,
+                    T_REGISTER_POST => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Post,
+                        &key,
+                        &value,
+                    )?,
                     // A tag this build does not know means the backup came from
                     // a newer version. Skipping it would restore a database
                     // missing whatever that table held, silently.
@@ -554,6 +652,10 @@ pub fn restore_with(
                 format!("{}.{}", build.redb.0, build.redb.1).as_bytes(),
             )?;
         }
+        // Judged whole, after every record is in and before anything is committed: a damaged or hand-made backup is refused by the check's
+        // own message, and the temporary file the caller removes is the only thing that was written (Q6.6, unit A). The restore itself runs
+        // no settle pass and sets no purge deferral: it transcribes.
+        crate::register::check_restored(&txn)?;
         txn.commit()?;
     }
     // The sidecar is regenerated, never carried: this build's redb wrote the
@@ -561,23 +663,19 @@ pub fn restore_with(
     // backup format does not change. META already records this build's redb,
     // written in the data commit above.
     let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
+    // Closed, and only then published: the target never exists half-written
+    drop(db);
+    publish(temp, path)?;
+    // The sidecar is written AFTER the store is published, and by the sidecar's own temporary and rename. If this write fails the store at
+    // the target is complete and the restore reports the error: the next open finds a clean store with no sidecar, checks it by the schema
+    // and the redb version its META records (this build's, written above), and writes the sidecar then, with `written_by` unknown, as it does
+    // for any store without one (which also resets the tombstone horizon, and a restore carries none). A second restore into the same path is
+    // refused, because the target exists. It is written after and not before because a sidecar written for the target before it is ours
+    // could overwrite the sidecar of a store another restore published there.
     crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
     info!(records, bytes, held = marked, %node, path = %path.display(), "restored a backup");
     Ok(BackupInfo { node: Some(node), created_ms, records, bytes })
-}
-
-// A test hook: runs once, on this thread, after every check has passed and before the store is published. Declared here for the tests
-// commit, which only has to compile: nothing in the product calls it until the code commit makes the restore publish a temporary file.
-#[cfg(test)]
-thread_local! {
-    static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn before_publish_for_tests(hook: impl FnOnce() + 'static) {
-    BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 fn read_chunk(input: &mut impl Read) -> Result<Vec<u8>> {
@@ -656,6 +754,10 @@ mod tests {
         "OPLOG_VERSIONS",
         "INDEXES_DROPPED",
         "MISSING_THROUGH",
+        "REGISTER",
+        "REGISTER_INFO",
+        "REGISTER_STAGES",
+        "REGISTER_POST",
     ];
 
     /// The tables it does not, and why. Each is node-local or derived; the doc
@@ -674,18 +776,8 @@ mod tests {
         ),
         ("UNIQUE_VIOLATIONS", "derived from the oplog"),
         (
-            "REGISTER",
-            "the swap's register events in effect: carried from Q6.6 (Chris, 2026-11-23); not yet. Until then a restore does not rebuild them",
-        ),
-        ("REGISTER_INFO", "the swap's register events ahead of their position: as REGISTER"),
-        (
             "PURGE_NOT_BEFORE",
             "this member's own clock and requests (ADR-272, decision 5): a restore starts with no request in flight, so there is nothing to defer for",
-        ),
-        ("REGISTER_STAGES", "the swap's stage creations: as REGISTER (carried from Q6.6; not yet)"),
-        (
-            "REGISTER_POST",
-            "the post-drop row of a swapped name: carried from Q6.6 (Chris, 2026-11-23); not yet",
         ),
         (
             "VECTOR_VERIFIED",
@@ -741,9 +833,23 @@ mod tests {
         let source = include_str!("backup.rs");
         let write_side = &source
             [source.find("pub fn backup_to").unwrap()..source.find("pub fn restore(").unwrap()];
+        // The four register tables are read by `register::carried_rows`, the one module that opens them, through `Carried::table`: the
+        // write side must name each of its variants, and the tables that function maps them to are counted as read.
+        let registers = include_str!("register.rs");
+        let from = registers.find("impl Carried {").unwrap();
+        let carried_reads = &registers[from..from + registers[from..].find("\n}\n").unwrap()];
+        for variant in ["Register", "Info", "Stages", "Post"] {
+            assert!(
+                write_side.contains(&format!("Carried::{variant}),")),
+                "backup_to does not write the register's Carried::{variant}"
+            );
+        }
         let mut read: Vec<&str> = declared_tables(include_str!("tables.rs"))
             .into_iter()
-            .filter(|name| write_side.contains(&format!("tables::{name},")))
+            .filter(|name| {
+                write_side.contains(&format!("tables::{name},"))
+                    || carried_reads.contains(&format!("tables::{name},"))
+            })
             .collect();
         read.sort();
         let mut carried = CARRIED.to_vec();
@@ -761,20 +867,25 @@ mod tests {
             read_chunk(&mut rest).unwrap();
             read_chunk(&mut rest).unwrap();
         }
+        // The register's four tags are written only for a member that holds register rows, which this engine does not: the register
+        // tests (`backup_register_tests`) read each of them from the backup of a swapped name.
+        let register_tags = T_REGISTER..=T_REGISTER_POST;
+        let expected: Vec<u8> =
+            (1..=CARRIED.len() as u8).filter(|tag| !register_tags.contains(tag)).collect();
         assert_eq!(
             tags.into_iter().collect::<Vec<u8>>(),
-            (1..=CARRIED.len() as u8).collect::<Vec<u8>>(),
-            "a populated engine's backup carries one tag per carried table, 1 to {}",
-            CARRIED.len()
+            expected,
+            "a populated engine's backup carries one tag per carried table but the register's"
         );
     }
 
-    /// Every tag is declared once and read by `restore`, which refuses an
-    /// unknown one: a tag with no arm writes a backup nothing can restore.
+    /// Every tag is declared once and read by `restore_to_temp` (what `restore` writes through), which
+    /// refuses an unknown one: a tag with no arm writes a backup nothing can restore.
     #[test]
     fn every_tag_is_unique_and_has_a_read_arm() {
         let source = include_str!("backup.rs");
-        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let restore = &production[production.find("fn restore_to_temp(").unwrap()..];
         let tags: Vec<(&str, u8)> = production
             .lines()
             .filter_map(|line| {
@@ -790,8 +901,8 @@ mod tests {
         assert_eq!(values.len(), tags.len(), "a tag value is used twice: {tags:?}");
         for (name, _) in &tags {
             assert!(
-                production.contains(&format!("T_{name} =>")),
-                "T_{name} has no read arm in restore"
+                restore.contains(&format!("T_{name} =>")),
+                "T_{name} has no read arm in restore_to_temp"
             );
         }
     }

@@ -971,7 +971,7 @@ mod tests {
         ("gc.rs", "remove_oplog_entries"),
         ("gc.rs", "trim_violation_rows"),
         ("rewind.rs", "rewind_to"),
-        ("backup.rs", "restore_with"),
+        ("backup.rs", "restore_to_temp"),
         ("migrate.rs", "rewrite_oplog"),
         // the register's one door (ADR-272): `store` writes a row of REGISTER or REGISTER_INFO, the table passed in as a parameter;
         // neither is the oplog, a version vector or a held mark, and the entry that carries a swap's event is appended by `append_oplog_at`
