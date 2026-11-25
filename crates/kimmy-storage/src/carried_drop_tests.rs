@@ -880,13 +880,38 @@ fn a_name_the_receiver_cannot_name_has_its_rows_stored_by_id_and_nothing_else() 
     assert!(stored, "the rows of a name no stage row names are stored by id");
 }
 
+/// A post-drop row of `orders` holding one index, `carried_ix`, made at `made`.
+fn a_post_row_with_an_index(made: Stamp) -> crate::register::PostRow {
+    let index = kimmy_core::IndexMeta {
+        id: kimmy_core::IndexMeta::derive_id("carried_ix"),
+        name: "carried_ix".into(),
+        fields: vec![kimmy_core::IndexField::ascending("t")],
+        unique: false,
+        enforcement: kimmy_core::Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: Some(made),
+    };
+    crate::register::PostRow { indexes: vec![index], ..Default::default() }
+}
+
 #[test]
 fn a_post_drop_row_is_taken_only_for_a_name_that_reads_dropped() {
+    // The row's definitions are what the guard protects: a row taken beside a visible physical is joined into it by the settle pass and
+    // deleted in the same transaction, so the absence of the row proves nothing. The stage the name serves must not hold its index.
     let s = swap(&[]);
     let (j, _dj) = engine();
+    let made = Stamp::new(Hlc::new(s.bind.stamp.hlc.wall_ms - 1, 0), s.a.node_id(), s.a.epoch());
+    let carried = a_post_row_with_an_index(made);
+    assert!(
+        s.sender.get_collection(DB, STAGE1).unwrap().index("carried_ix").is_none(),
+        "premise: the sender's stage does not hold the index, so only the post-drop row has it"
+    );
+    assert!(j.get_collection(DB, STAGE1).is_err(), "premise: the joiner holds no stage yet");
     let patched = std::cell::Cell::new(false);
     let patch = |page: &mut crate::SnapshotPage| {
-        let row = serde_json::to_vec(&crate::register::PostRow::default()).unwrap();
+        let row = serde_json::to_vec(&carried).unwrap();
         let key = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
         if let Some(carry) = &mut page.register {
             carry.posts.push((serde_bytes::ByteBuf::from(key), serde_bytes::ByteBuf::from(row)));
@@ -899,8 +924,14 @@ fn a_post_drop_row_is_taken_only_for_a_name_that_reads_dropped() {
         patched.get(),
         "premise: the last page carried the register and the patch pushed the row"
     );
+    assert_eq!(served_by(&j), Ok(STAGE1.to_string()), "premise: the stage serves the name");
+    assert!(j.get_collection(DB, STAGE1).is_ok(), "premise: the member holds the stage it serves");
     let row = crate::register::post_row_for_tests(&j, DB, "orders").unwrap();
     assert!(row.is_none(), "a post-drop row beside a visible physical is not taken");
+    assert!(
+        j.get_collection(DB, STAGE1).unwrap().index("carried_ix").is_none(),
+        "and its definitions did not join the stage the name serves"
+    );
 }
 
 #[test]
@@ -915,18 +946,7 @@ fn a_post_drop_row_is_taken_for_a_name_that_reads_dropped() {
     let wall = s.bind.stamp.hlc.wall_ms;
     let at = |ms: u64| Stamp::new(Hlc::new(wall + ms, 0), s.a.node_id(), s.a.epoch());
     let (dropped, made) = (at(5), at(9));
-    let index = kimmy_core::IndexMeta {
-        id: kimmy_core::IndexMeta::derive_id("carried_ix"),
-        name: "carried_ix".into(),
-        fields: vec![kimmy_core::IndexField::ascending("t")],
-        unique: false,
-        enforcement: kimmy_core::Enforcement::Local,
-        multikey: false,
-        expire_after_secs: None,
-        partial_filter: None,
-        created: Some(made),
-    };
-    let carried = crate::register::PostRow { indexes: vec![index], ..Default::default() };
+    let carried = a_post_row_with_an_index(made);
     let patched = std::cell::Cell::new(false);
     let patch = |page: &mut crate::SnapshotPage| {
         page.versions.observe(made);
