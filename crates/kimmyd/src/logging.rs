@@ -2460,13 +2460,21 @@ impl TelemetryGuard {
             "Stages a snapshot's last page listed as not alive at the sender that this member left standing and did not restart the snapshot for. 0 on a healthy member.",
             snapshot_listed_stage_left
         );
-        // Standing lives a seed of the register buried: lost and reported (ADR-272, decision 6).
+        // `kimmy_register_life_burials_total{by}` (ADR-272, decision 6): one instrument per route, each reading its own element of one
+        // array, in the order of `LIFE_BURIAL_LABELS`. Lost and reported.
         observe!(
             u64_observable_counter,
-            "kimmy.register.seed_burials",
+            "kimmy.register.life_burials.seed",
             "{life}",
-            "Standing lives a seed of the register buried: a life of a name made over a drop of it, then a stage of the name created below the drop. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
-            register_seed_burial
+            "Standing lives the register buried by the seed: a life of a name made over a drop of it, then a stage of the name created below the drop. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
+            |s| s.register_life_burials[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.register.life_burials.drop",
+            "{life}",
+            "Standing lives the register buried by a replicated drop: a life of a name made after a drop of it, which the drop buried because a stage of the name was created below it. Lost and reported. 0 on a cluster whose members all know of a swap before a name is made again.",
+            |s| s.register_life_burials[1]
         );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
@@ -3512,12 +3520,18 @@ mod tests {
     }
 
     #[test]
-    fn the_seed_burial_counter_reads_its_own_field() {
-        let call = instrument_call("kimmy.register.seed_burials");
-        assert!(
-            call.ends_with("register_seed_burial"),
-            "kimmy.register.seed_burials reads the seed burial count: {call}"
-        );
+    fn each_life_burial_instrument_reads_the_slot_of_its_own_route() {
+        // As for the values of `within_grant`: one instrument per value of `by`, each reading its own slot of
+        // `MetricsSnapshot::register_life_burials`, in the order of `LIFE_BURIAL_LABELS`.
+        for (slot, label) in kimmy_storage::LIFE_BURIAL_LABELS.iter().enumerate() {
+            let name = format!("kimmy.register.life_burials.{label}");
+            let call = instrument_call(&name);
+            let want = format!("|s|s.register_life_burials[{slot}]");
+            assert!(
+                call.ends_with(&want),
+                "{name} does not read slot {slot}, the slot of `{label}`: {call}"
+            );
+        }
     }
 
     #[test]

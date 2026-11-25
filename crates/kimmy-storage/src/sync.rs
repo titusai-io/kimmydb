@@ -3605,6 +3605,19 @@ impl Engine {
                             event.clone(),
                         )?,
                     };
+                    // A replicated drop that took effect as a logical drop buries a life of the name made after it: the loss of the decision,
+                    // counted and reported by the commit (the seed's burials are noted by the seed)
+                    if put == kimmy_core::register_state::Put::Stored
+                        && apply.mode == RegisterMode::Effect
+                        && apply.event == Some(kimmy_core::RegisterEvent::LogicalDrop)
+                    {
+                        crate::register::note_drop_burial(
+                            &txn,
+                            &apply.db,
+                            &apply.logical,
+                            entry.stamp,
+                        )?;
+                    }
                     if put == kimmy_core::register_state::Put::UnknownStage {
                         txn.abort()?;
                         let physical = apply

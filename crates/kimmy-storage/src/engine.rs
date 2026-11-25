@@ -60,6 +60,10 @@ pub const OUT_BURIAL_CAUSES: [&str; 4] = ["bound_out", "doomed", "orphan", "drop
 /// renders them: whether the stamp of a document a snapshot page carried and this member skipped is at
 /// or below the snapshot's grant.
 pub const SNAPSHOT_SKIP_LABELS: [&str; 2] = ["true", "false"];
+/// The values of the `by` label of `kimmy_register_life_burials_total`, in the order it renders them: the route by which the register buried
+/// a life a member made over a drop of its name (ADR-272, decision 6): `seed` (the seed from the identity's tombstone, when a stage created
+/// below the drop is met after the life) and `drop` (a replicated drop that takes effect as a logical drop over a life made after it).
+pub const LIFE_BURIAL_LABELS: [&str; 2] = ["seed", "drop"];
 /// Why the settle pass buried a physical: the slot of its cause in [`OUT_BURIAL_CAUSES`]. Read from the pass, never stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BuryCause {
@@ -237,8 +241,9 @@ pub struct Engine {
     /// Stages a join's last page listed as not alive that this member left standing or held none of, and did not restart for
     /// (`kimmy_snapshot_listed_stages_left_total`).
     pub(crate) snapshot_listed_stages_left: std::sync::atomic::AtomicU64,
-    /// Standing lives a seed of the register buried since start (`kimmy_register_seed_burials_total`, ADR-272, decision 6).
-    pub(crate) register_seed_burials: std::sync::atomic::AtomicU64,
+    /// Standing lives the register buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
+    /// (`kimmy_register_life_burials_total{by}`, ADR-272, decision 6).
+    pub(crate) register_life_burials: [std::sync::atomic::AtomicU64; 2],
     /// A test's hook on the page reader of this member as a SENDER: called at the start of every `snapshot_page`, with the cursor the
     /// page is asked after, before anything of the page is read (Q6.6, unit E). Lets a test do to the sender what a client does
     /// between two pages of a join (bury a stage).
@@ -1138,8 +1143,9 @@ impl WriteTxn<'_> {
         let engine = self.engine;
         let coalesced = self.coalesced;
         let is_write = self.holder == WriterHolder::Write;
-        // The standing lives this transaction's seeds buried: counted and reported once the inner commit has landed, and by nothing else
-        let seed_burials = crate::register::take_seed_burials();
+        // The standing lives this transaction buried by a seed or a replicated drop: counted and reported once the inner commit has landed,
+        // and by nothing else
+        let life_burials = crate::register::take_life_burials();
         // A burial by the register changes the catalogue from a window or a grant, which are not DDL transactions
         let changes_collections =
             self.holder == WriterHolder::Ddl || !self.burials.lock().is_empty();
@@ -1185,12 +1191,15 @@ impl WriteTxn<'_> {
             if swaps > 0 {
                 engine.out_swaps.fetch_add(swaps, std::sync::atomic::Ordering::Relaxed);
             }
-            // ... and the lives their seeds buried (lost and reported, ADR-272, decision 6), counted and warned of with both stamps
-            for burial in &seed_burials {
-                engine.register_seed_burials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // ... and the lives they buried by a seed or by a replicated drop (lost and reported, ADR-272, decision 6), counted by route and
+            // warned of with both stamps
+            for burial in &life_burials {
+                engine.register_life_burials[burial.by as usize]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     db = %burial.db,
                     collection = %burial.logical,
+                    by = LIFE_BURIAL_LABELS[burial.by as usize],
                     dropped = ?burial.dropped,
                     life_created = ?burial.life_created,
                     remains_of_the_drop = burial.remains_of_the_drop,
@@ -1877,7 +1886,7 @@ impl Engine {
             snapshot_restarted: Mutex::new(std::collections::HashMap::new()),
             snapshot_join_restarts: std::sync::atomic::AtomicU64::new(0),
             snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
-            register_seed_burials: std::sync::atomic::AtomicU64::new(0),
+            register_life_burials: Default::default(),
             register_carry_warned_ms: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1967,19 +1976,17 @@ impl Engine {
         self.register_resolve_fallbacks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Standing lives a seed of the register has buried since start (`kimmy_register_seed_burials_total`): a life this member made, or
-    /// held, over a drop of its name that a stage created below the drop turned out to be the swap's. Lost and reported (ADR-272,
-    /// decision 6); expected 0 on a cluster whose members all know of every swap before they re-create a name.
-    pub fn register_seed_burials(&self) -> u64 {
-        self.register_seed_burials.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Standing lives the register buried by the route that buried them, in the order of the labels `seed` and `drop`
+    /// Standing lives the register has buried since start, by the route that buried them, in the order of [`LIFE_BURIAL_LABELS`]
     /// (`kimmy_register_life_burials_total{by}`): a life made over a drop of its name that a stage created below the drop turned out
     /// to be the swap's (`seed`), and a life made after a replicated drop that the drop then buried (`drop`). Lost and reported (ADR-272,
-    /// decision 6).
+    /// decision 6); expected 0 on a cluster whose members all know of every swap before they re-create a name.
     pub fn register_life_burials(&self) -> Vec<(&'static str, u64)> {
-        vec![("seed", self.register_seed_burials()), ("drop", 0)]
+        use std::sync::atomic::Ordering::Relaxed;
+        LIFE_BURIAL_LABELS
+            .iter()
+            .zip(&self.register_life_burials)
+            .map(|(label, count)| (*label, count.load(Relaxed)))
+            .collect()
     }
 
     /// The warnings the carry's size has raised since start: one when it reaches half of what a page can hold, then one at most an hour.
@@ -4659,8 +4666,8 @@ impl Engine {
                 .expect("no persistent savepoint was touched in a fresh transaction");
         }
         self.writer_hold.publish(holder);
-        // a writer begins with no seed burial noted: one a transaction that did not commit left is not this one's
-        crate::register::forget_seed_burials();
+        // a writer begins with no life burial noted: one a transaction that did not commit left is not this one's
+        crate::register::forget_life_burials();
         Ok(WriteTxn {
             txn: Some(txn),
             engine: self,

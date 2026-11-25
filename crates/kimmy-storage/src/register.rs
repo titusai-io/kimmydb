@@ -971,7 +971,7 @@ pub(crate) enum SeedAsk {
 /// - **The identity standing** (a life created after the drop, or the remains the drop kept): judged by the stage's stamp alone, for a
 ///   stage's creation and for a binding: the stage created below the drop, the swap began below it and the life is the one the drop
 ///   hides on every member that knew of the swap. An event that names no stage never seeds on a standing identity. A life lost this way
-///   is a life a member made without knowing of the swap (lost and reported): the seed notes it ([`note_seed_burial`]), and the
+///   is a life a member made without knowing of the swap (lost and reported): the seed notes it ([`note_life_burial`]), and the
 ///   transaction that commits it counts it and warns, with both stamps.
 /// - **The database guard.** The tombstone a database's drop leaves on a collection (its stamp is the database's drop) is not a drop of a
 ///   life made after it: such a life stands over the tombstone, the drop never ended it, and no stage met late makes it the swap's. It is
@@ -1028,7 +1028,8 @@ pub(crate) fn seed_from_the_tombstone(
     let wrote = store(txn, tables::REGISTER, db, logical, dropped, RegisterEvent::LogicalDrop)?
         == Put::Stored;
     if let (true, Some(meta)) = (wrote, &standing) {
-        note_seed_burial(SeedBurial {
+        note_life_burial(LifeBurial {
+            by: LifeBurialBy::Seed,
             db: db.to_string(),
             logical: logical.to_string(),
             dropped,
@@ -1039,11 +1040,21 @@ pub(crate) fn seed_from_the_tombstone(
     Ok(wrote)
 }
 
-/// A standing life a seed buried (ADR-272, decision 6): the drop it was buried by, and the life.
-pub(crate) struct SeedBurial {
+/// The route by which the register buried a standing life (ADR-272, decision 6), the slot of its label in
+/// [`crate::LIFE_BURIAL_LABELS`]: the seed of a name's register from the identity's tombstone, or a replicated drop that took effect as a
+/// logical drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifeBurialBy {
+    Seed = 0,
+    Drop = 1,
+}
+
+/// A standing life the register buried (ADR-272, decision 6): the route, the drop it was buried by, and the life.
+pub(crate) struct LifeBurial {
+    pub(crate) by: LifeBurialBy,
     pub(crate) db: String,
     pub(crate) logical: String,
-    /// The tombstone's stamp, the drop the seed put in the register.
+    /// The drop's stamp: the tombstone the seed put in the register, or the replicated drop that took effect.
     pub(crate) dropped: Stamp,
     /// When the life that stood was created.
     pub(crate) life_created: Hlc,
@@ -1052,25 +1063,52 @@ pub(crate) struct SeedBurial {
 }
 
 thread_local! {
-    /// The standing lives the seeds of this thread's open transaction have buried, until the transaction commits (and counts them) or ends
-    /// (and forgets them). The seed is a function of the register, which holds no engine, so what it buried is noted here and the
-    /// transaction that commits is the one that counts it, as it counts the swaps its passes saw.
-    static SEED_BURIALS: std::cell::RefCell<Vec<SeedBurial>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The standing lives the register has buried in this thread's open transaction, until the transaction commits (and counts them) or ends
+    /// (and forgets them). The seed and the register's door are functions of the register, which holds no engine, so what they buried is
+    /// noted here and the transaction that commits is the one that counts it, as it counts the swaps its passes saw.
+    static LIFE_BURIALS: std::cell::RefCell<Vec<LifeBurial>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Note a standing life a seed buried, for the commit of the transaction that made the seed.
-fn note_seed_burial(burial: SeedBurial) {
-    SEED_BURIALS.with(|noted| noted.borrow_mut().push(burial));
+/// Note a standing life the register buried, for the commit of the transaction that buried it.
+fn note_life_burial(burial: LifeBurial) {
+    LIFE_BURIALS.with(|noted| noted.borrow_mut().push(burial));
 }
 
-/// What the seeds of this thread's transaction buried, taken by its commit. Nothing else takes them.
-pub(crate) fn take_seed_burials() -> Vec<SeedBurial> {
-    SEED_BURIALS.with(|noted| std::mem::take(&mut *noted.borrow_mut()))
+/// A replicated drop took effect as a logical drop at `dropped` (ADR-272, decision 6): if a life of the name stands that was made AFTER
+/// it, the drop is about to bury it, and that is the loss the decision names. Noted for the commit, with no write. A life made before the
+/// drop is the drop's to end as any drop ends it, and is no loss of this kind; a name with no life standing has none to bury. A newer event of
+/// the name that the pass finds above the drop buries the life all the same.
+pub(crate) fn note_drop_burial(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    dropped: Stamp,
+) -> Result<()> {
+    let standing = match txn.open_table(tables::COLLECTIONS)?.get((db, logical))? {
+        Some(raw) => serde_json::from_slice::<crate::meta::CollectionMeta>(raw.value())?,
+        None => return Ok(()),
+    };
+    if standing.created > dropped.hlc {
+        note_life_burial(LifeBurial {
+            by: LifeBurialBy::Drop,
+            db: db.to_string(),
+            logical: logical.to_string(),
+            dropped,
+            life_created: standing.created,
+            remains_of_the_drop: false,
+        });
+    }
+    Ok(())
+}
+
+/// What the register buried in this thread's transaction, taken by its commit. Nothing else takes them.
+pub(crate) fn take_life_burials() -> Vec<LifeBurial> {
+    LIFE_BURIALS.with(|noted| std::mem::take(&mut *noted.borrow_mut()))
 }
 
 /// Forget what a transaction that did not commit noted: every writer begins with none.
-pub(crate) fn forget_seed_burials() {
-    SEED_BURIALS.with(|noted| noted.borrow_mut().clear());
+pub(crate) fn forget_life_burials() {
+    LIFE_BURIALS.with(|noted| noted.borrow_mut().clear());
 }
 
 /// Whether the register owns the collection id `id`: a stage row is kept under it (a stage this member has the creation of, whether or
