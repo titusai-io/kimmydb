@@ -192,6 +192,9 @@ mod backup_register_tests;
 mod names_and_options_tests;
 
 #[cfg(test)]
+mod unit_s_shadow_tests;
+
+#[cfg(test)]
 mod definition_door_tests;
 #[cfg(test)]
 mod recreate_tests;
