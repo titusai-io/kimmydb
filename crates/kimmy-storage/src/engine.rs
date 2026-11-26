@@ -5504,6 +5504,7 @@ impl Engine {
                 &|_| false,
                 None,
                 None,
+                None,
                 validator.as_ref().map(|spec| (spec, None)),
                 policy,
                 (policy.fixed_for(name) == kimmy_core::MergePolicy::Field)
@@ -5546,6 +5547,7 @@ impl Engine {
                 true,
                 None,
                 &|_| false,
+                None,
                 None,
                 None,
                 None,
@@ -5663,6 +5665,7 @@ impl Engine {
             None,
             None,
             None,
+            None,
             kimmy_core::MergePolicy::Document,
             None,
             None,
@@ -5698,6 +5701,7 @@ impl Engine {
                 &|_| false,
                 None,
                 None,
+                None,
                 Some((&validator, None)),
                 kimmy_core::MergePolicy::Document,
                 None,
@@ -5722,6 +5726,7 @@ impl Engine {
         history: &dyn Fn(Stamp) -> bool,
         redated_from: Option<Hlc>,
         sender_floor: Option<Hlc>,
+        policy_at: Option<Hlc>,
         validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
         policy: kimmy_core::MergePolicy,
         join_retention_ms: Option<u64>,
@@ -5802,6 +5807,31 @@ impl Engine {
                 {
                     meta.incarnation_floor = Some(floor);
                     changed = true;
+                }
+                // The creation's policy stamp, when the creation is a page's (unit N): the page's own, and not `created`, which for a life a
+                // drop re-dated is the drop's successor, an invented stamp above the creation's. Set here, in the creation's own transaction,
+                // so no stop leaves the collection standing with the other.
+                let stage_info = stage.map(|stage| stage.info);
+                if let Some(at) = policy_at {
+                    if meta.merge_policy_at != Some(at) {
+                        meta.merge_policy_at = Some(at);
+                        changed = true;
+                    }
+                    // And the options row of the creation, in this same transaction: a stop between the creation's commit and a row written
+                    // after it would leave a collection standing with no row, which a page applied again never fixes (the collection is
+                    // held). Rise-only, so a no-op when the route already wrote it at the top (a stamp the sender's coverage names).
+                    crate::register::note_base_options(
+                        &txn,
+                        &crate::register::BaseOptions::of_creation(
+                            db,
+                            name,
+                            at,
+                            policy,
+                            join_retention_ms,
+                            loss_limits,
+                            stage_info,
+                        ),
+                    )?;
                 }
                 if changed {
                     Self::put_collection_meta(&txn, &meta)?;

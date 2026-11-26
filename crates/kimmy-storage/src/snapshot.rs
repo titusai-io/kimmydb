@@ -3951,16 +3951,17 @@ impl Engine {
         // after a re-dated life (the drop's successor), so a joined member and an entry-fed one would hold different rows. Held to what
         // the sender's coverage names (ADR-163), as the policy is: a stamp it does not name raises nothing.
         let creation_at = state.merge_policy_at.unwrap_or(state.created);
-        if hlc_is_named(creation_at, versions) {
-            let creation_seen = crate::register::BaseOptions::of_creation(
-                &state.db,
-                &state.name,
-                creation_at,
-                state.merge_policy,
-                state.join_retention_ms,
-                state.loss_limits,
-                state.stage.map(|stage| stage.info),
-            );
+        let creation_seen = crate::register::BaseOptions::of_creation(
+            &state.db,
+            &state.name,
+            creation_at,
+            state.merge_policy,
+            state.join_retention_ms,
+            state.loss_limits,
+            state.stage.map(|stage| stage.info),
+        );
+        let creation_named = hlc_is_named(creation_at, versions);
+        if creation_named {
             self.note_creation_seen(&creation_seen)?;
         }
         // The creation, before it is stored: the clock must be past the incarnation this
@@ -4057,6 +4058,9 @@ impl Engine {
                 &history,
                 redated_from,
                 adopted,
+                // the page's own policy stamp, whether or not its coverage names it: a collection the page MAKES takes its creation, policy
+                // and options from the page, so the stamp is no new trust (the coverage gate stays for adoption over a held definition)
+                Some(creation_at),
                 None,
                 state.merge_policy,
                 state.join_retention_ms,

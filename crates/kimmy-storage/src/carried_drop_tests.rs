@@ -3311,6 +3311,7 @@ fn a_creation_that_bypassed_the_check(by: &Engine, name: &str) -> OplogEntry {
         None,
         None,
         None,
+        None,
         MergePolicy::Document,
         None,
         None,

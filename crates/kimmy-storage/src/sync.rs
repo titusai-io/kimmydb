@@ -2764,6 +2764,7 @@ impl Engine {
                             &|dropped_at| creation_is_history(entry.stamp.hlc, dropped_at.hlc),
                             None,
                             None,
+                            None,
                             target.validator.as_ref().map(|spec| (spec, Some(entry.stamp))),
                             target.merge_policy,
                             target.join_retention_ms,
