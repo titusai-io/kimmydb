@@ -217,6 +217,54 @@ fn the_rows_a_member_relays_are_the_newest_by_start_and_at_most_the_cap() {
 // -- the halt (tests 1, 2, 7; findings 8a, 8c)
 // --------------------------------------------------------------------------
 
+/// The flush leader that was asleep through the halt finds the flag and commits nothing (ADR-274,
+/// the refusal site the halt's order protects: mutant "the flush does not read the flag"). A
+/// coalesced commit has landed and is leading its barrier, asleep for the window, when the host
+/// halts. The halt's own transaction is a flush: it carries that commit to the disk and does the
+/// barrier's bookkeeping. The leader then wakes and flushes, finds the flag, and writes nothing:
+/// the count of flushes does not move after the halt, and the commit is acknowledged and durable.
+#[test]
+fn a_flush_leader_asleep_through_the_halt_finds_it_and_commits_nothing() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::DurabilityClass;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let engine = Arc::new(open(&path));
+    engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(800));
+    let orders = engine.create_collection("shop", "orders").unwrap();
+
+    let writer = {
+        let (engine, orders) = (Arc::clone(&engine), orders.clone());
+        std::thread::spawn(move || engine.insert(&orders, doc! { "_id": 1 }))
+    };
+    // The commit is visible once it has landed, and it then leads its barrier and sleeps the
+    // window: halt in the middle of it.
+    let id = kimmy_core::DocId::Int64(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.get(&orders, &id).unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the commit never landed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    engine.halt(an_epoch_ahead(1_000, 6)).unwrap();
+    let flushes_at_the_halt = engine.fsyncs();
+
+    writer.join().unwrap().expect("the commit is acknowledged");
+    assert!(engine.halted().is_some(), "premise: the host is halted");
+    assert_eq!(
+        engine.fsyncs(),
+        flushes_at_the_halt,
+        "the leader that slept through the halt found it and committed nothing"
+    );
+    drop(engine);
+    let again = open(&path);
+    let orders = again.get_collection("shop", "orders").unwrap();
+    assert!(again.get(&orders, &id).unwrap().is_some(), "the halt's flush carried the commit");
+}
+
 /// A told host refuses every write from then on, and the refusal commits nothing: the chokepoint's
 /// own count does not move.
 #[test]

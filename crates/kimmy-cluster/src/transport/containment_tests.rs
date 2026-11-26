@@ -365,6 +365,41 @@ async fn a_hello_with_no_epoch_that_is_not_a_probe_is_refused_by_name() {
     assert_eq!(answer.unwrap(), Message::Fault(reason));
 }
 
+/// The same for the dialling side: a `Welcome` that names this protocol and carries no epoch is a
+/// build from before containment, and the dialler refuses it by name, before it checks the proof or
+/// records anything, and says so to the peer (mutant: a missing epoch read as the dialler's own).
+#[tokio::test]
+async fn a_welcome_with_no_epoch_is_refused_by_name_by_the_dialler() {
+    let (dialler, _d) = engine();
+    let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+    let peer = NodeId::generate();
+    let opening = open_handshake(&dialler, &mut ours, SECRET, BINDING);
+    let answering = async {
+        let Ok(Message::Hello { .. }) = read_frame(&mut theirs).await else {
+            panic!("expected the dialler's Hello");
+        };
+        let welcome = Message::Welcome {
+            node: peer,
+            nonce: nonce(peer),
+            proof: vec![0; 32],
+            protocol: Some(crate::protocol::PROTOCOL),
+            epoch: None,
+        };
+        write_frame(&mut theirs, &welcome).await.unwrap();
+        read_frame(&mut theirs).await
+    };
+    let (refused, said) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(opening, answering) })
+            .await
+            .expect("the refusal ends the handshake");
+    let Err(ProtocolError::Release(reason)) = refused else {
+        panic!("expected a release refusal, got {refused:?}");
+    };
+    assert!(reason.contains("before containment"), "the refusal says what the peer is: {reason}");
+    assert_eq!(said.unwrap(), Message::Fault(reason), "and the peer is told so");
+    assert_eq!(dialler.newest_epoch(peer).unwrap(), Epoch::ZERO, "nothing was recorded");
+}
+
 /// A probe is answered by a member that would refuse an epoch-less `Hello`: it gets a `Welcome`
 /// whose proof verifies, nothing follows it, and the probed side records nothing.
 #[tokio::test]
