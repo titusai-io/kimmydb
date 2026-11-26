@@ -127,6 +127,10 @@ pub enum ErrorCode {
     /// horizon, and is catching up (ADR-202). Nothing was read or
     /// written, and another member serves.
     CatchingUp,
+    /// This host was told that a newer epoch of its node exists, and halted (D13 containment,
+    /// ADR-274): it serves nothing but its probes and its scrape. Nothing was read or written, and
+    /// another member serves.
+    Halted,
     /// A host this request had to resolve was not looked up: the node's
     /// lookups were all waiting on a resolver that has stopped answering
     /// (`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT` and
@@ -220,7 +224,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 33] = [
+    pub const ALL: [ErrorCode; 34] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
@@ -253,6 +257,7 @@ impl ErrorCode {
         Self::NodeStopping,
         Self::Starting,
         Self::CatchingUp,
+        Self::Halted,
         Self::ResolverBusy,
     ];
 
@@ -291,6 +296,7 @@ impl ErrorCode {
             Self::NodeStopping => "node_stopping",
             Self::Starting => "starting",
             Self::CatchingUp => "catching_up",
+            Self::Halted => "halted",
             Self::ResolverBusy => "resolver_busy",
         }
     }
@@ -378,6 +384,8 @@ impl ErrorCode {
             // Behind, and no timing it could honour: another member holds what
             // this one is still fetching.
             Self::CatchingUp => Retry::Elsewhere,
+            // A newer host of this node serves; this one is done.
+            Self::Halted => Retry::Elsewhere,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -505,6 +513,8 @@ impl ErrorCode {
             Self::Starting => Some(LogLevel::Warn),
             // A member doing what it should while it catches up.
             Self::CatchingUp => Some(LogLevel::Warn),
+            // A host doing what it should once superseded.
+            Self::Halted => Some(LogLevel::Warn),
             // One is a resolver slow for a moment, or a client registering
             // names that never answer; a rise is a resolver that has stopped
             // answering, which is the operator's.
@@ -965,6 +975,16 @@ impl ApiError {
         )
     }
 
+    /// This host is halted (ADR-274): `reason` says why and how to recover. Nothing was read or
+    /// written.
+    pub fn halted(reason: &str) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Halted,
+            format!("this host is halted and serves nothing; another member answers: {reason}"),
+        )
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, message)
     }
@@ -1227,6 +1247,8 @@ impl From<StorageError> for ApiError {
             // its own. Nothing was written, as with a busy writer, and this
             // node is going away: another member serves.
             StorageError::Stopping(reason) => ApiError::node_stopping(reason),
+            // The host was told a newer epoch of its node exists (ADR-274): nothing was written.
+            StorageError::Halted(reason) => ApiError::halted(&reason),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -1462,7 +1484,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 33] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 34] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1499,6 +1521,7 @@ mod tests {
             (NodeStopping, Some(LogLevel::Warn)),
             (Starting, Some(LogLevel::Warn)),
             (CatchingUp, Some(LogLevel::Warn)),
+            (Halted, Some(LogLevel::Warn)),
             (Misconfigured, Some(LogLevel::Error)),
             (Snapshot, Some(LogLevel::Error)),
         ];

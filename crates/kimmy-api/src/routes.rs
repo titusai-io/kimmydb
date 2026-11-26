@@ -99,6 +99,12 @@ fn catching_up_exempt(path: &str) -> bool {
     matches!(path, "/healthz" | "/readyz" | "/metrics" | "/v1/topology")
 }
 
+/// The routes a halted host still answers (ADR-274): the probes and the scrape. The topology is not
+/// among them: its registry rows are stale, and the host is down in SWIM within seconds.
+fn halted_exempt(path: &str) -> bool {
+    matches!(path, "/healthz" | "/readyz" | "/metrics")
+}
+
 /// While the catching-up marker is set and the wait has not run out, answer
 /// `503 catching_up` (retry elsewhere), and on every response while it is set at
 /// all (gated or `unknown`) carry `x-kimmy-catching-up: <state>` (ADR-202).
@@ -107,6 +113,13 @@ async fn catching_up_gate(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // A halted host (ADR-274) refuses every route but its probes and its scrape, before anything
+    // else is asked.
+    if let Some(halt) = state.engine.halted()
+        && !halted_exempt(request.uri().path())
+    {
+        return ApiError::halted(&halt.reason()).into_response();
+    }
     let Some(catch_up) = state.catch_up() else { return next.run(request).await };
     let now = std::time::Instant::now();
     let mut response = if catch_up.gated(now) && !catching_up_exempt(request.uri().path()) {
@@ -716,6 +729,16 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
                 failed.call, failed.error
             ),
         ));
+    }
+    // A halted host is not ready, and the reason is here, in the standard envelope, for a probe or
+    // an operator to read without parsing a message (ADR-274). Liveness still answers, so an
+    // orchestrator does not restart it into a loop.
+    if let Some(halt) = state.engine.halted() {
+        let reason = halt.reason();
+        let mut refusal = ApiError::halted(&reason);
+        refusal.extra =
+            Some(Box::new(serde_json::Map::from_iter([("reason".to_string(), json!(reason))])));
+        return Err(refusal);
     }
     state.engine.list_databases()?;
     // A member that knows it is behind is not ready: a readiness probe keeps it

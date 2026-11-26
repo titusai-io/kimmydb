@@ -3758,6 +3758,7 @@ components:
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
+        | `halted` | 503 | elsewhere | This host was told that a newer epoch of its node exists, and halted: it answers only `/healthz`, `/readyz` and `/metrics`, and every other route is refused with the reason and the recovery. Nothing was read or written. Send it to another member |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
@@ -3792,6 +3793,7 @@ components:
         - node_stopping
         - starting
         - catching_up
+        - halted
         - resolver_busy
 
     Capability:
