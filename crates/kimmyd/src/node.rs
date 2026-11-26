@@ -1814,6 +1814,26 @@ async fn start_and_serve(
     if let Some(call) = fail_storage {
         arm_storage_switch_when_serving(&front, &engine, call);
     }
+    // A running host that halts stops its background work (ADR-274): the supervised tasks
+    // (retention, the drop purger, expiry, the embedding worker, the webhook dispatcher,
+    // replication, the cluster listener, SWIM) are told to stop as they are at a shutdown, so a
+    // halted host does not log a refused write on every tick, while the HTTP front stays up for its
+    // probes and its scrape until the process is signalled. The halt itself is logged once, by the
+    // engine.
+    {
+        let (engine, shutdown) = (Arc::clone(&engine), shutdown.clone());
+        // UNSUPERVISED: a watcher that ends at the halt, or with the process.
+        tokio::spawn(async move {
+            loop {
+                if engine.halted().is_some() {
+                    warn!("this host is halted: its background work stops");
+                    shutdown.begin();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
     // An accept error that is the HTTP listener's own, counted beside the
     // cluster listener's on `kimmy_accept_errors_total{listener}`.
     let on_accept_error = accept_error_hook(Arc::clone(&state), |state| &state.metrics);
@@ -3160,7 +3180,6 @@ fn classify(
 }
 
 /// Why a schema change's confirmation names every member pending while the guard has not passed.
-#[allow(dead_code)] // the scaffold's confirmer ignores the gate; the code commit that follows uses it
 const GUARD_NOT_PASSED: &str =
     "this member's mistaken-restore guard has not passed, so nothing is sent to peers yet";
 
@@ -3181,11 +3200,23 @@ fn ddl_confirmer(
     confirmer: Arc<kimmy_cluster::Confirmer>,
     members: kimmy_cluster::Members,
     deadline: Duration,
-    _gate: tokio::sync::watch::Receiver<Option<bool>>,
+    gate: tokio::sync::watch::Receiver<Option<bool>>,
 ) -> kimmy_api::DdlConfirmer {
     Arc::new(move |entry: kimmy_core::OplogEntry, cap: Option<Duration>| {
         let confirmer = Arc::clone(&confirmer);
         let members = members.clone();
+        // The mistaken-restore guard exists to stop a fresh epoch from reaching peers before it
+        // passes, and a confirmation reaches them: until the gate is open (the guard waits, or
+        // halted this host) every member is pending, named at once, and none is dialled. The change
+        // is committed here and anti-entropy carries it later.
+        if *gate.borrow() != Some(true) {
+            let mut found = kimmy_api::DdlConfirmation::default();
+            for (_, node) in members.entries() {
+                found.pending.push((node, GUARD_NOT_PASSED.to_string()));
+            }
+            found.pending.sort();
+            return Box::pin(std::future::ready(found));
+        }
         // The request's own deadline, when it is sooner: what no member has
         // answered by then is pending, not a request abandoned.
         let deadline = cap.map_or(deadline, |cap| deadline.min(cap));
