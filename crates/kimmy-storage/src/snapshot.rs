@@ -4067,7 +4067,11 @@ impl Engine {
                     created: Some(stage.created),
                 }),
             ) {
-                Ok(Some(_)) => self.judge_a_stage_a_page_made(state, granted)?,
+                Ok(Some(_)) => {
+                    #[cfg(test)]
+                    crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::RestoreCreated);
+                    self.judge_a_stage_a_page_made(state, granted)?
+                }
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);

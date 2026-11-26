@@ -393,9 +393,11 @@ fn a_page_raises_the_row_with_its_policy_stamp_and_not_created() {
     assert_ne!(row.at, created, "and not created");
 }
 
-/// A policy stamp the sender's coverage does not name raises nothing, as it adopts nothing (ADR-163).
+/// A page MAKES the collection it defines with the page's creation, policy and options, whether or not the sender's coverage names the
+/// policy stamp: nothing is adopted over a definition this member holds, so there is no new trust. The stamp the page gives is the
+/// definition's and the options row's (the coverage gate stays for adoption over a HELD definition, and for the clock).
 #[test]
-fn a_page_whose_coverage_does_not_name_the_policy_stamp_raises_no_row() {
+fn an_unnamed_policy_stamp_is_still_the_page_stamp_of_a_collection_the_page_makes() {
     let (a, _da) = engine();
     a.create_collection(DB, "orders").unwrap();
     let mut page = a.snapshot_page(None, None).unwrap();
@@ -404,14 +406,42 @@ fn a_page_whose_coverage_does_not_name_the_policy_stamp_raises_no_row() {
         .iter_mut()
         .find(|state| state.name == "orders")
         .expect("premise: the page defines orders");
-    state.merge_policy_at = Some(Hlc::new(state.created.wall_ms + 60_000, 0));
+    let stamp = Hlc::new(state.created.wall_ms + 60_000, 0);
+    state.merge_policy_at = Some(stamp);
     // the definition's route alone: the sender's own row rides the carry (tested below) and would be held
     page.carried.clear();
     let (b, _db) = engine();
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
         .expect("the page applies");
-    assert!(b.get_collection(DB, "orders").is_ok(), "premise: the collection was made");
-    assert!(options_of(&b, "orders").is_none(), "no row: the stamp is above what the sender named");
+    let made = b.get_collection(DB, "orders").expect("premise: the collection was made");
+    assert_eq!(made.merge_policy_at, Some(stamp), "the definition holds the page's stamp");
+    assert_eq!(options_of(&b, "orders").map(|row| row.at), Some(stamp), "and so does the row");
+}
+
+/// A creation a page does not make writes no row when its stamp is not named: the collection was refused (history under a drop here), the
+/// stamp is unvouched, and a row written for it could never come down.
+#[test]
+fn a_creation_a_page_does_not_make_writes_no_row_for_a_stamp_it_does_not_name() {
+    let base = physical_now_ms();
+    let (a, _da) = engine();
+    let first = creation(&a, base - 3_000);
+    let dropped = drop_entry(&a, base - 2_000);
+    // the receiver holds the drop: the creation below it is history
+    let (b, _db) = applied_in_order(&[&first, &dropped]);
+    // the sender holds the first life, and its page names a policy stamp above what its coverage names
+    let (s, _ds) = applied_in_order(&[&first]);
+    let mut page = s.snapshot_page(None, None).unwrap();
+    let state = page.collections.iter_mut().find(|state| state.name == "orders").unwrap();
+    state.merge_policy_at = Some(Hlc::new(base - 100, 0));
+    page.carried.clear();
+    b.apply_snapshot_page(s.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect("the page applies");
+    assert!(b.get_collection(DB, "orders").is_err(), "premise: the creation was refused");
+    assert_eq!(
+        options_of(&b, "orders").map(|row| row.at),
+        Some(Hlc::new(base - 3_000, 0)),
+        "only the first creation, seen as an entry, is held: the unvouched stamp wrote nothing"
+    );
 }
 
 // -- The shadow a replicated vector configuration makes: the one creation from elsewhere that passes neither route's top ----------------------
@@ -1393,4 +1423,123 @@ fn a_page_whose_database_drop_is_far_ahead_of_the_clock_is_a_stop() {
     let (b, _db) = engine();
     let applied = b.apply_snapshot_page(a.node_id(), &mut scoped(id), &page).unwrap();
     assert!(applied.clock_refused.is_some(), "the page is a stop until the stamp is due");
+}
+
+// -- The page route makes a collection with the page's policy stamp, not its `created` ---------------------------------------------------------
+
+fn insert_entry(by: &Engine, id: &str, wall_ms: u64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::Insert,
+        collection: CollectionId::derive(DB, "orders"),
+        doc_id: Some(kimmy_core::DocId::String(id.into())),
+        body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).expect("it encodes")),
+        meta: None,
+    }
+}
+
+/// A fresh member that joins from `from` by one whole-database page.
+fn joined_from(from: &Engine) -> (Engine, tempfile::TempDir) {
+    let (joiner, dir) = engine();
+    pulled(&joiner, from, &mut SnapshotProgress::whole_database());
+    (joiner, dir)
+}
+
+/// A life a drop RE-DATED (the creation, a write stamped after the drop by a member that had not heard of it, then the drop) is held by the
+/// first member with `created` moved to the drop's successor and the creation's own Hlc as its policy stamp. A first joiner from it, a
+/// second joiner from that one, and a member fed the same entries must all hold that policy stamp, and the same options row.
+#[test]
+fn a_second_joiner_of_a_re_dated_life_holds_the_same_policy_stamp_and_row_as_an_entry_fed_member() {
+    let base = physical_now_ms();
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    let first = creation(&a, base - 3_000);
+    let write = insert_entry(&c, "late", base - 1_000);
+    let dropped = drop_entry(&a, base - 2_000);
+    let (source, _ds) = applied_in_order(&[&first, &write, &dropped]);
+    let kept = source.get_collection(DB, "orders").expect("premise: the write keeps the life");
+    let policy_at = Hlc::new(base - 3_000, 0);
+    assert!(kept.is_redated(), "premise: the drop re-dated the life");
+    assert_eq!(kept.merge_policy_at, Some(policy_at), "premise: the policy stamp is the first's");
+    assert!(kept.created > policy_at, "premise: created is the drop's successor, above it");
+    let (first_joiner, _d1) = joined_from(&source);
+    let (second_joiner, _d2) = joined_from(&first_joiner);
+    let (fed, _d3) = applied_in_order(&[&first, &write, &dropped]);
+    for (who, member) in
+        [("first joiner", &first_joiner), ("second joiner", &second_joiner), ("entry-fed", &fed)]
+    {
+        let held = member.get_collection(DB, "orders").expect("the member holds it");
+        assert_eq!(
+            held.merge_policy_at,
+            Some(policy_at),
+            "{who}: the policy stamp is the creation's, not the invented created"
+        );
+        assert_eq!(
+            options_of(member, "orders").map(|row| row.at),
+            Some(policy_at),
+            "{who}: the options row's Hlc is the creation's"
+        );
+    }
+}
+
+/// A sender whose page does not name the creation (its coverage is empty) is no reason for the joiner to hold a different stamp: the page
+/// makes the collection, so its stamp is the definition's and the row's, and a second joiner from that member matches the first.
+#[test]
+fn a_joiner_from_a_page_that_names_nothing_still_holds_the_senders_stamp_and_row() {
+    let (a, _da) = engine();
+    a.create_collection(DB, "orders").unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    page.versions = Default::default();
+    // the definition's route alone: the sender's own row rides the carry (tested above) and would be merged at the grant
+    page.carried.clear();
+    let (first, _d1) = engine();
+    first
+        .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect("the page applies");
+    let (second, _d2) = joined_from(&first);
+    for (who, member) in [("first", &first), ("second", &second)] {
+        assert_eq!(
+            options_of(member, "orders"),
+            options_of(&a, "orders"),
+            "{who}: the options row is the sender's"
+        );
+        assert_eq!(
+            member.get_collection(DB, "orders").unwrap().merge_policy_at,
+            a.get_collection(DB, "orders").unwrap().merge_policy_at,
+            "{who}: and so is the policy stamp"
+        );
+    }
+}
+
+/// A stop after the creation's commit: the first write the page makes after it fails (a stop here is a crash before whatever the page writes
+/// next), and the member restarts. The collection the page made stands, and it has its options row: the row is written in the creation's own
+/// transaction, so no stop leaves a collection standing without it (a re-applied page never fixes that, because the collection is held).
+#[test]
+fn a_stop_after_the_creation_commits_leaves_the_collection_its_options_row() {
+    let (a, _da) = engine();
+    let meta = a.create_collection(DB, "orders").unwrap();
+    // a document of the collection, so that a write always follows the creation's commit (the page's documents), whatever route wrote the row
+    a.insert(&meta, bson::doc! { "_id": 1 }).unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    assert_eq!(page.documents.len(), 1, "premise: the page carries the document");
+    // an unnamed creation, by the definition's route alone: the row is the route's to write
+    page.versions = Default::default();
+    page.carried.clear();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let b = std::sync::Arc::new(Engine::open(&path).unwrap());
+    let stopped = std::sync::Arc::clone(&b);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::RestoreCreated, move || {
+        assert!(stopped.arm_test_storage_failure("write"), "premise: the stop is armed");
+    });
+    let result = b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page);
+    assert!(result.is_err(), "premise: a write after the creation failed: {result:?}");
+    drop(b);
+    let b = Engine::open(&path).unwrap();
+    assert!(b.get_collection(DB, "orders").is_ok(), "premise: the creation committed");
+    assert_eq!(
+        options_of(&b, "orders"),
+        options_of(&a, "orders"),
+        "the collection the page made has its options row after the restart"
+    );
 }

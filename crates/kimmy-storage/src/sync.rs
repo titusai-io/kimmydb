@@ -3996,6 +3996,9 @@ pub(crate) mod race_hooks {
         ConvergePage,
         /// A validator change read the collection's definition, and has not yet taken the writer to write it back.
         Validator,
+        /// A snapshot restore has committed the collection it made and has done nothing more of it: not a race, a point at which a test stops
+        /// the page (a failed write from here is a stop between the creation's commit and whatever the page writes next).
+        RestoreCreated,
     }
 
     type Hook = Box<dyn FnOnce()>;
