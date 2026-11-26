@@ -2,13 +2,16 @@
 //!
 //! - S1: a page whose shadow is newer than the buried shadow waits on nothing, and makes neither the shadow nor the identity;
 //! - S2: after the purge, a page makes no shadow beside the swapped name and reports it orphaned;
-//! - S3 (a guard): a page of documents of the swapped identity is superseded and leaves the held rows untouched.
+//! - S3 (a guard): a page of documents of the swapped identity is superseded and leaves the held rows untouched;
+//! - S6-S8: an entry that changes the schema of a stage (an index dropped, a vector configuration, a validator) is refused, by the member that holds the stage and by the one that does not (S5, the index creation, lands with Q6.7 unit 1: below);
+//! - S9, S10: a page whose state is a stage does not configure vectors on it (S9) and still builds its index (S10, a guard).
 
 use std::time::Duration;
 
 use bson::doc;
 use kimmy_core::{
-    CollectionBind, CollectionId, DocId, Hlc, MergePolicy, OpKind, OplogEntry, Stamp, VectorRecord,
+    CollectionBind, CollectionId, DocId, Enforcement, Hlc, IndexCreate, IndexDrop, IndexField,
+    MergePolicy, OpKind, OplogEntry, Stamp, ValidatorSet, ValidatorSpec, VectorRecord, VectorSet,
     VersionVector, vector_meta,
 };
 
@@ -545,4 +548,304 @@ fn s12_a_shadow_whose_parent_name_is_swapped_before_the_writer_is_not_made() {
         m.get_collection(DB, &shadow_name()).is_err(),
         "the shadow is not made beside the swapped name"
     );
+}
+
+// ---- S5-S8: S's third commit, one test per entry arm ------------------------------------------------------------------------------------
+
+/// The four entry arms a definition reaches the stage by. Decision 15: a schema change addressed to a stage is refused on the name alone; the honest traffic addresses the LOGICAL name (the coder's addendum, item 3), so the refusal is not a carve-out.
+#[derive(Clone, Copy, Debug)]
+enum Arm {
+    #[allow(dead_code, reason = "built by S5, which lands with Q6.7 unit 1 (below)")]
+    CreateIndex,
+    DropIndex,
+    ConfigureVectors,
+    ConfigureValidator,
+}
+
+/// The entry for `arm`, addressed to the stage `FIRST` by the stage's author, stamped above the stage's creation and inside the clock-skew bound.
+fn entry_to_the_stage(w: &World, arm: Arm) -> OplogEntry {
+    entry_addressed_to(w, arm, FIRST)
+}
+
+/// The entry for `arm` addressed to the hidden physical `physical` (a stage's or a recreation's name), stamped as above.
+fn entry_addressed_to(w: &World, arm: Arm, physical: &str) -> OplogEntry {
+    let stamp =
+        Stamp::new(Hlc::new(physical_now_ms() + 25_000, 0), w.author.node_id(), w.author.epoch());
+    let at = CollectionId::derive(DB, physical);
+    let made = match arm {
+        Arm::CreateIndex => crate::engine::ddl_entry(
+            stamp,
+            OpKind::CreateIndex,
+            at,
+            &IndexCreate {
+                db: DB.into(),
+                collection: physical.into(),
+                index: kimmy_core::IndexMeta {
+                    id: kimmy_core::IndexMeta::derive_id("by_t"),
+                    name: "by_t".into(),
+                    fields: vec![IndexField::ascending("t")],
+                    unique: false,
+                    enforcement: Enforcement::Local,
+                    multikey: false,
+                    expire_after_secs: None,
+                    partial_filter: None,
+                    created: None,
+                },
+            },
+        ),
+        Arm::DropIndex => crate::engine::ddl_entry(
+            stamp,
+            OpKind::DropIndex,
+            at,
+            &IndexDrop { db: DB.into(), collection: physical.into(), index: "by_t".into() },
+        ),
+        Arm::ConfigureVectors => crate::engine::ddl_entry(
+            stamp,
+            OpKind::ConfigureVectors,
+            at,
+            &VectorSet {
+                db: DB.into(),
+                collection: physical.into(),
+                config: Some(vector_config()),
+            },
+        ),
+        Arm::ConfigureValidator => crate::engine::ddl_entry(
+            stamp,
+            OpKind::ConfigureValidator,
+            at,
+            &ValidatorSet {
+                db: DB.into(),
+                collection: physical.into(),
+                validator: Some(ValidatorSpec {
+                    schema: doc! { "bsonType": "object", "title": "to the stage" },
+                    action: Default::default(),
+                    level: Default::default(),
+                }),
+            },
+        ),
+    };
+    made.expect("the entry encodes")
+}
+
+/// What the stage must NOT have gained, per arm. The stage holds no index, no configuration, no validator and no shadow before the entry; after it, still none (for a drop: no tombstone under the stage's id).
+fn assert_the_stage_gained_nothing(m: &Engine, arm: Arm, what: &str) {
+    let stage = m.get_collection(DB, FIRST).expect("the stage is held");
+    assert!(stage.index("by_t").is_none(), "{what}: the stage gains no index ({arm:?})");
+    assert!(stage.vector.is_none(), "{what}: the stage gains no vector configuration ({arm:?})");
+    assert!(m.validator_of(&stage).is_none(), "{what}: the stage gains no validator ({arm:?})");
+    assert!(
+        m.get_collection(DB, &vector_meta::shadow_name(FIRST)).is_err(),
+        "{what}: the stage gains no shadow ({arm:?})"
+    );
+    assert!(
+        m.index_dropped_at(stage.id, kimmy_core::IndexMeta::derive_id("by_t"))
+            .expect("the tombstone is readable")
+            .is_none(),
+        "{what}: no index tombstone is recorded under the stage ({arm:?})"
+    );
+}
+
+/// One arm, both members: a member that HOLDS the stage (the entry is refused, counted, not applied: the stage gains nothing) and one that does NOT (it answers Refused too, not `UnknownCollection`: the window is not stopped, so a member that lacks the stage does not
+/// stall behind the entry and does not differ from one that holds it: decision 15's "an answer that depends on whether the stage is held would differ between members"). RED TODAY by the coder's read (sync.rs:3004, :3101, :3254, :3322; resolve_in
+/// finds no register event under a physical name's id and answers `resolve_identity` with `visible: None`, so the target is the stage and the entry is applied): the member that holds it applies the entry; the member without it stops with `UnknownCollection`
+/// (sync.rs:3052-3060, :3330-3335).
+/// Mutant: the check only in two of the four arms (the other two stay red); the check after the stage is resolved (the held member still applies); the refusal as `UnknownCollection` for the member without the stage.
+fn an_entry_addressed_to_a_hidden_physical_is_refused_and_changes_nothing(arm: Arm) {
+    let w = world();
+    let entry = entry_to_the_stage(&w, arm);
+
+    let (held, _dh) = member_plain(&[&w.first]);
+    assert!(held.get_collection(DB, FIRST).is_ok(), "premise: this member holds the stage");
+    assert_the_stage_gained_nothing(&held, arm, "premise");
+    let outcome = window(&held, std::slice::from_ref(&entry));
+    assert_eq!(
+        outcome.ddl_refused, 1,
+        "the member that holds the stage refuses the entry ({arm:?}; {outcome:?})"
+    );
+    assert_eq!(outcome.unknown_collection, 0, "and is not stopped by it ({arm:?})");
+    assert_the_stage_gained_nothing(&held, arm, "the member that holds the stage");
+
+    let (without, _dw) = member_plain(&[]);
+    assert!(
+        without.get_collection(DB, FIRST).is_err(),
+        "premise: this member does not hold the stage"
+    );
+    let outcome = window(&without, std::slice::from_ref(&entry));
+    assert_eq!(
+        outcome.unknown_collection, 0,
+        "the member WITHOUT the stage is not stopped (UnknownCollection) by an entry the member that holds it refuses ({arm:?}; {outcome:?})"
+    );
+    assert_eq!(outcome.ddl_refused, 1, "it answers Refused ({arm:?}; {outcome:?})");
+    assert!(without.get_collection(DB, FIRST).is_err(), "and holds no stage afterwards ({arm:?})");
+}
+
+/// The same refusal for a RECREATION's physical name (`orders.__rc.<stamp>`): hidden and made by the register alone, as a stage is, and no honest entry names it. A member that does not hold it answers Refused, not `UnknownCollection`, and creates nothing: the predicate is the hidden name, not the stage's.
+fn an_entry_addressed_to_a_recreation_is_refused_and_changes_nothing(arm: Arm) {
+    let w = world();
+    let stamp = Stamp::new(Hlc::new(physical_now_ms(), 0), w.author.node_id(), w.author.epoch());
+    let recreation = kimmy_core::recreation_name("orders", &stamp);
+    assert!(kimmy_core::is_recreation_name(&recreation), "premise: a recreation's name");
+    let entry = entry_addressed_to(&w, arm, &recreation);
+
+    let (m, _d) = member_plain(&[]);
+    assert!(
+        m.get_collection(DB, &recreation).is_err(),
+        "premise: this member holds no such collection"
+    );
+    let outcome = window(&m, std::slice::from_ref(&entry));
+
+    assert_eq!(
+        outcome.unknown_collection, 0,
+        "an entry addressed to a recreation does not stop the window ({arm:?}; {outcome:?})"
+    );
+    assert_eq!(outcome.ddl_refused, 1, "it answers Refused ({arm:?}; {outcome:?})");
+    assert!(
+        m.get_collection(DB, &recreation).is_err(),
+        "and holds nothing under that name ({arm:?})"
+    );
+}
+
+/// Q6.7 unit 1: lands with the creation entry carrying the definitions. A stage's indexes are copied into it by the writer's creation entry (Q67-prebuild
+/// unit 1, point 1, which rules separate stage-addressed CreateIndex entries out), and until unit 1 builds that, the join and floor tests make the copy
+/// by hand as a replicated CreateIndex addressed to the stage (23 of them). The refusal of that arm, and so S5, land with it, and with them the test
+/// that pins today's UnknownCollection for a physical the member never held (`join_tests::a_definition_entry_addressed_to_a_physical_the_member_never_held_...`).
+#[cfg(any())]
+mod q67_unit_1 {
+    use super::*;
+
+    #[test]
+    fn s5_a_create_index_addressed_to_a_stage_is_refused_by_the_member_that_holds_it_and_by_the_one_that_does_not()
+     {
+        an_entry_addressed_to_a_hidden_physical_is_refused_and_changes_nothing(Arm::CreateIndex);
+        an_entry_addressed_to_a_recreation_is_refused_and_changes_nothing(Arm::CreateIndex);
+    }
+}
+
+#[test]
+fn s6_a_drop_index_addressed_to_a_stage_is_refused_by_the_member_that_holds_it_and_by_the_one_that_does_not()
+ {
+    an_entry_addressed_to_a_hidden_physical_is_refused_and_changes_nothing(Arm::DropIndex);
+    an_entry_addressed_to_a_recreation_is_refused_and_changes_nothing(Arm::DropIndex);
+}
+
+#[test]
+fn s7_a_configure_vectors_addressed_to_a_stage_is_refused_by_the_member_that_holds_it_and_by_the_one_that_does_not()
+ {
+    an_entry_addressed_to_a_hidden_physical_is_refused_and_changes_nothing(Arm::ConfigureVectors);
+    an_entry_addressed_to_a_recreation_is_refused_and_changes_nothing(Arm::ConfigureVectors);
+}
+
+#[test]
+fn s8_a_configure_validator_addressed_to_a_stage_is_refused_by_the_member_that_holds_it_and_by_the_one_that_does_not()
+ {
+    an_entry_addressed_to_a_hidden_physical_is_refused_and_changes_nothing(Arm::ConfigureValidator);
+    an_entry_addressed_to_a_recreation_is_refused_and_changes_nothing(Arm::ConfigureValidator);
+}
+
+// ---- S9, S10: the page route ------------------------------------------------------------------------------------------------------------
+
+/// The stage information the member holds for `FIRST`, which a page whose state is that stage carries.
+fn held_stage(m: &Engine) -> kimmy_core::StageMeta {
+    m.get_collection(DB, FIRST)
+        .expect("the stage is held")
+        .stage
+        .expect("premise: the held stage carries its stage information")
+}
+
+/// A whole-database page of a sender that holds `orders` with the index `by_t` and (when `vector`) its vector configuration, in which the state of `orders` is RENAMED to the stage `FIRST`: what a page carries when its sender's visible physical is a stage
+/// (the page applies a state by `state.name`). HAND-FORGED. ASSUMPTIONS: `SnapshotPage::collections` is a public `Vec<CollectionState>`, and `CollectionState` has public `name` and `vector` fields (snapshot.rs:406 copies `vector` from the meta; the stamps
+/// `vector_changed` and the index `created` come from the sender and are named by the page's `versions`, so the coverage check at snapshot.rs:3955 passes).
+fn a_page_whose_state_is_the_stage(
+    vector: bool,
+    stage: kimmy_core::StageMeta,
+) -> (crate::SnapshotPage, Engine, tempfile::TempDir) {
+    let (a, d) = engine();
+    a.create_collection(DB, "orders").expect("the sender's collection");
+    a.create_index(DB, "orders", vec![IndexField::ascending("t")], false, Some("by_t".into()))
+        .expect("the sender's index");
+    if vector {
+        a.configure_vectors(DB, "orders", vector_config()).expect("the sender's configuration");
+    }
+    let mut page = a.snapshot_page(None, None).expect("the sender's page");
+    let state = page
+        .collections
+        .iter_mut()
+        .find(|state| state.name == "orders")
+        .expect("the page defines `orders`");
+    state.name = FIRST.into();
+    // what a sender whose visible physical is a stage carries: the stage's own information (a stage name with none is refused outright, and
+    // nothing of the state is applied)
+    state.stage = Some(stage);
+    (page, a, d)
+}
+
+fn apply_one_page(m: &Engine, from: &Engine, page: &crate::SnapshotPage) -> crate::SnapshotApplied {
+    let mut progress = SnapshotProgress::whole_database();
+    m.apply_snapshot_page(from.node_id(), &mut progress, page).expect("the page applies")
+}
+
+/// The page's vector step on a HIDDEN state: a swapped name keeps no vector configuration and a stage never has one (decision 12; the coder's addendum, item 4: snapshot.rs:3955-4001 calls `configure_vectors_inner` on the physical name with no hidden-name check).
+/// WANTED: the step is refused through `settled_vector_step`'s Refused path: skipped, warned, counted in `ddl_refused`; the stage gains no configuration; the page completes. RED TODAY: the stage is configured and `ddl_refused` is 0. The "and no shadow" assert is
+/// a GUARD and not a red reason: a configuration applied from a page makes no shadow (vectors.rs, `Configured::FromSnapshot` => None).
+/// Mutant: the check placed before `settled_vector_step` raises instead of skipping (the page fails and is asked again every round).
+#[test]
+fn s9_a_page_whose_state_is_a_stage_does_not_configure_vectors_on_it_and_counts_the_refusal() {
+    let w = world();
+    let (m, _d) = member_plain(&[&w.first]);
+    let (page, a, _da) = a_page_whose_state_is_the_stage(true, held_stage(&m));
+    assert!(
+        page.collections.iter().any(|state| state.name == FIRST && state.vector.is_some()),
+        "premise: the forged page carries a vector configuration for the stage"
+    );
+
+    let done = apply_one_page(&m, &a, &page);
+
+    assert_eq!(done.ddl_refused, 1, "the vector step is refused and counted once ({done:?})");
+    let stage = m.get_collection(DB, FIRST).expect("the stage is held");
+    assert!(stage.vector.is_none(), "the stage gains no vector configuration");
+    assert!(
+        m.get_collection(DB, &vector_meta::shadow_name(FIRST)).is_err(),
+        "and no shadow (a guard: a page's configuration makes none)"
+    );
+}
+
+/// The same for a state that TURNS vectors off (no configuration, a stamp the sender's coverage names): the step is skipped for a hidden physical whatever the state says, so the turn-off is not recorded on the stage either, and it is counted as the configuration is.
+#[test]
+fn s9b_a_page_whose_state_is_a_stage_and_turns_vectors_off_records_nothing_and_counts_the_refusal()
+{
+    let w = world();
+    let (m, _d) = member_plain(&[&w.first]);
+    let (mut page, a, _da) = a_page_whose_state_is_the_stage(false, held_stage(&m));
+    let covered = page.versions.get(Stamp::new(Hlc::ZERO, a.node_id(), a.epoch()).origin());
+    assert!(covered > Hlc::ZERO, "premise: the page's coverage names the sender's own writes");
+    let turned_off = Stamp::new(covered, a.node_id(), a.epoch());
+    let state = page
+        .collections
+        .iter_mut()
+        .find(|state| state.name == FIRST)
+        .expect("the page defines the stage");
+    assert!(state.vector.is_none(), "premise: the state carries no configuration");
+    state.vector_changed = Some(turned_off);
+
+    let done = apply_one_page(&m, &a, &page);
+
+    assert_eq!(done.ddl_refused, 1, "the turn-off is refused and counted once ({done:?})");
+    let stage = m.get_collection(DB, FIRST).expect("the stage is held");
+    assert!(stage.vector.is_none(), "the stage holds no vector configuration");
+    assert_eq!(stage.vector_changed, None, "and the turn-off is not recorded on it");
+}
+
+/// The refusal must stay on the VECTOR step: a page from a sender whose visible physical is a stage carries that physical's indexes and validator (the join gave them), and the receiver applies them by `state.name`. GUARD, GREEN TODAY (the coder's read; the
+/// index of a page lands on the stage in `a_snapshot_page_of_a_life_newer_...`'s second half through the name). It goes red if S's refusal is widened from the vector step to the whole hidden state.
+#[test]
+fn s10_a_page_whose_state_is_a_stage_still_builds_its_index_on_the_stage() {
+    let w = world();
+    let (m, _d) = member_plain(&[&w.first]);
+    let (page, a, _da) = a_page_whose_state_is_the_stage(false, held_stage(&m));
+
+    let done = apply_one_page(&m, &a, &page);
+
+    assert_eq!(done.ddl_refused, 0, "the index is not refused ({done:?})");
+    let stage = m.get_collection(DB, FIRST).expect("the stage is held");
+    assert!(stage.index("by_t").is_some(), "the page's index is built on the stage");
 }

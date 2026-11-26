@@ -467,8 +467,9 @@ fn a_replicated_validator_addressed_to_a_swapped_name_lands_on_the_bound_physica
 
 #[test]
 fn a_replicated_index_creation_addressed_to_a_stage_lands_on_that_stage() {
-    // The writer's own copy of a definition into the stage it is filling (Q6.7) names the stage's physical: a name with no register
-    // event of its own, found as a physical is. Built by hand here, as nothing mints it yet.
+    // A STAND-IN, built by hand. Q6.7 carries the writer's copy of a definition in the stage's CREATION ENTRY (Q67-prebuild unit 1, point 1),
+    // and a separate CreateIndex entry addressed to the stage is what that design rules out; until unit 1 builds it this entry stands in
+    // for the copy: a name with no register event of its own, found as a physical is. Unit S refuses it once unit 1 lands (S5).
     let pair = two_flipped_members();
     let index = kimmy_core::IndexMeta {
         id: kimmy_core::IndexMeta::derive_id("v_1"),

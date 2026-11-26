@@ -1917,6 +1917,10 @@ fn a_definition_entry_addressed_to_a_physical_the_member_never_held_stops_the_wi
     // Only an entry made by hand reaches it, as Q6.7's stage definitions would if they were separate entries; Q6.7 carries the
     // stage's definitions in the stage's creation entry (Q67-prebuild unit 1), which the member holds. A stop on an unknown collection
     // plans a snapshot, which never brings a buried physical: if Q6.7 ever sends such an entry the arm must treat it as history.
+    // Unit S (ADR-272, decision 15) refuses a replicated DropIndex, ConfigureVectors and ConfigureValidator addressed to a hidden physical,
+    // by its name; its refusal of a CreateIndex (S5) is NOT in place and lands WITH Q6.7 unit 1, which moves the stage's definitions into
+    // its creation entry, so that the stage-addressed CreateIndex entries below are no longer built by hand. When it lands this test
+    // expects Refused (counted, the window going on) and not the stop.
     let w = world();
     let (m, _d) = member(&w);
     flip(&m, &w.bind, Route::Window);
