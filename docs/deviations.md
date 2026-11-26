@@ -4321,6 +4321,18 @@ A restore is a new epoch, so a new origin, and a counter or a document that the 
 
 ---
 
+<a id="containment-untested-guarantees-d13"></a>
+
+## 🟡 Two guarantees of the halt are held by the code's order and by the model, and no test of this repository can observe them (D13)
+
+**What they are.** (1) **The halt's row is durable at the moment the halt returns:** it is committed `Immediate`, so a crash after the halt does not lose it. A mutant that commits it without the fsync is not killed, because the process would have to die between the commit and the fsync, and no test kills it there. (2) **`flush_pending_epochs` clears its flag before it takes the pending rows:** a row noted in between sets the flag again and is written by the next commit, where the other order could clear a flag that a concurrent note had just set and lose the row until the next contact. Both orders pass every test, because the loss is a race no unit test schedules, and the cost of the wrong one is a belief forgotten until the next handshake.
+
+**Where they are checked instead.** The order of the halt (mirror, then the gate, then the row) is by the plan review and the model row (crash windows are not in the model, so by the review); the race is by reading the code, and the model row's crash that loses unwritten rows (99,355 and 20,574 states, nothing broken).
+
+**To close:** a crash-injection test of the halt (a kill between the commit and the fsync) and a loom-style schedule of a note against a flush, neither of which the harness has.
+
+---
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —
