@@ -1730,6 +1730,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         // on another host. Not a peer that failed, so no back-off,
                         // no failure counted and no warning per tick: the address is
                         // remembered and left out (the transport said why, once).
+                        // An older epoch of its node, or this host superseded (ADR-274): the
+                        // contact ended, no round ran, and nobody failed.
+                        Err(crate::protocol::ProtocolError::Superseded) => {
+                            debug!(%peer, "left out: a superseded host");
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
+                            contact.finish();
+                        }
                         Err(crate::protocol::ProtocolError::SelfContact) => {
                             self_addresses.insert(peer, Instant::now());
                             debug!(%peer, "left out: the peer at this address is this node");

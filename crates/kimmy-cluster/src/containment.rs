@@ -192,3 +192,43 @@ pub fn clear_marker_file(_data_dir: &Path) -> std::io::Result<()> {
 pub fn restore_floor(_data_dir: &Path, _node: NodeId) -> std::io::Result<Option<Epoch>> {
     Ok(None)
 }
+
+/// Act on a tell that a newer epoch of `node` exists (the model row's finding 3). Called with a
+/// tell from a verified peer, read as the first frame after a handshake or as the reply to a first
+/// request. It halts this host only when `node` is this host's own and the told epoch is strictly
+/// newer than its own and within the bound of its own clock; anything else is logged and not acted
+/// on. The contact ends either way, and no round runs with that peer.
+pub(crate) fn act_on_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: Epoch) {
+    if node != engine.node_id() {
+        tracing::debug!(?node, "a tell about another node: not acted on");
+        return;
+    }
+    let clock = engine.bound_clock_ms();
+    let skew = engine.clock_bound().skew_ms;
+    if !tell_acted_on(clock, skew, engine.epoch(), epoch) {
+        tracing::warn!(
+            told = %epoch.to_hex(),
+            own = %engine.epoch().to_hex(),
+            "a peer told this host of an epoch of its node that is not newer than its own or is \
+             beyond its clock bound: not acted on, and no round runs with that peer"
+        );
+        return;
+    }
+    tracing::warn!(
+        told = %epoch.to_hex(),
+        own = %engine.epoch().to_hex(),
+        "this host was told that a newer epoch of its node exists: it halts"
+    );
+    // Halt FIRST and whatever else happens: the note is a best effort and must not delay the
+    // mirror. `halt` takes the writer gate, which is not re-entrant, so this is called only where
+    // no write transaction is held (a test pins the call sites).
+    if let Err(e) = kimmy_storage::blocking(|| engine.halt(epoch)) {
+        tracing::error!(
+            error = %e,
+            "this host could not be halted; it refuses writes if the halt's mirror was set"
+        );
+    }
+    if let Err(e) = engine.note_epoch(node, epoch) {
+        tracing::warn!(error = %e, "the newer epoch could not be noted; a handshake relearns it");
+    }
+}

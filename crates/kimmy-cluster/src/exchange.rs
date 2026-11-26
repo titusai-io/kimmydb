@@ -152,15 +152,17 @@ async fn exchange_within(
     limit: Duration,
 ) -> Result<NodeId, ProtocolError> {
     let (mut stream, their_node) = dial(engine, peer, secret).await?;
-    let answered = tokio::time::timeout(limit, frames(&mut stream, their_node, members, ours))
-        .await
-        .unwrap_or_else(|_| Err(ProtocolError::TimedOut("facts exchange".into())));
+    let answered =
+        tokio::time::timeout(limit, frames(engine, &mut stream, their_node, members, ours))
+            .await
+            .unwrap_or_else(|_| Err(ProtocolError::TimedOut("facts exchange".into())));
     close(&mut stream).await;
     answered.map(|()| their_node)
 }
 
 /// The frame pair of an exchange, over a dialled and authenticated stream.
 async fn frames<S>(
+    engine: &Engine,
     stream: &mut S,
     their_node: NodeId,
     members: &Members,
@@ -194,6 +196,11 @@ where
             Ok(())
         }
         Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
+        // The member answering tells this host that a newer epoch of its node exists (ADR-274).
+        Message::Superseded { node, epoch } => {
+            crate::containment::act_on_tell(engine, node, epoch);
+            Err(ProtocolError::Superseded)
+        }
         other => Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}"))),
     }
 }

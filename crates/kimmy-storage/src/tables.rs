@@ -341,6 +341,14 @@ pub const META_NODE_ID: &str = "node_id";
 /// finds no row, never from a value read from the store.
 pub const META_EPOCH: &str = "epoch";
 
+/// The halt of a host that was told a newer epoch of its node exists (D13 containment, ADR-274):
+/// the 18-byte epoch it halts (this member's own), a byte that is 1 when a newer epoch was told of
+/// (0 for a halt by the mistaken-restore guard), and that epoch's 18 bytes. Read at the end of an
+/// open, and **in force only when the epoch it names is the store's own**: a backup copies `META`
+/// whole, and a restore mints a new epoch, so a restored copy of a halted host is not halted.
+/// Written in a durable commit under the writer gate.
+pub const META_HALT: &str = "halt";
+
 /// The newest epoch of each node this member has recorded (D13 containment, ADR-274): the key is
 /// the 16-byte node id and the value the 18-byte epoch, and a row only ever rises. Written from a
 /// verified handshake (a peer's claim, within the clock bound) and from a relayed row, never from a

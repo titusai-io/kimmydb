@@ -1,8 +1,8 @@
 //! D13 containment (ADR-274): the newest epoch of each node this member has heard of, and the halt
 //! of a host that is told a newer epoch of its own node exists.
 //!
-//! The table of newest epochs is here ([`tables::EPOCH_NEWEST`]); the halt is still the scaffold of
-//! the tests commits (`halt` and `halted` do nothing), and the code commits replace them.
+//! The table of newest epochs is here ([`tables::EPOCH_NEWEST`]), and the halt's row and text.
+//! The halt itself (`Engine::halt`, `Engine::halted`) is in `engine.rs`, beside the gate it takes.
 
 use kimmy_core::{Epoch, NodeId};
 use redb::{ReadableDatabase, ReadableTable};
@@ -150,18 +150,55 @@ impl Engine {
     pub fn bound_clock_ms(&self) -> u64 {
         crate::physical_now_ms().max(self.logical_clock_wall_ms())
     }
+}
 
-    /// Halt this host: it was told that `told`, a newer epoch of its own node, exists. The mirror
-    /// is set first, then the writer gate is taken, then the halt row (naming this member's own
-    /// epoch) is committed durably. **Scaffold: does nothing yet.**
-    pub fn halt(&self, _told: Epoch) -> Result<()> {
-        Ok(())
+impl Halt {
+    /// The row [`tables::META_HALT`] holds: the epoch halted, a byte for whether a newer one was
+    /// told of, and that epoch.
+    pub(crate) fn to_row(self) -> Vec<u8> {
+        let mut row = self.halted.0.to_vec();
+        match self.told {
+            Some(told) => {
+                row.push(1);
+                row.extend_from_slice(&told.0);
+            }
+            None => {
+                row.push(0);
+                row.extend_from_slice(&[0; Epoch::LEN]);
+            }
+        }
+        row
     }
 
-    /// The halt this store holds for its own epoch, if any: `None` when it was never halted, and
-    /// `None` when the row names another epoch (a backup of a halted host, restored). **Scaffold:
-    /// always `None` yet.**
-    pub fn halted(&self) -> Option<Halt> {
-        None
+    /// The inverse of [`Self::to_row`]; `None` for a row that is not 37 bytes.
+    pub(crate) fn from_row(row: &[u8]) -> Option<Self> {
+        if row.len() != 2 * Epoch::LEN + 1 {
+            return None;
+        }
+        let halted = Epoch(row[..Epoch::LEN].try_into().ok()?);
+        let told = (row[Epoch::LEN] == 1)
+            .then(|| row[Epoch::LEN + 1..].try_into().ok().map(Epoch))
+            .flatten();
+        Some(Self { halted, told })
+    }
+
+    /// What an operator reads: why this host halted and what to do. One text, shared by the refusal
+    /// of a request, readiness and the log line.
+    pub fn reason(&self) -> String {
+        let recovery = "delete the store file, keep the containment file, and run \
+                        `kimmyd restore`; the recovered host wins only with `--replace`";
+        match self.told {
+            Some(told) => format!(
+                "it was told that a newer epoch of its node exists ({}); a host of that node now \
+                 runs elsewhere, and this one, on epoch {}, serves nothing; to recover: {recovery}",
+                told.to_hex(),
+                self.halted.to_hex()
+            ),
+            None => format!(
+                "the mistaken-restore guard found its node live at another address, and this host, \
+                 on epoch {}, serves nothing; to recover: {recovery}",
+                self.halted.to_hex()
+            ),
+        }
     }
 }

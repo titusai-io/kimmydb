@@ -269,3 +269,60 @@ fn replace_is_honoured_only_for_the_store_on_the_epoch_it_names() {
     );
     assert!(!replace_honoured(None, minted), "no flag, no replace");
 }
+
+// -- halt takes the writer gate, which is not re-entrant (hardproblems' review) ------------
+
+/// `Engine::halt` waits for the writer, so a thread that holds a write transaction and calls it
+/// would wait for itself. The cluster crate opens no write transaction of its own, and a tell is
+/// acted on only from the async functions that read the frame (the accept loop, the handshakes,
+/// a sync round's first reply, a push's reply, an exchange): a write transaction holds a guard that
+/// is not `Send`, so none can be alive across the `.await` that read it. This pins both.
+#[test]
+fn a_tell_is_acted_on_only_where_no_write_transaction_is_held() {
+    const ALLOWED: &[&str] = &[
+        "accept_handshake",
+        "open_handshake",
+        "serve_peer_counting",
+        "sync_round",
+        "push_over",
+        "frames",
+    ];
+    let mut found = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    for (file, source) in [
+        ("transport.rs", include_str!("transport.rs")),
+        ("confirm.rs", include_str!("confirm.rs")),
+        ("exchange.rs", include_str!("exchange.rs")),
+    ] {
+        // The production code ends where the file's own test module begins: transport.rs has
+        // smaller test modules above most of its code, so the first `#[cfg(test)]` is not the end.
+        let end = source.find("#[cfg(test)]\nmod tests {").expect("the file's test module");
+        let production = &source[..end];
+        assert!(!production.contains("begin_write"), "{file} opens a write transaction");
+        let lines: Vec<&str> = production.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains("act_on_tell(") {
+                continue;
+            }
+            let enclosing = lines[..=n]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    let head = l.trim_start();
+                    let at = head.find("fn ")?;
+                    head[..at]
+                        .split_whitespace()
+                        .all(|w| w.starts_with("pub") || ["async", "const"].contains(&w))
+                        .then(|| head[at + 3..].split(['(', '<']).next().unwrap_or("").to_string())
+                })
+                .unwrap_or_default();
+            assert!(ALLOWED.contains(&enclosing.as_str()), "{file}:{}: {enclosing}", n + 1);
+            seen.insert(enclosing);
+            found += 1;
+        }
+    }
+    assert!(found >= 5, "premise: the scan found the call sites: {found}");
+    let allowed: std::collections::BTreeSet<String> =
+        ALLOWED.iter().map(ToString::to_string).collect();
+    assert_eq!(seen, allowed, "every allowed function still acts on a tell, and no other does");
+}

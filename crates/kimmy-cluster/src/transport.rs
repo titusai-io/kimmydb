@@ -721,6 +721,8 @@ impl ServeFailure {
             ProtocolError::SelfContact => None,
             // A probe was answered, and ends there.
             ProtocolError::Probed => None,
+            // A superseded host: the contact ends, and nobody failed.
+            ProtocolError::Superseded => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
             ProtocolError::Fault(_) => Some(Self::Fault),
             ProtocolError::Release(_) => Some(Self::Release),
@@ -971,7 +973,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::StoreInUse(_)
         | E::OutcomeUnknown(_)
         | E::NotEnoughSpace { .. }
-        | E::Stopping(_) => true,
+        | E::Stopping(_)
+        // A halted host (ADR-274) refuses an apply on its own account: this node's, not the peer's.
+        | E::Halted(_) => true,
         // A client request's answer, never an apply's; placed by what
         // stopped it.
         E::PartiallyApplied { cause, .. } => is_local_failure(cause),
@@ -1713,6 +1717,12 @@ where
                 .await?;
             }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            // A verified peer tells this host that a newer epoch of its node exists (ADR-274): it
+            // acts, and the contact ends.
+            Message::Superseded { node, epoch } => {
+                crate::containment::act_on_tell(engine, node, epoch);
+                return Err(ProtocolError::Superseded);
+            }
             // Anything else is a peer talking out of turn.
             other => {
                 let reason = format!("unexpected message: {other:?}");
@@ -1793,8 +1803,23 @@ where
     }
     // The proof has verified: only now is the peer's claim of its epoch believed (ADR-274). It is
     // bounded by this member's clock, recorded, and the contact ends if it is beyond the bound.
-    if let Some(epoch) = claimed {
-        believe_claim(engine, node, epoch)?;
+    if let Some(claimed) = claimed {
+        believe_claim(engine, node, claimed)?;
+        // A newer host of this node dialled this one and its proof verified: this host is
+        // superseded.
+        if node == engine.node_id() && claimed > engine.epoch() {
+            crate::containment::act_on_tell(engine, node, claimed);
+            return Err(ProtocolError::Superseded);
+        }
+        // The dialler is on an epoch older than the newest this member knows of its node: tell it,
+        // after its Confirm has verified, and run no round with it. Equal is no tell: a host that
+        // dials its own address is not halted.
+        let newest = kimmy_storage::blocking(|| engine.newest_epoch(node))
+            .map_err(|e| from_storage(e, ProtocolError::Local))?;
+        if !crate::containment::runs_round(newest, claimed) {
+            let _ = write_frame(stream, &Message::Superseded { node, epoch: newest }).await;
+            return Err(ProtocolError::Superseded);
+        }
     }
     Ok(node)
 }
@@ -1830,7 +1855,10 @@ fn believe_claim(
             clock.saturating_add(skew)
         )));
     }
-    // A first sight of an epoch writes a row, which is a blocking write on a runtime worker.
+    // Recording the newer epoch of this host's own node, which a newer host's handshake brings, is
+    // the intended path: the row is what the halt reads, and an equal epoch (a host dialling its
+    // own address) raises nothing. A first sight of an epoch writes a row, which is a blocking
+    // write on a runtime worker.
     kimmy_storage::blocking(|| engine.note_epoch(peer, epoch))
         .map_err(|e| from_storage(e, ProtocolError::Local))
 }
@@ -2870,6 +2898,11 @@ where
             (servable, witnessed, facts, replay_from)
         }
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+        // The member answering tells this host that a newer epoch of its node exists (ADR-274).
+        Message::Superseded { node, epoch } => {
+            crate::containment::act_on_tell(engine, node, epoch);
+            return Err(ProtocolError::Superseded);
+        }
         other => {
             return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
         }
@@ -6784,6 +6817,20 @@ where
     believe_claim(engine, their_node, their_epoch)?;
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
+    // A newer host of this node answered: this host is superseded and halts (a verified Welcome,
+    // within the bound).
+    if their_node == engine.node_id() && their_epoch > engine.epoch() {
+        crate::containment::act_on_tell(engine, their_node, their_epoch);
+        return Err(ProtocolError::Superseded);
+    }
+    // The responder is on an epoch older than the newest this member knows of its node: send the
+    // tell after the Confirm, and run no round with it.
+    let newest = kimmy_storage::blocking(|| engine.newest_epoch(their_node))
+        .map_err(|e| from_storage(e, ProtocolError::Local))?;
+    if !crate::containment::runs_round(newest, their_epoch) {
+        let _ = write_frame(stream, &Message::Superseded { node: their_node, epoch: newest }).await;
+        return Err(ProtocolError::Superseded);
+    }
     Ok(their_node)
 }
 

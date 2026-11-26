@@ -186,6 +186,12 @@ pub enum StorageError {
     #[error("the node is stopping: {0}")]
     Stopping(StopReason),
 
+    /// This host was told that a newer epoch of its node exists, and halted (D13 containment,
+    /// ADR-274). No transaction begins and no flush commits from then on; the text says why and
+    /// what to do. The halt is durable: a restart is still halted.
+    #[error("this host is halted: {0}")]
+    Halted(String),
+
     /// A request that commits in more than one transaction failed after its
     /// first commit (ADR-192). What `applied` counts is committed, published
     /// and replicating; `cause` is why the request stopped there.

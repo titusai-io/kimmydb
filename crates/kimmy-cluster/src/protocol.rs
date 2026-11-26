@@ -715,6 +715,12 @@ pub enum ProtocolError {
     /// with a `Welcome` and nothing follows it. Not a failure of anyone.
     #[error("the peer was a probe")]
     Probed,
+    /// A contact ended because one of the two hosts is superseded (D13 containment, ADR-274): this
+    /// host was told, or found, that a newer epoch of its node exists and halted, or the peer is on
+    /// an epoch older than the newest this member knows of its node and was told so. No round runs
+    /// with it (the model row's finding 3). Not a failure of anyone: no backoff, nothing counted.
+    #[error("a host of an older epoch of its node: the contact ends")]
+    Superseded,
     /// The peer's handshake named a cluster protocol other than this build's
     /// (or none). The text names both; it is also what the refuser sent the
     /// peer as a [`Message::Fault`].

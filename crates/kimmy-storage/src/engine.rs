@@ -340,6 +340,15 @@ pub struct Engine {
     /// from any peer, unlike the halt, whose row is durable.
     pub(crate) epochs_pending: Mutex<std::collections::BTreeMap<NodeId, Epoch>>,
     pub(crate) epochs_pending_flag: std::sync::atomic::AtomicBool,
+    /// Set when this host is halted (D13 containment, ADR-274): every write transaction and every
+    /// flush is refused, as with `writes_closed`, and read under the writer gate in the same two
+    /// places. The halt's row is durable and this is its mirror: **set first, then the gate is
+    /// taken, then the row is committed** ([`Engine::halt`]), so a writer queued on the gate cannot
+    /// commit after the halt. Loaded at the end of an open.
+    halted_flag: std::sync::atomic::AtomicBool,
+    /// What the halt knows of why: set with [`Self::halted_flag`], and read by readiness and the
+    /// refusal's text.
+    halt_info: Mutex<Option<crate::containment::Halt>>,
     /// Set at the node's stop signal, for reads that walk: see
     /// [`Engine::stop_walks`].
     walks_stopping: std::sync::atomic::AtomicBool,
@@ -1896,6 +1905,8 @@ impl Engine {
             newest_epochs: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending_flag: std::sync::atomic::AtomicBool::new(false),
+            halted_flag: std::sync::atomic::AtomicBool::new(false),
+            halt_info: Mutex::new(None),
             walks_stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
@@ -1952,6 +1963,10 @@ impl Engine {
             engine.violations.set_ready();
         }
 
+        // Last, so that the open's own transactions above (the rebuild of the loss records goes
+        // through `begin_write`) are not refused by a halt that was in force when the store was
+        // closed (ADR-274).
+        engine.load_halt_row()?;
         engine.load_newest_epochs()?;
 
         Ok(engine)
@@ -2515,6 +2530,98 @@ impl Engine {
         drop(guard);
         self.coalesce_woken.notify_all();
         ok
+    }
+
+    /// Halt this host: it was told that `told`, a newer epoch of its own node, exists (D13
+    /// containment, ADR-274). **The order is the order of [`Self::close_writes`]**: the mirror
+    /// first, then the writer gate, then the halt row (naming this member's own epoch) in one
+    /// durable transaction. A transaction that held the gate before the halt took it has finished;
+    /// one queued behind it reads the flag under the gate and is refused; the flush leader that was
+    /// asleep through the halt finds the flag in `flush_now` and commits nothing. The halt's own
+    /// transaction is also a flush: it carries every earlier coalesced commit to the disk and does
+    /// the barrier's bookkeeping.
+    ///
+    /// A halt that is already in force for `told` or a newer epoch changes nothing. If the row's
+    /// commit fails the mirror stays set and the failure is returned: the host refuses writes until
+    /// it restarts and is then told again.
+    pub fn halt(&self, told: Epoch) -> Result<()> {
+        let halt = {
+            let mut info = self.halt_info.lock();
+            let told = info.and_then(|h| h.told).map_or(told, |held| held.max(told));
+            if info.is_some_and(|h| h.told == Some(told)) {
+                return Ok(());
+            }
+            let halt = crate::containment::Halt { halted: self.epoch, told: Some(told) };
+            *info = Some(halt);
+            halt
+        };
+        self.halted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waited_from = std::time::Instant::now();
+        let gate = blocking(|| self.writer_gate.lock());
+        meter_writer_wait(waited_from.elapsed());
+        let row = halt.to_row();
+        let result = self.flush_holding_with(gate, Some((tables::META_HALT, row.as_slice())));
+        {
+            let mut guard = self.coalescer.lock();
+            if let Some(c) = guard.as_mut() {
+                let (coverage, failure) = match &result {
+                    Ok(coverage) => (coverage, None),
+                    Err((coverage, e)) => (coverage, Some(e)),
+                };
+                if coverage.generation == Some(c.generation) {
+                    match failure {
+                        None => c.flushed = c.flushed.max(coverage.covered),
+                        Some(e) => c.failed = Some((coverage.covered, e.to_string())),
+                    }
+                }
+            }
+        }
+        self.coalesce_woken.notify_all();
+        match result {
+            Ok(_) => {
+                warn!(epoch = %self.epoch.to_hex(), told = %told.to_hex(), "this host is halted");
+                Ok(())
+            }
+            Err((_, e)) => {
+                tracing::error!(
+                    error = %e,
+                    "the halt's row could not be committed: this host refuses writes until restart"
+                );
+                Err(StorageError::Database(e.to_string()))
+            }
+        }
+    }
+
+    /// The halt this host is in, if any: `None` when it was never halted, and `None` when the
+    /// store's halt row names another epoch (a backup of a halted host, restored).
+    pub fn halted(&self) -> Option<crate::containment::Halt> {
+        *self.halt_info.lock()
+    }
+
+    /// The refusal of a write on a halted host: the text says why and what to do.
+    fn halted_refusal(&self) -> StorageError {
+        let why = self.halted().map_or_else(|| "this host is halted".to_string(), |h| h.reason());
+        StorageError::Halted(why)
+    }
+
+    /// Load the halt row at the end of an open: in force only when it names this store's own epoch.
+    fn load_halt_row(&self) -> Result<()> {
+        let row = {
+            let txn = self.db.begin_read()?;
+            let meta = txn.open_table(tables::META)?;
+            meta.get(tables::META_HALT)?.map(|v| v.value().to_vec())
+        };
+        if let Some(halt) = row.as_deref().and_then(crate::containment::Halt::from_row)
+            && halt.halted == self.epoch
+        {
+            *self.halt_info.lock() = Some(halt);
+            self.halted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            warn!(
+                epoch = %self.epoch.to_hex(),
+                "this store was halted by a newer epoch of its node and starts halted"
+            );
+        }
+        Ok(())
     }
 
     /// Whether a continuing request must stop: the drain deadline passed, or
@@ -4770,6 +4877,12 @@ impl Engine {
             let reason = self.stop_reason().unwrap_or(crate::StopReason::DrainDeadline);
             return Err(StorageError::Stopping(reason));
         }
+        // A halted host begins no transaction (ADR-274): read under the gate, so a writer that
+        // queued before the halt took the gate finds the flag the halt set first.
+        if self.halted_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(gate);
+            return Err(self.halted_refusal());
+        }
         if continuing == Continuing::Yes
             && let Some(reason) = self.stop_reason()
         {
@@ -4962,7 +5075,12 @@ impl Engine {
         let waited_from = std::time::Instant::now();
         let gate = blocking(|| self.writer_gate.lock());
         meter_writer_wait(waited_from.elapsed());
-        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
+        // Closed, or halted (ADR-274): the flush that finds either flag commits nothing, and a
+        // halt's own flush covered every ticket issued before it (`halt`), none can have been
+        // issued since.
+        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.halted_flag.load(std::sync::atomic::Ordering::SeqCst)
+        {
             // Closed (ADR-192): `close_writes` ran the last flush under the
             // writer, and no ticket can have been issued since. Commit
             // nothing, and report what that flush made durable.
@@ -4992,6 +5110,16 @@ impl Engine {
         &self,
         gate: parking_lot::MutexGuard<'_, ()>,
     ) -> std::result::Result<Coverage, (Coverage, redb::CommitError)> {
+        self.flush_holding_with(gate, None)
+    }
+
+    /// A flush that also writes `row` into `META` in its own durable transaction: the halt's row
+    /// ([`Engine::halt`]).
+    fn flush_holding_with(
+        &self,
+        gate: parking_lot::MutexGuard<'_, ()>,
+        row: Option<(&str, &[u8])>,
+    ) -> std::result::Result<Coverage, (Coverage, redb::CommitError)> {
         let mut gate = WriterHold::new(self, gate, WriterHolder::Durability);
         // Read with the writer held, and before this flush's own commit:
         // every ticket up to here belongs to a commit that has landed, and
@@ -5014,6 +5142,9 @@ impl Engine {
             let n = self.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
             meta.insert("durability_flush", n.to_be_bytes().as_slice())
                 .map_err(|e| (covered, io(e.to_string())))?;
+            if let Some((key, value)) = row {
+                meta.insert(key, value).map_err(|e| (covered, io(e.to_string())))?;
+            }
         }
         gate.commit_from = Some(std::time::Instant::now());
         txn.commit().map_err(|e| (covered, e))?;
@@ -8510,6 +8641,7 @@ mod tests {
         const GATE: &[(&str, &str)] = &[
             ("begin_write_as", "record_writer_wait("),
             ("flush_now", "meter_writer_wait("),
+            ("halt", "meter_writer_wait("),
             ("hold_writer", "record_writer_wait("),
             (
                 "close_writes",
@@ -8566,7 +8698,7 @@ mod tests {
             "seed_collected_if_untracked",
             "decide_violations_ready",
             "begin_write_as",
-            "flush_holding",
+            "flush_holding_with",
         ];
         let raw = mentions(".begin_write()");
         for (name, code) in &raw {

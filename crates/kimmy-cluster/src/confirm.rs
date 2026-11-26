@@ -595,6 +595,11 @@ impl Confirmer {
         let held = match read_frame(&mut stream).await {
             Ok(Message::Witnessed(held)) => held,
             Ok(Message::Fault(reason)) => return failed(ProtocolError::Fault(reason)),
+            // The member answering tells this host that a newer epoch of its node exists (ADR-274).
+            Ok(Message::Superseded { node, epoch }) => {
+                crate::containment::act_on_tell(&self.engine, node, epoch);
+                return failed(ProtocolError::Superseded);
+            }
             Ok(other) => {
                 return failed(ProtocolError::Malformed(format!(
                     "expected Witnessed, got {other:?}"
