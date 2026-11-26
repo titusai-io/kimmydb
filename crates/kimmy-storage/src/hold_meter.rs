@@ -806,6 +806,15 @@ impl redb::StorageBackend for MeteredBackend {
     fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::SetLen);
+        #[cfg(test)]
+        {
+            self.health.note_resize(true);
+            if crate::health::in_write_commit() {
+                test_hooks::GROWS_IN_COMMIT.with(|c| c.set(c.get() + 1));
+            } else {
+                test_hooks::GROWS_IN_BODY.with(|c| c.set(c.get() + 1));
+            }
+        }
         self.checked("set_len", || io(Io::SetLen, 0, || self.inner.set_len(len)))
     }
 
@@ -815,12 +824,17 @@ impl redb::StorageBackend for MeteredBackend {
         // Before the call: a commit that attempted a sync and then failed,
         // here or later, may have reached the disk.
         self.health.sync_attempted();
-        self.checked("sync_data", || io(Io::Sync, 0, || self.inner.sync_data()))
+        let synced = self.checked("sync_data", || io(Io::Sync, 0, || self.inner.sync_data()));
+        #[cfg(test)]
+        self.health.note_resize(false);
+        synced
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::Write);
+        #[cfg(test)]
+        self.health.note_resize(false);
         self.checked("write", || io(Io::Write, data.len(), || self.inner.write(offset, data)))
     }
 
@@ -930,6 +944,10 @@ pub(crate) mod test_hooks {
         /// The backend call the next engine open on this thread fails once,
         /// armed before redb's open runs.
         pub static ARM_AT_OPEN: Cell<Option<&'static str>> = const { Cell::new(None) };
+        /// `set_len` calls made inside the commit of a client write on this thread: growths that a commit made itself.
+        pub static GROWS_IN_COMMIT: Cell<u64> = const { Cell::new(0) };
+        /// `set_len` calls made outside any commit on this thread: growths made in the body of a transaction.
+        pub static GROWS_IN_BODY: Cell<u64> = const { Cell::new(0) };
         /// Where the next engine open on this thread stops, as a kill would:
         /// `"tables"` after the ensure-tables commit, `"schema"` after the
         /// schema's. The open then returns an error and leaves the store as that

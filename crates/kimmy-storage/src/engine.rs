@@ -10582,6 +10582,105 @@ mod tests {
         assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
     }
 
+    /// The growth's own sync, inside the commit: redb lengthens the file and syncs it from inside page allocation, with the commit's pages
+    /// still buffered (`grow`, redb 4.6.0). A client write whose commit does that and whose sync fails is UNKNOWN, since a sync was attempted in
+    /// the commit, and nothing of the commit has been written: the write is ABSENT after the reopen, and the store opens clean.
+    ///
+    /// Where a store's file runs out depends on what it holds, so the test does not name a document: a scratch store is filled in the same
+    /// way until a write's commit grows the file by itself (a growth counted inside the commit), and a second store, filled the same way
+    /// (pages are the same size whatever the stamps and ids the stores hold), is armed for that one write.
+    #[test]
+    fn a_growth_inside_a_client_commit_whose_sync_fails_is_unknown_and_leaves_the_write_absent() {
+        use bson::doc;
+        let grows = || crate::hold_meter::test_hooks::GROWS_IN_COMMIT.with(|c| c.get());
+        let fill = |id: i64| doc! {"_id": id, "pad": "x".repeat(200)};
+        // the scratch store: the first write whose commit grows the file
+        let scratch = {
+            let (engine, coll, _dir, _path) = engine_with_collection();
+            let mut found = None;
+            for id in 0..20_000i64 {
+                let before = grows();
+                engine.insert(&coll, fill(id)).unwrap();
+                if grows() > before {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found.expect("premise: some write's commit grows the file by itself")
+        };
+        let (engine, coll, _dir, path) = engine_with_collection();
+        for id in 0..scratch {
+            engine.insert(&coll, fill(id)).unwrap();
+        }
+        assert!(engine.arm_test_storage_failure("sync_data@grow"));
+        let failed = engine.insert(&coll, fill(scratch)).unwrap_err();
+        assert!(
+            matches!(failed, StorageError::OutcomeUnknown(_)),
+            "unknown, not failed: {failed:?}"
+        );
+        drop(coll);
+        drop(engine);
+        assert!(!present_after_reopen(&path, scratch), "the write whose growth failed is absent");
+        // and the store opens clean, with every earlier write in it
+        let reopened = Engine::open(&path).unwrap();
+        let coll = reopened.get_collection("app", "c").unwrap();
+        assert_eq!(reopened.count(&coll, crate::walk::WalkScope::Request).unwrap(), scratch as u64);
+    }
+
+    /// The same growth in the BODY of the transaction, before the commit begins: nothing of the transaction is written, so the failure is a
+    /// PLAIN failure and not unknown, the write is absent after the repair, and the repaired store takes a further write and reads it back.
+    /// The last pins that the repair accepts a file longer than its layout (redb 4.6.0 rebuilds the layout from the file's length), since
+    /// the failed growth had already lengthened the file.
+    #[test]
+    fn a_growth_in_the_body_whose_sync_fails_is_a_plain_failure_and_the_store_takes_the_next_write()
+    {
+        use bson::doc;
+        let body_grows = || crate::hold_meter::test_hooks::GROWS_IN_BODY.with(|c| c.get());
+        let fill = |id: i64| doc! {"_id": id, "pad": "x".repeat(200)};
+        let scratch = {
+            let (engine, coll, _dir, _path) = engine_with_collection();
+            let mut found = None;
+            for id in 0..20_000i64 {
+                let before = body_grows();
+                engine.insert(&coll, fill(id)).unwrap();
+                if body_grows() > before {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found.expect("premise: some write grows the file in its body")
+        };
+        let (engine, coll, _dir, path) = engine_with_collection();
+        for id in 0..scratch {
+            engine.insert(&coll, fill(id)).unwrap();
+        }
+        let length = || std::fs::metadata(&path).unwrap().len();
+        let length_before = length();
+        assert!(engine.arm_test_storage_failure("sync_data@grow-body"));
+        let failed = engine.insert(&coll, fill(scratch)).unwrap_err();
+        assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "a plain failure: {failed:?}");
+        // and it is the injected failure of the growth's sync, not some other (a hook that misfired would pass the line above too)
+        let failure = engine.storage_failed().expect("the injected failure was recorded");
+        assert_eq!(failure.call, "sync_data", "{failure:?}");
+        assert!(failure.error.contains("os error 5"), "the injected I/O error: {failure:?}");
+        // the failed growth had already lengthened the file, so the repair below is of a file longer than its layout
+        assert!(
+            length() > length_before,
+            "premise: the file is longer than before the failed write"
+        );
+        drop(coll);
+        drop(engine);
+        assert!(!present_after_reopen(&path, scratch), "the write is absent after the repair");
+        let reopened = Engine::open(&path).unwrap();
+        let coll = reopened.get_collection("app", "c").unwrap();
+        reopened.insert(&coll, fill(1_000_000)).expect("the repaired store takes a further write");
+        assert!(reopened.get(&coll, &kimmy_core::DocId::Int64(1_000_000)).unwrap().is_some());
+        assert_eq!(
+            reopened.count(&coll, crate::walk::WalkScope::Request).unwrap(),
+            scratch as u64 + 1
+        );
+    }
+
     #[test]
     fn a_write_whose_fsync_fails_while_another_threads_failure_is_reported_is_outcome_unknown() {
         // The first I/O error hits a reader, whose thread runs the reaction

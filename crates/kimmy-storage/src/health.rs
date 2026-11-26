@@ -61,12 +61,28 @@ pub(crate) struct StorageHealth {
     /// redb takes after it.
     #[cfg(test)]
     armed_after_sync: AtomicBool,
+    /// Test builds only, `call@grow`: the armed call fails only inside the commit of a client write and only when it directly follows a
+    /// `set_len`, which is how redb's `grow` syncs the file it has just lengthened (the commit's own sync follows its writes).
+    #[cfg(test)]
+    armed_after_resize: AtomicBool,
+    /// Test builds only, `call@grow-body`: as `call@grow`, but a growth made OUTSIDE a commit, in the body of a transaction.
+    #[cfg(test)]
+    armed_outside_commit: AtomicBool,
+    /// Test builds only: the last backend call was a `set_len`.
+    #[cfg(test)]
+    resized: AtomicBool,
 }
 
 thread_local! {
     /// Whether this thread is inside the commit of a client write, for the
     /// test switch's `@write` target.
     static IN_WRITE_COMMIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test builds: whether this thread is inside the commit of a client write.
+#[cfg(test)]
+pub(crate) fn in_write_commit() -> bool {
+    IN_WRITE_COMMIT.with(Cell::get)
 }
 
 /// Run `commit` marked as the commit of a client write when `is_write`, for
@@ -90,6 +106,12 @@ impl Default for StorageHealth {
             synced: AtomicBool::new(false),
             #[cfg(test)]
             armed_after_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            armed_after_resize: AtomicBool::new(false),
+            #[cfg(test)]
+            armed_outside_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            resized: AtomicBool::new(false),
         }
     }
 }
@@ -143,6 +165,12 @@ impl StorageHealth {
         self.synced.store(true, Ordering::SeqCst);
     }
 
+    /// Test builds: a `set_len` is being made (`true`), or another backend call is (`false`).
+    #[cfg(test)]
+    pub(crate) fn note_resize(&self, resized: bool) {
+        self.resized.store(resized, Ordering::SeqCst);
+    }
+
     /// Whether the commit in progress has attempted a `sync_data`.
     pub(crate) fn synced(&self) -> bool {
         self.synced.load(Ordering::SeqCst)
@@ -177,9 +205,25 @@ impl StorageHealth {
     /// `call@write` to fail it only inside the commit of a client write.
     /// Returns whether `call` names one of the backend's calls.
     pub(crate) fn arm(&self, call: &str) -> bool {
+        // Test builds: `call@grow` is `call@write` that fails only a sync that directly follows a resize, and `call@grow-body` the same
+        // for a resize made outside a commit.
+        #[cfg(test)]
+        let (grow, after_resize, outside_commit) = match call.strip_suffix("@grow") {
+            Some(call) => (format!("{call}@write"), true, false),
+            None => match call.strip_suffix("@grow-body") {
+                Some(call) => (call.to_string(), true, true),
+                None => (call.to_string(), false, false),
+            },
+        };
+        #[cfg(test)]
+        let call = grow.as_str();
         let Some((i, for_write, after_sync)) = Self::parse_switch(call) else {
             return false;
         };
+        #[cfg(test)]
+        self.armed_after_resize.store(after_resize, Ordering::SeqCst);
+        #[cfg(test)]
+        self.armed_outside_commit.store(outside_commit, Ordering::SeqCst);
         #[cfg(test)]
         self.armed_after_sync.store(after_sync, Ordering::SeqCst);
         #[cfg(not(test))]
@@ -219,6 +263,14 @@ impl StorageHealth {
         }
         #[cfg(test)]
         if self.armed_after_sync.load(Ordering::SeqCst) && !self.synced() {
+            return None;
+        }
+        #[cfg(test)]
+        if self.armed_after_resize.load(Ordering::SeqCst) && !self.resized.load(Ordering::SeqCst) {
+            return None;
+        }
+        #[cfg(test)]
+        if self.armed_outside_commit.load(Ordering::SeqCst) && in_write_commit() {
             return None;
         }
         let i = CALLS.iter().position(|c| *c == call)? as u8 + 1;
