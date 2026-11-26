@@ -239,6 +239,37 @@ jwt_secret = "{JWT_SECRET}"
         }
     }
 
+    /// Wait until the node answers `/healthz` (a halted node never answers `/readyz` with 200),
+    /// failing at once, with its log, if it exits first.
+    async fn wait_live(&self, client: &reqwest::Client) {
+        let deadline = Instant::now() + PATIENCE;
+        let mut line_wait = ports::LineWait::default();
+        loop {
+            if self.http.get().is_none() {
+                let bound =
+                    ports::bound_http_port(&self.stdout, ports::BOUND_HTTP_LINE, self.pid, &[]);
+                match line_wait.judge(bound, ports::BOUND_HTTP_LINE) {
+                    Ok(Some(port)) => {
+                        let _ = self.http.set(port);
+                    }
+                    Ok(None) => {}
+                    Err(why) => panic!("{why}; log: {}", self.log()),
+                }
+            }
+            if let Some(port) = self.http.get()
+                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/healthz")).send().await
+                && res.status().is_success()
+            {
+                return;
+            }
+            if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                panic!("exited ({status}) before it answered /healthz; log: {}", self.log());
+            }
+            assert!(Instant::now() < deadline, "never answered /healthz; log: {}", self.log());
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     fn signal(&self, sig: &str) {
         let status =
             Command::new("kill").arg(format!("-{sig}")).arg(self.pid.to_string()).status().unwrap();
@@ -2818,6 +2849,129 @@ fn a_restore_without_replace_writes_no_replace_entry() {
     let (backup, config) = backup_and_config(dir.path());
     restore_with(&config, &backup, &[]);
     assert_eq!(read_marker_file(&dir.path().join("data")).unwrap().replace, None);
+}
+
+// ---------------------------------------------------------------------------
+// A halted start (D13 containment, ADR-274, unit 14a)
+// ---------------------------------------------------------------------------
+
+/// A store of this build in `dir/data` as a node that has run leaves it (its user and role
+/// collections exist, which is what the API state opens, and a halted store refuses to create), the
+/// node id it carries, and the epoch it minted.
+fn a_store_for_a_halted_start(dir: &Path) -> (kimmy_core::NodeId, Epoch) {
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    let engine = kimmy_storage::Engine::open(&dir.join("data").join("kimmy.redb")).unwrap();
+    kimmy_auth::UserStore::open(&engine).unwrap();
+    engine.create_collection("shop", "orders").unwrap();
+    (engine.node_id(), engine.epoch())
+}
+
+async fn get_json(client: &reqwest::Client, run: &Run, path: &str) -> (u16, serde_json::Value) {
+    let res = client.get(format!("{}{path}", base(run))).send().await.unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+/// A store whose halt row names its own epoch starts halted and stays up: the process serves its
+/// probes, `/readyz` reads not-ready with the reason, every other route answers `503 halted`, and
+/// it exits cleanly on a stop. It exits at no point on its own (an orchestrator would restart it
+/// into a loop, and hide the reason).
+#[tokio::test]
+async fn a_store_halted_by_a_newer_epoch_starts_halted_and_stays_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let told = an_epoch_ahead(60_000);
+    a_store_for_a_halted_start(dir.path());
+    kimmy_storage::Engine::open(&dir.path().join("data").join("kimmy.redb"))
+        .unwrap()
+        .halt(told)
+        .unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn(dir.path(), "halted");
+    run.wait_live(&client).await;
+
+    let (status, ready) = get_json(&client, &run, "/readyz").await;
+    assert_eq!(status, 503, "{ready}");
+    assert_eq!(ready["error"], "halted", "{ready}");
+    assert!(
+        ready["reason"].as_str().is_some_and(|r| r.contains(&told.to_hex())),
+        "the reason names the epoch it was told of: {ready}"
+    );
+    let (status, version) = get_json(&client, &run, "/v1/version").await;
+    assert_eq!(status, 503, "{version}");
+    assert_eq!(version["error"], "halted", "{version}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(run.child.lock().unwrap().try_wait().unwrap().is_none(), "it stays up: {}", run.log());
+    assert!(run.log().contains("halted"), "the start says so: {}", run.log());
+
+    run.signal("TERM");
+    assert!(run.wait_exit().success(), "a stop is a clean exit: {}", run.log());
+}
+
+/// An older copy of a store put back under a containment file whose floor is above its epoch starts
+/// halted (the rule "ignored when the epoch differs" would let it run and take writes until its
+/// first contact).
+#[tokio::test]
+async fn a_store_below_the_floor_of_the_containment_file_starts_halted() {
+    use kimmy_cluster::containment::{Marker, MarkerFile, write_marker_file};
+    let dir = tempfile::tempdir().unwrap();
+    let (node, own) = a_store_for_a_halted_start(dir.path());
+    let floor = an_epoch_ahead(60_000);
+    assert!(own < floor, "premise: the store is below the floor");
+    let marker = Marker { node, floor, guard: None };
+    write_marker_file(
+        &dir.path().join("data"),
+        &MarkerFile { marker: Some(marker), replace: None },
+    )
+    .unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn(dir.path(), "below-floor");
+    run.wait_live(&client).await;
+    let (status, ready) = get_json(&client, &run, "/readyz").await;
+    assert_eq!((status, &ready["error"]), (503, &serde_json::json!("halted")), "{ready}");
+    run.signal("TERM");
+    assert!(run.wait_exit().success(), "{}", run.log());
+}
+
+/// The controls: a marker of another node, and a marker whose floor the store is not below, halt
+/// nothing.
+#[tokio::test]
+async fn a_containment_file_that_does_not_apply_halts_nothing() {
+    use kimmy_cluster::containment::{Marker, MarkerFile, write_marker_file};
+    let dir = tempfile::tempdir().unwrap();
+    let (node, own) = a_store_for_a_halted_start(dir.path());
+    let data = dir.path().join("data");
+    let floor = an_epoch_ahead(60_000);
+    let other = Marker { node: kimmy_core::NodeId::generate(), floor, guard: None };
+    write_marker_file(&data, &MarkerFile { marker: Some(other), replace: None }).unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn(dir.path(), "other-node");
+    run.wait_ready(&client).await;
+    run.signal("TERM");
+    assert!(run.wait_exit().success(), "{}", run.log());
+
+    let on_it = Marker { node, floor: own, guard: None };
+    write_marker_file(&data, &MarkerFile { marker: Some(on_it), replace: None }).unwrap();
+    let mut run = Run::spawn(dir.path(), "on-the-floor");
+    run.wait_ready(&client).await;
+    run.signal("TERM");
+    assert!(run.wait_exit().success(), "{}", run.log());
+}
+
+/// A containment file that cannot be read is never read as no halt: the start refuses, naming the
+/// file.
+#[tokio::test]
+async fn a_containment_file_that_does_not_parse_refuses_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    a_store_for_a_halted_start(dir.path());
+    std::fs::write(
+        dir.path().join("data").join(kimmy_cluster::containment::MARKER_FILE),
+        "not a marker",
+    )
+    .unwrap();
+    let mut run = Run::spawn(dir.path(), "unreadable-marker");
+    let status = run.wait_exit();
+    assert!(!status.success(), "{}", run.log());
+    assert!(run.log().contains("containment file"), "{}", run.log());
 }
 
 /// `kimmyd restore --until` on a collection with merge policy `field` (the default): the user-facing path, end to
