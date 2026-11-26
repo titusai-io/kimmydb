@@ -141,12 +141,13 @@ fn a_write_the_receiver_made_after_the_drop_is_kept() {
     assert!(!has(&b, 1), "the previous life's document is still here");
     assert!(has(&b, 9), "a write stamped after the drop was buried with the life");
     assert!(has(&b, 2));
-    // And where it ends: the ADR-231 shape, pinned. The life is re-dated above the drop
-    // (the receiver keeps its own write), with the sender's floor, not at the sender's
-    // `created`.
+    // And where it ends. UNIT P (P8a, the 3:33 PM dating split): the page names a creation of the name stamped AFTER the drop (the
+    // sender's life 2), which raises the options row above the drop, so the life the receiver keeps is that CREATION's life: dated by it, not
+    // re-dated (no marker), with the sender's floor. (Before, a life that kept a write after the drop was re-dated to the drop's successor.)
     let held = b.get_collection("shop", "orders").unwrap();
     let sender = a.get_collection("shop", "orders").unwrap();
-    assert!(held.is_redated(), "a life that kept a write after the drop is re-dated");
+    assert!(!held.is_redated(), "the creation's life carries no marker");
+    assert_eq!(held.created, sender.created, "and is dated by the creation the page named");
     assert_eq!(held.incarnation_floor, sender.incarnation_floor, "the sender's floor");
 }
 

@@ -4240,11 +4240,13 @@ fn the_enumeration_counts() {
 }
 
 /// F7's stop. An index created after a concurrent drop and
-/// dropped again before the drop arrives: the creating member buries the life (nothing
-/// is stamped after the drop) and still serves the `CreateIndex`; every member that
-/// lacks the collection stopped at it on every round, and A's later write in another
-/// collection never reached them by entries or by the repair. The scoped page that holds
-/// no life now answers the stop (ADR-236 item 4).
+/// dropped again before the drop arrives: the creating member buried the life (nothing
+/// was stamped after the drop) and still served the `CreateIndex`; every member that
+/// lacked the collection stopped at it on every round, and A's later write in another
+/// collection never reached them by entries or by the repair. UNIT P (P8): the index's
+/// tombstone is a fact above the drop, so the keep test spares the life (re-dated, empty), and
+/// a member that holds the row makes the collection again at the `CreateIndex` and does not
+/// stop: `orders` stands, empty, on every member.
 #[test]
 fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     finding(
@@ -4252,7 +4254,7 @@ fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
         "A.create(items)@100; A.create(orders)@110; C<-A entries; C.drop(orders)@150; \
          A.index(orders,k_1:asc)@200; A.dropindex(orders,k_1)@210; A<-C entries; \
          A.write(items/1)@220",
-        &[(ORDERS, None), (ITEMS, Some(&[1]))],
+        &[(ORDERS, Some(&[])), (ITEMS, Some(&[1]))],
     );
 }
 
@@ -4273,17 +4275,18 @@ fn finding_f10_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor() 
 }
 
 /// F7's stop, the generator's own shape (seed 13739, minimised): no
-/// delivery in the schedule at all. B's life is buried by A's drop at quiescence with
-/// nothing stamped after it (the index was dropped), and A and C stop at B's
+/// delivery in the schedule at all. B's life was buried by A's drop at quiescence with
+/// nothing stamped after it (the index was dropped), and A and C stopped at B's
 /// `CreateIndex` for good. Visible only to the `Wedged` check or a later write;
-/// `finding_f7_seed_13739_without_the_write` is the shape with no write.
+/// `finding_f7_seed_13739_without_the_write` is the shape with no write. UNIT P (P8): the
+/// dropped index's tombstone keeps B's life (re-dated, empty), and every member holds `orders`, empty.
 #[test]
 fn finding_f7_seed_13739_without_the_write() {
     finding(
         "F7 seed 13739, no write",
         "B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
          B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170",
-        &[(ORDERS, None)],
+        &[(ORDERS, Some(&[]))],
     );
 }
 
@@ -4293,7 +4296,7 @@ fn finding_f7_seed_13739_wedges_without_a_visible_difference() {
         "F7 seed 13739",
         "B.create(items)@110; B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
          B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170; B.write(items/1)@180",
-        &[(ORDERS, None), (ITEMS, Some(&[1]))],
+        &[(ORDERS, Some(&[])), (ITEMS, Some(&[1]))],
     );
 }
 

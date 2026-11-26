@@ -85,11 +85,14 @@ fn field() -> Vec<IndexField> {
 }
 
 /// F7, all members on this build. An index created after a concurrent collection drop
-/// and dropped again before the drop arrives leaves nothing stamped after the drop, so
-/// the creating member buries the life, and still holds and serves the `CreateIndex`.
-/// A member that lacks the collection stops at it (`defines_a_later_life`), asks for the
-/// scoped page, gets the same tombstone back, and stops again on every round: nothing
-/// past the index in that peer's window, in any collection, reaches it by entries.
+/// and dropped again before the drop arrives left nothing stamped after the drop, so
+/// the creating member buried the life, and still held and served the `CreateIndex`;
+/// a member that lacked the collection stopped at it (`defines_a_later_life`), asked for the
+/// scoped page, got the same tombstone back, and stopped again on every round: nothing
+/// past the index in that peer's window, in any collection, reached it by entries.
+/// UNIT P (P8): the tombstone of the dropped index is itself a fact stamped above the drop, so
+/// the keep test spares the life (re-dated, empty), and a member that holds the row of the
+/// name makes the collection again at the `CreateIndex` and does not stop.
 #[test]
 fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     let (a, _da) = engine();
@@ -102,15 +105,18 @@ fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     let index = a.create_index("shop", "orders", field(), false, None).unwrap();
     assert!(a.drop_index("shop", "orders", &index.name).unwrap());
     round(&a, &c);
-    assert!(a.get_collection("shop", "orders").is_err(), "premise: A buried the life");
+    let kept = a.get_collection("shop", "orders").expect("the index's tombstone keeps the life");
+    assert!(kept.is_redated(), "re-dated above the drop: {kept:?}");
     a.insert(&items, doc! { "_id": 1i64 }).unwrap();
 
     let stops = settle(&c, &a);
+    assert_eq!(stops, 0, "no stop for a member that holds the row");
     assert_eq!(
         ids_on(&c, "shop", "items"),
         ids_on(&a, "shop", "items"),
-        "C never took A's acknowledged write behind the index ({stops} stops in 6 rounds)"
+        "C took A's acknowledged write behind the index ({stops} stops in 6 rounds)"
     );
+    assert!(c.get_collection("shop", "orders").is_ok(), "and holds the life");
     assert!(c.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
 }
 

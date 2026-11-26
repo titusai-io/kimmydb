@@ -1512,6 +1512,23 @@ pub(crate) fn base_options_in(
     }
 }
 
+/// Test only: lower the `at` of the options row of `id` to `at`, to make a world whose row agrees with a creation the test dates by hand (the row
+/// rises and never falls, so a fixture that moves a collection's `created` below a drop by hand leaves a row above it that no route would make).
+#[cfg(test)]
+pub(crate) fn lower_the_options_row_for_test(engine: &crate::Engine, id: CollectionId, at: Hlc) {
+    let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+    {
+        let mut table = txn.open_table(tables::COLLECTION_BASE_OPTIONS).unwrap();
+        let key = id.0.to_be_bytes();
+        let held = table.get(key.as_slice()).unwrap().map(|raw| raw.value().to_vec());
+        let mut row: BaseOptions =
+            serde_json::from_slice(&held.expect("the collection has an options row")).unwrap();
+        row.at = at;
+        table.insert(key.as_slice(), serde_json::to_vec(&row).unwrap().as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
 /// Whether [`note_base_options`] would write `options`: read in a read transaction, so a creation judged history, which holds no
 /// transaction of its own, takes the writer only when its options rise.
 pub(crate) fn base_options_would_rise(

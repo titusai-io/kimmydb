@@ -279,8 +279,14 @@ impl Engine {
                 // walked, and from the digest row, which counts tombstones and is
                 // never lowered, for one that landed in a range already walked. A
                 // shadow's rows are its parent's vectors, judged by its parent.
+                // The same keep test as the drop's (unit P): the options row above the drop, or a tombstone of one of its indexes above it,
+                // keeps the life a sweep would otherwise bury.
+                let above_the_drop = !kimmy_core::vector_meta::is_shadow(&standing.name)
+                    && (crate::register::base_options_in(&txn, standing.id)?
+                        .is_some_and(|row| row.at > dropped.hlc)
+                        || index_tombstone_above(&txn, standing.id, dropped.hlc)?);
                 let stamped_after = !kimmy_core::vector_meta::is_shadow(&standing.name)
-                    && (kept_after || {
+                    && (kept_after || above_the_drop || {
                         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
                         crate::live_digest::kept_row(&rows, standing.id.0)?
                             .is_some_and(|row| row.maxw.values().any(|maxw| *maxw > dropped.hlc))
@@ -729,7 +735,12 @@ impl Engine {
         // stage and its stage meta, the author's valid binding then made a partial output visible, and divergence repair spread it.
         // It is buried whole at the drop, whatever it holds. This is the one place every route to a drop passes: the sweep of a
         // database's drop, the replicated collection drop and the snapshot route.
-        if meta.stage.is_some() || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+        let kept = if meta.stage.is_some() {
+            Kept::Nothing
+        } else {
+            self.what_is_stamped_after(&txn, &meta, dropped.hlc)?
+        };
+        if meta.stage.is_some() || kept == Kept::Nothing {
             let a_stage = meta.stage.is_some();
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
             #[cfg(test)]
@@ -760,14 +771,31 @@ impl Engine {
         // Nothing written after this commit has its entry below this position,
         // whatever range of the collection the sweep has already passed.
         let next = next_arrival_in(&txn)?;
-        redate(&mut meta, dropped.hlc);
-        if let Some(marker) = meta.redated.as_mut() {
-            marker.arrivals_from = Some(next);
-        }
-        Engine::put_collection_meta(&txn, &meta)?;
-        if let Some(shadow) = shadow.as_mut() {
-            redate(shadow, dropped.hlc);
-            Engine::put_collection_meta(&txn, shadow)?;
+        match kept {
+            // Kept because the options row says a creation of the name stands above the drop: this is the CREATION's life (ruled 3:33 PM),
+            // dated by the creation and not re-dated: no marker. What the drop ended of it is swept below, as for a re-dated life.
+            Kept::Creation(at) => {
+                meta.created = at;
+                meta.redated = None;
+                Engine::put_collection_meta(&txn, &meta)?;
+                if let Some(shadow) = shadow.as_mut() {
+                    shadow.created = at;
+                    shadow.redated = None;
+                    Engine::put_collection_meta(&txn, shadow)?;
+                }
+            }
+            // Kept because a fact is stamped above the drop: the life is re-dated to the drop's successor, with the marker.
+            Kept::Fact | Kept::Nothing => {
+                redate(&mut meta, dropped.hlc);
+                if let Some(marker) = meta.redated.as_mut() {
+                    marker.arrivals_from = Some(next);
+                }
+                Engine::put_collection_meta(&txn, &meta)?;
+                if let Some(shadow) = shadow.as_mut() {
+                    redate(shadow, dropped.hlc);
+                    Engine::put_collection_meta(&txn, shadow)?;
+                }
+            }
         }
         txn.commit()?;
         #[cfg(test)]
@@ -803,16 +831,26 @@ impl Engine {
         Ok(if end.survived { Dropped::Kept } else { Dropped::Buried(true) })
     }
 
-    /// Whether a collection holds nothing stamped after `dropped`, read through
-    /// the transaction that would bury it.
-    fn nothing_is_stamped_after(
+    /// What a collection holds stamped after `dropped`, read through the transaction that would bury it (the KEEP TEST). Three things keep a
+    /// life: the options row of its id, whose `at` above the drop says a creation of the name stands above it (unit P: then the life is the
+    /// creation's, dated by it); and a fact stamped above it: a definition, a record or a delete (the digest row's high-water mark, or a
+    /// seek when there is no row), or a tombstone of one of the id's indexes (an index created and dropped again above the drop leaves
+    /// nothing else of it, and is the same kind of fact as the definition it removed).
+    fn what_is_stamped_after(
         &self,
         txn: &crate::engine::WriteTxn<'_>,
         meta: &CollectionMeta,
         dropped: Hlc,
-    ) -> Result<bool> {
-        if holds_a_definition_stamped_after(meta, dropped) {
-            return Ok(false);
+    ) -> Result<Kept> {
+        if let Some(row) = crate::register::base_options_in(txn, meta.id)?
+            && row.at > dropped
+        {
+            return Ok(Kept::Creation(row.at));
+        }
+        if holds_a_definition_stamped_after(meta, dropped)
+            || index_tombstone_above(txn, meta.id, dropped)?
+        {
+            return Ok(Kept::Fact);
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
         let Some(row) = crate::live_digest::kept_row(&rows, meta.id.0)? else {
@@ -822,9 +860,17 @@ impl Engine {
             // database's drop took every such collection through the survivors
             // path, three commits and a notice of its own each (ADR-236).
             let docs = txn.open_table(tables::DOCS)?;
-            return Ok(docs.range(crate::engine::doc_range(meta.id))?.next().is_none());
+            return Ok(if docs.range(crate::engine::doc_range(meta.id))?.next().is_none() {
+                Kept::Nothing
+            } else {
+                Kept::Fact
+            });
         };
-        Ok(row.maxw.values().all(|stamp| *stamp <= dropped))
+        Ok(if row.maxw.values().all(|stamp| *stamp <= dropped) {
+            Kept::Nothing
+        } else {
+            Kept::Fact
+        })
     }
 
     /// Bury a re-dated life that the drop which re-dated it, or a database's
@@ -978,6 +1024,33 @@ fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
         first_arrival: None,
         arrivals_from: None,
     });
+}
+
+/// What keeps a life through a drop (see [`Engine::what_is_stamped_after`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kept {
+    /// Nothing is stamped above the drop: the life is buried.
+    Nothing,
+    /// A fact (a definition, a record, a delete, an index's tombstone) is above the drop: the remains of the life are kept, re-dated.
+    Fact,
+    /// The options row's `at` is above the drop: a creation of the name stands above it, and the life is that creation's, dated by it.
+    Creation(Hlc),
+}
+
+/// Whether a tombstone of one of the indexes of `id` is stamped above `dropped`: read through the writer's transaction.
+fn index_tombstone_above(
+    txn: &crate::engine::WriteTxn<'_>,
+    id: CollectionId,
+    dropped: Hlc,
+) -> Result<bool> {
+    let tombstones = txn.open_table(tables::INDEXES_DROPPED)?;
+    for row in tombstones.range((id.0, 0u32)..=(id.0, u32::MAX))? {
+        let (_, value) = row?;
+        if codec::decode_oplog_key(value.value())?.hlc > dropped {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a definition of `standing` is stamped after `dropped`: an index, or
@@ -1324,6 +1397,10 @@ mod tests {
             Engine::put_collection_meta(&txn, &meta).unwrap();
             txn.commit().unwrap();
         }
+        // The fixture's drop is stamped below the collection's real creation, and the life's `created` was moved below it by hand: the options
+        // row, which rises and never falls, still holds the real creation above the drop, and the keep test (unit P, P8a) would read it as the
+        // creation's life. The row follows the life the test says it is.
+        crate::register::lower_the_options_row_for_test(&b, id, meta.created);
         let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node, dropped.epoch);
         {
             let key = crate::docs::doc_key(&DocId::Int64(1_000_000)).unwrap();

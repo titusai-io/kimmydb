@@ -9444,13 +9444,14 @@ mod tests {
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
 
-    /// The answer a page holding no life gives is bounded by its sender's coverage: a
-    /// definition made after that page (here, by a member that has not heard the drop and
-    /// then keeps its life, re-dated with the index) still stops the batch, and that
-    /// member's page brings the life. Taken as history because some page once answered,
-    /// it left B without the life A keeps.
+    /// UNIT P (P8, the keep test): a definition made above a drop never stops a member that holds the row of the name, and an index
+    /// created and dropped again above the drop leaves a tombstone that is itself a fact above it, so the life that made it is KEPT, re-dated
+    /// and empty, and not buried. C made and dropped an index before it heard B's drop: it keeps its life; B makes the collection again from its
+    /// row at C's `CreateIndex`; A, which has not heard the drop either, makes an index and then keeps its life; and every member ends holding
+    /// the one life with A's index. (This was "the answer a page holding no life gives is bounded by its sender's coverage": C buried its life,
+    /// B stopped at C's index and a page answered the stop. The stop and the answer no longer arise for a member that holds the row.)
     #[test]
-    fn a_later_definition_the_answering_pages_coverage_does_not_name_still_stops() {
+    fn an_index_created_and_dropped_above_a_drop_keeps_the_life_and_stops_no_member() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let (c, _dc) = engine();
@@ -9461,23 +9462,21 @@ mod tests {
         b.drop_collection("shop", "orders").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let field = |p: &str| crate::meta::IndexField { path: p.into(), descending: false };
-        let scoped = |into: &Engine, from: &Engine, id| {
-            let mut progress = crate::SnapshotProgress::of_collection(id);
-            while !progress.is_complete() {
-                let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-                into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
-            }
-        };
 
-        // C makes an index and drops it before it hears the drop, then buries its life.
+        // C makes an index and drops it before it hears the drop; the tombstone of that index is above the drop, so its life is kept.
         let index = c.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
         c.drop_index("shop", "orders", &index.name).unwrap();
         round(&c, &b, BATCH);
-        assert!(c.get_collection("shop", "orders").is_err(), "premise: C buried the life");
-        // B stops at C's index; C's page holds no life and answers it.
-        let stopped = round(&b, &c, BATCH).unknown.expect("premise: a later-life stop");
-        scoped(&b, &c, stopped.id);
-        assert_eq!(round(&b, &c, BATCH).unknown_collection, 0, "premise: answered");
+        let kept_on_c = c.get_collection("shop", "orders").expect("C keeps its life");
+        assert!(kept_on_c.is_redated(), "re-dated above the drop: {kept_on_c:?}");
+        // B takes C's index and its drop: no stop, the collection is made again from the row.
+        let outcome = round(&b, &c, BATCH);
+        assert_eq!(
+            outcome.unknown_collection, 0,
+            "no stop for a member that holds the row: {outcome:?}"
+        );
+        let on_b = b.get_collection("shop", "orders").expect("B holds the life again");
+        assert_eq!(on_b.indexes.len(), 0, "the index was dropped");
 
         // A, which has not heard the drop either, makes an index and then keeps its life.
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -9486,23 +9485,23 @@ mod tests {
         round(&a, &b, BATCH);
         assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 1, "A's index is not C's page's: {outcome:?}");
-        scoped(&b, &a, stopped.id);
-        round(&b, &a, BATCH);
-        let on_b = b.get_collection("shop", "orders").expect("A's life arrived");
-        assert_eq!(on_b.indexes.len(), 1, "with A's index");
+        assert_eq!(outcome.unknown_collection, 0, "no stop: {outcome:?}");
+        round(&c, &a, BATCH);
+        for (member, e) in [("A", &a), ("B", &b), ("C", &c)] {
+            let held = e.get_collection("shop", "orders").expect("every member holds the life");
+            assert_eq!(held.indexes.len(), 1, "{member} holds A's index");
+            assert_eq!(held.created, on_b.created, "{member} holds the one life");
+        }
         assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
     }
 
-    /// The answer is read from a resumed page too, when the page carries the collection's
-    /// drop (ADR-236 item 4): a scoped pull cut short after its first page, which carried a
-    /// life B refused, and resumed after A buried that life (its index made and dropped
-    /// again after the drop, nothing of it left after the drop), is answered by the pages
-    /// that follow, whose sender lacked the collection and read its vector first. Read from
-    /// the first page only, the pull completed with no answer and the stop stood until a
-    /// fresh pull after the repair cooldown.
+    /// UNIT P (P8): the resumed-page shape. A made an index on its life and dropped it again after B's drop; B takes the index and its drop
+    /// by entries without a stop (it makes the collection again from its row, empty), and A, which then hears the drop, KEEPS its life:
+    /// the index's tombstone is above the drop, so the keep test spares it, and the sweep removes the rows the drop ended. Both hold one empty,
+    /// re-dated life. (This was "the answer is read from a resumed page too": B stopped at A's index, a pull cut short and resumed was
+    /// answered by pages whose sender had buried the life, and no member held the collection at the end.)
     #[test]
-    fn a_resumed_page_carrying_the_drop_answers_the_later_life_stop() {
+    fn a_definition_made_and_dropped_above_a_drop_does_not_stop_and_both_sides_keep_the_life() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let orders = a.create_collection("shop", "orders").unwrap();
@@ -9519,24 +9518,28 @@ mod tests {
         a.drop_index("shop", "orders", &index.name).unwrap();
         a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
 
-        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
-        // The pull's first page only: it carries A's life, which B refuses.
-        let mut progress = crate::SnapshotProgress::of_collection(stopped.id);
-        let page = a.snapshot_page(None, progress.scope()).unwrap();
-        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        assert!(!progress.is_complete(), "premise: the pull is cut short after one page");
-        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
-        // A hears the drop and buries the life, which holds nothing after it.
-        round(&a, &b, BATCH);
-        assert!(a.get_collection("shop", "orders").is_err(), "premise: A buried the life");
-        // The pull resumes, and its pages carry the drop.
-        while !progress.is_complete() {
-            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            assert!(page.dropped.is_some(), "premise: a resumed page carries the drop");
-            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        }
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 0, "the resumed pages answered it: {outcome:?}");
+        assert_eq!(
+            outcome.unknown_collection, 0,
+            "no stop for a member that holds the row: {outcome:?}"
+        );
+        let on_b = b.get_collection("shop", "orders").expect("B makes the collection again");
+        assert!(on_b.is_redated(), "the remains of the life the drop ended: {on_b:?}");
+        assert_eq!(
+            b.count(&on_b, crate::WalkScope::Request).unwrap(),
+            0,
+            "and none of the old rows"
+        );
+        // A hears the drop and keeps its life: the index's tombstone is above it.
+        round(&a, &b, BATCH);
+        let kept = a.get_collection("shop", "orders").expect("the keep test spares the life");
+        assert!(kept.is_redated(), "re-dated: {kept:?}");
+        assert_eq!(
+            a.count(&kept, crate::WalkScope::Request).unwrap(),
+            0,
+            "the rows the drop ended are swept"
+        );
+        assert_eq!(kept.created, on_b.created, "A and B hold the one life");
         assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }

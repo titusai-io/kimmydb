@@ -92,6 +92,14 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "late_drop::index_tombstone_above",
+        "the index tombstones of ONE collection, one row per index name ever dropped on it, which the retention pass collects; read through the writer's transaction of a drop's keep test (ADR-272, unit P)",
+    ),
+    (
+        "late_drop::Engine::what_is_stamped_after",
+        "the keep test of a drop, run through the writer's transaction of the drop: one seek (whether a collection with no digest row holds any record at all, ADR-236), and the other reads are keyed gets (ADR-272, unit P)",
+    ),
+    (
         "remake_loss_tests::parked",
         "test code counting the parked loss records of one document in a store it wrote itself (ADR-272, unit P)",
     ),
@@ -182,10 +190,6 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     (
         "database_tombstone::Engine::record_database_tombstone_in",
         "the dropped-collection registry, one row per drop, read once when a database's tombstone is raised (ADR-236)",
-    ),
-    (
-        "late_drop::Engine::nothing_is_stamped_after",
-        "one seek: whether a collection with no digest row holds any record at all (ADR-236)",
     ),
     (
         "watch::Engine::creation_arrival",
