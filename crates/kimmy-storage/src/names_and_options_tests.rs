@@ -973,3 +973,378 @@ fn the_carried_row_overhead_bounds_the_encoding() {
         crate::snapshot::CARRIED_ROW_FRAME
     );
 }
+
+// -- The scoped carry: a scoped page carries the scoped collection's names row and options row, and names the database's drop ----------------
+//
+// `SnapshotPage::dropped_database: Option<Stamp>` and every literal). Uses the module's helpers (`engine`, `a_sender_with`, `pulled`, `rows`,
+// `options_of`, `names_of`, `id_key`, `keys`) and `crate::vector_meta` for the shadow's name.
+
+fn scoped(id: CollectionId) -> SnapshotProgress {
+    SnapshotProgress::of_collection(id)
+}
+
+/// A scoped page carries the options row of the scoped collection, as the sender stores it, and the row of no other collection.
+#[test]
+fn a_scoped_page_carries_the_options_row_of_the_scoped_collection_and_no_other() {
+    let (a, _da) = a_sender_with(3);
+    let id = CollectionId::derive(DB, "c1");
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    let carried: Vec<(u8, Vec<u8>)> =
+        page.carried.iter().map(|row| (row.table, row.key.to_vec())).collect();
+    assert_eq!(carried, vec![(crate::CARRY_OPTIONS, id_key(DB, "c1"))], "one row, c1's");
+    let held = rows(&a, Carried::Options)
+        .into_iter()
+        .find(|(key, _)| *key == id_key(DB, "c1"))
+        .expect("premise: the sender holds the row");
+    assert_eq!(page.carried[0].value.to_vec(), held.1, "as the sender stores it");
+}
+
+/// The page of a stage carries its names row too: the stage's own physical, naming the logical name it belongs to.
+#[test]
+fn a_scoped_page_of_a_stage_carries_its_names_row() {
+    let (a, _da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE, MergePolicy::Document, deadline).unwrap();
+    let page = a.snapshot_page(None, Some(CollectionId::derive(DB, STAGE))).unwrap();
+    assert!(
+        page.carried
+            .iter()
+            .any(|row| row.table == crate::CARRY_NAMES && row.key.to_vec() == id_key(DB, STAGE)),
+        "the stage's names row rides the page: {:?}",
+        page.carried
+    );
+}
+
+/// A pull of a collection the sender dropped has no definition to bring the options of: the carried row does, and the receiver holds it
+/// with no collection.
+#[test]
+fn a_scoped_pull_of_a_dropped_collection_leaves_the_receiver_its_options_row() {
+    let (a, _da) = engine();
+    a.create_collection(DB, "ghost").unwrap();
+    a.drop_collection(DB, "ghost").unwrap();
+    let (b, _db) = engine();
+    let id = CollectionId::derive(DB, "ghost");
+    pulled(&b, &a, &mut scoped(id));
+    assert!(b.get_collection(DB, "ghost").is_err(), "premise: no collection is made");
+    assert_eq!(options_of(&b, "ghost"), options_of(&a, "ghost"), "the sender's row");
+    assert!(options_of(&b, "ghost").is_some(), "and it is there");
+}
+
+/// Every row a scoped page carries is the scoped collection's: one keyed by another id is a damaged page.
+#[test]
+fn a_scoped_carried_row_of_another_collection_refuses_the_page() {
+    let (a, _da) = a_sender_with(2);
+    let mut page = a.snapshot_page(None, Some(CollectionId::derive(DB, "c0"))).unwrap();
+    let other = rows(&a, Carried::Options)
+        .into_iter()
+        .find(|(key, _)| *key == id_key(DB, "c1"))
+        .expect("premise: the sender holds c1's row");
+    page.carried.push(crate::CarriedRow {
+        table: crate::CARRY_OPTIONS,
+        key: serde_bytes::ByteBuf::from(other.0),
+        value: serde_bytes::ByteBuf::from(other.1),
+    });
+    let (b, _db) = engine();
+    let refused =
+        b.apply_snapshot_page(a.node_id(), &mut scoped(CollectionId::derive(DB, "c0")), &page);
+    assert!(refused.is_err(), "the page is refused: {refused:?}");
+    assert!(options_of(&b, "c1").is_none(), "and the other collection's row is held nowhere");
+}
+
+// -- `dropped_database` ------------------------------------------------------------------------------------------------------------------
+
+/// A sender whose collection `orders` was dropped (its own tombstone, at the first stamp) and whose database was dropped LATER (its
+/// tombstone, at the second, which the collection's own does not follow): the stamps of the two.
+fn a_sender_with_a_later_database_drop() -> (Engine, tempfile::TempDir, Stamp, Stamp) {
+    let (a, dir) = engine();
+    a.create_collection(DB, "orders").unwrap();
+    a.create_collection(DB, "keep").unwrap();
+    a.drop_collection(DB, "orders").unwrap();
+    let own = a
+        .collection_dropped_at(CollectionId::derive(DB, "orders"))
+        .unwrap()
+        .expect("premise: the collection's own tombstone");
+    a.drop_database(DB).unwrap();
+    let database = a.database_dropped_at(DB).unwrap().expect("premise: the database's drop");
+    assert!(database > own, "premise: the database was dropped after the collection");
+    assert_eq!(
+        a.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap(),
+        Some(own),
+        "premise: the collection's own tombstone stays at its own drop"
+    );
+    (a, dir, own, database)
+}
+
+#[test]
+fn a_scoped_page_of_a_collection_gone_before_a_database_drop_names_both_drops() {
+    let (a, _da, own, database) = a_sender_with_a_later_database_drop();
+    let id = CollectionId::derive(DB, "orders");
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    assert_eq!(page.dropped, Some(own), "the collection's own drop");
+    assert_eq!(page.dropped_database, Some(database), "and the database's");
+    // a whole-database page and a page of a collection that stands name none
+    assert_eq!(a.snapshot_page(None, None).unwrap().dropped_database, None, "a whole page: none");
+    let (c, _dc) = engine();
+    c.create_collection(DB, "orders").unwrap();
+    let standing = c.snapshot_page(None, Some(id)).unwrap();
+    assert_eq!(standing.dropped_database, None, "a collection that stands: no drop to name");
+}
+
+/// The receiver raises the collection's tombstone, and its shadow's, to the database's stamp, and does NOT record the database's own:
+/// another collection of that database that it holds stands.
+#[test]
+fn a_scoped_receiver_raises_the_collections_tombstones_and_never_records_the_databases() {
+    let (a, _da, own, database) = a_sender_with_a_later_database_drop();
+    let id = CollectionId::derive(DB, "orders");
+    let shadow = CollectionId::derive(DB, &kimmy_core::vector_meta::shadow_name("orders"));
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    let (b, _db) = engine();
+    b.create_collection(DB, "other").unwrap();
+    b.apply_snapshot_page(a.node_id(), &mut scoped(id), &page).unwrap();
+    let raised = b.collection_dropped_at(id).unwrap();
+    assert_eq!(raised, Some(database), "the collection's tombstone, raised from {own:?}");
+    assert_eq!(b.collection_dropped_at(shadow).unwrap(), Some(database), "and its shadow's");
+    assert_eq!(b.database_dropped_at(DB).unwrap(), None, "the database's own is not recorded");
+    assert!(b.get_collection(DB, "other").is_ok(), "so the other collection of it stands");
+}
+
+/// The sender is believed only up to its own coverage (ADR-163): a drop stamped above it raises nothing.
+#[test]
+fn a_scoped_page_whose_database_drop_is_above_its_coverage_is_ignored() {
+    let (a, _da, own, database) = a_sender_with_a_later_database_drop();
+    let id = CollectionId::derive(DB, "orders");
+    let mut page = a.snapshot_page(None, Some(id)).unwrap();
+    page.dropped_database = Some(Stamp::new(
+        Hlc::new(database.hlc.wall_ms + 60_000, 0),
+        database.origin().node,
+        database.origin().epoch,
+    ));
+    let (b, _db) = engine();
+    b.apply_snapshot_page(a.node_id(), &mut scoped(id), &page).unwrap();
+    assert_eq!(b.collection_dropped_at(id).unwrap(), Some(own), "only the collection's own drop");
+}
+
+/// A receiver with neither the collection nor a names row learns the database from the page's own rows (the options row names its
+/// database and its collection), and checks that they derive the scoped id: a row that does not is a damaged page.
+#[test]
+fn a_scoped_receiver_checks_the_rows_it_learns_the_database_from_derive_the_scoped_id() {
+    let (a, _da, _own, _database) = a_sender_with_a_later_database_drop();
+    let id = CollectionId::derive(DB, "orders");
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    assert!(!page.carried.is_empty(), "premise: the page carries the collection's row");
+    let mut damaged = page.clone();
+    // another collection's value under this key: its names do not derive the scoped id
+    let (b0, _d0) = engine();
+    b0.create_collection(DB, "elsewhere").unwrap();
+    let other = rows(&b0, Carried::Options).into_iter().next().unwrap();
+    damaged.carried = vec![crate::CarriedRow {
+        table: crate::CARRY_OPTIONS,
+        key: serde_bytes::ByteBuf::from(id_key(DB, "orders")),
+        value: serde_bytes::ByteBuf::from(other.1),
+    }];
+    let (b, _db) = engine();
+    let refused = b.apply_snapshot_page(a.node_id(), &mut scoped(id), &damaged);
+    assert!(refused.is_err(), "refused: {refused:?}");
+    assert_eq!(b.collection_dropped_at(id).unwrap(), None, "and nothing is recorded");
+}
+
+/// The field is required on the wire. (Read as BSON, the page's own encoding: its version vector is keyed by origins, which JSON cannot hold.)
+#[test]
+fn a_page_without_its_database_drop_does_not_decode() {
+    let (a, _da) = engine();
+    let page = a.snapshot_page(None, None).unwrap();
+    let mut value = bson::serialize_to_document(&page).unwrap();
+    assert!(value.contains_key("dropped_database"), "premise: the field is written, as null");
+    bson::deserialize_from_document::<crate::SnapshotPage>(value.clone())
+        .expect("the whole page reads");
+    value.remove("dropped_database");
+    assert!(
+        bson::deserialize_from_document::<crate::SnapshotPage>(value).is_err(),
+        "a page without the field does not read"
+    );
+}
+
+// -- Rulings of 4:3x: scoped pulls STAGE (keyed by peer AND scope), and the carry page's cursor reserve is tested -------------------------------
+
+/// A scoped pull and a whole-database pull from the SAME peer run interleaved, and neither empties or merges the other's staging: the
+/// whole pull is stopped after its carry (rows staged under the peer and no scope), and a scoped pull of a gone collection of that peer
+/// completes in between (its page 0 empties only the staging of ITS scope, and its completion merges only its own).
+#[test]
+fn a_scoped_pull_and_a_whole_pull_from_one_peer_do_not_touch_each_others_staging() {
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    let mut whole = stopped_after_the_carry(&b, &a);
+    let staged = b.carry_stage_rows_for_test(a.node_id());
+    assert!(!staged.is_empty(), "premise: the whole pull staged rows");
+    // the scoped pull of one gone collection, to its end, between two pages of the whole pull
+    let ghost = CollectionId::derive(DB, "g3");
+    pulled(&b, &a, &mut scoped(ghost));
+    assert_eq!(options_of(&b, "g3"), options_of(&a, "g3"), "the scoped pull merged its own row");
+    let left = b.carry_stage_rows_for_test(a.node_id());
+    assert_eq!(left, staged, "and left the whole pull's staging");
+    // the whole pull goes on and ends with every row
+    pulled(&b, &a, &mut whole);
+    assert_eq!(keys(&b, Carried::Options), keys(&a, Carried::Options), "the whole pull merged");
+}
+
+/// A carry page cut by the budget is counted within its room: the rows as the sender bounds them (key, value and the carried row's frame)
+/// and the cursor it cuts at, reserved for the widest carry key, never exceed the page's rows room; and the page encodes within it. A room
+/// that is not a multiple of a row, so that the rows fill it to within a cursor of its end.
+#[test]
+fn a_carry_page_cut_by_the_budget_is_counted_within_its_room() {
+    let (a, _da) = a_sender_with_ghosts(40);
+    let widest = rows(&a, Carried::Options)
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + crate::snapshot::CARRIED_ROW_FRAME)
+        .max()
+        .unwrap();
+    let reserve = crate::snapshot::cursor_reserve(8, 0);
+    // rows fill the room to within less than the cursor's reserve of its end, for the rows of this sender
+    let room = 4 * widest + reserve / 2;
+    a.set_snapshot_room_for_test(Some(room));
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let mut cut = 0;
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        let in_the_carry = matches!(page.next.as_ref().map(|c| &c.carry), Some(Carry::At(_)));
+        if page.carried.len() > 1 && in_the_carry {
+            cut += 1;
+            let counted: usize = page
+                .carried
+                .iter()
+                .map(|row| row.key.len() + row.value.len() + crate::snapshot::CARRIED_ROW_FRAME)
+                .sum();
+            assert!(
+                counted + reserve <= room,
+                "{} carry rows count {counted} and the cursor {reserve}: over the room {room}",
+                page.carried.len()
+            );
+        }
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(cut >= 3, "premise: the carry was cut by the budget on several pages: {cut}");
+}
+
+// -- A collection this member HOLDS, when the database's drop reaches it through a scoped page -------------------------------------------------
+
+fn pause() {
+    std::thread::sleep(std::time::Duration::from_millis(15));
+}
+
+/// A record of an earlier life, planted in the collection `id` of `e` at `stamp`, as the sweep tests plant one: what a partial copy of a life
+/// that has ended leaves under a life that stands.
+fn plant(e: &Engine, id: CollectionId, doc_id: i64, stamp: Stamp) {
+    let body = bson::serialize_to_vec(&bson::doc! { "_id": doc_id, "old": true }).unwrap();
+    let key = crate::docs::doc_key(&kimmy_core::DocId::Int64(doc_id)).unwrap();
+    let record = kimmy_core::DocRecord::live(stamp, body);
+    let txn = e.begin_write(WriterHolder::Replication).unwrap();
+    {
+        let mut docs = txn.open_table(crate::tables::DOCS).unwrap();
+        crate::live_count::put_record(
+            &txn,
+            &mut docs,
+            id.0,
+            &key,
+            &crate::codec::encode_doc_record(&record),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// A sender whose collection `orders` was dropped (d) and whose database was dropped later (D), the two stamps, and a pause after each so
+/// that a life made between them is stamped between them.
+fn a_sender_with_the_two_drops_apart() -> (Engine, tempfile::TempDir, Stamp, Stamp) {
+    let (s, dir) = engine();
+    s.create_collection(DB, "orders").unwrap();
+    s.create_collection(DB, "keep").unwrap();
+    s.drop_collection(DB, "orders").unwrap();
+    let d = s.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap().unwrap();
+    pause();
+    s.drop_database(DB).unwrap();
+    let big_d = s.database_dropped_at(DB).unwrap().unwrap();
+    assert!(big_d.hlc.wall_ms > d.hlc.wall_ms + 5, "premise: the drops are apart");
+    (s, dir, d, big_d)
+}
+
+/// A holder whose life of the collection stands ABOVE the database's drop, and holds a record stamped between the collection's drop and the
+/// database's: the drop of the database is a carried drop of that collection, and the life it ignores is swept of what is at or below it.
+/// The life stands, and holds nothing at or below the database's stamp, with no restart.
+#[test]
+fn a_holder_whose_life_is_above_the_databases_drop_is_swept_of_what_is_at_or_below_it() {
+    let (s, _ds, d, big_d) = a_sender_with_the_two_drops_apart();
+    let id = CollectionId::derive(DB, "orders");
+    pause();
+    let (r, _dr) = engine();
+    r.create_collection(DB, "orders").unwrap();
+    let between = Hlc::new((d.hlc.wall_ms + big_d.hlc.wall_ms) / 2, 0);
+    plant(&r, id, 7, Stamp::new(between, s.node_id(), s.epoch()));
+    assert_eq!(r.count_by_id(id).unwrap(), Some(1), "premise: the record of the earlier life");
+    pulled(&r, &s, &mut scoped(id));
+    assert!(r.get_collection(DB, "orders").is_ok(), "the life above the drop stands");
+    assert_eq!(r.count_by_id(id).unwrap(), Some(0), "and holds nothing at or below the drop");
+}
+
+/// A holder whose life was made after the collection's drop and before the database's: the database's drop ends it, with what it holds at or
+/// below that stamp, and it is not left standing under a tombstone above its creation.
+#[test]
+fn a_holder_whose_life_is_at_or_below_the_databases_drop_is_ended_by_it() {
+    let (s, _ds) = engine();
+    s.create_collection(DB, "orders").unwrap();
+    s.create_collection(DB, "keep").unwrap();
+    s.drop_collection(DB, "orders").unwrap();
+    pause();
+    let (r, _dr) = engine();
+    let held = r.create_collection(DB, "orders").unwrap();
+    r.insert(&held, bson::doc! { "_id": 1 }).unwrap();
+    pause();
+    s.drop_database(DB).unwrap();
+    let id = CollectionId::derive(DB, "orders");
+    let d = s.collection_dropped_at(id).unwrap().unwrap();
+    let big_d = s.database_dropped_at(DB).unwrap().unwrap();
+    assert!(held.created > d.hlc && held.created <= big_d.hlc, "premise: the life is between");
+    pulled(&r, &s, &mut scoped(id));
+    assert!(r.get_collection(DB, "orders").is_err(), "the database's drop ended the life");
+}
+
+/// A scoped pull of two pages, whose sender drops the collection between them, ends on a page with no document, delete or grant: the rows
+/// the first page staged are still merged, in a transaction the completion opens for them.
+#[test]
+fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
+    let base = physical_now_ms();
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    let earlier = creation(&a, base - 3_000);
+    let later = creation(&c, base - 1_000);
+    let (source, _ds) = applied_in_order(&[&earlier, &later]);
+    let meta = source.get_collection(DB, "orders").unwrap();
+    for i in 0..4 {
+        source.insert(&meta, bson::doc! { "_id": i, "pad": "x".repeat(200) }).unwrap();
+    }
+    assert_eq!(
+        source.get_collection(DB, "orders").unwrap().merge_policy_at,
+        Some(Hlc::new(base - 3_000, 0)),
+        "premise: the definition's policy stamp stayed at the first creation"
+    );
+    source.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&source)));
+    // between the two pages the sender drops the collection: the second page is the drop and nothing else
+    let id = meta.id;
+    source.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(move |e, after| {
+        if after.is_some() {
+            e.drop_collection(DB, "orders").unwrap();
+        }
+    })));
+    let (b, _db) = engine();
+    let mut progress = scoped(id);
+    let pages = pulled(&b, &source, &mut progress);
+    assert_eq!(pages.len(), 2, "premise: two pages, the second without a document");
+    let nothing = pages[1].documents.is_empty() && pages[1].carried.is_empty();
+    assert!(nothing, "premise: and nothing else");
+    assert_eq!(
+        options_of(&b, "orders").unwrap().at,
+        Hlc::new(base - 1_000, 0),
+        "the first page's row, which only the carry brings, was merged"
+    );
+}
