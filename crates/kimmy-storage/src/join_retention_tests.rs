@@ -282,10 +282,11 @@ fn no_production_code_builds_join_options_from_a_local_source() {
     }
 }
 
-/// A creation cannot have two join retentions: the same creation met again with another `R` is refused by name
-/// (counted, not applied) and the collection keeps the one it holds.
+/// Unit P (the 11:36 AM ruling): the same creation met again with another `R` is no longer refused. The options row orders the two (the
+/// later creation, and at one `Hlc` and one policy the greater encoding of the whole row, as text), and the definition follows the row.
 #[test]
-fn a_creation_met_again_with_another_join_retention_is_refused_by_name() {
+fn a_creation_met_again_with_another_join_retention_is_settled_by_the_options_row_and_not_refused()
+{
     let (a, _da) = engine();
     let (b, _db) = engine();
     a.set_default_join_retention(Duration::from_millis(HOUR_MS));
@@ -300,14 +301,18 @@ fn a_creation_met_again_with_another_join_retention_is_refused_by_name() {
     again.body = Some(bson::serialize_to_vec(&body).unwrap());
     let outcome = b.apply_batch(std::slice::from_ref(&again)).unwrap();
 
-    assert_eq!(outcome.ddl_refused, 1, "a creation cannot have two Rs: {outcome:?}");
+    assert_eq!(outcome.ddl_refused, 0, "no refusal is counted: {outcome:?}");
     let held = b.get_collection("shop", "orders").unwrap();
-    assert_eq!(held.join_retention_ms, Some(HOUR_MS), "and the one held stands");
+    assert_eq!(
+        held.join_retention_ms,
+        Some(2 * HOUR_MS),
+        "the greater encoding of the row stands (7200000 over 3600000, as text)"
+    );
 }
 
-/// The same for a snapshot page: it is refused by name, never applied over the held value.
+/// The same for a snapshot page: it is settled by the options row, and is no error of the pull.
 #[test]
-fn a_page_carrying_another_join_retention_for_the_same_creation_is_refused_by_name() {
+fn a_page_carrying_another_join_retention_for_the_same_creation_is_settled_by_the_options_row() {
     let (a, _da) = engine();
     let (b, _db) = engine();
     a.set_default_join_retention(Duration::from_millis(HOUR_MS));
@@ -318,18 +323,10 @@ fn a_page_carrying_another_join_retention_for_the_same_creation_is_refused_by_na
 
     page.collections[0].join_retention_ms = Some(2 * HOUR_MS);
     let mut progress = SnapshotProgress::whole_database();
-    let refused = b.apply_snapshot_page(a.node_id(), &mut progress, &page);
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the page applies");
 
-    match refused {
-        Err(crate::StorageError::Core(e)) => {
-            assert!(e.to_string().contains("a creation cannot have two join retentions"), "{e}");
-        }
-        other => {
-            panic!("a creation cannot have two join retentions: refused by name, not {other:?}")
-        }
-    }
     let held = b.get_collection("shop", "orders").unwrap();
-    assert_eq!(held.join_retention_ms, Some(HOUR_MS));
+    assert_eq!(held.join_retention_ms, Some(2 * HOUR_MS), "the greater encoding of the row stands");
 }
 
 /// Two creations of one name under the same policy and different `R` settle on the later creation's `R`, on every

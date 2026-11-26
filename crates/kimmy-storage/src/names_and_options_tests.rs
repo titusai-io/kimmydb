@@ -826,17 +826,33 @@ fn a_carried_row_whose_key_does_not_derive_from_its_names_refuses_the_page() {
     assert!(!keys(&b, Carried::Options).contains(&key), "and the damaged row is held nowhere");
 }
 
-/// A member that met two creations of one name with EQUAL options holds the definition's policy stamp at the first (the second changes no
-/// option), and the options row at the LATER creation's Hlc. A joiner must hold the later one too, and the definition alone cannot tell it:
-/// the carry of the options row does.
+/// A member whose definition LAGS its options row (a delivery stopped between the row's commit and the definition's adoption of it, the
+/// crash half of row 5): the row is at the LATER creation's Hlc, the definition's policy stamp at the first. A joiner must hold the later
+/// one too, and the definition alone cannot tell it: the carry of the options row does. (Since unit P the definition follows the row every
+/// time a creation is seen, so two creations of equal options met in order no longer leave this state: it is built by hand, as the stop leaves it.)
+/// WHY: under unit P a standing collection's page definition carries the row's policy stamp, so the carry is the only source of the later `at` exactly
+/// when the definition lags the row; with the definition equal to the row the assertion would pass with no carry at all.
 #[test]
-fn a_joiner_from_a_member_that_met_two_creations_of_equal_options_holds_the_later_at() {
+fn a_joiner_from_a_member_whose_definition_lags_its_row_holds_the_later_at() {
     let base = physical_now_ms();
     let (a, _da) = engine();
     let (c, _dc) = engine();
     let earlier = creation(&a, base - 3_000);
     let later = creation(&c, base - 1_000);
-    let (source, _ds) = applied_in_order(&[&earlier, &later]);
+    let (source, _ds) = applied_in_order(&[&earlier]);
+    let later_options = BaseOptions::of_creation(
+        DB,
+        "orders",
+        later.stamp.hlc,
+        MergePolicy::Document,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        in_txn(&source, |txn| crate::register::note_base_options(txn, &later_options).unwrap()),
+        "premise: the later creation's row rises above the first's"
+    );
     let state = source.get_collection(DB, "orders").expect("premise: the collection stands");
     assert_eq!(
         state.merge_policy_at,
@@ -1348,7 +1364,10 @@ fn a_holder_whose_life_is_at_or_below_the_databases_drop_is_ended_by_it() {
 }
 
 /// A scoped pull of two pages, whose sender drops the collection between them, ends on a page with no document, delete or grant: the rows
-/// the first page staged are still merged, in a transaction the completion opens for them.
+/// the first page staged are still merged, in a transaction the completion opens for them. The sender's definition lags its options row (the
+/// state a stop between the row's commit and the definition's adoption leaves, built by hand: since unit P the definition otherwise follows
+/// the row), so the later creation's row is the one thing only the carry brings. WHY: under unit P a standing collection's page definition carries the
+/// row's policy stamp, so the carry is the only source exactly when the definition lags the row.
 #[test]
 fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
     let base = physical_now_ms();
@@ -1356,7 +1375,20 @@ fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
     let (c, _dc) = engine();
     let earlier = creation(&a, base - 3_000);
     let later = creation(&c, base - 1_000);
-    let (source, _ds) = applied_in_order(&[&earlier, &later]);
+    let (source, _ds) = applied_in_order(&[&earlier]);
+    let later_options = BaseOptions::of_creation(
+        DB,
+        "orders",
+        later.stamp.hlc,
+        MergePolicy::Document,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        in_txn(&source, |txn| crate::register::note_base_options(txn, &later_options).unwrap()),
+        "premise: the later creation's row rises above the first's"
+    );
     let meta = source.get_collection(DB, "orders").unwrap();
     for i in 0..4 {
         source.insert(&meta, bson::doc! { "_id": i, "pad": "x".repeat(200) }).unwrap();

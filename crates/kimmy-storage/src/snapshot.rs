@@ -4135,31 +4135,7 @@ impl Engine {
             }
         }
 
-        // The collection is held now, by this page's creation or by another of the name: the
-        // merge policy follows the later creation, as it does on the entries route, when the
-        // page's coverage names that creation (ADR-163). A held policy never changes otherwise.
-        let policy_at = state.merge_policy_at.unwrap_or(state.created);
-        // A creation cannot have two join retentions: a page that carries another `R` than the one held
-        // for the SAME creation is refused by name (the sender is inconsistent), never applied over it.
-        {
-            let held = self.get_collection(&state.db, &state.name)?;
-            if held.merge_policy_at.unwrap_or(held.created) == policy_at
-                && held.merge_policy == state.merge_policy.fixed_for(&state.name)
-                && (held.join_retention_ms != state.join_retention_ms
-                    || held.loss_limits != state.loss_limits)
-            {
-                return Err(crate::StorageError::Core(kimmy_core::Error::Unsupported(format!(
-                    "a creation cannot have two join retentions or two sets of loss limits: {}.{} holds {:?} and {:?} \
-                     for the creation at {policy_at:?} and the page carries {:?} and {:?}",
-                    state.db,
-                    state.name,
-                    held.join_retention_ms,
-                    held.loss_limits,
-                    state.join_retention_ms,
-                    state.loss_limits
-                ))));
-            }
-        }
+        // The collection is held now, by this page's creation or by another of the name.
         // A stage has one creation. A held stage whose creation is not the page's is an inconsistent sender, refused by name as two
         // join retentions for one creation are (Q6.6, unit C2a).
         {
@@ -4174,16 +4150,10 @@ impl Engine {
                 ))));
             }
         }
-        if hlc_is_named(policy_at, versions) {
-            self.adopt_creation_policy(
-                &state.db,
-                &state.name,
-                state.merge_policy,
-                state.join_retention_ms,
-                state.loss_limits,
-                policy_at,
-            )?;
-        }
+        // The definition follows the options row (`follow_the_options_row`): the row rose above only for a creation the sender's coverage
+        // names (written at the top of this restore), so the coverage gate holds where it protects what this member holds, and a page that
+        // carries another `R` than the one held for a creation is no inconsistency to refuse: the row orders the two (unit P).
+        self.follow_the_options_row(&state.db, &state.name)?;
 
         // The definition floor the page carries, when its coverage names it (ADR-163): adopted into the physical's definition floor, and
         // never into its incarnation floor, which refuses documents. The collection is held here by now, made by this page or held before,

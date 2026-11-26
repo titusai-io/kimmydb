@@ -5596,35 +5596,54 @@ impl Engine {
         Ok(())
     }
 
-    /// Converge the merge policy of a collection held already on the creation that wins: a
-    /// creation of the name at `at` under `policy`, met by an entry or a snapshot page, takes the
-    /// policy when it is later than the creation the held policy came from
-    /// ([`CollectionMeta::policy_yields_to`]); otherwise nothing changes. The policy is fixed
-    /// for the life of each creation, not chosen by arrival order. Converting the records written
-    /// under the policy that lost is not done here (D3).
-    pub(crate) fn adopt_creation_policy(
+    /// Make the definition of the collection `db.name`, when this member holds it, follow the options row of its id (ADR-272, unit P): the
+    /// row is the final answer for the name's options (the later creation by `(Hlc, policy text)`, and a tie to the greater encoding of the
+    /// whole row, `register::options_rise`), and the definition is compared with it EVERY time a creation is seen, never tied to the row
+    /// having risen: the row commits first (`note_creation_seen`), so a delivery that stopped after it and is offered again raises nothing,
+    /// and an adoption tied to the rise would be lost for good. What the definition takes is the policy, `R`, `K` and the policy stamp; a
+    /// vector shadow keeps its stamp (its row's `at` is the constant `Hlc::ZERO`), and a stage keeps its own creation. A creation judged
+    /// history under a drop adopts through here too. Converting the records written under the policy that lost is not done here (D3).
+    /// Returns the definition as it stands, or `None` when the collection is not held.
+    pub(crate) fn follow_the_options_row(
         &self,
         db: &str,
         name: &str,
-        policy: kimmy_core::MergePolicy,
-        join_retention_ms: Option<u64>,
-        loss_limits: Option<kimmy_core::LossLimits>,
-        at: Hlc,
-    ) -> Result<CollectionMeta> {
-        let policy = policy.fixed_for(name);
+    ) -> Result<Option<CollectionMeta>> {
+        let id = CollectionId::derive(db, name);
         for _ in 0..Self::MAX_DEFINITION_RETRIES {
-            let mut meta = self.get_collection(db, name)?;
-            if !meta.policy_yields_to(at, policy) {
-                return Ok(meta);
+            let row = {
+                let txn = self.db.begin_read()?;
+                crate::register::base_options_of(&txn, id)?
+            };
+            let mut meta = match self.get_collection(db, name) {
+                Ok(meta) => meta,
+                Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let Some(row) = row else {
+                return Ok(Some(meta));
+            };
+            let held = crate::register::BaseOptions::of_meta(&meta);
+            if (held.at, held.merge_policy, held.join_retention_ms, held.loss_limits)
+                == (row.at, row.merge_policy, row.join_retention_ms, row.loss_limits)
+            {
+                return Ok(Some(meta));
             }
-            Self::require_join_retention(db, name, policy, join_retention_ms, loss_limits)?;
+            Self::require_join_retention(
+                db,
+                name,
+                row.merge_policy,
+                row.join_retention_ms,
+                row.loss_limits,
+            )?;
             let read = meta.clone();
-            meta.merge_policy = policy;
-            meta.merge_policy_at = Some(at);
-            // R follows the creation that wins, as the policy does: both belong to it.
-            meta.join_retention_ms =
-                join_retention_ms.filter(|_| policy == kimmy_core::MergePolicy::Field);
-            meta.loss_limits = loss_limits.filter(|_| policy == kimmy_core::MergePolicy::Field);
+            meta.merge_policy = row.merge_policy;
+            if !vector_meta::is_shadow(name) {
+                meta.merge_policy_at = Some(row.at);
+            }
+            // R and K follow the creation that wins, as the policy does: both belong to it, and the row keeps them for a `field` collection only.
+            meta.join_retention_ms = row.join_retention_ms;
+            meta.loss_limits = row.loss_limits;
             let txn = self.begin_write(WriterHolder::Ddl)?;
             if !Self::definition_is(&txn, &read)? {
                 txn.abort()?;
@@ -5632,8 +5651,8 @@ impl Engine {
             }
             Self::put_collection_meta(&txn, &meta)?;
             txn.commit()?;
-            info!(db, collection = name, policy = %policy, "took the merge policy of the later creation");
-            return Ok(meta);
+            info!(db, collection = name, policy = %row.merge_policy, "took the options of the later creation");
+            return Ok(Some(meta));
         }
         Err(Self::retries_exhausted_error(db, name))
     }

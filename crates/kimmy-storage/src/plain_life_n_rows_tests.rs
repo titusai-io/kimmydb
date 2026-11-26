@@ -655,13 +655,20 @@ fn row5_a_creation_redelivered_after_its_row_committed_and_its_adoption_did_not_
     assert_eq!(outcome.ddl_refused, 0, "and no refusal is counted");
 }
 
-/// ROW 5, the crash half: the failure BETWEEN the row's commit and the adoption, on the first delivery. NOT COMPILED, and `cfg(any())` until the product has the point.
-/// NEEDS a `Race` point between sync.rs:2646 (`note_creation_seen`, which commits the row in a transaction of its own) and sync.rs:2730 (`adopt_creation_policy`): the coder's call when P is built. The ASSUMED name is `Race::OptionsRowCommitted`.
-/// `arm_test_storage_failure("write")` cannot stand in for it: armed before the call it fails the row's own write first (the row rises), and the existing points (`ReplicatedCreate` at sync.rs:2754, `RestoreCreated`) are after the adoption or on the page route.
-/// WANTED: the first delivery fails after the row committed (the row holds B, the definition A); the second delivery (the same entry) succeeds, adopts B by comparison, and raises nothing (the same assertions as the state half).
-#[cfg(any())]
-mod needs_a_race_point_between_the_row_and_the_adoption {
+/// ROW 5, the crash half: the failure BETWEEN the row's commit and the adoption, on the first delivery. The `Race::OptionsRowCommitted` point (sync.rs, the entries route, right after
+/// `note_creation_seen` has committed the row in a transaction of its own) is where the test arms a failed write: the row holds B and the definition A.
+/// WANTED: the first delivery fails after the row committed; the second delivery (the same entry) succeeds, adopts B by comparison, and raises nothing (the same assertions as the state half).
+/// `row5b` is the same stop on a member that holds NO collection yet: a lower creation delivered afterwards makes the collection from its own options and the definition then follows the row.
+mod row5_crash_half {
     use super::*;
+
+    /// An engine on a directory of its own, and the path to open it again by: a failed write at the stop point poisons the handle (redb asks to close and re-open the
+    /// database), so a crash is followed by a REOPEN on the same directory, as a restart would do.
+    fn on_a_directory() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        (dir, path)
+    }
 
     #[test]
     fn row5_crash_half_a_stop_after_the_options_row_commits_is_healed_by_the_redelivery() {
@@ -671,12 +678,12 @@ mod needs_a_race_point_between_the_row_and_the_adoption {
         let (other, _do) = engine();
         let a = creation_entry(&author, base, &field_body(3_600_000, k));
         let b = creation_entry(&other, base + 1_000, &field_body(172_800_000, k));
-        let (m, _dm) = engine();
-        let m = std::sync::Arc::new(m);
+        let (_dir, path) = on_a_directory();
+        let m = std::sync::Arc::new(Engine::open(&path).unwrap());
         m.apply_batch(std::slice::from_ref(&a)).expect("A applies");
         let stopped = std::sync::Arc::clone(&m);
         crate::sync::race_hooks::at(
-            crate::sync::race_hooks::Race::OptionsRowCommitted, /* ASSUMED */
+            crate::sync::race_hooks::Race::OptionsRowCommitted,
             move || {
                 assert!(stopped.arm_test_storage_failure("write"), "premise: the stop is armed");
             },
@@ -685,7 +692,15 @@ mod needs_a_race_point_between_the_row_and_the_adoption {
             m.apply_batch(std::slice::from_ref(&b)).is_err(),
             "the first delivery stops after the row committed"
         );
+        // the restart
+        drop(m);
+        let m = Engine::open(&path).unwrap();
         let row_before = options_bytes(&m, "orders").expect("the row holds B");
+        assert_eq!(
+            options_of(&m, "orders").expect("the row").at,
+            b.stamp.hlc,
+            "premise: the row committed for B before the stop"
+        );
         assert_eq!(
             m.get_collection(DB, "orders").unwrap().join_retention_ms,
             Some(3_600_000),
@@ -703,5 +718,55 @@ mod needs_a_race_point_between_the_row_and_the_adoption {
             "the redelivery raised nothing"
         );
         assert_eq!(outcome.ddl_refused, 0, "and counted no refusal");
+    }
+
+    /// The stop between the row's commit and the creation, on a member that holds no collection: B (the later creation) commits its row and stops; A (the lower creation)
+    /// is delivered after the restart, makes the collection from its own options, and the definition follows the row, so it ends with B's, as it would had B been applied.
+    #[test]
+    fn row5b_a_lower_creation_met_after_a_later_ones_row_committed_and_stopped_ends_with_the_rows_options()
+     {
+        let base = physical_now_ms().saturating_sub(5_000);
+        let k = LossLimits { cap: 4, cut_bytes: 64 };
+        let (author, _da) = engine();
+        let (other, _do) = engine();
+        let a = creation_entry(&author, base, &field_body(3_600_000, k));
+        let b = creation_entry(&other, base + 1_000, &field_body(172_800_000, k));
+        let (_dir, path) = on_a_directory();
+        let m = std::sync::Arc::new(Engine::open(&path).unwrap());
+        let stopped = std::sync::Arc::clone(&m);
+        crate::sync::race_hooks::at(
+            crate::sync::race_hooks::Race::OptionsRowCommitted,
+            move || {
+                assert!(stopped.arm_test_storage_failure("write"), "premise: the stop is armed");
+            },
+        );
+        assert!(
+            m.apply_batch(std::slice::from_ref(&b)).is_err(),
+            "the delivery of B stops after its row committed"
+        );
+        // the restart
+        drop(m);
+        let m = Engine::open(&path).unwrap();
+        assert!(
+            m.get_collection(DB, "orders").is_err(),
+            "premise: nothing was made by the stopped delivery"
+        );
+        assert_eq!(
+            options_of(&m, "orders").expect("the row holds B").at,
+            b.stamp.hlc,
+            "premise: B's row committed"
+        );
+        let row_before = options_bytes(&m, "orders").expect("the row");
+        m.apply_batch(std::slice::from_ref(&a)).expect("A applies");
+        assert_eq!(
+            m.get_collection(DB, "orders").expect("A made the collection").join_retention_ms,
+            Some(172_800_000),
+            "the definition follows the row: B's R, not the A that made it"
+        );
+        assert_eq!(
+            options_bytes(&m, "orders").expect("the row"),
+            row_before,
+            "and A raised nothing"
+        );
     }
 }

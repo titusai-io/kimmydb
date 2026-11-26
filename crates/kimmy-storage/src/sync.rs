@@ -2644,6 +2644,11 @@ impl Engine {
                     target.stage,
                 );
                 self.note_creation_seen(&seen)?;
+                // The definition follows the row, compared every time a creation is seen (a standing life adopts here, from a creation judged
+                // history too), after the row has committed on its own (unit P).
+                #[cfg(test)]
+                race_hooks::reach(race_hooks::Race::OptionsRowCommitted);
+                self.follow_the_options_row(&target.db, &target.name)?;
 
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
@@ -2696,53 +2701,11 @@ impl Engine {
                     // Held already: by this entry applied before, or by another creation
                     // of the name. The validator it carries is then a change like a
                     // `ConfigureValidator`'s, last writer winning on the stamp.
-                    Ok(held) => {
-                        // A creation cannot have two join retentions: the same creation (its stamp) met
-                        // again, carrying another `R` than the one this member holds for it, is
-                        // inconsistent and is refused by name, counted and not applied. R is fixed at
-                        // creation and immutable, so every member computes the same horizon.
-                        if held.merge_policy_at == Some(entry.stamp.hlc)
-                            && held.merge_policy == target.merge_policy.fixed_for(&target.name)
-                            && (held.join_retention_ms != target.join_retention_ms
-                                || held.loss_limits != target.loss_limits)
-                        {
-                            warn!(
-                                db = %target.db,
-                                collection = %target.name,
-                                held = ?held.join_retention_ms,
-                                entry = ?target.join_retention_ms,
-                                held_loss_limits = ?held.loss_limits,
-                                entry_loss_limits = ?target.loss_limits,
-                                "a creation carries another join retention or other loss limits than the ones held for the same \
-                                 creation; refused: a creation cannot have two Rs or two sets of limits"
-                            );
-                            return Ok(DdlOutcome::Refused);
-                        }
-                        // The policy is fixed at creation, and two members can create the
-                        // name at once under different ones: it follows the creation with the
-                        // later stamp, on every member, whichever arrives first. So does its join
-                        // retention `R`, which belongs to the creation: two creations of the one name
-                        // under the same policy and different `R` settle on the later one too.
-                        if held.merge_policy != target.merge_policy.fixed_for(&target.name)
-                            || held.join_retention_ms != target.join_retention_ms
-                            || held.loss_limits != target.loss_limits
-                        {
-                            let kept = self.adopt_creation_policy(
-                                &target.db,
-                                &target.name,
-                                target.merge_policy,
-                                target.join_retention_ms,
-                                target.loss_limits,
-                                entry.stamp.hlc,
-                            )?;
-                            warn!(
-                                db = %target.db,
-                                collection = %target.name,
-                                entry = %target.merge_policy,
-                                standing = %kept.merge_policy,
-                                "a creation names a merge policy or a join retention other than the one held; the later creation's stands"
-                            );
-                        }
+                    Ok(_) => {
+                        // The policy, `R` and `K` of a name are fixed by the later creation, on every member, whichever arrives first, and
+                        // the definition follows the options row (`follow_the_options_row`, called above, where the creation is seen): a
+                        // creation of a name that carries another `R` than the one held is no inconsistency of its sender, since the row
+                        // orders them, and a shadow's creation that carries one is judged through the forcing the row already applies.
                         if let Some(outcome) = self.validator_of_a_creation(&target, entry)? {
                             return Ok(outcome);
                         }
@@ -2776,6 +2739,9 @@ impl Engine {
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                                // Made from this creation's own options: the row may hold a later creation's, seen and not applied (a stop
+                                // after its row committed), and the definition follows the row (unit P).
+                                self.follow_the_options_row(&target.db, &target.name)?;
                                 // A drop of the name in effect here can hide the collection just made (ADR-272, decision 5):
                                 // counted and warned of, where the members that serve it cannot see it.
                                 self.report_a_creation_the_register_hides(
@@ -4055,6 +4021,9 @@ pub(crate) mod race_hooks {
         /// A snapshot restore has committed the collection it made and has done nothing more of it: not a race, a point at which a test stops
         /// the page (a failed write from here is a stop between the creation's commit and whatever the page writes next).
         RestoreCreated,
+        /// A replicated creation has committed its options row, in a transaction of its own, and has done nothing more: not a race, a point at
+        /// which a test stops the delivery (a failed write from here is a stop between the row's commit and the definition's adoption of it).
+        OptionsRowCommitted,
     }
 
     type Hook = Box<dyn FnOnce()>;

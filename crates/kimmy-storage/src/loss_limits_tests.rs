@@ -480,10 +480,10 @@ fn claim_4_every_member_holds_and_reports_each_record_of_the_k_greatest_of_what_
 
 // ---- the limits belong to the creation, as `R` does ---------------------------------------------------------
 
-/// A creation cannot have two sets of loss limits: the same creation met again with other limits is refused by name
-/// (counted, not applied) and the collection keeps the ones it holds.
+/// Unit P (the 11:36 AM ruling): the same creation met again with other limits is no longer refused. The options row orders the two
+/// (the greater encoding of the whole row, as text), and the definition follows the row.
 #[test]
-fn a_creation_met_again_with_other_loss_limits_is_refused_by_name() {
+fn a_creation_met_again_with_other_loss_limits_is_settled_by_the_options_row_and_not_refused() {
     let (a, b, _ca, _cb, _d) = pair();
     let creation = everything(&a);
     let held_before = b.get_collection("shop", "orders").unwrap();
@@ -495,17 +495,18 @@ fn a_creation_met_again_with_other_loss_limits_is_refused_by_name() {
     again.body = Some(bson::serialize_to_vec(&body).unwrap());
     let outcome = b.apply_batch(std::slice::from_ref(&again)).unwrap();
 
-    assert_eq!(outcome.ddl_refused, 1, "a creation cannot have two sets of limits: {outcome:?}");
+    assert_eq!(outcome.ddl_refused, 0, "no refusal is counted: {outcome:?}");
+    assert_ne!(held_before.loss_limits, Some(LossLimits { cap: 9, cut_bytes: 300 }), "premise");
     assert_eq!(
         b.get_collection("shop", "orders").unwrap().loss_limits,
-        held_before.loss_limits,
-        "and the ones held stand"
+        Some(LossLimits { cap: 9, cut_bytes: 300 }),
+        "the greater encoding of the row stands (a cap of 9 over a cap of 5, as text)"
     );
 }
 
-/// The same for a snapshot page: refused by name, never applied over the held limits.
+/// The same for a snapshot page: settled by the options row, and no error of the pull.
 #[test]
-fn a_page_carrying_other_loss_limits_for_the_same_creation_is_refused_by_name() {
+fn a_page_carrying_other_loss_limits_for_the_same_creation_is_settled_by_the_options_row() {
     let (a, b, _ca, _cb, _d) = pair();
     let mut page = a.snapshot_page(None, None).unwrap();
     assert_eq!(
@@ -515,16 +516,14 @@ fn a_page_carrying_other_loss_limits_for_the_same_creation_is_refused_by_name() 
     );
     page.collections[0].loss_limits = Some(LossLimits { cap: 9, cut_bytes: 300 });
 
-    let refused =
-        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page);
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect("the page applies");
 
-    match refused {
-        Err(crate::StorageError::Core(e)) => {
-            assert!(e.to_string().contains("two sets of loss limits"), "{e}");
-        }
-        other => panic!("refused by name, not {other:?}"),
-    }
-    assert_eq!(b.get_collection("shop", "orders").unwrap().loss_limits, Some(limits()));
+    assert_eq!(
+        b.get_collection("shop", "orders").unwrap().loss_limits,
+        Some(LossLimits { cap: 9, cut_bytes: 300 }),
+        "the greater encoding of the row stands"
+    );
 }
 
 /// A creation whose limits are outside the bounds, or that carries none, is not a valid creation: refused as corrupt, so no

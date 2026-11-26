@@ -1432,6 +1432,23 @@ pub(crate) fn note_base_options(
     Ok(true)
 }
 
+/// The options row of `id`, read in a read transaction: `None` when the table or the row is absent (the table is created by its first write).
+pub(crate) fn base_options_of(
+    txn: &redb::ReadTransaction,
+    id: CollectionId,
+) -> Result<Option<BaseOptions>> {
+    let key = id.0.to_be_bytes();
+    let held = match txn.open_table(tables::COLLECTION_BASE_OPTIONS) {
+        Ok(table) => table.get(key.as_slice())?.map(|raw| raw.value().to_vec()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    match held {
+        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
 /// Whether [`note_base_options`] would write `options`: read in a read transaction, so a creation judged history, which holds no
 /// transaction of its own, takes the writer only when its options rise.
 pub(crate) fn base_options_would_rise(
