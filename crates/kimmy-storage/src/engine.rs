@@ -1434,8 +1434,8 @@ pub struct OpenOptions {
     cache_bytes: Option<usize>,
     force_rebuild: Option<&'static str>,
     /// The epoch a mint must be strictly above (D13 containment, ADR-274): a restore into a halted
-    /// host's directory passes the newer epoch the marker names. Scaffold: accepted and not yet
-    /// read.
+    /// host's directory passes the newer epoch the marker names. Read at the mint, which starts
+    /// above it whatever the clock says.
     epoch_floor: Option<Epoch>,
 }
 
