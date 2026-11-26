@@ -486,3 +486,40 @@ async fn a_relay_cut_by_the_cap_leaves_the_members_own_table_to_tell() {
         "the member's own table tells the old host: {tell:?}"
     );
 }
+
+// -- a completed handshake is what ends a fresh epoch's guard (ADR-274)
+// ------------------------------
+
+/// A verified handshake with another node marks both sides as having met a peer, with no write in
+/// the contact.
+#[tokio::test]
+async fn a_verified_handshake_with_another_node_marks_both_sides() {
+    let ((dialler, _d), (responder, _r)) = (engine(), engine());
+    assert!(!dialler.has_met_a_peer() && !responder.has_met_a_peer(), "premise");
+    let (opened, accepted, _ours, _theirs) = handshake(&dialler, &responder).await;
+    opened.unwrap();
+    accepted.unwrap();
+    assert!(dialler.has_met_a_peer(), "the dialler met the responder");
+    assert!(responder.has_met_a_peer(), "the responder met the dialler");
+}
+
+/// A host that dials its own address met no peer, and neither did a probe's answerer.
+#[tokio::test]
+async fn a_self_contact_and_a_probe_mark_nobody() {
+    let (host, _h) = engine();
+    let (opened, accepted, _ours, _theirs) = handshake(&host, &host).await;
+    let _ = (opened, accepted);
+    assert!(!host.has_met_a_peer(), "a host that dialled itself has met no peer");
+
+    let (responder, _r) = engine();
+    let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+    let probed = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let probing = async {
+        raw_hello(&mut ours, NodeId::generate(), Some(crate::protocol::PROTOCOL), None, true).await;
+        let _ = read_frame(&mut ours).await;
+        drop(ours);
+    };
+    let _ =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(probed, probing) }).await;
+    assert!(!responder.has_met_a_peer(), "a probe is not a handshake");
+}

@@ -144,6 +144,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether this epoch's host has completed a handshake with another node (ADR-274): the durable
+    /// bit that tells a fresh epoch, which runs the mistaken-restore guard before it dials or
+    /// accepts, from one that has already joined. Held in memory and loaded at the end of an open
+    /// from a row that names this store's own epoch, so a restore, which mints a new epoch, starts
+    /// without it. **Scaffold: always false.**
+    pub fn has_met_a_peer(&self) -> bool {
+        false
+    }
+
+    /// Note that this epoch's host completed a handshake with another node. Sets the flag and
+    /// nothing else: a handshake never waits on the writer. **Scaffold: does nothing.**
+    pub fn note_met_a_peer(&self) {}
+
+    /// Write the bit durably, from outside a contact (it takes the writer). **Scaffold: does
+    /// nothing.**
+    pub fn persist_met_a_peer(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The clock a claimed epoch's start is held against: the later of the physical clock and the
     /// logical clock's last wall time (a member whose wall clock is behind its own logical clock
     /// must not refuse every legitimate new epoch, gap 4).

@@ -260,3 +260,50 @@ fn a_restore_of_a_halted_hosts_backup_is_not_halted() {
     assert!(restored.halted().is_none(), "the halt belongs to the epoch it named");
     restored.create_collection("shop", "more").unwrap();
 }
+
+// -- the bit that tells a fresh epoch from a joined one (the guard)
+// ----------------------------------
+
+/// A fresh epoch has met no peer; noting one is remembered, and written durably from outside a
+/// contact, it survives a restart.
+#[test]
+fn the_bit_that_a_peer_was_met_is_held_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = open(&path);
+        assert!(!engine.has_met_a_peer(), "premise: a fresh epoch has met nobody");
+        engine.note_met_a_peer();
+        assert!(engine.has_met_a_peer(), "noted at once, with no writer");
+        engine.persist_met_a_peer().unwrap();
+    }
+    assert!(open(&path).has_met_a_peer(), "the bit is durable once written");
+}
+
+/// A note that was never written is lost with the process, and the guard runs again: harmless.
+#[test]
+fn a_bit_that_was_never_written_is_forgotten_by_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = open(&path);
+        engine.note_met_a_peer();
+        assert!(engine.has_met_a_peer(), "premise: held in memory");
+    }
+    assert!(!open(&path).has_met_a_peer());
+}
+
+/// The bit belongs to the epoch: a restore of the store's backup mints a new one, and starts
+/// without it.
+#[test]
+fn a_restore_starts_without_the_bit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = open(&dir.path().join("source.redb"));
+    source.note_met_a_peer();
+    source.persist_met_a_peer().unwrap();
+    assert!(source.has_met_a_peer(), "premise: the source has met a peer");
+    let backup = backup_of(&source);
+    let path = dir.path().join("restored.redb");
+    restore(&path, &mut backup.as_slice()).unwrap();
+    assert!(!open(&path).has_met_a_peer(), "a new epoch has met nobody");
+}
