@@ -1116,13 +1116,13 @@ fn holds_table(
 /// it no write. A damaged row fails the page, before anything of it is held. Returned as (wire tag, key, value).
 fn carried_news(
     txn: &redb::WriteTransaction,
-    rows: &[CarriedRow],
+    rows: &[Judged<'_>],
 ) -> Result<Vec<crate::register::WireRow>> {
     let mut news = Vec::new();
     let held = crate::register::CarryTables::open(txn)?;
-    for row in rows {
-        let judged = crate::register::judge_carried_row(row.table, &row.key, &row.value)?;
-        if held.is_news(&judged)? {
+    for judged in rows {
+        if held.is_news(&judged.kind)? {
+            let row = judged.row;
             news.push((row.table, row.key.to_vec(), row.value.to_vec()));
         }
     }
@@ -1135,7 +1135,7 @@ fn stage_carried_rows(
     txn: &redb::WriteTransaction,
     peer: NodeId,
     scope: Option<CollectionId>,
-    rows: &[CarriedRow],
+    rows: &[Judged<'_>],
 ) -> Result<bool> {
     let news = carried_news(txn, rows)?;
     if news.is_empty() {
@@ -1161,7 +1161,7 @@ fn restage_carry(
     txn: &redb::WriteTransaction,
     peer: NodeId,
     scope: Option<CollectionId>,
-    rows: &[CarriedRow],
+    rows: &[Judged<'_>],
 ) -> Result<bool> {
     let news = carried_news(txn, rows)?;
     let before = take_carry_stage(txn, peer, scope)?;
@@ -1189,24 +1189,25 @@ fn merge_carry(
     peer: NodeId,
     scope: Option<CollectionId>,
     discard_staged: bool,
-    rows: &[CarriedRow],
+    rows: &[Judged<'_>],
 ) -> Result<bool> {
     let previous = take_carry_stage(txn, peer, scope)?;
     let mut wrote = !previous.is_empty();
-    let mut judged = Vec::new();
+    // what the earlier pages staged is judged again as it leaves the staging (the one place a row is read back), and the rows of this page
+    // are the judgements made on arrival
+    let mut staged = Vec::new();
     if !discard_staged {
         for (tag, key, value) in &previous {
-            judged.push((*tag, crate::register::judge_carried_row(*tag, key, value)?));
+            staged.push((*tag, crate::register::judge_carried_row(*tag, key, value)?));
         }
     }
-    for row in rows {
-        let kind = crate::register::judge_carried_row(row.table, &row.key, &row.value)?;
-        judged.push((row.table, kind));
-    }
+    let mut order: Vec<(u8, &crate::register::CarriedRowKind)> =
+        staged.iter().map(|(tag, kind)| (*tag, kind)).collect();
+    order.extend(rows.iter().map(|judged| (judged.row.table, &judged.kind)));
     // the names table first: its tag is the lower
-    judged.sort_by_key(|(tag, _)| *tag);
-    for (_, row) in &judged {
-        wrote |= crate::register::merge_carried_row(txn, row)?;
+    order.sort_by_key(|(tag, _)| *tag);
+    for (_, kind) in order {
+        wrote |= crate::register::merge_carried_row(txn, kind)?;
     }
     Ok(wrote)
 }
@@ -1249,7 +1250,74 @@ pub(crate) fn clear_carry_stage(
     Ok(!take_carry_stage(txn, peer, scope)?.is_empty())
 }
 
+/// A row of a page's carry, judged once on arrival and carried on from there: the row as it crossed and what it names.
+struct Judged<'a> {
+    row: &'a CarriedRow,
+    kind: crate::register::CarriedRowKind,
+}
+
+/// Judge every row a page carries before anything of the page is applied: each by its table's rules, and on a scoped page each must be
+/// the scoped collection's own (its key is the scoped id). A row that is not is a damaged page. The judgement is made here, once, and
+/// passed on to the staging and the merge.
+fn judge_page_carry(scope: Option<CollectionId>, page: &SnapshotPage) -> Result<Vec<Judged<'_>>> {
+    let mut judged = Vec::with_capacity(page.carried.len());
+    for row in &page.carried {
+        let kind = crate::register::judge_carried_row(row.table, &row.key, &row.value)?;
+        if let Some(id) = scope
+            && row.key.as_slice() != id.0.to_be_bytes().as_slice()
+        {
+            return Err(crate::StorageError::Corrupt(
+                "a scoped snapshot page carries a row that is not its collection's".into(),
+            ));
+        }
+        judged.push(Judged { row, kind });
+    }
+    Ok(judged)
+}
+
 impl Engine {
+    /// A scoped page of a collection the sender no longer holds may name the drop of its DATABASE (ADR-272, unit N): the collection's own
+    /// tombstone, which `dropped` carries, does not follow a database dropped after it. Believed only up to the sender's own coverage
+    /// (ADR-163), it is applied to the collection as a CARRIED DROP, as `dropped` is: a collection this member holds standing goes through
+    /// the incarnation test, the sweep of what a life above the drop may still hold, the keeping of later writes and the register's
+    /// deferral, and a member that holds nothing records the tombstone of the collection and its shadow after the register's deferral. It
+    /// is never the database's own tombstone that is recorded: that would sweep the other collections of it, which a scoped pull has no word
+    /// about. The page's rows were judged, and are the collection's own, before anything was applied.
+    fn apply_page_database_drop(&self, id: CollectionId, page: &SnapshotPage) -> Result<()> {
+        let Some(stamp) = page.dropped_database else { return Ok(()) };
+        if stamp.hlc > page.versions.get(stamp.origin()) {
+            return Ok(());
+        }
+        self.witness_covered(&stamp, &page.versions);
+        // Whether this member holds the collection is decided BEFORE the drop is applied: a collection the drop buries reads as held no
+        // longer afterwards, and it was buried with its shadow, in the parent's transaction.
+        let held = self.collection_by_id(id)?.is_some();
+        self.restore_collection_drop(id, stamp)?;
+        // A member that holds nothing under the id records the collection's shadow too, as a burial records both: a shadow's chunks are
+        // judged by the shadow's own id. The database and the name are the page's own judged rows', and the register's deferral is asked
+        // of the PARENT's id, as `restore_collection_drop` asks it: what the register owns is recorded for neither.
+        if !held {
+            let rows = page
+                .carried
+                .iter()
+                .map(|row| (row.table, row.key.as_slice(), row.value.as_slice()));
+            if let Some((db, name)) = crate::register::database_and_name_of(rows)
+                && !kimmy_core::vector_meta::is_shadow(&name)
+            {
+                let owned = {
+                    let txn = self.db().begin_read()?;
+                    crate::register::owns_id(&txn, id)?
+                };
+                if !owned {
+                    let shadow =
+                        CollectionId::derive(&db, &kimmy_core::vector_meta::shadow_name(&name));
+                    self.record_ids_at(&[shadow], stamp)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the staging holds a row of the pull with `peer` of `scope`, read without the writer.
     fn carry_stage_has_rows(&self, peer: NodeId, scope: Option<CollectionId>) -> Result<bool> {
         use std::ops::Bound;
@@ -1343,6 +1411,32 @@ impl Engine {
             None if after.is_none() => (self.collection_states()?, None),
             None => (Vec::new(), None),
         };
+        // The rows of the carry that are the scoped collection's own, and the drop of its DATABASE when that is what reached it (ADR-272,
+        // unit N): the collection's names row and options row ride the first page of a scoped snapshot, and a collection that is gone names
+        // the database's drop, which its own tombstone does not follow when the database was dropped later. The sender's own coverage
+        // bounds what it names, as for every drop a page carries (ADR-163).
+        let scoped_rows = match scope {
+            Some(id) => {
+                let txn = self.db().begin_read()?;
+                crate::register::rows_of(&txn, id)?
+            }
+            None => Vec::new(),
+        };
+        let dropped_database = match scope {
+            Some(id) if collections.is_empty() && self.collection_by_id(id)?.is_none() => {
+                let rows = scoped_rows
+                    .iter()
+                    .map(|(tag, key, value)| (*tag, key.as_slice(), value.as_slice()));
+                let named = crate::register::database_and_name_of(rows);
+                match named {
+                    Some((db, _)) => self
+                        .database_dropped_at(&db)?
+                        .filter(|stamp| stamp.hlc <= versions.get(stamp.origin())),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
         // What the sender has DELETED, for the whole-database route only: the
         // scoped route names its one collection in `dropped` above. On every
         // page, so a drop that lands mid-transfer is carried (ADR-152's lesson,
@@ -1377,7 +1471,7 @@ impl Engine {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
-            dropped_database: None,
+            dropped_database,
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
@@ -1390,6 +1484,18 @@ impl Engine {
         // key is no key, so the walk reads it as before the first collection).
         let mut carried: Vec<CarriedRow> = Vec::new();
         let mut carry_used = 0usize;
+        if scope.is_some() && first {
+            carried = scoped_rows
+                .iter()
+                .map(|(table, key, value)| CarriedRow {
+                    table: *table,
+                    key: serde_bytes::ByteBuf::from(key.clone()),
+                    value: serde_bytes::ByteBuf::from(value.clone()),
+                })
+                .collect();
+            carry_used =
+                carried.iter().map(|row| row.key.len() + row.value.len() + CARRIED_ROW_FRAME).sum();
+        }
         let in_the_carry = scope.is_none() && after.as_ref().is_none_or(|c| c.carry != Carry::Done);
         if in_the_carry {
             // the cursor that cuts the carry names a row's key, which crosses as an array: reserved once, from the longest key
@@ -1480,7 +1586,7 @@ impl Engine {
             tombstone_horizon,
             register,
             carried,
-            dropped_database: None,
+            dropped_database,
         })
     }
 
@@ -2027,6 +2133,7 @@ impl Engine {
         let named = |hlc: Hlc| Stamp::new(hlc, peer, Epoch::ZERO);
         let mut stamps: Vec<Stamp> = Vec::new();
         stamps.extend(page.dropped);
+        stamps.extend(page.dropped_database);
         stamps.extend(page.dropped_collections.iter().map(|(_, stamp)| *stamp));
         for state in &page.collections {
             stamps.push(named(state.created));
@@ -2065,6 +2172,8 @@ impl Engine {
         // member's clock, is refused until due whatever the collection's merge policy, before anything is
         // applied: the page is a stop, as a far-future document of a `field` collection is.
         self.refuse_far_future_definitions(peer, page)?;
+        // A damaged row of the carry refuses the page before anything of it is applied (ADR-272, unit N).
+        let carry_rows = judge_page_carry(progress.scope, page)?;
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
@@ -2105,6 +2214,9 @@ impl Engine {
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
             self.witness_covered(&dropped, &page.versions);
             self.restore_collection_drop(id, dropped)?;
+        }
+        if let Some(id) = progress.scope {
+            self.apply_page_database_drop(id, page)?;
         }
         // The whole-database route's own denials, through the same predicate
         // the scoped one uses -- `restore_collection_drop` asks
@@ -2216,9 +2328,12 @@ impl Engine {
         // The rows of the carry (ADR-272, unit N), of a whole-database pull: the first page of the pull empties what an earlier pull of this
         // sender left staged, every page stages the rows it carries, and the page that completes the join merges them, in its transaction
         // and before the register's events are named from the names. A scoped pull stages nothing.
-        let stale = progress.scope.is_none()
-            && progress.pages == 0
-            && self.carry_stage_has_rows(peer, None)?;
+        // The staging is looked at on the first page (to empty what an earlier pull left) and on the page that completes the pull (to merge
+        // what it staged): a completing page with no document, delete or grant still owes the merge, and so opens its transaction.
+        let holds_stage =
+            (progress.pages == 0 || complete) && self.carry_stage_has_rows(peer, progress.scope)?;
+        let stale = progress.pages == 0 && holds_stage;
+        let owes_a_merge = complete && holds_stage;
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
@@ -2227,6 +2342,7 @@ impl Engine {
             || grant.is_some()
             || !page.carried.is_empty()
             || stale
+            || owes_a_merge
         {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
@@ -2330,13 +2446,14 @@ impl Engine {
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
             let mut wrote = !pending.is_empty() || recorded > 0 || state_moved > 0;
-            if progress.scope.is_none() {
-                if grant.is_some() {
-                    wrote |= merge_carry(&txn, peer, None, progress.pages == 0, &page.carried)?;
+            {
+                let scope = progress.scope;
+                if complete {
+                    wrote |= merge_carry(&txn, peer, scope, progress.pages == 0, &carry_rows)?;
                 } else if progress.pages == 0 {
-                    wrote |= restage_carry(&txn, peer, None, &page.carried)?;
+                    wrote |= restage_carry(&txn, peer, scope, &carry_rows)?;
                 } else {
-                    wrote |= stage_carried_rows(&txn, peer, None, &page.carried)?;
+                    wrote |= stage_carried_rows(&txn, peer, scope, &carry_rows)?;
                 }
             }
             // The register the last page carries, put in effect BEFORE the grant is absorbed and settled AFTER it, in this one

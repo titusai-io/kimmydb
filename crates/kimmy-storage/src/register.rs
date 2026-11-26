@@ -1549,6 +1549,45 @@ impl<'txn> CarryTables<'txn> {
     }
 }
 
+/// The rows of the carry that belong to one collection id: its names row and its options row, as the tables store them (wire tag, key,
+/// value). A scoped snapshot carries them on its first page; a table that is not there holds none.
+pub(crate) fn rows_of(txn: &redb::ReadTransaction, id: CollectionId) -> Result<Vec<WireRow>> {
+    let key = id.0.to_be_bytes();
+    let mut rows = Vec::new();
+    for (tag, definition) in [
+        (crate::snapshot::CARRY_NAMES, tables::REGISTER_NAMES),
+        (crate::snapshot::CARRY_OPTIONS, tables::COLLECTION_BASE_OPTIONS),
+    ] {
+        let table = match txn.open_table(definition) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(held) = table.get(key.as_slice())? {
+            rows.push((tag, key.to_vec(), held.value().to_vec()));
+        }
+    }
+    Ok(rows)
+}
+
+/// The database and the name of the collection the rows of a scoped carry are of: the options row names both, and a names row names the
+/// database and the collection's own physical. A row that does not judge names nothing. `None` when the rows name no collection.
+pub(crate) fn database_and_name_of<'a>(
+    rows: impl IntoIterator<Item = (u8, &'a [u8], &'a [u8])>,
+) -> Option<(String, String)> {
+    let mut named = None;
+    for (tag, key, value) in rows {
+        match judge_carried_row(tag, key, value) {
+            Ok(CarriedRowKind::Options(options)) => return Some((options.db, options.name)),
+            Ok(CarriedRowKind::Names { db, physical, .. }) => {
+                named = named.or(Some((db, physical)));
+            }
+            Err(_) => {}
+        }
+    }
+    named
+}
+
 /// The length of a key of the carry: both carried tables are keyed by a collection id.
 pub(crate) const CARRY_KEY_LEN: usize = 8;
 

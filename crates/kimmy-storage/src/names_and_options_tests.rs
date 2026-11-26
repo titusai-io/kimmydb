@@ -894,7 +894,15 @@ fn a_carried_names_row_of_another_logical_name_refuses_the_page() {
 #[test]
 fn a_carried_names_row_of_another_logical_name_is_refused_beside_the_held_one() {
     let (a, _da, page) = a_page_with_a_wrong_logical_names_row();
+    // the member already holds the real row: an honest page of the same sender came first
     let (b, _db) = engine();
+    b.apply_snapshot_page(
+        a.node_id(),
+        &mut SnapshotProgress::whole_database(),
+        &a.snapshot_page(None, None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(names_of(&b, STAGE), named(STAGE, "orders"), "premise: the real row is held");
     let refused =
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page);
     assert!(refused.is_err(), "the page is refused: {refused:?}");
@@ -1347,4 +1355,42 @@ fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
         Hlc::new(base - 1_000, 0),
         "the first page's row, which only the carry brings, was merged"
     );
+}
+
+/// The progress guarantee of the carry: a page room below one carried row still sends one row a page, so the carry ends. Each page holds at
+/// most one row, every row of the sender's options table is sent, and the carry's pages are bounded, so that a page that sent none (which
+/// would read as a carry that is done, and drop every row) or one that went on for ever fails the test and does not hang it.
+#[test]
+fn a_room_below_one_carried_row_still_sends_one_row_a_page() {
+    let (a, _da) = a_sender_with_ghosts(8);
+    a.set_snapshot_room_for_test(Some(1));
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let (mut sent, mut pages) = (0usize, 0usize);
+    while progress.after().is_none_or(|cursor| matches!(cursor.carry, Carry::At(_))) {
+        assert!(pages < 100, "the carry does not end after {pages} pages");
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        assert!(page.carried.len() <= 1, "a page of {} rows in a room of 1", page.carried.len());
+        sent += page.carried.len();
+        pages += 1;
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(sent, rows(&a, Carried::Options).len(), "every row was sent, one a page");
+}
+
+/// A database's drop a page names is held to the clock bound with the page's other schema stamps: one far ahead of this member's clock is a
+/// stop, not a record, and the page is asked for again once it is due.
+#[test]
+fn a_page_whose_database_drop_is_far_ahead_of_the_clock_is_a_stop() {
+    let (a, _da, _own, database) = a_sender_with_a_later_database_drop();
+    let id = CollectionId::derive(DB, "orders");
+    let mut page = a.snapshot_page(None, Some(id)).unwrap();
+    page.dropped_database = Some(Stamp::new(
+        Hlc::new(database.hlc.wall_ms + 10 * 365 * 24 * 3600 * 1000, 0),
+        database.origin().node,
+        database.origin().epoch,
+    ));
+    let (b, _db) = engine();
+    let applied = b.apply_snapshot_page(a.node_id(), &mut scoped(id), &page).unwrap();
+    assert!(applied.clock_refused.is_some(), "the page is a stop until the stamp is due");
 }
