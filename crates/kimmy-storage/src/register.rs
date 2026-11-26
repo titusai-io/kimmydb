@@ -1371,6 +1371,23 @@ impl BaseOptions {
         }
     }
 
+    /// Whether the row is of the normal form: exactly what [`Self::of_creation`] makes of its own fields (the policy forced for a shadow and a
+    /// system name, `R` and `K` kept for a `field` collection only, a shadow's `at` the constant zero). No creation route writes any other
+    /// shape, so a row that is not of it comes from a member whose own check was bypassed: held, it would rise over the honest row
+    /// (`options_rise` orders by `(at, policy text)`) and be served on to every joiner for good (unit P, PF4).
+    pub(crate) fn is_of_normal_form(&self) -> bool {
+        let normal = Self::of_creation(
+            &self.db,
+            &self.name,
+            self.at,
+            self.merge_policy,
+            self.join_retention_ms,
+            self.loss_limits,
+            self.stage,
+        );
+        *self == normal
+    }
+
     /// What a creation names that never became a collection here (judged history, or one that found the collection standing): the same
     /// options [`Self::of_meta`] reads from the collection a creation makes, with `R` and `K` kept only for a `field` collection.
     pub(crate) fn of_creation(
@@ -1490,6 +1507,11 @@ pub(crate) fn judge_carried_row(table: u8, key: &[u8], value: &[u8]) -> Result<C
                 .map_err(|_| corrupt("a carried options row that does not decode"))?;
             if CollectionId::derive(&options.db, &options.name).0.to_be_bytes().as_slice() != key {
                 return Err(corrupt("a carried options row whose names derive another key"));
+            }
+            if !options.is_of_normal_form() {
+                return Err(corrupt(
+                    "a carried options row that is not of the normal form of its own fields",
+                ));
             }
             Ok(CarriedRowKind::Options(options))
         }
@@ -2369,6 +2391,12 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
         {
             return Err(damaged(&format!(
                 "a base-options row whose names derive another key than its own: {}.{}",
+                options.db, options.name
+            )));
+        }
+        if !options.is_of_normal_form() {
+            return Err(damaged(&format!(
+                "a base-options row that is not of the normal form of its own fields: {}.{}",
                 options.db, options.name
             )));
         }
