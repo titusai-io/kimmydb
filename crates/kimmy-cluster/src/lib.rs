@@ -41,6 +41,9 @@ mod clock_stop_tests;
 mod codec_tests;
 
 #[cfg(test)]
+mod containment_marker_tests;
+
+#[cfg(test)]
 mod containment_tests;
 
 #[cfg(test)]

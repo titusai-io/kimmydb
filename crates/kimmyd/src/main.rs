@@ -112,7 +112,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Restore { from, until } => {
+        Command::Restore { from, until, replace: _ } => {
             // Into the configured data directory, at the same filename a node
             // opens, so that starting the node afterwards needs no extra flag.
             let target = config.storage.data_dir.join("kimmy.redb");

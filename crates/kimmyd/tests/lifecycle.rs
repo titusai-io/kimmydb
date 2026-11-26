@@ -2713,6 +2713,114 @@ fn restore(config: &Path, backup: &Path) -> std::process::Output {
     out
 }
 
+// ---------------------------------------------------------------------------
+// A restore and the containment file (D13 containment, ADR-274, unit 14a)
+// ---------------------------------------------------------------------------
+
+/// An epoch another host of the node could have minted `ahead_ms` from now.
+fn an_epoch_ahead(ahead_ms: u64) -> Epoch {
+    let start = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + ahead_ms, 0);
+    Epoch::new(start, [4; 8])
+}
+
+/// The node id of the backup `backup_and_config` made: the source's, which a restore carries.
+fn source_node(dir: &Path) -> kimmy_core::NodeId {
+    kimmy_storage::Engine::open(&dir.join("source.redb")).unwrap().node_id()
+}
+
+/// `kimmyd restore`, with `extra` arguments after `--from`, run to its end.
+fn restore_with(config: &Path, backup: &Path, extra: &[&str]) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        .arg("--config")
+        .arg(config)
+        .arg("restore")
+        .arg("--from")
+        .arg(backup)
+        .args(extra)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("running kimmyd restore");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A restore into the directory of a halted host reads the containment file before its first open
+/// and mints strictly above the newer epoch the file names (findings 1 and 11). The told epoch
+/// starts above this host's clock, or the floor would not be binding and a mint from the clock
+/// alone would pass.
+#[test]
+fn a_restore_into_a_directory_with_a_marker_mints_above_the_epoch_it_names() {
+    use kimmy_cluster::containment::{MARKER_FILE, Marker, MarkerFile, write_marker_file};
+    let dir = tempfile::tempdir().unwrap();
+    let (backup, config) = backup_and_config(dir.path());
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let told = an_epoch_ahead(60_000);
+    let marker =
+        Marker { node: source_node(dir.path()), halted: an_epoch_ahead(1_000), told: Some(told) };
+    write_marker_file(&data, &MarkerFile { marker: Some(marker), replace: None }).unwrap();
+    assert!(data.join(MARKER_FILE).exists(), "premise: the marker is in the directory");
+
+    restore_with(&config, &backup, &[]);
+    let restored = kimmy_storage::Engine::open(&data.join("kimmy.redb")).unwrap();
+    assert!(restored.epoch() > told, "{:?} is not above {told:?}", restored.epoch());
+    assert!(
+        restored.epoch().start_hlc() > told.start_hlc(),
+        "strictly above in the start HLC, so no tie is left to the random bytes"
+    );
+}
+
+/// The control: a marker of another node does not constrain the restore of this one.
+#[test]
+fn a_restore_ignores_the_marker_of_another_node() {
+    use kimmy_cluster::containment::{Marker, MarkerFile, write_marker_file};
+    let dir = tempfile::tempdir().unwrap();
+    let (backup, config) = backup_and_config(dir.path());
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let told = an_epoch_ahead(10 * 60_000);
+    let marker = Marker {
+        node: kimmy_core::NodeId::generate(),
+        halted: an_epoch_ahead(1_000),
+        told: Some(told),
+    };
+    write_marker_file(&data, &MarkerFile { marker: Some(marker), replace: None }).unwrap();
+
+    restore_with(&config, &backup, &[]);
+    let restored = kimmy_storage::Engine::open(&data.join("kimmy.redb")).unwrap();
+    assert!(
+        restored.epoch().start_hlc() < told.start_hlc(),
+        "the mint came from the clock: {:?}",
+        restored.epoch()
+    );
+}
+
+/// `--replace` is written into the containment file naming the epoch the restore minted, and a
+/// restore without it writes no such entry.
+#[test]
+fn restore_replace_names_the_epoch_it_minted() {
+    use kimmy_cluster::containment::read_marker_file;
+    let dir = tempfile::tempdir().unwrap();
+    let (backup, config) = backup_and_config(dir.path());
+    let data = dir.path().join("data");
+
+    restore_with(&config, &backup, &["--replace"]);
+    let restored = kimmy_storage::Engine::open(&data.join("kimmy.redb")).unwrap();
+    assert_eq!(
+        read_marker_file(&data).unwrap().replace,
+        Some(restored.epoch()),
+        "the flag names the epoch this restore minted, and no other"
+    );
+}
+
+#[test]
+fn a_restore_without_replace_writes_no_replace_entry() {
+    use kimmy_cluster::containment::read_marker_file;
+    let dir = tempfile::tempdir().unwrap();
+    let (backup, config) = backup_and_config(dir.path());
+    restore_with(&config, &backup, &[]);
+    assert_eq!(read_marker_file(&dir.path().join("data")).unwrap().replace, None);
+}
+
 /// `kimmyd restore --until` on a collection with merge policy `field` (the default): the user-facing path, end to
 /// end. The rewind folds the states the collection's entries carry, so the document written before the target is
 /// put back as it was and the one created after it is gone, in the store the restore wrote.

@@ -55,6 +55,12 @@ pub enum Command {
         /// document's earlier value has already been collected.
         #[arg(long)]
         until: Option<u64>,
+        /// Authorize this restore to replace a host of the same node that is still running
+        /// (D13 containment): the mistaken-restore guard otherwise halts the restored host when
+        /// it finds its node live at another address. The flag names the epoch this restore mints
+        /// and is honoured only for a store on that epoch.
+        #[arg(long)]
+        replace: bool,
     },
     /// Verify a stopped node's store against redb's page checksums, then exit.
     ///

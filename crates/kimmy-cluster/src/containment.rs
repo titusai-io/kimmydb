@@ -6,6 +6,7 @@
 //! none on a missing symbol. The code commits replace each body, and none of these stubs survives
 //! to the last commit (a source scan asserts it).
 
+use std::path::Path;
 use std::time::Duration;
 
 use kimmy_core::{Epoch, NodeId};
@@ -85,4 +86,40 @@ pub fn marker_halts(_marker: &Marker, _node: NodeId, _store_epoch: Epoch) -> boo
 /// it).
 pub fn replace_honoured(_flag: Option<Epoch>, _store_epoch: Epoch) -> bool {
     false
+}
+
+/// The containment file's name, in the data directory. It holds the halt marker and the `--replace`
+/// flag, and it lives beside a healthy host as often as beside a halted one, so its name does not
+/// say "halted".
+pub const MARKER_FILE: &str = "kimmy.containment";
+
+/// What the containment file holds: the halt marker (if the host was halted), and the epoch a
+/// `--replace` restore minted (if the operator gave the flag). Either may be absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkerFile {
+    pub marker: Option<Marker>,
+    pub replace: Option<Epoch>,
+}
+
+/// Write the containment file: to a temporary name, synced, then renamed, so a crash leaves the old
+/// file or the new one and never half of one.
+pub fn write_marker_file(_data_dir: &Path, _file: &MarkerFile) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Read the containment file: an absent file is an empty one.
+pub fn read_marker_file(_data_dir: &Path) -> std::io::Result<MarkerFile> {
+    Ok(MarkerFile::default())
+}
+
+/// Remove the containment file; removing an absent one is not an error.
+pub fn clear_marker_file(_data_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The epoch a restore of `node`'s backup into `data_dir` must mint strictly above: the newer epoch
+/// the marker names, or, for a marker that carries only the guard's reason, the epoch it halted.
+/// `None` for no marker, a marker of another node, and a file with only a `--replace` flag.
+pub fn restore_floor(_data_dir: &Path, _node: NodeId) -> std::io::Result<Option<Epoch>> {
+    Ok(None)
 }
