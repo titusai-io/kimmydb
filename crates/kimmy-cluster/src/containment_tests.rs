@@ -56,6 +56,10 @@ fn a_claim_far_beyond_the_bound_is_refused_and_a_past_one_is_not() {
 fn the_maximum_epoch_is_never_believed() {
     assert!(!claim_within_bound(CLOCK, SKEW, &Epoch::MAX));
     assert!(!claim_within_bound(u64::MAX / 2, SKEW, &Epoch::MAX));
+    assert!(
+        !claim_within_bound(u64::MAX, SKEW, &Epoch::MAX),
+        "not even at the last clock, where the bound saturates and its start is no longer beyond it"
+    );
 }
 
 /// A member whose wall clock is behind its own logical clock (it took peers' stamps within the

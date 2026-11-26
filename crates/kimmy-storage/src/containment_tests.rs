@@ -157,18 +157,62 @@ fn the_newest_epoch_reads_the_origins_in_the_vectors_as_well_as_the_row() {
     );
 }
 
+/// The durable row never falls (ADR-274): whatever is raised into it, the table keeps the larger.
+/// Memory and the pending set already keep a lower epoch from arriving here, so this is the
+/// function's own guard, called with the transaction a flush would give it.
+#[test]
+fn a_durable_row_never_falls_whatever_is_raised_into_it() {
+    use redb::ReadableTable;
+
+    use crate::containment::raise_row;
+    use crate::{WriterHolder, tables};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir.path().join("kimmy.redb"));
+    let node = NodeId::from_bytes([6; 16]);
+    let (low, high) = (an_epoch_ahead(1_000, 1), an_epoch_ahead(5_000, 2));
+    // Through the engine's own chokepoint: the scan `commits_are_counted_at_one_chokepoint`
+    // allows redb's own begin_write, the one with no holder, only on a database named `db`.
+    // The transaction derefs to redb's, which is what `raise_row` takes.
+    let txn = engine.begin_write(WriterHolder::Ddl).unwrap();
+    assert!(raise_row(&txn, node, high).unwrap(), "a first row is written");
+    assert!(!raise_row(&txn, node, low).unwrap(), "a lower epoch does not raise it");
+    assert!(!raise_row(&txn, node, high).unwrap(), "nor does an equal one");
+    let held = txn
+        .open_table(tables::EPOCH_NEWEST)
+        .unwrap()
+        .get(node.to_bytes().as_slice())
+        .unwrap()
+        .map(|v| v.value().to_vec());
+    assert_eq!(held.as_deref(), Some(high.0.as_slice()), "the row still holds the larger epoch");
+    txn.abort().unwrap();
+}
+
 /// A backup keeps the own node's row only (finding 9): staging clusters built from production
 /// backups share node ids, and a backup that carried the whole table would carry production's
 /// newest epochs into them.
 #[test]
 fn a_backup_carries_the_own_nodes_row_and_no_other() {
     let dir = tempfile::tempdir().unwrap();
-    let source = open(&dir.path().join("source.redb"));
+    let source_path = dir.path().join("source.redb");
     let (other, third) = (NodeId::from_bytes([7; 16]), NodeId::from_bytes([8; 16]));
     let (e_other, e_third) = (an_epoch_ahead(1_000, 2), an_epoch_ahead(2_000, 3));
-    source.note_epoch(other, e_other).unwrap();
-    source.note_epoch(third, e_third).unwrap();
-    assert_eq!(source.newest_epoch(other).unwrap(), e_other, "premise: the table records");
+    {
+        // The rows are held in memory until the next commit writes them: a write carries them to
+        // the table, which a backup then has to leave out.
+        let first = open(&source_path);
+        let orders = first.create_collection("shop", "orders").unwrap();
+        first.note_epoch(other, e_other).unwrap();
+        first.note_epoch(third, e_third).unwrap();
+        first.insert(&orders, doc! { "_id": 1 }).unwrap();
+    }
+    let source = open(&source_path);
+    assert_eq!(
+        source.newest_epoch(other).unwrap(),
+        e_other,
+        "premise: the row is in the table of the store the backup is taken from"
+    );
+    assert_eq!(source.newest_epoch(third).unwrap(), e_third, "premise: and the other");
     let backup = backup_of(&source);
 
     let path = dir.path().join("restored.redb");

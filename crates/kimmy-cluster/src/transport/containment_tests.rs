@@ -310,6 +310,19 @@ async fn a_dialler_that_knows_the_newer_epoch_only_from_entries_tells_the_old_ho
     );
 }
 
+/// A tell names an epoch of some node, and a host acts on it only when the node is its own: a tell
+/// about another node, however new and in the bound, halts nobody (mutant: the host is halted by a
+/// tell that is not about it).
+#[test]
+fn a_tell_about_another_node_halts_nobody() {
+    let (host, _dir) = engine();
+    let other = NodeId::from_bytes([8; 16]);
+    assert!(an_epoch_ahead(1_000) > host.epoch(), "premise: newer than the host's own epoch");
+    crate::containment::act_on_tell(&host, other, an_epoch_ahead(1_000));
+    assert!(host.halted().is_none(), "a tell about another node is not acted on");
+    assert_eq!(host.newest_epoch(other).unwrap(), Epoch::ZERO, "and nothing is recorded by it");
+}
+
 /// A responder tells only after the `Confirm` verifies: a socket that sends a bad one is answered
 /// with the fault and no tell.
 #[tokio::test]
@@ -444,7 +457,8 @@ async fn a_probe_is_answered_and_nothing_follows_it() {
 async fn a_host_that_dials_its_own_address_is_not_halted_and_tells_nobody() {
     let (host, _dir) = engine();
     let (opened, accepted, mut ours, _theirs) = handshake(&host, &host).await;
-    let _ = (opened, accepted);
+    assert!(opened.is_ok(), "the dialling end completes: an equal epoch is not a newer one");
+    assert!(accepted.is_ok(), "and so does the answering end, which does not end it as superseded");
     assert!(host.halted().is_none(), "an equal epoch is not a newer one");
     let tell = next_frame(&mut ours, Duration::from_millis(300)).await;
     assert!(tell.is_none(), "and nobody is told: {tell:?}");

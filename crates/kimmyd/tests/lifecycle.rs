@@ -2928,7 +2928,15 @@ async fn a_store_halted_by_a_newer_epoch_starts_halted_and_stays_up() {
     assert_eq!(version["error"], "halted", "{version}");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(run.child.lock().unwrap().try_wait().unwrap().is_none(), "it stays up: {}", run.log());
-    assert!(run.log().contains("halted"), "the start says so: {}", run.log());
+    assert!(
+        run.log().contains("this host starts halted"),
+        "the halted start's own line, not the ordinary start's: {}",
+        run.log()
+    );
+    assert!(
+        !dir.path().join("data").join("kimmy.last-start").exists(),
+        "a halted start records no start: it never reached the ordinary start's serving"
+    );
 
     run.signal("TERM");
     assert!(run.wait_exit().success(), "a stop is a clean exit: {}", run.log());

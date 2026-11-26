@@ -76,6 +76,15 @@ async fn member() -> Member {
         .await
         .unwrap();
     assert_eq!(created.status(), 200);
+    // The topology's registry, which every real member has: without it the topology route would
+    // try to make it, be refused by the halted store, and answer `503 halted` for that reason and
+    // not because the gate refused the route.
+    engine
+        .create_system_collection(
+            kimmy_api::topology::NODES_DB,
+            kimmy_api::topology::NODES_COLLECTION,
+        )
+        .unwrap();
     let told = Epoch::new(Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0), [3; 8]);
     Member { base, engine, token, told, state, _dir: dir }
 }
