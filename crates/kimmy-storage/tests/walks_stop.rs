@@ -92,6 +92,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "plain_life_page_rows_tests::parked_under",
+        "test code reading the parked loss records of one collection id in a store it wrote itself (ADR-272, unit P)",
+    ),
+    (
         "join::Engine::tombstones_of",
         "the index tombstones of ONE collection, one row per index name ever dropped on it, which the retention pass collects; read under the writer of the transaction that joins the physical into the one that becomes visible (ADR-272, rule 3)",
     ),
