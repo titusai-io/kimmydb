@@ -111,6 +111,7 @@ use crate::docs::RemoteApplied;
 use crate::engine::{Engine, Position, WriterHolder};
 use crate::error::Result;
 use crate::meta::CollectionMeta;
+use crate::remake::Remade;
 use crate::sync::{Memo, Pending};
 use crate::tables;
 use crate::walk::{WalkScope, open_walk_table};
@@ -491,6 +492,21 @@ impl From<CollectionMeta> for CollectionState {
 /// coverage reaches it (ADR-163).
 fn hlc_is_named(hlc: Hlc, versions: &VersionVector) -> bool {
     versions.iter().any(|(_, covered)| hlc <= covered)
+}
+
+/// The latest definition a page's state names (an index's creation, a vector configuration, a validator change) that the sender's
+/// coverage names: the fact a collection gone here may be made again for (unit P). A state's own `created` is not one: it is the life's
+/// creation, and the options row says what that life began as.
+fn state_fact(state: &CollectionState, versions: &VersionVector) -> Option<Hlc> {
+    state
+        .indexes
+        .iter()
+        .filter_map(|index| index.created)
+        .chain(state.vector_changed)
+        .chain(state.validator_changed)
+        .map(|stamp| stamp.hlc)
+        .filter(|hlc| hlc_is_named(*hlc, versions))
+        .max()
 }
 
 /// One document, as it currently stands.
@@ -1191,7 +1207,7 @@ fn merge_carry(
     scope: Option<CollectionId>,
     discard_staged: bool,
     rows: &[Judged<'_>],
-) -> Result<bool> {
+) -> Result<(bool, Vec<CollectionId>)> {
     let previous = take_carry_stage(txn, peer, scope)?;
     let mut wrote = !previous.is_empty();
     // what the earlier pages staged is judged again as it leaves the staging (the one place a row is read back), and the rows of this page
@@ -1207,10 +1223,15 @@ fn merge_carry(
     order.extend(rows.iter().map(|judged| (judged.row.table, &judged.kind)));
     // the names table first: its tag is the lower
     order.sort_by_key(|(tag, _)| *tag);
+    // the collections whose options rows were merged: the ones a remake may be owed (unit P)
+    let mut named = Vec::new();
     for (_, kind) in order {
         wrote |= crate::register::merge_carried_row(txn, kind)?;
+        if let crate::register::CarriedRowKind::Options(options) = kind {
+            named.push(CollectionId::derive(&options.db, &options.name));
+        }
     }
-    Ok(wrote)
+    Ok((wrote, named))
 }
 
 /// The rows staged for one pull, removed from the staging and returned as (wire tag, key, value), in the order of the carry.
@@ -2015,8 +2036,23 @@ impl Engine {
     /// The first collection `page` defines that this node cannot create yet,
     /// because it is absent here and a drop's rows remain under its id; every
     /// such id is asked for next.
-    fn page_waits_on_a_purge(&self, page: &SnapshotPage) -> Result<Option<CollectionId>> {
+    fn page_waits_on_a_purge(
+        &self,
+        page: &SnapshotPage,
+        carried: &[Judged<'_>],
+    ) -> Result<Option<CollectionId>> {
         let mut waits = None;
+        // A row the page carries that makes a collection gone here again (unit P) waits on the drop's rows as a definition does: the
+        // remake would be made over them. The carry's merge makes it, in the page's transaction, and a page whose first pages staged
+        // the row is waited for there.
+        for judged in carried {
+            let crate::register::CarriedRowKind::Options(options) = &judged.kind else { continue };
+            let id = CollectionId::derive(&options.db, &options.name);
+            if self.remake_is_wanted(id, None, Some(options))? && self.purge_pending(id)? {
+                self.prioritise_purge(id);
+                waits.get_or_insert(id);
+            }
+        }
         for state in &page.collections {
             match self.get_collection(&state.db, &state.name) {
                 Ok(_) => continue,
@@ -2033,14 +2069,17 @@ impl Engine {
             }
             let id = CollectionId::derive(&state.db, &state.name);
             // A definition the tombstone here makes history is not restored
-            // (`restore_collection`'s rule), so it waits on nothing.
+            // (`restore_collection`'s rule), so it waits on nothing, unless a definition of it above the floor makes the collection
+            // again (unit P).
+            let remade = self.remake_is_wanted(id, state_fact(state, &page.versions), None)?;
             if let Some(dropped) = self.collection_dropped_at(id)?
                 && crate::sync::creation_is_history(state.created, dropped.hlc)
+                && !remade
             {
                 continue;
             }
             // Nor one the drop of its database makes history (ADR-229).
-            if self.database_refusal(&state.db, state.created)?.is_some() {
+            if self.database_refusal(&state.db, state.created)?.is_some() && !remade {
                 continue;
             }
             if self.purge_pending(id)? {
@@ -2237,7 +2276,7 @@ impl Engine {
         // A page defining a collection this node cannot create yet waits,
         // whole, before any of it is applied (ADR-189): `progress` is not
         // moved, so the same page comes again once the drop purger is done.
-        if let Some(id) = self.page_waits_on_a_purge(page)? {
+        if let Some(id) = self.page_waits_on_a_purge(page, &carry_rows)? {
             return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
         }
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
@@ -2399,12 +2438,58 @@ impl Engine {
             let txn = self.begin_write(WriterHolder::Repair)?;
             let mut pending = Vec::new();
             // The rows of the carry, merged before the first document of the pull: this is the page that ends the carry's walk.
-            let merged_before_the_documents = merges_here
-                && merge_carry(&txn, peer, progress.scope, progress.pages == 0, &carry_rows)?;
+            let mut merged_before_the_documents = false;
+            if merges_here {
+                let (merged, named) =
+                    merge_carry(&txn, peer, progress.scope, progress.pages == 0, &carry_rows)?;
+                merged_before_the_documents = merged;
+                // Every remake from a carried row happens here, before any document of the pull: a collection that is gone here, whose
+                // row now says it was made above its floor, is made again from the row. One whose drop's rows are not purged yet makes
+                // the page wait whole, as a page that defines one it cannot create does: nothing of it is kept.
+                for id in named {
+                    match self.remake_in_txn(&txn, id, None)? {
+                        Remade::Made(meta) => {
+                            memo.put_collection(*meta);
+                            merged_before_the_documents = true;
+                        }
+                        Remade::Purging { id, .. } => {
+                            txn.abort()?;
+                            return Ok(SnapshotApplied {
+                                purge_pending: Some(id),
+                                ..Default::default()
+                            });
+                        }
+                        Remade::Held | Remade::Unwanted => {}
+                    }
+                }
+            }
             // Documents whose stored state moved with the document as it was: written into the transaction.
             let mut state_moved = 0usize;
             for document in &page.documents {
-                let collection = self.memo_collection(&mut memo, document.collection)?;
+                let mut collection = self.memo_collection(&mut memo, document.collection)?;
+                // A document stamped above the floor of a collection that is gone here makes it again from its row (unit P), in the
+                // page's transaction: one whose drop's rows are not purged yet makes the page wait whole
+                if collection.is_none()
+                    && self
+                        .memo_gone_plan(&mut memo, document.collection)?
+                        .wants(Some(document.stamp.hlc))
+                {
+                    match self.remake_in_txn(&txn, document.collection, Some(document.stamp.hlc))? {
+                        Remade::Made(meta) => collection = Some(memo.put_collection(*meta)),
+                        Remade::Purging { id, .. } => {
+                            txn.abort()?;
+                            return Ok(SnapshotApplied {
+                                purge_pending: Some(id),
+                                ..Default::default()
+                            });
+                        }
+                        Remade::Held => {
+                            memo.forget_collection(document.collection);
+                            collection = self.memo_collection(&mut memo, document.collection)?;
+                        }
+                        Remade::Unwanted => {}
+                    }
+                }
 
                 // The predicate the entries path applies, applied here too:
                 // `apply_remote_in_txn` below decides last-writer-wins on the
@@ -2476,7 +2561,7 @@ impl Engine {
 
             // The page's deletes, in the same transaction as its documents, so
             // they share its cursor and, on the last page, its grant (ADR-167).
-            let recorded = self.apply_carried_document_deletes(
+            let recorded = match self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
                 &page.versions,
@@ -2484,7 +2569,15 @@ impl Engine {
                 &mut pending,
                 &mut superseded,
                 None,
-            )?;
+            ) {
+                Ok(recorded) => recorded,
+                // a delete above the floor of a gone collection whose drop's rows are not purged yet: the page waits whole
+                Err(crate::StorageError::CollectionPurging { id, .. }) => {
+                    txn.abort()?;
+                    return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
+                }
+                Err(e) => return Err(e),
+            };
 
             // Only a *completed* snapshot grants coverage: adopting it
             // earlier would stop the receiver asking for pages it has not
@@ -3095,7 +3188,26 @@ impl Engine {
                 );
                 continue;
             }
-            let collection = self.memo_collection(memo, tombstone.collection)?;
+            let mut collection = self.memo_collection(memo, tombstone.collection)?;
+            // A delete stamped above the floor of a collection that is gone here makes it again from its row (unit P), as a document
+            // does: not under `Converge`, which repairs what stands. One whose drop's rows are not purged yet fails the page with the
+            // wait, which the page's caller answers (`SnapshotApplied::purge_pending`).
+            if collection.is_none()
+                && converge.is_none()
+                && self.memo_gone_plan(memo, tombstone.collection)?.wants(Some(tombstone.stamp.hlc))
+            {
+                match self.remake_in_txn(txn, tombstone.collection, Some(tombstone.stamp.hlc))? {
+                    Remade::Made(meta) => collection = Some(memo.put_collection(*meta)),
+                    Remade::Purging { db, name, id } => {
+                        return Err(crate::StorageError::CollectionPurging { db, name, id });
+                    }
+                    Remade::Held => {
+                        memo.forget_collection(tombstone.collection);
+                        collection = self.memo_collection(memo, tombstone.collection)?;
+                    }
+                    Remade::Unwanted => {}
+                }
+            }
             if self.is_history(
                 memo,
                 collection.as_deref(),
@@ -4057,6 +4169,27 @@ impl Engine {
                 "ignored a vector shadow of a swapped name"
             );
             return Ok(0);
+        }
+        // A definition of the page stamped above the floor of a collection that is gone here makes it again from its row (unit P): the
+        // life the page's state names is history, and what stands is what the row says, taking the definitions above the floor. A name
+        // this member swapped was answered above. One whose drop's rows are not purged yet is waited for before the page
+        // (`page_waits_on_a_purge`); met here all the same, it is the wait.
+        if self.get_collection(&state.db, &state.name).is_err() {
+            let id = CollectionId::derive(&state.db, &state.name);
+            let refused_as_history = match self.collection_dropped_at(id)? {
+                Some(dropped) if crate::sync::creation_is_history(state.created, dropped.hlc) => {
+                    true
+                }
+                _ => self.database_refusal(&state.db, state.created)?.is_some(),
+            };
+            let fact = state_fact(state, versions);
+            if refused_as_history
+                && self.remake_is_wanted(id, fact, None)?
+                && let crate::remake::Remade::Purging { db, name, id } =
+                    self.remake_from_the_row(id, fact)?
+            {
+                return Err(crate::StorageError::CollectionPurging { db, name, id });
+            }
         }
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
@@ -6065,7 +6198,9 @@ mod tests {
     /// serves it. Recreating it here would put it back on every member that
     /// had it right — the finding, reached through the repair rather than
     /// through a replayed `CreateCollection`, which `sync::apply_ddl` has
-    /// refused since ADR-034.
+    /// refused since ADR-034. The GUARD half (split by unit P): the page holds
+    /// the life, and one document of it, both at or below the drop here, and
+    /// nothing is made.
     #[test]
     fn a_snapshot_does_not_recreate_a_collection_this_node_has_dropped() {
         let (a, _da) = engine();
@@ -6078,12 +6213,6 @@ mod tests {
         b.drop_collection("shop", "orders").unwrap();
         let dropped = b.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
         assert!(ca.created <= dropped.hlc, "the fixture must drop after the sender's create");
-        // A second document, written on A *after* the drop it has not heard
-        // about: not history by its own stamp, and history only because the
-        // collection it names is one this node buried. The two documents are
-        // the two ways a page's document is turned away.
-        a_moment();
-        a.insert(&ca, doc! { "_id": 2 }).unwrap();
 
         let outcome = b
             .apply_snapshot_page(
@@ -6095,8 +6224,51 @@ mod tests {
         assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         assert_eq!(outcome.applied, 0, "{outcome:?}");
         assert_eq!(
-            outcome.superseded, 2,
-            "both documents are history, counted rather than passed over: {outcome:?}"
+            outcome.superseded, 1,
+            "the document at or below the drop is history, counted rather than passed over: {outcome:?}"
+        );
+    }
+
+    /// The FLIP half (unit P): a second document, written on A *after* the drop it has not heard about,
+    /// is a fact above the collection's floor. The life the page names is history here, and the
+    /// document at or below the drop with it, but the document above the drop makes the collection again
+    /// from the row this node kept (the write-after-a-drop ruling): dated just above the drop, re-dated,
+    /// holding that document alone.
+    #[test]
+    fn a_snapshot_document_above_the_drop_makes_the_dropped_collection_again_with_that_document_alone()
+     {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+
+        b.create_collection("shop", "orders").unwrap();
+        a_moment();
+        b.drop_collection("shop", "orders").unwrap();
+        let dropped = b.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+        a_moment();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+        let outcome = b
+            .apply_snapshot_page(
+                a.node_id(),
+                &mut SnapshotProgress::whole_database(),
+                &a.snapshot_page(None, None).unwrap(),
+            )
+            .unwrap();
+        let made = b.get_collection("shop", "orders").expect("the document above the drop made it");
+        assert_eq!(made.created, dropped.hlc.successor(), "dated just above the drop");
+        assert!(made.is_redated(), "the remains of the life the drop ended");
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.superseded, 1,
+            "the document at or below the drop is history: {outcome:?}"
+        );
+        assert_eq!(b.count(&made, crate::WalkScope::Request).unwrap(), 1);
+        assert!(b.get(&made, &kimmy_core::DocId::Int64(2)).unwrap().is_some(), "document 2");
+        assert!(
+            b.get(&made, &kimmy_core::DocId::Int64(1)).unwrap().is_none(),
+            "and not document 1"
         );
     }
 
@@ -6106,7 +6278,8 @@ mod tests {
     /// window that chunking widens and this is the guard on it. The tombstone
     /// is recorded in the drop's first commit, so the refusal is in place for
     /// the whole of the purge rather than from its end: neither the
-    /// definition nor a document of the buried life comes back.
+    /// definition nor a document of the buried life comes back. The GUARD half
+    /// (split by unit P): the page's one document is at or below the drop.
     #[test]
     fn a_snapshot_does_not_recreate_a_collection_whose_drop_is_still_purging() {
         let (a, _da) = engine();
@@ -6122,8 +6295,6 @@ mod tests {
         b.bury_collection("shop", "orders", None).unwrap().expect("dropped");
         let dropped = b.collection_dropped_at(cb.id).unwrap().expect("a tombstone");
         assert!(ca.created <= dropped.hlc, "the fixture must drop after the sender's create");
-        a_moment();
-        a.insert(&ca, doc! { "_id": 2 }).unwrap();
 
         let outcome = b
             .apply_snapshot_page(
@@ -6135,10 +6306,44 @@ mod tests {
 
         assert!(b.get_collection("shop", "orders").is_err(), "the drop stands mid-purge");
         assert_eq!(outcome.applied, 0, "{outcome:?}");
-        assert_eq!(outcome.superseded, 2, "both documents are history: {outcome:?}");
+        assert_eq!(outcome.superseded, 1, "the document is history: {outcome:?}");
         // And the purge finishes over the top of the refused page.
         assert_eq!(b.purge_dropped_collection(cb.id).unwrap(), 1, "the one document it held");
         assert!(b.get_collection("shop", "orders").is_err());
+    }
+
+    /// The FLIP half of the chunked drop (unit P): a document above the drop, met while the drop's rows are
+    /// still filed under the id, makes the page WAIT whole (the remake would be made over them): nothing
+    /// is applied and the progress does not move; the purge is asked for. After the purge the same page
+    /// applies and makes the collection again from the row, holding document 2 alone.
+    #[test]
+    fn a_snapshot_document_above_a_drop_that_is_still_purging_waits_and_then_remakes_the_collection()
+     {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 1 }).unwrap();
+        a_moment();
+        b.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+        a_moment();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+        let page = a.snapshot_page(None, None).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+        let waited = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(waited.purge_pending, Some(cb.id), "the remake waits for the purge: {waited:?}");
+        assert_eq!(progress.pages(), 0, "and the progress did not move");
+        assert!(b.get_collection("shop", "orders").is_err(), "nothing of the page was applied");
+
+        assert_eq!(b.purge_dropped_collection(cb.id).unwrap(), 1, "the one document it held");
+        let applied = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(applied.purge_pending, None, "{applied:?}");
+        let made = b.get_collection("shop", "orders").expect("the document above the drop made it");
+        assert_eq!(b.count(&made, crate::WalkScope::Request).unwrap(), 1, "document 2 alone");
+        assert!(b.get(&made, &kimmy_core::DocId::Int64(2)).unwrap().is_some());
     }
 
     /// A snapshot is served from collections that stand, never from rows under

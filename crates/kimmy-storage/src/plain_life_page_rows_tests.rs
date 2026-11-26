@@ -4,7 +4,7 @@
 //! - pb1, pb2, pb3 (A2): the DROP-BETWEEN shape through a PAGE and through the CARRY's merge (the carry's names and options rows are merged when the carry's walk ends, BEFORE the pull's first document is applied; hardproblems' 1:10 PM ruling, not at the grant). The sender holds c2's life and has seen c4 (its options row is at c4); the receiver holds only
 //!   d3 (c2 < d3 < c4). The page's state (created = c2) is refused by d3, but the row with `at` = c4 is above the floor, so the collection stands and the receiver makes it. pb1: the whole-database pages as they
 //!   are. pb2: the same pages with their DEFINITIONS taken out, so only the carry brings the row (the carry's merge, before the pull's first document, must make it). pb3, a guard: a floor ABOVE the row's `at` makes nothing.
-//!   RED today (pb1, pb2: the state is refused and nothing remakes it; the page route has no remake). GREEN at P7 (A2: ONE function, "gone, never swapped, row at above the later floor: make it, dated the floor's successor",
+//!   RED today (pb1, pb2: the state is refused and nothing remakes it; the page route has no remake). GREEN at P7 (A2: ONE function, "gone, never swapped, row at above the later floor: make it"; DATED by hardproblems' 3:33 PM split: a ROW above the floor makes the creation's life (created = the row's `at`, NO Redated marker), a FACT above the floor with the row's `at` at or below it makes the drop's remains (created = the floor's successor, the marker SET),
 //!   called at both route tops and at the carry's merge; the coder says if the page and carry callers land in another commit). pb3 is green today and must stay green: its mutant is "a remake whenever a row exists".
 //! - pc1, pc2 (A1, B3): the remake fires for EXACTLY the kinds the keep test counts, so gone-versus-standing does not depend on order. pc1: CreateIndex@5, DropIndex@6, drop@4, in the three causal orders. pc2: the
 //!   DropIndex ALONE above the floor (the index was made below it). pc3: a ConfigureVectors above the floor of a gone collection remakes it (it is not history), in both orders. Each: every order ends in the SAME state, the
@@ -25,7 +25,14 @@
 //!   pf2: above the floor it is APPENDED (served onward) and PARKED by collection id and document with the row's R (its expiry is the loser's wall plus R), and no collection is made: RED today (the gone arm judges it history: not parked), GREEN at P7. pf3, the order row: drop@4, write@5,
 //!   LossRecord@6 on a `field` collection, in the orders (5, 6) and (6, 5): the same collection, the same loss record on the document, and the entry in both oplogs. RED today (both orders lose the write and the record), GREEN at P7. Mutant (P7): the record taken as history before the write
 //!   remakes the collection (the order (6, 5) loses the record).
-//! - ph1 (a guard): a stage created below a database drop leaves both orders alike. It is not the Redated ruling's row (that is the survivor file's marker row), and it pins no count of logical drops: F1/F2 decide the register under a database drop.
+//! - ph1 (Redated marker ruling, hardproblems' 2:37 PM): a GUARD that a stage created below a database drop leaves the two orders of delivery ALIKE (the register's logical drops, the own tombstone, the standing of `orders` and of the stage). The count is not asserted: a stage creation that
+//!   arrives after D is refused under D, so it is 0 as built. Its sibling is the survivor file's s1 marker row.
+//! - ph2 (the case the Redated ruling is really about): `orders` held, a stage created at sc, a database drop D above sc, a write W above D from a member that had not heard D, and a binding B of the stage above D and inside its deadline. One member takes them as "W, D, sc, B" (the life is
+//!   re-dated) and as "D, W, sc, B" (the collection is remade): both end alike in the register's events for `orders`, the own tombstone, the marker `is_redated()`, and whether `orders` and the stage stand. Expected GREEN today, count 1 or 0 in both (not asserted). Installed with P7b; mutant:
+//!   the remake sets no Redated marker.
+//!
+//! - pg1 (hardproblems' 3:33 PM, against P7b 13882962): the one stop path left after P7b flips the old "later-life stop" tests to remakes, `defines_a_later_life` (sync.rs:1832, the `UnknownCollection` arm ~2410): a CreateIndex stamped ABOVE a collection's
+//!   tombstone reaches a member that holds the drop and NO options row for the id. The window STOPS (the transport plans the fetch), nothing is made before the fetch; after the fetch, whose page carries the row and the author's definition above the floor (so the page remakes the collection itself), the collection is held as P7b rules and the window proceeds.
 //!
 //! First-compile risks: `Hlc::successor` (pub, hlc.rs:65), `Engine::record_database_tombstone`, `index_dropped_at(CollectionId, u32)`, `IndexMeta::derive_id`, `VectorConfig`'s fields (as unit S's tests build it), and the page's `collections`
 //! being assignable (pub) for pb2.
@@ -35,8 +42,8 @@ use kimmy_core::merge_state::{
     LossKey, LossKind, LossValue, MStamp, MergeState, Path, Value, WriterId,
 };
 use kimmy_core::{
-    CollectionCreate, CollectionId, CollectionRef, DocId, Hlc, IndexField, IndexMeta, LossLimits,
-    MergePolicy, OpKind, OplogEntry, Stamp, VersionVector,
+    CollectionBind, CollectionCreate, CollectionId, CollectionRef, DocId, Hlc, IndexField,
+    IndexMeta, LossLimits, MergePolicy, OpKind, OplogEntry, Stamp, VersionVector,
 };
 use redb::ReadableDatabase;
 
@@ -211,12 +218,19 @@ fn pull(from: &Engine, into: &Engine, without_definitions: bool) {
     panic!("the pull did not complete in 50 pages");
 }
 
-/// What the receiver must hold after the pull: the collection stands, dated just above the floor d3 (its successor), under the ROW's options (`field`, from c4), the row's `at` in its policy stamp, and no document.
+/// What the receiver must hold after the pull: the collection stands, the CREATION's life (hardproblems' 3:33 PM dating split: made because the ROW's `at` is above the floor, so created = the row's `at`, c4, and NO Redated marker), under the ROW's options (`field`, from c4), the row's `at` in its policy stamp, and no document.
 fn the_collection_c4_makes(m: &Engine, s: &Stamps, how: &str) {
     let held = m.get_collection(DB, "orders");
     assert!(held.is_ok(), "{how}: the row with `at` above the floor d3 makes the collection");
     let held = held.unwrap();
-    assert_eq!(held.created, s.d3.stamp.hlc.successor(), "{how}: dated just above the floor");
+    assert_eq!(
+        held.created, s.c4.stamp.hlc,
+        "{how}: the creation's life: created is the row's `at` (c4), above the floor"
+    );
+    assert!(
+        !held.is_redated(),
+        "{how}: and no Redated marker (a remake made by a ROW above the floor is the creation's own life)"
+    );
     assert_eq!(
         held.merge_policy,
         MergePolicy::Field,
@@ -563,7 +577,7 @@ fn the_world_where_a_purge_is_pending()
 /// Mutants (P7): the page's remake runs without checking the pending purge (the old rows come back into the new life: the second half); the wait counted only for a state that is not history.
 #[test]
 fn pe1_a_page_whose_remake_cannot_run_waits_whole_and_applies_after_the_purge() {
-    let (s, m, _c2, d3, c4, _dirs) = the_world_where_a_purge_is_pending();
+    let (s, m, _c2, _d3, c4, _dirs) = the_world_where_a_purge_is_pending();
     let id = id_of("orders");
     let page = s.snapshot_page(None, None).unwrap();
     let mut progress = SnapshotProgress::whole_database();
@@ -582,7 +596,14 @@ fn pe1_a_page_whose_remake_cannot_run_waits_whole_and_applies_after_the_purge() 
     assert_eq!(applied.purge_pending, None, "pe1: after the purge the page applies: {applied:?}");
     assert!(progress.is_complete(), "pe1: and the pull completes");
     let held = m.get_collection(DB, "orders").expect("pe1: the collection is made from the row");
-    assert_eq!(held.created, d3.stamp.hlc.successor(), "pe1: dated just above the floor");
+    assert_eq!(
+        held.created, c4.stamp.hlc,
+        "pe1: the creation's life: created is the row's `at` (c4)"
+    );
+    assert!(
+        !held.is_redated(),
+        "pe1: and no Redated marker (made because the ROW is above the floor)"
+    );
     assert_eq!(held.merge_policy, MergePolicy::Field, "pe1: under the row's options");
     assert_eq!(held.merge_policy_at, Some(c4.stamp.hlc), "pe1: the row's `at` is the policy stamp");
     assert_eq!(
@@ -636,7 +657,12 @@ fn pe2_a_write_above_the_floor_that_meets_a_pending_purge_is_left_untaken_and_ap
     let again = window(&m, &w);
     assert_eq!(again.purge_pending, 0, "pe2: after the purge the re-offer is taken: {again:?}");
     let held = m.get_collection(DB, "orders").expect("pe2: the write remakes the collection");
-    assert_eq!(held.created, d.stamp.hlc.successor(), "pe2: dated just above the floor");
+    assert_eq!(
+        held.created,
+        d.stamp.hlc.successor(),
+        "pe2: dated just above the floor (made by a FACT above the floor, the row's `at` below it: the drop's remains)"
+    );
+    assert!(held.is_redated(), "pe2: with the Redated marker set");
     assert_eq!(m.count(&held, WalkScope::Background).unwrap(), 1, "pe2: with the write alone");
     assert!(m.get(&held, &DocId::Int64(2)).unwrap().is_some(), "pe2: document 2 is there");
     assert!(
@@ -839,8 +865,9 @@ fn logical_drops(m: &Engine) -> usize {
         .count()
 }
 
-/// ph1, a guard: a member holds `orders` and a stage of it (`orders.__stg.h1`) created BELOW a database drop D (the author's creation is stamped before D). The stage's creation and D reach it in both orders, and the two orders end alike: the same logical drops, the same own tombstone for
-/// `orders`, the same standing of `orders` and of the stage. It is NOT the Redated ruling's row, and it pins no count of logical drops (what the register holds under a database drop is for F1/F2 to decide). Mutant: a creation below the database's drop applied only when it arrives first.
+/// ph1, a GUARD (hardproblems' 2:37 PM ruling): a member holds `orders` and a stage of it (`orders.__stg.h1`) created BELOW a database drop D (the author's creation is stamped before D). The stage's creation and D reach it in both orders, and the two orders end ALIKE: the same logical
+/// drops in the register, the same own tombstone for `orders`, the same standing of `orders` and of the stage. The EXACT COUNT of logical drops is not asserted: a stage creation that arrives after D is refused under D, so the count is 0 as built. Expected GREEN today. Mutant: a seed made only
+/// when the stage's creation arrives before D (the orders then differ).
 #[test]
 fn ph1_a_stage_created_below_a_database_drop_leaves_both_orders_alike() {
     let (x, _dx) = engine();
@@ -876,4 +903,185 @@ fn ph1_a_stage_created_below_a_database_drop_leaves_both_orders_alike() {
         (second.1, second.2, second.3, second.4),
         "ph1: the two orders end alike ({first:?} against {second:?})"
     );
+}
+
+// ---- ph2: the Redated marker's case: W, D, sc, B in two orders --------------------------------------------------------------------------------------------
+
+/// A binding of `physical` to the name `orders`, by `by`, stamped `wall_ms`.
+fn bind_entry(by: &Engine, wall_ms: u64, physical: &str) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall_ms, 0), by.node_id(), by.epoch()),
+        kind: OpKind::BindCollection,
+        collection: id_of("orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&CollectionBind {
+                db: DB.into(),
+                name: "orders".into(),
+                physical: physical.into(),
+            })
+            .expect("the binding encodes"),
+        ),
+        meta: None,
+    }
+}
+
+/// What the register, the tombstones and the catalogue hold of `orders` and of the stage, in a form two members can be compared by.
+#[derive(Debug, PartialEq)]
+struct Standing {
+    events: Vec<(String, Option<String>)>,
+    own_tombstone: Option<Stamp>,
+    orders_stands: bool,
+    orders_redated: Option<bool>,
+    stage_stands: bool,
+}
+
+fn standing(m: &Engine, stage: &str) -> Standing {
+    let txn = m.db().begin_read().unwrap();
+    let events = crate::register::timeline_read(&txn, DB, "orders")
+        .unwrap()
+        .events()
+        .iter()
+        .map(|(at, event)| (format!("{at:?}"), event.physical().map(|p| p.to_string())))
+        .collect();
+    let orders = m.get_collection(DB, "orders").ok();
+    Standing {
+        events,
+        own_tombstone: m.collection_dropped_at(id_of("orders")).unwrap(),
+        orders_stands: orders.is_some(),
+        orders_redated: orders.map(|c| c.is_redated()),
+        stage_stands: m.get_collection(DB, stage).is_ok(),
+    }
+}
+
+/// ph2: the case the Redated ruling is about. `orders` is held (with its first document); a stage of it is created at sc; a database drop D is stamped above sc; a write W is made above D by a member that had not heard D; a binding B of the stage is stamped above D and inside the stage's
+/// deadline. ONE member takes sc, D, W and B in two orders: "W, D, sc, B" (the write meets a standing collection, then D re-dates its life) and "D, W, sc, B" (D buries it, then W remakes it); each from a fresh member that holds `orders`. Both end ALIKE in the register's events for `orders`,
+/// the own tombstone, `is_redated()` and whether `orders` and the stage stand. The count of logical drops is NOT asserted (if B answers UnknownStage because sc was refused under D it is 0 in both; the row still guards "alike"). Expected GREEN today (hardproblems). Installed with P7b.
+/// Mutant (P7b): the remake sets no Redated marker (the "D, W, sc, B" member then differs from the re-dated one on `is_redated()`).
+#[test]
+fn ph2_a_write_above_a_database_drop_and_a_binding_of_a_stage_end_alike_re_dated_or_remade() {
+    let stage = "orders.__stg.h2";
+    let (y, _dy) = engine();
+    let orders = y.create_collection(DB, "orders").unwrap();
+    y.insert(&orders, doc! { "_id": 1, "v": "old" }).unwrap();
+    let prefix = everything(&y);
+    let (x, _dx) = engine();
+    x.create_stage(DB, stage, MergePolicy::Document, Hlc::new(physical_now_ms() + 60_000, 0))
+        .expect("the stage");
+    let sc = everything(&x)
+        .into_iter()
+        .find(|e| e.kind == OpKind::CreateCollection && e.collection == id_of(stage))
+        .expect("the stage's creation");
+    let (z, _dz) = engine();
+    let d = database_drop_entry(&z, sc.stamp.hlc.wall_ms + 10);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    y.insert(&orders, doc! { "_id": 2, "v": "above the drop" }).unwrap();
+    let w = everything(&y)
+        .into_iter()
+        .find(|e| e.doc_id == Some(DocId::Int64(2)) && e.collection == id_of("orders"))
+        .expect("the write");
+    let b = bind_entry(&x, w.stamp.hlc.wall_ms + 10, stage);
+    assert!(
+        sc.stamp.hlc < d.stamp.hlc && d.stamp.hlc < w.stamp.hlc && w.stamp.hlc < b.stamp.hlc,
+        "premise: sc < D < W < B"
+    );
+    assert!(
+        b.stamp.hlc.wall_ms < physical_now_ms() + 60_000,
+        "premise: B is inside the stage's deadline"
+    );
+    let mut ends = Vec::new();
+    for (what, order) in [("W, D, sc, B", [&w, &d, &sc, &b]), ("D, W, sc, B", [&d, &w, &sc, &b])] {
+        let (m, _dm) = engine();
+        for entry in &prefix {
+            window(&m, std::slice::from_ref(entry));
+        }
+        assert!(
+            m.get_collection(DB, "orders").is_ok(),
+            "premise: the member holds orders before the facts"
+        );
+        for entry in order {
+            window(&m, std::slice::from_ref(entry));
+        }
+        ends.push((what, standing(&m, stage)));
+    }
+    assert_eq!(
+        ends[0].1, ends[1].1,
+        "ph2: the two orders end alike ({} against {}): {:?} against {:?}",
+        ends[0].0, ends[1].0, ends[0].1, ends[1].1
+    );
+}
+
+// ---- pg1: the later-life stop, the one stop left after P7b ------------------------------------------------------------------------------------------------
+
+/// pg1 (hardproblems' 3:33 PM): a definition above a tombstone, at a member that holds the drop and NO options row for the id (it never saw the collection's creation, so `memo_gone_plan` has no row to make it from). The sender `a` holds the collection standing and creates the index `x`
+/// above the drop (`z` took the collection and dropped it, `a` had not heard). The member takes the drop, then the `CreateIndex`: the window STOPS at it (`unknown_collection`; the transport plans the scoped fetch from that stop), and nothing is made by the stop. After the fetch (a scoped
+/// page of `a`'s collection: its creation is at or below the floor; it carries the options row AND the author's index definition stamped above the floor, so the page's own `restore_collection` remakes the collection from that definition, P7b's page site (2)) the retried entry is NOT stopped (applied or superseded, whichever the code does) and: the collection is held, dated just above the floor WITH the Redated marker (a FACT above the floor, the row's `at` at or below it: the drop's remains, per the 3:33 PM dating split), with the index, and the window is not stopped. The CreateIndex variant of
+/// "CreateIndex or ConfigureValidator". Expected GREEN at P7b. Mutants (P7b): the definition judged history at the first window (the stop removed); the remake made without a row (the first window does not stop); the retry stopped again after the page (the row is not read).
+#[test]
+fn pg1_a_definition_above_a_tombstone_stops_a_member_with_no_row_and_is_applied_after_the_fetch() {
+    let (a, _da) = engine();
+    let orders = a.create_collection(DB, "orders").unwrap();
+    a.insert(&orders, doc! { "_id": 1, "v": "old" }).unwrap();
+    let (z, _dz) = engine();
+    window(&z, &everything(&a));
+    pause();
+    assert!(z.drop_collection(DB, "orders").unwrap());
+    let d3 = own(&z, OpKind::DropCollection).pop().expect("the drop");
+    pause();
+    a.create_index(DB, "orders", vec![IndexField::ascending("v")], false, Some("x".into()))
+        .unwrap();
+    let i = own(&a, OpKind::CreateIndex).pop().expect("the index creation");
+    assert!(d3.stamp.hlc < i.stamp.hlc, "premise: the CreateIndex is stamped above the drop");
+
+    let (m, _dm) = engine();
+    window(&m, std::slice::from_ref(&d3));
+    assert_eq!(
+        m.collection_dropped_at(id_of("orders")).unwrap(),
+        Some(d3.stamp),
+        "premise: the member holds the drop"
+    );
+    assert!(m.get_collection(DB, "orders").is_err(), "premise: and no collection");
+    assert!(options_of(&m).is_none(), "premise: and no options row for the id");
+
+    let first = window(&m, std::slice::from_ref(&i));
+    assert!(
+        first.unknown_collection > 0,
+        "pg1: the window stops at a definition above the tombstone when no row can make the collection: {first:?}"
+    );
+    if let Some(stopped) = &first.unknown {
+        assert_eq!(
+            stopped.id,
+            id_of("orders"),
+            "pg1: and the stop names the collection the fetch is for"
+        );
+    }
+    assert!(m.get_collection(DB, "orders").is_err(), "pg1: nothing is made before the fetch");
+
+    // the fetch: the scoped page of `a`'s standing collection
+    let mut progress = SnapshotProgress::of_collection(id_of("orders"));
+    let page = a.snapshot_page(None, Some(id_of("orders"))).unwrap();
+    m.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    let row = options_of(&m).expect("premise: the page carried the options row");
+    assert!(
+        row.at <= d3.stamp.hlc,
+        "premise: the row's `at` is at or below the drop (the creation was before it), so only the FACT can make the collection"
+    );
+    // The page itself may make the collection: it carries the author's index definition, stamped above the floor, so `restore_collection` remakes from it (P7b's page site (2), correct under the rulings). Not asserted either way.
+
+    let retry = window(&m, std::slice::from_ref(&i));
+    assert_eq!(
+        retry.unknown_collection, 0,
+        "pg1: after the fetch the window is not stopped: {retry:?}"
+    );
+    let held = m.get_collection(DB, "orders").expect("pg1: the collection is held after the fetch");
+    assert_eq!(
+        held.created,
+        d3.stamp.hlc.successor(),
+        "pg1: dated just above the floor: the drop's remains"
+    );
+    assert!(
+        held.is_redated(),
+        "pg1: with the Redated marker set (made by a FACT above the floor, the row's `at` at or below it)"
+    );
+    assert!(held.index("x").is_some(), "pg1: and the definition that made it is applied");
 }

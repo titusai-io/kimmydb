@@ -62,6 +62,7 @@ pub mod open_progress;
 pub mod purge;
 pub mod refusal_hint;
 mod register;
+mod remake;
 pub mod rewind;
 pub mod snapshot;
 mod store_lock;
@@ -402,6 +403,8 @@ mod loss_limits_tests;
 mod plain_life_n_rows_tests;
 #[cfg(test)]
 mod plain_life_page_rows_tests;
+#[cfg(test)]
+mod remake_page_tests;
 #[cfg(test)]
 mod shadow_forcing_tests;
 #[cfg(test)]

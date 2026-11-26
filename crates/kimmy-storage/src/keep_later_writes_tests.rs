@@ -364,8 +364,9 @@ fn the_survivors_path_logs_buried_when_the_sweep_left_nothing() {
 
 /// The database's drop reaches the life it covers: what was written into it
 /// after the drop stands, re-dated, and what was written before goes. The
-/// member that never held the life takes it from the one that kept it, as the
-/// existence half's scoped repair brings it (ADR-231, extended).
+/// dropper, which holds no life of it, takes the kept write as a fact above its
+/// floor: it makes the collection again from the row it keeps (unit P), and the
+/// existence half's scoped repair (ADR-231, extended) then agrees with it.
 #[test]
 fn a_database_drop_keeps_a_write_stamped_after_it_in_the_life_it_covers() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
@@ -385,11 +386,17 @@ fn a_database_drop_keeps_a_write_stamped_after_it_in_the_life_it_covers() {
     assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3]);
     assert!(!holds(&d, "items"), "nothing after: buried");
     assert_counts_exact(&d, "a database drop that kept");
-    // The repair the existence half plans brings the kept life to the dropper.
-    assert!(!holds(&a, "orders"), "premise: A has nothing to put it in");
+    // The dropper took the write above its floor and made the collection again from its row (unit P), the one life.
+    assert!(holds(&a, "orders"), "the write above the drop made it again on A");
+    assert_eq!(docs_of(&a, "orders", &[1, 3]), vec![3], "with the write alone");
+    // And the repair the existence half plans finds nothing to change.
     let page = d.snapshot_page(None, Some(id)).unwrap();
     a.apply_snapshot_page(d.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
-    assert_eq!(docs_of(&a, "orders", &[1, 3]), vec![3], "the dropper takes the kept write");
+    assert_eq!(
+        docs_of(&a, "orders", &[1, 3]),
+        vec![3],
+        "and the dropper still holds the kept write"
+    );
 }
 
 // -- D-3 / M-2 / M-4: the database's guard, as ADR-236 leaves it -------------

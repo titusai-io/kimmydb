@@ -76,8 +76,10 @@ fn the_clock_is_unchanged_after_a_reopen_by_a_far_future_entry_for_a_dropped_col
     );
 }
 
+/// Unit P: an honest entry stamped ABOVE the tombstone of a collection this member kept the row of is a fact above its floor, so it makes the
+/// collection again and is applied (it was judged history and not applied before); the bound is the same, and it is witnessed.
 #[test]
-fn an_honest_entry_for_a_dropped_collection_is_still_history_and_taken() {
+fn an_honest_entry_above_a_dropped_collections_tombstone_makes_it_again_and_is_taken() {
     let (m, _d, mut entry) = a_dropped_collection_and_a_far_entry_for_it();
     entry.stamp = Stamp::new(
         Hlc::new(physical_now_ms() + 1_000, 0),
@@ -85,9 +87,9 @@ fn an_honest_entry_for_a_dropped_collection_is_still_history_and_taken() {
         entry.stamp.epoch,
     );
     let outcome = m.apply_batch(std::slice::from_ref(&entry)).unwrap();
-    assert_eq!((outcome.clock_refused, outcome.applied), (0, 0), "{outcome:?}");
+    assert_eq!((outcome.clock_refused, outcome.applied), (0, 1), "{outcome:?}");
     assert!(
         m.witnessed_vector().unwrap().get(entry.stamp.origin()) > Hlc::ZERO,
-        "a write inside the bound that lost to a drop is taken and witnessed, as before: waiting for it would wait for nothing"
+        "a write inside the bound that made the collection again is taken and witnessed"
     );
 }

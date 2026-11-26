@@ -3829,16 +3829,15 @@ fn known_residual_a_collections_own_drop_and_a_later_database_drop() {
     );
 }
 
-/// ADR-236's residual 4, accepted (the divergence repair restores it), pinned by its exact
-/// failures. C writes `orders/2` into its life after A's database drop (t150.1C), B takes that
-/// life by a whole page and writes the document again (t160.1B). A, holding the drop, refuses
-/// B's life on a whole page and takes the write as history, as it would by entries (ADR-148),
-/// with the coverage of its entry; C, which keeps the life with its own older version, takes A's
-/// whole page and is granted past B's write. Every count agrees, so neither half of the check
-/// plans a repair; the cut digest sees the stamps differ. Nothing blocks: no route is wedged or
-/// still moving, and the pages route converges.
+/// ADR-236's residual 4, CLOSED by unit P's remake on every route (it was accepted, with the divergence repair restoring it, and pinned by
+/// its exact failures). C writes `orders/2` into its life after A's database drop (t150.1C), B takes that life by a whole page and writes
+/// the document again (t160.1B). A, holding the drop, used to refuse B's life on a whole page and take the write as history, and C was
+/// granted past B's write, so the three members held different documents. Now A holds the name's row, so each write above the drop is a
+/// fact above the floor that makes the collection again on A from the row: every member ends in one life holding `orders/2` at t160.1B,
+/// on the entries route, the repaired route and the pages route. The document repair that once restored it (ADR-237) is pinned by
+/// `converge_tests::a_newer_live_row_is_applied_over_a_held_live_row`, which this schedule no longer needs to reach.
 #[test]
-fn known_residual_a_later_write_a_refused_life_s_whole_page_granted_past() {
+fn residual_4_is_closed_by_the_remake_on_all_three_routes() {
     let ops = parse(
         "A.create(orders)@100; C.create(orders)@110; A.dropdb@130; C.write(orders/2)@150; \
          B<-C whole; B.write(orders/2)@160",
@@ -3856,103 +3855,17 @@ fn known_residual_a_later_write_a_refused_life_s_whole_page_granted_past() {
         .iter()
         .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
         .collect();
-    let stale = (
-        Category::LostWrite,
-        "C lacks orders/2 written by B at t160.1B (step 5); holds Some(\"t150.1C\")".to_string(),
-    );
-    let entries = vec![
-        (Category::Databases, r#"A/B: {} vs {"shop"}"#.to_string()),
-        (Category::Collections, r#"A/B: {} vs {"orders"}"#.to_string()),
-        (Category::Databases, r#"A/C: {} vs {"shop"}"#.to_string()),
-        (Category::Collections, r#"A/C: {} vs {"orders"}"#.to_string()),
-        (
-            Category::LostWrite,
-            "A lacks orders/2 written by B at t160.1B (step 5); holds None".to_string(),
-        ),
-        stale.clone(),
-    ];
-    let repaired =
-        vec![(Category::Docs, r#"A/C orders: ["2@t160.1B"] vs ["2@t150.1C"]"#.to_string()), stale];
     assert_eq!(
         found,
-        vec![(Route::Entries, entries), (Route::Repaired, repaired), (Route::Pages, vec![])],
+        vec![(Route::Entries, vec![]), (Route::Repaired, vec![]), (Route::Pages, vec![])],
         "{}",
         render(&ops, &outcomes)
     );
 }
 
-/// ADR-237 closes ADR-236's residual 4: the document repair (a `Converge` pull of the
-/// collection, as the transport runs one for a confirmed cut-digest finding) takes the write
-/// C was granted past. The schedule is the residual row's. The cluster is first settled as the
-/// row pins it (the `Repaired` route leaves C holding `2@t150.1C` against `2@t160.1B` on A and
-/// B, every count equal, the digests different); then C pulls A's collection under `Converge`
-/// and holds `t160.1B`, B and A are untouched, the three digests agree, and a second pull
-/// writes nothing, so the finding does not come back (one effective repair, no loop). Without
-/// the apply, C keeps the older write: the assertion after the pull is the one that fails.
-#[test]
-fn residual_4_is_closed_by_the_document_repair() {
-    let ops = parse(
-        "A.create(orders)@100; C.create(orders)@110; A.dropdb@130; C.write(orders/2)@150; \
-         B<-C whole; B.write(orders/2)@160",
-    );
-    let mut cluster = Cluster::new(base());
-    cluster.run(&ops).expect("the schedule runs");
-    let settled = settle(&mut cluster, Route::Repaired);
-    assert!(
-        settled.failures.iter().any(|f| f.category == Category::Docs),
-        "premise: the residual stands before the repair: {:?}",
-        settled.failures
-    );
-
-    let orders = CollectionId::derive(DB, NAMES[ORDERS as usize]);
-    let held = |cluster: &Cluster, m: u8| {
-        let (observed, _) = cluster.observe(m as usize).expect("observe");
-        let coll = observed.collections.get(NAMES[ORDERS as usize]).expect("orders is held");
-        let (stamp, _) = coll.documents.get(&2).expect("orders/2 is held");
-        (cluster.stamp(*stamp), observed.clone())
-    };
-    let digest = |cluster: &Cluster, m: u8| {
-        cluster.e(m as usize).digest_row(orders).expect("digest row").expect("a digest row").digest
-    };
-    let (a_before, a_state) = held(&cluster, A);
-    let (b_before, b_state) = held(&cluster, B);
-    let (c_before, _) = held(&cluster, C);
-    assert_eq!((a_before.as_str(), b_before.as_str()), ("t160.1B", "t160.1B"), "premise");
-    assert_eq!(c_before, "t150.1C", "premise: C was granted past B's write");
-    assert_ne!(digest(&cluster, C), digest(&cluster, A), "premise: the cut digest sees it");
-    assert_eq!(digest(&cluster, A), digest(&cluster, B), "premise");
-
-    let pull = |cluster: &Cluster, to: u8, from: u8| {
-        let (to, from) = (cluster.e(to as usize), cluster.e(from as usize));
-        let mut progress =
-            SnapshotProgress::of_collection_converging(orders, kimmy_core::VersionVector::new());
-        let mut applied = 0;
-        let mut pages = 0;
-        while !progress.is_complete() {
-            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            let page_applied =
-                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
-            assert!(
-                page_applied.clock_refused.is_none(),
-                "a page refused until due by the clock bound never completes: {page_applied:?}"
-            );
-            applied += page_applied.applied;
-            pages += 1;
-            assert!(pages < 16, "a repair that never completes");
-        }
-        applied
-    };
-    assert!(pull(&cluster, C, A) >= 1, "the repair wrote the document C lacked");
-    // The digest oracle after the repair; `settle` held it before.
-
-    assert_eq!(held(&cluster, C).0, "t160.1B", "C holds B's write: {}", render(&ops, &[settled]));
-    assert_eq!(digest(&cluster, C), digest(&cluster, A), "the digests agree");
-    assert_eq!(digest(&cluster, C), digest(&cluster, B), "the digests agree");
-    assert_eq!(held(&cluster, A).1, a_state, "A is untouched");
-    assert_eq!(held(&cluster, B).1, b_state, "B is untouched");
-    assert_eq!(pull(&cluster, C, A), 0, "a second repair writes nothing: no loop");
-    assert_eq!(held(&cluster, C).0, "t160.1B");
-}
+// `residual_4_is_closed_by_the_document_repair` (ADR-237) is retired by unit P: its premise, "the residual stands before the repair" (C
+// granted past B's write), no longer arises, since the remake closes it on every route (the test above). The Converge pull of a newer
+// write over a held older one, which it also exercised, is pinned by `converge_tests::a_newer_live_row_is_applied_over_a_held_live_row`.
 
 // -- Generated schedules -------------------------------------------------------------------
 

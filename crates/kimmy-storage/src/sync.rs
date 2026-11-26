@@ -1666,6 +1666,20 @@ impl Engine {
         Ok(found)
     }
 
+    /// [`Self::memo_dropped_at`] for a database's drop, read once per database in a batch or a page.
+    pub(crate) fn memo_database_dropped_at(
+        &self,
+        memo: &mut Memo,
+        db: &str,
+    ) -> Result<Option<Stamp>> {
+        if let Some(found) = memo.databases.get(db) {
+            return Ok(*found);
+        }
+        let found = self.database_dropped_at(db)?;
+        memo.databases.insert(db.to_string(), found);
+        Ok(found)
+    }
+
     /// Whether a change stamped `stamp` and addressed to collection `id`
     /// belongs to a life of that collection this node has already buried.
     ///
@@ -1716,6 +1730,14 @@ impl Engine {
         }
         if let Some(floor) = collection.and_then(|c| c.incarnation_floor)
             && stamp.hlc <= floor
+        {
+            return Ok(true);
+        }
+        // The floor of a standing collection is the later of its own tombstone and its database's (unit P, B5): a write at or below the
+        // database's drop is of a life that drop ended, whether or not this life's own floor says so.
+        if let Some(collection) = collection
+            && let Some(dropped) = self.memo_database_dropped_at(memo, &collection.db)?
+            && stamp.hlc <= dropped.hlc
         {
             return Ok(true);
         }
@@ -1936,7 +1958,25 @@ pub(crate) fn arriving_life_ends_the_standing_one(
 pub(crate) struct Memo {
     collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>>,
     dropped: HashMap<CollectionId, Option<Stamp>>,
+    /// The drop of a database, by name (a standing collection's writes are judged by it too: unit P, B5).
+    databases: HashMap<String, Option<Stamp>>,
+    /// What is known of the collections that are not held here, read once each (unit P's remake).
+    pub(crate) gone: HashMap<CollectionId, crate::remake::GonePlan>,
     stages: HashMap<CollectionId, Option<Arc<crate::register::StageRow>>>,
+}
+
+impl Memo {
+    /// A collection made in the page's own transaction (unit P's remake), which no read of the committed state can see yet.
+    pub(crate) fn put_collection(&mut self, meta: CollectionMeta) -> Arc<CollectionMeta> {
+        let meta = Arc::new(meta);
+        self.collections.insert(meta.id, Some(Arc::clone(&meta)));
+        meta
+    }
+
+    /// Forget what was read of a collection.
+    pub(crate) fn forget_collection(&mut self, id: CollectionId) {
+        self.collections.remove(&id);
+    }
 }
 
 /// A run of consecutive document entries sharing one transaction.
@@ -2236,6 +2276,17 @@ impl Engine {
                 let staging = self.may_be_a_staging_write(memo, entry, position)?;
                 return Ok(Judged::History { staging });
             }
+            // No tombstone of its own, and the database's drop covers the write, for a member that holds the name's row (unit P: both
+            // floors): history at once, with no fetch. Without the row a member cannot say the name was never swapped, and stops.
+            if !entry.kind.is_loss_record()
+                && self
+                    .memo_gone_plan(memo, entry.collection)?
+                    .is_history_by_the_database(entry.stamp.hlc)
+            {
+                outcome.superseded += 1;
+                let staging = self.may_be_a_staging_write(memo, entry, position)?;
+                return Ok(Judged::History { staging });
+            }
             return Ok(Judged::Decided(Step::Unknown(None)));
         };
         Ok(Judged::Apply(collection))
@@ -2324,6 +2375,24 @@ impl Engine {
             // Whatever the batch knew about collections may be wrong after
             // this, whether or not the change turns out to apply.
             *memo = Memo::default();
+            // A definition stamped above the floor of a collection that is gone here makes it again from its row (unit P), after the
+            // bound and before the change is applied to what then stands; a remake that meets the drop's rows still to be purged leaves the
+            // entry untaken
+            if matches!(
+                entry.kind,
+                OpKind::CreateIndex
+                    | OpKind::DropIndex
+                    | OpKind::ConfigureValidator
+                    | OpKind::ConfigureVectors
+            ) && self.memo_gone_plan(memo, entry.collection)?.wants(Some(entry.stamp.hlc))
+            {
+                self.refuse_if_past_the_bound(&entry.stamp, None)?;
+                if let Some(name) =
+                    self.remake_for_an_entry(memo, entry.collection, entry.stamp.hlc)?
+                {
+                    return Ok(Step::PurgePending(name));
+                }
+            }
             match self.apply_ddl(entry, position)? {
                 DdlOutcome::Applied => outcome.ddl += 1,
                 DdlOutcome::Held => outcome.ddl_held += 1,
@@ -2411,6 +2480,18 @@ impl Engine {
         // holds only a tombstone for was witnessed durably and dragged the clock at the next open. The bound inside
         // `apply_remote_in_txn` is never reached on those paths.
         self.refuse_entry_past_the_bound(entry)?;
+        // A document or a delete stamped above the floor of a collection that is gone here makes it again from its row (unit P), before it
+        // is judged: the run is committed first, as for a schema change, since the remake takes the writer. A Q7 loss record does not (it is
+        // parked by its own rule), and one that meets the drop's rows still to be purged is left untaken.
+        if !entry.kind.is_loss_record()
+            && self.memo_collection(memo, entry.collection)?.is_none()
+            && self.memo_gone_plan(memo, entry.collection)?.wants(Some(entry.stamp.hlc))
+        {
+            self.commit_run(run)?;
+            if let Some(name) = self.remake_for_an_entry(memo, entry.collection, entry.stamp.hlc)? {
+                return Ok(Step::PurgePending(name));
+            }
+        }
         let collection = match self.judge_document(memo, entry, position, outcome)? {
             Judged::Decided(step) => return Ok(step),
             Judged::History { staging } => {
@@ -9124,16 +9205,19 @@ mod tests {
     /// The ordinary concurrent drop-and-write, which must **not** stop a
     /// batch (ADR-148). B drops a collection; A, which has not heard the
     /// drop yet, writes into it, so the write is stamped *after* the drop.
-    /// A tombstone at all makes that write history here — the collection is
-    /// never coming back on its own — so it is superseded, witnessed, and
-    /// everything behind it in the window lands.
+    /// Since unit P the write is a fact above the collection's floor, so it
+    /// makes the collection again from the row B kept (the write-after-a-drop
+    /// ruling): the write lands, nothing is stranded, and everything behind it
+    /// in the window lands too. (Before, a tombstone at all made the write
+    /// history here, and it was lost on B while A kept it.)
     ///
     /// Stopping instead is ADR-123's wedge wearing this ADR's clothes: the
     /// entry can never succeed, the window is re-served for ever, and the
     /// only way past it is a full-database snapshot whose completion
     /// witnesses the entry anyway.
     #[test]
-    fn a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall() {
+    fn a_write_stamped_after_the_drop_makes_the_dropped_collection_again_and_does_not_stop_the_batch()
+     {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let doomed = a.create_collection("app", "doomed").unwrap();
@@ -9149,9 +9233,11 @@ mod tests {
         a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
 
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 0, "a drop is history, not a stop: {outcome:?}");
-        assert!(outcome.superseded >= 1, "{outcome:?}");
-        assert_eq!(outcome.applied, 1, "and the entry behind it landed: {outcome:?}");
+        assert_eq!(outcome.unknown_collection, 0, "a drop is not a stop: {outcome:?}");
+        assert_eq!(
+            outcome.applied, 2,
+            "the write above the drop and the entry behind it: {outcome:?}"
+        );
         let other_on_b = b.get_collection("app", "other").unwrap();
         assert_eq!(
             ids_on(&b, "app", "other"),
@@ -9163,7 +9249,11 @@ mod tests {
             b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
             "and the round converged rather than re-serving the same window for ever"
         );
-        assert!(b.get_collection("app", "doomed").is_err(), "the drop stands");
+        assert_eq!(
+            ids_on(&b, "app", "doomed"),
+            ids_on(&a, "app", "doomed"),
+            "the write above the drop made the collection again, and B holds what A holds"
+        );
 
         // And it stays converged: a further round moves nothing.
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default());
@@ -9176,17 +9266,19 @@ mod tests {
     /// history here, and the count half's replay brings it back where it belongs;
     /// nothing replays a definition, so a definition stamped after the drop stops
     /// the batch, as a collection B has no record of does, until the life it
-    /// belongs to arrives. Here that is once A learns the drop: A's life keeps
-    /// what was stamped after it (ADR-231, extended), re-dated above the drop with
-    /// the index, and B takes it by the scoped page the stop asks for (ADR-148),
-    /// and then what followed the definition in the window.
+    /// belongs to arrives. Since unit P a member that holds the row of the name does
+    /// not stop: the definition is a fact above the collection's floor, so it makes
+    /// the collection again from the row, dated just above the drop and re-dated (the
+    /// remains of the life the drop ended, which A keeps in the same shape once it
+    /// hears the drop, ADR-231 extended), with the index, and what followed the
+    /// definition in the window lands in the same round. (A member with no row of the
+    /// name still stops and fetches: `pg1` in the page-and-order file.)
     ///
-    /// Taken as history, as it was before, the definition was witnessed and never
-    /// served again: A held the index and B the same collection without it, for
-    /// good. The stop is not ADR-123's wedge: it lasts until the member that made
-    /// the definition hears the drop, which it pulls from the member that made it.
+    /// Taken as history, as it was before that, the definition was witnessed and never
+    /// served again: A held the index and B the same collection without it, for good.
     #[test]
-    fn a_schema_change_stamped_after_a_local_drop_stops_the_batch_until_its_life_arrives() {
+    fn a_schema_change_stamped_after_a_local_drop_makes_the_collection_again_and_does_not_stop_the_batch()
+     {
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -9202,30 +9294,25 @@ mod tests {
         a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
 
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 1, "a later life's definition stops: {outcome:?}");
-        assert_eq!(outcome.applied, 0, "and what is behind it waits: {outcome:?}");
-        let stopped = outcome.unknown.expect("the stop names the collection");
-        assert_eq!(stopped.id, CollectionId::derive("shop", "orders"));
+        assert_eq!(
+            outcome.unknown_collection, 0,
+            "a definition above the drop is no stop: {outcome:?}"
+        );
+        assert_eq!(outcome.applied, 1, "and what is behind it lands: {outcome:?}");
+        let on_b = b.get_collection("shop", "orders").expect("the definition made the collection");
+        assert!(on_b.is_redated(), "the remains of the life the drop ended: {on_b:?}");
+        assert_eq!(on_b.indexes.len(), 1, "with the index");
         assert!(
-            !b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
-            "nothing past the stop is claimed"
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "and the round claims all of A"
         );
 
-        // A hears the drop and keeps its life, with the index stamped after it.
+        // A hears the drop and keeps its life, with the index stamped after it: the same life.
         round(&a, &b, BATCH);
         let kept = a.get_collection("shop", "orders").expect("the life keeps its later index");
         assert!(kept.is_redated(), "re-dated above the drop: {kept:?}");
         assert_eq!(kept.indexes.len(), 1, "with the index");
-
-        // B's stop is answered with the scoped page, and the window then lands.
-        let mut progress = crate::SnapshotProgress::of_collection(stopped.id);
-        while !progress.is_complete() {
-            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        }
-        let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
-        let on_b = b.get_collection("shop", "orders").expect("the life arrived");
+        assert_eq!(kept.created, on_b.created, "A and B hold the one life");
         assert_eq!(
             on_b.indexes.iter().map(|i| &i.name).collect::<Vec<_>>(),
             kept.indexes.iter().map(|i| &i.name).collect::<Vec<_>>(),
@@ -9239,14 +9326,15 @@ mod tests {
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and stays converged");
     }
 
-    /// The bound on that stop (ADR-236 item 4), the side it leaves standing: a page from
-    /// a sender that still holds the life the drop here ended (it has not heard the
-    /// drop) carries that life, which B refuses, and the definition is not taken as
-    /// history; the stop stands until A hears the drop and keeps the life, re-dated
-    /// with the index, and A's page then brings it. Taken as history on the first
-    /// page, B would never hold the life A keeps: a re-dated life has no creation entry.
+    /// A page that carries a life this member refuses brings nothing of it back over the collection a
+    /// definition above the drop made (unit P; this was the bound on the later-life stop, ADR-236 item
+    /// 4, which a member that holds the row no longer meets): B dropped and purged `orders`, and A, which
+    /// has not heard the drop, made an index above it, so B made the collection again from the row,
+    /// re-dated, with the index and none of the rows the drop removed. A's scoped page carries A's life
+    /// (created below the drop) and its rows below the drop: history here, so they do not come back. A
+    /// then hears the drop and keeps its life, re-dated with the index, and the two hold one life.
     #[test]
-    fn a_page_carrying_a_life_this_member_refuses_leaves_the_later_life_stop_standing() {
+    fn a_page_carrying_a_life_this_member_refuses_does_not_bring_it_back_over_the_remade_life() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let orders = a.create_collection("shop", "orders").unwrap();
@@ -9269,24 +9357,35 @@ mod tests {
             }
         };
 
-        // Answered before A has heard the drop: the page carries A's life, B refuses it.
-        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
-        scoped(&b, &a, stopped.id);
-        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
+        // The definition above the drop makes the collection again: no stop.
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 1, "the stop stands: {outcome:?}");
+        assert_eq!(
+            outcome.unknown_collection, 0,
+            "no stop for a member that holds the row: {outcome:?}"
+        );
+        let made = b.get_collection("shop", "orders").expect("the definition made the collection");
+        assert_eq!(made.indexes.len(), 1, "with the index");
+        assert_eq!(
+            b.count(&made, crate::WalkScope::Request).unwrap(),
+            0,
+            "and none of the old rows"
+        );
+        // A's page carries A's life and its rows, which are history here.
+        scoped(&b, &a, orders.id);
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, made.created, "the life B made stands");
+        assert_eq!(b.count(&held, crate::WalkScope::Request).unwrap(), 0, "no row came back");
 
-        // A hears the drop and keeps the life; its page brings it.
+        // A hears the drop and keeps the life; the two hold one life.
         round(&a, &b, BATCH);
-        assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
-        scoped(&b, &a, stopped.id);
+        let kept = a.get_collection("shop", "orders").unwrap();
+        assert!(kept.is_redated(), "premise: kept");
+        scoped(&b, &a, orders.id);
         let outcome = round(&b, &a, BATCH);
         assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
-        assert_eq!(
-            b.get_collection("shop", "orders").expect("the life arrived").indexes.len(),
-            1,
-            "with its index"
-        );
+        let on_b = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(on_b.indexes.len(), 1, "with its index");
+        assert_eq!(on_b.created, kept.created, "A and B hold the one life");
         assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
@@ -9608,10 +9707,10 @@ mod tests {
         assert_eq!(outcome.superseded, 1, "{outcome:?}");
     }
 
-    /// A vector configuration stamped after a local drop is a definition of a later life
-    /// too (ADR-236), and stops the batch as an index creation does.
+    /// A vector configuration stamped after a local drop is a definition above the collection's
+    /// floor too, and makes it again from the row as an index creation does (unit P): no stop.
     #[test]
-    fn a_vector_configuration_stamped_after_a_local_drop_stops_the_batch() {
+    fn a_vector_configuration_stamped_after_a_local_drop_makes_the_collection_again() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -9620,9 +9719,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.unknown_collection, 1, "{outcome:?}");
-        let stopped = outcome.unknown.expect("the stop names the collection");
-        assert_eq!(stopped.id, CollectionId::derive("shop", "orders"), "{stopped:?}");
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        let on_b = b.get_collection("shop", "orders").expect("the configuration made it again");
+        assert!(on_b.vector.is_some(), "with the vector configuration");
+        assert!(on_b.is_redated(), "the remains of the life the drop ended");
     }
 
     /// What a peer serves `into`'s position from `from`: the window, and the

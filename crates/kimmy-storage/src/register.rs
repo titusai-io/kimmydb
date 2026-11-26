@@ -1495,6 +1495,23 @@ pub(crate) fn base_options_of(
     }
 }
 
+/// The options row of `id` as the writer `txn` sees it (unit P's remake reads it under the writer, after a carry's merge wrote it in the
+/// same transaction): `None` when the row is absent.
+pub(crate) fn base_options_in(
+    txn: &redb::WriteTransaction,
+    id: CollectionId,
+) -> Result<Option<BaseOptions>> {
+    let key = id.0.to_be_bytes();
+    let held = {
+        let table = txn.open_table(tables::COLLECTION_BASE_OPTIONS)?;
+        table.get(key.as_slice())?.map(|raw| raw.value().to_vec())
+    };
+    match held {
+        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
 /// Whether [`note_base_options`] would write `options`: read in a read transaction, so a creation judged history, which holds no
 /// transaction of its own, takes the writer only when its options rise.
 pub(crate) fn base_options_would_rise(

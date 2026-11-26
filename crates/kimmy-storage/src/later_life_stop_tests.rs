@@ -159,8 +159,11 @@ fn finding_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
 /// life's definition made after the drop with the life, and granted the coverage of the
 /// definition's entry all the same. C, which keeps the life (re-dated by that drop, with a
 /// write made after it) and takes A's whole page, was granted the same coverage and never
-/// received the definition; nothing replays one. The entry is not granted: C takes it from B,
-/// and A takes it with the life once B has heard the drop and kept the life.
+/// received the definition; nothing replays one. UNIT P's premise: a member that holds the row of
+/// the name takes the definition (and the write) above its drop from the page, as a fact above the
+/// floor that makes the collection again, so the coverage the page grants A is a coverage A HOLDS:
+/// "a page grants a definition's coverage only where the receiver holds it". A's page then carries
+/// the definition to C, and the three members hold one life with it.
 fn a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
     define: impl Fn(&Engine) -> kimmy_core::Stamp,
     holds: impl Fn(&crate::meta::CollectionMeta) -> bool,
@@ -183,18 +186,16 @@ fn a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
     let made = define(&b);
 
     whole(&a, &b);
-    assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
+    let on_a = a.get_collection("shop", "orders").expect("A takes the remains of B's life");
+    assert!(holds(&on_a), "A holds the definition the page granted it: {on_a:?}");
     assert!(
-        a.witnessed_vector().unwrap().get(made.origin()) < made.hlc,
-        "the page granted A the definition of the life it refused"
+        a.witnessed_vector().unwrap().get(made.origin()) >= made.hlc,
+        "and the page granted its coverage, which A holds"
     );
     whole(&c, &a);
     let kept = c.get_collection("shop", "orders").expect("premise: C keeps its life");
     assert!(kept.is_redated(), "premise: re-dated by A's drop: {kept:?}");
-    assert!(
-        c.witnessed_vector().unwrap().get(made.origin()) < made.hlc,
-        "A's page granted C the definition it never held"
-    );
+    assert!(holds(&kept), "C takes the definition from A's page, which holds it: {kept:?}");
 
     round(&b, &a);
     assert!(b.get_collection("shop", "orders").unwrap().is_redated(), "premise: B kept it");

@@ -951,7 +951,7 @@ impl Engine {
 }
 
 /// The arrival position the next entry appended to this node's log will take.
-fn next_arrival_in(txn: &redb::WriteTransaction) -> Result<u64> {
+pub(crate) fn next_arrival_in(txn: &redb::WriteTransaction) -> Result<u64> {
     let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
     Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
 }
@@ -1145,8 +1145,11 @@ mod tests {
 
     /// Nobody recreated the name: D keeps document 3 in a collection the drop
     /// removed on A, re-dated above the drop and floored at it. A has no
-    /// collection to put the write in, so the write waits there as history; the
-    /// existence repair (the loop test) brings the collection back.
+    /// collection to put the write in, but it keeps the name's row, and the
+    /// write is stamped above its floor: it makes the collection again on A, dated
+    /// just above the drop with the same marker, holding the write alone (unit P;
+    /// before, the write waited on A as history until the existence repair brought
+    /// the collection back).
     #[test]
     fn a_drop_that_meets_a_later_write_keeps_the_collection_re_dated_above_the_drop() {
         let (a, _da) = engine();
@@ -1164,7 +1167,10 @@ mod tests {
         assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
         assert!(kept.created > dropped.hlc, "re-dated above the drop: {:?}", kept.created);
         assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
-        assert!(a.get_collection("shop", "orders").is_err(), "A has nothing to put it in");
+        let on_a_now = a.get_collection("shop", "orders").expect("the write made it again on A");
+        assert_eq!(docs_of(&a, "shop", "orders", &[1, 3]), vec![3], "with the write alone");
+        assert_eq!(on_a_now.created, kept.created, "A and D hold the one life");
+        assert!(on_a_now.is_redated(), "the remains of the life the drop ended");
     }
 
     /// A replicated drop that meets nothing stamped after it buries the

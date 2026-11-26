@@ -313,12 +313,21 @@ fn a_create_older_than_a_database_drop_is_history_and_its_documents_are_supersed
         .expect("b holds the creation");
     assert!(c.oplog_entry(&created.stamp).unwrap().is_some(), "a refused creation was withheld");
 
-    // And more of the old life, after the create was refused, is history, not a stop.
+    // And a write of that collection stamped AFTER the drop is not history and not a stop: it is a fact above the floor of a collection
+    // that is gone here, which makes it again from the row the refused creation left (unit P: the write-after-a-drop ruling; the creation
+    // itself stays refused, and the life below the drop does not come back).
     let bl = b.get_collection("shop", "late").unwrap();
     b.insert(&bl, doc! { "_id": "z" }).unwrap();
     let outcome = pull(&c, &b);
     assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
-    assert!(!holds(&c, "shop", "late"));
+    let made =
+        c.get_collection("shop", "late").expect("the write above the drop made the collection");
+    assert_eq!(c.count(&made, crate::WalkScope::Request).unwrap(), 1, "with the write alone");
+    assert!(c.get(&made, &kimmy_core::DocId::String("z".into())).unwrap().is_some());
+    assert!(
+        c.get(&made, &kimmy_core::DocId::String("x".into())).unwrap().is_none(),
+        "and the document below the drop did not come back"
+    );
 }
 
 #[test]
@@ -430,12 +439,15 @@ fn a_definition_older_than_the_tombstone_is_not_restored_and_its_entries_are_his
         a.collection_dropped_at(late).unwrap().is_some(),
         "the refusal must leave the collection's own tombstone"
     );
-    // Later entries for the refused collection are history, not a stop.
+    // A later write of the refused collection, stamped above the drop, is not a stop: it makes the collection again from its row (unit P),
+    // with that write alone.
     let bl = b.get_collection("shop", "late").unwrap();
     b.insert(&bl, doc! { "_id": "more" }).unwrap();
     let outcome = pull(&a, &b);
     assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
-    assert!(!holds(&a, "shop", "late"));
+    let made =
+        a.get_collection("shop", "late").expect("the write above the drop made the collection");
+    assert_eq!(a.count(&made, crate::WalkScope::Request).unwrap(), 1, "with the write alone");
 }
 
 /// The pre-existing defect the same change fixes: a never-held collection with
