@@ -1288,6 +1288,13 @@ fn names_of(
     if CollectionId::derive(&db, &physical).0.to_be_bytes().as_slice() != key {
         return Err("a names row whose names derive another key than its own");
     }
+    // the physical is the identity itself, or a stage or a recreation of the logical name: a row wrong only in its logical name would name
+    // the events of another name, and nothing else refuses it (a row under an id no other row holds is simply inserted)
+    let of_it = kimmy_core::swap::logical_of_stage(&physical)
+        .or_else(|| kimmy_core::swap::logical_of_recreation(&physical));
+    if physical != logical && of_it != Some(logical.as_str()) {
+        return Err("a names row whose logical name is not its physical's");
+    }
     Ok((db, logical, physical))
 }
 
@@ -1447,6 +1454,154 @@ pub(crate) fn base_options_would_rise(
     }
 }
 
+/// A row of the carry, judged: what it names.
+pub(crate) enum CarriedRowKind {
+    Names { db: String, logical: String, physical: String },
+    Options(BaseOptions),
+}
+
+/// Judge one row of the carry as its table's own door would: `table` is the snapshot's wire tag, and the key must derive from the names the
+/// value holds. A row that does not is a damaged page, and is judged here before anything of it is held.
+pub(crate) fn judge_carried_row(table: u8, key: &[u8], value: &[u8]) -> Result<CarriedRowKind> {
+    match table {
+        crate::snapshot::CARRY_NAMES => {
+            let (db, logical, physical) = names_of(key, value).map_err(corrupt)?;
+            Ok(CarriedRowKind::Names { db, logical, physical })
+        }
+        crate::snapshot::CARRY_OPTIONS => {
+            let options: BaseOptions = serde_json::from_slice(value)
+                .map_err(|_| corrupt("a carried options row that does not decode"))?;
+            if CollectionId::derive(&options.db, &options.name).0.to_be_bytes().as_slice() != key {
+                return Err(corrupt("a carried options row whose names derive another key"));
+            }
+            Ok(CarriedRowKind::Options(options))
+        }
+        _ => Err(corrupt("a carried row of a table the carry does not name")),
+    }
+}
+
+/// Merge a judged row of the carry into its table: a names row is kept if absent (it is a function of its names), an options row rises by
+/// the rule that orders them. Returns whether a row was written.
+pub(crate) fn merge_carried_row(
+    txn: &redb::WriteTransaction,
+    row: &CarriedRowKind,
+) -> Result<bool> {
+    match row {
+        CarriedRowKind::Names { db, logical, physical } => note_names(txn, db, logical, physical),
+        CarriedRowKind::Options(options) => note_base_options(txn, options),
+    }
+}
+
+/// The names table and the base options, opened ONCE for the rows of a page, to ask of each whether holding it would change its table. A
+/// table that is not there yet holds nothing, and is not opened (opening a table in a write transaction creates it, and a table is created
+/// by its first row).
+pub(crate) struct CarryTables<'txn> {
+    names: Option<redb::Table<'txn, &'static [u8], &'static [u8]>>,
+    options: Option<redb::Table<'txn, &'static [u8], &'static [u8]>>,
+}
+
+impl<'txn> CarryTables<'txn> {
+    pub(crate) fn open(txn: &'txn redb::WriteTransaction) -> Result<Self> {
+        use redb::TableHandle as _;
+        let held: Vec<String> = txn.list_tables()?.map(|table| table.name().to_string()).collect();
+        let open = |definition: redb::TableDefinition<'static, &'static [u8], &'static [u8]>| {
+            if held.iter().any(|name| name == definition.name()) {
+                Ok::<_, StorageError>(Some(txn.open_table(definition)?))
+            } else {
+                Ok(None)
+            }
+        };
+        Ok(CarryTables {
+            names: open(tables::REGISTER_NAMES)?,
+            options: open(tables::COLLECTION_BASE_OPTIONS)?,
+        })
+    }
+
+    /// Whether holding a judged row of the carry would change its table: a names row that is not held, an options row that rises over the
+    /// one held. A names row whose id is held with other names is damage, refused where it arrives and not at the merge of the last page.
+    pub(crate) fn is_news(&self, row: &CarriedRowKind) -> Result<bool> {
+        match row {
+            CarriedRowKind::Names { db, logical, physical } => {
+                let Some(table) = &self.names else { return Ok(true) };
+                let key = CollectionId::derive(db, physical).0.to_be_bytes();
+                let value = names_value(db, logical, physical);
+                let held = table.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+                match held {
+                    None => Ok(true),
+                    Some(held) if held == value => Ok(false),
+                    Some(_) => Err(corrupt("a names row is held under an id other names derive")),
+                }
+            }
+            CarriedRowKind::Options(options) => {
+                let Some(table) = &self.options else { return Ok(true) };
+                let key = CollectionId::derive(&options.db, &options.name).0.to_be_bytes();
+                let value = serde_json::to_vec(options)?;
+                let held = table.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+                match held {
+                    None => Ok(true),
+                    Some(held) => {
+                        let held_options: BaseOptions = serde_json::from_slice(&held)?;
+                        Ok(options_rise(&held_options, &held, options, &value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The length of a key of the carry: both carried tables are keyed by a collection id.
+pub(crate) const CARRY_KEY_LEN: usize = 8;
+
+/// One row of the carry as a table stores it: the wire tag, the key and the value.
+pub(crate) type WireRow = (u8, Vec<u8>, Vec<u8>);
+
+/// What [`carry_rows`] returns: the rows (wire tag, key, value), the bytes they used, and where the next page resumes.
+pub(crate) type CarryRows = (Vec<(u8, Vec<u8>, Vec<u8>)>, usize, Option<(u8, Vec<u8>)>);
+
+/// The rows of the carry a page holds, in the order of the carry (the names table, then the base options, each in key order), strictly
+/// after the row `after` names (a table's wire tag and the key; the whole carry when `None`) and within `room` bytes, each row counted as
+/// its key and value and a frame ([`crate::snapshot::CARRIED_ROW_FRAME`]). A row that does not fit ends the page, unless it is the page's
+/// first, which is always sent so that a pull makes progress. Returns the rows, the bytes they used, and the row the next page resumes
+/// after, which is `None` when the carry is done: a row is looked for beyond the last one sent, so a carry of exactly a page's worth ends
+/// on it.
+pub(crate) fn carry_rows(
+    txn: &redb::ReadTransaction,
+    after: Option<(u8, &[u8])>,
+    room: usize,
+) -> Result<CarryRows> {
+    use std::ops::Bound;
+    let mut rows: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut used = 0usize;
+    for (tag, definition) in [
+        (crate::snapshot::CARRY_NAMES, tables::REGISTER_NAMES),
+        (crate::snapshot::CARRY_OPTIONS, tables::COLLECTION_BASE_OPTIONS),
+    ] {
+        let from: Option<&[u8]> = match after {
+            // a table the cursor is past
+            Some((held, _)) if held > tag => continue,
+            Some((held, key)) if held == tag && !key.is_empty() => Some(key),
+            _ => None,
+        };
+        let table = match txn.open_table(definition) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let start = from.map_or(Bound::Unbounded, Bound::Excluded);
+        for row in table.range::<&[u8]>((start, Bound::Unbounded))? {
+            let (key, value) = row?;
+            let cost = key.value().len() + value.value().len() + crate::snapshot::CARRIED_ROW_FRAME;
+            if !rows.is_empty() && used + cost > room {
+                let last = rows.last().map(|(tag, key, _)| (*tag, key.clone()));
+                return Ok((rows, used, last));
+            }
+            used += cost;
+            rows.push((tag, key.value().to_vec(), value.value().to_vec()));
+        }
+    }
+    Ok((rows, used, None))
+}
+
 /// Seed the name's drop from the receiver's own tombstone for the identity, but only when that tombstone is ABOVE the grant for its
 /// origin (Q6.6, unit C2b; D1): one the sender could not have judged. A tombstone at or below the grant is the sender's to have used, and
 /// seeding from it would put in this register a drop the sender's register does not hold.
@@ -1516,6 +1671,31 @@ fn seed_by_id_above_the_grant(
         }
         _ => Ok(false),
     }
+}
+
+/// Name the ids in `unnamed` (the ids of logical names, which a register event is keyed by) from the names table: a row held under the id
+/// whose physical is the logical name itself names the identity. An id with no such row stays unnamed. The table is looked for before it is
+/// opened, since opening a table in a write transaction creates it.
+fn name_from_names_table(
+    txn: &redb::WriteTransaction,
+    unnamed: &std::collections::BTreeSet<u64>,
+    names: &mut std::collections::BTreeMap<u64, (String, String)>,
+) -> Result<()> {
+    use redb::TableHandle as _;
+    let held = tables::REGISTER_NAMES.name();
+    if !txn.list_tables()?.any(|table| table.name() == held) {
+        return Ok(());
+    }
+    let table = txn.open_table(tables::REGISTER_NAMES)?;
+    for id in unnamed {
+        let key = id.to_be_bytes();
+        let Some(raw) = table.get(key.as_slice())? else { continue };
+        let (db, logical, physical) = names_of(key.as_slice(), raw.value()).map_err(corrupt)?;
+        if logical == physical {
+            names.insert(*id, (db, logical));
+        }
+    }
+    Ok(())
 }
 
 /// Name the ids in `unnamed` that a collection this member holds belongs to: a hidden collection (a stage, a recreation), whose logical
@@ -1604,6 +1784,14 @@ pub(crate) fn apply_carried(
     // recreation of it that a page from an older sender made with no stage row. The member's own collections are what the join's earlier
     // pages created, so this covers a join of several pages as the page's own collection states would, and a name found here goes
     // through the same door, pass and row as any other.
+    // The names table comes first (ADR-272, unit N): a join's carry brings the sender's names rows, which its last page merges in this
+    // transaction before this runs, and an identity named there is named for good; the member's own collections are asked only of what
+    // is still unnamed.
+    let unnamed: std::collections::BTreeSet<u64> =
+        events.keys().filter(|id| !names.contains_key(id)).copied().collect();
+    if !unnamed.is_empty() {
+        name_from_names_table(txn, &unnamed, &mut names)?;
+    }
     let unnamed: std::collections::BTreeSet<u64> =
         events.keys().filter(|id| !names.contains_key(id)).copied().collect();
     if !unnamed.is_empty() {

@@ -132,6 +132,18 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "one logical name's rows of the register, a prefix range of the 8-byte id: the swap events of one name inside tombstone retention, read inside the write transaction of the entry that carries one of them (ADR-272)",
     ),
     (
+        "register::carry_rows",
+        "the rows of the names table and the base options one snapshot page carries: a range that stops at the page's byte budget (and reads one row beyond it), the sender's catalogue read in pieces by the pages of a join, in one read transaction (ADR-272, unit N)",
+    ),
+    (
+        "snapshot::take_carry_stage",
+        "the rows one pull staged of the carry, a range of the prefix of one sender and scope: a row for each collection or swapped name the sender's carry held, merged and removed in the write transaction that completes the join, or emptied by the first page of the next pull (ADR-272, unit N)",
+    ),
+    (
+        "snapshot::Engine::carry_stage_has_rows",
+        "a range of the prefix of one sender and scope that takes its first row and no other: whether the pull staged anything, in a read transaction, before the page's own (ADR-272, unit N)",
+    ),
+    (
         "engine::drop_superseded_covered_marks",
         "inside a replicated window's write transaction, which does not stop (ADR-192): one row per held mark, the table `held_marks_covered_by` already reads whole on every pull (ADR-172); drops a mark only where the servable vector already covers it",
     ),

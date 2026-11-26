@@ -1243,6 +1243,24 @@ fn a_names_row_of_the_wrong_shape_refuses_the_restore() {
 }
 
 #[test]
+fn a_names_row_wrong_only_in_its_logical_name_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let physical = "orders.__stg.zz";
+    let key = CollectionId::derive(DB, physical).0.to_be_bytes().to_vec();
+    // db length || db || logical length || logical || physical, with the logical name of another name and the key as the names derive it
+    let mut value = Vec::new();
+    value.extend_from_slice(&(DB.len() as u16).to_be_bytes());
+    value.extend_from_slice(DB.as_bytes());
+    value.extend_from_slice(&("another".len() as u16).to_be_bytes());
+    value.extend_from_slice(b"another");
+    value.extend_from_slice(physical.as_bytes());
+    records.push((T_REGISTER_NAMES, key, value));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("logical name is not its physical's"), "the check is named: {error}");
+}
+
+#[test]
 fn a_base_options_row_whose_key_does_not_derive_from_its_names_refuses_the_restore() {
     let (bytes, _w, _m, _d) = a_flipped_backup();
     let mut records = records(&bytes);

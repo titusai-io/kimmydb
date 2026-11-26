@@ -326,6 +326,16 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
+/// The rows of the carry a whole-database snapshot pull has received and not yet merged (ADR-272, unit N): the names table's rows and the
+/// base options' of the sender, which ride the first pages of the pull and are merged into their own tables in the transaction that
+/// completes it. Key = the sender's node id (16 bytes), the pull's scope (1 byte, 0 for the whole database, 1 for one collection, then
+/// the collection's id, 8 bytes, only for 1), the carry's wire tag (1 byte) and the row's key; value = the row's value as its table stores
+/// it. Written in the transaction of the page that carried the rows, with the pull's stored cursor, so the two stand or fall together;
+/// removed by the merge, by the first page of a later pull of the same sender and scope, and when that progress is forgotten. Never
+/// carried by a backup. Created by its first row, never at the open.
+pub const SNAPSHOT_CARRY_STAGE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("snapshot_carry_stage");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 

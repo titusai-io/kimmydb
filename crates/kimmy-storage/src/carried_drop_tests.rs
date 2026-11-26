@@ -1652,6 +1652,27 @@ fn a_carry_that_fits_rides_the_page_that_walks_the_last_row() {
     );
 }
 
+/// The pages of the snapshot of `sender`, from the first, each asked after the cursor the one before it named, to the last page or the
+/// first error. The names and the options ride the first pages (ADR-272, unit N), so a test of where the register's carry rides follows
+/// the cursor to it rather than asking for the first page and the one after.
+fn pages_to_the_end(sender: &Engine) -> (Vec<crate::SnapshotPage>, Option<crate::StorageError>) {
+    let mut pages: Vec<crate::SnapshotPage> = Vec::new();
+    let mut after = None;
+    loop {
+        assert!(pages.len() < 200, "the snapshot does not end");
+        match sender.snapshot_page(after.take(), None) {
+            Ok(page) => {
+                after = page.next.clone();
+                pages.push(page);
+                if after.is_none() {
+                    return (pages, None);
+                }
+            }
+            Err(e) => return (pages, Some(e)),
+        }
+    }
+}
+
 #[test]
 fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
     let (s, size, last) = a_sender_and_the_size_of_its_carry();
@@ -1659,23 +1680,25 @@ fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
     s.sender.set_snapshot_room_for_test(Some(size + 1));
     let probe = s.sender.snapshot_page(None, Some(plain_id())).unwrap();
     assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
-    let first = s.sender.snapshot_page(None, None).unwrap();
-    assert_eq!(first.documents.len(), 1, "premise: the row fits the room");
-    assert!(first.register.is_none(), "the carry is not on the page that cannot hold it");
-    let cursor = first.next.clone();
-    assert!(cursor.is_some(), "the page ends early, after its last row, and the walk goes on");
-    let second = s.sender.snapshot_page(cursor, None).unwrap();
+    let (pages, error) = pages_to_the_end(&s.sender);
+    assert!(error.is_none(), "the snapshot is served: {error:?}");
+    let total: usize = pages.iter().map(|page| page.documents.len()).sum();
+    assert_eq!(total, 1, "the pages hold the source's one row: none lost, none sent twice");
+    let with_the_row = pages.iter().position(|page| !page.documents.is_empty()).unwrap();
+    let row_page = &pages[with_the_row];
+    assert!(row_page.register.is_none(), "the carry is not on the page that cannot hold it");
+    assert!(row_page.next.is_some(), "the page ends early, after its last row");
+    let last_page = pages.last().unwrap();
     assert!(
-        second.documents.is_empty() && second.collections.is_empty(),
+        last_page.documents.is_empty()
+            && last_page.collections.is_empty()
+            && last_page.carried.is_empty(),
         "the carry rides a page with nothing else on it, and no row is sent twice"
     );
-    assert_eq!(
-        first.documents.len() + second.documents.len(),
-        1,
-        "the two pages together hold the source's one row: none lost, none sent twice"
-    );
-    assert!(second.register.is_some() && second.next.is_none(), "which is the last page");
+    assert!(last_page.register.is_some() && last_page.next.is_none(), "which is the last page");
+    assert_eq!(pages.len() - 1, with_the_row + 1, "and it is the page after the row's");
     // and the pull completes with the register applied
+    s.sender.set_snapshot_room_for_test(None);
     let (j, _dj) = engine();
     pull(&j, &s.sender);
     assert_eq!(
@@ -1694,8 +1717,9 @@ fn a_carry_that_does_not_fit_a_page_of_its_own_is_refused_not_cut() {
     // the whole database exhausts on its page and only the carry, which does not fit a page of its own, can refuse
     let probe = s.sender.snapshot_page(None, Some(plain_id())).unwrap();
     assert_eq!(probe.documents.len(), 1, "premise: the row fits the room");
-    match s.sender.snapshot_page(None, None) {
-        Err(crate::StorageError::SnapshotRegisterCarryTooLarge { bytes, cap }) => {
+    // the first pages are the names and the options, which fit (a row at least is sent); the refusal is on the page that ends the walk
+    match pages_to_the_end(&s.sender) {
+        (_, Some(crate::StorageError::SnapshotRegisterCarryTooLarge { bytes, cap })) => {
             assert_eq!((bytes, cap), (size, size - 1), "the error names the size and the room");
         }
         other => panic!("a carry no page can hold is refused, never cut: {other:?}"),
@@ -1728,9 +1752,10 @@ fn the_warning_fires_at_half_the_cap_and_at_most_once_an_hour() {
     assert_eq!(s.sender.register_carry_warnings(), 0, "below half the cap: no warning");
     // a cap just above the carry: the carry is more than half of it
     s.sender.set_snapshot_page_bytes_for_test(Some(size + 1));
-    let _ = s.sender.snapshot_page(None, None);
+    // the carry is measured on the page that ends the walk, which the names and the options precede
+    let _ = pages_to_the_end(&s.sender);
     assert_eq!(s.sender.register_carry_warnings(), 1, "at half the cap or more: one warning");
-    let _ = s.sender.snapshot_page(None, None);
+    let _ = pages_to_the_end(&s.sender);
     assert_eq!(s.sender.register_carry_warnings(), 1, "and not again within the hour");
 }
 

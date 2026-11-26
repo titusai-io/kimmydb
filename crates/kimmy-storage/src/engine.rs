@@ -4269,14 +4269,16 @@ impl Engine {
         peer: NodeId,
         scope: Option<CollectionId>,
     ) -> Result<bool> {
+        // What the pull staged of the carry goes with it (ADR-272, unit N), whether or not a cursor was stored.
+        let staged = crate::snapshot::clear_carry_stage(txn, peer, scope)?;
         let mut table = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
         match Self::stored_snapshot_scope(&table, peer)? {
             // No row, or one this pull does not own.
-            None => return Ok(false),
-            Some(stored) if stored != scope => return Ok(false),
+            None => return Ok(staged),
+            Some(stored) if stored != scope => return Ok(staged),
             Some(_) => {}
         }
-        Ok(table.remove(peer.to_bytes().as_slice())?.is_some())
+        Ok(table.remove(peer.to_bytes().as_slice())?.is_some() || staged)
     }
 
     /// Whether a snapshot pull with `peer` scoped to `scope` is recorded,

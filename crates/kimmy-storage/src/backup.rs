@@ -816,6 +816,10 @@ mod tests {
             "SNAPSHOT_PROGRESS",
             "the resume cursor of a pull in flight, which must not outlive its records",
         ),
+        (
+            "SNAPSHOT_CARRY_STAGE",
+            "the rows a pull in flight has received and not yet merged, which live and die with its resume cursor",
+        ),
     ];
 
     /// The names `source` declares as `pub const NAME: TableDefinition<..>`.

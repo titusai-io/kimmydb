@@ -527,6 +527,19 @@ fn a_sender_with(n: usize) -> (Engine, tempfile::TempDir) {
     (a, dir)
 }
 
+/// A sender with a live collection `c0` holding a document, and `n` collections that existed and were dropped: the options of a gone
+/// collection are a row only the carry brings (a live one's arrives as the same row from its definition, so it is no news to a joiner and
+/// costs it no write).
+fn a_sender_with_ghosts(n: usize) -> (Engine, tempfile::TempDir) {
+    let (a, dir) = a_sender_with(1);
+    for i in 0..n {
+        let name = format!("g{i}");
+        a.create_collection(DB, &name).unwrap();
+        a.drop_collection(DB, &name).unwrap();
+    }
+    (a, dir)
+}
+
 /// Every page of the pull `progress` is of, from `from` into `to`, the way the transport asks for them: the cursor the progress holds is
 /// the one the next page is asked after.
 fn pulled(to: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> Vec<crate::SnapshotPage> {
@@ -541,12 +554,12 @@ fn pulled(to: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> Vec<cr
 }
 
 /// A page budget that is small against the carry and still holds one document: the larger of three options rows (a row costs its key, its
-/// value and a frame of 32) and the first document with the cursor a page cuts after it. Measured from the sender, so that a change of
+/// value and the carried row's frame) and the first document with the cursor a page cuts after it. Measured from the sender, so that a change of
 /// the layout or of the format moves the budget with it and not the test.
 fn a_small_room_that_holds_a_document(e: &Engine) -> usize {
     let row = rows(e, Carried::Options)
         .iter()
-        .map(|(key, value)| key.len() + value.len() + 32)
+        .map(|(key, value)| key.len() + value.len() + crate::snapshot::CARRIED_ROW_FRAME)
         .max()
         .expect("premise: the sender has an options row");
     let whole = e.snapshot_page(None, None).unwrap();
@@ -631,7 +644,7 @@ fn a_carry_that_does_not_fit_the_first_page_goes_on_pages_before_the_documents()
 /// the pages before it staged: it ends with every row, and not with the rows of the pages it asked for again only.
 #[test]
 fn a_join_stopped_in_the_carry_resumes_from_its_stored_progress() {
-    let (a, _da) = a_sender_with(30);
+    let (a, _da) = a_sender_with_ghosts(30);
     a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
     let (b, dir) = engine();
     let mut progress = SnapshotProgress::whole_database();
@@ -658,11 +671,12 @@ fn a_join_stopped_in_the_carry_resumes_from_its_stored_progress() {
     assert_eq!(keys(&b, Carried::Options), keys(&a, Carried::Options), "every row, both halves");
 }
 
-/// A pull that starts again at its first page, against another sender, holds nothing the abandoned one staged: a row only the carry brings
-/// (the options of a collection that is gone) is in the table of the one that completed and in no other.
+/// The staging is keyed by sender: a pull from ANOTHER sender that completes merges none of the rows a first sender's abandoned pull staged
+/// (here the options of a collection that is gone, a row only the carry brings), and leaves them where they are until that sender's own
+/// pull starts again or is forgotten.
 #[test]
-fn a_new_pull_discards_what_an_abandoned_one_staged() {
-    let (a, _da) = a_sender_with(30);
+fn a_pull_from_another_sender_does_not_merge_the_rows_a_first_sender_staged() {
+    let (a, _da) = a_sender_with_ghosts(30);
     a.create_collection(DB, "ghost").unwrap();
     a.drop_collection(DB, "ghost").unwrap();
     assert!(
@@ -671,14 +685,13 @@ fn a_new_pull_discards_what_an_abandoned_one_staged() {
     );
     a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
     let (b, _db) = engine();
-    let mut abandoned = SnapshotProgress::whole_database();
-    for _ in 0..2 {
-        let page = a.snapshot_page(abandoned.after().cloned(), abandoned.scope()).unwrap();
-        b.apply_snapshot_page(a.node_id(), &mut abandoned, &page).unwrap();
-    }
+    stopped_after_the_carry(&b, &a);
+    let staged = b.carry_stage_rows_for_test(a.node_id());
     assert!(
-        abandoned.after().is_some_and(|cursor| matches!(cursor.carry, Carry::At(_))),
-        "premise: the pull stopped in the carry"
+        staged
+            .iter()
+            .any(|(table, key, _)| *table == crate::CARRY_OPTIONS && *key == id_key(DB, "ghost")),
+        "premise: the abandoned pull staged the ghost's row"
     );
     let (c, _dc) = a_sender_with(2);
     let mut fresh = SnapshotProgress::whole_database();
@@ -691,6 +704,74 @@ fn a_new_pull_discards_what_an_abandoned_one_staged() {
     for key in keys(&c, Carried::Options) {
         assert!(held.contains(&key), "the completed pull's own rows are held");
     }
+    // staged by sender, so a pull of another is not the first's to merge or to clear: they stand until that sender's pull restarts or is
+    // forgotten
+    assert_eq!(
+        b.carry_stage_rows_for_test(a.node_id()),
+        staged,
+        "the first sender's staging is as it was"
+    );
+}
+
+/// A pull of `from` into `to`, stopped where the carry is done and the documents have not begun: every row of the carry is staged.
+fn stopped_after_the_carry(to: &Engine, from: &Engine) -> SnapshotProgress {
+    let mut progress = SnapshotProgress::whole_database();
+    while progress.after().is_none_or(|cursor| matches!(cursor.carry, Carry::At(_))) {
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(!progress.is_complete(), "premise: the pull stopped before the documents");
+    progress
+}
+
+/// The first page of a pull empties what an EARLIER pull of the same sender left staged, whether the new pull is one page (the page that
+/// completes it discards the staged rows and merges its own) or several (its first page replaces the staging). The pages of the second pull
+/// are applied under the first sender's node id, which is what makes it the same sender's.
+#[test]
+fn the_first_page_of_a_pull_empties_what_the_same_sender_left_staged() {
+    for pages in ["one page", "several pages"] {
+        let (a, _da) = a_sender_with_ghosts(30);
+        a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+        let (b, _db) = engine();
+        stopped_after_the_carry(&b, &a);
+        assert!(
+            !b.carry_stage_rows_for_test(a.node_id()).is_empty(),
+            "{pages}: premise: the abandoned pull staged rows"
+        );
+        let (c, _dc) = a_sender_with(if pages == "one page" { 2 } else { 12 });
+        if pages != "one page" {
+            c.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&c)));
+        }
+        let mut fresh = SnapshotProgress::whole_database();
+        while !fresh.is_complete() {
+            let page = c.snapshot_page(fresh.after().cloned(), None).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut fresh, &page).unwrap();
+        }
+        assert!(
+            fresh.pages() > 1 || pages == "one page",
+            "{pages}: premise: the second pull took several pages"
+        );
+        assert!(
+            options_of(&b, "g0").is_none() && options_of(&b, "g29").is_none(),
+            "{pages}: what the abandoned pull staged is not merged by the one that replaced it"
+        );
+        assert!(
+            b.carry_stage_rows_for_test(a.node_id()).is_empty(),
+            "{pages}: and the staging is empty"
+        );
+    }
+}
+
+/// Forgetting a pull forgets what it staged.
+#[test]
+fn forgetting_a_pull_forgets_its_staged_rows() {
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    stopped_after_the_carry(&b, &a);
+    assert!(!b.carry_stage_rows_for_test(a.node_id()).is_empty(), "premise: rows are staged");
+    b.forget_snapshot_progress(a.node_id(), None).unwrap();
+    assert!(b.carry_stage_rows_for_test(a.node_id()).is_empty(), "forgotten with the pull");
 }
 
 /// A carried options row whose key does not derive from the names it holds is a damaged page: it fails, the progress does not move, and
@@ -763,5 +844,131 @@ fn a_cursor_that_does_not_name_its_carry_is_malformed() {
     assert!(
         serde_json::from_value::<crate::SnapshotCursor>(value).is_err(),
         "a cursor without the field does not read"
+    );
+}
+
+/// The wire form of a names row: db length (u16, big-endian) || db || logical length (u16) || logical || physical.
+fn names_value_of(db: &str, logical: &str, physical: &str) -> Vec<u8> {
+    let mut value = Vec::new();
+    value.extend_from_slice(&(db.len() as u16).to_be_bytes());
+    value.extend_from_slice(db.as_bytes());
+    value.extend_from_slice(&(logical.len() as u16).to_be_bytes());
+    value.extend_from_slice(logical.as_bytes());
+    value.extend_from_slice(physical.as_bytes());
+    value
+}
+
+/// A sender with a stage, and the page of its whole database with the names row of the stage made wrong only in its logical name.
+fn a_page_with_a_wrong_logical_names_row() -> (Engine, tempfile::TempDir, crate::SnapshotPage) {
+    let (a, dir) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE, MergePolicy::Document, deadline).unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    let row = page
+        .carried
+        .iter_mut()
+        .find(|row| row.table == crate::CARRY_NAMES && row.key.to_vec() == id_key(DB, STAGE))
+        .expect("premise: the page carries the stage's names row");
+    // the key as it was, and a logical name of another name
+    row.value = serde_bytes::ByteBuf::from(names_value_of(DB, "another", STAGE));
+    (a, dir, page)
+}
+
+/// A names row whose logical name is not its physical's (the physical itself, or the name before a stage's or a recreation's mark) is a
+/// damaged page, refused when it arrives: held, it would name the events of another name. NOTHING else on the page holds the id (no
+/// definition, no register), so it is this rule alone that refuses it: a row that passed would be news, and merge.
+#[test]
+fn a_carried_names_row_of_another_logical_name_refuses_the_page() {
+    let (a, _da, mut page) = a_page_with_a_wrong_logical_names_row();
+    page.collections.clear();
+    page.register = None;
+    let (b, _db) = engine();
+    let refused =
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page);
+    assert!(refused.is_err(), "the page is refused: {refused:?}");
+    assert!(names_of(&b, STAGE).is_none(), "and no names row is held for the stage");
+}
+
+/// The same row on a page whose definitions made the stage first: the member holds the real row for the id, the page is refused and the
+/// real row stands.
+#[test]
+fn a_carried_names_row_of_another_logical_name_is_refused_beside_the_held_one() {
+    let (a, _da, page) = a_page_with_a_wrong_logical_names_row();
+    let (b, _db) = engine();
+    let refused =
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page);
+    assert!(refused.is_err(), "the page is refused: {refused:?}");
+    assert_eq!(names_of(&b, STAGE), named(STAGE, "orders"), "and the real row stands");
+}
+
+/// A names row held under an id that OTHER names derive (a collision of the 64-bit ids, which no row of this member can make: the value of
+/// a row is fixed by its key and the logical-name rule) is refused where a row of it arrives, and not at the merge of the last page.
+#[test]
+fn a_names_row_held_under_an_id_other_names_derive_is_refused_on_arrival() {
+    let (e, _dir) = engine();
+    let txn = e.begin_write(WriterHolder::Ddl).unwrap();
+    // planted by hand: the key of `orders` over the value of other names
+    crate::register::restore_row(
+        &txn,
+        Carried::Names,
+        &id_key(DB, "orders"),
+        &names_value_of(DB, "other", "other"),
+    )
+    .unwrap();
+    let held = crate::register::CarryTables::open(&txn).unwrap();
+    let row = crate::register::CarriedRowKind::Names {
+        db: DB.to_string(),
+        logical: "orders".to_string(),
+        physical: "orders".to_string(),
+    };
+    assert!(held.is_news(&row).is_err(), "a row for the id with other names is damage");
+    drop(held);
+    txn.abort().unwrap();
+}
+
+/// The bound a carried row is counted at holds of the real encoding, at the widest index a page can reach. A page of at most
+/// `SNAPSHOT_PAGE_BYTES` of rows that each cost at least their key and the bound cannot hold a million of them, so its array index has at
+/// most 6 digits, which the cost of the page's LAST row measures: the size of a page of a million rows less that of one of 999,999, less
+/// the key.
+#[test]
+fn the_carried_row_overhead_bounds_the_encoding() {
+    const ROWS: usize = 1_000_000;
+    const KEY: usize = 8;
+    const {
+        assert!(
+            crate::SNAPSHOT_PAGE_BYTES / (KEY + crate::snapshot::CARRIED_ROW_FRAME) < ROWS,
+            "premise: a page cannot hold a million rows, so no index has 7 digits"
+        );
+    }
+    let page_of = |rows: Vec<crate::CarriedRow>| crate::SnapshotPage {
+        collections: Vec::new(),
+        documents: Vec::new(),
+        next: None,
+        versions: Default::default(),
+        dropped: None,
+        dropped_collections: Vec::new(),
+        deleted_documents: Vec::new(),
+        dropped_indexes: Vec::new(),
+        tombstone_horizon: None,
+        register: None,
+        carried: rows,
+    };
+    let size = |page: &crate::SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
+    let mut rows: Vec<crate::CarriedRow> = (0..ROWS)
+        .map(|i| crate::CarriedRow {
+            table: crate::CARRY_OPTIONS,
+            key: serde_bytes::ByteBuf::from((i as u64).to_be_bytes().to_vec()),
+            value: serde_bytes::ByteBuf::new(),
+        })
+        .collect();
+    let full = size(&page_of(rows.clone()));
+    rows.pop();
+    let one_less = size(&page_of(rows));
+    let last = full - one_less - KEY;
+    assert!(
+        last <= crate::snapshot::CARRIED_ROW_FRAME,
+        "the last row costs {last} bytes beyond its key and value, at index {}; the bound is {}",
+        ROWS - 1,
+        crate::snapshot::CARRIED_ROW_FRAME
     );
 }

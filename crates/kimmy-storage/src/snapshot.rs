@@ -245,7 +245,19 @@ pub(crate) fn cursor_reserve(key: usize, until: usize) -> usize {
         + CARRY_FIELD_OVERHEAD
 }
 
-/// The `carry` field's name, type byte and framing in a cursor that cuts a document walk, which is always `null`: a bound.
+/// The cursor at the start of the document walk, with no carry left: what the page that ends the carry names for the next page to begin the
+/// documents. The walk resumes strictly after the cursor's key, and no stored key is empty, so the cursor (collection 0, an empty key) reads
+/// as before the first row of the first collection, whether or not a collection of id 0 exists.
+fn doc_start() -> SnapshotCursor {
+    SnapshotCursor {
+        collection: CollectionId(0),
+        after_key: Vec::new(),
+        until_key: None,
+        carry: Carry::Done,
+    }
+}
+
+/// The `carry` field's name, type byte and framing in a cursor that cuts a document walk, which is a bare `"Done"`: a bound.
 const CARRY_FIELD_OVERHEAD: usize = 32;
 
 /// The `until_key` field's name, type byte and framing in a cursor, a bound.
@@ -691,6 +703,12 @@ pub struct RegisterCarry {
 /// What a row of the carry costs on the wire besides its key and value: the array that holds the pair and the two binary headers. A bound,
 /// as [`DOCUMENT_OVERHEAD`] is for a document.
 const CARRY_ROW_FRAME: usize = 32;
+/// What a row of the names and options carry (a [`CarriedRow`]) costs on the wire besides its key and value, a bound the sender counts
+/// its page against. Its own, and not [`CARRY_ROW_FRAME`], which was sized for the register carry's bare pairs: a `CarriedRow` is a
+/// three-field struct in an array, so it also costs its index as text in the array (up to 6 digits in a page of at most 64 MiB), the
+/// document's frame, and the name, type and length of its three fields. Measured against the real encoding at the widest index by
+/// `the_carried_row_overhead_bounds_the_encoding`.
+pub(crate) const CARRIED_ROW_FRAME: usize = 64;
 /// How often the warning that the carry is over half a page may be logged: an hour.
 const REGISTER_CARRY_WARN_EVERY_MS: u64 = 60 * 60 * 1000;
 /// What the carry costs besides its rows: its three lists and the field that holds it.
@@ -1033,7 +1051,220 @@ struct ConvergeTombstones<'a> {
     replaced_at_cut: &'a mut usize,
     at_cut: &'a dyn Fn(Stamp) -> bool,
 }
+/// The prefix of the staging rows of one pull of the carry: the sender, then the pull's scope (a byte, and the collection's id when it is
+/// one collection's), so that a scoped repair run against a peer in the middle of that peer's whole-database pull neither clears nor
+/// merges the staging of the other.
+fn carry_stage_prefix(peer: NodeId, scope: Option<CollectionId>) -> Vec<u8> {
+    let mut prefix = peer.to_bytes().to_vec();
+    match scope {
+        None => prefix.push(0),
+        Some(id) => {
+            prefix.push(1);
+            prefix.extend_from_slice(&id.0.to_be_bytes());
+        }
+    }
+    prefix
+}
+
+/// The key of one staged row: the pull's prefix, the carry's wire tag and the row's key.
+fn carry_stage_key(prefix: &[u8], table: u8, key: &[u8]) -> Vec<u8> {
+    let mut staged = prefix.to_vec();
+    staged.push(table);
+    staged.extend_from_slice(key);
+    staged
+}
+
+/// The range of the keys that begin with `prefix`: a wire tag is 1 or 2, so a key never reaches `prefix` and 0xff.
+fn carry_stage_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    end.push(0xff);
+    end
+}
+
+/// Whether a write transaction holds the table: opening it there would create it, and a table is created by its first row.
+fn holds_table(
+    txn: &redb::WriteTransaction,
+    definition: redb::TableDefinition<'static, &'static [u8], &'static [u8]>,
+) -> Result<bool> {
+    use redb::TableHandle as _;
+    let name = definition.name();
+    Ok(txn.list_tables()?.any(|held| held.name() == name))
+}
+
+/// Judge the rows a page carries, and keep those that would still change the table they are of: a row this member already holds as it
+/// stands (a names row held, an options row that does not rise) is nothing to stage or to merge, so a page this member already holds costs
+/// it no write. A damaged row fails the page, before anything of it is held. Returned as (wire tag, key, value).
+fn carried_news(
+    txn: &redb::WriteTransaction,
+    rows: &[CarriedRow],
+) -> Result<Vec<crate::register::WireRow>> {
+    let mut news = Vec::new();
+    let held = crate::register::CarryTables::open(txn)?;
+    for row in rows {
+        let judged = crate::register::judge_carried_row(row.table, &row.key, &row.value)?;
+        if held.is_news(&judged)? {
+            news.push((row.table, row.key.to_vec(), row.value.to_vec()));
+        }
+    }
+    Ok(news)
+}
+
+/// Add the news among the rows a page carries to the staging of the pull (`tables::SNAPSHOT_CARRY_STAGE`). A row already staged as it
+/// arrives is not written again. Returns whether the staging changed.
+fn stage_carried_rows(
+    txn: &redb::WriteTransaction,
+    peer: NodeId,
+    scope: Option<CollectionId>,
+    rows: &[CarriedRow],
+) -> Result<bool> {
+    let news = carried_news(txn, rows)?;
+    if news.is_empty() {
+        return Ok(false);
+    }
+    let prefix = carry_stage_prefix(peer, scope);
+    let mut table = txn.open_table(tables::SNAPSHOT_CARRY_STAGE)?;
+    let mut wrote = false;
+    for (tag, key, value) in &news {
+        let staged = carry_stage_key(&prefix, *tag, key);
+        let held = table.get(staged.as_slice())?.map(|raw| raw.value().to_vec());
+        if held.as_deref() != Some(value.as_slice()) {
+            table.insert(staged.as_slice(), value.as_slice())?;
+            wrote = true;
+        }
+    }
+    Ok(wrote)
+}
+
+/// The first page of a pull: its staging becomes the news among the rows the page carries, whatever an earlier pull left. Returns whether
+/// the staging changed, so that a page this member already holds, which leaves it as it was, writes nothing.
+fn restage_carry(
+    txn: &redb::WriteTransaction,
+    peer: NodeId,
+    scope: Option<CollectionId>,
+    rows: &[CarriedRow],
+) -> Result<bool> {
+    let news = carried_news(txn, rows)?;
+    let before = take_carry_stage(txn, peer, scope)?;
+    if !news.is_empty() {
+        let prefix = carry_stage_prefix(peer, scope);
+        let mut table = txn.open_table(tables::SNAPSHOT_CARRY_STAGE)?;
+        for (tag, key, value) in &news {
+            table.insert(carry_stage_key(&prefix, *tag, key).as_slice(), value.as_slice())?;
+        }
+    }
+    type Held = std::collections::BTreeMap<(u8, Vec<u8>), Vec<u8>>;
+    let by_key = |rows: &[(u8, Vec<u8>, Vec<u8>)]| -> Held {
+        rows.iter().map(|(tag, key, value)| ((*tag, key.clone()), value.clone())).collect()
+    };
+    Ok(by_key(&before) != by_key(&news))
+}
+
+/// The page that completes the join: merge what the pull staged on its earlier pages (nothing, on a pull of one page, where whatever is
+/// staged is an earlier pull's and is discarded) and the rows this page carries into the names table and the base options, names first
+/// (kept if absent) and then the options (by the rule that orders them), and empty the staging, before the register's events are named
+/// from the names. Returns whether anything changed: the rows this page carries are not staged first, so a page this member already holds
+/// writes nothing.
+fn merge_carry(
+    txn: &redb::WriteTransaction,
+    peer: NodeId,
+    scope: Option<CollectionId>,
+    discard_staged: bool,
+    rows: &[CarriedRow],
+) -> Result<bool> {
+    let previous = take_carry_stage(txn, peer, scope)?;
+    let mut wrote = !previous.is_empty();
+    let mut judged = Vec::new();
+    if !discard_staged {
+        for (tag, key, value) in &previous {
+            judged.push((*tag, crate::register::judge_carried_row(*tag, key, value)?));
+        }
+    }
+    for row in rows {
+        let kind = crate::register::judge_carried_row(row.table, &row.key, &row.value)?;
+        judged.push((row.table, kind));
+    }
+    // the names table first: its tag is the lower
+    judged.sort_by_key(|(tag, _)| *tag);
+    for (_, row) in &judged {
+        wrote |= crate::register::merge_carried_row(txn, row)?;
+    }
+    Ok(wrote)
+}
+
+/// The rows staged for one pull, removed from the staging and returned as (wire tag, key, value), in the order of the carry.
+fn take_carry_stage(
+    txn: &redb::WriteTransaction,
+    peer: NodeId,
+    scope: Option<CollectionId>,
+) -> Result<Vec<crate::register::WireRow>> {
+    use std::ops::Bound;
+    if !holds_table(txn, tables::SNAPSHOT_CARRY_STAGE)? {
+        return Ok(Vec::new());
+    }
+    let prefix = carry_stage_prefix(peer, scope);
+    let end = carry_stage_end(&prefix);
+    let mut table = txn.open_table(tables::SNAPSHOT_CARRY_STAGE)?;
+    let bounds = (Bound::Included(prefix.as_slice()), Bound::Excluded(end.as_slice()));
+    let mut taken = Vec::new();
+    for row in table.range::<&[u8]>(bounds)? {
+        let (key, value) = row?;
+        let key = key.value();
+        let Some(&tag) = key.get(prefix.len()) else {
+            return Err(crate::StorageError::Corrupt("a staged carry row with no table".into()));
+        };
+        taken.push((tag, key[prefix.len() + 1..].to_vec(), value.value().to_vec()));
+    }
+    for (tag, key, _) in &taken {
+        table.remove(carry_stage_key(&prefix, *tag, key).as_slice())?;
+    }
+    Ok(taken)
+}
+
+/// Empty the staging of one pull without merging it. Returns whether there was anything to remove.
+pub(crate) fn clear_carry_stage(
+    txn: &redb::WriteTransaction,
+    peer: NodeId,
+    scope: Option<CollectionId>,
+) -> Result<bool> {
+    Ok(!take_carry_stage(txn, peer, scope)?.is_empty())
+}
+
 impl Engine {
+    /// Whether the staging holds a row of the pull with `peer` of `scope`, read without the writer.
+    fn carry_stage_has_rows(&self, peer: NodeId, scope: Option<CollectionId>) -> Result<bool> {
+        use std::ops::Bound;
+        let txn = self.db().begin_read()?;
+        let table = match txn.open_table(tables::SNAPSHOT_CARRY_STAGE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let prefix = carry_stage_prefix(peer, scope);
+        let end = carry_stage_end(&prefix);
+        let bounds = (Bound::Included(prefix.as_slice()), Bound::Excluded(end.as_slice()));
+        let mut rows = table.range::<&[u8]>(bounds)?;
+        Ok(rows.next().transpose()?.is_some())
+    }
+
+    /// The rows the whole-database pull with `peer` has staged of the carry, as (wire tag, key, value), for a test.
+    #[cfg(test)]
+    pub(crate) fn carry_stage_rows_for_test(&self, peer: NodeId) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+        use std::ops::Bound;
+        let txn = self.db().begin_read().unwrap();
+        let Ok(table) = txn.open_table(tables::SNAPSHOT_CARRY_STAGE) else { return Vec::new() };
+        let prefix = carry_stage_prefix(peer, None);
+        let end = carry_stage_end(&prefix);
+        let bounds = (Bound::Included(prefix.as_slice()), Bound::Excluded(end.as_slice()));
+        let mut staged = Vec::new();
+        for row in table.range::<&[u8]>(bounds).unwrap() {
+            let (key, value) = row.unwrap();
+            let key = key.value();
+            let tag = key[prefix.len()];
+            staged.push((tag, key[prefix.len() + 1..].to_vec(), value.value().to_vec()));
+        }
+        staged
+    }
+
     /// Produce one page of a snapshot of current state: the whole database,
     /// or — for a repair — the one collection `scope` names.
     pub fn snapshot_page(
@@ -1130,8 +1361,65 @@ impl Engine {
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
         let rows_room = self.snapshot_rows_room(fixed);
+        // The carry of a whole-database snapshot (ADR-272, unit N): the rows of the names table and the base options go first, on the first
+        // page after the definitions and on the pages after it, and the documents after them. The first page holds the documents too when
+        // the carry leaves it room, so a small database is still one page; a later page that ends the carry holds nothing else, so that a
+        // document too large for what the carry left is never refused for a room it does not have. The cursor says which walk the next
+        // page resumes: the carry's while rows remain, and the document walk's start after them (collection 0 has no rows, and an empty
+        // key is no key, so the walk reads it as before the first collection).
+        let mut carried: Vec<CarriedRow> = Vec::new();
+        let mut carry_used = 0usize;
+        let in_the_carry = scope.is_none() && after.as_ref().is_none_or(|c| c.carry != Carry::Done);
+        if in_the_carry {
+            // the cursor that cuts the carry names a row's key, which crosses as an array: reserved once, from the longest key
+            let room = rows_room.saturating_sub(cursor_reserve(crate::register::CARRY_KEY_LEN, 0));
+            let resume = match after.as_ref().map(|c| &c.carry) {
+                Some(Carry::At(at)) => Some((at.table, at.after_key.as_slice())),
+                _ => None,
+            };
+            let (rows, used, more) = {
+                let txn = self.db().begin_read()?;
+                crate::register::carry_rows(&txn, resume, room)?
+            };
+            carried = rows
+                .into_iter()
+                .map(|(table, key, value)| CarriedRow {
+                    table,
+                    key: serde_bytes::ByteBuf::from(key),
+                    value: serde_bytes::ByteBuf::from(value),
+                })
+                .collect();
+            carry_used = used;
+            let cursor = match more {
+                Some((table, after_key)) => {
+                    let mut cursor = doc_start();
+                    cursor.carry = Carry::At(CarryCursor { table, after_key });
+                    Some(cursor)
+                }
+                // the carry ends on a page that is not the first: the documents begin on the next
+                None if !first => Some(doc_start()),
+                None => None,
+            };
+            if let Some(next) = cursor {
+                let tombstone_horizon = self.tombstone_horizon()?;
+                return Ok(SnapshotPage {
+                    collections,
+                    documents: Vec::new(),
+                    next: Some(next),
+                    versions,
+                    dropped,
+                    dropped_collections,
+                    deleted_documents: Vec::new(),
+                    dropped_indexes,
+                    tombstone_horizon,
+                    register: None,
+                    carried,
+                });
+            }
+        }
+        let docs_room = rows_room.saturating_sub(carry_used);
         let (documents, deleted_documents, mut next, walk) =
-            self.snapshot_rows(after, scope, rows_room, first)?;
+            self.snapshot_rows(after, scope, docs_room, first)?;
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
@@ -1144,11 +1432,13 @@ impl Engine {
         if scope.is_none() && next.is_none() {
             let carry = self.register_carry()?;
             let bytes = carry.encoded_len();
-            let has_rows = !documents.is_empty() || !deleted_documents.is_empty();
-            if walk.used + bytes <= rows_room {
+            let has_rows =
+                !documents.is_empty() || !deleted_documents.is_empty() || !carried.is_empty();
+            if walk.used + carry_used + bytes <= rows_room {
                 register = Some(carry);
-            } else if bytes <= rows_room && has_rows && walk.end.is_some() {
-                next = walk.end;
+            } else if bytes <= rows_room && has_rows {
+                // after the last row the page sent, or at the start of the document walk when it sent none
+                next = walk.end.or_else(|| Some(doc_start()));
             } else {
                 return Err(crate::StorageError::SnapshotRegisterCarryTooLarge {
                     bytes,
@@ -1167,7 +1457,7 @@ impl Engine {
             dropped_indexes,
             tombstone_horizon,
             register,
-            carried: Vec::new(),
+            carried,
         })
     }
 
@@ -1900,10 +2190,21 @@ impl Engine {
         // advanced. It is one vector, on the last page only.
         let grant = if complete { progress.granted.clone() } else { None };
 
+        // The rows of the carry (ADR-272, unit N), of a whole-database pull: the first page of the pull empties what an earlier pull of this
+        // sender left staged, every page stages the rows it carries, and the page that completes the join merges them, in its transaction
+        // and before the register's events are named from the names. A scoped pull stages nothing.
+        let stale = progress.scope.is_none()
+            && progress.pages == 0
+            && self.carry_stage_has_rows(peer, None)?;
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
-        if !page.documents.is_empty() || !deletes.is_empty() || grant.is_some() {
+        if !page.documents.is_empty()
+            || !deletes.is_empty()
+            || grant.is_some()
+            || !page.carried.is_empty()
+            || stale
+        {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
             // outside the writer, from the state the definitions above left.
@@ -2006,6 +2307,15 @@ impl Engine {
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
             let mut wrote = !pending.is_empty() || recorded > 0 || state_moved > 0;
+            if progress.scope.is_none() {
+                if grant.is_some() {
+                    wrote |= merge_carry(&txn, peer, None, progress.pages == 0, &page.carried)?;
+                } else if progress.pages == 0 {
+                    wrote |= restage_carry(&txn, peer, None, &page.carried)?;
+                } else {
+                    wrote |= stage_carried_rows(&txn, peer, None, &page.carried)?;
+                }
+            }
             // The register the last page carries, put in effect BEFORE the grant is absorbed and settled AFTER it, in this one
             // transaction (ADR-272, decision 4; Q6.6, unit C2b): the grant releases the parked events of this member it covers, and the
             // pass then sees every event of the name. A damaged carry fails the page: nothing is applied and the progress does not move.
