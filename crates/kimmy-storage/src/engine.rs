@@ -340,6 +340,10 @@ pub struct Engine {
     /// from any peer, unlike the halt, whose row is durable.
     pub(crate) epochs_pending: Mutex<std::collections::BTreeMap<NodeId, Epoch>>,
     pub(crate) epochs_pending_flag: std::sync::atomic::AtomicBool,
+    /// This epoch's host has completed a handshake with another node (ADR-274); see
+    /// [`Engine::has_met_a_peer`]. The second flag says the row is written, so it is written once.
+    pub(crate) met_peer: std::sync::atomic::AtomicBool,
+    pub(crate) met_peer_written: std::sync::atomic::AtomicBool,
     /// Set when this host is halted (D13 containment, ADR-274): every write transaction and every
     /// flush is refused, as with `writes_closed`, and read under the writer gate in the same two
     /// places. The halt's row is durable and this is its mirror: **set first, then the gate is
@@ -1912,6 +1916,8 @@ impl Engine {
             newest_epochs: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending_flag: std::sync::atomic::AtomicBool::new(false),
+            met_peer: std::sync::atomic::AtomicBool::new(false),
+            met_peer_written: std::sync::atomic::AtomicBool::new(false),
             halted_flag: std::sync::atomic::AtomicBool::new(false),
             halt_info: Mutex::new(None),
             walks_stopping: std::sync::atomic::AtomicBool::new(false),
@@ -1975,6 +1981,7 @@ impl Engine {
         // closed (ADR-274).
         engine.load_halt_row()?;
         engine.load_newest_epochs()?;
+        engine.load_met_peer()?;
 
         Ok(engine)
     }

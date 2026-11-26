@@ -11,7 +11,7 @@ use kimmy_core::NodeId;
 use kimmy_storage::Engine;
 use tokio::net::TcpListener;
 
-use crate::guard::{GuardConfig, GuardVerdict, run_guard};
+use crate::guard::{GuardConfig, GuardVerdict, a_seed_answers, run_guard};
 use crate::transport::probe_peer;
 
 const SECRET: &str = "a-guard-test-secret";
@@ -212,4 +212,21 @@ async fn a_list_that_does_not_name_the_node_elsewhere_passes_at_once() {
         assert!(started.elapsed() < Duration::from_millis(300), "no probe, no wait");
     }
     old.serving.abort();
+}
+
+// -- a seed that answers (the guard's "a seed answered" fact) -----------------------------------
+
+/// A seed that is up answers a probe; one that is down, or does not resolve, does not.
+#[tokio::test]
+async fn a_seed_that_is_up_answers_and_one_that_is_down_does_not() {
+    let up = live(SECRET).await;
+    let down = a_stopped_hosts_address().await;
+    let guard = config(NodeId::generate(), SECRET);
+    assert!(a_seed_answers(&guard, &[up.addr.to_string()]).await, "a seed that is up");
+    assert!(
+        !a_seed_answers(&guard, &[down.to_string(), "no-such-host.invalid:1".into()]).await,
+        "a seed that is down, and a name that does not resolve"
+    );
+    assert!(!a_seed_answers(&guard, &[]).await, "no seeds");
+    up.serving.abort();
 }

@@ -60,6 +60,14 @@ const MAX_DATAGRAM: usize = 64 * 1024;
 /// suits the deployments this is aimed at, and it is not a limit.
 const CLUSTER_SIZE_HINT: u32 = 16;
 
+/// How long SWIM, as this build configures it, waits between suspecting a member and declaring it
+/// down (foca's `suspect_to_down_after` for the cluster size hint): the guard's window is twice
+/// this (ADR-274).
+pub fn suspect_to_down_after() -> Duration {
+    Config::new_lan(std::num::NonZeroU32::new(CLUSTER_SIZE_HINT).expect("non-zero literal"))
+        .suspect_to_down_after
+}
+
 /// The node id an announce carries before the peer's real one is known.
 ///
 /// Discovery yields an *address*; the identity behind it is whatever answers.

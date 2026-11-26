@@ -2691,6 +2691,108 @@ struct Cluster {
     confirmer: Option<Arc<kimmy_cluster::Confirmer>>,
 }
 
+/// Wait for the guard's verdict: true when this host may serve and dial, false when the guard
+/// halted it.
+async fn cluster_gate_open(gate: &mut tokio::sync::watch::Receiver<Option<bool>>) -> bool {
+    match gate.wait_for(|verdict| verdict.is_some()).await {
+        Ok(verdict) => *verdict == Some(true),
+        Err(_) => false,
+    }
+}
+
+/// The addresses the configured seeds name now, as `ip:port` text for the guard's probe. Each
+/// source is resolved the way the discovery loop resolves it (`dns:`, `dns-srv:`, `k8s:`, a static
+/// list, and the test name server), at once and each bounded: a source that has not answered
+/// within the bound names nothing, which the guard reads as "no seed answered", so the first
+/// member of a cluster whose seeds are not up yet does not wait on a name that cannot resolve.
+async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<String> {
+    const BOUND: Duration = Duration::from_secs(3);
+    let mut resolving = tokio::task::JoinSet::new();
+    for seed in seeds {
+        // The task owns its source: a spawned future cannot borrow the slice.
+        let seed = seed.clone();
+        // UNSUPERVISED: a lookup's panic ends that source only; the join reads it as none.
+        resolving.spawn(async move { tokio::time::timeout(BOUND, seed.resolve()).await });
+    }
+    let mut addresses = Vec::new();
+    while let Some(done) = resolving.join_next().await {
+        if let Ok(Ok(Ok(resolved))) = done {
+            addresses.extend(resolved.iter().map(ToString::to_string));
+        }
+    }
+    addresses
+}
+
+/// Run the mistaken-restore guard for a fresh epoch (ADR-274): ask whether this node id is live at
+/// another address, open the gate if nothing answers (or `--replace` was given for this epoch) and
+/// halt this host if one does, then write the bit that a peer was met once the first handshake has
+/// completed, from here and never from inside a contact.
+fn spawn_guard(
+    engine: Arc<Engine>,
+    live: kimmy_cluster::Members,
+    local: std::net::SocketAddr,
+    config: &Config,
+    secret: String,
+    gate: tokio::sync::watch::Sender<Option<bool>>,
+) {
+    let own_addresses = vec![local, advertised(local)];
+    let data_dir = config.storage.data_dir.clone();
+    let seed_configured =
+        kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind);
+    let seeds = config.cluster.seeds.clone();
+    // UNSUPERVISED: a one-shot that ends with its verdict and then the write of the bit. A panic in
+    // it leaves the gate closed, which a waiting host shows by serving nothing of the cluster.
+    tokio::spawn(async move {
+        let replace =
+            kimmy_cluster::containment::read_marker_file(&data_dir).ok().and_then(|f| f.replace);
+        let mut guard =
+            kimmy_cluster::guard::GuardConfig::new(engine.node_id(), own_addresses, &secret);
+        guard.seed_configured = seed_configured;
+        // A seed that answers a probe is the fact that makes the guard wait for SWIM's first list;
+        // with none answering the host proceeds at once.
+        guard.a_seed_answered = seed_configured
+            && kimmy_cluster::guard::a_seed_answers(&guard, &seed_addresses(&seeds).await).await;
+        guard.suspect_to_down = kimmy_cluster::membership::suspect_to_down_after();
+        guard.replace = kimmy_cluster::containment::replace_honoured(replace, engine.epoch());
+        let verdict = kimmy_cluster::guard::run_guard(&guard, || {
+            let listed = live.entries();
+            (!listed.is_empty()).then_some(listed)
+        })
+        .await;
+        match verdict {
+            kimmy_cluster::guard::GuardVerdict::Pass => {
+                let _ = gate.send(Some(true));
+            }
+            kimmy_cluster::guard::GuardVerdict::LiveHost(address) => {
+                warn!(
+                    %address,
+                    "the mistaken-restore guard found this node live at another address: this host \
+                     halts itself and dials and accepts nothing; restore with `--replace` to take \
+                     the node over"
+                );
+                kimmy_storage::blocking(|| {
+                    kimmy_cluster::containment::halt_by_guard(&engine, address)
+                });
+                let _ = gate.send(Some(false));
+                return;
+            }
+        }
+        loop {
+            if engine.has_met_a_peer() {
+                if let Err(e) = kimmy_storage::blocking(|| engine.persist_met_a_peer()) {
+                    warn!(
+                        error = %e,
+                        "could not record that this epoch has met a peer; the guard runs again at \
+                         the next start"
+                    );
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 async fn spawn_cluster(
     engine: Arc<Engine>,
     state: kimmy_api::SharedState,
@@ -2751,20 +2853,33 @@ async fn spawn_cluster(
             Some(evaluator),
         ));
     }
-    let serving = kimmy_task::supervise(
-        "replication_server",
-        shutdown.clone(),
-        kimmy_cluster::serve_with(
-            Arc::clone(&engine),
-            listener,
-            secret.clone(),
-            Some(on_pushed),
-            Some(on_failed),
-            Some(on_accept_error),
-            cluster_tls,
-            live.clone(),
-        ),
+    // The mistaken-restore guard (ADR-274): a fresh epoch, which has completed no handshake,
+    // neither accepts nor dials until the guard has passed. The listener is bound (a peer that
+    // connects waits, and completes no handshake), the serve and replication tasks wait on this
+    // gate, and SWIM runs meanwhile, which is where the guard reads its list. A host that has met a
+    // peer, or has no membership to ask, passes at once.
+    let guarded = config.cluster.membership && !engine.has_met_a_peer();
+    let (gate_tx, gate_rx) =
+        tokio::sync::watch::channel::<Option<bool>>((!guarded).then_some(true));
+    let serve = kimmy_cluster::serve_with(
+        Arc::clone(&engine),
+        listener,
+        secret.clone(),
+        Some(on_pushed),
+        Some(on_failed),
+        Some(on_accept_error),
+        cluster_tls,
+        live.clone(),
     );
+    let serving = kimmy_task::supervise("replication_server", shutdown.clone(), {
+        let mut gate = gate_rx.clone();
+        async move {
+            if !cluster_gate_open(&mut gate).await {
+                std::future::pending::<()>().await;
+            }
+            serve.await
+        }
+    });
 
     // SWIM shares the port with replication: UDP for probes and membership,
     // TCP for oplog transfer. Bound here for the same reason as the listener —
@@ -2805,6 +2920,9 @@ async fn spawn_cluster(
         ));
         members = Some(live);
         announce = Some(tx);
+        if guarded && let Some(live) = members.clone() {
+            spawn_guard(Arc::clone(&engine), live, local, config, secret.clone(), gate_tx);
+        }
     } else {
         warn!("SWIM membership is disabled; peers come from discovery alone");
     }
@@ -2870,58 +2988,63 @@ async fn spawn_cluster(
             Err(_) => 0,
         })
     });
-    let replicating = kimmy_task::supervise(
-        "replication",
-        shutdown.clone(),
-        kimmy_cluster::replicate(
-            engine,
-            kimmy_cluster::ReplicationConfig {
-                seeds: config.cluster.seeds.clone(),
-                secret,
-                local,
-                catch_up: state.catch_up().cloned(),
-                expected_members: config.cluster.expected_members,
-                self_recheck: kimmy_cluster::SELF_RECHECK,
-                resolver: None,
-                sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
-                discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
-                fanout: config.cluster.fanout,
-                announce,
-                // Cloned: the replication loop and the webhook dispatcher both
-                // read the same live set, and `Members` is a shared handle.
-                members: members.clone(),
-                tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
-                // A stale rejoiner is a fact about a peer's vector, which only the
-                // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
-                on_peer_staleness: Some(std::sync::Arc::new({
-                    let state = state.clone();
-                    move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
-                })),
-                // What the loop saw that lag cannot say: rounds that failed,
-                // peers backed off, schema changes refused. Pushed after every
-                // tick, reached peers or not, because a tick in which every
-                // round failed is the one that leaves the lag gauge at its last
-                // value and the cluster looking healthy (ADR-123). Two of its
-                // fields say whether the divergence check ran at all, so that
-                // gauge's 0 can be told apart from silence (ADR-135).
-                //
-                // Handed over whole rather than unpacked into arguments here:
-                // this closure is the only caller of `record_sync_round` and no
-                // test covers it, so a pair of same-typed positional arguments
-                // transposed on this line would compile, pass every gate, and
-                // report one series under another's name until somebody read a
-                // dashboard closely. There is nothing here to get in the wrong
-                // order (ADR-135).
-                on_round: Some(round_hook(state.clone(), |state| &state.metrics)),
-                // Nothing pushed: the gauge is computed from these when read.
-                on_lag: None,
-                lag_vectors: Some(lag_vectors),
-                divergence_repair: config.cluster.divergence_repair,
-                repair_max_documents: config.cluster.repair_max_documents,
-                repair_max_index_documents: config.cluster.repair_max_index_documents,
-            },
-        ),
+    let replicate = kimmy_cluster::replicate(
+        engine,
+        kimmy_cluster::ReplicationConfig {
+            seeds: config.cluster.seeds.clone(),
+            secret,
+            local,
+            catch_up: state.catch_up().cloned(),
+            expected_members: config.cluster.expected_members,
+            self_recheck: kimmy_cluster::SELF_RECHECK,
+            resolver: None,
+            sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
+            discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
+            fanout: config.cluster.fanout,
+            announce,
+            // Cloned: the replication loop and the webhook dispatcher both
+            // read the same live set, and `Members` is a shared handle.
+            members: members.clone(),
+            tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
+            // A stale rejoiner is a fact about a peer's vector, which only the
+            // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
+            on_peer_staleness: Some(std::sync::Arc::new({
+                let state = state.clone();
+                move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
+            })),
+            // What the loop saw that lag cannot say: rounds that failed,
+            // peers backed off, schema changes refused. Pushed after every
+            // tick, reached peers or not, because a tick in which every
+            // round failed is the one that leaves the lag gauge at its last
+            // value and the cluster looking healthy (ADR-123). Two of its
+            // fields say whether the divergence check ran at all, so that
+            // gauge's 0 can be told apart from silence (ADR-135).
+            //
+            // Handed over whole rather than unpacked into arguments here:
+            // this closure is the only caller of `record_sync_round` and no
+            // test covers it, so a pair of same-typed positional arguments
+            // transposed on this line would compile, pass every gate, and
+            // report one series under another's name until somebody read a
+            // dashboard closely. There is nothing here to get in the wrong
+            // order (ADR-135).
+            on_round: Some(round_hook(state.clone(), |state| &state.metrics)),
+            // Nothing pushed: the gauge is computed from these when read.
+            on_lag: None,
+            lag_vectors: Some(lag_vectors),
+            divergence_repair: config.cluster.divergence_repair,
+            repair_max_documents: config.cluster.repair_max_documents,
+            repair_max_index_documents: config.cluster.repair_max_index_documents,
+        },
     );
+    let replicating = kimmy_task::supervise("replication", shutdown.clone(), {
+        let mut gate = gate_rx;
+        async move {
+            if !cluster_gate_open(&mut gate).await {
+                std::future::pending::<()>().await;
+            }
+            replicate.await
+        }
+    });
     cluster_tasks.push(replicating);
 
     info!(

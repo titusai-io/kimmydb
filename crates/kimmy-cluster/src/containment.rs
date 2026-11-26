@@ -345,3 +345,23 @@ pub fn apply_marker_at_start(
     halted.map_err(std::io::Error::other)?;
     Ok(true)
 }
+
+/// Halt this host because the mistaken-restore guard found its node live at `address` (ADR-274):
+/// the halt has no newer epoch to name, and the containment file records the guard's halt (the
+/// epoch that halted itself and the address that answered), keeping any floor an earlier tell set.
+/// The halt row is the authority; a failure to write the file is logged.
+pub fn halt_by_guard(engine: &kimmy_storage::Engine, address: SocketAddr) {
+    if let Err(e) = engine.halt_by_guard() {
+        tracing::error!(
+            error = %e,
+            "this host could not be halted; it refuses writes if the halt's mirror was set"
+        );
+    }
+    let Some(dir) = engine.path().parent() else { return };
+    let held = read_marker_file(dir).unwrap_or_default();
+    let guard = GuardHalt { epoch: engine.epoch(), address };
+    let marker = marker_guard_halted(held.marker.as_ref(), engine.node_id(), guard);
+    if let Err(e) = write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held }) {
+        tracing::error!(error = %e, "the containment file could not be written beside the store");
+    }
+}

@@ -140,3 +140,30 @@ async fn probe_all(
     };
     tokio::time::timeout(window, waiting).await.ok().flatten()
 }
+
+/// Whether any of `seeds` (`host:port` names, resolved here) answers a probe within a second and a
+/// half: the guard's "a seed answered" fact. With none answering the host proceeds at once, so the
+/// first node of a cluster that is starting, whose seeds are down, does not wait for a member list
+/// that cannot come.
+pub async fn a_seed_answers(config: &GuardConfig, seeds: &[String]) -> bool {
+    const WITHIN: Duration = Duration::from_millis(1_500);
+    let mut probes = tokio::task::JoinSet::new();
+    for seed in seeds {
+        let Ok(resolved) = tokio::net::lookup_host(seed.as_str()).await else { continue };
+        for addr in resolved.filter(|addr| !config.own_addresses.contains(addr)) {
+            let (own, secret) = (config.own_node, config.secret.clone());
+            // UNSUPERVISED: a probe's panic ends that probe only; the join reads it as no answer.
+            probes.spawn(async move {
+                tokio::time::timeout(WITHIN, crate::transport::probe_peer(own, addr, &secret))
+                    .await
+                    .unwrap_or(false)
+            });
+        }
+    }
+    while let Some(done) = probes.join_next().await {
+        if done.unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}

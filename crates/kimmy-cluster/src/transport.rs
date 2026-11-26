@@ -1860,7 +1860,13 @@ fn believe_claim(
     // own address) raises nothing. A first sight of an epoch writes a row, which is a blocking
     // write on a runtime worker.
     kimmy_storage::blocking(|| engine.note_epoch(peer, epoch))
-        .map_err(|e| from_storage(e, ProtocolError::Local))
+        .map_err(|e| from_storage(e, ProtocolError::Local))?;
+    // A verified handshake with another node ends a fresh epoch's guard (ADR-274); a host dialling
+    // its own address does not.
+    if peer != engine.node_id() {
+        engine.note_met_a_peer();
+    }
+    Ok(())
 }
 
 /// The one collection this round wants a peer's document count for, and this

@@ -349,6 +349,12 @@ pub const META_EPOCH: &str = "epoch";
 /// Written in a durable commit under the writer gate.
 pub const META_HALT: &str = "halt";
 
+/// The epoch whose host has completed a handshake with another node (D13 containment, ADR-274): the
+/// 18-byte epoch, in force only when it is the store's own, so a restore, which mints a new epoch,
+/// starts without it. A fresh epoch runs the mistaken-restore guard before it dials or accepts; one
+/// that has met a peer does not. Written once, from outside a contact.
+pub const META_MET_PEER: &str = "met_peer";
+
 /// The newest epoch of each node this member has recorded (D13 containment, ADR-274): the key is
 /// the 16-byte node id and the value the 18-byte epoch, and a row only ever rises. Written from a
 /// verified handshake (a peer's claim, within the clock bound) and from a relayed row, never from a

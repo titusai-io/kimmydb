@@ -7,7 +7,7 @@
 use kimmy_core::{Epoch, NodeId};
 use redb::{ReadableDatabase, ReadableTable};
 
-use crate::{Engine, Result, StorageError, tables};
+use crate::{Engine, Result, StorageError, WriterHolder, tables};
 
 /// What a halted host knows of why: the epoch it halts (its own), and the newer epoch of its node
 /// it was told of. `told` is `None` for a halt by the mistaken-restore guard, which has no newer
@@ -148,18 +148,41 @@ impl Engine {
     /// bit that tells a fresh epoch, which runs the mistaken-restore guard before it dials or
     /// accepts, from one that has already joined. Held in memory and loaded at the end of an open
     /// from a row that names this store's own epoch, so a restore, which mints a new epoch, starts
-    /// without it. **Scaffold: always false.**
+    /// without it.
     pub fn has_met_a_peer(&self) -> bool {
-        false
+        self.met_peer.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Note that this epoch's host completed a handshake with another node. Sets the flag and
-    /// nothing else: a handshake never waits on the writer. **Scaffold: does nothing.**
-    pub fn note_met_a_peer(&self) {}
+    /// nothing else: a handshake never waits on the writer.
+    pub fn note_met_a_peer(&self) {
+        self.met_peer.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
-    /// Write the bit durably, from outside a contact (it takes the writer). **Scaffold: does
-    /// nothing.**
+    /// Write the bit durably, once, from outside a contact (it takes the writer). A bit that was
+    /// never written is lost with the process, and the guard runs again at the next start, which is
+    /// harmless.
     pub fn persist_met_a_peer(&self) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.met_peer.load(SeqCst) || self.met_peer_written.load(SeqCst) {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        txn.open_table(tables::META)?.insert(tables::META_MET_PEER, self.epoch().0.as_slice())?;
+        txn.commit()?;
+        self.met_peer_written.store(true, SeqCst);
+        Ok(())
+    }
+
+    /// Load the bit at the end of an open: in force only when the row names this store's own epoch.
+    pub(crate) fn load_met_peer(&self) -> Result<()> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(tables::META)?;
+        let held = meta.get(tables::META_MET_PEER)?.map(|v| v.value().to_vec());
+        if held.as_deref() == Some(self.epoch().0.as_slice()) {
+            self.met_peer.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.met_peer_written.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 
