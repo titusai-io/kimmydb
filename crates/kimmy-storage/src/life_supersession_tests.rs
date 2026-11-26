@@ -514,18 +514,20 @@ fn an_index_survives_the_burial_and_both_members_agree_on_it() {
     );
 }
 
+/// The burial is its own transaction and the restore follows. What a failure between them leaves is the burial alone: the standing life ended, the
+/// tombstone at the floor, the page's progress not advanced. Modelled by running the burial and stopping, then retrying the whole page. UNIT P (P10b):
+/// a page whose own life stands above its floor no longer buries (it KEEPS, see the twin below), so the burial is reached here by a page whose life is
+/// NOT above the floor, which the state is edited into (an honest page never says so; the burial stays as the fallback for a page that does).
 #[test]
 fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_heal() {
-    // The burial is its own transaction and the restore follows. What a failure between
-    // them leaves is the burial alone: the standing life ended, the tombstone at the
-    // floor, the page's progress not advanced. Modelled by running the burial and
-    // stopping, then retrying the whole page.
     let (a, b, _dirs) = receiver_holds_the_previous_life();
     forget_the_tombstone(&a);
     let page = a.snapshot_page(None, Some(orders_id())).unwrap();
-    let state = &page.collections[0];
+    let mut state = page.collections[0].clone();
     let floor = state.incarnation_floor.expect("premise: the page carries the floor");
-    b.bury_the_life_this_one_followed(state, &page.versions, None).unwrap();
+    // the page's life is not above its floor: the page does not keep the standing life, so the drop buries it
+    state.created = floor;
+    b.bury_the_life_this_one_followed(&state, &page.versions, None).unwrap();
     assert!(b.get_collection("shop", "orders").is_err(), "the burial left a life standing");
     let tombstone = b.collection_dropped_at(orders_id()).unwrap().expect("a tombstone");
     assert_eq!(tombstone.hlc, floor, "the tombstone is at the floor");
@@ -533,6 +535,33 @@ fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_hea
     transfer_under(&b, &a, SnapshotProgress::of_collection(orders_id()));
     assert_holds_the_senders_life(&a, &b, "the retry");
     assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap(), floor);
+}
+
+/// The twin for the KEPT path (unit P, P10b): the page's life stands above the floor, so the standing life is kept, re-dated and swept in place, and
+/// the restore follows. A failure between them leaves the keep alone: the life stands (re-dated, with the floor taken and the document the drop ended
+/// swept), the tombstone at the floor, the progress not advanced. The retry of the whole page heals it: the floor is already taken, so the page asks
+/// nothing of the life again, and what the page brings is applied into it. The model runs the step alone, as the test above does, so the options row
+/// of the page's creation is not yet kept and the life is re-dated rather than the creation's: the end is compared by what the fold compares (the
+/// floor, the documents), not by `created`.
+#[test]
+fn a_failure_between_the_keep_and_the_restore_leaves_nothing_that_does_not_heal() {
+    let (a, b, _dirs) = receiver_holds_the_previous_life();
+    forget_the_tombstone(&a);
+    let page = a.snapshot_page(None, Some(orders_id())).unwrap();
+    let state = &page.collections[0];
+    let floor = state.incarnation_floor.expect("premise: the page carries the floor");
+    assert!(state.created > floor, "premise: the page's life stands above its floor");
+    b.bury_the_life_this_one_followed(state, &page.versions, None).unwrap();
+    let kept = b.get_collection("shop", "orders").expect("the page's life keeps the standing life");
+    assert_eq!(kept.incarnation_floor, Some(floor), "the floor is taken");
+    assert!(!has(&b, 1), "and the document the drop ended is swept");
+    let tombstone = b.collection_dropped_at(orders_id()).unwrap().expect("a tombstone");
+    assert_eq!(tombstone.hlc, floor, "the tombstone is at the floor");
+    // The retry: the whole page again, from the progress that never advanced.
+    transfer_under(&b, &a, SnapshotProgress::of_collection(orders_id()));
+    assert!(has(&b, 2), "the page's document landed");
+    assert!(!has(&b, 1), "and the document the drop ended did not come back");
+    assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor, Some(floor));
 }
 
 /// The burial takes the drop's own stamp from the page's tombstone when the page carries

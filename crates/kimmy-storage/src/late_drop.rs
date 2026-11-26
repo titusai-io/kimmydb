@@ -212,6 +212,19 @@ impl Engine {
         dropped: Stamp,
         stop: StopCheck<'_>,
     ) -> Result<SweepEnd> {
+        self.sweep_until_with(db, name, dropped, stop, false)
+    }
+
+    /// [`Self::sweep_until`] for a life a page keeps (unit P, P10b: `kept_by_the_page`): the sweep's last chunk, which buries a re-dated life it
+    /// leaves empty, does not bury it: the page shows the life stands above the floor, and what it brings is applied into it.
+    fn sweep_until_with(
+        &self,
+        db: &str,
+        name: &str,
+        dropped: Stamp,
+        stop: StopCheck<'_>,
+        kept_by_the_page: bool,
+    ) -> Result<SweepEnd> {
         // A shadow is decided by its parent: the parent is swept first, and
         // buries the shadow with itself if it is left with nothing. Whatever
         // order a start, a replay or a drop's own path reaches them in.
@@ -219,7 +232,7 @@ impl Engine {
             && let Ok(standing) = self.get_collection(db, parent)
             && owes_a_sweep(&standing, dropped.hlc)
         {
-            self.sweep_until(db, parent, dropped, stop)?;
+            self.sweep_until_with(db, parent, dropped, stop, kept_by_the_page)?;
         }
         let mut survived = true;
         let mut removed = 0usize;
@@ -309,6 +322,7 @@ impl Engine {
                     && live == 0
                     && !stamped_after
                     && !configured_parent
+                    && !kept_by_the_page
                     && !holds_a_definition_stamped_after(&standing, dropped.hlc)
                 {
                     survived = false;
@@ -704,6 +718,23 @@ impl Engine {
         stop: StopCheck<'_>,
         notify: crate::database_tombstone::Notify<'_>,
     ) -> Result<Dropped> {
+        self.drop_keeping_later_writes_with(db, name, dropped, stop, notify, false)
+    }
+
+    /// [`Self::drop_keeping_later_writes`] with the decision of a page (unit P, P10b): `kept_by_the_page` says the page that carried the drop's floor
+    /// shows the life stands above it (its own life is dated above the floor), so a standing life the keep test would bury because nothing of
+    /// it is above the drop is KEPT instead: re-dated to the drop's successor with the marker, its rows at or below the floor swept in place. The
+    /// end state is the burial's and the page's restore, but the member is never without the collection and owes no purge. The options row still
+    /// decides first (a creation above the drop is the creation's life), and a stage is always buried.
+    pub(crate) fn drop_keeping_later_writes_with(
+        &self,
+        db: &str,
+        name: &str,
+        dropped: Stamp,
+        stop: StopCheck<'_>,
+        notify: crate::database_tombstone::Notify<'_>,
+        kept_by_the_page: bool,
+    ) -> Result<Dropped> {
         let shadow_name = kimmy_core::vector_meta::shadow_name(name);
         if kimmy_core::vector_meta::is_shadow(name) {
             return Ok(Dropped::Buried(self.drop_collection_inner(db, name, Some(dropped))?));
@@ -739,6 +770,11 @@ impl Engine {
             Kept::Nothing
         } else {
             self.what_is_stamped_after(&txn, &meta, dropped.hlc)?
+        };
+        let kept = if kept_by_the_page && meta.stage.is_none() && kept == Kept::Nothing {
+            Kept::Fact
+        } else {
+            kept
         };
         if meta.stage.is_some() || kept == Kept::Nothing {
             let a_stage = meta.stage.is_some();
@@ -801,9 +837,9 @@ impl Engine {
         #[cfg(test)]
         hooks::took_the_survivors_path();
         notify.buried(self, db, name, &ids);
-        let end = self.sweep_until(db, name, dropped, stop)?;
+        let end = self.sweep_until_with(db, name, dropped, stop, kept_by_the_page)?;
         if end.survived && self.get_collection(db, &shadow_name).is_ok() {
-            self.sweep_until(db, &shadow_name, dropped, stop)?;
+            self.sweep_until_with(db, &shadow_name, dropped, stop, kept_by_the_page)?;
         }
         // Two lines, because the survivors path is taken whenever the collection might
         // hold something stamped after the drop (its digest row is above it, or absent),

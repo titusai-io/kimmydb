@@ -3691,6 +3691,16 @@ impl Engine {
     /// node serves carries on, so a member that took the drop this way and one
     /// that took it as an entry end with the same table.
     fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
+        self.restore_collection_drop_with(id, dropped, false)
+    }
+
+    /// [`Self::restore_collection_drop`] with the page's decision (unit P, P10b): see [`Engine::drop_keeping_later_writes_with`].
+    fn restore_collection_drop_with(
+        &self,
+        id: CollectionId,
+        dropped: Stamp,
+        kept_by_the_page: bool,
+    ) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
             // The burial of a swapped name, or of one of its stages, is the register's to judge (ADR-272, decisions 5 and 6; Q6.4
             // item 1b-2). A bare tombstone cannot say whether the burial of the identity is a drop of the name or the loser of
@@ -3730,12 +3740,13 @@ impl Engine {
             // entry (ADR-231, extended), whether or not the database's own drop
             // covers the life (ADR-236): one rule, judged in the burying
             // transaction.
-            match self.drop_keeping_later_writes(
+            match self.drop_keeping_later_writes_with(
                 &current.db,
                 &current.name,
                 dropped,
                 &|| self.check_walk(crate::WalkScope::Background),
                 crate::database_tombstone::Notify::Each,
+                kept_by_the_page,
             )? {
                 crate::late_drop::Dropped::Kept => {
                     return self.record_collection_drop(id, dropped);
@@ -4062,7 +4073,13 @@ impl Engine {
              that drop would, keeping what was written after it"
         );
         self.witness_hlc(floor);
-        self.restore_collection_drop(CollectionId::derive(&state.db, &state.name), stamp)
+        // The page shows the life stands above the floor (its own life is dated above it): the standing life is kept and swept in place
+        // when the keep test finds nothing of it above the drop, and not buried to wait for the purger (P10b)
+        self.restore_collection_drop_with(
+            CollectionId::derive(&state.db, &state.name),
+            stamp,
+            state.created > floor,
+        )
     }
 
     /// Recreate a collection and its indexes from a snapshot.

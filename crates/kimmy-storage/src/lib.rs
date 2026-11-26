@@ -388,6 +388,8 @@ pub use watch::{
     WatchScope, set_test_serve_walk_budget, set_test_serve_walk_linear,
 };
 #[cfg(test)]
+mod keep_by_page_tests;
+#[cfg(test)]
 mod keep_by_row_tests;
 #[cfg(test)]
 mod loss_apply_tests;
