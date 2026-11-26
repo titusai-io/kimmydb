@@ -100,6 +100,14 @@ impl Engine {
         Ok(())
     }
 
+    /// The rows this member relays to a peer on its vectors (ADR-274): the newest epoch it holds
+    /// for each node, the newest by epoch start first, at most `cap` of them. The second value says
+    /// whether the cap cut any. **Scaffold: no rows.**
+    pub fn newest_epoch_rows(&self, cap: usize) -> (Vec<(NodeId, Epoch)>, bool) {
+        let _ = cap;
+        (Vec::new(), false)
+    }
+
     /// The newest epoch of `node` this member knows: the larger of the recorded row and the node's
     /// own origins in the version vectors, read at each check (finding 7: a peer's entries of an
     /// epoch this member never saw in a handshake still count). `Epoch::ZERO` for a node it has

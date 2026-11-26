@@ -231,6 +231,37 @@ fn no_round_runs_with_a_peer_on_an_epoch_older_than_the_newest_known() {
     assert!(runs_round(Epoch::ZERO, older), "nothing is known of the node");
 }
 
+// -- the relayed rows (test 14; the model row's finding 4)
+// ---------------------------------------------------------------
+
+/// What a relayed row does: a newer epoch of the host's own node, within the bound, halts it; a
+/// newer epoch of another node, within the bound, is recorded; everything else is dropped. The
+/// bound is the claim's, inclusive.
+#[test]
+fn a_relayed_row_halts_records_or_is_dropped() {
+    let own = (node(1), epoch_starting(CLOCK - 5_000));
+    let newer = epoch_starting(CLOCK);
+    assert_eq!(relayed_row(CLOCK, SKEW, own, (node(1), newer)), RelayedRow::Halt);
+    assert_eq!(
+        relayed_row(CLOCK, SKEW, own, (node(1), epoch_starting(CLOCK + SKEW))),
+        RelayedRow::Halt,
+        "exactly at the bound"
+    );
+    assert_eq!(relayed_row(CLOCK, SKEW, own, (node(2), newer)), RelayedRow::Record);
+    for (what, row) in [
+        ("own node, equal", (node(1), own.1)),
+        ("own node, older", (node(1), epoch_starting(CLOCK - 10_000))),
+        ("own node, no epoch", (node(1), Epoch::ZERO)),
+        ("own node, beyond the bound", (node(1), epoch_starting(CLOCK + SKEW + 1))),
+        ("own node, the maximum", (node(1), Epoch::MAX)),
+        ("another node, beyond the bound", (node(2), epoch_starting(CLOCK + SKEW + 1))),
+        ("another node, the maximum", (node(2), Epoch::MAX)),
+        ("another node, no epoch", (node(2), Epoch::ZERO)),
+    ] {
+        assert_eq!(relayed_row(CLOCK, SKEW, own, row), RelayedRow::Drop, "{what}");
+    }
+}
+
 // -- the recovery restore (tests 4 and 17: which case each is)
 // --------------------------------------
 

@@ -2723,6 +2723,7 @@ async fn serve_replay<S>(
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
     asked: kimmy_core::Stamp,
+    _their_epoch: kimmy_core::Epoch,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2985,7 +2986,16 @@ where
         ));
     }
     if let Some(asked) = asked_replay
-        && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
+        && serve_replay(
+            engine,
+            stream,
+            peer,
+            their_node,
+            &theirs,
+            asked,
+            stalls.peer_epochs.get(&their_node).copied().unwrap_or(kimmy_core::Epoch::MAX),
+        )
+        .await?
             == ReplayServed::OutOfStep
     {
         return Ok(SyncOutcome::default());
@@ -3981,6 +3991,10 @@ pub struct PeerStalls {
     /// `BeyondHorizon` and this node takes a whole-database snapshot, and the
     /// owner of the replay of this node's own origin.
     catch_up: Option<Arc<crate::catchup::CatchUp>>,
+    /// The epoch each peer proved at the handshake of the contact that is about to run a round
+    /// (ADR-274), set by the dial that made the contact: a replay serves the peer entries of its
+    /// node up to this epoch and no further. A round that did not handshake (a test's) has none.
+    peer_epochs: HashMap<NodeId, kimmy_core::Epoch>,
     /// Where this node stood behind each peer when its probe count was read,
     /// on the origins it then trailed that peer on (ADR-168) — the mirror of
     /// `by_peer`, so a member that is itself draining a backlog is not read
@@ -4772,6 +4786,12 @@ struct Stall {
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Note the epoch `node` proved at the handshake of the contact the next round runs on.
+    #[allow(dead_code)] // scaffold: the dial paths call it in the code commit
+    pub(crate) fn note_peer_epoch(&mut self, node: NodeId, epoch: kimmy_core::Epoch) {
+        self.peer_epochs.insert(node, epoch);
     }
 
     /// The collections to ask `peer` for the definition detail of, at the next

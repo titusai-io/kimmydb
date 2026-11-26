@@ -129,6 +129,43 @@ pub fn runs_round(known_newest: Epoch, peer_epoch: Epoch) -> bool {
     peer_epoch >= known_newest
 }
 
+/// The most newest-epoch rows a member sends on its vectors, and reads from a peer's: one row per
+/// node id ever seen is carried, the newest by epoch start. A cut loses no halt: a host learns it
+/// is superseded from the peer's own table at the handshake, and a relayed row is the third source.
+pub const MAX_RELAYED_EPOCHS: usize = 1_024;
+
+/// What a member does with one row a verified peer relayed (ADR-274).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayedRow {
+    /// Nothing: out of the bound, the maximum epoch, no epoch, or about this host's own node and
+    /// not newer than its own epoch. Not recorded, not relayed on, not acted on.
+    Drop,
+    /// Record it: a newer epoch of another node, within the bound.
+    Record,
+    /// This host is superseded: the row names a strictly newer epoch of its own node, within the
+    /// bound of its own clock.
+    Halt,
+}
+
+/// Classify one relayed row. `own` is this host's node and epoch. A row is bounded as a claim is,
+/// and one about this host's own node halts it only when strictly newer than its own epoch.
+/// **Scaffold: every row is dropped.**
+pub fn relayed_row(
+    clock_ms: u64,
+    skew_ms: u64,
+    own: (NodeId, Epoch),
+    row: (NodeId, Epoch),
+) -> RelayedRow {
+    let _ = (clock_ms, skew_ms, own, row);
+    RelayedRow::Drop
+}
+
+/// Read the rows a verified peer relayed on its vectors: at most [`MAX_RELAYED_EPOCHS`] of them,
+/// each classified by [`relayed_row`], recorded or acted on. **Scaffold: reads nothing.**
+pub(crate) fn take_relayed(engine: &kimmy_storage::Engine, relayed: &[(NodeId, Epoch)]) {
+    let _ = (engine, relayed);
+}
+
 /// What the recovery restore (delete the store, keep the marker, `kimmyd restore`) comes to: the
 /// recovered host is a third host of the node, so a live newer host halts it through the guard
 /// unless `--replace` was honoured; with it the recovered host proceeds, and the newer host is then

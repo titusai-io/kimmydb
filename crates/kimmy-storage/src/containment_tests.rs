@@ -186,6 +186,34 @@ fn a_backup_carries_the_own_nodes_row_and_no_other() {
     );
 }
 
+/// The rows a member relays on its vectors are the newest by epoch start, at most the cap, and the
+/// cap's cut is reported: a relay of everything it holds would grow with every node id ever seen.
+#[test]
+fn the_rows_a_member_relays_are_the_newest_by_start_and_at_most_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir.path().join("kimmy.redb"));
+    let nodes: Vec<NodeId> = (0..10u8).map(|i| NodeId::from_bytes([0x40 + i; 16])).collect();
+    for (i, node) in nodes.iter().enumerate() {
+        engine.note_epoch(*node, an_epoch_ahead(1_000 + 1_000 * i as u64, i as u8)).unwrap();
+    }
+
+    let (all, cut) = engine.newest_epoch_rows(100);
+    assert!(!cut, "nothing is cut under the cap");
+    assert_eq!(all.len(), 11, "ten rows noted, and this member's own: {all:?}");
+    assert!(all.iter().any(|(node, epoch)| *node == engine.node_id() && *epoch == engine.epoch()));
+    for pair in all.windows(2) {
+        assert!(
+            pair[0].1.start_hlc() >= pair[1].1.start_hlc(),
+            "the newest by start first: {all:?}"
+        );
+    }
+
+    let (few, cut) = engine.newest_epoch_rows(4);
+    assert!(cut, "the cap cut rows, and says so");
+    let held: Vec<NodeId> = few.iter().map(|(node, _)| *node).collect();
+    assert_eq!(held, vec![nodes[9], nodes[8], nodes[7], nodes[6]], "the four newest, in order");
+}
+
 // -- the halt (tests 1, 2, 7; findings 8a, 8c)
 // --------------------------------------------------------------------------
 

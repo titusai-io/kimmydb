@@ -2803,6 +2803,33 @@ fn a_restore_into_a_directory_with_a_marker_mints_above_the_epoch_it_names() {
     );
 }
 
+/// `restore --until` opens the store twice around the rewind, which clears the epoch row, so it
+/// mints two epochs (finding 12): the floor is read before the first open and applied to both, and
+/// the store the restore leaves is above the epoch the marker names. A control: the code reads the
+/// floor once and opens with it each time, and this pins that a rewind does not drop it.
+#[test]
+fn a_restore_until_into_a_directory_with_a_marker_mints_above_the_epoch_it_names() {
+    use kimmy_cluster::containment::{Marker, MarkerFile, write_marker_file};
+    let dir = tempfile::tempdir().unwrap();
+    let (backup, config) = backup_and_config(dir.path());
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let told = an_epoch_ahead(60_000);
+    let marker = Marker { node: source_node(dir.path()), floor: told, guard: None };
+    write_marker_file(&data, &MarkerFile { marker: Some(marker), replace: None }).unwrap();
+    let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
+    let written = source.version_vector().unwrap().get(source.origin()).wall_ms;
+    drop(source);
+
+    restore_with(&config, &backup, &["--until", &(written + 10).to_string()]);
+    let restored = kimmy_storage::Engine::open(&data.join("kimmy.redb")).unwrap();
+    assert!(
+        restored.epoch().start_hlc() > told.start_hlc(),
+        "the epoch of the rewound store starts above the marker's: {:?} vs {told:?}",
+        restored.epoch()
+    );
+}
+
 /// The control: a marker of another node does not constrain the restore of this one.
 #[test]
 fn a_restore_ignores_the_marker_of_another_node() {

@@ -378,7 +378,8 @@ async fn a_round_answered_with_relays(engine: &Engine, relayed: Vec<(NodeId, Epo
                 newest_epochs: relayed,
             };
             let _ = write_frame(&mut stream, &answer).await;
-            while read_frame(&mut stream).await.is_ok() {}
+            // The stream is dropped: the round ends at once, and what it did with the rows is
+            // what the test reads.
         }
     }
     let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
@@ -442,6 +443,81 @@ async fn relayed_rows_of(server: &Engine) -> Vec<(NodeId, Epoch)> {
         Message::Vectors { newest_epochs, .. } => newest_epochs,
         other => panic!("expected the vectors, got {other:?}"),
     }
+}
+
+/// A node id and an epoch for the `i`th of many rows: all within the bound, the later `i` the
+/// later start.
+fn filler_row(i: u32) -> (NodeId, Epoch) {
+    let mut bytes = [0xEE; 16];
+    bytes[..4].copy_from_slice(&i.to_be_bytes());
+    let start = Hlc::new(kimmy_storage::physical_now_ms() + 10_000 + u64::from(i), 0);
+    (NodeId::from_bytes(bytes), Epoch::new(start, [2; 8]))
+}
+
+/// What a member holds it relays: every newest-epoch row on its vectors, its own included, so that
+/// a member that never met a newer host of a node can still be taught of it by a peer that did.
+#[tokio::test]
+async fn a_member_relays_the_newest_epoch_rows_it_holds_on_its_vectors() {
+    let (server, _dir) = engine();
+    let (x, y) = (NodeId::from_bytes([0x51; 16]), NodeId::from_bytes([0x52; 16]));
+    let (ex, ey) = (an_epoch_ahead(20_000), an_epoch_ahead(30_000));
+    server.note_epoch(x, ex).unwrap();
+    server.note_epoch(y, ey).unwrap();
+    let relayed = relayed_rows_of(&server).await;
+    assert!(relayed.contains(&(x, ex)), "{relayed:?}");
+    assert!(relayed.contains(&(y, ey)), "{relayed:?}");
+    assert!(relayed.contains(&(server.node_id(), server.epoch())), "its own row: {relayed:?}");
+}
+
+/// The relay is capped at 1,024 rows and the cap keeps the newest by epoch start (and says so in
+/// the log): a cluster with a node id for every pod it ever ran does not grow every frame.
+#[tokio::test]
+async fn a_relay_is_capped_at_1024_rows_and_keeps_the_newest_by_start() {
+    let (server, _dir) = engine();
+    // Built once: a row's start is read from the clock when it is made, so a second call for the
+    // same index would be another epoch.
+    let rows: Vec<(NodeId, Epoch)> = (0..1_100u32).map(filler_row).collect();
+    for (node, epoch) in &rows {
+        server.note_epoch(*node, *epoch).unwrap();
+    }
+    let relayed = relayed_rows_of(&server).await;
+    assert_eq!(relayed.len(), 1_024, "the cap");
+    assert!(relayed.contains(&rows[1_099]), "the newest by start is kept");
+    assert!(!relayed.iter().any(|(node, _)| *node == rows[0].0), "the oldest is cut");
+}
+
+/// A relayed row about another node, within the bound, is recorded: this member then knows the
+/// epoch, relays it on, and runs no round with an older host of that node.
+#[tokio::test]
+async fn a_relayed_row_about_another_node_within_the_bound_is_recorded() {
+    let (old, _new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let other = NodeId::from_bytes([8; 16]);
+    let theirs = an_epoch_ahead(30_000);
+    a_round_answered_with_relays(&old, vec![(other, theirs)]).await;
+    assert_eq!(old.newest_epoch(other).unwrap(), theirs);
+}
+
+/// A relayed row beyond the bound, or the maximum epoch, is not recorded (nothing is poisoned by a
+/// verified peer's relay), whichever node it is about.
+#[tokio::test]
+async fn a_relayed_row_beyond_the_bound_or_the_maximum_epoch_is_not_recorded() {
+    let (old, _new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let other = NodeId::from_bytes([8; 16]);
+    a_round_answered_with_relays(&old, vec![(other, an_epoch_ahead(10 * 60_000))]).await;
+    assert_eq!(old.newest_epoch(other).unwrap(), Epoch::ZERO, "beyond the bound");
+    a_round_answered_with_relays(&old, vec![(other, Epoch::MAX)]).await;
+    assert_eq!(old.newest_epoch(other).unwrap(), Epoch::ZERO, "the maximum epoch");
+}
+
+/// A frame of more rows than the cap is read to the cap: the receiver bounds what a peer makes it
+/// hold, as the sender bounds what it sends.
+#[tokio::test]
+async fn a_relay_of_more_than_the_cap_is_read_only_to_the_cap() {
+    let (old, _new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let rows: Vec<(NodeId, Epoch)> = (0..1_100u32).map(filler_row).collect();
+    a_round_answered_with_relays(&old, rows.clone()).await;
+    assert_eq!(old.newest_epoch(rows[1_023].0).unwrap(), rows[1_023].1, "the last row read");
+    assert_eq!(old.newest_epoch(rows[1_024].0).unwrap(), Epoch::ZERO, "the first row not read");
 }
 
 /// Row C: the relay is cut by the cap, so only the member's own table can tell. The server knows

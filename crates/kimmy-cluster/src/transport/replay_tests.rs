@@ -685,7 +685,9 @@ async fn an_ack_that_does_not_advance_ends_the_replay_for_the_contact() {
     // The dialer holds the whole tail; the peer (A) is the origin it serves.
     let theirs_vector = kimmy_core::VersionVector::default();
     let served =
-        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs_vector, from).await.unwrap();
+        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs_vector, from, f.a.epoch())
+            .await
+            .unwrap();
     drop(ours);
     assert_eq!(served, ReplayServed::InStep);
     assert_eq!(scripted.await.unwrap(), 1, "one page, then it stopped: it does not trust the ack");
@@ -711,6 +713,7 @@ async fn a_missing_ack_ends_the_contact_without_failing_it() {
         f.a.node_id(),
         &kimmy_core::VersionVector::default(),
         crate::catchup::replay_after(Hlc::new(1, 0), f.a.node_id()),
+        f.a.epoch(),
     )
     .await
     .unwrap();
@@ -755,8 +758,16 @@ fn the_replay_is_served_while_the_holders_writer_is_held() {
                     open_handshake(&f.c, &mut ours, SECRET, BINDING).await.unwrap();
                     let asked = ask_versions(&mut ours).await.expect("the ask");
                     let theirs = kimmy_core::VersionVector::default();
-                    let served =
-                        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs, asked).await;
+                    let served = serve_replay(
+                        &f.c,
+                        &mut ours,
+                        addr(),
+                        f.a.node_id(),
+                        &theirs,
+                        asked,
+                        f.a.epoch(),
+                    )
+                    .await;
                     drop(ours);
                     served
                 };
@@ -1004,6 +1015,7 @@ async fn a_stop_during_the_serve_ends_the_contact_as_a_stop() {
         f.a.node_id(),
         &kimmy_core::VersionVector::new(),
         from,
+        f.a.epoch(),
     )
     .await;
     drop(ours);
@@ -1328,7 +1340,8 @@ async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_ot
 
     let (mut server_end, mut client_end) = tokio::io::duplex(MAX_FRAME);
     let asked = crate::catchup::replay_after(from, f.a.node_id());
-    let serving = serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, asked);
+    let serving =
+        serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, asked, f.a.epoch());
     let asking = async {
         let Message::ReplayEntries { entries, exhausted, horizon, scanned_to, .. } =
             read_frame(&mut client_end).await.unwrap()
@@ -1355,6 +1368,83 @@ async fn the_replay_a_peer_serves_holds_every_epoch_of_the_askers_node_and_no_ot
         entries.iter().all(|e| e.stamp.origin() != new_origin),
         "and they are the old epoch's writes, not the new one's"
     );
+}
+
+/// A replay page carries no entry of an epoch above the asker's (finding 7). A newer host of the
+/// asker's node has written under a newer epoch, and this member holds those entries: they are not
+/// the asker's lost writes, and an older host handed them would hold writes of the host that
+/// superseded it. The asker's epoch is the handshake's, not a table row that may be stale.
+#[tokio::test]
+async fn a_replay_page_carries_no_entry_of_an_epoch_above_the_askers() {
+    let f = fixture(5, 0);
+    let theirs = f.a.version_vector().unwrap();
+    let from = f.a.own_position_at_open();
+    let newer = Epoch::new(Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0), [5; 8]);
+    assert!(newer > f.a.epoch(), "premise: an epoch above the asker's");
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let above = OplogEntry {
+        stamp: Stamp::new(
+            Hlc::new(kimmy_storage::physical_now_ms() + 500, 0),
+            f.a.node_id(),
+            newer,
+        ),
+        kind: OpKind::Insert,
+        collection: orders.id,
+        doc_id: Some(kimmy_core::DocId::String("by-the-newer-host".into())),
+        body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "by-the-newer-host" }).unwrap()),
+        meta: None,
+    };
+    f.c.apply_batch(std::slice::from_ref(&above)).unwrap();
+    assert!(
+        f.c.version_vector()
+            .unwrap()
+            .iter()
+            .any(|(o, _)| o.node == f.a.node_id() && o.epoch == newer),
+        "premise: this member holds an entry of the asker's node at the newer epoch"
+    );
+
+    let (mut server_end, mut client_end) = tokio::io::duplex(MAX_FRAME);
+    let asked = crate::catchup::replay_after(from, f.a.node_id());
+    let serving =
+        serve_replay(&f.c, &mut server_end, addr(), f.a.node_id(), &theirs, asked, f.a.epoch());
+    let asking = async {
+        let Message::ReplayEntries { entries, exhausted, scanned_to, .. } =
+            read_frame(&mut client_end).await.unwrap()
+        else {
+            panic!("a page of the replay")
+        };
+        write_frame(
+            &mut client_end,
+            &Message::ReplayAck { next_from: scanned_to, done: exhausted, stalled: None },
+        )
+        .await
+        .unwrap();
+        entries
+    };
+    let (served, entries) = tokio::join!(serving, asking);
+    served.unwrap();
+    assert_eq!(entries.len(), 5, "the five lost writes, and not the newer host's: {entries:?}");
+    assert!(
+        entries.iter().all(|e| e.stamp.epoch <= f.a.epoch()),
+        "no entry of an epoch above the asker's"
+    );
+}
+
+/// The round hands the replay the epoch the peer proved at the handshake: the dial paths that make
+/// a contact for a round note it on the stalls the round reads (a round with none serves
+/// unfiltered, which only a test's round without a handshake has).
+#[test]
+fn the_dial_paths_hand_the_handshakes_epoch_to_the_round() {
+    let source = include_str!("../transport.rs");
+    for name in ["sync_once_with", "sync_once_dialled_within"] {
+        let start = source.find(&format!("async fn {name}(")).expect("the function");
+        let rest = &source[start..];
+        let body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+        assert!(
+            body.contains("note_peer_epoch("),
+            "`{name}` makes the contact for a round and never notes the peer's epoch"
+        );
+    }
 }
 
 /// Two lost writes of A's node at one HLC under two of its earlier epochs, put on C after `before`
@@ -1621,6 +1711,7 @@ async fn a_replay_position_of_another_member_is_refused() {
         f.a.node_id(),
         &kimmy_core::VersionVector::default(),
         from,
+        f.a.epoch(),
     )
     .await;
     drop(ours);
