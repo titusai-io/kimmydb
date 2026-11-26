@@ -5965,6 +5965,18 @@ impl Engine {
                 }
             }
 
+            // And one whose parent's NAME is swapped here (unit S): the swap discarded the parent's vector configuration, so the shadow has no
+            // parent to serve. Judged under the writer, by the parent's name, with the catalogue already open (a table opened twice in a write
+            // transaction is an error in redb).
+            if !log
+                && origin.is_some()
+                && let Some(base) = kimmy_core::vector_meta::base_name(name)
+                && collections.get((db, base))?.is_none()
+                && crate::register::is_swapped_with(txn, &collections, db, base)?
+            {
+                return Ok(InTxn::History);
+            }
+
             // The derivation is a 64-bit hash, so a collision is possible in
             // principle. Checked rather than trusted, because the failure would
             // be two unrelated collections quietly sharing storage — refusing

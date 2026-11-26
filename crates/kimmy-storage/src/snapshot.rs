@@ -2021,8 +2021,9 @@ impl Engine {
                 Err(e) => return Err(e),
             }
             // A swapped name is not made again beside its buried identity: `restore_collection`'s swapped branch creates no identity, so
-            // it has nothing to wait for (the same predicate as that branch).
-            if self.name_is_swapped(&state.db, &state.name)? {
+            // it has nothing to wait for (the same predicate as that branch). A vector shadow is judged by its PARENT's name: its own is
+            // never swapped (no stage carries its prefix), and a shadow of a swapped name is not made either (unit S).
+            if self.name_or_parent_is_swapped(&state.db, &state.name)? {
                 continue;
             }
             let id = CollectionId::derive(&state.db, &state.name);
@@ -4010,6 +4011,21 @@ impl Engine {
             }
             return self.restore_definitions_of_a_swapped_name(state, versions);
         }
+        // A vector shadow of a swapped name whose identity is gone (unit S): the swap discarded the parent's vector configuration, so the shadow
+        // has no parent to serve, and made here it would stand beside a name whose configuration this very page discards. Before the flip the
+        // identity still stands with its vectors, and its shadow is legitimate. It is not made, and the page
+        // reports it orphaned (`shadows_orphaned`), so that the pull planned for it is cancelled.
+        if let Some(parent) = kimmy_core::vector_meta::base_name(&state.name)
+            && self.get_collection(&state.db, &state.name).is_err()
+            && self.parent_is_swapped_and_absent(&state.db, parent)?
+        {
+            debug!(
+                db = %state.db,
+                collection = %state.name,
+                "ignored a vector shadow of a swapped name"
+            );
+            return Ok(0);
+        }
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -4337,6 +4353,29 @@ impl Engine {
         crate::register::is_swapped(&txn, db, name)
     }
 
+    /// [`Self::name_is_swapped`] for the name that decides it: a vector shadow is judged by its parent's (unit S).
+    fn name_or_parent_is_swapped(&self, db: &str, name: &str) -> Result<bool> {
+        match kimmy_core::vector_meta::base_name(name) {
+            Some(parent) => self.parent_is_swapped_and_absent(db, parent),
+            None => self.name_is_swapped(db, name),
+        }
+    }
+
+    /// Whether `name` is a vector shadow whose parent's name is swapped here and whose parent is not held.
+    fn is_a_shadow_of_a_swapped_name(&self, db: &str, name: &str) -> Result<bool> {
+        match kimmy_core::vector_meta::base_name(name) {
+            Some(parent) => self.parent_is_swapped_and_absent(db, parent),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether a shadow's parent `parent` is swapped here AND its identity is not held. A name is swapped as soon as a stage of it is held or
+    /// an event is parked, before the flip, while the identity still stands with its vectors and its shadow: that shadow is the identity's own
+    /// and legitimate. Only a swapped name whose identity is gone keeps no vector configuration (unit S).
+    fn parent_is_swapped_and_absent(&self, db: &str, parent: &str) -> Result<bool> {
+        Ok(self.get_collection(db, parent).is_err() && self.name_is_swapped(db, parent)?)
+    }
+
     /// What a page offers for a name this member swapped and whose identity is buried: each index is judged by the one rule against the
     /// collection the name answers from and restored through the name's door; a name absent under a drop in effect sends it the way the
     /// arms do (history at or below the drop, otherwise the post-drop row); the validator goes through the same door. A vector
@@ -4648,7 +4687,8 @@ impl Engine {
     fn shadows_orphaned(&self, page: &SnapshotPage) -> Result<Vec<CollectionId>> {
         let mut orphaned = Vec::new();
         for state in &page.collections {
-            if self.parent_buried_since(&state.db, &state.name, state.created)?
+            if (self.parent_buried_since(&state.db, &state.name, state.created)?
+                || self.is_a_shadow_of_a_swapped_name(&state.db, &state.name)?)
                 && self.get_collection(&state.db, &state.name).is_err()
             {
                 orphaned.push(CollectionId::derive(&state.db, &state.name));

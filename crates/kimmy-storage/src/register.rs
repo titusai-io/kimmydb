@@ -2091,13 +2091,24 @@ pub(crate) fn is_swapped(txn: &redb::ReadTransaction, db: &str, logical: &str) -
 
 /// [`is_swapped`] under the writer.
 pub(crate) fn is_swapped_in(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<bool> {
+    is_swapped_with(txn, &txn.open_table(tables::COLLECTIONS)?, db, logical)
+}
+
+/// [`is_swapped_in`] with the collections table the caller already holds open: a table opened twice in one write transaction is an error
+/// in redb, and the creation path holds the catalogue open while it judges a vector shadow by its parent's name (unit S).
+pub(crate) fn is_swapped_with(
+    txn: &redb::WriteTransaction,
+    collections: &impl ReadableTable<(&'static str, &'static str), &'static [u8]>,
+    db: &str,
+    logical: &str,
+) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
     if !rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
         || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty()
     {
         return Ok(true);
     }
-    stage_of_the_name_is_held(&txn.open_table(tables::COLLECTIONS)?, db, logical)
+    stage_of_the_name_is_held(collections, db, logical)
 }
 
 fn stage_of_the_name_is_held(

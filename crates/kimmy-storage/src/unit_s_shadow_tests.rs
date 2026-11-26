@@ -510,3 +510,39 @@ fn s13b_before_the_flip_the_scoped_pull_of_the_shadow_makes_it() {
     );
     assert!(done.shadows_orphaned.is_empty(), "and is not reported orphaned");
 }
+
+// ---- S12: the writer's own judgement ---------------------------------------------------------------------------------------------------------
+
+/// The creation of a shadow whose parent is ABSENT is judged again under the writer by the parent's name (the catalogue is open there, hence
+/// `register::is_swapped_with`): between the restore's own check and the writer, a competitor makes the parent's name swapped (the stage's
+/// creation and its binding arrive in a window), and the shadow must not be made beside it. The page carries the shadow's state alone, so the
+/// parent is absent and unswapped at the restore's check; the race point is the one before the creation.
+#[test]
+fn s12_a_shadow_whose_parent_name_is_swapped_before_the_writer_is_not_made() {
+    let w = world();
+    let (m, _d) = engine();
+    let m = std::sync::Arc::new(m);
+    let (a, _da) = a_sender(&[1], true);
+    let mut page = a.snapshot_page(None, None).expect("the sender's page");
+    page.collections.retain(|state| state.name == shadow_name());
+    page.carried.clear();
+    assert_eq!(page.collections.len(), 1, "premise: the page defines the shadow alone");
+    let (rival, first, bind) = (std::sync::Arc::clone(&m), w.first.clone(), w.bind_first.clone());
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Restore, move || {
+        window(&rival, std::slice::from_ref(&first));
+        window(&rival, std::slice::from_ref(&bind));
+    });
+
+    m.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect("the page applies");
+
+    assert_eq!(
+        m.resolve(DB, "orders").expect("the name resolves").physical,
+        FIRST,
+        "premise: the competitor swapped the name before the writer"
+    );
+    assert!(
+        m.get_collection(DB, &shadow_name()).is_err(),
+        "the shadow is not made beside the swapped name"
+    );
+}
