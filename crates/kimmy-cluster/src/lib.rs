@@ -53,6 +53,9 @@ mod guard_tests;
 #[cfg(test)]
 mod join_retention_tests;
 
+#[cfg(test)]
+mod unknown_fetch_tests;
+
 pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };

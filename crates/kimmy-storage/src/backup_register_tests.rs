@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use bson::doc;
 use kimmy_core::{
-    CollectionBind, CollectionId, DocId, Enforcement, Hlc, IndexCreate, IndexField, MergePolicy,
-    OpKind, OplogEntry, Stamp, VersionVector,
+    CollectionBind, CollectionId, DocId, Enforcement, Hlc, IndexCreate, IndexField, LossLimits,
+    MergePolicy, OpKind, OplogEntry, Stamp, VersionVector,
 };
 use redb::{ReadableDatabase, ReadableTable};
 
-use crate::register::Carried;
+use crate::register::{BaseOptions, Carried};
 use crate::{Engine, PeerWindow, SyncOutcome, WalkScope, physical_now_ms};
 
 const DB: &str = "app";
@@ -1276,6 +1276,56 @@ fn a_base_options_row_whose_key_does_not_derive_from_its_names_refuses_the_resto
     assert!(error.contains("derive another key"), "the refusal names the check: {error}");
 }
 
+/// The backup of a flipped world, with one more options row: the shadow's, as `forged`, under the key its names derive (so the key check passes). No collection of that name
+/// stands in the backup, which is allowed (the identity the flip buried keeps its row with no collection to need it).
+fn refused_with_the_shadows_row(forged: BaseOptions) -> String {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let key = CollectionId::derive(DB, "orders.__vectors").0.to_be_bytes().to_vec();
+    assert!(
+        !records.iter().any(|(tag, k, _)| *tag == T_COLLECTION_BASE_OPTIONS && *k == key),
+        "premise: the backup holds no row for the shadow"
+    );
+    assert_eq!(forged.db, DB, "premise: the row's names derive the key");
+    records.push((T_COLLECTION_BASE_OPTIONS, key, serde_json::to_vec(&forged).unwrap()));
+    refused(&rebuilt(&bytes, &records))
+}
+
+fn named_by_the_new_check(error: &str) {
+    assert!(error.contains("base-options row"), "the refusal is about the row: {error}");
+    assert!(!error.contains("derive another key"), "and is not the key check: {error}");
+    assert!(!error.contains("does not decode"), "and is not the decode check: {error}");
+}
+
+/// (a) The shadow's row says `field`, with an `R` and a `K`. DESIGNED RED today (the restore is accepted, so `refused` fails its `expect_err`). Mutant PF4-M2: the normal-form
+/// check removed at the restore check.
+#[test]
+fn pf4a_designed_red_a_backup_with_a_shadow_row_that_says_field_is_refused() {
+    named_by_the_new_check(&refused_with_the_shadows_row(BaseOptions {
+        db: DB.to_string(),
+        name: "orders.__vectors".to_string(),
+        at: Hlc::ZERO,
+        merge_policy: MergePolicy::Field,
+        join_retention_ms: Some(86_400_000),
+        loss_limits: Some(LossLimits::DEFAULT),
+        stage: None,
+    }));
+}
+
+/// (b) The shadow's row has an `at` above `Hlc::ZERO`. DESIGNED RED today. Mutant PF4-M2.
+#[test]
+fn pf4b_designed_red_a_backup_with_a_shadow_row_with_an_at_above_zero_is_refused() {
+    named_by_the_new_check(&refused_with_the_shadows_row(BaseOptions {
+        db: DB.to_string(),
+        name: "orders.__vectors".to_string(),
+        at: Hlc::new(5, 0),
+        merge_policy: MergePolicy::Document,
+        join_retention_ms: None,
+        loss_limits: None,
+        stage: None,
+    }));
+}
+
 #[test]
 fn a_base_options_row_that_does_not_decode_refuses_the_restore() {
     let (bytes, _w, _m, _d) = a_flipped_backup();
@@ -1328,6 +1378,37 @@ fn a_backup_with_a_collection_that_has_no_options_row_is_refused() {
     assert_eq!(records.len(), before - 1, "premise: the backup carries the stage's options row");
     let error = refused(&rebuilt(&bytes, &records));
     assert!(error.contains("no options row"), "the refusal names the check: {error}");
+}
+
+/// w1g (the 6:12 AM ruling, "an options row with no collection is valid", one-way ON PURPOSE): a backup with a GONE collection (its tombstone, no collection) and NO options row for it is ACCEPTED. `check_restored` clause 2 refuses a STANDING collection with no row
+/// (the test beside it) and says nothing of a gone one: P12's collector may have taken the row of a collection whose tombstones are collected, and the member's own backup must restore. EXPECTED: green at 30f3fc04 (read: clause 2 walks the collections that stand);
+/// it changes at NO P commit and must stay green through P4 (whose normal-form check on the carried and restored ROWS must not add a "row for every tombstone" demand) and P12. Mutant (P4): clause 2 also demands a row for every tombstoned id.
+/// If it is RED at the first run, that is a finding for P (the ruling is not what the code does), not a test bug.
+#[test]
+fn w1g_a_backup_with_a_gone_collection_and_no_options_row_is_accepted() {
+    let (m, _d) = engine();
+    let orders = m.create_collection(DB, "orders").unwrap();
+    m.insert(&orders, bson::doc! { "_id": 1, "v": "old" }).unwrap();
+    assert!(m.drop_collection(DB, "orders").unwrap());
+    let bytes = backup_of(&m);
+    let mut records = records(&bytes);
+    let key = orders_id().0.to_be_bytes().to_vec();
+    let before = records.len();
+    records.retain(|(tag, k, _)| !(*tag == T_COLLECTION_BASE_OPTIONS && *k == key));
+    assert_eq!(
+        records.len(),
+        before - 1,
+        "premise: the backup carried the gone collection's row, and it is taken out"
+    );
+    let (restored_member, _dir) = restored(&rebuilt(&bytes, &records));
+    assert!(
+        restored_member.get_collection(DB, "orders").is_err(),
+        "the collection is gone after the restore"
+    );
+    assert!(
+        restored_member.collection_dropped_at(orders_id()).unwrap().is_some(),
+        "and its tombstone came with the backup"
+    );
 }
 
 /// The names ride the FIRST pages of a join and the register's events the LAST. A name whose first event the sender stores AFTER the names

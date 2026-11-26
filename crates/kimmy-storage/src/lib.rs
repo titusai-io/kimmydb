@@ -305,6 +305,10 @@ mod young_stamp_model_tests;
 #[cfg(test)]
 mod decimal_definition_tests;
 #[cfg(test)]
+mod pending_write_rows_tests;
+#[cfg(test)]
+mod plain_life_tests;
+#[cfg(test)]
 mod size_cap_tests;
 #[cfg(test)]
 mod snapshot_pages_tests;
@@ -394,5 +398,9 @@ mod loss_free_digest_tests;
 mod loss_lifecycle_tests;
 #[cfg(test)]
 mod loss_limits_tests;
+#[cfg(test)]
+mod plain_life_n_rows_tests;
+#[cfg(test)]
+mod shadow_forcing_tests;
 #[cfg(test)]
 mod tombstone_id_tests;
