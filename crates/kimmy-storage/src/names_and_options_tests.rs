@@ -21,6 +21,7 @@ use kimmy_core::{
 use redb::ReadableDatabase;
 
 use crate::register::{BaseOptions, Carried};
+use crate::snapshot::Carry;
 use crate::{Engine, SnapshotProgress, WalkScope, WriterHolder, physical_now_ms};
 
 const DB: &str = "app";
@@ -381,6 +382,9 @@ fn a_page_raises_the_row_with_its_policy_stamp_and_not_created() {
     let created = state.created;
     let lower = Hlc::new(created.wall_ms - 5, 0);
     state.merge_policy_at = Some(lower);
+    // the sender's own row rides the page's carry and would rise over this one (the carry has its own tests below): this test is of the
+    // definition's route alone
+    page.carried.clear();
     let (b, _db) = engine();
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
         .expect("the page applies");
@@ -401,6 +405,8 @@ fn a_page_whose_coverage_does_not_name_the_policy_stamp_raises_no_row() {
         .find(|state| state.name == "orders")
         .expect("premise: the page defines orders");
     state.merge_policy_at = Some(Hlc::new(state.created.wall_ms + 60_000, 0));
+    // the definition's route alone: the sender's own row rides the carry (tested below) and would be held
+    page.carried.clear();
     let (b, _db) = engine();
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
         .expect("the page applies");
@@ -505,4 +511,257 @@ fn every_route_leaves_a_vector_shadows_options_row_byte_identical_after_two_conf
         .expect("the page applies");
     assert!(joined.get_collection(DB, &shadow).is_ok(), "premise: the page made the shadow");
     assert_eq!(options_bytes(&joined, &shadow), Some(owner), "joined by a page");
+}
+
+// -- The carry: the names table and the base options ride the first pages of a whole-database snapshot, before the documents -------------------
+
+/// A sender with `n` collections `c0`.. in the database, and one document in the first of them.
+fn a_sender_with(n: usize) -> (Engine, tempfile::TempDir) {
+    let (a, dir) = engine();
+    for i in 0..n {
+        let meta = a.create_collection(DB, &format!("c{i}")).unwrap();
+        if i == 0 {
+            a.insert(&meta, bson::doc! { "_id": 1, "v": "one" }).unwrap();
+        }
+    }
+    (a, dir)
+}
+
+/// Every page of the pull `progress` is of, from `from` into `to`, the way the transport asks for them: the cursor the progress holds is
+/// the one the next page is asked after.
+fn pulled(to: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> Vec<crate::SnapshotPage> {
+    let mut pages = Vec::new();
+    while !progress.is_complete() {
+        assert!(pages.len() < 100, "the pull does not end");
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        to.apply_snapshot_page(from.node_id(), progress, &page).expect("the page applies");
+        pages.push(page);
+    }
+    pages
+}
+
+/// A page budget that is small against the carry and still holds one document: the larger of three options rows (a row costs its key, its
+/// value and a frame of 32) and the first document with the cursor a page cuts after it. Measured from the sender, so that a change of
+/// the layout or of the format moves the budget with it and not the test.
+fn a_small_room_that_holds_a_document(e: &Engine) -> usize {
+    let row = rows(e, Carried::Options)
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 32)
+        .max()
+        .expect("premise: the sender has an options row");
+    let whole = e.snapshot_page(None, None).unwrap();
+    let document = whole.documents.first().expect("premise: the sender has a document");
+    let document = document.body.as_ref().map_or(0, Vec::len)
+        + crate::snapshot::id_wire_len(&document.id)
+        + crate::snapshot::DOCUMENT_OVERHEAD
+        + crate::snapshot::cursor_reserve(8, 0);
+    (3 * row + 10).max(document + 16)
+}
+
+/// The keys of the rows of one carried table, sorted.
+fn keys(e: &Engine, which: Carried) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = rows(e, which).into_iter().map(|(key, _)| key).collect();
+    keys.sort();
+    keys
+}
+
+/// A whole-database page that holds the whole database carries the options of every collection, and the joiner ends holding them: the
+/// rows as the sender stores them, not rows it made from the definitions.
+#[test]
+fn a_whole_database_page_carries_the_options_of_every_collection() {
+    let (a, _da) = a_sender_with(3);
+    let page = a.snapshot_page(None, None).unwrap();
+    assert!(page.next.is_none(), "premise: the whole database is one page");
+    let carried: Vec<Vec<u8>> = {
+        let mut keys: Vec<Vec<u8>> = page
+            .carried
+            .iter()
+            .filter(|row| row.table == crate::CARRY_OPTIONS)
+            .map(|row| row.key.to_vec())
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(carried, keys(&a, Carried::Options), "every options row of the sender, once");
+    assert_eq!(carried.len(), 3, "premise: three collections, three rows");
+    let (b, _db) = engine();
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+        .expect("the page applies");
+    assert_eq!(rows(&b, Carried::Options), rows(&a, Carried::Options), "the rows as stored");
+}
+
+/// With a room of a few rows, a carry of thirty is several pages before the documents: the first page keeps the definitions, no page
+/// of the carry holds a document, the page that ends the carry names where the documents begin, and the join ends holding every row and
+/// the document, with the progress complete only after the documents.
+#[test]
+fn a_carry_that_does_not_fit_the_first_page_goes_on_pages_before_the_documents() {
+    let (a, _da) = a_sender_with(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let pages = pulled(&b, &a, &mut progress);
+    assert!(pages.len() >= 5, "premise: the carry took several pages and then the documents");
+    let first = &pages[0];
+    assert!(!first.collections.is_empty(), "the first page keeps the definitions");
+    assert!(first.documents.is_empty(), "no document before the carry is done");
+    assert!(
+        first.next.as_ref().is_some_and(|cursor| matches!(cursor.carry, Carry::At(_))),
+        "its cursor says the carry has rows left"
+    );
+    let carry_pages = pages.iter().take_while(|page| !page.carried.is_empty()).count();
+    assert!(carry_pages >= 4, "thirty rows, a few a page: {carry_pages} pages carried rows");
+    for page in &pages[1..carry_pages] {
+        assert!(page.collections.is_empty(), "the definitions are on the first page only");
+        assert!(page.documents.is_empty(), "no document on a page of the carry");
+    }
+    let last_of_the_carry = &pages[carry_pages - 1];
+    assert!(
+        last_of_the_carry.next.as_ref().is_some_and(|cursor| cursor.carry == Carry::Done),
+        "the page that ends the carry is not the last, and its cursor has no carry"
+    );
+    let total: usize = pages.iter().map(|page| page.carried.len()).sum();
+    assert_eq!(total, rows(&a, Carried::Options).len() + rows(&a, Carried::Names).len());
+    assert!(progress.is_complete(), "complete after the documents");
+    assert_eq!(keys(&b, Carried::Options), keys(&a, Carried::Options), "every row arrived");
+    let received = b.get_collection(DB, "c0").unwrap();
+    assert_eq!(b.count(&received, WalkScope::Request).unwrap(), 1, "and the document");
+}
+
+/// A join that stops between two pages of the carry resumes from the progress it stored, which holds the carry's cursor and the rows
+/// the pages before it staged: it ends with every row, and not with the rows of the pages it asked for again only.
+#[test]
+fn a_join_stopped_in_the_carry_resumes_from_its_stored_progress() {
+    let (a, _da) = a_sender_with(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, dir) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    for _ in 0..2 {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(
+        progress.after().is_some_and(|cursor| matches!(cursor.carry, Carry::At(_))),
+        "premise: stopped in the carry"
+    );
+    // a restart: the member opens its store again and takes what it stored
+    drop(b);
+    let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    let mut resumed = b
+        .snapshots_to_resume()
+        .unwrap()
+        .into_iter()
+        .find(|(peer, _)| *peer == a.node_id())
+        .map(|(_, stored)| stored)
+        .expect("the stopped join was stored");
+    assert_eq!(resumed.after(), progress.after(), "the stored cursor is where it stopped");
+    pulled(&b, &a, &mut resumed);
+    assert_eq!(keys(&b, Carried::Options), keys(&a, Carried::Options), "every row, both halves");
+}
+
+/// A pull that starts again at its first page, against another sender, holds nothing the abandoned one staged: a row only the carry brings
+/// (the options of a collection that is gone) is in the table of the one that completed and in no other.
+#[test]
+fn a_new_pull_discards_what_an_abandoned_one_staged() {
+    let (a, _da) = a_sender_with(30);
+    a.create_collection(DB, "ghost").unwrap();
+    a.drop_collection(DB, "ghost").unwrap();
+    assert!(
+        options_of(&a, "ghost").is_some(),
+        "premise: the options of a gone collection are kept"
+    );
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    let mut abandoned = SnapshotProgress::whole_database();
+    for _ in 0..2 {
+        let page = a.snapshot_page(abandoned.after().cloned(), abandoned.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut abandoned, &page).unwrap();
+    }
+    assert!(
+        abandoned.after().is_some_and(|cursor| matches!(cursor.carry, Carry::At(_))),
+        "premise: the pull stopped in the carry"
+    );
+    let (c, _dc) = a_sender_with(2);
+    let mut fresh = SnapshotProgress::whole_database();
+    pulled(&b, &c, &mut fresh);
+    assert!(
+        options_of(&b, "ghost").is_none(),
+        "what the abandoned pull staged is not merged by the one that completed"
+    );
+    let held = keys(&b, Carried::Options);
+    for key in keys(&c, Carried::Options) {
+        assert!(held.contains(&key), "the completed pull's own rows are held");
+    }
+}
+
+/// A carried options row whose key does not derive from the names it holds is a damaged page: it fails, the progress does not move, and
+/// the row is held nowhere.
+#[test]
+fn a_carried_row_whose_key_does_not_derive_from_its_names_refuses_the_page() {
+    let (a, _da) = a_sender_with(1);
+    let mut page = a.snapshot_page(None, None).unwrap();
+    let row = page
+        .carried
+        .iter_mut()
+        .find(|row| row.table == crate::CARRY_OPTIONS)
+        .expect("premise: the page carries an options row");
+    let mut key = row.key.to_vec();
+    key[7] ^= 1;
+    row.key = serde_bytes::ByteBuf::from(key.clone());
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let refused = b.apply_snapshot_page(a.node_id(), &mut progress, &page);
+    assert!(refused.is_err(), "the page is refused: {refused:?}");
+    assert!(!progress.is_complete() && progress.pages() == 0, "the progress did not move");
+    assert!(!keys(&b, Carried::Options).contains(&key), "and the damaged row is held nowhere");
+}
+
+/// A member that met two creations of one name with EQUAL options holds the definition's policy stamp at the first (the second changes no
+/// option), and the options row at the LATER creation's Hlc. A joiner must hold the later one too, and the definition alone cannot tell it:
+/// the carry of the options row does.
+#[test]
+fn a_joiner_from_a_member_that_met_two_creations_of_equal_options_holds_the_later_at() {
+    let base = physical_now_ms();
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    let earlier = creation(&a, base - 3_000);
+    let later = creation(&c, base - 1_000);
+    let (source, _ds) = applied_in_order(&[&earlier, &later]);
+    let state = source.get_collection(DB, "orders").expect("premise: the collection stands");
+    assert_eq!(
+        state.merge_policy_at,
+        Some(Hlc::new(base - 3_000, 0)),
+        "premise: the definition's policy stamp stayed at the first creation"
+    );
+    assert_eq!(
+        options_of(&source, "orders").unwrap().at,
+        Hlc::new(base - 1_000, 0),
+        "premise: the options row rose to the later one"
+    );
+    let (joiner, _dj) = engine();
+    pulled(&joiner, &source, &mut SnapshotProgress::whole_database());
+    assert_eq!(
+        options_of(&joiner, "orders").unwrap().at,
+        Hlc::new(base - 1_000, 0),
+        "the joiner holds the later creation's Hlc, as the source does"
+    );
+}
+
+/// The cursor and the page are required on the wire: one that does not name its carry is malformed, and so is a stored progress written
+/// before the carry existed (an undecodable record reads as none, and the pull starts again from its first page).
+#[test]
+fn a_cursor_that_does_not_name_its_carry_is_malformed() {
+    let cursor = crate::SnapshotCursor {
+        collection: CollectionId(7),
+        after_key: vec![1],
+        until_key: None,
+        carry: Carry::Done,
+    };
+    let mut value = serde_json::to_value(&cursor).unwrap();
+    assert!(value.get("carry").is_some(), "premise: a done carry is written, as \"Done\"");
+    serde_json::from_value::<crate::SnapshotCursor>(value.clone()).expect("the whole cursor reads");
+    value.as_object_mut().unwrap().remove("carry");
+    assert!(
+        serde_json::from_value::<crate::SnapshotCursor>(value).is_err(),
+        "a cursor without the field does not read"
+    );
 }
