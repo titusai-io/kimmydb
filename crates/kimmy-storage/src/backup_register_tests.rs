@@ -1285,3 +1285,161 @@ fn a_base_options_row_that_does_not_decode_refuses_the_restore() {
     let error = refused(&rebuilt(&bytes, &records));
     assert!(error.contains("does not decode"), "the refusal names the check: {error}");
 }
+
+// -- The restore check's two clauses (ADR-272, unit N): every register event id and stage row is NAMED, and every collection has an options row ----
+
+/// An event of a name that no names row holds is a backup that would restore a register nothing can read by name: refused, whole.
+#[test]
+fn a_backup_with_an_event_of_a_name_no_names_row_holds_is_refused() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let orders = CollectionId::derive(DB, "orders").0.to_be_bytes().to_vec();
+    let before = records.len();
+    records.retain(|(tag, key, _)| !(*tag == T_REGISTER_NAMES && *key == orders));
+    assert!(records.len() < before, "premise: the backup carries the identity's names row");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("no names row"), "the refusal names the check: {error}");
+}
+
+/// A stage row whose physical no names row holds is refused the same way.
+#[test]
+fn a_backup_with_a_stage_row_no_names_row_holds_is_refused() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let stage = CollectionId::derive(DB, BOUND).0.to_be_bytes().to_vec();
+    let before = records.len();
+    records.retain(|(tag, key, _)| !(*tag == T_REGISTER_NAMES && *key == stage));
+    assert!(records.len() < before, "premise: the backup carries the stage's names row");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("no names row"), "the refusal names the check: {error}");
+}
+
+/// A collection with no options row: the invariant of every creation path (a creation writes its row, whatever its route). Refused, and the
+/// restore invents no row to satisfy it.
+#[test]
+fn a_backup_with_a_collection_that_has_no_options_row_is_refused() {
+    let (bytes, _w, m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    // the row of a collection that STANDS in the backup (the identity the flip buried keeps its row, with no collection to need it)
+    let standing = m.get_collection(DB, BOUND).expect("premise: the bound stage stands");
+    let key = standing.id.0.to_be_bytes().to_vec();
+    let before = records.len();
+    records.retain(|(tag, k, _)| !(*tag == T_COLLECTION_BASE_OPTIONS && *k == key));
+    assert_eq!(records.len(), before - 1, "premise: the backup carries the stage's options row");
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("no options row"), "the refusal names the check: {error}");
+}
+
+/// The names ride the FIRST pages of a join and the register's events the LAST. A name whose first event the sender stores AFTER the names
+/// walk has passed its key, and before the last page, reaches the joiner without a names row, and with no stage row or collection to name it
+/// by: so the last page carries the names rows of the ids its register unit holds. The joiner holds the row, and a backup of it restores.
+#[test]
+fn a_name_the_sender_stores_after_the_names_walk_is_named_by_the_last_page() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (s, _ds) = engine();
+    for i in 0..12 {
+        s.create_collection(DB, &format!("c{i}")).unwrap();
+    }
+    // a room that splits the carry over several pages and still holds the register's carry
+    s.set_snapshot_room_for_test(Some(1_200));
+    let stored = Arc::new(AtomicBool::new(false));
+    let stamp = Stamp::new(Hlc::new(1_000, 0), s.node_id(), s.epoch());
+    let once = Arc::clone(&stored);
+    s.set_snapshot_reader_hook_for_test(Some(Arc::new(move |e, after| {
+        if after.is_some() && !once.swap(true, Ordering::SeqCst) {
+            let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+            crate::register::put(&txn, DB, "late", stamp, kimmy_core::RegisterEvent::LogicalDrop)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+    })));
+    let (j, _dj) = engine();
+    let mut progress = crate::SnapshotProgress::whole_database();
+    let mut pages = 0;
+    while !progress.is_complete() {
+        assert!(pages < 100, "the pull does not end");
+        let page = s.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        j.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+        pages += 1;
+    }
+    assert!(stored.load(Ordering::SeqCst) && pages >= 3, "premise: stored between pages {pages}");
+    let key = CollectionId::derive(DB, "late").0.to_be_bytes().to_vec();
+    let named = {
+        let txn = j.db().begin_read().unwrap();
+        crate::register::carried_rows(&txn, crate::register::Carried::Names).unwrap()
+    };
+    assert!(named.iter().any(|(k, _)| *k == key), "the joiner holds the name's row");
+    let (_restored, _dr) = restored(&backup_of(&j));
+}
+
+/// The twin of the race above with a recreation's `Create` event: the sender stores a recreation of "late" after the names walk, and `store`
+/// writes TWO names rows for it (the identity's and the recreation's physical's), which the joiner can never get later (a row is written when
+/// an event is newly stored, and the carry stores it). The last page carries both, in the transaction the event is read in.
+#[test]
+fn a_recreation_stored_after_the_names_walk_is_named_by_the_last_page_with_its_physical() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (s, _ds) = engine();
+    for i in 0..12 {
+        s.create_collection(DB, &format!("c{i}")).unwrap();
+    }
+    s.set_snapshot_room_for_test(Some(1_400));
+    let stored = Arc::new(AtomicBool::new(false));
+    let stamp = Stamp::new(Hlc::new(1_000, 0), s.node_id(), s.epoch());
+    let physical = kimmy_core::recreation_name("late", &stamp);
+    let (once, event) = (Arc::clone(&stored), physical.clone());
+    s.set_snapshot_reader_hook_for_test(Some(Arc::new(move |e, after| {
+        if after.is_some() && !once.swap(true, Ordering::SeqCst) {
+            let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+            let create = kimmy_core::RegisterEvent::Create { physical: event.clone() };
+            crate::register::put(&txn, DB, "late", stamp, create).unwrap();
+            txn.commit().unwrap();
+        }
+    })));
+    let (j, _dj) = engine();
+    let mut progress = crate::SnapshotProgress::whole_database();
+    let mut pages = 0;
+    while !progress.is_complete() {
+        assert!(pages < 100, "the pull does not end");
+        let page = s.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        j.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+        pages += 1;
+    }
+    assert!(stored.load(Ordering::SeqCst) && pages >= 3, "premise: stored between pages {pages}");
+    let named = {
+        let txn = j.db().begin_read().unwrap();
+        crate::register::carried_rows(&txn, Carried::Names).unwrap()
+    };
+    let held = |name: &str| {
+        let key = CollectionId::derive(DB, name).0.to_be_bytes().to_vec();
+        named.iter().any(|(k, _)| *k == key)
+    };
+    assert!(held("late"), "the joiner holds the identity's names row");
+    assert!(held(&physical), "and the recreation's physical's");
+}
+
+/// The gauge of the register's carry (`kimmy_snapshot_register_carry_bytes`) and the warning at half the cap measure what the unit carries:
+/// the register AND the names rows of its events' ids that ride the same page.
+#[test]
+fn the_register_carry_gauge_counts_the_names_that_ride_with_it() {
+    let (_bytes, _w, m, _d) = a_flipped_backup();
+    let page = m.snapshot_page(None, None).unwrap();
+    let register = page.register.as_ref().expect("premise: the one page carries the register");
+    let ids: Vec<Vec<u8>> = register.events.iter().map(|(key, _)| key[..8].to_vec()).collect();
+    assert!(!ids.is_empty(), "premise: the register holds events");
+    let names: usize = {
+        let txn = m.db().begin_read().unwrap();
+        let held = crate::register::carried_rows(&txn, Carried::Names).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        held.iter()
+            .filter(|(key, _)| ids.contains(key) && seen.insert(key.clone()))
+            .map(|(key, value)| key.len() + value.len() + crate::snapshot::CARRIED_ROW_FRAME)
+            .sum()
+    };
+    assert!(names > 0, "premise: the events' names are held");
+    assert!(
+        m.snapshot_register_carry_bytes() as usize >= register.encoded_len() + names,
+        "the gauge reads {} for a register of {} and names of {names}",
+        m.snapshot_register_carry_bytes(),
+        register.encoded_len()
+    );
+}
