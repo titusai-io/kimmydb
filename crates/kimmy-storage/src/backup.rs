@@ -771,6 +771,11 @@ mod tests {
         ("OPLOG_COLLECTED", "derived by the first open"),
         ("OPLOG_HELD", "re-derived by `restore` from the backup's vector (ADR-244)"),
         (
+            "EPOCH_NEWEST",
+            "learned from verified handshakes, never carried (D13, finding 9): another cluster's \
+             newest epochs must not enter one that shares node ids",
+        ),
+        (
             "LOSS_PENDING",
             "node-local and short-lived: the loss entries a backup carries park again at open",
         ),

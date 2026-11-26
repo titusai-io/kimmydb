@@ -112,8 +112,30 @@ fn the_newest_epoch_of_a_node_is_recorded_and_only_ever_rises() {
             newer,
             "an older epoch never lowers a row (grow-only)"
         );
+        // A belief opens no transaction: the row is written by the next commit of any holder.
+        engine.create_collection("shop", "orders").unwrap();
     }
-    assert_eq!(open(&path).newest_epoch(other).unwrap(), newer, "the row is durable");
+    assert_eq!(
+        open(&path).newest_epoch(other).unwrap(),
+        newer,
+        "the row is durable once a write has carried it"
+    );
+}
+
+/// What the design accepts (the model row, with a crash): a member that restarts before its next
+/// write forgets an epoch it had only heard in a handshake, and relearns it at its next contact.
+#[test]
+fn a_row_no_write_has_carried_is_forgotten_by_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let other = NodeId::from_bytes([7; 16]);
+    let newer = an_epoch_ahead(2_000, 1);
+    {
+        let engine = open(&path);
+        engine.note_epoch(other, newer).unwrap();
+        assert_eq!(engine.newest_epoch(other).unwrap(), newer, "premise: held in memory");
+    }
+    assert_eq!(open(&path).newest_epoch(other).unwrap(), Epoch::ZERO);
 }
 
 /// The newest epoch of a node is also what the node's origins in the version vectors say, read at

@@ -68,6 +68,18 @@ pub fn release_fault(theirs: Option<u32>) -> String {
     )
 }
 
+/// What a member says to a peer whose `Hello` or `Welcome` names this protocol and carries no epoch
+/// (and is not a probe): a build from before the epoch was added to the handshake (D13 containment,
+/// ADR-274), which cannot be contained.
+pub fn pre_containment_fault() -> String {
+    format!(
+        "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}) and needs the peer's epoch in \
+         the handshake; the peer speaks protocol {PROTOCOL} from before containment; every member \
+         must run one release",
+        kimmy_core::build::PROTOCOL_4_RELEASE
+    )
+}
+
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 // A snapshot page's counted bytes leave a frame 1 MiB for what is not counted
@@ -699,6 +711,10 @@ pub enum ProtocolError {
     /// says nothing about the cluster.
     #[error("the peer is this node itself")]
     SelfContact,
+    /// The peer was the mistaken-restore guard's probe (D13 containment, ADR-274): it was answered
+    /// with a `Welcome` and nothing follows it. Not a failure of anyone.
+    #[error("the peer was a probe")]
+    Probed,
     /// The peer's handshake named a cluster protocol other than this build's
     /// (or none). The text names both; it is also what the refuser sent the
     /// peer as a [`Message::Fault`].

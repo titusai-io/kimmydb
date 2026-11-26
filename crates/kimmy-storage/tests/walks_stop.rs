@@ -434,6 +434,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "watch::Engine::read_arrival_from",
         "at most `limit` entries; test support, which no stream reads through",
     ),
+    (
+        "containment::Engine::load_newest_epochs",
+        "the newest epochs: one row per node id this member has verified in a handshake, read once, in the read transaction at the end of an open, before the member serves (ADR-274)",
+    ),
 ];
 
 /// The API guard's walks that are writes: bounded by `close_writes`, which

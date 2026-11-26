@@ -341,6 +341,17 @@ pub const META_NODE_ID: &str = "node_id";
 /// finds no row, never from a value read from the store.
 pub const META_EPOCH: &str = "epoch";
 
+/// The newest epoch of each node this member has recorded (D13 containment, ADR-274): the key is
+/// the 16-byte node id and the value the 18-byte epoch, and a row only ever rises. Written from a
+/// verified handshake (a peer's claim, within the clock bound) and from a relayed row, never from a
+/// stamp. The newest epoch of a node is the larger of this row and the node's own origins in the
+/// version vectors, read at each check. **Not carried by a backup**: a backup that carried the
+/// table would take another cluster's newest epochs into one that shares node ids (finding 9).
+/// **Created by the first row written to it, never at an open**: a store that has not met another
+/// epoch has the file layout it had before the table existed (hand-cut fixtures depend on it), and
+/// this member's own epoch is held in memory from its epoch row, never written here.
+pub const EPOCH_NEWEST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("epoch_newest");
+
 /// Set, in the transaction that parks the loss records of the oplog, once `LOSS_PENDING` has been built from it
 /// (`loss_pending.rs`). A restore **skips** it (the table is not carried, so a carried marker would lie), so a
 /// restored store has none and its first open builds the table again; a new store builds an empty one.

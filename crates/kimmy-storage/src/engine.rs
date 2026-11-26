@@ -330,6 +330,16 @@ pub struct Engine {
     /// its shutdown: every write transaction, first or later, is refused.
     /// See [`Engine::close_writes`].
     writes_closed: std::sync::atomic::AtomicBool,
+    /// The newest epoch of each node this member has recorded (ADR-274), in memory: a handshake
+    /// updates it and reads it without the writer, and the table [`tables::EPOCH_NEWEST`] is its
+    /// durable copy, loaded at the end of an open.
+    pub(crate) newest_epochs: Mutex<std::collections::BTreeMap<NodeId, Epoch>>,
+    /// Rows raised and not yet written: written by the next write transaction this member commits
+    /// (any holder), or at once by the best-effort write that raised them when the writer is free.
+    /// A crash loses them, and a handshake relearns them: the table is a grow-only fact relearned
+    /// from any peer, unlike the halt, whose row is durable.
+    pub(crate) epochs_pending: Mutex<std::collections::BTreeMap<NodeId, Epoch>>,
+    pub(crate) epochs_pending_flag: std::sync::atomic::AtomicBool,
     /// Set at the node's stop signal, for reads that walk: see
     /// [`Engine::stop_walks`].
     walks_stopping: std::sync::atomic::AtomicBool,
@@ -1141,6 +1151,7 @@ impl WriteTxn<'_> {
         // inside it (ADR-174's addendum). Before the inner commit, so this is
         // the same commit as the records that moved them and a failure here
         // fails the write rather than leaving a landed batch miscounted.
+        crate::containment::flush_pending_epochs(self.engine, &txn)?;
         crate::live_count::flush(&txn, &self.live_counts.lock())?;
         self.counted_at = Some(std::time::Instant::now());
         #[cfg(test)]
@@ -1882,6 +1893,9 @@ impl Engine {
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             stopping: std::sync::atomic::AtomicBool::new(false),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
+            newest_epochs: Mutex::new(std::collections::BTreeMap::new()),
+            epochs_pending: Mutex::new(std::collections::BTreeMap::new()),
+            epochs_pending_flag: std::sync::atomic::AtomicBool::new(false),
             walks_stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
@@ -1937,6 +1951,8 @@ impl Engine {
         if Self::decide_violations_ready(engine.db())? {
             engine.violations.set_ready();
         }
+
+        engine.load_newest_epochs()?;
 
         Ok(engine)
     }
@@ -4648,7 +4664,7 @@ impl Engine {
 
     /// The wall component of the last time the clock handed out or witnessed: how far this member's logical clock has
     /// gone ([`Engine::clock_lead_ms`]).
-    pub(crate) fn logical_clock_wall_ms(&self) -> u64 {
+    pub fn logical_clock_wall_ms(&self) -> u64 {
         self.clock.lock().last().wall_ms
     }
 

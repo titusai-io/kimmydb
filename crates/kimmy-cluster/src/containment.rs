@@ -1,10 +1,11 @@
 //! D13 containment (ADR-274), the cluster half: when a peer's claim of an epoch is believed and
 //! bounded, when a halt marker applies to a store, and what the mistaken-restore guard waits for.
 //!
-//! **This file is the scaffold of the tests commit and nothing else**: each function compiles and
-//! does nothing, so that every test in `containment_tests.rs` is red on its designed assertion and
-//! none on a missing symbol. The code commits replace each body, and none of these stubs survives
-//! to the last commit (a source scan asserts it).
+//! The pure decisions are real. **The containment file's functions (`write_marker_file`,
+//! `read_marker_file`, `clear_marker_file`, `restore_floor`) are still the scaffold of the tests
+//! commits**: they compile and do nothing, so that the tests of the file are red on their designed
+//! assertions. A later code commit replaces them, and none survives to the last commit (a source
+//! scan asserts it).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -20,15 +21,15 @@ pub const SEED_TIMEOUT: Duration = Duration::from_secs(15);
 /// The clock a claimed epoch's start is held against: `max(the physical clock, the HLC's last wall
 /// time)`, or a member whose wall clock is behind its own logical clock refuses every legitimate
 /// new epoch (gap 4).
-pub fn bound_clock_ms(physical_ms: u64, _hlc_last_wall_ms: u64) -> u64 {
-    physical_ms
+pub fn bound_clock_ms(physical_ms: u64, hlc_last_wall_ms: u64) -> u64 {
+    physical_ms.max(hlc_last_wall_ms)
 }
 
 /// Whether a claimed epoch is within the bound at `clock_ms`: its start's wall time is at most
 /// `clock_ms + skew_ms`, inclusive. `Epoch::MAX`, whose start bytes are `0xFF`, is beyond any
 /// bound.
-pub fn claim_within_bound(_clock_ms: u64, _skew_ms: u64, _epoch: &Epoch) -> bool {
-    true
+pub fn claim_within_bound(clock_ms: u64, skew_ms: u64, epoch: &Epoch) -> bool {
+    *epoch != Epoch::MAX && epoch.start_hlc().wall_ms <= clock_ms.saturating_add(skew_ms)
 }
 
 /// What the guard does next.
@@ -48,7 +49,7 @@ pub enum GuardStep {
 /// answer a probe (a stopped host stays listed longer than that, and is not what the window
 /// measures).
 pub fn guard_window(suspect_to_down: Duration) -> Duration {
-    suspect_to_down
+    suspect_to_down * 2
 }
 
 /// The guard's three cases (and the fourth, nobody reachable). `seed_configured`: the seeds name
@@ -56,13 +57,21 @@ pub fn guard_window(suspect_to_down: Duration) -> Duration {
 /// member list has arrived. `listed_elsewhere`: that list has this node id at an address other than
 /// this member's own.
 pub fn guard_step(
-    _seed_configured: bool,
-    _a_seed_answered: bool,
-    _member_list_seen: bool,
-    _listed_elsewhere: bool,
-    _suspect_to_down: Duration,
+    seed_configured: bool,
+    a_seed_answered: bool,
+    member_list_seen: bool,
+    listed_elsewhere: bool,
+    suspect_to_down: Duration,
 ) -> GuardStep {
-    GuardStep::Pass
+    if !seed_configured || !a_seed_answered {
+        GuardStep::Pass
+    } else if !member_list_seen {
+        GuardStep::AwaitMemberList(SEED_TIMEOUT)
+    } else if listed_elsewhere {
+        GuardStep::Probe(guard_window(suspect_to_down))
+    } else {
+        GuardStep::Pass
+    }
 }
 
 /// Why the mistaken-restore guard halted a fresh host: the epoch that halted itself, and the
@@ -86,35 +95,42 @@ pub struct Marker {
 
 /// Whether `marker` halts the store of `node` on `store_epoch`: a store below the floor is halted,
 /// a store on the guard's epoch is halted, and another node's marker is ignored.
-pub fn marker_halts(_marker: &Marker, _node: NodeId, _store_epoch: Epoch) -> bool {
-    false
+pub fn marker_halts(marker: &Marker, node: NodeId, store_epoch: Epoch) -> bool {
+    marker.node == node
+        && (store_epoch < marker.floor || marker.guard.is_some_and(|g| g.epoch == store_epoch))
 }
 
 /// The marker after a host of `node` was told of the newer epoch `told`: the floor is the larger of
 /// what it was and `told`, and a guard halt already recorded is kept.
-pub fn marker_told(_previous: Option<&Marker>, node: NodeId, _told: Epoch) -> Marker {
-    Marker { node, floor: Epoch::ZERO, guard: None }
+pub fn marker_told(previous: Option<&Marker>, node: NodeId, told: Epoch) -> Marker {
+    let previous = previous.filter(|p| p.node == node);
+    Marker {
+        node,
+        floor: previous.map_or(told, |p| p.floor.max(told)),
+        guard: previous.and_then(|p| p.guard),
+    }
 }
 
 /// The marker after the guard halted a host of `node`: the guard's halt is recorded and the floor
 /// an earlier tell set is kept (row 4c: a recovery that finds the newer host up is halted by the
 /// guard and must still mint above the floor).
-pub fn marker_guard_halted(_previous: Option<&Marker>, node: NodeId, guard: GuardHalt) -> Marker {
-    Marker { node, floor: Epoch::ZERO, guard: Some(guard) }
+pub fn marker_guard_halted(previous: Option<&Marker>, node: NodeId, guard: GuardHalt) -> Marker {
+    let previous = previous.filter(|p| p.node == node);
+    Marker { node, floor: previous.map_or(Epoch::ZERO, |p| p.floor), guard: Some(guard) }
 }
 
 /// Whether a told epoch is acted on by the told host (the model row's finding 3): it must be
 /// strictly newer than the host's own epoch and within the bound of the host's own clock, as a
 /// relayed row is. A tell beyond the bound is not acted on.
-pub fn tell_acted_on(_clock_ms: u64, _skew_ms: u64, _own: Epoch, _told: Epoch) -> bool {
-    true
+pub fn tell_acted_on(clock_ms: u64, skew_ms: u64, own: Epoch, told: Epoch) -> bool {
+    told > own && claim_within_bound(clock_ms, skew_ms, &told)
 }
 
 /// Whether a member runs a round with a peer: not when it knows the peer's epoch of its node is
 /// older than the newest it has recorded, whether or not the tell was acted on (the model row's
 /// finding 3, `round-with-superseded`).
-pub fn runs_round(_known_newest: Epoch, _peer_epoch: Epoch) -> bool {
-    true
+pub fn runs_round(known_newest: Epoch, peer_epoch: Epoch) -> bool {
+    peer_epoch >= known_newest
 }
 
 /// What the recovery restore (delete the store, keep the marker, `kimmyd restore`) comes to: the
@@ -127,15 +143,18 @@ pub struct Recovery {
     pub newer_host_halts: bool,
 }
 
-pub fn recovery_outcome(_newer_host_up: bool, _replace_honoured: bool) -> Recovery {
-    Recovery { recovered_host_halts: false, newer_host_halts: false }
+pub fn recovery_outcome(newer_host_up: bool, replace_honoured: bool) -> Recovery {
+    Recovery {
+        recovered_host_halts: newer_host_up && !replace_honoured,
+        newer_host_halts: newer_host_up && replace_honoured,
+    }
 }
 
 /// The `--replace` flag of a restore: it names the epoch the restore minted, and is honoured only
 /// for a store on that epoch (a marker left in a directory must not authorize the next restore into
 /// it).
-pub fn replace_honoured(_flag: Option<Epoch>, _store_epoch: Epoch) -> bool {
-    false
+pub fn replace_honoured(flag: Option<Epoch>, store_epoch: Epoch) -> bool {
+    flag == Some(store_epoch)
 }
 
 /// The containment file's name, in the data directory. It holds the halt marker and the `--replace`

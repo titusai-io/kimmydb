@@ -719,6 +719,8 @@ impl ServeFailure {
             // This node dialled itself; the dialler ends it, and it is not a
             // failure of a peer.
             ProtocolError::SelfContact => None,
+            // A probe was answered, and ends there.
+            ProtocolError::Probed => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
             ProtocolError::Fault(_) => Some(Self::Fault),
             ProtocolError::Release(_) => Some(Self::Release),
@@ -1731,7 +1733,8 @@ pub(crate) async fn accept_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Message::Hello { node, nonce: their_nonce, protocol, .. } = read_frame(stream).await?
+    let Message::Hello { node, nonce: their_nonce, protocol, epoch: claimed, probe } =
+        read_frame(stream).await?
     else {
         return Err(ProtocolError::Malformed("expected Hello".into()));
     };
@@ -1741,6 +1744,19 @@ where
         let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
         return Err(ProtocolError::Release(reason));
     }
+    // The mistaken-restore guard's probe (ADR-274): answered with a Welcome, which proves this
+    // member holds the secret and says its epoch, and nothing follows. It records nothing and acts
+    // on nothing. Without the mark an epoch-less Hello is a build from before containment, and is
+    // refused by name.
+    let claimed = match (probe, claimed) {
+        (true, _) => None,
+        (false, Some(epoch)) => Some(epoch),
+        (false, None) => {
+            let reason = crate::protocol::pre_containment_fault();
+            let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
+            return Err(ProtocolError::Release(reason));
+        }
+    };
 
     // Answer their challenge and issue ours in the same frame.
     let ours = nonce(engine.node_id());
@@ -1751,11 +1767,13 @@ where
             nonce: ours.clone(),
             proof: prove(secret, &their_nonce, binding),
             protocol: Some(crate::protocol::PROTOCOL),
-            // Scaffold: the epoch rides here once the code commits build it (ADR-274).
-            epoch: None,
+            epoch: Some(engine.epoch()),
         },
     )
     .await?;
+    if probe {
+        return Err(ProtocolError::Probed);
+    }
 
     // A peer that reads our proof and hangs up is a peer whose secret does
     // not match: that is what `open_handshake` does on a proof it cannot
@@ -1773,7 +1791,48 @@ where
         let _ = write_frame(stream, &Message::Fault("authentication failed".into())).await;
         return Err(ProtocolError::Unauthenticated);
     }
+    // The proof has verified: only now is the peer's claim of its epoch believed (ADR-274). It is
+    // bounded by this member's clock, recorded, and the contact ends if it is beyond the bound.
+    if let Some(epoch) = claimed {
+        believe_claim(engine, node, epoch)?;
+    }
     Ok(node)
+}
+
+/// Believe a verified peer's claim of its epoch: within this member's clock bound, record it;
+/// beyond it, or the maximum epoch, record nothing and end the contact with a line that names the
+/// peer, the epoch's start and the bound (a member with a skewed clock would otherwise be
+/// unreachable with no reason). Called after the peer's proof has verified, from both ends of the
+/// handshake: push, replay and exchange all pass through `dial` and `accept_handshake`.
+fn believe_claim(
+    engine: &Engine,
+    peer: kimmy_core::NodeId,
+    epoch: kimmy_core::Epoch,
+) -> Result<(), ProtocolError> {
+    let clock = crate::containment::bound_clock_ms(
+        kimmy_storage::physical_now_ms(),
+        engine.logical_clock_wall_ms(),
+    );
+    let skew = engine.clock_bound().skew_ms;
+    if !crate::containment::claim_within_bound(clock, skew, &epoch) {
+        let start = epoch.start_hlc();
+        warn!(
+            ?peer,
+            epoch_start = %start,
+            bound_ms = clock.saturating_add(skew),
+            "refused a verified peer's epoch: it starts beyond this member's clock bound \
+             (storage.max_clock_skew_secs), so nothing was recorded and the contact ends; a member \
+             whose clock is ahead cannot be reached until it is due"
+        );
+        return Err(ProtocolError::Release(format!(
+            "the epoch the peer claims starts at {start}, beyond this member's clock bound of \
+             {} ms",
+            clock.saturating_add(skew)
+        )));
+    }
+    // A first sight of an epoch writes a row, which is a blocking write on a runtime worker.
+    kimmy_storage::blocking(|| engine.note_epoch(peer, epoch))
+        .map_err(|e| from_storage(e, ProtocolError::Local))
 }
 
 /// The one collection this round wants a peer's document count for, and this
@@ -6686,22 +6745,27 @@ where
             node: engine.node_id(),
             nonce: ours.clone(),
             protocol: Some(crate::protocol::PROTOCOL),
-            // Scaffold: the epoch rides here once the code commits build it (ADR-274).
-            epoch: None,
+            epoch: Some(engine.epoch()),
             probe: false,
         },
     )
     .await?;
 
-    let (their_node, their_nonce, proof) = match read_frame(stream).await? {
-        Message::Welcome { node, nonce, proof, protocol, .. } => {
+    let (their_node, their_nonce, proof, their_epoch) = match read_frame(stream).await? {
+        Message::Welcome { node, nonce, proof, protocol, epoch } => {
             if protocol != Some(crate::protocol::PROTOCOL) {
                 let reason = crate::protocol::release_fault(protocol);
                 warn!(peer = ?node, "refusing a peer: {reason}");
                 let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
                 return Err(ProtocolError::Release(reason));
             }
-            (node, nonce, proof)
+            let Some(epoch) = epoch else {
+                let reason = crate::protocol::pre_containment_fault();
+                warn!(peer = ?node, "refusing a peer: {reason}");
+                let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
+                return Err(ProtocolError::Release(reason));
+            };
+            (node, nonce, proof, epoch)
         }
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
@@ -6715,6 +6779,9 @@ where
     if !proof_is_valid(secret, &ours, binding, &proof) {
         return Err(ProtocolError::Unauthenticated);
     }
+    // The responder's proof has verified: its claim of its epoch is believed now, bounded
+    // (ADR-274).
+    believe_claim(engine, their_node, their_epoch)?;
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
     Ok(their_node)
@@ -11244,7 +11311,7 @@ mod tests {
                     node: peer.node_id(),
                     nonce: nonce(peer.node_id()),
                     protocol: Some(crate::protocol::PROTOCOL),
-                    epoch: None,
+                    epoch: Some(peer.epoch()),
                     probe: false,
                 },
             )
