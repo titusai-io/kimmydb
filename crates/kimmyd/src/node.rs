@@ -2961,6 +2961,7 @@ async fn spawn_cluster(
                 Arc::clone(&built),
                 live.clone(),
                 Duration::from_secs(secs),
+                gate_rx.clone(),
             ));
             confirmer = Some(built);
         }
@@ -3158,6 +3159,11 @@ fn classify(
     }
 }
 
+/// Why a schema change's confirmation names every member pending while the guard has not passed.
+#[allow(dead_code)] // the scaffold's confirmer ignores the gate; the code commit that follows uses it
+const GUARD_NOT_PASSED: &str =
+    "this member's mistaken-restore guard has not passed, so nothing is sent to peers yet";
+
 /// How this node confirms a schema change on its live members (ADR-140).
 ///
 /// Asks the node's [`kimmy_cluster::Confirmer`] for every member at once, and
@@ -3175,6 +3181,7 @@ fn ddl_confirmer(
     confirmer: Arc<kimmy_cluster::Confirmer>,
     members: kimmy_cluster::Members,
     deadline: Duration,
+    _gate: tokio::sync::watch::Receiver<Option<bool>>,
 ) -> kimmy_api::DdlConfirmer {
     Arc::new(move |entry: kimmy_core::OplogEntry, cap: Option<Duration>| {
         let confirmer = Arc::clone(&confirmer);
@@ -3931,7 +3938,87 @@ mod tests {
             members.clone(),
             kimmy_cluster::ConfirmConfig::new(Duration::from_secs(30)),
         );
-        (ddl_confirmer(confirmer, members, Duration::from_secs(10)), entry, silent, dir)
+        let (_, open) = tokio::sync::watch::channel(Some(true));
+        (ddl_confirmer(confirmer, members, Duration::from_secs(10), open), entry, silent, dir)
+    }
+
+    /// A member that counts the connections made to it, and a confirmer whose gate (the
+    /// mistaken-restore guard's) says `verdict`: `None` while the guard waits, `Some(false)` once
+    /// it halted the host, `Some(true)` once it passed.
+    async fn counted_member(
+        verdict: Option<bool>,
+    ) -> (
+        kimmy_api::DdlConfirmer,
+        kimmy_core::OplogEntry,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![kimmy_storage::IndexField::ascending("email")],
+                false,
+                Some("by_email".into()),
+            )
+            .unwrap();
+        let entry = engine
+            .entries_for_peer(kimmy_core::Hlc::ZERO, 1_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap();
+        let members = kimmy_cluster::Members::default();
+        members.insert_for_test(addr, kimmy_core::NodeId::generate());
+        let confirmer = kimmy_cluster::Confirmer::new(
+            engine,
+            "a-secret-long-enough-for-the-node-tests".into(),
+            members.clone(),
+            kimmy_cluster::ConfirmConfig::new(Duration::from_secs(30)),
+        );
+        let (_, gate) = tokio::sync::watch::channel(verdict);
+        let confirm = ddl_confirmer(confirmer, members, Duration::from_secs(10), gate);
+        (confirm, entry, connections, silent, dir)
+    }
+
+    /// The guard exists to stop a fresh epoch from reaching peers before it passes, and the
+    /// schema-change confirmation reaches peers: while the guard waits, or after it halted the
+    /// host, a confirmation answers at once with every member pending, naming why, and makes no
+    /// connection. Once the guard passed it dials as it always did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_confirmer_reaches_no_peer_until_the_guard_has_passed() {
+        use futures::FutureExt;
+        for verdict in [None, Some(false)] {
+            let (confirm, entry, connections, silent, _dir) = counted_member(verdict).await;
+            let found = confirm(entry, None)
+                .now_or_never()
+                .unwrap_or_else(|| panic!("{verdict:?}: answered at once, awaiting nothing"));
+            assert_eq!(found.pending.len(), 1, "{verdict:?}: {found:?}");
+            assert_eq!(found.pending[0].1, super::GUARD_NOT_PASSED, "{verdict:?}");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let dialled = connections.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(dialled, 0, "{verdict:?}: no dial");
+            silent.abort();
+        }
+        let (confirm, entry, connections, silent, _dir) = counted_member(Some(true)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), confirm(entry, None)).await;
+        assert!(connections.load(std::sync::atomic::Ordering::SeqCst) >= 1, "a passed guard dials");
+        silent.abort();
     }
 
     /// The request's time left caps the confirmer's own deadline: a member

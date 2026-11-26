@@ -5918,3 +5918,146 @@ async fn a_decimal128_id_and_bound_are_created_anywhere_and_applied_everywhere()
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// The mistaken-restore guard, and what a halt leaves running (D13 containment, ADR-274, unit 14a)
+// ---------------------------------------------------------------------------
+
+/// A running node A, and a second node B that is a restore of A's backup (so it carries A's node id
+/// under a new epoch), started while A runs. `replace` gives the restore `--replace`. B starts with
+/// its first run's data directory wiped.
+async fn a_restore_of_a_live_node(client: &reqwest::Client, replace: bool) -> (Node, Node) {
+    let (pa, pb) = (ports::choose(), ports::choose());
+    let a = Node::spawn_with("node-a", pa, &[pb], "");
+    let mut b = Node::spawn_with("node-b", pb, &[pa], "");
+    a.wait_ready(client).await;
+    b.wait_ready(client).await;
+    eventually("gossip to form", || all_report(client, vec![&a, &b], 1)).await;
+    let token = a.login(client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    // Work for the background tasks of the host that will be halted: a TTL collection holding a
+    // document that falls due every second for the next minute and a half. Expiry, which runs every
+    // second in this harness, writes only when something is due, so a host that is halted partway
+    // through still has documents it cannot expire, and a task that is not stopped says so on
+    // every tick.
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+    let created = client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ttl_seen",
+            "fields": [{ "path": "seen" }],
+            "expireAfterSeconds": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200, "creating the TTL index");
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
+    for id in 0..90i64 {
+        let seen = now_ms + id * 1_000;
+        let stored = client
+            .post(a.url("/v1/db/shop/coll/sessions/docs"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "_id": id, "seen": { "$date": seen } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), 200, "storing a document that falls due later");
+    }
+    let backup = client.get(a.url("/v1/admin/backup")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(backup.status(), 200);
+    let backup_path = a.dir.path().join("backup.bin");
+    std::fs::write(&backup_path, backup.bytes().await.unwrap()).unwrap();
+
+    // B is stopped, its data replaced by a restore of A's backup, and started again while A runs.
+    b.signal("TERM");
+    b.wait_exit(Duration::from_secs(60));
+    std::fs::remove_dir_all(b.dir.path().join("data")).unwrap();
+    let mut restore = Command::new(env!("CARGO_BIN_EXE_kimmyd"));
+    restore
+        .arg("--config")
+        .arg(b.dir.path().join("kimmy.toml"))
+        .arg("restore")
+        .arg("--from")
+        .arg(&backup_path)
+        .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD);
+    if replace {
+        restore.arg("--replace");
+    }
+    let restored = restore.output().expect("running kimmyd restore");
+    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+    b.restart_with(&[]);
+    (a, b)
+}
+
+/// What `/readyz` answers: its status and its `error` code, if any.
+async fn readyz_answer(client: &reqwest::Client, node: &Node) -> Option<(u16, String)> {
+    let res = client.get(node.url("/readyz")).send().await.ok()?;
+    let status = res.status().as_u16();
+    let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+    Some((status, body["error"].as_str().unwrap_or("").to_string()))
+}
+
+async fn is_halted(client: &reqwest::Client, node: &Node) -> bool {
+    readyz_answer(client, node).await == Some((503, "halted".to_string()))
+}
+
+/// 9a: a restore of a live node's backup, started while the node runs, finds its own node id live
+/// at another address and halts itself, without `--replace`. The live node is untouched. This is a
+/// test of the guard (the daemon's, since 6c); the quiet halt of 6d does not change its outcome.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_of_a_live_node_halts_itself_by_the_guard() {
+    let client = reqwest::Client::new();
+    let (a, b) = a_restore_of_a_live_node(&client, false).await;
+    eventually("the restored node to halt itself", || is_halted(&client, &b)).await;
+    assert!(b.log().contains("mistaken-restore guard"), "it says why: {}", b.log());
+    assert!(!is_halted(&client, &a).await, "the live node is not halted");
+    a.wait_ready(&client).await;
+}
+
+/// 9e, and the rest of a halt: with `--replace` the restored node proceeds and the old host, told
+/// by the ordinary containment, halts. A halted host's background work stops, so it does not try
+/// a write on every tick and log its refusal: the expiry task, which has documents falling due that
+/// it cannot expire, logs `expiry pass failed for this index` on every tick of a host that goes on
+/// running it. The halt itself is logged once.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_with_replace_takes_the_node_over_and_the_old_host_halts_quietly() {
+    let client = reqwest::Client::new();
+    let (a, b) = a_restore_of_a_live_node(&client, true).await;
+    eventually("the old host to be told and halt", || is_halted(&client, &a)).await;
+    assert!(!is_halted(&client, &b).await, "the restored node proceeded: {}", b.log());
+
+    // The halted host's log is read after the halt has settled and again some ticks later (expiry
+    // runs every second here, and a document falls due every second): it has not grown with
+    // refusals.
+    let noise = |node: &Node| node.log().matches("expiry pass failed for this index").count();
+    let halts = |node: &Node| node.log().matches("this host is halted").count();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (first, first_halts) = (noise(&a), halts(&a));
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(noise(&a), first, "no refusal is logged per tick:\n{}", a.log());
+    assert!(first <= 2, "at most a tick that raced the halt: {first}\n{}", a.log());
+    assert_eq!(halts(&a), first_halts, "the halt is not logged again:\n{}", a.log());
+    assert!(
+        first_halts <= 3,
+        "the halt is logged once, not repeatedly: {first_halts}\n{}",
+        a.log()
+    );
+}
