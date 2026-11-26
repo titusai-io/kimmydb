@@ -2036,6 +2036,13 @@ pub(crate) async fn dial(
     Ok((stream, their_node))
 }
 
+/// The mistaken-restore guard's probe (ADR-274): dial `peer`, say a `Hello` that is a probe and
+/// carries no epoch, and report whether a `Welcome` came back whose proof verifies. Records nothing
+/// and sends nothing else. **Scaffold: never answered.**
+pub(crate) async fn probe_peer(_own: NodeId, _peer: SocketAddr, _secret: &str) -> bool {
+    false
+}
+
 /// A connection [`dial`] opened for a round that has not started: dialled with the
 /// tick's other peers at once, and used when its peer's turn comes.
 pub(crate) struct Dialled {
