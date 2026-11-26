@@ -25,14 +25,14 @@ fn the_helper_creates_document_and_the_explicit_form_the_policy_asked() {
 }
 
 #[test]
-fn system_and_shadow_collections_are_document_whatever_is_asked() {
+fn a_system_collection_and_a_shadow_made_by_the_system_path_are_document() {
     let (e, _d) = open();
     e.create_collection_with_policy("app", "orders", MergePolicy::Field, None).unwrap();
     let sys = e.create_system_collection("app", "__jobs").unwrap();
     assert_eq!(sys.merge_policy, MergePolicy::Document);
-    let shadow = e
-        .create_collection_with_policy("app", "orders.__vectors", MergePolicy::Field, None)
-        .unwrap();
+    // A test makes a shadow by the system path (the product makes it in `configure_vectors_inner`; a client's creation of the name is refused: unit S,
+    // S11), which asks for `document` itself: the forcing of a `field` request is pinned on the replicated route, in names_and_options_tests.rs.
+    let shadow = e.create_system_collection("app", "orders.__vectors").unwrap();
     assert_eq!(shadow.merge_policy, MergePolicy::Document);
     assert_eq!(e.get_collection("app", "orders").unwrap().merge_policy, MergePolicy::Field);
 }

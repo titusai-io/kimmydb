@@ -445,14 +445,34 @@ mod tests {
 
     #[test]
     fn valid_names_are_accepted() {
-        for name in ["orders", "user_events", "a", "col-1", "Ünïcödé"] {
+        for name in [
+            "orders",
+            "user_events",
+            "a",
+            "col-1",
+            "Ünïcödé",
+            "orders.vectors",
+            "orders__vectors",
+            "orders.__vectorsx",
+        ] {
             assert!(Error::validate_name(name).is_ok(), "{name} should be valid");
         }
     }
 
     #[test]
     fn invalid_names_are_rejected() {
-        for name in ["", "__vectors", "a/b", "a$b", "with space", ".", "..", "a\0b"] {
+        for name in [
+            "",
+            "__vectors",
+            "a/b",
+            "a$b",
+            "with space",
+            ".",
+            "..",
+            "a\0b",
+            "orders.__vectors",
+            ".__vectors",
+        ] {
             assert!(Error::validate_name(name).is_err(), "{name:?} should be rejected");
         }
         assert!(Error::validate_name(&"x".repeat(121)).is_err());

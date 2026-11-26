@@ -4,7 +4,8 @@
 //! - S2: after the purge, a page makes no shadow beside the swapped name and reports it orphaned;
 //! - S3 (a guard): a page of documents of the swapped identity is superseded and leaves the held rows untouched;
 //! - S6-S8: an entry that changes the schema of a stage (an index dropped, a vector configuration, a validator) is refused, by the member that holds the stage and by the one that does not (S5, the index creation, lands with Q6.7 unit 1: below);
-//! - S9, S10: a page whose state is a stage does not configure vectors on it (S9) and still builds its index (S10, a guard).
+//! - S9, S10: a page whose state is a stage does not configure vectors on it (S9) and still builds its index (S10, a guard);
+//! - S11: a client cannot create a database or a collection whose name ends with the shadow suffix, by any creation door (a guard beside them: a name that only resembles the suffix stays valid).
 
 use std::time::Duration;
 
@@ -848,4 +849,81 @@ fn s10_a_page_whose_state_is_a_stage_still_builds_its_index_on_the_stage() {
     assert_eq!(done.ddl_refused, 0, "the index is not refused ({done:?})");
     let stage = m.get_collection(DB, FIRST).expect("the stage is held");
     assert!(stage.index("by_t").is_some(), "the page's index is built on the stage");
+}
+
+// ---- S11: a client cannot create a collection named like a shadow ---------------------------------------------------------------------------
+
+/// RULED INTO S (the manager, build-order addendum "`is_shadow` and the look-alike name"): the shadow suffix `.__vectors` (`vector_meta::VECTOR_SUFFIX`) is refused by `validate_name`, where the recreation mark is refused. The product already treats such a name as a
+/// shadow (its policy is forced, it is hidden, skipped and swept as chunks), and vector_meta.rs says the segment is reserved, so a collection a client made under such a name never worked as an ordinary one: refusing it loses no working behaviour.
+/// RED TODAY: `validate_name` refuses only a leading `__`, so each creation door below SUCCEEDS on "a.b.__vectors". WANTED: `Error::InvalidName` from each door. A mid-name suffix ("orders.__vectors.x") is NOT pinned either way: it is unruled.
+/// The entries and page routes validate no names (the manager's ruling): honest peers create only through validated paths, and S's arm refusals cover the hidden physicals, so no row here for them; the product makes the shadow in `configure_vectors_inner` through `create_collection_in_txn`, which
+/// validates no name and stays as it is (a test makes one by `create_system_collection`; names_and_options_tests.rs pins the replicated route). The pure rows of `validate_name` are kimmy-core's own (error.rs).
+const LOOKS_LIKE_A_SHADOW: &str = "a.b.__vectors";
+
+#[test]
+fn s11_create_collection_refuses_a_name_that_ends_with_the_shadow_suffix() {
+    let (m, _d) = engine();
+    let Err(err) = m.create_collection(DB, LOOKS_LIKE_A_SHADOW) else {
+        panic!("create_collection accepted {LOOKS_LIKE_A_SHADOW:?}");
+    };
+    assert!(
+        matches!(err, crate::StorageError::Core(kimmy_core::Error::InvalidName { .. })),
+        "{err:?}"
+    );
+    assert!(m.get_collection(DB, LOOKS_LIKE_A_SHADOW).is_err(), "and nothing was created");
+}
+
+#[test]
+fn s11_create_collection_with_policy_refuses_a_name_that_ends_with_the_shadow_suffix() {
+    let (m, _d) = engine();
+    let Err(err) =
+        m.create_collection_with_policy(DB, LOOKS_LIKE_A_SHADOW, MergePolicy::Document, None)
+    else {
+        panic!("create_collection_with_policy accepted {LOOKS_LIKE_A_SHADOW:?}");
+    };
+    assert!(
+        matches!(err, crate::StorageError::Core(kimmy_core::Error::InvalidName { .. })),
+        "{err:?}"
+    );
+    assert!(m.get_collection(DB, LOOKS_LIKE_A_SHADOW).is_err(), "and nothing was created");
+}
+
+#[test]
+fn s11_create_collection_with_validator_refuses_a_name_that_ends_with_the_shadow_suffix() {
+    let (m, _d) = engine();
+    let validator = ValidatorSpec {
+        schema: doc! { "bsonType": "object" },
+        action: Default::default(),
+        level: Default::default(),
+    };
+    let Err(err) = m.create_collection_with_validator(DB, LOOKS_LIKE_A_SHADOW, validator) else {
+        panic!("create_collection_with_validator accepted {LOOKS_LIKE_A_SHADOW:?}");
+    };
+    assert!(
+        matches!(err, crate::StorageError::Core(kimmy_core::Error::InvalidName { .. })),
+        "{err:?}"
+    );
+    assert!(m.get_collection(DB, LOOKS_LIKE_A_SHADOW).is_err(), "and nothing was created");
+}
+
+#[test]
+fn s11_create_database_refuses_a_name_that_ends_with_the_shadow_suffix() {
+    let (m, _d) = engine();
+    let Err(err) = m.create_database(LOOKS_LIKE_A_SHADOW) else {
+        panic!("create_database accepted {LOOKS_LIKE_A_SHADOW:?}");
+    };
+    assert!(
+        matches!(err, crate::StorageError::Core(kimmy_core::Error::InvalidName { .. })),
+        "{err:?}"
+    );
+}
+
+/// GUARDS, apart from the refusals so that none sits behind a red assert: GREEN TODAY and after the fix. Only the exact suffix is reserved: names that merely resemble it stay valid, and a collection is created under each.
+#[test]
+fn s11_names_that_only_resemble_the_shadow_suffix_stay_valid_and_create() {
+    let (m, _d) = engine();
+    for name in ["orders.vectors", "orders__vectors", "orders.__vectorsx"] {
+        assert!(kimmy_core::Error::validate_name(name).is_ok(), "{name:?} stays a valid name");
+        assert!(m.create_collection(DB, name).is_ok(), "create_collection succeeds on {name:?}");
+    }
 }

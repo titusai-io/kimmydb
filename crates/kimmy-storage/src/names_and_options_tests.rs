@@ -1543,3 +1543,94 @@ fn a_stop_after_the_creation_commits_leaves_the_collection_its_options_row() {
         "the collection the page made has its options row after the restart"
     );
 }
+
+// -- a shadow's name that asks for `field` (unit S, S11): the forcing on the replicated route -----------------------------------------------
+
+/// A `CreateCollection` entry for `name` that asks for `field` with the given `R` and `K`, made BY HAND: a replicated creation passes no door that validates a name (swap.rs), so this is the one live route on which a shadow's
+/// name can still arrive asking for a policy other than `document`, and two members that disagreed about it would diverge.
+fn field_creation(
+    by: &Engine,
+    name: &str,
+    r: Option<u64>,
+    k: Option<kimmy_core::LossLimits>,
+) -> OplogEntry {
+    crate::engine::ddl_entry(
+        Stamp::new(Hlc::new(physical_now_ms() - 1_000, 0), by.node_id(), by.epoch()),
+        OpKind::CreateCollection,
+        CollectionId::derive(DB, name),
+        &CollectionCreate {
+            db: DB.into(),
+            name: name.into(),
+            merge_policy: MergePolicy::Field,
+            validator: None,
+            join_retention_ms: r,
+            loss_limits: k,
+            stage: None,
+        },
+    )
+    .expect("the creation encodes")
+}
+
+/// Premise (the entry's body carries `field`), then the entry applied alone on a fresh member: the collection it made and its options row, which is
+/// read from the table as stored (the `of_creation` site writes it, so a collection that was forced and a row that was not would both show here).
+fn applied_alone(entry: &OplogEntry, name: &str) -> (crate::CollectionMeta, BaseOptions) {
+    let asked: CollectionCreate =
+        bson::deserialize_from_slice(entry.body.as_ref().expect("a body")).unwrap();
+    assert_eq!(asked.merge_policy, MergePolicy::Field, "premise: the entry asks for field");
+    let (b, _db) = engine();
+    b.apply_batch(std::slice::from_ref(entry)).expect("the entry applies");
+    let held = b.get_collection(DB, name).expect("the creation is applied");
+    let row = options_of(&b, name).expect("the creation wrote its options row");
+    (held, row)
+}
+
+/// (a) `field` with a valid `R` and valid `K`: the shadow is held as `document`, and neither `R` nor `K` is kept (`create_collection_in_txn` and `of_creation` keep them for `field` only).
+#[test]
+fn a_replicated_creation_of_a_shadow_name_that_asks_for_field_with_r_and_k_is_held_as_document_without_them()
+ {
+    let (a, _da) = engine();
+    let shadow = kimmy_core::vector_meta::shadow_name("orders");
+    let limits = kimmy_core::LossLimits::DEFAULT;
+    assert!(limits.is_valid(), "premise: valid limits");
+    let (held, row) =
+        applied_alone(&field_creation(&a, &shadow, Some(60_000), Some(limits)), &shadow);
+    assert_eq!(held.merge_policy, MergePolicy::Document, "the collection is a document collection");
+    assert_eq!((held.join_retention_ms, held.loss_limits), (None, None), "and keeps no R or K");
+    assert_eq!(
+        (row.merge_policy, row.join_retention_ms, row.loss_limits),
+        (MergePolicy::Document, None, None),
+        "and so does its options row"
+    );
+}
+
+/// (b) `field` with no `R` and no `K` (a creation a `field` collection could not be made from): it still applies, and the shadow is held as `document`.
+#[test]
+fn a_replicated_creation_of_a_shadow_name_that_asks_for_field_without_r_or_k_applies_and_is_held_as_document()
+ {
+    let (a, _da) = engine();
+    let shadow = kimmy_core::vector_meta::shadow_name("orders");
+    let (held, row) = applied_alone(&field_creation(&a, &shadow, None, None), &shadow);
+    assert_eq!(held.merge_policy, MergePolicy::Document, "the collection is a document collection");
+    assert_eq!((held.join_retention_ms, held.loss_limits), (None, None), "and keeps no R or K");
+    assert_eq!(
+        (row.merge_policy, row.join_retention_ms, row.loss_limits),
+        (MergePolicy::Document, None, None),
+        "and so does its options row"
+    );
+}
+
+/// The twin, under a plain name: the same hand-made entry with a valid `R` and `K` stays `field` and keeps them, so the two tests above fail on the FORCING and never on the entry.
+#[test]
+fn the_same_creation_under_a_plain_name_stays_field_and_keeps_its_r_and_k() {
+    let (a, _da) = engine();
+    let limits = kimmy_core::LossLimits::DEFAULT;
+    let (held, row) =
+        applied_alone(&field_creation(&a, "wide", Some(60_000), Some(limits)), "wide");
+    assert_eq!(held.merge_policy, MergePolicy::Field, "the collection is a field collection");
+    assert_eq!((held.join_retention_ms, held.loss_limits), (Some(60_000), Some(limits)));
+    assert_eq!(
+        (row.merge_policy, row.join_retention_ms, row.loss_limits),
+        (MergePolicy::Field, Some(60_000), Some(limits)),
+        "and so does its options row"
+    );
+}

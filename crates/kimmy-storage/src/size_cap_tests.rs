@@ -187,7 +187,7 @@ fn binary_and_multibyte_ids_are_measured_in_bytes_at_the_cap() {
 fn the_vectors_of_a_document_whose_id_is_within_the_cap_can_be_stored() {
     let dir = tempfile::tempdir().unwrap();
     let e = open(&dir);
-    let shadow = e.create_collection("shop", "c.__vectors").unwrap();
+    let shadow = e.create_system_collection("shop", "c.__vectors").unwrap();
     let record = |source: DocId| kimmy_core::VectorRecord {
         source,
         chunk: 0,
