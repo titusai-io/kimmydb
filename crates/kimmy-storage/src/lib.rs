@@ -16,6 +16,7 @@ pub mod check;
 pub mod class_step;
 pub mod clock_bound;
 pub mod codec;
+pub mod containment;
 mod database_tombstone;
 pub mod definition_digest;
 pub mod definition_probe;
@@ -94,6 +95,9 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod epoch_tests;
+
+#[cfg(test)]
+mod containment_tests;
 
 #[cfg(test)]
 mod field_write_tests;

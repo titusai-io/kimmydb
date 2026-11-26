@@ -237,6 +237,15 @@ pub enum Message {
         nonce: Vec<u8>,
         #[serde(default)]
         protocol: Option<u32>,
+        /// The dialler's own epoch (D13 containment, ADR-274). Believed only after the dialler's
+        /// proof verifies. Absent from a build before containment, which is refused by name unless
+        /// the `Hello` is a probe.
+        #[serde(default)]
+        epoch: Option<kimmy_core::Epoch>,
+        /// The mistaken-restore guard's probe: answered with a `Welcome` and nothing else follows
+        /// it. Carries no epoch, and the probed side records nothing and acts on nothing.
+        #[serde(default)]
+        probe: bool,
     },
     /// Answers the challenge, and issues one of my own.
     Welcome {
@@ -245,9 +254,18 @@ pub enum Message {
         proof: Vec<u8>,
         #[serde(default)]
         protocol: Option<u32>,
+        /// The responder's own epoch, believed by the dialler only after this `Welcome`'s proof
+        /// verifies.
+        #[serde(default)]
+        epoch: Option<kimmy_core::Epoch>,
     },
     /// Answers the responder's challenge. The handshake is complete after this.
     Confirm { proof: Vec<u8> },
+    /// The tell (D13 containment, ADR-274): `epoch` is a newer epoch of `node` than the epoch the
+    /// receiver holds, and the receiver halts. Sent once the handshake is complete: by the
+    /// responder after the dialler's `Confirm` verifies, and by the dialler after it has sent its
+    /// own `Confirm`. Acted on only from a peer whose proof verified.
+    Superseded { node: NodeId, epoch: kimmy_core::Epoch },
     /// "What do you hold, and what have you processed?"
     ///
     /// A struct variant rather than a unit variant: BSON has no
@@ -1114,7 +1132,24 @@ mod tests {
                 node: NodeId::generate(),
                 nonce: vec![1, 2, 3],
                 protocol: Some(PROTOCOL),
+                epoch: Some(kimmy_core::Epoch::from_u64(7)),
+                probe: false,
             },
+            Message::Hello {
+                node: NodeId::generate(),
+                nonce: vec![1, 2, 3],
+                protocol: Some(PROTOCOL),
+                epoch: None,
+                probe: true,
+            },
+            Message::Welcome {
+                node: NodeId::generate(),
+                nonce: vec![4, 5],
+                proof: vec![6],
+                protocol: Some(PROTOCOL),
+                epoch: Some(kimmy_core::Epoch::from_u64(8)),
+            },
+            Message::Superseded { node: NodeId::generate(), epoch: kimmy_core::Epoch::from_u64(9) },
             Message::Confirm { proof: vec![9, 9] },
             Message::AskDivergence {
                 probe: Some(CollectionId(42)),

@@ -20,6 +20,7 @@
 
 pub mod catchup;
 pub mod confirm;
+pub mod containment;
 pub mod discovery;
 mod exchange;
 pub mod facts;
@@ -38,6 +39,9 @@ mod clock_stop_tests;
 
 #[cfg(test)]
 mod codec_tests;
+
+#[cfg(test)]
+mod containment_tests;
 
 #[cfg(test)]
 mod join_retention_tests;

@@ -1730,7 +1730,8 @@ pub(crate) async fn accept_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Message::Hello { node, nonce: their_nonce, protocol } = read_frame(stream).await? else {
+    let Message::Hello { node, nonce: their_nonce, protocol, .. } = read_frame(stream).await?
+    else {
         return Err(ProtocolError::Malformed("expected Hello".into()));
     };
     if protocol != Some(crate::protocol::PROTOCOL) {
@@ -1749,6 +1750,8 @@ where
             nonce: ours.clone(),
             proof: prove(secret, &their_nonce, binding),
             protocol: Some(crate::protocol::PROTOCOL),
+            // Scaffold: the epoch rides here once the code commits build it (ADR-274).
+            epoch: None,
         },
     )
     .await?;
@@ -6682,12 +6685,15 @@ where
             node: engine.node_id(),
             nonce: ours.clone(),
             protocol: Some(crate::protocol::PROTOCOL),
+            // Scaffold: the epoch rides here once the code commits build it (ADR-274).
+            epoch: None,
+            probe: false,
         },
     )
     .await?;
 
     let (their_node, their_nonce, proof) = match read_frame(stream).await? {
-        Message::Welcome { node, nonce, proof, protocol } => {
+        Message::Welcome { node, nonce, proof, protocol, .. } => {
             if protocol != Some(crate::protocol::PROTOCOL) {
                 let reason = crate::protocol::release_fault(protocol);
                 warn!(peer = ?node, "refusing a peer: {reason}");
@@ -7023,6 +7029,9 @@ mod digest_repair_tests;
 
 #[cfg(test)]
 mod repair_review_tests;
+
+#[cfg(test)]
+mod containment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11218,6 +11227,8 @@ mod tests {
                     node: peer.node_id(),
                     nonce: nonce(peer.node_id()),
                     protocol: Some(crate::protocol::PROTOCOL),
+                    epoch: None,
+                    probe: false,
                 },
             )
             .await
@@ -11266,7 +11277,13 @@ mod tests {
         let asking = async {
             write_frame_without_protocol(
                 &mut ours,
-                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(0) },
+                &Message::Hello {
+                    node: peer,
+                    nonce: nonce(peer),
+                    protocol: Some(0),
+                    epoch: None,
+                    probe: false,
+                },
             )
             .await;
             read_frame(&mut ours).await.unwrap()
@@ -11299,7 +11316,13 @@ mod tests {
         let asking = async {
             write_frame(
                 &mut ours,
-                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(2) },
+                &Message::Hello {
+                    node: peer,
+                    nonce: nonce(peer),
+                    protocol: Some(2),
+                    epoch: None,
+                    probe: false,
+                },
             )
             .await
             .unwrap();
@@ -11336,6 +11359,7 @@ mod tests {
                     nonce: nonce(peer),
                     proof: prove(SECRET, &asked, BINDING),
                     protocol: Some(0),
+                    epoch: None,
                 },
             )
             .await;

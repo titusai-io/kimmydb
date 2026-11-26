@@ -1405,6 +1405,10 @@ pub(crate) mod definition_hooks {
 pub struct OpenOptions {
     cache_bytes: Option<usize>,
     force_rebuild: Option<&'static str>,
+    /// The epoch a mint must be strictly above (D13 containment, ADR-274): a restore into a halted
+    /// host's directory passes the newer epoch the marker names. Scaffold: accepted and not yet
+    /// read.
+    epoch_floor: Option<Epoch>,
 }
 
 impl OpenOptions {
@@ -1423,6 +1427,13 @@ impl OpenOptions {
     /// reason is logged with the rebuild.
     pub fn force_rebuild(mut self, why: &'static str) -> Self {
         self.force_rebuild = Some(why);
+        self
+    }
+
+    /// The epoch a mint at this open must start strictly above (witness, then tick): the newer
+    /// epoch a halted host was told of. No effect on an open that finds an epoch row.
+    pub fn epoch_floor(mut self, floor: Epoch) -> Self {
+        self.epoch_floor = Some(floor);
         self
     }
 }
