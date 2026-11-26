@@ -952,6 +952,7 @@ fn the_carried_row_overhead_bounds_the_encoding() {
         tombstone_horizon: None,
         register: None,
         carried: rows,
+        dropped_database: None,
     };
     let size = |page: &crate::SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
     let mut rows: Vec<crate::CarriedRow> = (0..ROWS)

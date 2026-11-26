@@ -9305,6 +9305,7 @@ mod tests {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
             deleted_documents: Vec::new(),
         }
     }

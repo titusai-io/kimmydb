@@ -842,6 +842,26 @@ pub struct SnapshotPage {
     /// documents (ADR-272, unit N). REQUIRED (no default): a page without the list is malformed, and an empty list says there are no rows
     /// on this page. The receiver stages them, by sender, as they arrive and merges them in the transaction that completes the join.
     pub carried: Vec<CarriedRow>,
+    /// For a snapshot of one collection the sender no longer holds: the stamp of the DATABASE's drop, when the sender holds that tombstone
+    /// (ADR-272, unit N). The collection may be gone because its database was dropped, with no tombstone of its own (the database's expands
+    /// lazily into the tombstones of the collections it reaches), and `dropped` names only the collection's own. Held to the sender's own
+    /// coverage by the receiver, as every drop a page names is (ADR-163). `None` on a whole-database page, on a page of a collection that
+    /// stands, and when the sender holds no such tombstone.
+    ///
+    /// REQUIRED, and not an `Option` read as absent: a page without the field is malformed (see [`required`]).
+    #[serde(deserialize_with = "required")]
+    pub dropped_database: Option<Stamp>,
+}
+
+/// Read an `Option` field that must be present on the wire: serde reads a missing `Option` as `None`, which would make a page from a sender
+/// that predates the field read as one that has nothing to say. A field read with this does not decode when it is missing, and `null`
+/// still says there is no value.
+fn required<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -1357,6 +1377,7 @@ impl Engine {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
@@ -1414,6 +1435,7 @@ impl Engine {
                     tombstone_horizon,
                     register: None,
                     carried,
+                    dropped_database: None,
                 });
             }
         }
@@ -1458,6 +1480,7 @@ impl Engine {
             tombstone_horizon,
             register,
             carried,
+            dropped_database: None,
         })
     }
 
@@ -6429,6 +6452,7 @@ mod tests {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -6497,6 +6521,7 @@ mod tests {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -6988,6 +7013,7 @@ mod tests {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -8080,6 +8106,7 @@ mod tests {
             tombstone_horizon: None,
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

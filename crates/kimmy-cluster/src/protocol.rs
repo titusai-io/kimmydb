@@ -1681,6 +1681,7 @@ mod tests {
                 tombstone_horizon: None,
                 register: None,
                 carried: Vec::new(),
+                dropped_database: None,
             })),
         )
         .await
@@ -1789,6 +1790,7 @@ mod tests {
             tombstone_horizon: Some(Hlc::new(777, 3)),
             register: None,
             carried: Vec::new(),
+            dropped_database: None,
         };
         let message = Message::Snapshot(Box::new(page.clone()));
         let whole = written_document(&message).await;

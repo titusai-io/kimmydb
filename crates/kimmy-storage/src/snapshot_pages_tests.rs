@@ -390,6 +390,7 @@ fn the_row_overheads_bound_the_encoding() {
         tombstone_horizon: None,
         register: None,
         carried: Vec::new(),
+        dropped_database: None,
     };
     let size = |page: &SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
     let base = size(&bare);
