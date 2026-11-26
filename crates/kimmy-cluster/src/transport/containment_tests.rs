@@ -254,6 +254,62 @@ async fn a_responder_that_knows_of_no_newer_epoch_tells_nobody() {
     assert!(tell.is_none(), "nothing to tell: {tell:?}");
 }
 
+/// A member that holds the newer host's entries and has never met it: it pulled them from a peer,
+/// and no row of the newer epoch was ever written (as after a crash before the next commit). What
+/// it knows of the newer epoch is the origins in its vectors.
+fn a_member_that_knows_the_newer_epoch_only_from_entries(
+    new: &Engine,
+) -> (Engine, tempfile::TempDir) {
+    let (member, dir) = engine();
+    let orders = new.get_collection("shop", "orders").unwrap();
+    new.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+    let window =
+        new.entries_for_peer(Hlc::ZERO, 1_000, kimmy_storage::WalkScope::Background).unwrap();
+    assert!(window.exhausted, "premise: the whole oplog in one window");
+    member.apply_batch(&window.entries).unwrap();
+    assert_eq!(
+        member.newest_epoch(new.node_id()).unwrap(),
+        new.epoch(),
+        "premise: the vectors name the newer epoch"
+    );
+    assert!(
+        !member.newest_epoch_rows(1_000).0.iter().any(|(node, _)| *node == new.node_id()),
+        "premise: no row of the node was written, only entries were applied"
+    );
+    (member, dir)
+}
+
+/// The tell reads the newest epoch the member knows, which is the row and the node's origins in its
+/// vectors, and never the row alone (the model row's finding 10; mutant: the tell reads the row
+/// alone). A responder that knows the newer epoch only from entries it pulled still tells.
+#[tokio::test]
+async fn a_responder_that_knows_the_newer_epoch_only_from_entries_tells_the_old_host() {
+    let (old, new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let (responder, _r) = a_member_that_knows_the_newer_epoch_only_from_entries(&new);
+    let (_opened, _accepted, mut ours, _theirs) = handshake(&old, &responder).await;
+    let tell = next_frame(&mut ours, Duration::from_secs(2)).await;
+    assert!(
+        matches!(&tell, Some(Message::Superseded { node, epoch })
+            if *node == old.node_id() && *epoch == new.epoch()),
+        "the responder tells the old host from the origins in its vectors: {tell:?}"
+    );
+}
+
+/// The same for a dialler: it knows the newer epoch of the responder's node only from entries it
+/// pulled, and tells the old host after its `Confirm`.
+#[tokio::test]
+async fn a_dialler_that_knows_the_newer_epoch_only_from_entries_tells_the_old_host() {
+    let (old, new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let (dialler, _d) = a_member_that_knows_the_newer_epoch_only_from_entries(&new);
+    let (_opened, _accepted, _ours, mut theirs) = handshake(&dialler, &old).await;
+    let tell = next_frame(&mut theirs, Duration::from_secs(2)).await;
+    assert!(
+        matches!(&tell, Some(Message::Superseded { node, epoch })
+            if *node == old.node_id() && *epoch == new.epoch()),
+        "the dialler tells the old host from the origins in its vectors: {tell:?}"
+    );
+}
+
 /// A responder tells only after the `Confirm` verifies: a socket that sends a bad one is answered
 /// with the fault and no tell.
 #[tokio::test]
