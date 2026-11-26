@@ -60,10 +60,83 @@ pub enum GuardVerdict {
 }
 
 /// Run the guard. `listed` is SWIM's member list as `(address, node)` pairs, or `None` until the
-/// first one has arrived. **Scaffold: always passes.**
+/// first one has arrived.
+///
+/// The three cases (ruled 2026-11-25): with no seed, or none that answered, it passes at once; with
+/// a seed that answered and no member list yet it waits for the first list, at most `seed_timeout`,
+/// and then passes; with a list that names this node at an address other than its own it probes
+/// each such address at once and waits at most the window for an answer. A probe that is answered
+/// halts the fresh host (unless `--replace`); none, or one that does not verify, passes.
 pub async fn run_guard(
-    _config: &GuardConfig,
-    _listed: impl Fn() -> Option<Vec<(SocketAddr, NodeId)>>,
+    config: &GuardConfig,
+    listed: impl Fn() -> Option<Vec<(SocketAddr, NodeId)>>,
 ) -> GuardVerdict {
-    GuardVerdict::Pass
+    let started = std::time::Instant::now();
+    loop {
+        let list = listed();
+        let elsewhere: Vec<SocketAddr> = list
+            .iter()
+            .flatten()
+            .filter(|(addr, node)| *node == config.own_node && !config.own_addresses.contains(addr))
+            .map(|(addr, _)| *addr)
+            .collect();
+        let step = crate::containment::guard_step(
+            config.seed_configured,
+            config.a_seed_answered,
+            list.is_some(),
+            !elsewhere.is_empty(),
+            config.suspect_to_down,
+        );
+        match step {
+            crate::containment::GuardStep::Pass => return GuardVerdict::Pass,
+            crate::containment::GuardStep::AwaitMemberList(_) => {
+                if started.elapsed() >= config.seed_timeout {
+                    return GuardVerdict::Pass;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            crate::containment::GuardStep::Probe(window) => {
+                let window = config.window.unwrap_or(window);
+                return match probe_all(config, &elsewhere, window).await {
+                    Some(addr) if !config.replace => GuardVerdict::LiveHost(addr),
+                    Some(addr) => {
+                        tracing::warn!(
+                            %addr,
+                            "a live host of this node answered the guard's probe; `--replace` was \
+                             given for this epoch, so this host proceeds and the ordinary \
+                             containment tells that host"
+                        );
+                        GuardVerdict::Pass
+                    }
+                    None => GuardVerdict::Pass,
+                };
+            }
+        }
+    }
+}
+
+/// Probe every address at once and return the first that answers with a verifying `Welcome` within
+/// `window`.
+async fn probe_all(
+    config: &GuardConfig,
+    addresses: &[SocketAddr],
+    window: Duration,
+) -> Option<SocketAddr> {
+    let mut probes = tokio::task::JoinSet::new();
+    for addr in addresses.iter().copied() {
+        let (own, secret) = (config.own_node, config.secret.clone());
+        // UNSUPERVISED: a probe's panic ends that probe only; the join reads it as no answer.
+        probes.spawn(async move {
+            crate::transport::probe_peer(own, addr, &secret).await.then_some(addr)
+        });
+    }
+    let waiting = async {
+        while let Some(done) = probes.join_next().await {
+            if let Ok(Some(addr)) = done {
+                return Some(addr);
+            }
+        }
+        None
+    };
+    tokio::time::timeout(window, waiting).await.ok().flatten()
 }

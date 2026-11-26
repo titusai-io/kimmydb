@@ -2037,10 +2037,39 @@ pub(crate) async fn dial(
 }
 
 /// The mistaken-restore guard's probe (ADR-274): dial `peer`, say a `Hello` that is a probe and
-/// carries no epoch, and report whether a `Welcome` came back whose proof verifies. Records nothing
-/// and sends nothing else. **Scaffold: never answered.**
-pub(crate) async fn probe_peer(_own: NodeId, _peer: SocketAddr, _secret: &str) -> bool {
-    false
+/// carries no epoch, and report whether a `Welcome` came back whose proof verifies. Records
+/// nothing, sends nothing else, and ends there. The caller bounds it with the guard's window.
+pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> bool {
+    let attempt = async {
+        let tcp = TcpStream::connect(peer).await.ok()?;
+        set_keepalive(&tcp);
+        let tls = crate::tls::ClusterTls::new().ok()?;
+        let mut stream =
+            tls.connector().connect(crate::tls::ClusterTls::server_name(), tcp).await.ok()?;
+        let binding = {
+            let (_, conn) = stream.get_ref();
+            crate::tls::binding(conn).ok()?
+        };
+        let challenge = nonce(own);
+        let hello = Message::Hello {
+            node: own,
+            nonce: challenge.clone(),
+            protocol: Some(crate::protocol::PROTOCOL),
+            epoch: None,
+            probe: true,
+        };
+        write_frame(&mut stream, &hello).await.ok()?;
+        match read_frame(&mut stream).await.ok()? {
+            Message::Welcome { proof, protocol, .. }
+                if protocol == Some(crate::protocol::PROTOCOL)
+                    && proof_is_valid(secret, &challenge, &binding, &proof) =>
+            {
+                Some(())
+            }
+            _ => None,
+        }
+    };
+    attempt.await.is_some()
 }
 
 /// A connection [`dial`] opened for a round that has not started: dialled with the
