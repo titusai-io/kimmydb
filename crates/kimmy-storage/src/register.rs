@@ -1388,6 +1388,35 @@ impl BaseOptions {
         *self == normal
     }
 
+    /// Warn when what a creation ASKED for is not what [`Self::of_creation`] keeps: a shadow and a system name are `document` collections
+    /// whatever is asked, and `R` and `K` belong to a `field` collection only. Called at the route tops that call `of_creation` (the entries
+    /// route and the page route), with what the creation's body asked. It reads the body alone, so every member says the same, and it
+    /// counts nothing and changes no state (unit P).
+    pub(crate) fn warn_if_asked_options_are_not_kept(
+        &self,
+        route: &str,
+        asked_policy: kimmy_core::MergePolicy,
+        asked_join_retention_ms: Option<u64>,
+        asked_loss_limits: Option<kimmy_core::LossLimits>,
+    ) {
+        if asked_policy != self.merge_policy
+            || asked_join_retention_ms != self.join_retention_ms
+            || asked_loss_limits != self.loss_limits
+        {
+            tracing::warn!(
+                route,
+                db = %self.db,
+                collection = %self.name,
+                asked_policy = %asked_policy,
+                asked_join_retention_ms = ?asked_join_retention_ms,
+                asked_loss_limits = ?asked_loss_limits,
+                kept_policy = %self.merge_policy,
+                "a creation asks for options its options row does not keep (a shadow or a system name is a document collection, and R and K belong to a field \
+                 collection only); the kept ones stand"
+            );
+        }
+    }
+
     /// What a creation names that never became a collection here (judged history, or one that found the collection standing): the same
     /// options [`Self::of_meta`] reads from the collection a creation makes, with `R` and `K` kept only for a `field` collection.
     pub(crate) fn of_creation(

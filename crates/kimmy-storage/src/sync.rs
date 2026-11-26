@@ -2643,6 +2643,12 @@ impl Engine {
                     target.loss_limits,
                     target.stage,
                 );
+                seen.warn_if_asked_options_are_not_kept(
+                    "entries",
+                    target.merge_policy,
+                    target.join_retention_ms,
+                    target.loss_limits,
+                );
                 self.note_creation_seen(&seen)?;
                 // The definition follows the row, compared every time a creation is seen (a standing life adopts here, from a creation judged
                 // history too), after the row has committed on its own (unit P).

@@ -3984,6 +3984,12 @@ impl Engine {
             state.loss_limits,
             state.stage.map(|stage| stage.info),
         );
+        creation_seen.warn_if_asked_options_are_not_kept(
+            "page",
+            state.merge_policy,
+            state.join_retention_ms,
+            state.loss_limits,
+        );
         let creation_named = hlc_is_named(creation_at, versions);
         if creation_named {
             self.note_creation_seen(&creation_seen)?;

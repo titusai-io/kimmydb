@@ -1666,3 +1666,101 @@ fn the_same_creation_under_a_plain_name_stays_field_and_keeps_its_r_and_k() {
         "and so does its options row"
     );
 }
+
+// -- the warn at the route tops (unit P): what a creation asked for is not what its options row keeps --------------------------------------------
+
+/// What `f` logged at `warn` or above, run under a subscriber of its own on this thread (the work is synchronous, so it is the thread that logs).
+fn logged_while(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = capture.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+const NOT_KEPT: &str = "its options row does not keep";
+
+/// A shadow-named creation that asks for `field` with an `R` and a `K` (which the forcing discards) is warned of at the entries route's top, and its state is as it was.
+#[test]
+fn a_replicated_creation_asking_for_options_the_row_does_not_keep_is_warned_of() {
+    let (a, _da) = engine();
+    let shadow = kimmy_core::vector_meta::shadow_name("orders");
+    let entry = field_creation(&a, &shadow, Some(60_000), Some(kimmy_core::LossLimits::DEFAULT));
+    let (b, _db) = engine();
+    let log = logged_while(|| {
+        b.apply_batch(std::slice::from_ref(&entry)).expect("the entry applies");
+    });
+    assert!(log.contains(NOT_KEPT), "the creation is warned of: {log:?}");
+    assert!(
+        log.contains(&shadow) && log.contains("entries"),
+        "naming the collection and the route: {log:?}"
+    );
+    assert_eq!(
+        b.get_collection(DB, &shadow).expect("and the shadow is made").merge_policy,
+        MergePolicy::Document,
+        "the state is what it was before the warn: the forced policy"
+    );
+}
+
+/// An honest creation, whose body is what its row keeps, is not warned of: a `field` collection with its `R` and `K`, and a `document` collection with none, by entries and by a page.
+#[test]
+fn an_honest_creation_is_not_warned_of() {
+    let (a, _da) = engine();
+    a.create_collection_with_policy(DB, "wide", MergePolicy::Field, None).unwrap();
+    a.create_collection(DB, "plain").unwrap();
+    let entries = everything(&a);
+    let page = a.snapshot_page(None, None).unwrap();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    let log = logged_while(|| {
+        b.apply_batch(&entries).expect("the entries apply");
+        c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .expect("the page applies");
+    });
+    assert!(
+        b.get_collection(DB, "wide").is_ok() && c.get_collection(DB, "plain").is_ok(),
+        "premise: the creations applied, by entries and by a page"
+    );
+    assert!(!log.contains(NOT_KEPT), "no warn for an honest creation: {log:?}");
+}
+
+/// The page route's top: a state that asks for an `R` of a `document` collection (the forcing discards it) is warned of, and the page applies.
+#[test]
+fn a_page_asking_for_options_the_row_does_not_keep_is_warned_of() {
+    let (a, _da) = engine();
+    a.create_collection(DB, "orders").unwrap();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    let state = page
+        .collections
+        .iter_mut()
+        .find(|state| state.name == "orders")
+        .expect("the page defines orders");
+    state.join_retention_ms = Some(60_000);
+    let (b, _db) = engine();
+    let log = logged_while(|| {
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .expect("the page applies");
+    });
+    assert!(log.contains(NOT_KEPT), "the state is warned of: {log:?}");
+    assert!(
+        log.contains("orders") && log.contains("page"),
+        "naming the collection and the route: {log:?}"
+    );
+    assert!(b.get_collection(DB, "orders").is_ok(), "and the page applied");
+}
