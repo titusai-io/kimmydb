@@ -461,6 +461,21 @@ pub const REGISTER_STAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// `crate::register`. Member-local state, not carried by a backup until Q6.6 does.
 pub const REGISTER_POST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_post");
 
+/// `physical collection id (8) -> db length (u16, big-endian) || db || logical length (u16) || logical || physical (the rest)` (ADR-272;
+/// unit N): the names of every physical the register has a row for, so that an id nothing else names (a recreation's, a buried identity's)
+/// can be named. The identity's physical IS the logical name. Written at a name's first register row of any kind (in effect, seeded,
+/// parked or carried), at a stage's creation and at a recreation's `Create` event; the row is a pure function of its names, so a write is
+/// idempotent, and its key must derive from them (a row that does not is corrupt). Carried by a backup. Written only by `crate::register`.
+pub const REGISTER_NAMES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register_names");
+
+/// `collection id (8) -> register::BaseOptions as JSON` (ADR-272; unit N): the base options a creation fixes for a collection (its merge
+/// policy with the creation's Hlc, `R`, `K`, the stage's deadline) and the database and name of the creation entry, so that a collection
+/// that is gone, and has no definition row, can still be made again from what a later fact names by id. One row per id: the newest
+/// creation seen on any route, applied or judged history, by `(creation Hlc, policy text)`, a tie going to the greater encoding of the whole
+/// row (JSON, so numbers compare as text, the same on every member). Its key must derive from the names it holds (a row that does not is corrupt). Carried by a backup. Written only by `crate::register`.
+pub const COLLECTION_BASE_OPTIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("collection_base_options");
+
 /// `logical collection id (8) -> what the settle pass decided for the name` (`register::VisibleRow`): which kind of answer the name gives,
 /// the stamp of the event that is visible, the physical it names, the newest logical drop in effect and the newest event stored for the
 /// name when the pass decided (ADR-272; Q6.6, the resolve row). DERIVED, never a second source of truth: the events and the stage rows are

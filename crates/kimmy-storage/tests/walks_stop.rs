@@ -141,7 +141,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     (
         "register::carried_rows",
-        "the four register tables of ONE member, read whole in the read transaction of a backup (`kimmyd backup`, which serves no client): one row per event of a swapped name and per stage the member has met, bounded by the member's own register (ADR-272; Q6.6, unit A)",
+        "the register's tables of ONE member (the four register tables, the names table and the base options), read whole in the read transaction of a backup (`kimmyd backup`, which serves no client): one row per event of a swapped name, per stage the member has met, per physical the register names and per collection created, bounded by the member's own register and collections (ADR-272; Q6.6, unit A; unit N)",
     ),
     (
         "register::owned_ids",
@@ -149,7 +149,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     (
         "register::raw_rows",
-        "a register table of the temporary store a restore has just written, which no node has opened: one row per event and per stage of the backup, read inside the restore's own write transaction (ADR-272; Q6.6, unit A)",
+        "a register table, the names table or the base options of the temporary store a restore has just written, which no node has opened: one row per event, per stage, per named physical and per collection of the backup, read inside the restore's own write transaction (ADR-272; Q6.6, unit A; unit N)",
     ),
     (
         "register::check_restored",

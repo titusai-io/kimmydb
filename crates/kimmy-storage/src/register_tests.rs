@@ -243,6 +243,8 @@ fn only_this_module_opens_the_register_tables() {
             "tables::REGISTER_POST",
             "tables::REGISTER_VISIBLE",
             "tables::REGISTER_INFO",
+            "tables::REGISTER_NAMES",
+            "tables::COLLECTION_BASE_OPTIONS",
             "tables::REGISTER;",
             "tables::REGISTER)",
             "tables::REGISTER,",

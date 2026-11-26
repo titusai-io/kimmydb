@@ -2139,11 +2139,11 @@ mod tests {
         });
     }
 
-    /// One byte: the primary slot's system-root page order set to `order`, a
-    /// page of 2^order pages. The slot's checksum no longer matches.
+    /// The primary slot's system-root page order set to `order`, a page of 2^order pages. The slot's checksum no longer matches. For an
+    /// order of 0 or 1 the page's index is also lowered where the layout needs it, see [`set_root_order_inside_the_file`].
     fn damage_page_order(path: &Path, order: u8) {
         edit_store(path, |b| {
-            damage::set_primary_page_order(b, order, false).unwrap();
+            set_root_order_inside_the_file(b, order, false);
         });
     }
 
@@ -2151,9 +2151,36 @@ mod tests {
     /// page order itself can refuse it.
     fn damage_page_order_validly(path: &Path, order: u8) {
         edit_store(path, |b| {
-            let change = damage::set_primary_page_order(b, order, true).unwrap();
-            assert!(damage::slot_checksum_valid(b, change.offset));
+            let offset = set_root_order_inside_the_file(b, order, true);
+            assert!(damage::slot_checksum_valid(b, offset));
         });
+    }
+
+    /// The primary slot's system root raised to `order`; and for an order of 0 or 1, the page's index lowered until the page still ends
+    /// inside the file. Those are the orders the tests expect REDB to refuse (`reason_for`): a root that still fits, which this build's own
+    /// check (`check_roots`) lets through. Whether the page, twice the size at order one and so at twice the distance from the first page,
+    /// still fits at the store's own index depends on the layout (how many pages the tables a store holds took before its root, which
+    /// unit N moved by two tables), so the fixture does not depend on it: the index is lowered to the last page of that size the file
+    /// holds, which is unused and so no valid node, and redb panics reading it (the case these tests are about). The file is NOT padded
+    /// instead: redb adjusts a file longer than its layout when it opens it, changing the store before it reads the root, and a
+    /// refusal can then no longer say that nothing in it was changed. Orders of two or more are the ones this build refuses for lying
+    /// past the end, and are left as they are. Returns the slot's offset.
+    fn set_root_order_inside_the_file(b: &mut Vec<u8>, order: u8, valid_checksum: bool) -> usize {
+        let primary = SLOT_OFFSETS[usize::from(b[GOD_BYTE] & PRIMARY_BIT)];
+        let at = primary + SLOT_ROOTS[1].1;
+        let page_number = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let len = b.len() as u64;
+        let mut change = damage::set_primary_page_order(b, order, valid_checksum).unwrap();
+        if order < 2 {
+            let mut index = page_number & 0x000F_FFFF;
+            while index > 0 && root_past_end(b.as_slice(), primary, len).is_some() {
+                index -= 1;
+                let moved = (page_number & !0x000F_FFFF) | index;
+                b[at..at + 8].copy_from_slice(&moved.to_le_bytes());
+                change = damage::set_primary_page_order(b, order, valid_checksum).unwrap();
+            }
+        }
+        change.offset
     }
 
     /// A clean store's close commits with two-phase commit, which is what makes

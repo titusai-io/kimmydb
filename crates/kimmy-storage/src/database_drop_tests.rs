@@ -1755,7 +1755,12 @@ async fn a_dropped_collections_stream_skips_an_old_entry_stamped_after_its_drop(
 // -- What a refusal costs, and what it reads as ------------------------------
 
 /// A definition the database rule refuses is decided before the writer is
-/// taken; the one hold it costs is the record it leaves.
+/// taken, and NO CREATION IS ATTEMPTED for it. That is what this protects: the
+/// holds it costs are the record the refusal leaves and, once, the base options
+/// of the creation this member never saw (unit N: every creation seen from
+/// elsewhere raises its row, on the page route as on the entries route, in a
+/// transaction of its own only when the row rises). A second delivery of the
+/// same page costs no hold at all: the refusal is recorded and the row is held.
 #[test]
 fn a_definition_the_database_refuses_is_decided_before_the_writer() {
     let (a, b, _da, _db, _late) = the_field_sequence();
@@ -1763,8 +1768,16 @@ fn a_definition_the_database_refuses_is_decided_before_the_writer() {
     let slot = crate::engine::WriterHolder::Ddl.slot();
     let before = a.writer_hold().count[slot];
     a.apply_snapshot_page(b.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-    let after = a.writer_hold().count[slot];
-    assert_eq!(after - before, 1, "a refused definition took more than the one record");
+    let first = a.writer_hold().count[slot];
+    assert_eq!(
+        first - before,
+        2,
+        "the refusal's record and the options row of the one creation never seen, and no other \
+         hold: no creation is attempted for a refused definition"
+    );
+    a.apply_snapshot_page(b.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    let second = a.writer_hold().count[slot];
+    assert_eq!(second - first, 0, "a second delivery of the same page took a hold");
 }
 
 /// A page's definition the database rule refuses does not wait on the purge of

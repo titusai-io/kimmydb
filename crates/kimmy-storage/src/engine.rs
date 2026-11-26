@@ -5830,6 +5830,25 @@ impl Engine {
         }
     }
 
+    /// The base options of a creation from elsewhere, kept for the name's id when they rise (unit N): the creation was SEEN, whatever
+    /// becomes of it (judged history, adopted by a collection standing, or made), and the options it fixed are a fact of the name. One
+    /// helper for every route: the entries route calls it with the entry's stamp, the page route with the page's policy stamp held to its
+    /// sender's coverage. Read first in a read transaction, so the writer is taken only for a rise. It holds no transaction of its own
+    /// across the call. A failed write returns its error in place of the creation's own outcome (including `CollectionExists`), so the
+    /// batch or page that met the creation is retried, never applied without its row.
+    pub(crate) fn note_creation_seen(&self, options: &crate::register::BaseOptions) -> Result<()> {
+        let rises = {
+            let txn = self.db.begin_read()?;
+            crate::register::base_options_would_rise(&txn, options)?
+        };
+        if rises {
+            let txn = self.begin_write(WriterHolder::Ddl)?;
+            crate::register::note_base_options(&txn, options)?;
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
     /// The body of [`Self::create_collection_inner`] inside a transaction the
     /// caller holds and commits, so a collection that exists for another's
     /// sake is created in the same commit as the change it serves: a vector
@@ -6015,6 +6034,16 @@ impl Engine {
             // A collection arrives: the stored visibility row of its name may no longer be what the name serves (a stage whose binding is
             // in effect, made alive after it), so it goes, and the pass writes it again where it runs (ADR-272; Q6.6, the resolve row)
             crate::register::forget_visible_row(txn, db, name)?;
+            // The base options a LOCAL creation fixed, kept for the name's id (unit N): what a later fact that names the collection by
+            // id needs to make it again once it is gone. A creation from elsewhere is kept by its route, with the creation's own `Hlc`
+            // (the entry's stamp, or the page's policy stamp held to its sender's coverage), through `note_creation_seen`: `origin` is a
+            // page's `created` there, which sits too low after a later creation and too high after a re-dated life.
+            if origin.is_none() {
+                crate::register::note_base_options(
+                    txn,
+                    &crate::register::BaseOptions::of_meta(&meta),
+                )?;
+            }
             // A life created over its database's tombstone takes a tombstone of its
             // own at the database's drop, with its shadow's, which is what the
             // database's sweep gives every life it leaves standing (ADR-229 item 4).
@@ -10492,12 +10521,32 @@ mod tests {
     #[test]
     fn a_sync_in_one_commit_does_not_make_the_next_commits_failure_unknown() {
         use bson::doc;
-        let (engine, coll, _dir, _path) = engine_with_collection();
+        let (engine, coll, _dir, path) = engine_with_collection();
+        // redb syncs the file when a commit GROWS it, inside the commit and before the commit's first write, and a write that fails after
+        // that sync is rightly unknown: the failing commit has itself synced. Where a store's first file size runs out depends on what
+        // the store holds (the tables a fresh store creates, the rows a creation writes), so the test does not depend on it: it starts
+        // from a file that has grown, writing until a commit leaves the file's length as it was.
+        let length = || std::fs::metadata(&path).unwrap().len();
+        for id in 100..200i64 {
+            let before = length();
+            engine.insert(&coll, doc! {"_id": id}).unwrap();
+            if length() == before {
+                break;
+            }
+        }
         let fsyncs = engine.fsyncs();
         engine.insert(&coll, doc! {"_id": 1}).unwrap();
         assert_eq!(engine.fsyncs(), fsyncs + 1, "premise: that commit synced");
         assert!(engine.arm_test_storage_failure("write"));
+        let syncs = || crate::hold_meter::test_hooks::BACKEND_CALLS.with(|c| c.get())[2];
+        let before = syncs();
         let failed = engine.insert(&coll, doc! {"_id": 2}).unwrap_err();
+        assert_eq!(
+            syncs(),
+            before,
+            "premise: the failing commit synced before its first write (it grew the file), so its failure is \
+             unknown for its own sync: the store has no headroom left"
+        );
         assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
     }
 

@@ -336,6 +336,25 @@ impl crate::Engine {
                 // A sweep only turns a configuration off, and never configures.
                 Configured::FromSnapshot(_) | Configured::Swept(_) => None,
             };
+            // A replicated configuration makes the shadow through `create_collection_in_txn` WITH an origin, so it passes neither route's
+            // top, and that function writes the options row of a local creation only. The creation is SEEN here, whatever becomes of it
+            // (made, found standing, or history under the shadow's drop), and its options are kept for the shadow's id in this
+            // transaction, which already holds the writer: `note_base_options` directly, not `note_creation_seen`, which takes the writer
+            // (unit N). A gone shadow is made again from this row.
+            if let Configured::FromEntry(stamp) = by {
+                crate::register::note_base_options(
+                    &txn,
+                    &crate::register::BaseOptions::of_creation(
+                        db,
+                        &shadow,
+                        stamp.hlc,
+                        kimmy_core::MergePolicy::Document,
+                        None,
+                        None,
+                        None,
+                    ),
+                )?;
+            }
             let shadow_entry = match created {
                 Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
                 Some(Ok(crate::engine::InTxn::Exists)) => {

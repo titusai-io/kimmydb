@@ -3433,6 +3433,24 @@ impl Engine {
         ) {
             return Ok(0);
         }
+        // The creation is SEEN, whatever becomes of it below (history under a drop, a swapped name, adopted by a collection standing, made):
+        // its base options are kept for the name's id when they rise (unit N). The `Hlc` is the creation's policy stamp, as the policy is
+        // adopted below (`merge_policy_at`, else `created`), and NOT `created`, which sits too low after a later creation and too high
+        // after a re-dated life (the drop's successor), so a joined member and an entry-fed one would hold different rows. Held to what
+        // the sender's coverage names (ADR-163), as the policy is: a stamp it does not name raises nothing.
+        let creation_at = state.merge_policy_at.unwrap_or(state.created);
+        if hlc_is_named(creation_at, versions) {
+            let creation_seen = crate::register::BaseOptions::of_creation(
+                &state.db,
+                &state.name,
+                creation_at,
+                state.merge_policy,
+                state.join_retention_ms,
+                state.loss_limits,
+                state.stage.map(|stage| stage.info),
+            );
+            self.note_creation_seen(&creation_seen)?;
+        }
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
         self.witness_covered_hlc(state.created, versions);

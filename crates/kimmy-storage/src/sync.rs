@@ -2631,6 +2631,20 @@ impl Engine {
                     return Ok(DdlOutcome::Refused);
                 }
 
+                // The creation is SEEN, whatever becomes of it below (history under a drop, adopted by a collection standing, made): its
+                // base options are kept for the name's id when they rise, with the creation's own `Hlc`, the entry's stamp (unit N). One
+                // helper for every route, so the definition and the row cannot hold different creations' options.
+                let seen = crate::register::BaseOptions::of_creation(
+                    &target.db,
+                    &target.name,
+                    entry.stamp.hlc,
+                    target.merge_policy,
+                    target.join_retention_ms,
+                    target.loss_limits,
+                    target.stage,
+                );
+                self.note_creation_seen(&seen)?;
+
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
                 // the drop would recreate the collection on rejoining. A tie on

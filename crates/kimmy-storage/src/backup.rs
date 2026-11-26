@@ -92,6 +92,10 @@ const T_REGISTER: u8 = 13;
 const T_REGISTER_INFO: u8 = 14;
 const T_REGISTER_STAGES: u8 = 15;
 const T_REGISTER_POST: u8 = 16;
+// The names table and the base options (ADR-272; unit N), copied as stored and checked at the restore: the names of every physical the
+// register has a row for, and the options a creation fixed for every collection.
+const T_REGISTER_NAMES: u8 = 17;
+const T_COLLECTION_BASE_OPTIONS: u8 = 18;
 
 /// What a backup or restore moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,6 +220,8 @@ impl Engine {
             (T_REGISTER_INFO, crate::register::Carried::Info),
             (T_REGISTER_STAGES, crate::register::Carried::Stages),
             (T_REGISTER_POST, crate::register::Carried::Post),
+            (T_REGISTER_NAMES, crate::register::Carried::Names),
+            (T_COLLECTION_BASE_OPTIONS, crate::register::Carried::Options),
         ] {
             for (key, value) in crate::register::carried_rows(&txn, which)? {
                 bytes += write_record(out, tag, &key, &value)?;
@@ -589,6 +595,18 @@ fn restore_to_temp(
                         &key,
                         &value,
                     )?,
+                    T_REGISTER_NAMES => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Names,
+                        &key,
+                        &value,
+                    )?,
+                    T_COLLECTION_BASE_OPTIONS => crate::register::restore_row(
+                        &txn,
+                        crate::register::Carried::Options,
+                        &key,
+                        &value,
+                    )?,
                     // A tag this build does not know means the backup came from
                     // a newer version. Skipping it would restore a database
                     // missing whatever that table held, silently.
@@ -758,6 +776,8 @@ mod tests {
         "REGISTER_INFO",
         "REGISTER_STAGES",
         "REGISTER_POST",
+        "REGISTER_NAMES",
+        "COLLECTION_BASE_OPTIONS",
     ];
 
     /// The tables it does not, and why. Each is node-local or derived; the doc
@@ -847,7 +867,7 @@ mod tests {
         let registers = include_str!("register.rs");
         let from = registers.find("impl Carried {").unwrap();
         let carried_reads = &registers[from..from + registers[from..].find("\n}\n").unwrap()];
-        for variant in ["Register", "Info", "Stages", "Post"] {
+        for variant in ["Register", "Info", "Stages", "Post", "Names", "Options"] {
             assert!(
                 write_side.contains(&format!("Carried::{variant}),")),
                 "backup_to does not write the register's Carried::{variant}"
@@ -876,9 +896,10 @@ mod tests {
             read_chunk(&mut rest).unwrap();
             read_chunk(&mut rest).unwrap();
         }
-        // The register's four tags are written only for a member that holds register rows, which this engine does not: the register
-        // tests (`backup_register_tests`) read each of them from the backup of a swapped name.
-        let register_tags = T_REGISTER..=T_REGISTER_POST;
+        // The register's five tags (its four tables and the names table) are written only for a member that holds register rows, which
+        // this engine does not: the register tests (`backup_register_tests`) read each of them from the backup of a swapped name. The
+        // base options are different: every creation writes one, so a populated engine's backup carries that tag.
+        let register_tags = T_REGISTER..=T_REGISTER_NAMES;
         let expected: Vec<u8> =
             (1..=CARRIED.len() as u8).filter(|tag| !register_tags.contains(tag)).collect();
         assert_eq!(

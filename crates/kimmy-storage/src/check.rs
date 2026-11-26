@@ -873,28 +873,33 @@ mod tests {
         (dir, path)
     }
 
-    /// [`an_unclean_store`], after three hundred more documents and 250 deletes: the
-    /// deletes free pages, and the freed table is where a cut of the file's
-    /// last block reaches a page past the end of its region. (Ten documents and a
-    /// cut of two blocks did, while a new database started at about 1 MiB; redb's
-    /// `MIN_DESIRED_USABLE_BYTES` went from 1 MiB to 64 KiB in 4.6, a 72 KiB file that
-    /// doubles as it grows, so the pages fall elsewhere
-    /// and the same cut was met by the walk of the view instead, a verdict of
-    /// damage as well, but not redb's own layout check this test is for.)
-    fn an_unclean_store_with_freed_pages() -> (tempfile::TempDir, PathBuf) {
+    /// [`an_unclean_store`] with a large scratch table written LAST and deleted in the final commit: the file's highest pages are that
+    /// table's, and the final commit leaves them named in the freed table (which an unclean open validates, and which no walk reads),
+    /// with no page of the store's live trees above them. So a cut into that region is met by redb's own layout check, which names a
+    /// freed page past the end of its region, before any walk of the live trees reaches a page that is gone. This holds by construction,
+    /// not by where the store's own tables happen to fall: the layout of a fresh store changes whenever a table or a row is added to it.
+    fn an_unclean_store_with_a_freed_table_last() -> (tempfile::TempDir, PathBuf) {
+        const SCRATCH: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("scratch");
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("live.redb");
         let path = dir.path().join("data").join("kimmy.redb");
         std::fs::create_dir(path.parent().unwrap()).unwrap();
         let engine = Engine::open(&live).unwrap();
         fill(&engine);
-        let c = engine.get_collection("shop", "orders").unwrap();
-        let pad = "y".repeat(300);
-        let docs =
-            (0..300).map(|i| bson::doc! { "_id": format!("x{i}"), "pad": pad.clone() }).collect();
-        engine.insert_many(&c, docs).unwrap();
-        for i in 0..250 {
-            engine.delete(&c, &kimmy_core::DocId::String(format!("d{i}"))).unwrap();
+        {
+            let txn = engine.begin_write(crate::WriterHolder::Write).unwrap();
+            {
+                let mut table = txn.open_table(SCRATCH).unwrap();
+                for i in 0..4_000u64 {
+                    table.insert(i, [7u8; 64].as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        {
+            let txn = engine.begin_write(crate::WriterHolder::Write).unwrap();
+            txn.delete_table(SCRATCH).unwrap();
+            txn.commit().unwrap();
         }
         std::fs::copy(&live, &path).unwrap();
         std::fs::copy(crate::format::sidecar_path(&live), crate::format::sidecar_path(&path))
@@ -1252,36 +1257,47 @@ mod tests {
     /// without them has nothing there for the cut to pass.
     #[test]
     fn a_killed_store_cut_into_its_last_region_is_damaged_by_redb() {
-        // Self-calibrating, since where redb's own layout check is reached depends on where its pages fall (a 72 KiB first size
-        // since redb 4.6, `MIN_DESIRED_USABLE_BYTES`; a cut of one block of this fixture reaches it, probed over cuts of 1 to 24
-        // blocks, every one of which is damage): every cut of up to eight blocks is Damaged, exit 65, with the way out, and at
-        // least one of them is refused by redb's own check, the message this test is for. If a later redb moves the pages so that none
-        // is, the last assertion says so, and the fixture is probed again.
-        let mut by_redb = Vec::new();
-        for blocks in 1..=8u64 {
-            let (_dir, path) = an_unclean_store_with_freed_pages();
-            let len = std::fs::metadata(&path).unwrap().len();
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_len(len - blocks * BLOCK)
-                .unwrap();
-            let report = check_untouched(&path, PreviousRun::NotClean);
+        // The condition is BUILT, not found: the store (`an_unclean_store_with_a_freed_table_last`) ends in the pages of a table that
+        // was written last and deleted in the final commit, so the freed table names pages at the end of the file and no live page is
+        // above them. Cuts are made on a copy of the store's bytes, from one block upward. The free space above those pages is not
+        // damage, so the cuts that fall in it are skipped; the first cut that is Damaged must be redb's own layout check (the premise,
+        // asserted first, so that a layout change fails here with what every cut did, and not on a verdict), and that cut and the
+        // seven after it are Damaged, exit 65, with the way out, as the tests of the view's own walk are.
+        let (_dir, path) = an_unclean_store_with_a_freed_table_last();
+        let original = std::fs::read(&path).unwrap();
+        let blocks_in_file = original.len() as u64 / BLOCK;
+        let cut = |blocks: u64| {
+            let keep = original.len() - (blocks * BLOCK) as usize;
+            std::fs::write(&path, &original[..keep]).unwrap();
+            check_untouched(&path, PreviousRun::NotClean)
+        };
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        let mut first = None;
+        for blocks in 1..blocks_in_file {
+            let report = cut(blocks);
+            *seen.entry(format!("{:?}: {}", report.verdict, report.detail)).or_default() += 1;
+            if report.verdict == Verdict::Damaged {
+                first = Some((blocks, report));
+                break;
+            }
+        }
+        let (first_blocks, report) = first.unwrap_or_else(|| {
+            panic!("premise: no cut of the {blocks_in_file}-block file is damage at all: {seen:#?}")
+        });
+        assert!(
+            report.detail.contains("extends past the end of its region"),
+            "premise: the first cut that is damage ({first_blocks} blocks of {blocks_in_file}) is not refused by redb's own layout \
+             check: {report:?}; every cut before it: {seen:#?}"
+        );
+        for blocks in first_blocks..(first_blocks + 8).min(blocks_in_file) {
+            let report = cut(blocks);
             assert_eq!(report.verdict, Verdict::Damaged, "a cut of {blocks} blocks: {report:?}");
             assert_eq!(report.exit_code(), 65, "a cut of {blocks} blocks: {report:?}");
             assert!(
                 report.detail.contains("kimmyd restore"),
                 "a cut of {blocks} blocks: {report:?}"
             );
-            if report.detail.contains("extends past the end of its region") {
-                by_redb.push(blocks);
-            }
         }
-        assert!(
-            !by_redb.is_empty(),
-            "no cut of one to eight blocks reaches redb's own layout check any more: probe the fixture again"
-        );
     }
 
     /// The file shrinking under a running check is not the store's damage:

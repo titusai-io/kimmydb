@@ -238,13 +238,16 @@ pub(crate) fn register_opened_for_tests() -> usize {
     REGISTER_OPENED.with(std::cell::Cell::get)
 }
 
-/// Create the register's tables, so a read of them never meets a missing table.
+/// Create the register's tables that exist from the open, so a read of them never meets a missing table.
 pub(crate) fn open_tables(txn: &redb::WriteTransaction) -> Result<()> {
     let _ = txn.open_table(tables::REGISTER)?;
     let _ = txn.open_table(tables::REGISTER_INFO)?;
     let _ = txn.open_table(tables::REGISTER_STAGES)?;
     let _ = txn.open_table(tables::REGISTER_POST)?;
     let _ = txn.open_table(tables::REGISTER_VISIBLE)?;
+    // REGISTER_NAMES and COLLECTION_BASE_OPTIONS are not created here: a table is created by its first write, never at the open, so a
+    // store that has not written a row to them has the file layout it had before they existed (see `Engine::load_newest_epochs`).
+    // Every reader of them meets a missing table as an empty one.
     Ok(())
 }
 
@@ -446,6 +449,11 @@ pub(crate) fn write_stage_row(
     value.extend_from_slice(physical.as_bytes());
     txn.open_table(tables::REGISTER_STAGES)?
         .insert(CollectionId::derive(db, physical).0.to_be_bytes().as_slice(), value.as_slice())?;
+    // the stage's physical and the name it belongs to are nameable from its creation on (unit N)
+    if let Some(logical) = kimmy_core::swap::logical_of_stage(physical) {
+        note_names(txn, db, logical, physical)?;
+        note_names(txn, db, logical, logical)?;
+    }
     Ok(())
 }
 
@@ -783,6 +791,8 @@ fn store(
     if put == Put::Stored {
         let key = row_key(CollectionId::derive(db, logical), &stamp);
         txn.open_table(table)?.insert(key.as_slice(), event.encode().as_slice())?;
+        // the name's first register row of any kind, in effect or parked, names its identity and a recreation's physical (unit N)
+        note_event_names(txn, db, logical, &event)?;
     }
     Ok(put)
 }
@@ -1234,6 +1244,209 @@ fn stage_row_names(
     Ok((db, physical))
 }
 
+// -- The names table and the base options (ADR-272; unit N) -----------------------------------------------------------------------------
+
+/// The value of a names row: the database, the logical name and the physical, the first two length-prefixed.
+fn names_value(db: &str, logical: &str, physical: &str) -> Vec<u8> {
+    let mut value = Vec::with_capacity(4 + db.len() + logical.len() + physical.len());
+    value.extend_from_slice(&(db.len() as u16).to_be_bytes());
+    value.extend_from_slice(db.as_bytes());
+    value.extend_from_slice(&(logical.len() as u16).to_be_bytes());
+    value.extend_from_slice(logical.as_bytes());
+    value.extend_from_slice(physical.as_bytes());
+    value
+}
+
+/// The database, logical name and physical a names row holds, or why the row is damaged: of the wrong shape, a name that is not text, or
+/// names that derive another key than the row's own.
+fn names_of(
+    key: &[u8],
+    value: &[u8],
+) -> std::result::Result<(String, String, String), &'static str> {
+    let shape = "a names row of the wrong shape";
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| "a names row with a name that is not text")
+    };
+    if key.len() != 8 || value.len() < 2 {
+        return Err(shape);
+    }
+    let db_len = u16::from_be_bytes([value[0], value[1]]) as usize;
+    let logical_at = 2 + db_len;
+    if value.len() < logical_at + 2 {
+        return Err(shape);
+    }
+    let logical_len = u16::from_be_bytes([value[logical_at], value[logical_at + 1]]) as usize;
+    let physical_at = logical_at + 2 + logical_len;
+    if value.len() < physical_at {
+        return Err(shape);
+    }
+    let db = text(&value[2..logical_at])?;
+    let logical = text(&value[logical_at + 2..physical_at])?;
+    let physical = text(&value[physical_at..])?;
+    if CollectionId::derive(&db, &physical).0.to_be_bytes().as_slice() != key {
+        return Err("a names row whose names derive another key than its own");
+    }
+    Ok((db, logical, physical))
+}
+
+/// Keep the names of `physical`, a physical of the name `logical` in `db` (the identity's physical is the logical name itself). The row is
+/// a function of its names, so one already held is left as it is, and one held under the same id for other names (a hash collision) is
+/// corrupt. Returns whether a row was written.
+pub(crate) fn note_names(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    physical: &str,
+) -> Result<bool> {
+    let key = CollectionId::derive(db, physical).0.to_be_bytes();
+    let value = names_value(db, logical, physical);
+    let mut table = txn.open_table(tables::REGISTER_NAMES)?;
+    let held = table.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+    match held {
+        None => {
+            table.insert(key.as_slice(), value.as_slice())?;
+            Ok(true)
+        }
+        Some(held) if held == value => Ok(false),
+        Some(_) => Err(corrupt("a names row is held under an id that other names derive")),
+    }
+}
+
+/// The names a register event brings: its logical name's identity, and for a recreation the new physical it names.
+fn note_event_names(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    logical: &str,
+    event: &RegisterEvent,
+) -> Result<()> {
+    note_names(txn, db, logical, logical)?;
+    if let RegisterEvent::Create { physical } = event {
+        note_names(txn, db, logical, physical)?;
+    }
+    Ok(())
+}
+
+/// The base options a creation fixes for a collection, with the database and name of the creation entry: what a later fact that names the
+/// collection by id needs to make it again when it is gone (unit N). `at` is the creation's own `Hlc`, which orders two creations of one
+/// name together with the policy's text ([`crate::meta::CollectionMeta::policy_key`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BaseOptions {
+    pub(crate) db: String,
+    pub(crate) name: String,
+    pub(crate) at: Hlc,
+    pub(crate) merge_policy: kimmy_core::MergePolicy,
+    pub(crate) join_retention_ms: Option<u64>,
+    pub(crate) loss_limits: Option<kimmy_core::LossLimits>,
+    pub(crate) stage: Option<kimmy_core::StageInfo>,
+}
+
+impl BaseOptions {
+    /// The `Hlc` a collection's row carries: the creation's own, and for a vector shadow a CONSTANT, `Hlc::ZERO`. A shadow has no facts of
+    /// its own (it follows its parent's configuration), and whichever member makes it, by its own configuration, by the shadow's creation
+    /// entry, by a configuration entry or by a page, the options are the same: with a constant here every member holds the byte-identical
+    /// row by any route, and a peer's row never rises above the owner's.
+    fn row_at(name: &str, at: Hlc) -> Hlc {
+        if kimmy_core::vector_meta::is_shadow(name) { Hlc::ZERO } else { at }
+    }
+
+    /// What a creation fixed, read from the collection it made.
+    pub(crate) fn of_meta(meta: &crate::meta::CollectionMeta) -> Self {
+        BaseOptions {
+            db: meta.db.clone(),
+            name: meta.name.clone(),
+            at: Self::row_at(&meta.name, meta.merge_policy_at.unwrap_or(meta.created)),
+            merge_policy: meta.merge_policy,
+            join_retention_ms: meta.join_retention_ms,
+            loss_limits: meta.loss_limits,
+            stage: meta.stage.map(|kept| kept.info),
+        }
+    }
+
+    /// What a creation names that never became a collection here (judged history, or one that found the collection standing): the same
+    /// options [`Self::of_meta`] reads from the collection a creation makes, with `R` and `K` kept only for a `field` collection.
+    pub(crate) fn of_creation(
+        db: &str,
+        name: &str,
+        at: Hlc,
+        policy: kimmy_core::MergePolicy,
+        join_retention_ms: Option<u64>,
+        loss_limits: Option<kimmy_core::LossLimits>,
+        stage: Option<kimmy_core::StageInfo>,
+    ) -> Self {
+        let policy = policy.fixed_for(name);
+        let field = policy == kimmy_core::MergePolicy::Field;
+        BaseOptions {
+            db: db.to_string(),
+            name: name.to_string(),
+            at: Self::row_at(name, at),
+            merge_policy: policy,
+            join_retention_ms: join_retention_ms.filter(|_| field),
+            loss_limits: loss_limits.filter(|_| field),
+            stage,
+        }
+    }
+}
+
+/// Whether `new` takes the place of `held` in the options table: the later creation by `(Hlc, policy text)`, and when those are equal and
+/// the rest differs (`R`, `K` or the stage), the greater encoding of the whole row. A total order, so the outcome does not depend on
+/// the order the creations were seen in. **The encoding is JSON, so numbers compare as TEXT** (an `R` of 9 is greater than one of 10).
+/// That is deliberate: every member compares the same bytes, and the order only has to be total and the same everywhere, not numeric.
+/// It must not be "fixed" to a numeric comparison.
+fn options_rise(
+    held: &BaseOptions,
+    held_bytes: &[u8],
+    new: &BaseOptions,
+    new_bytes: &[u8],
+) -> bool {
+    let held_key = (held.at, held.merge_policy.as_str());
+    let new_key = (new.at, new.merge_policy.as_str());
+    new_key > held_key || (new_key == held_key && new_bytes > held_bytes)
+}
+
+/// Keep the base options of a creation seen on any route, applied or judged history, when they rise ([`options_rise`]). The row's key is
+/// the collection's id and derives from the names it holds. Returns whether a row was written.
+pub(crate) fn note_base_options(
+    txn: &redb::WriteTransaction,
+    options: &BaseOptions,
+) -> Result<bool> {
+    let key = CollectionId::derive(&options.db, &options.name).0.to_be_bytes();
+    let value = serde_json::to_vec(options)?;
+    let mut table = txn.open_table(tables::COLLECTION_BASE_OPTIONS)?;
+    let held = table.get(key.as_slice())?.map(|raw| raw.value().to_vec());
+    if let Some(held) = held {
+        let held_options: BaseOptions = serde_json::from_slice(&held)?;
+        if !options_rise(&held_options, &held, options, &value) {
+            return Ok(false);
+        }
+    }
+    table.insert(key.as_slice(), value.as_slice())?;
+    Ok(true)
+}
+
+/// Whether [`note_base_options`] would write `options`: read in a read transaction, so a creation judged history, which holds no
+/// transaction of its own, takes the writer only when its options rise.
+pub(crate) fn base_options_would_rise(
+    txn: &redb::ReadTransaction,
+    options: &BaseOptions,
+) -> Result<bool> {
+    let key = CollectionId::derive(&options.db, &options.name).0.to_be_bytes();
+    let value = serde_json::to_vec(options)?;
+    let held = match txn.open_table(tables::COLLECTION_BASE_OPTIONS) {
+        Ok(table) => table.get(key.as_slice())?.map(|raw| raw.value().to_vec()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    match held {
+        None => Ok(true),
+        Some(held) => {
+            let held_options: BaseOptions = serde_json::from_slice(&held)?;
+            Ok(options_rise(&held_options, &held, options, &value))
+        }
+    }
+}
+
 /// Seed the name's drop from the receiver's own tombstone for the identity, but only when that tombstone is ABOVE the grant for its
 /// origin (Q6.6, unit C2b; D1): one the sender could not have judged. A tombstone at or below the grant is the sender's to have used, and
 /// seeding from it would put in this register a drop the sender's register does not hold.
@@ -1367,6 +1580,8 @@ pub(crate) fn apply_carried(
                 if held.is_none() {
                     fresh.insert(id);
                 }
+                wrote |= note_names(txn, &db, logical, &physical)?;
+                wrote |= note_names(txn, &db, logical, logical)?;
                 names.insert(id, (db, logical.to_string()));
             }
         }
@@ -1410,6 +1625,8 @@ pub(crate) fn apply_carried(
             }
             continue;
         };
+        // the name is known here, so its identity is nameable from now on (unit N)
+        wrote |= note_names(txn, db, logical, logical)?;
         let seeded = seed_above_the_grant(txn, db, logical, granted)?;
         wrote |= seeded;
         let mut timeline = timeline_of(txn, tables::REGISTER, db, logical)?;
@@ -1674,13 +1891,16 @@ pub(crate) fn write_old_form_stage_row_for_test(engine: &crate::Engine, physical
 
 // -- The backup (ADR-272, decisions 4 and 13; Q6.6, unit A) -------------------------------------------------------------------------------
 
-/// The four tables a backup carries: no other module opens them.
+/// The tables a backup carries from this module (the four register tables, the names table and the base options): no other module opens
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Carried {
     Register,
     Info,
     Stages,
     Post,
+    Names,
+    Options,
 }
 
 impl Carried {
@@ -1690,6 +1910,8 @@ impl Carried {
             Carried::Info => tables::REGISTER_INFO,
             Carried::Stages => tables::REGISTER_STAGES,
             Carried::Post => tables::REGISTER_POST,
+            Carried::Names => tables::REGISTER_NAMES,
+            Carried::Options => tables::COLLECTION_BASE_OPTIONS,
         }
     }
 }
@@ -1731,6 +1953,16 @@ fn damaged(what: &str) -> StorageError {
 }
 
 fn raw_rows(txn: &redb::WriteTransaction, which: Carried) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    // Opening a table in a write transaction creates it, so the two tables that are created by their first write are looked for first:
+    // a backup that carries no row of them restores a store that holds neither.
+    if matches!(which, Carried::Names | Carried::Options) {
+        use redb::TableHandle as _;
+        let table = which.table();
+        let name = table.name();
+        if !txn.list_tables()?.any(|held| held.name() == name) {
+            return Ok(Vec::new());
+        }
+    }
     let table = txn.open_table(which.table())?;
     let mut rows = Vec::new();
     for row in table.iter()? {
@@ -1809,6 +2041,23 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
             )));
         }
         stages.push((db, physical));
+    }
+
+    // a names row's key derives from the names it holds, and so does a base-options row's (unit N)
+    for (key, value) in raw_rows(txn, Carried::Names)? {
+        names_of(&key, &value).map_err(damaged)?;
+    }
+    for (key, value) in raw_rows(txn, Carried::Options)? {
+        let options: BaseOptions = serde_json::from_slice(&value)
+            .map_err(|_| damaged("a base-options row does not decode"))?;
+        if CollectionId::derive(&options.db, &options.name).0.to_be_bytes().as_slice()
+            != key.as_slice()
+        {
+            return Err(damaged(&format!(
+                "a base-options row whose names derive another key than its own: {}.{}",
+                options.db, options.name
+            )));
+        }
     }
 
     // every binding has its stage row: found by the physical's name, and its names must derive the binding's own logical id
