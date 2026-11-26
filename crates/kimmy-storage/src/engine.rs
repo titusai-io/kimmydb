@@ -354,7 +354,8 @@ pub struct Engine {
     /// refusal's text.
     halt_info: Mutex<Option<crate::containment::Halt>>,
     /// The halt as a watch, for what is open when it lands (a change stream's pump): `true` from
-    /// the halt on, and at an open that finds the halt row. **Scaffold: never set.**
+    /// the halt on, and at an open that finds the halt row. Set by [`Engine::halt`] and by an open
+    /// that finds the row.
     halt_watch: tokio::sync::watch::Sender<bool>,
     /// Set at the node's stop signal, for reads that walk: see
     /// [`Engine::stop_walks`].
@@ -2587,6 +2588,7 @@ impl Engine {
             halt
         };
         self.halted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.halt_watch.send_replace(true);
         let waited_from = std::time::Instant::now();
         let gate = blocking(|| self.writer_gate.lock());
         meter_writer_wait(waited_from.elapsed());
@@ -2659,6 +2661,7 @@ impl Engine {
         {
             *self.halt_info.lock() = Some(halt);
             self.halted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.halt_watch.send_replace(true);
             warn!(
                 epoch = %self.epoch.to_hex(),
                 "this store was halted by a newer epoch of its node and starts halted"

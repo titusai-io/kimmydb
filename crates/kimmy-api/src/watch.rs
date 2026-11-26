@@ -82,8 +82,27 @@ async fn pump(
         close_catching_up(&mut socket).await;
         return;
     }
+    // The same for a halt (D13 containment, ADR-274): a stream that stayed open on a halted host
+    // would go on delivering from a store the rest of the cluster has moved past. The halt is a
+    // watch the engine sets, so the pump is woken without a timer, and it looks once after
+    // subscribing for the same reason as above.
+    let mut halt = state.engine.halt_watch();
+    if *halt.borrow_and_update() {
+        close_halted(&mut socket).await;
+        return;
+    }
     loop {
         tokio::select! {
+            () = async {
+                if halt.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if *halt.borrow_and_update() {
+                    close_halted(&mut socket).await;
+                    break;
+                }
+            }
             () = async {
                 match gate.as_mut() {
                     Some(gate) => {
@@ -134,10 +153,20 @@ async fn pump(
 /// Going away, and another member serves: the close a client reads as
 /// `retry: elsewhere` (`catching_up`, ADR-202).
 async fn close_catching_up(socket: &mut WebSocket) {
+    close_going_away(socket, "catching_up").await;
+}
+
+/// Going away because this host is halted (D13 containment, ADR-274): a client reads `halted` as
+/// it reads the error code of the same name, `retry: elsewhere`.
+async fn close_halted(socket: &mut WebSocket) {
+    close_going_away(socket, "halted").await;
+}
+
+async fn close_going_away(socket: &mut WebSocket, reason: &'static str) {
     let _ = socket
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
             code: 1001,
-            reason: "catching_up".into(),
+            reason: reason.into(),
         })))
         .await;
 }
