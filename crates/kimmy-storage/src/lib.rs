@@ -189,6 +189,9 @@ mod swap_routes_tests;
 mod backup_register_tests;
 
 #[cfg(test)]
+mod names_and_options_tests;
+
+#[cfg(test)]
 mod definition_door_tests;
 #[cfg(test)]
 mod recreate_tests;

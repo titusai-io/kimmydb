@@ -15,6 +15,7 @@ use kimmy_core::{
 };
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::register::Carried;
 use crate::{Engine, PeerWindow, SyncOutcome, WalkScope, physical_now_ms};
 
 const DB: &str = "app";
@@ -1162,4 +1163,107 @@ fn the_visible_physical_is_the_newest_binding_whose_collection_is_alive_in_the_b
         error.contains("at or below its own floor"),
         "the older, alive stage is the visible physical, and its floor is judged: {error}"
     );
+}
+
+// -- Unit N: the names table and the base options in a backup -----------------------------------------------------------------------------
+//
+// The names table and the base options are carried by a backup (tags 17 and 18), copied as stored, and the restore refuses a row whose key
+// does not derive from its names or that does not decode. The refusals are modelled on
+// `a_stage_row_whose_names_derive_another_key_refuses_the_restore`: a record is added under a key that is not its own, and the restore
+// is refused by the check's own message with nothing written.
+
+const T_REGISTER_NAMES: u8 = 17;
+const T_COLLECTION_BASE_OPTIONS: u8 = 18;
+
+fn rows_of(e: &Engine, which: Carried) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let txn = e.db().begin_read().expect("a read");
+    crate::register::carried_rows(&txn, which).expect("the table reads")
+}
+
+/// The source member's two tables are in the backup and a restore keeps them as they were: row for row, key and value.
+#[test]
+fn a_backup_carries_the_names_and_the_options_and_a_restore_keeps_them() {
+    let (bytes, _w, m, _d) = a_flipped_backup();
+    let carried = records(&bytes);
+    assert!(
+        carried.iter().any(|(tag, _, _)| *tag == T_REGISTER_NAMES),
+        "premise: the backup carries the names table"
+    );
+    assert!(
+        carried.iter().any(|(tag, _, _)| *tag == T_COLLECTION_BASE_OPTIONS),
+        "premise: and the base options"
+    );
+    let (r, _dr) = restored(&bytes);
+    assert_eq!(rows_of(&r, Carried::Names), rows_of(&m, Carried::Names), "the names, row for row");
+    assert_eq!(
+        rows_of(&r, Carried::Options),
+        rows_of(&m, Carried::Options),
+        "the options, row for row"
+    );
+}
+
+/// A recreation's physical has no stage row, and a collection that is gone leaves nothing else that names its id: the names table is what
+/// does, and the backup carries it.
+#[test]
+fn a_backup_names_a_recreation_that_has_no_stage_row_of_its_own() {
+    let (_bytes, records, recreation, _created) = a_backup_with_a_recreation();
+    let key = CollectionId::derive(DB, &recreation).0.to_be_bytes().to_vec();
+    assert!(
+        records.iter().any(|(tag, k, v)| {
+            *tag == T_REGISTER_NAMES && *k == key && v.ends_with(recreation.as_bytes())
+        }),
+        "the recreation {recreation} is named in the backup, by its own id"
+    );
+}
+
+#[test]
+fn a_names_row_whose_key_does_not_derive_from_its_names_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let names = records
+        .iter()
+        .find(|(tag, _, _)| *tag == T_REGISTER_NAMES)
+        .cloned()
+        .expect("premise: the backup carries a names row");
+    let stray = CollectionId::derive(DB, "orders.__stg.zz").0.to_be_bytes().to_vec();
+    assert_ne!(stray, names.1, "premise: the key is not the row's own");
+    records.push((T_REGISTER_NAMES, stray, names.2));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("derive another key"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_names_row_of_the_wrong_shape_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let key = CollectionId::derive(DB, "orders.__stg.zz").0.to_be_bytes().to_vec();
+    records.push((T_REGISTER_NAMES, key, vec![0]));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("wrong shape"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_base_options_row_whose_key_does_not_derive_from_its_names_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let options = records
+        .iter()
+        .find(|(tag, _, _)| *tag == T_COLLECTION_BASE_OPTIONS)
+        .cloned()
+        .expect("premise: the backup carries an options row");
+    let stray = CollectionId::derive(DB, "orders.__stg.zz").0.to_be_bytes().to_vec();
+    assert_ne!(stray, options.1, "premise: the key is not the row's own");
+    records.push((T_COLLECTION_BASE_OPTIONS, stray, options.2));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("derive another key"), "the refusal names the check: {error}");
+}
+
+#[test]
+fn a_base_options_row_that_does_not_decode_refuses_the_restore() {
+    let (bytes, _w, _m, _d) = a_flipped_backup();
+    let mut records = records(&bytes);
+    let key = CollectionId::derive(DB, "orders.__stg.zz").0.to_be_bytes().to_vec();
+    records.push((T_COLLECTION_BASE_OPTIONS, key, b"not json".to_vec()));
+    let error = refused(&rebuilt(&bytes, &records));
+    assert!(error.contains("does not decode"), "the refusal names the check: {error}");
 }
