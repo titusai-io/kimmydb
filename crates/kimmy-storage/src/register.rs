@@ -1570,6 +1570,61 @@ pub(crate) fn rows_of(txn: &redb::ReadTransaction, id: CollectionId) -> Result<V
     Ok(rows)
 }
 
+/// The names rows a register unit's events need on the page that carries it (unit N): the identity's row of each distinct id the events are
+/// keyed by, and, for a recreation's `Create`, the row of the recreation's physical too (the database from the identity's row). As the
+/// table stores them (wire tag, key, value), in the transaction the events were read in.
+pub(crate) fn names_rows_of_events<'a>(
+    txn: &redb::ReadTransaction,
+    events: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+) -> Result<Vec<WireRow>> {
+    let mut rows = Vec::new();
+    let mut seen: std::collections::BTreeSet<u64> = Default::default();
+    let mut databases: std::collections::BTreeMap<u64, Option<String>> = Default::default();
+    for (key, value) in events {
+        if key.len() < 8 {
+            continue;
+        }
+        let id = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+        if let std::collections::btree_map::Entry::Vacant(slot) = databases.entry(id) {
+            let row = names_row_of(txn, id)?;
+            let db = row
+                .as_ref()
+                .and_then(|(_, key, value)| names_of(key, value).ok())
+                .map(|(db, _, _)| db);
+            if let Some(row) = row
+                && seen.insert(id)
+            {
+                rows.push(row);
+            }
+            slot.insert(db);
+        }
+        if let Ok(RegisterEvent::Create { physical }) = RegisterEvent::decode(value)
+            && let Some(Some(db)) = databases.get(&id)
+        {
+            let physical_id = CollectionId::derive(db, &physical).0;
+            if seen.insert(physical_id)
+                && let Some(row) = names_row_of(txn, physical_id)?
+            {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The names row held under `id`, as the table stores it (wire tag, key, value), if there is one.
+fn names_row_of(txn: &redb::ReadTransaction, id: u64) -> Result<Option<WireRow>> {
+    let table = match txn.open_table(tables::REGISTER_NAMES) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let key = id.to_be_bytes();
+    Ok(table
+        .get(key.as_slice())?
+        .map(|held| (crate::snapshot::CARRY_NAMES, key.to_vec(), held.value().to_vec())))
+}
+
 /// The database and the name of the collection the rows of a scoped carry are of: the options row names both, and a names row names the
 /// database and the collection's own physical. A row that does not judge names nothing. `None` when the rows name no collection.
 pub(crate) fn database_and_name_of<'a>(
@@ -2270,10 +2325,14 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
         stages.push((db, physical));
     }
 
-    // a names row's key derives from the names it holds, and so does a base-options row's (unit N)
+    // a names row's key derives from the names it holds, and so does a base-options row's (unit N); what the rows name is kept for the two
+    // clauses below
+    let mut named: std::collections::BTreeMap<u64, (String, String, String)> = Default::default();
     for (key, value) in raw_rows(txn, Carried::Names)? {
-        names_of(&key, &value).map_err(damaged)?;
+        let names = names_of(&key, &value).map_err(damaged)?;
+        named.insert(u64::from_be_bytes(key[..8].try_into().expect("8 bytes")), names);
     }
+    let mut with_options: std::collections::BTreeMap<u64, (String, String)> = Default::default();
     for (key, value) in raw_rows(txn, Carried::Options)? {
         let options: BaseOptions = serde_json::from_slice(&value)
             .map_err(|_| damaged("a base-options row does not decode"))?;
@@ -2285,6 +2344,10 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
                 options.db, options.name
             )));
         }
+        with_options.insert(
+            u64::from_be_bytes(key[..8].try_into().expect("8 bytes")),
+            (options.db, options.name),
+        );
     }
 
     // every binding has its stage row: found by the physical's name, and its names must derive the binding's own logical id
@@ -2426,6 +2489,39 @@ pub(crate) fn check_restored(txn: &redb::WriteTransaction) -> Result<()> {
             return Err(damaged(&format!(
                 "a post-drop row left while a newer physical is visible: {db}.{logical}"
             )));
+        }
+    }
+
+    // The invariants of the names table and the base options (unit N), last, so that every older check names its own damage first. Every
+    // register event, in effect or parked, is of a name some names row holds (the identity's, under the id the events are keyed by), and
+    // every stage row's physical is held by a names row of its own; and every collection has an options row with its own names, because
+    // every creation path writes one. The restore invents no row to satisfy them: a backup that breaks one is damaged.
+    for (_, id, _, _) in &events {
+        if !named.get(&id.0).is_some_and(|(_, logical, physical)| logical == physical) {
+            return Err(damaged(&format!(
+                "a register event of a name with no names row: {}",
+                id.0
+            )));
+        }
+    }
+    for (db, physical) in &stages {
+        let held = named.get(&CollectionId::derive(db, physical).0);
+        let of_it = kimmy_core::swap::logical_of_stage(physical);
+        if !held.is_some_and(|(held_db, logical, held_physical)| {
+            held_db == db && held_physical == physical && Some(logical.as_str()) == of_it
+        }) {
+            return Err(damaged(&format!("a stage row with no names row: {db}.{physical}")));
+        }
+    }
+    {
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        for row in collections.iter()? {
+            let (key, _) = row?;
+            let (db, name) = key.value();
+            let held = with_options.get(&CollectionId::derive(db, name).0);
+            if !held.is_some_and(|(held_db, held_name)| held_db == db && held_name == name) {
+                return Err(damaged(&format!("a collection with no options row: {db}.{name}")));
+            }
         }
     }
     Ok(())

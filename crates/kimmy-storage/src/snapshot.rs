@@ -1558,12 +1558,18 @@ impl Engine {
         // one that does not fit even that is refused by name, never cut (a truncated register is a silently wrong one) (Q6.6, unit C2d).
         let mut register = None;
         if scope.is_none() && next.is_none() {
-            let carry = self.register_carry()?;
-            let bytes = carry.encoded_len();
+            let (carry, names) = self.register_carry()?;
+            // counted with the register, as the page's rows are: the names of its events ride it
+            let bytes = carry.encoded_len()
+                + names
+                    .iter()
+                    .map(|row| row.key.len() + row.value.len() + CARRIED_ROW_FRAME)
+                    .sum::<usize>();
             let has_rows =
                 !documents.is_empty() || !deleted_documents.is_empty() || !carried.is_empty();
             if walk.used + carry_used + bytes <= rows_room {
                 register = Some(carry);
+                carried.extend(names);
             } else if bytes <= rows_room && has_rows {
                 // after the last row the page sent, or at the start of the document walk when it sent none
                 next = walk.end.or_else(|| Some(doc_start()));
@@ -1592,7 +1598,7 @@ impl Engine {
 
     /// The sender's register as the last page carries it: the events in effect, every stage row and the post-drop rows, raw, in one read
     /// transaction. Never the events ahead of their position.
-    fn register_carry(&self) -> Result<RegisterCarry> {
+    fn register_carry(&self) -> Result<(RegisterCarry, Vec<CarriedRow>)> {
         use crate::register::Carried;
         let txn = self.db().begin_read()?;
         let rows = |which: Carried| -> Result<Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>> {
@@ -1612,8 +1618,25 @@ impl Engine {
                 .map(serde_bytes::ByteBuf::from)
                 .collect(),
         };
-        self.note_register_carry(&carry);
-        Ok(carry)
+        // The names of the ids the events are of ride the same page (unit N): the names walk of the first pages may have passed a name whose
+        // first event the sender stored after it, and a joiner that cannot name an id by a stage row or a collection stores its events by
+        // id, a state a backup of it would be refused for. A recreation's `Create` carries the recreation's physical's row too, which a
+        // joiner can never get later (`store` writes names when it newly stores an event, and the carry stores it). A row the joiner
+        // already holds is no news and costs it nothing. Read in the transaction the events were read in, so a name's row is there
+        // whenever its event is. They are part of what the unit carries: the gauge and the warning count them.
+        let events = carry.events.iter().map(|(key, value)| (key.as_slice(), value.as_slice()));
+        let names: Vec<CarriedRow> = crate::register::names_rows_of_events(&txn, events)?
+            .into_iter()
+            .map(|(table, key, value)| CarriedRow {
+                table,
+                key: serde_bytes::ByteBuf::from(key),
+                value: serde_bytes::ByteBuf::from(value),
+            })
+            .collect();
+        let names_bytes: usize =
+            names.iter().map(|row| row.key.len() + row.value.len() + CARRIED_ROW_FRAME).sum();
+        self.note_register_carry(&carry, names_bytes);
+        Ok((carry, names))
     }
 
     /// What a page can hold: [`SNAPSHOT_PAGE_BYTES`], or a test's own budget.
@@ -1630,9 +1653,9 @@ impl Engine {
 
     /// The carry's size is the gauge `kimmy_snapshot_register_carry_bytes`, set each time a carry is built; and at half of what a page can
     /// hold it is a warning, once an hour, that names what the register has grown to and that its compaction is due (Q6.6, unit C2d).
-    fn note_register_carry(&self, carry: &RegisterCarry) {
+    fn note_register_carry(&self, carry: &RegisterCarry, names_bytes: usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let bytes = carry.encoded_len();
+        let bytes = carry.encoded_len() + names_bytes;
         self.snapshot_register_carry_bytes.store(bytes as u64, Relaxed);
         let cap = self.snapshot_carry_cap();
         if bytes.saturating_mul(2) < cap {

@@ -1606,10 +1606,12 @@ fn a_sender_and_the_size_of_its_carry() -> (Swap, usize, String) {
     let size = loop {
         let whole = s.sender.snapshot_page(None, None).unwrap();
         assert_eq!(whole.documents.len(), 1, "premise: the page carries the plain document");
-        let carry = whole
-            .register
-            .expect("premise: the one page that exhausts the walk carries the register");
-        let size = carry.encoded_len();
+        assert!(
+            whole.register.is_some(),
+            "premise: the one page that exhausts the walk carries the register"
+        );
+        // the unit the page carries: the register AND the names rows of its events' ids (unit N), which the gauge measures with it
+        let size = s.sender.snapshot_register_carry_bytes() as usize;
         s.sender.set_snapshot_room_for_test(Some(size - 1));
         let probe = s.sender.snapshot_page(None, Some(plain)).unwrap();
         s.sender.set_snapshot_room_for_test(None);
@@ -1645,10 +1647,11 @@ fn a_carry_that_fits_rides_the_page_that_walks_the_last_row() {
     let page = s.sender.snapshot_page(None, None).unwrap();
     assert_eq!(page.documents.len(), 1, "premise: the page holds the row");
     assert!(page.next.is_none(), "the snapshot ends on the page that walks its last row");
+    assert!(page.register.is_some(), "and that page carries the register");
     assert_eq!(
-        page.register.as_ref().map(|carry| carry.encoded_len()),
-        Some(size),
-        "and that page carries the register"
+        s.sender.snapshot_register_carry_bytes() as usize,
+        size,
+        "which is the unit measured"
     );
 }
 
@@ -1692,7 +1695,7 @@ fn a_carry_that_does_not_fit_beside_the_rows_rides_the_empty_page_after_them() {
     assert!(
         last_page.documents.is_empty()
             && last_page.collections.is_empty()
-            && last_page.carried.is_empty(),
+            && last_page.carried.iter().all(|row| row.table == crate::CARRY_NAMES),
         "the carry rides a page with nothing else on it, and no row is sent twice"
     );
     assert!(last_page.register.is_some() && last_page.next.is_none(), "which is the last page");
