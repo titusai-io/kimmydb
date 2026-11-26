@@ -717,7 +717,11 @@ async fn a_field_delete_crosses_the_wire_in_a_snapshot_and_kills_the_life_the_re
 /// all of B without applying the drop (as the count-divergence test does for its hole), so it holds X, no floor
 /// and no drop tombstone, and its digest of the collection differs from B's. The repair pulls B's page as a
 /// Converge page, which does not carry the floor: the burial tombstone is a carried delete of a field document
-/// for C, and C refuses one with no state as corrupt, on every round, until the repair is abandoned.
+/// for C, and C refused one with no state as corrupt, on every round, until the repair was abandoned.
+/// UNIT P (P8b, ruled 4:44 PM): the page names B's floor, a drop C has not taken at or after its life's creation, so the
+/// Converge pull ENDS at its first page (nothing applied, no Converge row written) and the count kind's snapshot of the
+/// collection is planned: only a snapshot's page applies the drop first. The snapshot buries C's life (nothing of it is
+/// above the drop) and takes B's, so C ends holding what B holds: Y, not X, with B's floor.
 #[tokio::test]
 async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_has_not_taken_the_drop()
  {
@@ -756,9 +760,22 @@ async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_
         "premise: C holds no drop tombstone"
     );
 
-    let (totals, _) =
-        repair_loop(&b, &c, |_| {}, |_, totals| totals.digest_repairs.iter().sum::<usize>() >= 1)
-            .await;
+    // The loop runs until C holds what B holds: the digest repair ends at its first page and plans the snapshot, which takes the drop and B's life.
+    // The snapshot's page buries C's life (nothing of it is above the drop) and leaves X's rows to the drop purger before it can make B's life
+    // (ADR-189); `node()` starts no purger (kimmyd's daemon runs `run_drop_purger`), so the closure runs it, as the daemon would.
+    let (totals, _) = repair_loop(
+        &b,
+        &c,
+        |_| {},
+        |_, _| {
+            let _ = c.engine.finish_purges_now();
+            c.engine.get_collection("shop", "orders").is_ok_and(|meta| {
+                c.engine.get(&meta, &y).unwrap().is_some()
+                    && c.engine.get(&meta, &x).unwrap().is_none()
+            })
+        },
+    )
+    .await;
     assert!(
         totals.digest_repairs[DigestRepairOutcome::Applied.index()] >= 1,
         "the repair of the swept member's collection ran to its end: {totals:?}"
@@ -768,14 +785,28 @@ async fn the_repair_of_a_collection_a_member_has_swept_applies_at_a_member_that_
         0,
         "the repair is not abandoned: {totals:?}"
     );
-    // The page was applied: the row for Y, which C had never seen, was written. (The burial tombstone
-    // does not kill X on C, which has not taken the drop, so the digests still differ: the repair is judged
-    // ineffective, and the drop reaches C by the entries.)
-    assert!(
-        totals.digest_rows[RowResult::Created.index()] >= 1,
-        "premise: the repair applied a Converge page: {totals:?}"
+    // The Converge pull ended at its first page: no row of it was written. The snapshot that followed did the work.
+    assert_eq!(
+        totals.digest_rows[RowResult::Created.index()],
+        0,
+        "the Converge page applied nothing: {totals:?}"
     );
-    assert!(c.engine.get(&cc, &y).unwrap().is_some(), "premise: C holds Y after the repair");
+    let on_c = c.engine.get_collection("shop", "orders").unwrap();
+    // The route the ruling relies on, pinned: C's tombstone is the floor the snapshot's page carried, stamped at the ZERO node (a scoped page names
+    // the drop's time and not its maker), and not the real drop's entry, which C, believing it had witnessed B, was never served.
+    let tombstone = c.engine.collection_dropped_at(on_c.id).unwrap().expect("C took the drop");
+    assert_eq!(
+        tombstone.node,
+        kimmy_core::NodeId::from_bytes([0; 16]),
+        "the drop reached C by a snapshot's carried floor, not by entries"
+    );
+    assert_eq!(
+        on_c.incarnation_floor,
+        b.engine.get_collection("shop", "orders").unwrap().incarnation_floor,
+        "C ends with the drop as its floor, as B holds it"
+    );
+    assert!(c.engine.get(&on_c, &y).unwrap().is_some(), "C holds Y after the repair");
+    assert!(c.engine.get(&on_c, &x).unwrap().is_none(), "and not X, which the drop ended");
 }
 
 /// Step 3, item (3.5): the repair of a member that has collected the tombstone of a field document does not bring

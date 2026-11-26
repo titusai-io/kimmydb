@@ -257,11 +257,15 @@ fn a_standing_life_newer_than_the_arriving_one_is_not_buried() {
 }
 
 #[test]
-fn a_life_re_dated_by_the_drop_is_not_mistaken_for_a_newer_one() {
+fn a_member_holding_the_life_before_the_drop_takes_the_re_dated_life_with_the_drop_as_its_floor() {
     // ADR-231, extended: `m` keeps a write made after the drop, so its life is dated
-    // just above the drop, with the creation it had before in `redated_from`. A member
-    // still holding the original life (created at that creation) is looking at the same
-    // life continuing, and the drop reaches it by its own route.
+    // just above the drop, with the creation it had before in `redated_from`. UNIT P (P8b, ruled
+    // 4:44 PM): a member still holding the original life with nothing above the drop used to read
+    // that as the same life continuing (the lineage clause) and keep its own rows; the page's floor
+    // is a drop it has not taken, at or after its life's creation, so it applies the drop as a
+    // carried drop, the keep test finds nothing of its life above it, and the life is buried and
+    // replaced by the sender's: it ends with the sender's documents and the drop as its floor
+    // (accepted cost: one purge and one more pull).
     let (a, m) = {
         let (a, _da) = engine();
         let (m, _dm) = engine();
@@ -287,18 +291,12 @@ fn a_life_re_dated_by_the_drop_is_not_mistaken_for_a_newer_one() {
     let state = &page.collections[0];
     assert_eq!(state.redated_from, Some(on_a.created), "premise");
     assert!(state.incarnation_floor.is_some(), "premise: the page says so");
-    let before = p.get_collection("shop", "orders").unwrap().created;
-    p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
-        .unwrap();
-    assert_eq!(
-        p.get_collection("shop", "orders").unwrap().created,
-        before,
-        "a re-dated life was taken for a newer one and the standing life buried"
-    );
-    // What the page brings is the sender's content (its sweep deleted the document the
-    // drop ended, and that delete travels), not a replacement of the life.
-    assert!(has(&p, 3), "the page's write after the drop did not land");
-    assert!(!has(&p, 1), "the document the drop ended is still here");
+    transfer_under(&p, &m, SnapshotProgress::of_collection(orders_id()));
+    let held = p.get_collection("shop", "orders").unwrap();
+    assert_eq!(held.created, kept.created, "the receiver holds the sender's re-dated life");
+    assert_eq!(held.incarnation_floor, kept.incarnation_floor, "with the drop as its floor");
+    assert!(has(&p, 3), "the page's write after the drop landed");
+    assert!(!has(&p, 1), "and the document the drop ended is gone");
 }
 
 // -- The entries route ---------------------------------------------------------------------
@@ -351,12 +349,16 @@ fn a_create_that_arrives_before_the_drop_it_followed_converges_once_the_drop_arr
 
 // -- The predicate, one clause at a time, with its boundary --------------------------------
 
+/// UNIT P (P8b, ruled 4:44 PM): ONE predicate at both sites that read a page's floor, `page_floor_reaches_the_standing_life`: the floor the page
+/// names (through its sender's coverage) is a drop this member has NOT taken, and it is at or after the standing life's creation. It replaces
+/// `arriving_life_ends_the_standing_one`, whose lineage clause and "arriving life is newer" clause are gone: what a member holds of a life the
+/// floor reaches is judged by the keep test when the floor is applied as a carried drop.
 mod predicate {
     use kimmy_core::{CollectionId, Hlc};
 
     use crate::CollectionMeta;
     use crate::meta::Redated;
-    use crate::sync::arriving_life_ends_the_standing_one as ends;
+    use crate::sync::page_floor_reaches_the_standing_life as reaches;
 
     fn h(ms: u64) -> Hlc {
         Hlc::new(ms, 0)
@@ -372,60 +374,56 @@ mod predicate {
         )
     }
 
-    fn redated(from: u64, created: u64) -> CollectionMeta {
+    fn with_floor(created: u64, floor: u64) -> CollectionMeta {
         let mut meta = standing(created);
-        meta.redated = Some(Redated {
-            from: h(from),
-            created: h(created),
-            first_arrival: None,
-            arrivals_from: None,
-        });
+        meta.incarnation_floor = Some(h(floor));
         meta
     }
 
     #[test]
-    fn a_life_made_after_a_drop_that_ended_the_standing_one_ends_it() {
-        // Standing created at 100; the drop at 200; the arriving life created at 300.
-        assert!(ends(&standing(100), h(300), None, Some(h(200))));
+    fn a_floor_this_member_has_not_taken_and_at_or_above_the_creation_reaches_the_life() {
+        // Standing created at 100, no floor of its own; the page names a drop at 200.
+        assert!(reaches(&standing(100), Some(h(200))));
+        // A floor of its own below the page's: the page's drop is news.
+        assert!(reaches(&with_floor(100, 150), Some(h(200))));
     }
 
     #[test]
-    fn no_floor_is_no_evidence() {
-        assert!(!ends(&standing(100), h(300), None, None));
+    fn a_floor_the_pages_coverage_does_not_name_is_no_evidence() {
+        // The caller passes `None` for a floor with no page, or one its sender's coverage does not name (ADR-163).
+        assert!(!reaches(&standing(100), None));
     }
 
     #[test]
-    fn the_arriving_life_must_be_newer() {
-        assert!(!ends(&standing(300), h(300), None, Some(h(200))), "the same life");
-        assert!(!ends(&standing(400), h(300), None, Some(h(200))), "a sender that is behind");
-        assert!(ends(&standing(100), h(101), None, Some(h(100))), "one tick newer, at the edge");
+    fn a_floor_below_the_standing_creation_is_a_drop_the_standing_life_followed() {
+        assert!(!reaches(&standing(250), Some(h(200))));
+        assert!(reaches(&standing(200), Some(h(200))), "a tie with the creation is the drop's");
     }
 
     #[test]
-    fn the_drop_must_be_at_or_after_the_standing_creation() {
-        // A floor below the standing creation is a drop the standing life was made after.
-        assert!(!ends(&standing(250), h(300), None, Some(h(200))));
-        assert!(ends(&standing(200), h(300), None, Some(h(200))), "at it is a drop it followed");
+    fn a_floor_this_member_has_already_taken_is_no_news() {
+        assert!(!reaches(&with_floor(100, 200), Some(h(200))), "the same floor");
+        assert!(!reaches(&with_floor(100, 300), Some(h(200))), "a floor of its own above it");
     }
 
     #[test]
-    fn the_drop_must_be_before_the_arriving_creation() {
-        assert!(!ends(&standing(100), h(300), None, Some(h(300))), "a floor at the creation");
-        assert!(!ends(&standing(100), h(300), None, Some(h(400))), "a floor above it");
-        assert!(ends(&standing(100), h(300), None, Some(h(299))));
+    fn the_arriving_lifes_creation_is_not_asked() {
+        // The predicate takes no creation of the arriving life: a floor above any creation the page could carry reaches the life all the
+        // same, and the lineage of a re-dated life is the keep test's to decide, not a clause here.
+        assert!(reaches(&standing(100), Some(h(900))));
     }
 
     #[test]
-    fn a_re_dated_life_is_the_standing_life_continuing() {
-        // The arriving life was re-dated from the creation the standing one has.
-        assert!(!ends(&standing(100), h(201), Some(h(100)), Some(h(200))));
-        // The same life re-dated by another drop: both sides began at 100.
-        assert!(!ends(&redated(100, 151), h(251), Some(h(100)), Some(h(250))));
-        // A standing life that was re-dated is compared by where it began, not where it was
-        // dated to: an arriving life that began elsewhere is a different life.
-        assert!(ends(&redated(100, 151), h(400), None, Some(h(300))));
-        // And re-dated from a different beginning than the standing one's.
-        assert!(ends(&standing(100), h(401), Some(h(350)), Some(h(400))));
+    fn a_re_dated_standing_life_is_compared_by_its_creation_and_not_by_where_it_began() {
+        let mut meta = standing(151);
+        meta.redated = Some(Redated {
+            from: h(100),
+            created: h(151),
+            first_arrival: None,
+            arrivals_from: None,
+        });
+        assert!(reaches(&meta, Some(h(300))));
+        assert!(!reaches(&meta, Some(h(150))), "below its (re-dated) creation");
     }
 }
 

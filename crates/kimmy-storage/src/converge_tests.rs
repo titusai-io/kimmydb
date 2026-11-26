@@ -634,6 +634,33 @@ fn a_page_of_the_life_after_a_drop_that_ended_the_standing_life_ends_the_pull_an
     assert_eq!(value(&o, 2), None, "life 1's young document was written into life 0");
 }
 
+/// UNIT P (P8b): the page's floor, named by its sender's coverage, is below the life standing here: this member made its life AFTER the drop
+/// the floor names, so the drop did not end it, and the first page does not end the pull. (The shared predicate `page_floor_reaches_the_standing_life`
+/// asks "at or after the standing creation".) Mutant: the answer is always yes.
+#[test]
+fn a_page_whose_floor_is_below_the_standing_life_is_not_a_life_this_member_has_not_buried() {
+    let (s, ds) = engine();
+    let (o, d_o) = engine();
+    let _keep = (ds, d_o);
+    s.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(s.drop_collection("shop", "orders").unwrap());
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2, "v": 7 }).unwrap();
+    later();
+    let mine = o.create_collection("shop", "orders").unwrap();
+    o.insert(&mine, doc! { "_id": 5, "v": 1 }).unwrap();
+    let floor = s.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap();
+    assert!(floor < mine.created, "premise: this member's life was made after the drop");
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let page = s.snapshot_page(None, progress.scope()).unwrap();
+    let done = o.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    assert!(!done.history, "a drop this life was made after ended a repair");
+}
+
 #[test]
 fn the_same_life_is_not_taken_for_a_successor() {
     // Two members of one life: the page's floor is not above the standing life's creation.

@@ -664,8 +664,8 @@ pub struct SnapshotApplied {
     /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
     pub created_at_cut: usize,
     /// Under [`SnapshotPolicy::Converge`] and [`SnapshotPolicy::Definitions`]: the first page's
-    /// life of the collection began after a drop that ended the life standing here
-    /// (`sync::arriving_life_ends_the_standing_one`, with the sender's floor named by its own
+    /// life of the collection followed a drop this member has not taken, which reaches the life
+    /// standing here (`sync::page_floor_reaches_the_standing_life`, with the sender's floor named by its own
     /// coverage): its rows and its indexes belong to a life this member has not buried yet.
     /// Nothing was applied and the pull ends; the count kind's snapshot buries it (ADR-235).
     pub history: bool,
@@ -3067,12 +3067,7 @@ impl Engine {
         let Some(standing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
             return Ok(false);
         };
-        Ok(crate::sync::arriving_life_ends_the_standing_one(
-            &standing,
-            state.created,
-            state.redated_from,
-            Some(floor),
-        ))
+        Ok(crate::sync::page_floor_reaches_the_standing_life(&standing, Some(floor)))
     }
 
     /// Whether `collection` owes ADR-231's sweep for either tombstone that could end the
@@ -3987,7 +3982,7 @@ impl Engine {
     /// not carried): end the standing life as that drop would (ADR-235).
     ///
     /// The evidence is the sender's incarnation floor, judged by
-    /// [`crate::sync::arriving_life_ends_the_standing_one`] against what stands here,
+    /// [`crate::sync::page_floor_reaches_the_standing_life`] against what stands here,
     /// and named by the sender's own coverage like every stamp off the wire (ADR-163).
     /// The drop is applied through the one path a carried drop takes
     /// (`restore_collection_drop`: the late-drop sweep that keeps what was written
@@ -4053,12 +4048,7 @@ impl Engine {
         if crate::late_drop::owes_a_sweep(&standing, floor) {
             return self.sweep_after_an_ignored_drop(&standing, stamp);
         }
-        if !crate::sync::arriving_life_ends_the_standing_one(
-            &standing,
-            state.created,
-            state.redated_from,
-            Some(floor),
-        ) {
+        if !crate::sync::page_floor_reaches_the_standing_life(&standing, Some(floor)) {
             return Ok(());
         }
         warn!(

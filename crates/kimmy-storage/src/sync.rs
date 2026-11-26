@@ -1897,43 +1897,22 @@ pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: 
     predates_create || at_or_before_floor
 }
 
-/// Whether a life arriving from elsewhere began after a drop that ended the one
-/// standing here (ADR-235), so the standing one is over everywhere else and a member
-/// still holding it holds a life that has ended. The create-side counterpart of
-/// [`aims_at_a_previous_incarnation`], which judges a drop against what stands here.
-///
-/// All of these hold:
-/// - **a floor** (`floor` is the sender's incarnation floor, the drop it was created
-///   after): with none there is no evidence of a drop, and two members that create one
-///   name independently are not a life ended;
-/// - **the arriving life is newer** than the standing one (`created`), so a sender that
-///   is behind never buries a life it has not caught up to;
-/// - **the drop was at or after the standing life's creation** (`floor >= standing.created`)
-///   and before the arriving creation (`floor < created`): a floor below it is a drop the
-///   standing life was made after, which this member already knows by its own floor;
-/// - **it is not the same life re-dated** (ADR-231, extended): a life a drop re-dated to
-///   keep what was written after it (`redated_from` on the arriving side, the re-dating
-///   marker on the standing one) began where it always did, so both sides' beginnings
-///   are compared, and equal ones are one life continuing.
-pub(crate) fn arriving_life_ends_the_standing_one(
+/// Whether the floor a page names reaches the life standing here: the page's sender names a drop (its incarnation floor, named by its own
+/// coverage, ADR-163) that this member has NOT taken, and that is at or after the standing life's creation (unit P, ruled 4:44 PM). Own floor
+/// absent or below the page's, AND the page's floor `>=` the standing creation: a floor below the creation is a drop the standing life
+/// was made after, which this member knows by its own floor; one this member has already taken is no news. `floor` is `None` when the page
+/// names none, or its coverage does not name it: no evidence of a drop. Nothing else is asked: not the arriving life's creation, not its
+/// lineage (a life re-dated by the drop is the same life continuing, and what this member holds of it is judged by the keep test when the
+/// floor is applied as a carried drop), and not the options row. The two sites that ask it, the burial of the life the page's life followed
+/// and the routing of a repair at the first page, are therefore one question and cannot differ between members.
+pub(crate) fn page_floor_reaches_the_standing_life(
     standing: &CollectionMeta,
-    created: Hlc,
-    redated_from: Option<Hlc>,
     floor: Option<Hlc>,
 ) -> bool {
     let Some(floor) = floor else {
         return false;
     };
-    let standing_began = if standing.is_redated() {
-        standing.redated.map_or(standing.created, |marker| marker.from)
-    } else {
-        standing.created
-    };
-    let arriving_began = redated_from.unwrap_or(created);
-    created > standing.created
-        && floor >= standing.created
-        && floor < created
-        && arriving_began != standing_began
+    standing.incarnation_floor.is_none_or(|own| own < floor) && floor >= standing.created
 }
 
 /// Collection metadata as resolved during one batch.
