@@ -840,7 +840,8 @@ pub struct SnapshotPage {
     pub register: Option<RegisterCarry>,
     /// The rows of the sender's names table and base options this page carries, on a whole-database snapshot: the first pages, before the
     /// documents (ADR-272, unit N). REQUIRED (no default): a page without the list is malformed, and an empty list says there are no rows
-    /// on this page. The receiver stages them, by sender, as they arrive and merges them in the transaction that completes the join.
+    /// on this page. The receiver stages them, by sender, as they arrive and merges them in the transaction of the page that ends the carry's walk, before
+    /// that page's first document and not at the grant (unit P).
     pub carried: Vec<CarriedRow>,
     /// For a snapshot of one collection the sender no longer holds: the stamp of the DATABASE's drop, when the sender holds that tombstone
     /// (ADR-272, unit N). The collection may be gone because its database was dropped, with no tombstone of its own (the database's expands
@@ -1179,10 +1180,10 @@ fn restage_carry(
     Ok(by_key(&before) != by_key(&news))
 }
 
-/// The page that completes the join: merge what the pull staged on its earlier pages (nothing, on a pull of one page, where whatever is
-/// staged is an earlier pull's and is discarded) and the rows this page carries into the names table and the base options, names first
-/// (kept if absent) and then the options (by the rule that orders them), and empty the staging, before the register's events are named
-/// from the names. Returns whether anything changed: the rows this page carries are not staged first, so a page this member already holds
+/// The page that ENDS the carry's walk (unit P): merge what the pull staged on its earlier pages (nothing, on a pull whose carry ends on
+/// its first page, where whatever is staged is an earlier pull's and is discarded) and the rows this page carries into the names table and
+/// the base options, names first (kept if absent) and then the options (by the rule that orders them), and empty the staging, before the
+/// first document of the pull is applied and before the register's events are named from the names. Returns whether anything changed: the rows this page carries are not staged first, so a page this member already holds
 /// writes nothing.
 fn merge_carry(
     txn: &redb::WriteTransaction,
@@ -1319,7 +1320,11 @@ impl Engine {
     }
 
     /// Whether the staging holds a row of the pull with `peer` of `scope`, read without the writer.
-    fn carry_stage_has_rows(&self, peer: NodeId, scope: Option<CollectionId>) -> Result<bool> {
+    pub(crate) fn carry_stage_has_rows(
+        &self,
+        peer: NodeId,
+        scope: Option<CollectionId>,
+    ) -> Result<bool> {
         use std::ops::Bound;
         let txn = self.db().begin_read()?;
         let table = match txn.open_table(tables::SNAPSHOT_CARRY_STAGE) {
@@ -2344,20 +2349,36 @@ impl Engine {
             progress.granted = Some(granted);
         }
         let complete = page.next.is_none();
+        // The page that ENDS the carry's walk (unit P): the names and options rows are merged there, in that page's transaction and BEFORE
+        // the pull's first document is applied, and not at the grant, so that every remake from a carried row happens before any document of
+        // the pull. A whole-database pull ends its carry on the page whose cursor leaves it (the first page when the rows fit it, with the
+        // documents after them; otherwise a later page that holds nothing else); a scoped pull, whose rows ride its first page only, ends it
+        // on that page. The register's events and stage rows stay staged until the grant.
+        let carry_done_before = match progress.scope {
+            Some(_) => progress.pages > 0,
+            None => progress.after().is_some_and(|cursor| cursor.carry == Carry::Done),
+        };
+        let carry_done_after = progress.scope.is_some()
+            || page.next.as_ref().is_none_or(|next| next.carry == Carry::Done);
+        let ends_the_carry = !carry_done_before && carry_done_after;
+        // Until the carry ends a page's rows are staged. From the page that ends it ONWARD, the rows a page carries are merged in that page's
+        // own transaction, before its documents and before the register is applied: the last page of a whole pull carries the names rows of
+        // the register's events (`snapshot_page`), which are neither staged nor refused, and the events are named from them.
+        let merges_here = ends_the_carry || (carry_done_before && !carry_rows.is_empty());
         // Cloned rather than borrowed: the borrow would outlive the page's
         // transaction and keep `progress` frozen past the point it is
         // advanced. It is one vector, on the last page only.
         let grant = if complete { progress.granted.clone() } else { None };
 
-        // The rows of the carry (ADR-272, unit N), of a whole-database pull: the first page of the pull empties what an earlier pull of this
-        // sender left staged, every page stages the rows it carries, and the page that completes the join merges them, in its transaction
-        // and before the register's events are named from the names. A scoped pull stages nothing.
-        // The staging is looked at on the first page (to empty what an earlier pull left) and on the page that completes the pull (to merge
-        // what it staged): a completing page with no document, delete or grant still owes the merge, and so opens its transaction.
-        let holds_stage =
-            (progress.pages == 0 || complete) && self.carry_stage_has_rows(peer, progress.scope)?;
+        // The rows of the carry (ADR-272, unit N): the first page of the pull empties what an earlier pull of this sender (and scope) left
+        // staged, every page in the middle of the carry stages the rows it carries, and the page that ends the carry's walk merges them, in
+        // its transaction and before its first document (above). The staging is looked at on the first page (to empty what an earlier pull
+        // left) and on the page that ends the carry (to merge what it staged): a page that ends the carry with no document, delete or grant
+        // still owes the merge, and so opens its transaction.
+        let holds_stage = (progress.pages == 0 || ends_the_carry)
+            && self.carry_stage_has_rows(peer, progress.scope)?;
         let stale = progress.pages == 0 && holds_stage;
-        let owes_a_merge = complete && holds_stage;
+        let owes_a_merge = ends_the_carry && holds_stage;
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
@@ -2377,6 +2398,9 @@ impl Engine {
             let mut memo = Memo::default();
             let txn = self.begin_write(WriterHolder::Repair)?;
             let mut pending = Vec::new();
+            // The rows of the carry, merged before the first document of the pull: this is the page that ends the carry's walk.
+            let merged_before_the_documents = merges_here
+                && merge_carry(&txn, peer, progress.scope, progress.pages == 0, &carry_rows)?;
             // Documents whose stored state moved with the document as it was: written into the transaction.
             let mut state_moved = 0usize;
             for document in &page.documents {
@@ -2469,12 +2493,14 @@ impl Engine {
             // batch's vector).
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
-            let mut wrote = !pending.is_empty() || recorded > 0 || state_moved > 0;
-            {
+            let mut wrote = !pending.is_empty()
+                || recorded > 0
+                || state_moved > 0
+                || merged_before_the_documents;
+            if !merges_here && !carry_done_before {
+                // a page in the middle of the carry stages its rows (the first page empties what an earlier pull left)
                 let scope = progress.scope;
-                if complete {
-                    wrote |= merge_carry(&txn, peer, scope, progress.pages == 0, &carry_rows)?;
-                } else if progress.pages == 0 {
+                if progress.pages == 0 {
                     wrote |= restage_carry(&txn, peer, scope, &carry_rows)?;
                 } else {
                     wrote |= stage_carried_rows(&txn, peer, scope, &carry_rows)?;

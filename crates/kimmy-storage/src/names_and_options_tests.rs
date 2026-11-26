@@ -702,8 +702,9 @@ fn a_join_stopped_in_the_carry_resumes_from_its_stored_progress() {
 }
 
 /// The staging is keyed by sender: a pull from ANOTHER sender that completes merges none of the rows a first sender's abandoned pull staged
-/// (here the options of a collection that is gone, a row only the carry brings), and leaves them where they are until that sender's own
-/// pull starts again or is forgotten.
+/// (here the options of collections that are gone, rows only the carry brings), and leaves them where they are until that sender's own
+/// pull starts again or is forgotten. The first pull is stopped in the middle of its carry, since the page that ends the carry merges
+/// what the pull staged (unit P).
 #[test]
 fn a_pull_from_another_sender_does_not_merge_the_rows_a_first_sender_staged() {
     let (a, _da) = a_sender_with_ghosts(30);
@@ -715,22 +716,29 @@ fn a_pull_from_another_sender_does_not_merge_the_rows_a_first_sender_staged() {
     );
     a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
     let (b, _db) = engine();
-    stopped_after_the_carry(&b, &a);
+    stopped_in_the_carry(&b, &a);
     let staged = b.carry_stage_rows_for_test(a.node_id());
-    assert!(
-        staged
-            .iter()
-            .any(|(table, key, _)| *table == crate::CARRY_OPTIONS && *key == id_key(DB, "ghost")),
-        "premise: the abandoned pull staged the ghost's row"
-    );
     let (c, _dc) = a_sender_with(2);
+    // the rows of collections the second sender does not hold: only the first sender's staging has them
+    let held_by_c = keys(&c, Carried::Options);
+    let only_the_first_has: Vec<Vec<u8>> = staged
+        .iter()
+        .filter(|(table, key, _)| *table == crate::CARRY_OPTIONS && !held_by_c.contains(key))
+        .map(|(_, key, _)| key.clone())
+        .collect();
+    assert!(
+        !only_the_first_has.is_empty(),
+        "premise: the abandoned pull staged options rows the second sender does not hold"
+    );
     let mut fresh = SnapshotProgress::whole_database();
     pulled(&b, &c, &mut fresh);
-    assert!(
-        options_of(&b, "ghost").is_none(),
-        "what the abandoned pull staged is not merged by the one that completed"
-    );
     let held = keys(&b, Carried::Options);
+    for key in &only_the_first_has {
+        assert!(
+            !held.contains(key),
+            "what the abandoned pull staged is not merged by the one that completed"
+        );
+    }
     for key in keys(&c, Carried::Options) {
         assert!(held.contains(&key), "the completed pull's own rows are held");
     }
@@ -743,19 +751,28 @@ fn a_pull_from_another_sender_does_not_merge_the_rows_a_first_sender_staged() {
     );
 }
 
-/// A pull of `from` into `to`, stopped where the carry is done and the documents have not begun: every row of the carry is staged.
-fn stopped_after_the_carry(to: &Engine, from: &Engine) -> SnapshotProgress {
+/// A pull of `from` into `to`, stopped in the middle of the carry, before the page that ends it: the rows of the pages applied so far are
+/// staged and none is merged. (The page that ends the carry's walk merges the staging, before its first document: unit P.)
+fn stopped_in_the_carry(to: &Engine, from: &Engine) -> SnapshotProgress {
     let mut progress = SnapshotProgress::whole_database();
-    while progress.after().is_none_or(|cursor| matches!(cursor.carry, Carry::At(_))) {
+    loop {
         let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        if page.next.as_ref().is_none_or(|next| next.carry == Carry::Done) {
+            break;
+        }
         to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
     }
+    assert!(progress.pages() >= 1, "premise: the carry took more than one page");
+    assert!(
+        progress.after().is_some_and(|cursor| matches!(cursor.carry, Carry::At(_))),
+        "premise: the pull stopped in the carry"
+    );
     assert!(!progress.is_complete(), "premise: the pull stopped before the documents");
     progress
 }
 
 /// The first page of a pull empties what an EARLIER pull of the same sender left staged, whether the new pull is one page (the page that
-/// completes it discards the staged rows and merges its own) or several (its first page replaces the staging). The pages of the second pull
+/// ends its carry, its first, discards the staged rows and merges its own) or several (its first page replaces the staging). The pages of the second pull
 /// are applied under the first sender's node id, which is what makes it the same sender's.
 #[test]
 fn the_first_page_of_a_pull_empties_what_the_same_sender_left_staged() {
@@ -763,11 +780,9 @@ fn the_first_page_of_a_pull_empties_what_the_same_sender_left_staged() {
         let (a, _da) = a_sender_with_ghosts(30);
         a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
         let (b, _db) = engine();
-        stopped_after_the_carry(&b, &a);
-        assert!(
-            !b.carry_stage_rows_for_test(a.node_id()).is_empty(),
-            "{pages}: premise: the abandoned pull staged rows"
-        );
+        stopped_in_the_carry(&b, &a);
+        let staged = b.carry_stage_rows_for_test(a.node_id());
+        assert!(!staged.is_empty(), "{pages}: premise: the abandoned pull staged rows");
         let (c, _dc) = a_sender_with(if pages == "one page" { 2 } else { 12 });
         if pages != "one page" {
             c.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&c)));
@@ -781,10 +796,22 @@ fn the_first_page_of_a_pull_empties_what_the_same_sender_left_staged() {
             fresh.pages() > 1 || pages == "one page",
             "{pages}: premise: the second pull took several pages"
         );
+        let held = keys(&b, Carried::Options);
+        let held_by_c = keys(&c, Carried::Options);
+        let mut only_the_first_has = staged
+            .iter()
+            .filter(|(table, key, _)| *table == crate::CARRY_OPTIONS && !held_by_c.contains(key))
+            .peekable();
         assert!(
-            options_of(&b, "g0").is_none() && options_of(&b, "g29").is_none(),
-            "{pages}: what the abandoned pull staged is not merged by the one that replaced it"
+            only_the_first_has.peek().is_some(),
+            "{pages}: premise: the abandoned pull staged rows the second sender does not hold"
         );
+        for (_, key, _) in only_the_first_has {
+            assert!(
+                !held.contains(key),
+                "{pages}: what the abandoned pull staged is not merged by the one that replaced it"
+            );
+        }
         assert!(
             b.carry_stage_rows_for_test(a.node_id()).is_empty(),
             "{pages}: and the staging is empty"
@@ -798,10 +825,141 @@ fn forgetting_a_pull_forgets_its_staged_rows() {
     let (a, _da) = a_sender_with_ghosts(30);
     a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
     let (b, _db) = engine();
-    stopped_after_the_carry(&b, &a);
+    stopped_in_the_carry(&b, &a);
     assert!(!b.carry_stage_rows_for_test(a.node_id()).is_empty(), "premise: rows are staged");
     b.forget_snapshot_progress(a.node_id(), None).unwrap();
     assert!(b.carry_stage_rows_for_test(a.node_id()).is_empty(), "forgotten with the pull");
+}
+
+/// The page that ENDS the carry's walk merges the rows the pull staged, and the rows it carries itself, before the pull's first document
+/// (unit P, ruled): a pull stopped on that page holds every row of the carry in its tables, nothing is left staged, and no document of
+/// the pull has been applied. The register's own rows ride the last page and are not in question here. Mutant: the merge left to the
+/// pull's completion (the rows are still staged, and none is held, when the pull stops on the page that ends the carry).
+#[test]
+fn the_page_that_ends_the_carry_merges_what_the_pull_staged_before_the_first_document() {
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let mut staged_before_the_end = false;
+    loop {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        let ends = page.next.as_ref().is_some_and(|next| next.carry == Carry::Done);
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        if ends {
+            break;
+        }
+        assert!(!progress.is_complete(), "premise: the carry ends before the pull does");
+        staged_before_the_end |= !b.carry_stage_rows_for_test(a.node_id()).is_empty();
+    }
+    assert!(staged_before_the_end, "premise: the pages before the end staged their rows");
+    assert!(!progress.is_complete(), "premise: the documents have not begun");
+    assert_eq!(progress.documents(), 0, "and none of the pull's documents is applied");
+    assert_eq!(
+        keys(&b, Carried::Options),
+        keys(&a, Carried::Options),
+        "every options row is merged"
+    );
+    assert_eq!(keys(&b, Carried::Names), keys(&a, Carried::Names), "and every names row");
+    assert!(
+        b.carry_stage_rows_for_test(a.node_id()).is_empty(),
+        "and nothing is left staged: the page that ends the carry empties the staging"
+    );
+}
+
+/// A whole pull of ONE page ends its carry on its last page: the rows only the carry brings (the options of collections that are gone on the
+/// sender, which no definition on the page names) are merged by that page, in the transaction that also applies its documents, and nothing is
+/// left staged. Mutant: a pull whose carry ends on its last page never merges (the rows of live collections would still arrive by their
+/// definitions, which is why the sender here holds gone ones).
+#[test]
+fn a_whole_pull_of_one_page_merges_the_rows_only_the_carry_brings() {
+    let (a, _da) = a_sender_with_ghosts(3);
+    let page = a.snapshot_page(None, None).unwrap();
+    assert!(page.next.is_none(), "premise: the whole database is one page");
+    assert!(!page.documents.is_empty(), "premise: the page holds the document too");
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the page applies");
+    assert!(progress.is_complete(), "the pull is complete");
+    for name in ["g0", "g1", "g2"] {
+        assert!(b.get_collection(DB, name).is_err(), "premise: {name} is gone here too");
+        assert_eq!(options_of(&b, name), options_of(&a, name), "the row of {name}, from the carry");
+        assert!(options_of(&b, name).is_some(), "and it is held");
+    }
+    assert!(b.carry_stage_rows_for_test(a.node_id()).is_empty(), "nothing is left staged");
+}
+
+/// A page that carries rows of the carry after the carry's walk has ended merges them, in its own transaction, before its documents and
+/// before the register is applied (unit P, ruled): the last page of a whole pull carries the names rows of its register's events, which are
+/// neither staged nor refused. Here the page after the carry carries a row this member does not hold (the options of a collection of
+/// another sender, gone there) and the page applies, and the row is held. Mutant: a late page's rows are not merged.
+#[test]
+fn a_page_that_carries_rows_after_the_carry_has_ended_merges_them() {
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    while progress.after().is_none_or(|cursor| matches!(cursor.carry, Carry::At(_))) {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(!progress.is_complete(), "premise: the carry ended and the documents have not begun");
+    let mut page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+    assert!(page.carried.is_empty(), "premise: the sender sends no row after the carry");
+    assert!(!page.documents.is_empty(), "premise: the page holds documents");
+    let (c, _dc) = engine();
+    c.create_collection(DB, "late").unwrap();
+    c.drop_collection(DB, "late").unwrap();
+    let late = id_key(DB, "late");
+    page.carried = c
+        .snapshot_page(None, None)
+        .unwrap()
+        .carried
+        .into_iter()
+        .filter(|row| row.table == crate::CARRY_OPTIONS && row.key.as_slice() == late.as_slice())
+        .collect();
+    assert_eq!(page.carried.len(), 1, "premise: the row of a collection this member does not hold");
+    assert!(options_of(&b, "late").is_none(), "premise: not held yet");
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).expect("the page applies");
+    assert_eq!(options_of(&b, "late"), options_of(&c, "late"), "the late page's row is merged");
+    assert!(b.carry_stage_rows_for_test(a.node_id()).is_empty(), "and it was merged, not staged");
+}
+
+/// A whole pull of several pages from a sender whose register holds an event whose names row the carry's walk did not deliver (the sender
+/// stored the event after the walk passed its key): the last page carries the row, the pull completes and the joiner holds it. (The twin in
+/// backup_register_tests also restores a backup of the joiner.) Mutant: a late page's rows are not merged.
+#[test]
+fn a_whole_pull_of_several_pages_holds_the_names_row_its_last_page_carries() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (s, _ds) = engine();
+    for i in 0..12 {
+        s.create_collection(DB, &format!("c{i}")).unwrap();
+    }
+    // a room that splits the carry over several pages and still holds the register's carry
+    s.set_snapshot_room_for_test(Some(1_200));
+    let stored = std::sync::Arc::new(AtomicBool::new(false));
+    let stamp = Stamp::new(Hlc::new(1_000, 0), s.node_id(), s.epoch());
+    let once = std::sync::Arc::clone(&stored);
+    s.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(move |e, after| {
+        if after.is_some() && !once.swap(true, Ordering::SeqCst) {
+            let txn = e.begin_write(WriterHolder::Ddl).unwrap();
+            crate::register::put(&txn, DB, "late", stamp, kimmy_core::RegisterEvent::LogicalDrop)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+    })));
+    let (j, _dj) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let pages = pulled(&j, &s, &mut progress);
+    assert!(stored.load(Ordering::SeqCst) && pages.len() >= 3, "premise: stored between pages");
+    let last = pages.last().unwrap();
+    let key = id_key(DB, "late");
+    assert!(
+        last.carried.iter().any(|row| row.table == crate::CARRY_NAMES && row.key.as_slice() == key),
+        "premise: the last page carries the names row of the late event"
+    );
+    assert!(progress.is_complete(), "the pull completes");
+    assert!(keys(&j, Carried::Names).contains(&key), "and the joiner holds the names row");
 }
 
 /// A carried options row whose key does not derive from the names it holds is a damaged page: it fails, the progress does not move, and
@@ -1221,14 +1379,14 @@ fn a_page_without_its_database_drop_does_not_decode() {
 // -- Rulings of 4:3x: scoped pulls STAGE (keyed by peer AND scope), and the carry page's cursor reserve is tested -------------------------------
 
 /// A scoped pull and a whole-database pull from the SAME peer run interleaved, and neither empties or merges the other's staging: the
-/// whole pull is stopped after its carry (rows staged under the peer and no scope), and a scoped pull of a gone collection of that peer
+/// whole pull is stopped in its carry (rows staged under the peer and no scope), and a scoped pull of a gone collection of that peer
 /// completes in between (its page 0 empties only the staging of ITS scope, and its completion merges only its own).
 #[test]
 fn a_scoped_pull_and_a_whole_pull_from_one_peer_do_not_touch_each_others_staging() {
     let (a, _da) = a_sender_with_ghosts(30);
     a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
     let (b, _db) = engine();
-    let mut whole = stopped_after_the_carry(&b, &a);
+    let mut whole = stopped_in_the_carry(&b, &a);
     let staged = b.carry_stage_rows_for_test(a.node_id());
     assert!(!staged.is_empty(), "premise: the whole pull staged rows");
     // the scoped pull of one gone collection, to its end, between two pages of the whole pull
@@ -1364,12 +1522,13 @@ fn a_holder_whose_life_is_at_or_below_the_databases_drop_is_ended_by_it() {
 }
 
 /// A scoped pull of two pages, whose sender drops the collection between them, ends on a page with no document, delete or grant: the rows
-/// the first page staged are still merged, in a transaction the completion opens for them. The sender's definition lags its options row (the
+/// ride the first page, which ends the scoped carry and merges them in its own transaction, before the second page is asked for (unit P:
+/// not at the pull's completion). The sender's definition lags its options row (the
 /// state a stop between the row's commit and the definition's adoption leaves, built by hand: since unit P the definition otherwise follows
 /// the row), so the later creation's row is the one thing only the carry brings. WHY: under unit P a standing collection's page definition carries the
 /// row's policy stamp, so the carry is the only source exactly when the definition lags the row.
 #[test]
-fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
+fn a_scoped_pull_merges_its_rows_on_its_first_page_though_it_ends_on_a_page_of_nothing() {
     let base = physical_now_ms();
     let (a, _da) = engine();
     let (c, _dc) = engine();
@@ -1408,15 +1567,27 @@ fn a_scoped_pull_that_ends_on_a_page_of_nothing_still_merges_what_it_staged() {
     })));
     let (b, _db) = engine();
     let mut progress = scoped(id);
-    let pages = pulled(&b, &source, &mut progress);
-    assert_eq!(pages.len(), 2, "premise: two pages, the second without a document");
-    let nothing = pages[1].documents.is_empty() && pages[1].carried.is_empty();
-    assert!(nothing, "premise: and nothing else");
+    let first = source.snapshot_page(None, Some(id)).unwrap();
+    assert!(!first.carried.is_empty(), "premise: the first page carries the row");
+    b.apply_snapshot_page(source.node_id(), &mut progress, &first).unwrap();
+    assert!(!progress.is_complete(), "premise: the pull goes on to a second page");
     assert_eq!(
         options_of(&b, "orders").unwrap().at,
         Hlc::new(base - 1_000, 0),
-        "the first page's row, which only the carry brings, was merged"
+        "the first page's row, which only the carry brings, is merged by that page"
     );
+    assert!(
+        !b.carry_stage_has_rows(source.node_id(), Some(id)).unwrap(),
+        "and nothing is left staged for the second page to merge"
+    );
+    let second = source.snapshot_page(progress.after().cloned(), Some(id)).unwrap();
+    assert!(
+        second.documents.is_empty() && second.carried.is_empty(),
+        "premise: the second page is the drop and nothing else"
+    );
+    b.apply_snapshot_page(source.node_id(), &mut progress, &second).unwrap();
+    assert!(progress.is_complete(), "the pull ends on the page of nothing");
+    assert_eq!(options_of(&b, "orders").unwrap().at, Hlc::new(base - 1_000, 0), "and holds it");
 }
 
 /// The progress guarantee of the carry: a page room below one carried row still sends one row a page, so the carry ends. Each page holds at
