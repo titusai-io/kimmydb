@@ -639,13 +639,16 @@ fn a_parked_row_with_no_entry_in_the_backup_refuses_the_restore() {
 // -- Test 7: the classification --------------------------------------------------------------------------------------------------------
 
 #[test]
-fn the_four_register_tables_are_carried_and_none_is_classed_as_not_carried() {
+fn the_register_tables_are_carried_and_none_is_classed_as_not_carried() {
     let source = include_str!("backup.rs");
     let carried = &source[source.find("const CARRIED").expect("the carried list")
         ..source.find("const NOT_CARRIED").expect("the not-carried list")];
     let not_carried = &source[source.find("const NOT_CARRIED").expect("the not-carried list")..];
     let not_carried = &not_carried[..not_carried.find("];").expect("its end")];
-    for table in ["REGISTER", "REGISTER_INFO", "REGISTER_STAGES", "REGISTER_POST"] {
+    // The names table (unit N) is the fifth: a physical's id to its database and names.
+    let tables =
+        ["REGISTER", "REGISTER_INFO", "REGISTER_STAGES", "REGISTER_POST", "REGISTER_NAMES"];
+    for table in tables {
         let quoted = format!("\"{table}\"");
         assert!(carried.contains(&quoted), "{table} is in CARRIED");
         assert!(

@@ -2081,14 +2081,17 @@ fn a_joiner_refuses_a_stage_with_no_stage_information_and_the_name_stays_dropped
         vec![drop.stamp],
         "the joiner holds the drop"
     );
-    // The joiner cannot name the id of a name whose events arrive with no stage row (`apply_carried` stores such rows by id: it holds no
-    // collection of the name to name it from), so no pass ran for it and it holds no row. The answer is right and it is counted: the
-    // resolution is computed from the events and reads as a fallback. It heals at the name's next event, and is fixed with the id to name
-    // table of the next wire bump.
-    assert!(the_row(&j).is_none(), "the joiner holds no row for the name: it could not name it");
+    // The joiner names the id of the name from the names table the source's carry brings (unit N: a name's row is written at its first
+    // register row of any kind, and rides ONE page of the carry), so the pass ran for it and it holds the row the source holds. Nothing
+    // is answered by the computation, and nothing is counted as a fallback.
+    assert_eq!(
+        the_row(&j).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Dropped),
+        "the joiner holds the name's row: the page names the events"
+    );
     assert_eq!(j.register_resolve_fallbacks(), 0, "premise: nothing has resolved the name yet");
     assert!(j.resolve(DB, "orders").is_err(), "the name is absent, as on the source");
-    assert_eq!(j.register_resolve_fallbacks(), 1, "answered by the computation, and counted");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "answered from the row, and not counted");
     assert!(
         m.get_collection(DB, STAGE1).is_ok() && j.get_collection(DB, STAGE1).is_err(),
         "the source holds the stage and the joiner refused it: the two differ by it, as designed"
@@ -2173,30 +2176,35 @@ fn a_stale_member_holding_the_identity_buries_it_when_it_joins_from_events_with_
     assert_eq!(d.register_resolve_fallbacks(), 0, "from the row: no fallback");
 }
 
-/// A FRESH joiner holds nothing to name the events from (the identity, or a hidden collection of the name), so it stores them by id, runs
-/// no pass and holds no row: each resolve of the name is answered by the computation, correctly, and counted as a fallback. It heals at
-/// the name's next event: the stage's creation, taken by a window, writes its row and runs the pass.
+/// A FRESH joiner holds nothing of the name to name the events from (the identity, or a hidden collection of the name), and the sender
+/// holds no stage row for it, but the sender's names table has the name's row (unit N: written at the name's first register row of any
+/// kind, here the window's drop) and one page of the carry brings it. So the joiner names the events, runs the pass and holds the name's
+/// row: no resolve of the name is answered by the computation, and the stage's creation, taken later by a window, changes none of it.
 #[test]
-fn a_fresh_joiner_from_events_with_no_stage_row_counts_a_fallback_until_the_stage_arrives() {
+fn a_fresh_joiner_from_events_with_no_stage_row_holds_the_name_and_counts_no_fallback() {
     let (c, _d, creation, _dirs) =
         a_stale_member_joins_from_one_whose_events_have_no_stage_row(true);
     let (j, _dj) = engine();
     pull(&j, &c);
     assert!(!the_events_of_orders(&j).is_empty(), "premise: the joiner holds the name's events");
-    assert!(the_row(&j).is_none(), "the joiner holds no row: it holds nothing to name them from");
-    assert_eq!(j.register_resolve_fallbacks(), 0, "premise: nothing has resolved the name yet");
-    assert!(j.resolve(DB, "orders").is_err(), "the name is absent");
-    assert!(j.resolve(DB, "orders").is_err(), "and still");
-    assert_eq!(j.register_resolve_fallbacks(), 2, "each resolve is answered by the computation");
-    window(&j, std::slice::from_ref(&creation));
-    assert!(the_stage_row_of(&j, STAGE1).is_some(), "the stage's creation writes its row");
     assert_eq!(
         the_row(&j).map(|row| row.kind),
         Some(crate::register::VisibleKind::Dropped),
-        "and the pass it runs writes the name's row"
+        "the joiner holds the name's row: the page names the events"
+    );
+    assert_eq!(j.register_resolve_fallbacks(), 0, "premise: nothing has resolved the name yet");
+    assert!(j.resolve(DB, "orders").is_err(), "the name is absent");
+    assert!(j.resolve(DB, "orders").is_err(), "and still");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "each resolve is answered from the row");
+    window(&j, std::slice::from_ref(&creation));
+    assert!(the_stage_row_of(&j, STAGE1).is_some(), "the stage's creation still writes its row");
+    assert_eq!(
+        the_row(&j).map(|row| row.kind),
+        Some(crate::register::VisibleKind::Dropped),
+        "and the name's row is as it was"
     );
     assert!(j.resolve(DB, "orders").is_err(), "the name is still absent");
-    assert_eq!(j.register_resolve_fallbacks(), 2, "and is answered from the row: no new fallback");
+    assert_eq!(j.register_resolve_fallbacks(), 0, "and no resolve was ever counted");
 }
 
 #[test]
