@@ -112,7 +112,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Restore { from, until, replace: _ } => {
+        Command::Restore { from, until, replace } => {
             // Into the configured data directory, at the same filename a node
             // opens, so that starting the node afterwards needs no extra flag.
             let target = config.storage.data_dir.join("kimmy.redb");
@@ -124,6 +124,20 @@ fn main() -> Result<()> {
 
             let info = kimmy_storage::backup::restore(&target, &mut file)
                 .with_context(|| format!("restoring into {}", target.display()))?;
+            // A halted host's directory holds a containment file naming the newest epoch it was
+            // told of (D13 containment, ADR-274): the restore mints strictly above it, in every
+            // open it makes.
+            let floor = match info.node {
+                Some(node) => {
+                    kimmy_cluster::containment::restore_floor(&config.storage.data_dir, node)
+                        .context("reading the containment file")?
+                }
+                None => None,
+            };
+            let open_options = match floor {
+                Some(floor) => kimmy_storage::OpenOptions::new().epoch_floor(floor),
+                None => kimmy_storage::OpenOptions::new(),
+            };
 
             eprintln!(
                 "restored {} records into {} (node {}, backup taken at {})",
@@ -135,7 +149,7 @@ fn main() -> Result<()> {
             if let Some(until_ms) = until {
                 // Opened only after the restore has written the file, because
                 // the rewind reads the oplog the restore just put there.
-                let engine = kimmy_storage::Engine::open(&target)
+                let engine = kimmy_storage::Engine::open_with(&target, &open_options)
                     .with_context(|| format!("opening {} to rewind it", target.display()))?;
                 let outcome = engine
                     .rewind_to(kimmy_core::Hlc::new(until_ms, 0))
@@ -164,12 +178,21 @@ fn main() -> Result<()> {
             // Where the first start's replay of the node's own origin begins: the
             // position the backup holds, so what the node made after it is read back
             // from its peers even if a start before it reaches one writes first.
-            let position = {
-                let engine = kimmy_storage::Engine::open(&target).with_context(|| {
-                    format!("opening {} to read its position", target.display())
-                })?;
-                engine.own_position_at_open()
+            let (position, minted) = {
+                let engine = kimmy_storage::Engine::open_with(&target, &open_options)
+                    .with_context(|| {
+                        format!("opening {} to read its position", target.display())
+                    })?;
+                (engine.own_position_at_open(), engine.epoch())
             };
+            // `--replace` names the epoch this restore minted, and is honoured only for a store on
+            // it; a restore without it leaves no such entry behind.
+            let mut containment =
+                kimmy_cluster::containment::read_marker_file(&config.storage.data_dir)
+                    .context("reading the containment file")?;
+            containment.replace = replace.then_some(minted);
+            kimmy_cluster::containment::write_marker_file(&config.storage.data_dir, &containment)
+                .context("writing the containment file")?;
             kimmy_cluster::catchup::write_replay_floor(&config.storage.data_dir, position)
                 .context("writing the replay floor")?;
             eprintln!(

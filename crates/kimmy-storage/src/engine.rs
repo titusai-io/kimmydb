@@ -1498,7 +1498,13 @@ impl Engine {
     pub fn open_with(path: &Path, options: &OpenOptions) -> Result<Self> {
         let cleared =
             crate::format::check_before_open_with(path, &crate::format::BuildVersions::ours())?;
-        Self::open_cleared_forced(path, options.cache_bytes, cleared, options.force_rebuild)
+        Self::open_cleared_forced(
+            path,
+            options.cache_bytes,
+            cleared,
+            options.force_rebuild,
+            options.epoch_floor,
+        )
     }
 
     /// The read-write open, which only a [`crate::format::Cleared`] reaches.
@@ -1507,7 +1513,7 @@ impl Engine {
         cache_bytes: Option<usize>,
         cleared: crate::format::Cleared,
     ) -> Result<Self> {
-        Self::open_cleared_forced(path, cache_bytes, cleared, None)
+        Self::open_cleared_forced(path, cache_bytes, cleared, None, None)
     }
 
     /// [`Self::open_cleared`], with the live counts and the digests rebuilt
@@ -1517,6 +1523,7 @@ impl Engine {
         cache_bytes: Option<usize>,
         cleared: crate::format::Cleared,
         force_rebuild: Option<&'static str>,
+        epoch_floor: Option<Epoch>,
     ) -> Result<Self> {
         // Through a backend that meters what it is asked for, so a hold can
         // say how much of it was the disk (ADR-176). Opened exactly as
@@ -1778,7 +1785,7 @@ impl Engine {
         let mut clock = HlcClock::resuming_from(resumed);
         // After the clock resumed, so a minted epoch starts at or above every stamp the store
         // holds. A first open, a restored store and a rewound one all find no row and mint.
-        let (epoch, minted) = Self::load_or_mint_epoch(&db, &mut clock)?;
+        let (epoch, minted) = Self::load_or_mint_epoch(&db, &mut clock, epoch_floor)?;
         // No entry of an epoch is older than its start: a peer that has never witnessed this
         // origin asks for it from there (`VersionVector::behind`), and a write stamped below it
         // would never be asked for. A kept epoch may have been minted on a clock ahead of this
@@ -3166,7 +3173,11 @@ impl Engine {
     /// above every stamp the store holds; the other 64 bits come from the operating system. The
     /// mint reads no value from the store: a row is read back only as this member's own earlier
     /// mint, and a restore does not carry it (`backup.rs`).
-    fn load_or_mint_epoch(db: &Database, clock: &mut HlcClock) -> Result<(Epoch, bool)> {
+    fn load_or_mint_epoch(
+        db: &Database,
+        clock: &mut HlcClock,
+        floor: Option<Epoch>,
+    ) -> Result<(Epoch, bool)> {
         let txn = db.begin_write()?;
         let found = {
             let meta = txn.open_table(tables::META)?;
@@ -3178,6 +3189,13 @@ impl Engine {
                 false,
             ),
             None => {
+                // A floor (the newer epoch a halted host was told of, ADR-274) is witnessed before
+                // the tick, so the start is strictly above it whatever the clock says; at an equal
+                // start the order would be the random bytes', and a re-restore would lose half the
+                // time (finding 11).
+                if let Some(floor) = floor {
+                    clock.witness(floor.start_hlc());
+                }
                 let start = clock.tick(physical_now_ms());
                 let epoch = Epoch::generate(start);
                 txn.open_table(tables::META)?.insert(tables::META_EPOCH, epoch.0.as_slice())?;

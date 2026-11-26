@@ -1,11 +1,7 @@
 //! D13 containment (ADR-274), the cluster half: when a peer's claim of an epoch is believed and
 //! bounded, when a halt marker applies to a store, and what the mistaken-restore guard waits for.
 //!
-//! The pure decisions are real. **The containment file's functions (`write_marker_file`,
-//! `read_marker_file`, `clear_marker_file`, `restore_floor`) are still the scaffold of the tests
-//! commits**: they compile and do nothing, so that the tests of the file are red on their designed
-//! assertions. A later code commit replaces them, and none survives to the last commit (a source
-//! scan asserts it).
+//! The decisions are pure functions, and the containment file's reading and writing are here too.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -170,27 +166,110 @@ pub struct MarkerFile {
     pub replace: Option<Epoch>,
 }
 
-/// Write the containment file: to a temporary name, synced, then renamed, so a crash leaves the old
-/// file or the new one and never half of one.
-pub fn write_marker_file(_data_dir: &Path, _file: &MarkerFile) -> std::io::Result<()> {
-    Ok(())
+/// The file's lines are `key=value`: `node`, `floor` (an epoch's 36 hex digits), `guard_epoch` and
+/// `guard_address` (both or neither), and `replace` (an epoch). A key that is absent is none.
+fn render(file: &MarkerFile) -> String {
+    let mut out = String::new();
+    if let Some(marker) = &file.marker {
+        out.push_str(&format!("node={}\nfloor={}\n", marker.node, marker.floor.to_hex()));
+        if let Some(guard) = &marker.guard {
+            out.push_str(&format!(
+                "guard_epoch={}\nguard_address={}\n",
+                guard.epoch.to_hex(),
+                guard.address
+            ));
+        }
+    }
+    if let Some(replace) = &file.replace {
+        out.push_str(&format!("replace={}\n", replace.to_hex()));
+    }
+    out
 }
 
-/// Read the containment file: an absent file is an empty one.
-pub fn read_marker_file(_data_dir: &Path) -> std::io::Result<MarkerFile> {
-    Ok(MarkerFile::default())
+fn invalid(what: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("the containment file: {what}"))
+}
+
+fn parse(text: &str) -> std::io::Result<MarkerFile> {
+    let mut node = None;
+    let mut floor = None;
+    let mut guard_epoch = None;
+    let mut guard_address = None;
+    let mut replace = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let (key, value) = line.split_once('=').ok_or_else(|| invalid("a line has no `=`"))?;
+        let epoch =
+            || Epoch::from_hex(value).ok_or_else(|| invalid("an epoch is not 36 hex digits"));
+        match key {
+            "node" => node = Some(value.parse::<NodeId>().map_err(|_| invalid("a bad node id"))?),
+            "floor" => floor = Some(epoch()?),
+            "guard_epoch" => guard_epoch = Some(epoch()?),
+            "guard_address" => {
+                guard_address =
+                    Some(value.parse::<SocketAddr>().map_err(|_| invalid("a bad address"))?)
+            }
+            "replace" => replace = Some(epoch()?),
+            other => return Err(invalid(&format!("an unknown key `{other}`"))),
+        }
+    }
+    let guard = match (guard_epoch, guard_address) {
+        (Some(epoch), Some(address)) => Some(GuardHalt { epoch, address }),
+        (None, None) => None,
+        _ => return Err(invalid("the guard's epoch and address come together")),
+    };
+    let marker = match (node, floor) {
+        (Some(node), Some(floor)) => Some(Marker { node, floor, guard }),
+        (None, None) if guard.is_none() => None,
+        _ => return Err(invalid("a marker has a node and a floor")),
+    };
+    Ok(MarkerFile { marker, replace })
+}
+
+/// Write the containment file: to a temporary name, synced, then renamed, so a crash leaves the old
+/// file or the new one and never half of one. An empty file (no marker, no flag) removes it.
+pub fn write_marker_file(data_dir: &Path, file: &MarkerFile) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = render(file);
+    if text.is_empty() {
+        return clear_marker_file(data_dir);
+    }
+    let target = data_dir.join(MARKER_FILE);
+    let temporary = data_dir.join(format!("{MARKER_FILE}.tmp"));
+    {
+        let mut out = std::fs::File::create(&temporary)?;
+        out.write_all(text.as_bytes())?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&temporary, &target)?;
+    // The rename itself is made durable with the directory.
+    std::fs::File::open(data_dir)?.sync_all()
+}
+
+/// Read the containment file: an absent file is an empty one, and one that does not parse is an
+/// error, never an empty file (a marker that cannot be read must not read as no halt).
+pub fn read_marker_file(data_dir: &Path) -> std::io::Result<MarkerFile> {
+    match std::fs::read_to_string(data_dir.join(MARKER_FILE)) {
+        Ok(text) => parse(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MarkerFile::default()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove the containment file; removing an absent one is not an error.
-pub fn clear_marker_file(_data_dir: &Path) -> std::io::Result<()> {
-    Ok(())
+pub fn clear_marker_file(data_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(data_dir.join(MARKER_FILE)) {
+        Ok(()) => std::fs::File::open(data_dir)?.sync_all(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The epoch a restore of `node`'s backup into `data_dir` must mint strictly above: the floor of
 /// the marker, the newest epoch the directory was ever told of. `None` for no marker, a marker of
 /// another node, a marker whose floor is none, and a file with only a `--replace` flag.
-pub fn restore_floor(_data_dir: &Path, _node: NodeId) -> std::io::Result<Option<Epoch>> {
-    Ok(None)
+pub fn restore_floor(data_dir: &Path, node: NodeId) -> std::io::Result<Option<Epoch>> {
+    let file = read_marker_file(data_dir)?;
+    Ok(file.marker.filter(|m| m.node == node && m.floor != Epoch::ZERO).map(|m| m.floor))
 }
 
 /// Act on a tell that a newer epoch of `node` exists (the model row's finding 3). Called with a
@@ -230,5 +309,18 @@ pub(crate) fn act_on_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: E
     }
     if let Err(e) = engine.note_epoch(node, epoch) {
         tracing::warn!(error = %e, "the newer epoch could not be noted; a handshake relearns it");
+    }
+    record_the_tell(engine, node, epoch);
+}
+
+/// Write the tell into the containment file beside the store, after the halt row has committed: the
+/// restart record, and the floor a recovery restore mints above. The halt row is the authority; a
+/// crash between the two re-derives the halt from the first contact.
+fn record_the_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: Epoch) {
+    let Some(dir) = engine.path().parent() else { return };
+    let held = read_marker_file(dir).unwrap_or_default();
+    let marker = marker_told(held.marker.as_ref(), node, epoch);
+    if let Err(e) = write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held }) {
+        tracing::error!(error = %e, "the containment file could not be written beside the store");
     }
 }
