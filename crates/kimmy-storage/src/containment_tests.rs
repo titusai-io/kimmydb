@@ -242,6 +242,34 @@ fn a_halt_survives_a_restart() {
     );
 }
 
+/// What wakes a stream that is open at the halt (6e): the engine hands out a watch on the halt,
+/// which reads `false` until the halt and `true` from then on, and a subscriber is told of the
+/// change.
+#[test]
+fn a_halt_is_heard_by_a_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir.path().join("kimmy.redb"));
+    let mut heard = engine.halt_watch();
+    assert!(!*heard.borrow_and_update(), "premise: not halted");
+    engine.halt(an_epoch_ahead(1_000, 7)).unwrap();
+    assert!(heard.has_changed().unwrap(), "the subscriber is told of the halt");
+    assert!(*heard.borrow_and_update(), "and reads halted");
+}
+
+/// A store that starts halted reads halted to a subscriber from the first moment, so a stream
+/// opened on it is closed by the pump's own look after subscribing.
+#[test]
+fn a_store_that_starts_halted_reads_halted_to_a_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = open(&path);
+        engine.halt(an_epoch_ahead(1_000, 8)).unwrap();
+    }
+    let again = open(&path);
+    assert!(*again.halt_watch().borrow(), "halted at the open");
+}
+
 /// A backup of a halted host, restored, is a new epoch: the row names the epoch it halts, so the
 /// restored host is not halted (the review of the plan, B).
 #[test]

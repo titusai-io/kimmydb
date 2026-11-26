@@ -353,6 +353,9 @@ pub struct Engine {
     /// What the halt knows of why: set with [`Self::halted_flag`], and read by readiness and the
     /// refusal's text.
     halt_info: Mutex<Option<crate::containment::Halt>>,
+    /// The halt as a watch, for what is open when it lands (a change stream's pump): `true` from
+    /// the halt on, and at an open that finds the halt row. **Scaffold: never set.**
+    halt_watch: tokio::sync::watch::Sender<bool>,
     /// Set at the node's stop signal, for reads that walk: see
     /// [`Engine::stop_walks`].
     walks_stopping: std::sync::atomic::AtomicBool,
@@ -1920,6 +1923,7 @@ impl Engine {
             met_peer_written: std::sync::atomic::AtomicBool::new(false),
             halted_flag: std::sync::atomic::AtomicBool::new(false),
             halt_info: Mutex::new(None),
+            halt_watch: tokio::sync::watch::channel(false).0,
             walks_stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
@@ -2621,6 +2625,14 @@ impl Engine {
                 Err(StorageError::Database(e.to_string()))
             }
         }
+    }
+
+    /// A watch on the halt: reads `false` until this host is halted and `true` from then on, so a
+    /// long-lived reader (a change stream's pump) is woken when the halt lands (D13 containment,
+    /// ADR-274). A reader that subscribes reads the current value, and so sees a halt that is
+    /// already in force.
+    pub fn halt_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.halt_watch.subscribe()
     }
 
     /// The halt this host is in, if any: `None` when it was never halted, and `None` when the

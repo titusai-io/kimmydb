@@ -22,7 +22,7 @@ struct Member {
     engine: Arc<Engine>,
     token: String,
     told: Epoch,
-    _state: SharedState,
+    state: SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -77,7 +77,7 @@ async fn member() -> Member {
         .unwrap();
     assert_eq!(created.status(), 200);
     let told = Epoch::new(Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0), [3; 8]);
-    Member { base, engine, token, told, _state: state, _dir: dir }
+    Member { base, engine, token, told, state, _dir: dir }
 }
 
 impl Member {
@@ -201,4 +201,90 @@ async fn a_halted_host_is_not_ready_and_says_why() {
         "the reason names the newer epoch the host was told of: {}",
         ready.text
     );
+}
+
+// -- streams that are open when the halt lands (6e) ----------------------------------------------
+
+/// Upgrade `path` on `host` by hand and return the socket once the handshake has answered `101`.
+async fn open_stream(host: &str, path: &str, token: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Authorization: Bearer {token}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"), "the stream opens");
+    stream
+}
+
+/// The close frame the server sends: its code and its reason, or a failure if none arrives.
+async fn close_of(
+    stream: &mut tokio::net::TcpStream,
+    within: std::time::Duration,
+) -> (u16, String) {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; 2];
+    tokio::time::timeout(within, stream.read_exact(&mut header))
+        .await
+        .expect("the stream is closed")
+        .unwrap();
+    assert_eq!(header[0] & 0x0f, 8, "a close frame, opcode {}", header[0] & 0x0f);
+    let mut payload = vec![0u8; usize::from(header[1] & 0x7f)];
+    stream.read_exact(&mut payload).await.unwrap();
+    (u16::from_be_bytes([payload[0], payload[1]]), String::from_utf8_lossy(&payload[2..]).into())
+}
+
+/// A change stream open on a host that is then halted is closed with the going-away code, naming
+/// `halted`: left open it would go on delivering from a store the rest of the cluster has moved
+/// past. Before the halt it is quiet.
+#[tokio::test]
+async fn an_open_change_stream_is_closed_when_the_host_is_halted() {
+    let member = member().await;
+    let host = member.base.strip_prefix("http://").unwrap().to_string();
+    let mut stream = open_stream(&host, "/v1/db/shop/coll/orders/watch", &member.token).await;
+
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        tokio::io::AsyncReadExt::read_u8(&mut stream),
+    )
+    .await;
+    assert!(quiet.is_err(), "nothing arrives on an idle stream of a host that is not halted");
+
+    member.halt();
+    let (code, reason) = close_of(&mut stream, std::time::Duration::from_secs(5)).await;
+    assert_eq!(code, 1001, "going away");
+    assert_eq!(reason, "halted");
+}
+
+/// A stream that gets past the request's gate as the halt lands is closed when its pump starts: the
+/// pump's receiver treats the value it subscribed at as seen, so without its own check after
+/// subscribing nothing would wake it. The handler is mounted without the gate layer, which is the
+/// request that passed the check a moment earlier.
+#[tokio::test]
+async fn a_change_stream_that_passed_the_gate_as_the_host_halted_is_closed_at_once() {
+    let member = member().await;
+    member.halt();
+    let app = axum::Router::new()
+        .route("/w/{db}/coll/{coll}/watch", axum::routing::get(kimmy_api::watch::watch_collection))
+        .with_state(Arc::clone(&member.state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let mut stream =
+        open_stream(&addr.to_string(), "/w/shop/coll/orders/watch", &member.token).await;
+    let (code, reason) = close_of(&mut stream, std::time::Duration::from_secs(5)).await;
+    assert_eq!(code, 1001, "going away");
+    assert_eq!(reason, "halted");
 }
