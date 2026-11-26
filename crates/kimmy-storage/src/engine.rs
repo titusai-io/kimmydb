@@ -7500,6 +7500,19 @@ impl Engine {
             txn.abort()?;
         } else {
             txn.commit()?;
+            // The chunk that emptied the id's ranges completes the purge (unit P, P10): the one place that knows the dropped life's rows
+            // are gone. A plain name whose options row is above its floor (a creation of it was seen while the rows stood, and waited
+            // for this purge) is made again from the row, with no entry to offer again: the creation's life, dated by the row, unmarked.
+            // The remake judges everything again under its own writer (a name that is held, swapped, a stage or a shadow, or a row at or
+            // below the floor, makes nothing), and a failure of it does not fail the purge: the next entry or page asks again.
+            // A read-only look first (no writer): a purge that has nothing to make, which is nearly every purge, takes no writer transaction
+            // beyond its chunks (the writer is released between chunks, and a burial is one DDL transaction: tests pin both).
+            if removed < DROP_PURGE_CHUNK
+                && self.remake_is_wanted(id, None, None).unwrap_or(false)
+                && let Err(error) = self.remake_from_the_row(id, None)
+            {
+                warn!(collection = %id, %error, "the purge completed, and making the collection again from its row failed");
+            }
         }
         Ok(removed)
     }
