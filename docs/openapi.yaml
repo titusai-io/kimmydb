@@ -1258,8 +1258,10 @@ paths:
                 name:
                   type: string
                   description: |
-                    A leading `__` is reserved for system collections and is
-                    refused here.
+                    A leading `__` is reserved for system collections, a name that
+                    ends with `.__vectors` for the vector shadow of a collection, and
+                    a name that contains `.__rc.` for the physical collection of a
+                    recreated name; each is refused here.
                 validator: { $ref: "#/components/schemas/ValidatorInput" }
                 validationAction: { $ref: "#/components/schemas/ValidationAction" }
                 validationLevel: { $ref: "#/components/schemas/ValidationLevel" }

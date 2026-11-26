@@ -330,6 +330,8 @@ impl Error {
             Some("must not be '.' or '..'")
         } else if crate::swap::is_recreation_name(name) {
             Some("the mark `.__rc.` is reserved for the physical collection of a recreated name")
+        } else if crate::vector_meta::is_shadow(name) {
+            Some("the suffix `.__vectors` is reserved for the vector shadow of a collection")
         } else {
             None
         };

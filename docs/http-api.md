@@ -804,7 +804,9 @@ are **filtered by what the caller may read**, so they cannot be used to discover
 objects you have no access to.
 
 Names may not be empty, exceed 120 bytes, start with `__` (reserved for system
-objects), or contain `/`, `\`, `$`, spaces, or NUL.
+objects), end with `.__vectors` (reserved for the vector shadow of a collection),
+contain the mark `.__rc.` (reserved for the physical collection of a recreated name),
+or contain `/`, `\`, `$`, spaces, or NUL.
 
 ---
 
