@@ -324,3 +324,24 @@ fn record_the_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: Epoch) {
         tracing::error!(error = %e, "the containment file could not be written beside the store");
     }
 }
+
+/// Apply the containment file's rule at a start (ruling 7): a store below the marker's floor is
+/// halted, and so is the store on the epoch the guard halted, so an older copy put back under a
+/// marker takes no writes until its first contact. Returns whether it halted. A file that cannot be
+/// read is an error and never an empty file: the start refuses rather than run unmarked.
+pub fn apply_marker_at_start(
+    engine: &kimmy_storage::Engine,
+    data_dir: &Path,
+) -> std::io::Result<bool> {
+    let Some(marker) = read_marker_file(data_dir)?.marker else { return Ok(false) };
+    if !marker_halts(&marker, engine.node_id(), engine.epoch()) {
+        return Ok(false);
+    }
+    let halted = if marker.floor > engine.epoch() {
+        engine.halt(marker.floor)
+    } else {
+        engine.halt_by_guard()
+    };
+    halted.map_err(std::io::Error::other)?;
+    Ok(true)
+}

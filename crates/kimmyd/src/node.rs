@@ -961,6 +961,18 @@ async fn start_and_serve(
         info!("a stop was asked for while the store was opening; stopping without serving");
         return Ok(ended_before_serving(serving, Some(engine), Arc::clone(&stop.by)).await);
     }
+    // The containment file's rule at a start (ADR-274): a store below its floor, or on the epoch
+    // the guard halted, is halted before anything is served or written. A file that cannot be read
+    // refuses the start.
+    if let Err(e) = kimmy_storage::blocking(|| {
+        kimmy_cluster::containment::apply_marker_at_start(&engine, &config.storage.data_dir)
+    }) {
+        return Err(anyhow::Error::new(e).context("reading the containment file"));
+    }
+    // A halted host (its halt row names its own epoch, or the rule above just halted it) leaves the
+    // ordinary start right after the state and the router are built: it serves its probes and its
+    // scrape and nothing else.
+    let halted_start = engine.halted().is_some();
     // Flipped only now, after the check above, so that the phase an operator reads
     // and the stage the stop path judges agree: a stop that came before this point
     // is a stop during the open and is reported as one, and `starting` on `/readyz`
@@ -1072,7 +1084,7 @@ async fn start_and_serve(
 
     if config.auth.insecure_no_auth {
         warn!("authentication is DISABLED; every request runs with full privileges");
-    } else {
+    } else if !halted_start {
         bootstrap_users(&engine, &config)?;
     }
 
@@ -1256,6 +1268,42 @@ async fn start_and_serve(
         kimmy_api::router_with_limits(Arc::clone(&state), mcp, config.server.request_limits());
     if serving_mcp {
         info!("serving MCP at /mcp");
+    }
+
+    // A halted host starts and stays up (ADR-274). Every write the ordinary start makes between
+    // here and `spawn_cluster` (the registry's record, the reconciles, the collector, the drop
+    // purger, the cluster and the rest) is a write the halted store refuses, and two of them turn a
+    // refusal into an exit, so none of them runs: the router goes in with the state as it is, which
+    // answers `/healthz`, `/readyz` (not ready, with the reason) and `/metrics` and refuses the
+    // rest, and a stop ends it as it ends any run.
+    if let Some(halt) = engine.halted() {
+        warn!(
+            reason = %halt.reason(),
+            "this host starts halted: it serves its probes and its scrape and nothing else, starts \
+             no listener of the cluster, no dial and no background task, and records no start (a \
+             halted host is the end of its service, not a run to measure)"
+        );
+        lifecycle::settle(&config.storage.data_dir);
+        front.install(app);
+        let served = serving.await;
+        stop.begin();
+        let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
+        let (served, connections) = match served {
+            Ok(connections) => (Ok(()), Some(connections)),
+            Err(e) => (Err(e), None),
+        };
+        if let Some(connections) = connections
+            && tokio::time::timeout(WRITES_CLOSE_CAP, connections).await.is_err()
+        {
+            warn!("HTTP connections were still open at the end of the stop's window");
+        }
+        return Ok(Served {
+            engine: Some(engine),
+            outcome: served.context("serving"),
+            closed,
+            stop_by: Arc::clone(&stop.by),
+            test_stop,
+        });
     }
 
     // Published so `/v1/topology` can tell a client where this node is. The

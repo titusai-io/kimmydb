@@ -2552,13 +2552,26 @@ impl Engine {
     /// commit fails the mirror stays set and the failure is returned: the host refuses writes until
     /// it restarts and is then told again.
     pub fn halt(&self, told: Epoch) -> Result<()> {
+        self.halt_for(Some(told))
+    }
+
+    /// [`Self::halt`] for the mistaken-restore guard, which found this node live at another address
+    /// and has no newer epoch to name (the row's told epoch is absent).
+    pub fn halt_by_guard(&self) -> Result<()> {
+        self.halt_for(None)
+    }
+
+    fn halt_for(&self, told: Option<Epoch>) -> Result<()> {
         let halt = {
             let mut info = self.halt_info.lock();
-            let told = info.and_then(|h| h.told).map_or(told, |held| held.max(told));
-            if info.is_some_and(|h| h.told == Some(told)) {
+            let told = match (info.and_then(|h| h.told), told) {
+                (Some(held), Some(told)) => Some(held.max(told)),
+                (held, told) => held.or(told),
+            };
+            if info.is_some_and(|h| h.told == told) {
                 return Ok(());
             }
-            let halt = crate::containment::Halt { halted: self.epoch, told: Some(told) };
+            let halt = crate::containment::Halt { halted: self.epoch, told };
             *info = Some(halt);
             halt
         };
@@ -2586,7 +2599,11 @@ impl Engine {
         self.coalesce_woken.notify_all();
         match result {
             Ok(_) => {
-                warn!(epoch = %self.epoch.to_hex(), told = %told.to_hex(), "this host is halted");
+                warn!(
+                    epoch = %self.epoch.to_hex(),
+                    told = ?halt.told.map(|t| t.to_hex()),
+                    "this host is halted"
+                );
                 Ok(())
             }
             Err((_, e)) => {
@@ -8659,7 +8676,7 @@ mod tests {
         const GATE: &[(&str, &str)] = &[
             ("begin_write_as", "record_writer_wait("),
             ("flush_now", "meter_writer_wait("),
-            ("halt", "meter_writer_wait("),
+            ("halt_for", "meter_writer_wait("),
             ("hold_writer", "record_writer_wait("),
             (
                 "close_writes",
