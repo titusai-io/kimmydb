@@ -122,52 +122,138 @@ fn the_guard_probes_an_address_that_lists_this_node_and_passes_when_none_does() 
     );
 }
 
-// -- the halt marker (test 17, ruling 7)
-// ---------------------------------------------------------------------------------
+// -- the halt marker (test 17, ruling 7 as the model row made it exact)
+// ----------------------------
+
+fn a_guard_halt(epoch: Epoch) -> GuardHalt {
+    GuardHalt { epoch, address: "10.1.2.3:7900".parse().unwrap() }
+}
 
 #[test]
-fn a_marker_that_names_a_newer_epoch_halts_any_store_of_that_node_below_it() {
-    let (halted, newer) = (epoch_starting(1_000), epoch_starting(2_000));
-    let marker = Marker { node: node(1), halted, told: Some(newer) };
-    assert!(marker_halts(&marker, node(1), halted), "the store it names");
+fn a_marker_halts_any_store_of_its_node_below_the_floor() {
+    let (halted, floor) = (epoch_starting(1_000), epoch_starting(2_000));
+    let marker = Marker { node: node(1), floor, guard: None };
+    assert!(marker_halts(&marker, node(1), halted), "the store that was told");
     assert!(
         marker_halts(&marker, node(1), epoch_starting(500)),
         "an OLDER copy put back under the marker (an 'epoch differs, ignore' rule would let it run)"
     );
-    assert!(marker_halts(&marker, node(1), epoch_starting(1_999)), "any epoch below the newer one");
+    assert!(marker_halts(&marker, node(1), epoch_starting(1_999)), "any epoch below the floor");
 }
 
 #[test]
-fn a_marker_does_not_halt_a_store_at_or_above_the_newer_epoch() {
-    let (halted, newer) = (epoch_starting(1_000), epoch_starting(2_000));
-    let marker = Marker { node: node(1), halted, told: Some(newer) };
-    assert!(!marker_halts(&marker, node(1), newer), "the store on the newer epoch itself");
+fn a_marker_does_not_halt_a_store_at_or_above_its_floor() {
+    let marker = Marker { node: node(1), floor: epoch_starting(2_000), guard: None };
+    assert!(!marker_halts(&marker, node(1), epoch_starting(2_000)), "on the floor itself");
     assert!(
         !marker_halts(&marker, node(1), epoch_starting(2_001)),
-        "a re-restore, above the newer epoch by the floor"
+        "a re-restore, above the floor by the mint"
     );
 }
 
+/// A guard's halt halts only the store on the epoch it halted: the host that restored and was
+/// halted for a live host at that address, and no other store of the node.
 #[test]
-fn a_guard_only_marker_halts_only_the_store_on_its_epoch() {
+fn a_guard_halt_halts_only_the_store_on_its_epoch() {
     let halted = epoch_starting(1_000);
-    let marker = Marker { node: node(1), halted, told: None };
-    assert!(marker_halts(&marker, node(1), halted), "the store on the epoch it names");
-    assert!(
-        !marker_halts(&marker, node(1), epoch_starting(1_001)),
-        "another epoch is a different store"
-    );
-    assert!(
-        !marker_halts(&marker, node(1), epoch_starting(999)),
-        "a lower one too: there is no newer epoch to be below"
-    );
+    let marker = Marker { node: node(1), floor: Epoch::ZERO, guard: Some(a_guard_halt(halted)) };
+    assert!(marker_halts(&marker, node(1), halted), "the store on the epoch the guard halted");
+    assert!(!marker_halts(&marker, node(1), epoch_starting(1_001)), "another epoch");
+    assert!(!marker_halts(&marker, node(1), epoch_starting(999)), "no floor to be below");
 }
 
 #[test]
 fn a_marker_of_another_node_is_ignored() {
-    let (halted, newer) = (epoch_starting(1_000), epoch_starting(2_000));
-    assert!(!marker_halts(&Marker { node: node(1), halted, told: Some(newer) }, node(2), halted));
-    assert!(!marker_halts(&Marker { node: node(1), halted, told: None }, node(2), halted));
+    let marker = Marker {
+        node: node(1),
+        floor: epoch_starting(2_000),
+        guard: Some(a_guard_halt(epoch_starting(1_000))),
+    };
+    assert!(!marker_halts(&marker, node(2), epoch_starting(1_000)));
+    assert!(!marker_halts(&marker, node(2), epoch_starting(500)));
+}
+
+/// A tell raises the floor and never lowers it, and a guard halt already recorded is kept.
+#[test]
+fn a_tell_raises_the_floor_and_never_lowers_it() {
+    let first = marker_told(None, node(1), epoch_starting(2_000));
+    assert_eq!(first.floor, epoch_starting(2_000), "the first tell sets the floor");
+    let higher = marker_told(Some(&first), node(1), epoch_starting(3_000));
+    assert_eq!(higher.floor, epoch_starting(3_000));
+    let lower = marker_told(Some(&higher), node(1), epoch_starting(2_500));
+    assert_eq!(lower.floor, epoch_starting(3_000), "an older tell does not lower it");
+}
+
+/// Row 4c, mutant `floor-lost-at-guard`: a later halt that has only the guard's reason keeps the
+/// floor an earlier tell set, or a recovery that the guard halted mints below it.
+#[test]
+fn a_later_guard_halt_keeps_the_floor() {
+    let told = marker_told(None, node(1), epoch_starting(2_000));
+    let guarded = marker_guard_halted(Some(&told), node(1), a_guard_halt(epoch_starting(2_100)));
+    assert_eq!(guarded.floor, epoch_starting(2_000), "the floor survives the guard's halt");
+    assert_eq!(guarded.guard, Some(a_guard_halt(epoch_starting(2_100))));
+    let again = marker_told(Some(&guarded), node(1), epoch_starting(1_500));
+    assert_eq!(again.guard, guarded.guard, "and a tell keeps the guard's halt");
+}
+
+// -- a tell is bounded on the told side, and a superseded peer runs no round (model row, finding 3)
+// --
+
+#[test]
+fn a_tell_is_acted_on_only_when_it_is_newer_and_within_the_told_hosts_bound() {
+    let own = epoch_starting(CLOCK - 5_000);
+    assert!(tell_acted_on(CLOCK, SKEW, own, epoch_starting(CLOCK)), "newer and in the bound");
+    assert!(
+        tell_acted_on(CLOCK, SKEW, own, epoch_starting(CLOCK + SKEW)),
+        "exactly at the bound is believed, as a claim is"
+    );
+    assert!(
+        !tell_acted_on(CLOCK, SKEW, own, epoch_starting(CLOCK + SKEW + 1)),
+        "a tell beyond the told host's bound is not acted on (mutant `tell-unbounded`)"
+    );
+    assert!(!tell_acted_on(CLOCK, SKEW, own, Epoch::MAX), "Epoch::MAX is never acted on");
+    assert!(!tell_acted_on(CLOCK, SKEW, own, own), "an equal epoch is not newer");
+    assert!(
+        !tell_acted_on(CLOCK, SKEW, own, epoch_starting(CLOCK - 10_000)),
+        "an older one neither"
+    );
+}
+
+/// A member that knows its peer is on an older epoch of its node runs no round with it, whether or
+/// not the tell was acted on (mutant `round-with-superseded`): this keeps the cluster's side
+/// contained when the told host's clock is too far behind to act.
+#[test]
+fn no_round_runs_with_a_peer_on_an_epoch_older_than_the_newest_known() {
+    let (older, newest) = (epoch_starting(1_000), epoch_starting(2_000));
+    assert!(!runs_round(newest, older), "the peer is superseded");
+    assert!(runs_round(newest, newest), "the peer is on the newest epoch");
+    assert!(runs_round(older, newest), "the peer is newer than anything known");
+    assert!(runs_round(Epoch::ZERO, older), "nothing is known of the node");
+}
+
+// -- the recovery restore (tests 4 and 17: which case each is)
+// --------------------------------------
+
+/// The recovery makes a third host of the node: the newer host, if it is up, halts it through the
+/// guard unless `--replace` was honoured, and with it the newer host is then told and halts. With
+/// the newer host stopped, the recovered host proceeds.
+#[test]
+fn a_recovery_restore_wins_only_with_replace_or_when_the_newer_host_is_stopped() {
+    assert_eq!(
+        recovery_outcome(true, false),
+        Recovery { recovered_host_halts: true, newer_host_halts: false },
+        "row 4c: the newer host is up and no --replace: the guard halts the recovered host"
+    );
+    assert_eq!(
+        recovery_outcome(true, true),
+        Recovery { recovered_host_halts: false, newer_host_halts: true },
+        "row 4b: --replace: the recovered host proceeds and the host that halted it is told"
+    );
+    assert_eq!(
+        recovery_outcome(false, false),
+        Recovery { recovered_host_halts: false, newer_host_halts: false },
+        "the newer host is stopped: nothing answers the guard"
+    );
 }
 
 // -- `--replace` (ruling 2)

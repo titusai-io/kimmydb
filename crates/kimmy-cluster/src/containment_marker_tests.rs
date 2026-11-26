@@ -15,7 +15,11 @@ fn node(n: u8) -> NodeId {
 }
 
 fn a_marker() -> Marker {
-    Marker { node: node(1), halted: epoch_starting(1_000), told: Some(epoch_starting(2_000)) }
+    Marker { node: node(1), floor: epoch_starting(2_000), guard: None }
+}
+
+fn a_guard_halt() -> GuardHalt {
+    GuardHalt { epoch: epoch_starting(1_000), address: "10.1.2.3:7900".parse().unwrap() }
 }
 
 #[test]
@@ -41,8 +45,10 @@ fn a_marker_and_a_replace_flag_are_written_and_read_back() {
     write_marker_file(dir.path(), &file).unwrap();
     assert!(dir.path().join(MARKER_FILE).exists(), "the file is in the data directory");
     assert_eq!(read_marker_file(dir.path()).unwrap(), file);
-    let guard_only =
-        MarkerFile { marker: Some(Marker { told: None, ..a_marker() }), replace: None };
+    let guard_only = MarkerFile {
+        marker: Some(Marker { guard: Some(a_guard_halt()), ..a_marker() }),
+        replace: None,
+    };
     write_marker_file(dir.path(), &guard_only).unwrap();
     assert_eq!(
         read_marker_file(dir.path()).unwrap(),
@@ -83,11 +89,14 @@ fn a_restore_floor_is_the_newer_epoch_the_marker_names() {
 }
 
 #[test]
-fn the_floor_of_a_guard_only_marker_is_the_epoch_it_halted() {
+fn a_guard_only_marker_has_no_floor_and_a_guard_marker_keeps_the_floor_it_had() {
     let dir = tempfile::tempdir().unwrap();
-    let marker = Marker { told: None, ..a_marker() };
-    write_marker_file(dir.path(), &MarkerFile { marker: Some(marker), replace: None }).unwrap();
-    assert_eq!(restore_floor(dir.path(), node(1)).unwrap(), Some(epoch_starting(1_000)));
+    let guard_only = Marker { floor: Epoch::ZERO, guard: Some(a_guard_halt()), ..a_marker() };
+    write_marker_file(dir.path(), &MarkerFile { marker: Some(guard_only), replace: None }).unwrap();
+    assert_eq!(restore_floor(dir.path(), node(1)).unwrap(), None, "no tell, no floor");
+    let both = Marker { guard: Some(a_guard_halt()), ..a_marker() };
+    write_marker_file(dir.path(), &MarkerFile { marker: Some(both), replace: None }).unwrap();
+    assert_eq!(restore_floor(dir.path(), node(1)).unwrap(), Some(epoch_starting(2_000)));
 }
 
 /// A marker of another node, and a file with only a `--replace` flag, set no floor: a restore of a

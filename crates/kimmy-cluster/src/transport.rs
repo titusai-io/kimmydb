@@ -1282,6 +1282,7 @@ where
                         facts_gen,
                         echo,
                         replay_from: replay_cursor,
+                        newest_epochs: Vec::new(),
                     },
                 )
                 .await?;
@@ -2787,7 +2788,7 @@ where
         say_malformed_replay_from(their_node);
     }
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
+        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from, .. } => {
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -8112,6 +8113,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
@@ -8187,6 +8189,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
 
         let stalls = a_round_answered_with(&engine, answer, orders.id).await;
@@ -8223,6 +8226,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: Some(far),
+            newest_epochs: Vec::new(),
         };
 
         // The round goes on to the check: the replay was not served, so no replay page was sent.
@@ -8423,6 +8427,7 @@ mod tests {
             facts_gen: Some(8),
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
         let far = tokio::spawn(peer(theirs, answer, Some(sent)));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8446,6 +8451,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
         let far = tokio::spawn(peer(theirs, bare, None));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8478,6 +8484,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
@@ -8537,6 +8544,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8670,6 +8678,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8743,6 +8752,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8820,6 +8830,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8917,6 +8928,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9109,6 +9121,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9375,6 +9388,7 @@ mod tests {
                             facts_gen: None,
                             echo: None,
                             replay_from: None,
+                            newest_epochs: Vec::new(),
                         };
                         write_frame(&mut stream, &answer).await.unwrap();
                     }
@@ -9480,6 +9494,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9590,6 +9605,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
@@ -9842,6 +9858,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -11732,6 +11749,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
@@ -11910,6 +11928,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11950,6 +11969,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -12025,6 +12045,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -12133,6 +12154,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
@@ -12841,6 +12863,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -12888,6 +12911,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -13481,6 +13505,7 @@ mod tests {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    newest_epochs: Vec::new(),
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, definitions, .. }) =
@@ -14656,6 +14681,7 @@ mod partial_windows_never_skip {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    newest_epochs: Vec::new(),
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
@@ -14723,6 +14749,7 @@ mod partial_windows_never_skip {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             };
             write_frame(&mut peer_end, &vectors).await.unwrap();
             if !window.is_empty() {

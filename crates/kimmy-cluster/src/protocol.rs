@@ -346,6 +346,13 @@ pub enum Message {
             deserialize_with = "lenient_stamp"
         )]
         replay_from: Option<kimmy_core::Stamp>,
+        /// The newest epoch of each node the answerer has recorded (D13 containment, ADR-274): the
+        /// relayed rows. At most 1,024, and each is bounded on receipt before it is recorded or
+        /// acted on. A relay never replaces the answerer's own table: a host learns it is
+        /// superseded from the peer's table at the handshake, and this only teaches a member that
+        /// never met the host.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        newest_epochs: Vec<(NodeId, kimmy_core::Epoch)>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -1115,6 +1122,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             },
             Message::Entries {
                 entries: Vec::new(),
@@ -1520,6 +1528,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         };
         write_frame(&mut wire, &full).await.unwrap();
         assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
@@ -1533,6 +1542,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                newest_epochs: Vec::new(),
             },
         )
         .await

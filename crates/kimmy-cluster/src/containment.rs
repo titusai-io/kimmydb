@@ -6,6 +6,7 @@
 //! none on a missing symbol. The code commits replace each body, and none of these stubs survives
 //! to the last commit (a source scan asserts it).
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -64,21 +65,70 @@ pub fn guard_step(
     GuardStep::Pass
 }
 
-/// A halt marker's contents: the node and epoch halted, and the newer epoch it was told of (`None`
-/// for a halt by the guard, which has no newer epoch to name).
+/// Why the mistaken-restore guard halted a fresh host: the epoch that halted itself, and the
+/// address that answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardHalt {
+    pub epoch: Epoch,
+    pub address: SocketAddr,
+}
+
+/// A halt marker's contents (the model row's finding 2): the node; the floor, which is the newest
+/// epoch this directory was ever told of (`Epoch::ZERO` for none); and, when the guard halted it,
+/// the epoch that halted itself and the address that answered. A later guard-only halt keeps the
+/// floor an earlier tell set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Marker {
     pub node: NodeId,
-    pub halted: Epoch,
-    pub told: Option<Epoch>,
+    pub floor: Epoch,
+    pub guard: Option<GuardHalt>,
 }
 
-/// Whether `marker` halts the store of `node` on `store_epoch`, as the manager ruled it: a marker
-/// that names a newer epoch halts any store of THAT node whose epoch is below the newer epoch; a
-/// marker that carries only the guard's reason halts only the store on the epoch it names; a marker
-/// for another node is ignored.
+/// Whether `marker` halts the store of `node` on `store_epoch`: a store below the floor is halted,
+/// a store on the guard's epoch is halted, and another node's marker is ignored.
 pub fn marker_halts(_marker: &Marker, _node: NodeId, _store_epoch: Epoch) -> bool {
     false
+}
+
+/// The marker after a host of `node` was told of the newer epoch `told`: the floor is the larger of
+/// what it was and `told`, and a guard halt already recorded is kept.
+pub fn marker_told(_previous: Option<&Marker>, node: NodeId, _told: Epoch) -> Marker {
+    Marker { node, floor: Epoch::ZERO, guard: None }
+}
+
+/// The marker after the guard halted a host of `node`: the guard's halt is recorded and the floor
+/// an earlier tell set is kept (row 4c: a recovery that finds the newer host up is halted by the
+/// guard and must still mint above the floor).
+pub fn marker_guard_halted(_previous: Option<&Marker>, node: NodeId, guard: GuardHalt) -> Marker {
+    Marker { node, floor: Epoch::ZERO, guard: Some(guard) }
+}
+
+/// Whether a told epoch is acted on by the told host (the model row's finding 3): it must be
+/// strictly newer than the host's own epoch and within the bound of the host's own clock, as a
+/// relayed row is. A tell beyond the bound is not acted on.
+pub fn tell_acted_on(_clock_ms: u64, _skew_ms: u64, _own: Epoch, _told: Epoch) -> bool {
+    true
+}
+
+/// Whether a member runs a round with a peer: not when it knows the peer's epoch of its node is
+/// older than the newest it has recorded, whether or not the tell was acted on (the model row's
+/// finding 3, `round-with-superseded`).
+pub fn runs_round(_known_newest: Epoch, _peer_epoch: Epoch) -> bool {
+    true
+}
+
+/// What the recovery restore (delete the store, keep the marker, `kimmyd restore`) comes to: the
+/// recovered host is a third host of the node, so a live newer host halts it through the guard
+/// unless `--replace` was honoured; with it the recovered host proceeds, and the newer host is then
+/// told and halts (the model row's rows 4b and 4c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    pub recovered_host_halts: bool,
+    pub newer_host_halts: bool,
+}
+
+pub fn recovery_outcome(_newer_host_up: bool, _replace_honoured: bool) -> Recovery {
+    Recovery { recovered_host_halts: false, newer_host_halts: false }
 }
 
 /// The `--replace` flag of a restore: it names the epoch the restore minted, and is honoured only
@@ -117,9 +167,9 @@ pub fn clear_marker_file(_data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The epoch a restore of `node`'s backup into `data_dir` must mint strictly above: the newer epoch
-/// the marker names, or, for a marker that carries only the guard's reason, the epoch it halted.
-/// `None` for no marker, a marker of another node, and a file with only a `--replace` flag.
+/// The epoch a restore of `node`'s backup into `data_dir` must mint strictly above: the floor of
+/// the marker, the newest epoch the directory was ever told of. `None` for no marker, a marker of
+/// another node, a marker whose floor is none, and a file with only a `--replace` flag.
 pub fn restore_floor(_data_dir: &Path, _node: NodeId) -> std::io::Result<Option<Epoch>> {
     Ok(None)
 }

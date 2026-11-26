@@ -237,6 +237,7 @@ fn a_043_decoder_reads_the_new_block_and_frames() {
             facts_gen: Some(3),
             echo,
             replay_from: None,
+            newest_epochs: Vec::new(),
         },
     ] {
         let bytes = bson::serialize_to_vec(&message).unwrap();

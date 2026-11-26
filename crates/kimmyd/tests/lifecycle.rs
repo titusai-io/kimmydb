@@ -2755,8 +2755,11 @@ fn a_restore_into_a_directory_with_a_marker_mints_above_the_epoch_it_names() {
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let told = an_epoch_ahead(60_000);
-    let marker =
-        Marker { node: source_node(dir.path()), halted: an_epoch_ahead(1_000), told: Some(told) };
+    assert!(
+        told.start_hlc().wall_ms <= kimmy_storage::physical_now_ms() + 300_000,
+        "premise: at most the skew bound above the clock, or the tell is not acted on at all"
+    );
+    let marker = Marker { node: source_node(dir.path()), floor: told, guard: None };
     write_marker_file(&data, &MarkerFile { marker: Some(marker), replace: None }).unwrap();
     assert!(data.join(MARKER_FILE).exists(), "premise: the marker is in the directory");
 
@@ -2778,11 +2781,7 @@ fn a_restore_ignores_the_marker_of_another_node() {
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let told = an_epoch_ahead(10 * 60_000);
-    let marker = Marker {
-        node: kimmy_core::NodeId::generate(),
-        halted: an_epoch_ahead(1_000),
-        told: Some(told),
-    };
+    let marker = Marker { node: kimmy_core::NodeId::generate(), floor: told, guard: None };
     write_marker_file(&data, &MarkerFile { marker: Some(marker), replace: None }).unwrap();
 
     restore_with(&config, &backup, &[]);

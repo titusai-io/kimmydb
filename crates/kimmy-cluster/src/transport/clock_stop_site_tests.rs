@@ -79,6 +79,7 @@ async fn serve_window(
         facts_gen: None,
         echo: None,
         replay_from: None,
+        newest_epochs: Vec::new(),
     };
     write_frame(&mut stream, &answer).await.unwrap();
     let mut asked = Vec::new();

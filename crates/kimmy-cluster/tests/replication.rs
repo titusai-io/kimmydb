@@ -3937,6 +3937,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                                 facts_gen: None,
                                 echo: None,
                                 replay_from: None,
+                                newest_epochs: Vec::new(),
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
@@ -7919,6 +7920,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                             facts_gen: None,
                             echo: None,
                             replay_from: None,
+                            newest_epochs: Vec::new(),
                         },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
@@ -8040,6 +8042,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                             facts_gen: None,
                             echo: None,
                             replay_from: None,
+                            newest_epochs: Vec::new(),
                         },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
@@ -8183,6 +8186,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                             facts_gen: None,
                             echo: None,
                             replay_from: None,
+                            newest_epochs: Vec::new(),
                         },
                         Message::AskEntries { .. } => {
                             tokio::time::sleep(delay).await;
@@ -8590,6 +8594,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                                 facts_gen: None,
                                 echo: None,
                                 replay_from: None,
+                                newest_epochs: Vec::new(),
                             },
                             Message::AskEntries { .. } => {
                                 tokio::time::sleep(PULL_HOLD).await;
@@ -8758,6 +8763,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                                 facts_gen: None,
                                 echo: None,
                                 replay_from: None,
+                                newest_epochs: Vec::new(),
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;

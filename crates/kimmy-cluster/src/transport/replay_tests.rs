@@ -619,6 +619,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
         facts_gen: None,
         echo: None,
         replay_from: Some(tied),
+        newest_epochs: Vec::new(),
     };
     let back: Message =
         bson::deserialize_from_document(bson::serialize_to_document(&with_ask).unwrap()).unwrap();
@@ -633,6 +634,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
         facts_gen: None,
         echo: None,
         replay_from: None,
+        newest_epochs: Vec::new(),
     };
     let doc = bson::serialize_to_document(&without).unwrap();
     assert!(!doc.get_document("Vectors").unwrap().contains_key("replay_from"));
@@ -1030,6 +1032,7 @@ async fn a_malformed_replay_from_decodes_as_absent_through_the_real_decoder() {
         facts_gen: None,
         echo: None,
         replay_from: Some(ask),
+        newest_epochs: Vec::new(),
     })
     .unwrap();
     let mut short_epoch = bson::serialize_to_document(&ask).unwrap();
@@ -1641,6 +1644,7 @@ async fn a_replay_position_of_another_member_is_refused() {
                     facts_gen: None,
                     echo: None,
                     replay_from: Some(third),
+                    newest_epochs: Vec::new(),
                 };
                 write_frame(&mut theirs, &vectors).await.unwrap();
             }
@@ -1764,6 +1768,7 @@ async fn a_malformed_replay_from_is_no_ask_said_once_per_peer_and_the_round_goes
             facts_gen: None,
             echo: None,
             replay_from: None,
+            newest_epochs: Vec::new(),
         })
         .unwrap();
         doc.get_document_mut("Vectors").unwrap().insert("replay_from", replay_from);

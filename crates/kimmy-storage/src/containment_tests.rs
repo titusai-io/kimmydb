@@ -46,6 +46,11 @@ fn a_mint_with_a_floor_starts_strictly_above_it() {
         told.start_hlc() > Hlc::new(physical_now_ms(), u16::MAX),
         "premise: the told epoch starts above this host's clock, so the clock cannot pass the floor"
     );
+    assert!(
+        told.start_hlc().wall_ms
+            <= physical_now_ms() + crate::clock_bound::DEFAULT_MAX_CLOCK_SKEW_MS,
+        "premise: and at most the skew bound above it, or the tell is not acted on at all"
+    );
     let path = dir.path().join("restored.redb");
     restore(&path, &mut backup.as_slice()).unwrap();
     let engine = Engine::open_with(&path, &OpenOptions::new().epoch_floor(told)).unwrap();

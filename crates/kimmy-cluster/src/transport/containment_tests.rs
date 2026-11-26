@@ -343,3 +343,146 @@ async fn a_probe_is_answered_and_nothing_follows_it() {
     );
     assert!(responder.halted().is_none(), "and acts on nothing");
 }
+
+// -- an equal epoch (test 16, the model row's finding 5) ------------------------------------------
+
+/// "Halt on an equal epoch" can only fire when a host dials its own address (a seed list that names
+/// itself): no two hosts hold one `(node, epoch)` in the model. The host is not halted and tells
+/// nobody, which is what the mutant `halt-on-equal` breaks.
+#[tokio::test]
+async fn a_host_that_dials_its_own_address_is_not_halted_and_tells_nobody() {
+    let (host, _dir) = engine();
+    let (opened, accepted, mut ours, _theirs) = handshake(&host, &host).await;
+    let _ = (opened, accepted);
+    assert!(host.halted().is_none(), "an equal epoch is not a newer one");
+    let tell = next_frame(&mut ours, Duration::from_millis(300)).await;
+    assert!(tell.is_none(), "and nobody is told: {tell:?}");
+}
+
+// -- the relayed rows and the tell, each mechanism alone (the model row's finding 4)
+// ---------------
+
+/// A round of `engine` against a scripted peer of another node, whose answer to the first ask
+/// carries `relayed` as its newest-epoch rows. What the round does with the peer after that is not
+/// this test's.
+async fn a_round_answered_with_relays(engine: &Engine, relayed: Vec<(NodeId, Epoch)>) {
+    async fn peer(mut stream: DuplexStream, relayed: Vec<(NodeId, Epoch)>) {
+        if let Ok(Message::AskVersions { .. }) = read_frame(&mut stream).await {
+            let answer = Message::Vectors {
+                servable: VersionVector::new(),
+                witnessed: VersionVector::new(),
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+                newest_epochs: relayed,
+            };
+            let _ = write_frame(&mut stream, &answer).await;
+            while read_frame(&mut stream).await.is_ok() {}
+        }
+    }
+    let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+    let scripted = tokio::spawn(peer(theirs, relayed));
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let mut stalls = PeerStalls::new();
+    let round = sync_over(engine, ours, addr, NodeId::from_bytes([9; 16]), None, &mut stalls);
+    let _ = tokio::time::timeout(Duration::from_secs(5), round).await;
+    scripted.abort();
+}
+
+/// Row R: a member that never met the newer host (so its own table holds nothing of it) is taught
+/// by a relayed row alone. The old host asks a peer that relays the newer epoch of the old host's
+/// node, and halts: the mechanism the ordinary runs hide, because there the tell halts the old host
+/// first.
+#[tokio::test]
+async fn a_relayed_row_alone_halts_a_host_that_never_met_the_newer_one() {
+    let (old, new, _dirs) = an_old_and_a_new_host_of_one_node();
+    assert!(old.halted().is_none(), "premise: not halted");
+    a_round_answered_with_relays(&old, vec![(old.node_id(), new.epoch())]).await;
+    assert!(
+        old.halted().is_some(),
+        "the relayed row of its own node, newer and in the bound, halts it"
+    );
+}
+
+/// What a relayed row must not do (J-14): about another node, equal to the host's own epoch, older
+/// than it, or beyond the host's bound, it halts nobody.
+#[tokio::test]
+async fn a_relayed_row_about_another_node_or_not_newer_or_beyond_the_bound_halts_nobody() {
+    let (old, new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let other = NodeId::from_bytes([8; 16]);
+    a_round_answered_with_relays(&old, vec![(other, new.epoch())]).await;
+    assert!(old.halted().is_none(), "a newer epoch of ANOTHER node");
+    a_round_answered_with_relays(&old, vec![(old.node_id(), old.epoch())]).await;
+    assert!(old.halted().is_none(), "an epoch equal to its own");
+    a_round_answered_with_relays(&old, vec![(old.node_id(), Epoch::ZERO)]).await;
+    assert!(old.halted().is_none(), "an older epoch of its own node");
+    a_round_answered_with_relays(&old, vec![(old.node_id(), an_epoch_ahead(10 * 60_000))]).await;
+    assert!(old.halted().is_none(), "an epoch beyond its bound (a verified source relaying it)");
+}
+
+/// The vectors `server` answers a member that asks for them: the relayed rows of that answer.
+async fn relayed_rows_of(server: &Engine) -> Vec<(NodeId, Epoch)> {
+    let (asker, _dir) = engine();
+    let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+    let serving = serve_peer(server, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+    let asking = async {
+        open_handshake(&asker, &mut ours, SECRET, BINDING).await.unwrap();
+        let ask = Message::AskVersions { facts: None, facts_gen: None, echo: None };
+        write_frame(&mut ours, &ask).await.unwrap();
+        let answer = read_frame(&mut ours).await.unwrap();
+        drop(ours);
+        answer
+    };
+    let (_served, answer) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(serving, asking) })
+            .await
+            .expect("the contact ends");
+    match answer {
+        Message::Vectors { newest_epochs, .. } => newest_epochs,
+        other => panic!("expected the vectors, got {other:?}"),
+    }
+}
+
+/// Row C: the relay is cut by the cap, so only the member's own table can tell. The server knows
+/// the newer epoch of the old host's node from the new host's own handshake, and holds more rows
+/// than the cap, all starting later, so the cap cuts the old host's row out of the relay. A relay
+/// of at most 1,024 rows lacks it, and the old host, dialling the server, is told all the same.
+#[tokio::test]
+async fn a_relay_cut_by_the_cap_leaves_the_members_own_table_to_tell() {
+    let (old, new, _dirs) = an_old_and_a_new_host_of_one_node();
+    let (server, _server_dir) = engine();
+    let (opened, accepted, _ours, _theirs) = handshake(&new, &server).await;
+    let _ = (opened, accepted);
+
+    let now = kimmy_storage::physical_now_ms();
+    let filler = |i: u32| {
+        let mut bytes = [0xEE; 16];
+        bytes[..4].copy_from_slice(&i.to_be_bytes());
+        NodeId::from_bytes(bytes)
+    };
+    for i in 0..1_100u32 {
+        let start = Hlc::new(now + 10_000 + u64::from(i), 0);
+        server.note_epoch(filler(i), Epoch::new(start, [2; 8])).unwrap();
+    }
+    assert_eq!(
+        server.newest_epoch(filler(1_099)).unwrap().start_hlc().wall_ms,
+        now + 10_000 + 1_099,
+        "premise: the table holds the rows"
+    );
+
+    let relayed = relayed_rows_of(&server).await;
+    assert!(relayed.len() <= 1_024, "the relay is capped: {} rows", relayed.len());
+    assert!(
+        !relayed.iter().any(|(node, _)| *node == old.node_id()),
+        "premise: the cap cut the old host's row out of the relay"
+    );
+
+    let (_opened, _accepted, mut ours, _theirs) = handshake(&old, &server).await;
+    let tell = next_frame(&mut ours, Duration::from_secs(2)).await;
+    assert!(
+        matches!(&tell, Some(Message::Superseded { node, epoch })
+            if *node == old.node_id() && *epoch == new.epoch()),
+        "the member's own table tells the old host: {tell:?}"
+    );
+}
