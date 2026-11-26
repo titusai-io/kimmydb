@@ -20350,9 +20350,23 @@ is answered `500 outcome_unknown` with `retry: verify` (ADR-057), not `internal`
 The engine classifies by phase, conservatively. A commit that fails after a
 `sync_data` was attempted in it, including the file shrink redb makes after its
 final fsync and the frees that follow, is `StorageError::OutcomeUnknown`. A
-failure before any fsync (its writes, a growth) leaves the commit absent, and
-stays a plain failure. Under `coalesced`, a failed shared flush makes every
-commit it covered unknown.
+failure before any fsync (its writes) leaves the commit absent, and stays a
+plain failure. Under `coalesced`, a failed shared flush makes every commit it
+covered unknown.
+
+A growth is not a failure before any fsync. redb extends the file and syncs it
+at once, from inside page allocation. That sync does not flush the
+transaction's buffered pages, and no commit record exists yet. If it fails in
+the body of the transaction, before the commit begins, nothing of the
+transaction is committed and the write is a plain failure. If it fails inside
+the commit, the commit is equally absent after the repair, but it is reported
+as unknown: the engine classifies by whether a sync was attempted since the
+commit began, and cannot tell a growth's sync from the commit's own. Unknown
+there is the conservative answer, not a claim that the write may exist. Either
+way the file is left longer than the layout its header names, and the stop is
+not a clean close, so the next open recovers; redb (4.6.0) then rebuilds the
+layout from the file's length. The tests that pin both are in `kimmy-storage`'s
+engine tests.
 
 The test switch gains `sync_data@write`, which fails the fsync of a client
 write's own commit, so the end-to-end test watches the write it sent. The

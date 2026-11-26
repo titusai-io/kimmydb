@@ -1103,6 +1103,14 @@ async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
 /// The injection answers EIO in place of the fsync, and the kernel still
 /// holds the pages, so this shows what the client sees and what the repair
 /// keeps; it is not evidence of what a real failed fsync does to the platter.
+///
+/// The commit the injection watches must not grow the file: a growth syncs
+/// the file before the commit's pages are written, so the armed failure
+/// would land there and the write would be absent after the repair, which is
+/// also unknown and also correct, but is another test (the growth twins in
+/// kimmy-storage's engine tests). The test makes sure of it: the file is
+/// written to until it has grown, and then until three more writes leave its
+/// length as it was, so it stands just past a doubling with room to spare.
 #[tokio::test]
 async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_after() {
     let dir = tempfile::tempdir().unwrap();
@@ -1128,8 +1136,38 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
         .send()
         .await;
     assert!(res.unwrap().status().is_success());
+    // Headroom, so that the write the injection watches does not have to GROW the file. A commit that must grow it syncs the file BEFORE it
+    // writes its pages (redb's `grow`), and the armed `sync_data@write` then fails that sync: the node stops with the commit unwritten, the
+    // client is told the outcome is unknown, which is true, and the write is NOT there after the repair. That is not what this test is
+    // about, and where the file's size boundaries fall moves with every table and row a store holds (the tables of the names and the base
+    // options moved it). So: write filler documents until the file has grown, then until three more writes leave its length unchanged: the
+    // file is just past a doubling, with about half of it free.
+    let store = dir.path().join("data").join("kimmy.redb");
+    let length = || std::fs::metadata(&store).expect("the store exists").len();
+    let (mut grown, mut steady, mut last) = (false, 0u32, length());
+    for id in 100..700 {
+        let res = client
+            .post(url(&before, "/v1/db/shop/coll/orders/docs"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "_id": id, "item": "filler" }))
+            .send()
+            .await;
+        assert!(res.unwrap().status().is_success());
+        let now = length();
+        if now != last {
+            (grown, steady, last) = (true, 0, now);
+        } else if grown {
+            steady += 1;
+            if steady == 3 {
+                break;
+            }
+        }
+    }
+    assert!(grown && steady == 3, "premise: the file grew, and then held still for three writes");
     before.signal("TERM");
     assert!(before.wait_exit().success());
+    // For a red to be readable: the store's length before and after the failing run says whether the watched commit had to grow the file.
+    let length_before = length();
 
     let mut failing = Run::spawn_with(
         dir.path(),
@@ -1159,6 +1197,7 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
     assert_eq!(status.code(), Some(70), "the fsync failure stops the node: {status:?}");
     let log = failing.log();
     assert!(log.contains("sync_data"), "the log names the call: {log}");
+    let length_after = length();
 
     let mut after = Run::spawn(dir.path(), "write-fsync-after");
     after.wait_ready(&client).await;
@@ -1170,7 +1209,12 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
         .send()
         .await
         .unwrap();
-    assert_eq!(kept.status(), 200, "the write whose fsync failed is there after the repair");
+    assert_eq!(
+        kept.status(),
+        200,
+        "the write whose fsync failed is there after the repair (store length before the failing run \
+         {length_before}, after it {length_after}; the failing run's log: {log})"
+    );
     after.signal("TERM");
     assert!(after.wait_exit().success());
 }
