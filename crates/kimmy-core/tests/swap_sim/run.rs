@@ -55,6 +55,9 @@ pub struct Cfg {
     pub drop_late_marks: bool,
     /// the oracle's structural lost set (`Q6_LOSTSTRUCT=1` of the model, see `World::lost_struct`); off by default
     pub lost_struct: bool,
+    /// Unit 14 (`Q6_FOREIGNBIND=1` of the model): a job kind `Foreign` (a member other than the writer binds the stage in flight); the extra weight is drawn only when
+    /// this is set, so no existing draw moves. Off by default
+    pub foreign_bind: bool,
 }
 
 /// The route probes of `swapmodel6a.py` (default off): `f` is the probability, per window step, of a route step.
@@ -106,6 +109,7 @@ impl Cfg {
             product_marks: false,
             drop_late_marks: false,
             lost_struct: false,
+            foreign_bind: false,
         }
     }
 }
@@ -276,6 +280,9 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
         jobs.retain(|j| j.bind_step > step);
         for mut j in due {
             let live = ms.iter().filter(|m| !m.vanished).count();
+            if j.kind == JobKind::Foreign {
+                crate::member::mint_foreign_bind(&mut ms, &mut w, &mut j);
+            }
             ms[j.writer].do_bind(&mut w, &mut j, live);
         }
         let weights = [
@@ -328,8 +335,18 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
             1 => {
                 outs_left -= 1;
                 let m = active[w.rng.below(active.len())];
-                let kind = [JobKind::Good, JobKind::Late, JobKind::CrashAbandon, JobKind::Vanish]
-                    [choices(&mut w.rng, &[62.0, 12.0, 16.0, 10.0])];
+                let kind = if cfg.foreign_bind {
+                    [
+                        JobKind::Good,
+                        JobKind::Late,
+                        JobKind::CrashAbandon,
+                        JobKind::Vanish,
+                        JobKind::Foreign,
+                    ][choices(&mut w.rng, &[62.0, 12.0, 16.0, 10.0, 14.0])]
+                } else {
+                    [JobKind::Good, JobKind::Late, JobKind::CrashAbandon, JobKind::Vanish]
+                        [choices(&mut w.rng, &[62.0, 12.0, 16.0, 10.0])]
+                };
                 let delay = if kind == JobKind::Late {
                     w.d + randint(&mut w.rng, 4, 25)
                 } else {
@@ -555,6 +572,9 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     w.quiescing = true;
     for mut j in jobs {
         let live = ms.iter().filter(|m| !m.vanished).count();
+        if j.kind == JobKind::Foreign {
+            crate::member::mint_foreign_bind(&mut ms, &mut w, &mut j);
+        }
         ms[j.writer].do_bind(&mut w, &mut j, live);
     }
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();

@@ -300,6 +300,9 @@ pub enum JobKind {
     Late,
     CrashAbandon,
     Vanish,
+    /// Unit 14 (`Cfg::foreign_bind`): a member other than the writer, that holds the stage's creation, mints a binding of the stage in flight at or below
+    /// its deadline; the writer then binds as a `Good` job does (`mint_foreign_bind`)
+    Foreign,
 }
 
 #[derive(Clone, Debug)]

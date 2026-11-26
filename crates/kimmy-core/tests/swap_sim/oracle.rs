@@ -1109,6 +1109,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         ("kept_path_taken", st.get("kept_by_adr231_path") > 0),
         ("write_accepted_while_pending", st.get("accepted_while_pending") > 0),
         ("write_accepted_while_superseded", st.get("accepted_while_superseded") > 0),
+        ("foreign_bind_minted", st.get("foreign_bind_minted") > 0),
     ];
     for (k, v) in nv {
         res.insert(format!("nv_{k}"), v as i64);
@@ -1133,6 +1134,8 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "lww_losers_not_kept",
         "witnessed_at_quiescence",
         "snap_versions_as_entries",
+        "foreign_bind_minted",
+        "foreign_bind_took_effect",
     ] {
         res.insert(format!("nv_{kk}"), (st.get(kk) > 0) as i64);
         res.insert(format!("cnt_{kk}"), st.get(kk));

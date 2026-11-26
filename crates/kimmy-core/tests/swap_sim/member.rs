@@ -651,3 +651,34 @@ impl Member {
         Some(b)
     }
 }
+
+/// Unit 14 (`JobKind::Foreign`, drawn only under `Cfg::foreign_bind`): a member other than the job's writer, that holds the stage's creation and whose next stamp
+/// is at or below the stage's deadline, mints a binding of the stage in flight (one random draw, only for this kind). Returns the binding, or `None` when no member
+/// qualifies. The job's own writer then binds as a `Good` job does: the job's kind is changed here, so every later `do_bind` check sees a `Good` job.
+pub fn mint_foreign_bind(ms: &mut [Member], w: &mut World, job: &mut Job) -> Option<EntryRef> {
+    debug_assert_eq!(job.kind, JobKind::Foreign);
+    job.kind = JobKind::Good;
+    let cands: Vec<usize> = (0..ms.len())
+        .filter(|&i| {
+            i != job.writer
+                && !ms[i].vanished
+                && ms[i].creates.contains_key(&job.stage)
+                && ms[i].peek_hlc(w) <= job.dl
+        })
+        .collect();
+    if cands.is_empty() {
+        return None;
+    }
+    let x = cands[w.rng.below(cands.len())];
+    let h = ms[x].next_hlc(w);
+    let mut digest = job.digest.clone();
+    digest.sort();
+    let b = w.record(
+        Entry::new(x, h, Kind::Bind).phys(&job.stage).dl(job.dl).extra(Extra::Digest(digest)),
+        true,
+    );
+    w.stats.bump("foreign_bind_minted");
+    w.note(format!("{} mints a FOREIGN binding of {} at {}", ms[x].name, job.stage, b.hlc));
+    ms[x].take(w, &b);
+    Some(b)
+}

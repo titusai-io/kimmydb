@@ -17,6 +17,8 @@
 #![allow(dead_code)]
 
 mod apply;
+#[cfg(test)]
+mod bindorigin;
 mod classes;
 mod clockbound;
 mod coverage;

@@ -9,7 +9,7 @@ use crate::world::{Policy, World};
 impl Member {
     // ---- the register
     pub fn member_valid(&self, w: &World, e: &Entry) -> bool {
-        w.f.orphan_no_deadline || w.valid(e)
+        w.f.orphan_no_deadline || w.valid_by(e, !w.f.bind_foreign_origin_valid)
     }
 
     pub fn add_event(&mut self, w: &mut World, e: &Entry) -> bool {
@@ -34,6 +34,9 @@ impl Member {
                 ep.cover = Some(w.step);
                 ep.cover_q = w.quiescing; // the member covers the event: it takes effect
             }
+        }
+        if w.is_foreign_bind(e) {
+            w.stats.bump("foreign_bind_took_effect"); // a binding from another origin entered a member's register: only a mutant gets here
         }
         self.events.insert(e.idx);
         let pos = self.evl.partition_point(|&i| w.ent(i).stamp <= e.stamp);

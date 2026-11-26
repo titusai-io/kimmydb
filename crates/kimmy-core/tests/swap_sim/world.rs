@@ -110,6 +110,9 @@ pub struct World {
     pub names: Vec<String>,
     /// stage -> the staging entries (global truth, read by the partial-flip check)
     pub stage_docs: HashMap<String, Vec<EntryId>>,
+    /// Unit 14: a stage -> the id of its creation entry (the global truth; the entry every member holds in its `creates`). The origin check reads the
+    /// creator here, never from a field of the binding
+    pub creation: HashMap<String, EntryId>,
     pub stats: Counter,
     /// (phys, key, stamp) -> the document entry
     pub rec_index: HashMap<(String, u32, Stamp), EntryId>,
@@ -167,6 +170,7 @@ impl World {
             step: 0,
             names,
             stage_docs: HashMap::new(),
+            creation: HashMap::new(),
             stats: Counter::default(),
             rec_index: HashMap::new(),
             loss_by_key: HashMap::new(),
@@ -196,6 +200,9 @@ impl World {
         if cover {
             self.by_origin[e.origin].push(e.idx);
         }
+        if e.kind == Kind::Create {
+            self.creation.insert(e.phys.clone(), e.idx);
+        }
         if e.kind == Kind::Doc {
             self.rec_index.insert((e.phys.clone(), e.key, e.stamp), e.idx);
         }
@@ -214,9 +221,27 @@ impl World {
         self.loss_by_key.get(k).map_or(&[], |v| v.as_slice())
     }
 
-    /// R9: a binding stamped above its stage's deadline is invalid; a pure function of the stamps.
+    /// R9: a binding stamped above its stage's deadline is invalid; a pure function of the stamps. Unit 14: and a binding whose origin is not the origin of
+    /// its stage's creation (the creation entry, never a field of the binding; a stage whose creation is unknown is not tested here).
     pub fn valid(&self, e: &Entry) -> bool {
+        self.valid_by(e, true)
+    }
+
+    /// A binding whose origin is not the origin of its stage's creation (the origin check's subject; false for a stage whose creation is unknown).
+    pub fn is_foreign_bind(&self, e: &Entry) -> bool {
+        e.kind == Kind::Bind
+            && self.creation.get(&e.phys).is_some_and(|&c| self.all[c].origin != e.origin)
+    }
+
+    /// `valid`, with the origin test optional: `origin = false` is what `m-bind-foreign-origin`'s members ask (`Member::member_valid`).
+    pub fn valid_by(&self, e: &Entry, origin: bool) -> bool {
         if e.kind == Kind::Bind {
+            if origin
+                && self.f.bind_origin
+                && self.creation.get(&e.phys).is_some_and(|&c| self.all[c].origin != e.origin)
+            {
+                return false;
+            }
             return e.hlc <= e.dl;
         }
         true

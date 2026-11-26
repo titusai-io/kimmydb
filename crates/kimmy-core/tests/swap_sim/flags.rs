@@ -18,6 +18,12 @@ pub struct Flags {
     pub recreate_reuse: bool,
     pub orphan_age: Option<i64>,
     pub orphan_no_deadline: bool,
+    /// Unit 14 (the origin check): a binding is valid only when its origin is the origin of its stage's creation, and it is stamped at or below
+    /// the stage's deadline (`World::valid`). ON in every base (`Q6_BINDORIGIN=0` turns it off: the identity control of `swapmodel6i.py`)
+    pub bind_origin: bool,
+    /// Unit 14 mutant `m-bind-foreign-origin`: the MEMBERS' validity test leaves the origin out (`Member::member_valid`); the oracle and the counters keep
+    /// asking the full rule, so a foreign binding that a member takes is a difference
+    pub bind_foreign_origin_valid: bool,
     pub loss_key_collapse: bool,
     pub loss_outside_prefix: bool,
     pub report_before_burial: bool,
@@ -188,7 +194,8 @@ pub const BASES: [&str; 5] =
     ["v5", "v5-late-register", "v5-late-register-literal", "v5-literal-with-rule", "v6"];
 
 /// The mutants of `MUTANTS` (`swapmodel5.py` 160-190, plus the two of `swapmodel6a.py`), in the model's order.
-pub const MUTANTS: [&str; 39] = [
+pub const MUTANTS: [&str; 40] = [
+    "m-bind-foreign-origin",
     "m-recreate-reuse",
     "m-pending-narrow",
     "m-loss-outside-prefix",
@@ -241,8 +248,10 @@ pub const MUTANTS: [&str; 39] = [
 /// Rust-only mutants of the product routes (killed on the product-route grid, `main.rs`; not in `MUTANTS`, which runs the base grid).
 pub const PRODUCT_MUTANTS: [&str; 2] = ["m-window-noncontiguous", "m-release-unconditional"];
 
-/// The mutants of `MUTANTS` the Python model does not have (the differential's mutant traces skip them).
-pub const RUST_ONLY_MUTANTS: [&str; 6] = [
+/// The mutants of `MUTANTS` the vendored Python model (`reference_model/`, 6a to 6f) does not have (the differential's mutant traces skip them).
+/// `m-bind-foreign-origin` is in `swapmodel6i.py` (unit 14), which postdates the vendored copy.
+pub const RUST_ONLY_MUTANTS: [&str; 7] = [
+    "m-bind-foreign-origin",
     "m-stale-src",
     "m-loss-received-not-appended",
     "m-snap-record-not-served",
@@ -253,6 +262,7 @@ pub const RUST_ONLY_MUTANTS: [&str; 6] = [
 
 fn v5() -> Flags {
     Flags {
+        bind_origin: true,
         defer_received: true,
         state_scan: true,
         retain_history: true,
@@ -288,6 +298,9 @@ pub fn base(name: &str) -> Option<Flags> {
         "v5-literal-with-rule" => f.stale_src_bug = true,
         _ => return None,
     }
+    if std::env::var("Q6_BINDORIGIN").as_deref() == Ok("0") {
+        f.bind_origin = false; // the identity control of the origin check (default ON; `=0` is 6h4's rule)
+    }
     Some(f)
 }
 
@@ -313,6 +326,7 @@ fn apply_mutant(f: &mut Flags, name: &str, arg: Option<i64>) -> bool {
         "m-no-recreate-floor" => f.no_recreate_floor = true,
         "m-orphan-age" => f.orphan_age = Some(arg.unwrap_or(25)),
         "m-orphan-no-deadline" => f.orphan_no_deadline = true,
+        "m-bind-foreign-origin" => f.bind_foreign_origin_valid = true,
         "m-loss-key-collapse" => f.loss_key_collapse = true,
         "m-snap-no-events" => f.snap_no_events = true,
         "m-record-per-minter" => f.record_per_minter = true,
