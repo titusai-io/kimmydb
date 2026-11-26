@@ -149,21 +149,58 @@ pub enum RelayedRow {
 
 /// Classify one relayed row. `own` is this host's node and epoch. A row is bounded as a claim is,
 /// and one about this host's own node halts it only when strictly newer than its own epoch.
-/// **Scaffold: every row is dropped.**
 pub fn relayed_row(
     clock_ms: u64,
     skew_ms: u64,
     own: (NodeId, Epoch),
     row: (NodeId, Epoch),
 ) -> RelayedRow {
-    let _ = (clock_ms, skew_ms, own, row);
-    RelayedRow::Drop
+    let ((own_node, own_epoch), (node, epoch)) = (own, row);
+    if epoch == Epoch::ZERO || !claim_within_bound(clock_ms, skew_ms, &epoch) {
+        RelayedRow::Drop
+    } else if node != own_node {
+        RelayedRow::Record
+    } else if epoch > own_epoch {
+        RelayedRow::Halt
+    } else {
+        RelayedRow::Drop
+    }
 }
 
 /// Read the rows a verified peer relayed on its vectors: at most [`MAX_RELAYED_EPOCHS`] of them,
-/// each classified by [`relayed_row`], recorded or acted on. **Scaffold: reads nothing.**
-pub(crate) fn take_relayed(engine: &kimmy_storage::Engine, relayed: &[(NodeId, Epoch)]) {
-    let _ = (engine, relayed);
+/// each classified by [`relayed_row`], recorded or acted on. Returns whether this host was halted
+/// by one, in which case the contact ends and no round runs with that peer.
+///
+/// Called on a verified peer's answer, where no write transaction is held (a halt takes the writer
+/// gate), and it records through [`kimmy_storage::Engine::note_epoch`], which opens none.
+pub(crate) fn take_relayed(engine: &kimmy_storage::Engine, relayed: &[(NodeId, Epoch)]) -> bool {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if relayed.len() > MAX_RELAYED_EPOCHS && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            rows = relayed.len(),
+            cap = MAX_RELAYED_EPOCHS,
+            "a peer relayed more newest-epoch rows than the cap; the rest are not read (said once)"
+        );
+    }
+    let clock = engine.bound_clock_ms();
+    let skew = engine.clock_bound().skew_ms;
+    let own = (engine.node_id(), engine.epoch());
+    for &(node, epoch) in relayed.iter().take(MAX_RELAYED_EPOCHS) {
+        match relayed_row(clock, skew, own, (node, epoch)) {
+            RelayedRow::Drop => {}
+            RelayedRow::Record => {
+                if let Err(e) = engine.note_epoch(node, epoch) {
+                    tracing::debug!(error = %e, "a relayed epoch could not be noted");
+                }
+            }
+            RelayedRow::Halt => {
+                act_on_tell(engine, node, epoch);
+                return engine.halted().is_some();
+            }
+        }
+    }
+    false
 }
 
 /// What the recovery restore (delete the store, keep the marker, `kimmyd restore`) comes to: the

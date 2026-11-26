@@ -1288,7 +1288,7 @@ where
                         facts_gen,
                         echo,
                         replay_from: replay_cursor,
-                        newest_epochs: Vec::new(),
+                        newest_epochs: relayed_epochs(engine),
                     },
                 )
                 .await?;
@@ -1824,6 +1824,22 @@ where
     Ok(node)
 }
 
+/// The newest-epoch rows this member relays on its vectors (ADR-274): at most
+/// [`crate::containment::MAX_RELAYED_EPOCHS`], the newest by epoch start. A cut is said once.
+fn relayed_epochs(engine: &Engine) -> Vec<(kimmy_core::NodeId, kimmy_core::Epoch)> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (rows, cut) = engine.newest_epoch_rows(crate::containment::MAX_RELAYED_EPOCHS);
+    if cut && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            cap = crate::containment::MAX_RELAYED_EPOCHS,
+            "this member holds more newest-epoch rows than it relays: the newest by epoch start \
+             are sent and the rest are not (said once); a host still learns it is superseded from \
+             the table of the peer it meets"
+        );
+    }
+    rows
+}
+
 /// Believe a verified peer's claim of its epoch: within this member's clock bound, record it;
 /// beyond it, or the maximum epoch, record nothing and end the contact with a line that names the
 /// peer, the epoch's start and the bound (a member with a skewed clock would otherwise be
@@ -1934,7 +1950,8 @@ pub async fn sync_once_with(
     probe: Option<DivergenceProbe>,
     stalls: &mut PeerStalls,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let (mut stream, their_node) = dial(engine, peer, secret).await?;
+    let (mut stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
+    stalls.note_peer_epoch(their_node, their_epoch);
     let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
     close(&mut stream).await;
     outcome
@@ -1964,6 +1981,20 @@ pub(crate) async fn dial(
     peer: SocketAddr,
     secret: &str,
 ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, kimmy_core::NodeId), ProtocolError> {
+    let (stream, their_node, _) = dial_claimed(engine, peer, secret).await?;
+    Ok((stream, their_node))
+}
+
+/// [`dial`], and the epoch the peer proved at the handshake (ADR-274): what a round that
+/// replays to the peer is bounded by.
+pub(crate) async fn dial_claimed(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+) -> Result<
+    (tokio_rustls::client::TlsStream<TcpStream>, kimmy_core::NodeId, kimmy_core::Epoch),
+    ProtocolError,
+> {
     // `KIMMY_TEST_REFUSE_SYNC` refuses both directions: the listener drops what
     // peers dial, and this member dials nobody, because its own requests would carry
     // an echo and confirm a yield, which is what a peer that never completes a contact
@@ -2019,9 +2050,9 @@ pub(crate) async fn dial(
         crate::tls::binding(conn).map_err(ProtocolError::Malformed)?
     };
 
-    let their_node = tokio::time::timeout(
+    let (their_node, their_epoch) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        open_handshake(engine, &mut stream, secret, &binding),
+        open_handshake_claimed(engine, &mut stream, secret, &binding),
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
@@ -2039,7 +2070,7 @@ pub(crate) async fn dial(
         note_self_contact(peer);
         return Err(ProtocolError::SelfContact);
     }
-    Ok((stream, their_node))
+    Ok((stream, their_node, their_epoch))
 }
 
 /// The mistaken-restore guard's probe (ADR-274): dial `peer`, say a `Hello` that is a probe and
@@ -2083,6 +2114,8 @@ pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> b
 pub(crate) struct Dialled {
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     their_node: kimmy_core::NodeId,
+    /// The epoch the peer proved at the handshake (ADR-274).
+    their_epoch: kimmy_core::Epoch,
     /// When the dial finished: how long the stream has been held is what decides
     /// whether it is trusted ([`HELD_STREAM_MAX_AGE`]).
     at: Instant,
@@ -2105,9 +2138,9 @@ pub(crate) async fn dial_for_round(
     secret: String,
 ) -> Result<Dialled, ProtocolError> {
     let started = Instant::now();
-    let (stream, their_node) = dial(&engine, peer, &secret).await?;
+    let (stream, their_node, their_epoch) = dial_claimed(&engine, peer, &secret).await?;
     let at = Instant::now();
-    Ok(Dialled { stream, their_node, at, took: at.duration_since(started) })
+    Ok(Dialled { stream, their_node, their_epoch, at, took: at.duration_since(started) })
 }
 
 /// How long a dialled stream may be held before its round and still be used as it
@@ -2180,13 +2213,14 @@ async fn sync_once_dialled_within(
     dialled: Dialled,
     max_age: Duration,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let Dialled { mut stream, mut their_node, at, .. } = dialled;
+    let Dialled { mut stream, mut their_node, mut their_epoch, at, .. } = dialled;
     let old = at.elapsed() > max_age;
     if old || held_stream_is_gone(&mut stream).await {
         debug!(%peer, old, "a connection dialled for this tick is not used as it is; dialling again");
         close(&mut stream).await;
-        (stream, their_node) = dial(engine, peer, secret).await?;
+        (stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
     }
+    stalls.note_peer_epoch(their_node, their_epoch);
     let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
     close(&mut stream).await;
     outcome
@@ -2723,7 +2757,7 @@ async fn serve_replay<S>(
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
     asked: kimmy_core::Stamp,
-    _their_epoch: kimmy_core::Epoch,
+    their_epoch: kimmy_core::Epoch,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2799,7 +2833,13 @@ where
                     let mut entries: Vec<_> = window
                         .entries
                         .into_iter()
-                        .filter(|entry| entry.stamp.node == their_node && entry.stamp > from)
+                        // Not an entry of an epoch above the peer's: a newer host of its node wrote
+                        // those, and they are not the lost writes this replay is for (ADR-274).
+                        .filter(|entry| {
+                            entry.stamp.node == their_node
+                                && entry.stamp > from
+                                && entry.stamp.epoch <= their_epoch
+                        })
                         .collect();
                     let mut exhausted = window.exhausted && window.passed_through.is_none();
                     if let Fits::Only(fits) = how_many_fit(&entries) {
@@ -2918,7 +2958,21 @@ where
         say_malformed_replay_from(their_node);
     }
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from, .. } => {
+        Message::Vectors {
+            servable,
+            witnessed,
+            facts,
+            facts_gen,
+            echo,
+            replay_from,
+            newest_epochs,
+        } => {
+            // The rows a verified peer relays are the third source of a newer epoch (ADR-274),
+            // bounded on receipt: one about this host's own node that is newer halts it, and the
+            // contact ends.
+            if crate::containment::take_relayed(engine, &newest_epochs) {
+                return Err(ProtocolError::Superseded);
+            }
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -4789,7 +4843,6 @@ impl PeerStalls {
     }
 
     /// Note the epoch `node` proved at the handshake of the contact the next round runs on.
-    #[allow(dead_code)] // scaffold: the dial paths call it in the code commit
     pub(crate) fn note_peer_epoch(&mut self, node: NodeId, epoch: kimmy_core::Epoch) {
         self.peer_epochs.insert(node, epoch);
     }
@@ -6823,13 +6876,14 @@ where
 /// Open a handshake: challenge them, check the answer, then answer theirs.
 ///
 /// Returns the peer's node id, as it introduced itself and then proved it
-/// holds the cluster secret — the name a sync outcome is reported under.
-async fn open_handshake<S>(
+/// holds the cluster secret — the name a sync outcome is reported under — and
+/// the epoch it proved with it (ADR-274), which the round's replay is bounded by.
+async fn open_handshake_claimed<S>(
     engine: &Engine,
     stream: &mut S,
     secret: &str,
     binding: &[u8],
-) -> Result<kimmy_core::NodeId, ProtocolError>
+) -> Result<(kimmy_core::NodeId, kimmy_core::Epoch), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -6893,7 +6947,21 @@ where
         let _ = write_frame(stream, &Message::Superseded { node: their_node, epoch: newest }).await;
         return Err(ProtocolError::Superseded);
     }
-    Ok(their_node)
+    Ok((their_node, their_epoch))
+}
+
+/// [`open_handshake_claimed`], for a test that wants the peer's node alone.
+#[cfg(test)]
+async fn open_handshake<S>(
+    engine: &Engine,
+    stream: &mut S,
+    secret: &str,
+    binding: &[u8],
+) -> Result<kimmy_core::NodeId, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    open_handshake_claimed(engine, stream, secret, binding).await.map(|(node, _)| node)
 }
 
 /// Test-only ways to make a round's own apply slow. `cfg(test)`.
@@ -12823,8 +12891,8 @@ mod tests {
         peer: SocketAddr,
         secret: &str,
     ) -> Result<Dialled, ProtocolError> {
-        let (stream, their_node) = dial(engine, peer, secret).await?;
-        Ok(Dialled { stream, their_node, at: Instant::now(), took: Duration::ZERO })
+        let (stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
+        Ok(Dialled { stream, their_node, their_epoch, at: Instant::now(), took: Duration::ZERO })
     }
 
     /// A TCP relay in front of `to`: the address to dial, and the task of each

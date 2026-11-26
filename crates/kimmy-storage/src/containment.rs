@@ -102,10 +102,22 @@ impl Engine {
 
     /// The rows this member relays to a peer on its vectors (ADR-274): the newest epoch it holds
     /// for each node, the newest by epoch start first, at most `cap` of them. The second value says
-    /// whether the cap cut any. **Scaffold: no rows.**
+    /// whether the cap cut any. Read from memory, where the pending rows are as well as the
+    /// durable ones, and this member's own epoch.
     pub fn newest_epoch_rows(&self, cap: usize) -> (Vec<(NodeId, Epoch)>, bool) {
-        let _ = cap;
-        (Vec::new(), false)
+        let mut rows: Vec<(NodeId, Epoch)> = self
+            .newest_epochs
+            .lock()
+            .iter()
+            .filter(|(_, epoch)| **epoch != Epoch::ZERO)
+            .map(|(node, epoch)| (*node, *epoch))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.1.start_hlc().cmp(&a.1.start_hlc()).then_with(|| b.1.cmp(&a.1)).then(a.0.cmp(&b.0))
+        });
+        let cut = rows.len() > cap;
+        rows.truncate(cap);
+        (rows, cut)
     }
 
     /// The newest epoch of `node` this member knows: the larger of the recorded row and the node's

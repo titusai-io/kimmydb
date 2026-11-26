@@ -312,7 +312,7 @@ fn replace_is_honoured_only_for_the_store_on_the_epoch_it_names() {
 fn a_tell_is_acted_on_only_where_no_write_transaction_is_held() {
     const ALLOWED: &[&str] = &[
         "accept_handshake",
-        "open_handshake",
+        "open_handshake_claimed",
         "serve_peer_counting",
         "sync_round",
         "push_over",
