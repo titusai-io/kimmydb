@@ -739,7 +739,7 @@ a provider this member cannot build is one only an operator can.
 | `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
 | `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line: a storage failure (`internal`, `outcome_unknown`, or `storage_failed`, the storage failure that stops the node). **Page**. **One exception, which logs `WARN`**: a cause that is not this node's fault — the shutdown deadline (`stopping`), or the caller's, such as an operator a later document cannot take |
 | `starting` | `WARN` | This node has bound its port and is still starting: its store is opening, or its tasks are, and it answers only the two probes until then ([ADR-198](decisions.md)). Nothing was read or written, and the client is told to go to another member. The node's own answer while it opens is not logged (a probe every few seconds would be a line each); `/readyz` says what it is doing and for how long |
-| `halted` | `WARN` | This host was told that a newer epoch of its node exists, and halted ([ADR-274](decisions.md)): a host of that node now runs elsewhere, and this one serves nothing but its probes and its scrape. It stays up and answers `/healthz` so that an orchestrator does not restart it into a loop; `/readyz` is `503 halted` with the reason. Expected once, on the superseded host; the recovery is in the runbook |
+| `halted` | `WARN` | This host was told that a newer epoch of its node exists, and halted ([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)): a host of that node now runs elsewhere, and this one serves nothing but its probes and its scrape. It stays up and answers `/healthz` so that an orchestrator does not restart it into a loop; `/readyz` is `503 halted` with the reason. Expected once, on the superseded host; the recovery is in [the runbook](#two-hosts-of-one-node-and-the-host-that-halts) |
 | `catching_up` | `WARN` | This member knows it is behind (its catching-up marker is set: it created its store in a cluster it has seeds for, was restored, or fell behind its peers' retention horizon) and refuses every route but `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up ([ADR-202](decisions.md)). Nothing was read or written, and the client is told to go to another member. Expected for as long as a wiped member catches up; **alert on `kimmy_catching_up{reason="unknown"}` or a `catching_up` that lasts longer than the catch-up should**, not on the line. See [A member that is catching up](#a-member-that-is-catching-up) |
 | `node_stopping` | `WARN` | This node was shutting down and refused a write it had not begun; nothing was written, and the client is told to go to another member ([ADR-192](decisions.md)). Expected during every shutdown that meets a write after its drain. **Do not page**; a count that rises outside shutdowns is worth a look |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
@@ -2666,6 +2666,42 @@ history.
 There is deliberately no flag to mint a fresh identity on restore: it would be
 one keystroke between recovering and corrupting a cluster's identity space.
 
+### Two hosts of one node, and the host that halts
+
+A restore makes a second host of a node: `kimmyd restore` leaves the node id in the store and mints a new epoch ([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)), so the original and its restore are two epochs of one node. **The newest epoch of a node wins** ([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)): the epoch is in the cluster handshake, and a host that is told a newer epoch of its node exists **halts**.
+
+**Never run the old host after a restore.** Stop it first. If it is still running when the restored host starts, the restored host halts itself unless the restore was run with `--replace`, and with `--replace` the old host is told at its first contact and halts. Either is the intended end of one host, and not damage.
+
+**A halted host stays up, and is not ready, on purpose.** An orchestrator that restarted it would put it in a loop.
+
+- `/healthz` answers `200` and `/metrics` is served. `/readyz` is `503 halted`, in the error envelope, with a `reason` that names the epoch it was told of, the epoch it halted and the recovery. Every other route is `503 halted` (`retry: elsewhere`): a read, a write, a login, `/v1/version`, `/v1/topology`, `/mcp` and a WebSocket upgrade. Nothing is read or written.
+- A change stream that was open is closed with WebSocket 1001 and the reason `halted`, which a client reads as `retry: elsewhere`.
+- It stops its background work (retention, the drop purger, expiry, the embedding worker, the webhook dispatcher, replication, the cluster listener and SWIM), so the log carries the halt once (`WARN`: `this host is halted`) and not a refusal per tick, and peers see it go down within seconds.
+- The halt is durable. A restart starts halted and stays up: `kimmy.containment` in the data directory names the newest epoch it was told of, and the store's halt row names the epoch it halts. A halted start runs none of the ordinary start's writers (the user bootstrap, the registry's record, the reconciles, the collector, the purger) and does not record that it reached serving, so it writes nothing to the store.
+- Read the reason from `/readyz`, or from the start log.
+
+**Recovery.** Delete the store file, **keep `kimmy.containment`**, and run `kimmyd restore` from a backup. The restore reads the file's floor before its first open and mints strictly above the epoch it names (every open of `--until` included), so the recovered host is not halted by the marker. A marker whose named epoch is below the store's own is stale and ignored.
+
+**`--replace` wins.** A restore of a node whose original is **still running** is a mistake the host catches itself: a fresh epoch (one that has completed no handshake) runs a guard before it accepts or dials, and if its node id is live at another address and answers a probe within the window (twice foca's suspicion-to-down time, about 9.6 s), the fresh host halts **itself**, with the reason `the mistaken-restore guard found its node live at another address`. A stopped old host is not live: it is listed by SWIM for longer, does not answer, and the replacement proceeds. When you mean to replace a running host, run `kimmyd restore --replace`: the restored host proceeds, the old host is told at its first contact and halts. `--replace` names the epoch the restore minted and applies to that store only, and a restore without it leaves no such entry. **A recovered host wins only with `--replace`** when the newer host is still running.
+
+**The first start of a fresh member waits for the guard.** A member that is new to a cluster (no completed handshake) does not accept or dial until the guard has passed: with no seed that answers, at once; with a seed that answers and no member list yet, until SWIM's first list arrives, typically a second or two and at most 15 s; and about 10 s when its old address is still listed. SWIM runs meanwhile. A schema change made in that time is committed here and anti-entropy carries it, and the confirmation names every member pending.
+
+**The bound.** A claimed epoch is believed only within `storage.max_clock_skew_secs` (300 s) beyond this member's clock, the later of its wall clock and its logical clock; a peer's epoch beyond it records nothing, ends the contact with a line naming the peer, the epoch's start and the bound, and is not reached until it is due. A bad row, one recorded for an epoch no host minted, can only come from a holder of the cluster secret, within that bound; there is no command to lower a recorded row. A restore carries no row (the table is not in a backup), so a member restored from a backup taken before the row holds none, and any member left holding it relays it back: do it on **every** member, offline, at once.
+
+**What this does not contain.** Containment is not a lock. It does not stop:
+
+- two hosts on one `(node, epoch)`: a copied data directory, a volume or PV clone, a volume rollback;
+- both hosts writing until news meets, or a stale host inside a partition; and entries committed before the halt lands can leave through rounds already in progress;
+- a host whose clock is behind the new epoch's start by more than the skew bound: **it is not halted.** It refuses the new host's handshake and is not told, the members that know the new epoch run no round with it, so nothing it writes leaves it, and **it stays up and keeps accepting writes until its clock catches up**;
+- a member that restarts before its next write forgets a newer epoch it had only heard in a handshake, and runs rounds with the older host again until its next contact with the newer one;
+- a halted start of a store that lacks the `__users` or `__roles` collection (a very old backup, restored and halted at its first start): it fails closed with `opening the user store: this host is halted`, because the halt does not allow the write that would create them. Start it once on 0.62 tooling unhalted, or restore a newer backup;
+- a winner picked by clock skew, a tie or intent: the newest epoch wins, whichever host you meant;
+- the halted host's acknowledged writes: the recovery wipes its store, and there is no export;
+- a restore that reaches the seeds halting a member of production, which is what `--replace` authorizes and its absence makes visible;
+- a holder of the cluster secret claiming any `(node, epoch)` within the bound.
+
+Each restore keeps one of the 64 writer slots per counter and one of the 256 per document for good, and 44 bytes per vector.
+
 ### What a backup contains
 
 Documents, collection and index metadata, secondary index entries, the oplog and
@@ -3004,6 +3040,8 @@ disk-snapshot rollback, or a copied data directory, keeps the epoch**, because t
 brings back holds the row: the member goes on writing under the origin it lost writes in, and
 only the replay of its own origin protects it (see
 [A member that is catching up](#a-member-that-is-catching-up)). Restore with `kimmyd restore`.
+**Since 0.62.0 the epoch travels in the cluster handshake**, and a host on an older epoch of its node
+than a peer has seen is told and halts ([Two hosts of one node, and the host that halts](#two-hosts-of-one-node-and-the-host-that-halts)).
 **A resume token issued before the rewind or the
 restore may then redeliver events** once the member is reopened: the member is no longer the
 one that issued it, so the token resumes at-least-once, as on any other member, and a stream

@@ -410,6 +410,14 @@ The check happens **before** the WebSocket upgrade, so the client gets a real
 HTTP status rather than an unexplained socket close after a successful
 handshake. Authorization happens before the upgrade for the same reason.
 
+**A stream ends when its member stops serving.** An open stream is closed with the
+going-away code, WebSocket 1001, and a reason a client reads as `retry: elsewhere`:
+`catching_up` when the member has started refusing requests because it is behind
+([ADR-202](decisions.md)), and `halted` when the member was told that a newer epoch of
+its node exists and halted ([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)).
+Resume on another member with the last token you saw
+([Resuming on another member](#resuming-on-another-member)).
+
 ---
 
 ## Resuming on another member

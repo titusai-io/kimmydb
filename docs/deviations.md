@@ -4285,6 +4285,42 @@ When members write one document concurrently, every member serves the same order
 
 ---
 
+<a id="containment-newest-epoch-in-memory-d13"></a>
+
+## 🟡 Containment holds the newest epoch of each node in memory and writes it with the next commit, and a backup carries no row of it, where the plan made it durable at belief and carried the own node's row (D13)
+
+**What the plan said.** [ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins): record the newest epoch of a peer's node in a table at the moment it is believed, and let a backup carry the own node's row so a restore mints above it.
+
+**What was built, and why.** A handshake must never wait on the writer, and the first form, which wrote the row in a transaction inside the handshake, turned three replay tests red (a held writer during a contact; under `coalesced` durability the commit waits at a barrier whose leader takes the gate with no budget). The newest epoch is held in memory (loaded from the table at the end of an open) and written by the **next write transaction the member commits, of any holder**; the table is created by the first row written to it and never at an open, so a store that has met no other epoch has the layout it had. A backup carries **no row of the table**, and this member's own epoch is read from its epoch row and held in memory. The floor a recovery restore needs lives in the containment file (`kimmy.containment`), so the own node's row would have had no reader.
+
+**What you will see.** A member that restarts before its next write forgets a newer epoch it had only heard in a handshake, and runs rounds with the older host again until its next contact with the newer one, which tells it again. A backup restored into a staging cluster does not carry production's newest epochs into it.
+
+**To close:** none planned; a durable row at belief would need a path to the disk that does not take the writer, which the engine does not have.
+
+---
+
+<a id="containment-halted-start-d13"></a>
+
+## 🟡 A halted start of a store that lacks the `__users` or `__roles` collection fails closed, and a halted start does not record that it reached serving (D13)
+
+**What you will see.** A halted host builds the API state, which opens the user and role collections; opening one that exists is a read, so every store that has run starts. A store that lacks either (a very old backup, from before `__roles` was created on demand, restored and then halted by the containment file at its first start) is refused with `opening the user store: this host is halted`, because the halt does not allow the write that would create it. A halted start also skips `lifecycle::record_start`, so the next start does not read it as a run whose length it can judge.
+
+**Workaround.** Start the store once on 0.62 tooling unhalted, or restore a newer backup.
+
+**To close:** a halted start that builds its state without the two stores, which the halted router never reads.
+
+---
+
+<a id="containment-writer-slot-per-restore-d13"></a>
+
+## 🟡 Each restore keeps one writer slot per counter and per document for good (D13)
+
+A restore is a new epoch, so a new origin, and a counter or a document that the restored host writes again carries one more of the 64 writer slots per counter and the 256 per document, and 44 bytes per version vector, for the life of the cluster ([ADR-273](decisions.md#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both), [ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)). Containment stops a second host of the node from writing; it does not retire the epoch of the host it replaced, and closure (retiring an origin), the vector drop and the counter-slot fold were ruled out of 0.62.0 (Chris, 2026-11-14, "Narrow").
+
+**To close:** the retirement work, which needs a decision about who may say a member is gone.
+
+---
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —
