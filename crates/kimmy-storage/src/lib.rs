@@ -404,6 +404,8 @@ mod plain_life_n_rows_tests;
 #[cfg(test)]
 mod plain_life_page_rows_tests;
 #[cfg(test)]
+mod remake_loss_tests;
+#[cfg(test)]
 mod remake_page_tests;
 #[cfg(test)]
 mod shadow_forcing_tests;

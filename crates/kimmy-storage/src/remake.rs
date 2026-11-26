@@ -102,6 +102,20 @@ impl GonePlan {
     }
 }
 
+/// What a Q7 loss record for a collection that is gone here comes to: see [`Engine::judge_a_loss_record_of_a_gone_name`].
+pub(crate) enum GoneLoss {
+    /// The rules that held before answer (a swapped, hidden or shadow name, or no floor to judge by).
+    Old,
+    /// History: at or below the floor, or the name's row says `document`.
+    History,
+    /// This member holds no row of the name: the window stops and a scoped page is asked for.
+    Stops,
+    /// Above the floor of a `field` name: appended and parked with the row's `R`, no collection made.
+    Parks { retention_ms: u64 },
+    /// Above the floor, but the drop's rows are not purged yet: left untaken; the `db.name`.
+    Purging(String),
+}
+
 /// Whether a name's row allows it to be made again at all: never a stage, a recreation or a vector shadow.
 fn is_remakable(row: &BaseOptions) -> bool {
     row.stage.is_none()
@@ -283,6 +297,40 @@ impl Engine {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// What the entries route does with a Q7 loss record for a collection that is not held here (unit P, ruled 1:07 PM): the one kind of
+    /// fact that does not make the collection again.
+    pub(crate) fn judge_a_loss_record_of_a_gone_name(
+        &self,
+        entry: &kimmy_core::OplogEntry,
+    ) -> Result<GoneLoss> {
+        let id = entry.collection;
+        let row = {
+            let txn = self.db().begin_read()?;
+            crate::register::base_options_of(&txn, id)?
+        };
+        // No row: this member cannot say the name was never swapped, nor what its options are: the entry stops the window, and the scoped
+        // page of the fetch brings the row.
+        let Some(row) = row else { return Ok(GoneLoss::Stops) };
+        let plan = self.gone_plan(id, None)?;
+        // a name that is swapped, hidden or a shadow, or no floor to judge by: the old rules answer
+        let Some(floor) = plan.floor.filter(|_| plan.remakable) else { return Ok(GoneLoss::Old) };
+        if entry.stamp.hlc <= floor {
+            return Ok(GoneLoss::History);
+        }
+        // a record of a collection that is not `field` is ignored, as `relay_loss_record` ignores it
+        let (kimmy_core::MergePolicy::Field, Some(retention_ms)) =
+            (row.merge_policy, row.join_retention_ms)
+        else {
+            return Ok(GoneLoss::History);
+        };
+        // parked over the drop's rows, a record would be removed with them or kept for a life that ended: left until the purger is done
+        if self.purge_pending(id)? {
+            self.prioritise_purge(id);
+            return Ok(GoneLoss::Purging(format!("{}.{}", row.db, row.name)));
+        }
+        Ok(GoneLoss::Parks { retention_ms })
     }
 
     /// The remake the entries route owes a document or a definition: made, held out as a wait, or nothing. Returns the `db.name` of a

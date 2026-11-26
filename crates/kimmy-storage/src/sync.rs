@@ -2242,6 +2242,9 @@ enum Judged {
     History { staging: bool },
     /// To be applied, into this definition.
     Apply(Arc<CollectionMeta>),
+    /// A Q7 loss record above the floor of a gone `field` collection (unit P): appended and parked with this retention, and no collection
+    /// is made.
+    ParkLoss { retention_ms: u64 },
 }
 
 impl Engine {
@@ -2263,6 +2266,27 @@ impl Engine {
         }
 
         let Some(collection) = collection else {
+            // A Q7 loss record of a collection that is gone here is no fact that makes it again (unit P, ruled 1:07 PM): at or below the
+            // floor, or of a `document` name, it is history; above the floor of a `field` name it is parked with the row's `R`; with no row
+            // the window stops; with the drop's rows still to be purged it is left untaken.
+            if entry.kind.is_loss_record() {
+                match self.judge_a_loss_record_of_a_gone_name(entry)? {
+                    crate::remake::GoneLoss::Parks { retention_ms } => {
+                        return Ok(Judged::ParkLoss { retention_ms });
+                    }
+                    crate::remake::GoneLoss::Stops => {
+                        return Ok(Judged::Decided(Step::Unknown(None)));
+                    }
+                    crate::remake::GoneLoss::Purging(name) => {
+                        return Ok(Judged::Decided(Step::PurgePending(name)));
+                    }
+                    crate::remake::GoneLoss::History => {
+                        outcome.superseded += 1;
+                        return Ok(Judged::History { staging: false });
+                    }
+                    crate::remake::GoneLoss::Old => {}
+                }
+            }
             // Gone here, and a tombstone says so: history, whichever way the
             // stamps fall (ADR-148). [`Self::is_history`] turns away a write
             // from *before* a drop even when the collection was recreated;
@@ -2497,6 +2521,9 @@ impl Engine {
             Judged::History { staging } => {
                 return self.history_answer(run, entry, position, staging);
             }
+            Judged::ParkLoss { retention_ms } => {
+                return self.park_a_loss_record(run, entry, position, retention_ms, outcome);
+            }
             Judged::Apply(collection) => collection,
         };
 
@@ -2533,6 +2560,11 @@ impl Engine {
                     race_hooks::absorbed(race_hooks::Race::DocumentRun);
                     return self.history_answer(run, entry, position, staging);
                 }
+                Judged::ParkLoss { retention_ms } => {
+                    #[cfg(test)]
+                    race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    return self.park_a_loss_record(run, entry, position, retention_ms, outcome);
+                }
                 Judged::Apply(current) => {
                     #[cfg(test)]
                     if *current != *collection {
@@ -2568,6 +2600,28 @@ impl Engine {
             // transaction, which commits whole (`commit_run`), so a window needs no more than it counted
             // before (a superseded entry).
             RemoteApplied::Written { released } => {
+                outcome.superseded += 1;
+                run.released += u64::from(released);
+            }
+        }
+        Ok(Step::Taken)
+    }
+
+    /// A loss record above the floor of a gone `field` collection, appended and parked in the run's transaction (unit P).
+    fn park_a_loss_record<'e>(
+        &'e self,
+        run: &mut Run<'e>,
+        entry: &OplogEntry,
+        position: crate::engine::Position,
+        retention_ms: u64,
+        outcome: &mut SyncOutcome,
+    ) -> Result<Step> {
+        let txn = self.run_txn(run)?;
+        match self.park_a_loss_record_of_a_gone_collection(txn, entry, position, retention_ms)? {
+            // nothing is applied to any document: counted as the loss records a document row takes are (`Written` is a superseded entry)
+            crate::docs::RemoteApplied::Applied { released, .. }
+            | crate::docs::RemoteApplied::Written { released }
+            | crate::docs::RemoteApplied::Superseded { released } => {
                 outcome.superseded += 1;
                 run.released += u64::from(released);
             }

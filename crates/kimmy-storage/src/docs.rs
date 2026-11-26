@@ -2088,6 +2088,48 @@ impl Engine {
         })
     }
 
+    /// A loss-record entry for a collection that is GONE here, stamped above its floor, whose name's row says `field` (unit P, ruled
+    /// 1:07 PM): no collection is made (a record alone is no fact that makes one, and a row is never built from records), the entry is
+    /// appended, so this member serves it onward, and its record is PARKED by collection id and document key with the row's `R`
+    /// (`retention_ms`), exactly as `relay_loss_record` parks one for a document that has no row. The write that makes the collection again
+    /// finds it there, in either order.
+    pub(crate) fn park_a_loss_record_of_a_gone_collection(
+        &self,
+        txn: &WriteTxn<'_>,
+        entry: &OplogEntry,
+        position: Position,
+        retention_ms: u64,
+    ) -> Result<RemoteApplied> {
+        if position == Position::Hold {
+            return Err(StorageError::Corrupt(
+                "a snapshot page carries a loss record, which is history and never state".into(),
+            ));
+        }
+        let body = entry
+            .body
+            .as_deref()
+            .ok_or_else(|| StorageError::Corrupt("a loss record carries no body".into()))?;
+        kimmy_core::merge_state::MergeState::decode_loss_record(body)
+            .map_err(|e| StorageError::Corrupt(format!("the body of a loss record: {e:?}")))?;
+        let id = entry
+            .doc_id
+            .as_ref()
+            .ok_or_else(|| StorageError::Corrupt("a loss record names no document".into()))?;
+        let key = doc_key(id)?;
+        let appended = self.field_entry_kept(txn, entry, position, false)?;
+        let parked_at = self.clock_bound_now_ms();
+        crate::loss_pending::park(
+            txn,
+            entry.collection.0,
+            &key,
+            &codec::oplog_key(&entry.stamp),
+            body,
+            retention_ms,
+            parked_at,
+        )?;
+        Ok(appended)
+    }
+
     /// U1: refuse, by name and until due, an entry or state of a `field` collection whose clock is
     /// more than `max_clock_skew_secs` ahead of this member's physical clock. Nothing has been written
     /// when this returns the error, and the entry is not witnessed: it applies once it is due.

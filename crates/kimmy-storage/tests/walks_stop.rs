@@ -92,6 +92,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "remake_loss_tests::parked",
+        "test code counting the parked loss records of one document in a store it wrote itself (ADR-272, unit P)",
+    ),
+    (
         "plain_life_page_rows_tests::parked_under",
         "test code reading the parked loss records of one collection id in a store it wrote itself (ADR-272, unit P)",
     ),
