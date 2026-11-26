@@ -389,6 +389,7 @@ fn the_row_overheads_bound_the_encoding() {
         dropped_indexes: Vec::new(),
         tombstone_horizon: None,
         register: None,
+        carried: Vec::new(),
     };
     let size = |page: &SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
     let base = size(&bare);
@@ -441,6 +442,7 @@ fn the_row_overheads_bound_the_encoding() {
             collection: kimmy_core::CollectionId(u64::MAX),
             after_key: key.clone(),
             until_key: Some(key.clone()),
+            carry: crate::snapshot::Carry::Done,
         };
         let page = SnapshotPage { next: Some(cursor), ..bare.clone() };
         let actual = size(&page) - base;

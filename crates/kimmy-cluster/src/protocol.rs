@@ -1196,6 +1196,7 @@ mod tests {
                     collection: CollectionId(u64::MAX),
                     after_key: vec![1, 2],
                     until_key: Some(vec![9, 9]),
+                    carry: kimmy_storage::Carry::Done,
                 }),
                 collection: Some(CollectionId(u64::MAX)),
             },
@@ -1679,6 +1680,7 @@ mod tests {
                 dropped_indexes: Vec::new(),
                 tombstone_horizon: None,
                 register: None,
+                carried: Vec::new(),
             })),
         )
         .await
@@ -1771,6 +1773,7 @@ mod tests {
                 collection: CollectionId(7),
                 after_key: vec![1, 2, 3],
                 until_key: None,
+                carry: kimmy_storage::Carry::Done,
             }),
             versions,
             dropped: None,
@@ -1785,6 +1788,7 @@ mod tests {
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),
             register: None,
+            carried: Vec::new(),
         };
         let message = Message::Snapshot(Box::new(page.clone()));
         let whole = written_document(&message).await;

@@ -9304,6 +9304,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
             deleted_documents: Vec::new(),
         }
     }
@@ -9313,6 +9314,7 @@ mod tests {
             collection: CollectionId::derive("shop", "orders"),
             after_key: after.to_be_bytes().to_vec(),
             until_key: None,
+            carry: kimmy_storage::Carry::Done,
         }
     }
 

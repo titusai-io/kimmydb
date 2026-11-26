@@ -366,9 +366,9 @@ pub use refusal_hint::{HintKind, RefusalHint};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use snapshot::SnapshotReaderHook;
 pub use snapshot::{
-    CollectionState, LEFT_IDS_NAMED, RegisterCarry, SNAPSHOT_PAGE, SNAPSHOT_PAGE_BYTES,
-    ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy,
-    SnapshotProgress, SnapshotTombstone,
+    CARRY_NAMES, CARRY_OPTIONS, CarriedRow, Carry, CarryCursor, CollectionState, LEFT_IDS_NAMED,
+    RegisterCarry, SNAPSHOT_PAGE, SNAPSHOT_PAGE_BYTES, ServeVerdict, SnapshotApplied,
+    SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

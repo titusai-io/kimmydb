@@ -398,6 +398,7 @@ fn a_page_of_a_whole_database_snapshot_that_is_not_the_last_and_moves_only_a_sta
         collection: orders(),
         after_key: vec![0xff],
         until_key: None,
+        carry: crate::snapshot::Carry::Done,
     });
 
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -501,6 +502,7 @@ fn a_page_of_a_whole_database_snapshot_that_is_not_the_last_and_moves_only_a_tom
         collection: orders(),
         after_key: vec![0xff],
         until_key: None,
+        carry: crate::snapshot::Carry::Done,
     });
 
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();

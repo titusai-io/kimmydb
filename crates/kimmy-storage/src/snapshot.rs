@@ -238,8 +238,15 @@ pub(crate) fn id_name(id: &DocId) -> String {
 /// it, a bound: the key crosses as an array of `int32`s, and so does the key the
 /// snapshot ends at (`until` bytes; 0 when it has none), with its field.
 pub(crate) fn cursor_reserve(key: usize, until: usize) -> usize {
-    CURSOR_OVERHEAD + byte_array_wire_len(key) + UNTIL_FIELD_OVERHEAD + byte_array_wire_len(until)
+    CURSOR_OVERHEAD
+        + byte_array_wire_len(key)
+        + UNTIL_FIELD_OVERHEAD
+        + byte_array_wire_len(until)
+        + CARRY_FIELD_OVERHEAD
 }
+
+/// The `carry` field's name, type byte and framing in a cursor that cuts a document walk, which is always `null`: a bound.
+const CARRY_FIELD_OVERHEAD: usize = 32;
 
 /// The `until_key` field's name, type byte and framing in a cursor, a bound.
 const UNTIL_FIELD_OVERHEAD: usize = 32;
@@ -292,6 +299,54 @@ pub struct SnapshotCursor {
     /// whole-database snapshot, and for a collection that had no rows. The sender sets it
     /// and every cursor it returns carries it back: the receiver stores the cursor whole.
     pub until_key: Option<Vec<u8>>,
+    /// For a whole-database snapshot: where the CARRY stands, the rows of the sender's names table and base options that ride the first
+    /// pages, before the documents (ADR-272, unit N). [`Carry::At`] while carry rows remain to be sent, and the cursor then names no
+    /// document (the document walk begins when the carry is done); [`Carry::Done`] once they are all sent, on every cursor that cuts the
+    /// document walk, and always on a scoped page.
+    ///
+    /// REQUIRED, and not an `Option`: serde reads a missing `Option` as `None`, so a cursor written before the carry existed, a stored
+    /// progress record among them, would have read as a carry that is done and resumed the pull past the rows it never received. As a
+    /// two-variant enum with no default, a cursor that does not name its carry does not decode, and a stored record that does not decode
+    /// is read as none: the pull starts again from its first page (`stored_snapshot_scope`, `snapshots_to_resume`).
+    ///
+    /// It is a part of this cursor, and not a second one beside it, so that the one cursor a pull holds (`SnapshotProgress::after`, which
+    /// a page's request carries back whole and a restart stores whole) is the whole of where the pull stands; a snapshot is complete
+    /// when the page's cursor is `None`, which is when both walks are done.
+    pub carry: Carry,
+}
+
+/// Where the carry of a snapshot cursor stands: sent whole, or resuming after a row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Carry {
+    /// Every row of the carry has been sent.
+    Done,
+    /// The carry resumes strictly after this row.
+    At(CarryCursor),
+}
+
+/// Where the carry of a whole-database snapshot stands: after the row at `after_key` of the table `table`. Tables are walked in tag order
+/// and each in key order, so a cursor names one row and the next page resumes strictly after it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarryCursor {
+    /// The table the row is of: [`CARRY_NAMES`] or [`CARRY_OPTIONS`].
+    pub table: u8,
+    /// The row's key in that table (empty before the first row of the table).
+    pub after_key: Vec<u8>,
+}
+
+/// The tag of the names table (`REGISTER_NAMES`) on the wire. The wire's own, not the backup's.
+pub const CARRY_NAMES: u8 = 1;
+/// The tag of the base options table (`COLLECTION_BASE_OPTIONS`) on the wire.
+pub const CARRY_OPTIONS: u8 = 2;
+
+/// One row of the carry, as its table stores it: a page lists them by table and key, and the receiver judges them whole when the join
+/// completes (`SnapshotPage::carried`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedRow {
+    /// The table the row is of: [`CARRY_NAMES`] or [`CARRY_OPTIONS`].
+    pub table: u8,
+    pub key: serde_bytes::ByteBuf,
+    pub value: serde_bytes::ByteBuf,
 }
 
 /// `collection/hex-key`, for a log line that says where a snapshot stands.
@@ -765,6 +820,10 @@ pub struct SnapshotPage {
     /// a scoped one, and from a sender that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub register: Option<RegisterCarry>,
+    /// The rows of the sender's names table and base options this page carries, on a whole-database snapshot: the first pages, before the
+    /// documents (ADR-272, unit N). REQUIRED (no default): a page without the list is malformed, and an empty list says there are no rows
+    /// on this page. The receiver stages them, by sender, as they arrive and merges them in the transaction that completes the join.
+    pub carried: Vec<CarriedRow>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -1066,6 +1125,7 @@ impl Engine {
             dropped_indexes: dropped_indexes.clone(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
@@ -1107,6 +1167,7 @@ impl Engine {
             dropped_indexes,
             tombstone_horizon,
             register,
+            carried: Vec::new(),
         })
     }
 
@@ -1389,6 +1450,7 @@ impl Engine {
                 collection: CollectionId(collection),
                 after_key,
                 until_key: until.clone(),
+                carry: Carry::Done,
             })
         };
         loop {
@@ -6056,6 +6118,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -6123,6 +6186,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -6613,6 +6677,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -7704,6 +7769,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             register: None,
+            carried: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();
