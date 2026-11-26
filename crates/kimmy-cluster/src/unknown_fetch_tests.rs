@@ -2,8 +2,8 @@
 //! strength of the stop itself (`plan_repair(peer, collection, Repair::Snapshot)`, transport.rs, the `(None, Some(unknown))` arm), and `plan_repair` refuses a collection whose repair ran against that peer
 //! and has not cooled (`REPAIR_COOLDOWN_ROUNDS` = 60 contacts, about 5 minutes at the default tick). A collection dropped and remade twice inside five minutes, with the member stopped at a write each time,
 //! would wait out the cooldown for the second fetch. Expected: the second fetch is planned AT ONCE. Today RED: `plan_repair` answers false while cooling.
-//! The planner's own entry point is what the fix changes (an unknown-collection fetch is planned through its own call, or `plan_repair` takes the reason): adapt the calls then; the assertions stay.
-//! NOT COMMITTED: pending, with the other unit P tests; it goes in crates/kimmy-cluster/src/unknown_fetch_tests.rs with `#[cfg(test)] mod unknown_fetch_tests;` in lib.rs.
+//! The fetch is planned through its own call, `plan_unknown_collection_fetch`, which the transport's stop arm uses; `plan_repair` keeps the cooldown for a repair a finding plans (w4c), and a fetch already
+//! queued or running is not planned twice (w4b).
 
 use kimmy_core::{CollectionId, NodeId};
 
@@ -18,14 +18,14 @@ fn second_fetch_planned(rounds: u32) -> bool {
     let peer = node(1);
     let collection = CollectionId(7);
     let mut stalls = PeerStalls::new();
-    assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "the first fetch is planned");
+    assert!(stalls.plan_unknown_collection_fetch(peer, collection), "the first fetch is planned");
     assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)), "and runs");
     stalls.repair_finished(peer);
     for _ in 0..rounds {
         stalls.tick_opened();
         assert_eq!(stalls.repair_due(peer, false), None);
     }
-    stalls.plan_repair(peer, collection, Repair::Snapshot)
+    stalls.plan_unknown_collection_fetch(peer, collection)
 }
 
 #[test]
@@ -39,5 +39,34 @@ fn w4_a_second_unknown_collection_fetch_is_planned_at_once_not_after_the_cooldow
         waited.is_empty(),
         "w4: the second fetch of a collection the member cannot make was refused ({}): it waited for the {REPAIR_COOLDOWN_ROUNDS}-contact cooldown",
         waited.join("; ")
+    );
+}
+
+/// An unknown-collection fetch that is already queued or running is not planned a second time: the exemption is from the cooldown only.
+#[test]
+fn w4b_an_unknown_collection_fetch_that_is_queued_or_running_is_not_planned_twice() {
+    let (peer, collection) = (node(1), CollectionId(7));
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_unknown_collection_fetch(peer, collection), "the fetch is planned");
+    assert!(!stalls.plan_unknown_collection_fetch(peer, collection), "queued: not planned twice");
+    assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)), "and runs");
+    assert!(!stalls.plan_unknown_collection_fetch(peer, collection), "running: not planned twice");
+}
+
+/// A repair a finding plans still waits out the cooldown: only the unknown-collection fetch is exempt.
+#[test]
+fn w4c_a_repair_a_finding_plans_still_waits_out_the_cooldown() {
+    let (peer, collection) = (node(1), CollectionId(7));
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "the first repair is planned");
+    assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)), "and runs");
+    stalls.repair_finished(peer);
+    for _ in 0..(REPAIR_COOLDOWN_ROUNDS - 1) {
+        stalls.tick_opened();
+        assert_eq!(stalls.repair_due(peer, false), None);
+    }
+    assert!(
+        !stalls.plan_repair(peer, collection, Repair::Snapshot),
+        "a second repair of the collection, planned by a finding, is refused while the first cools"
     );
 }

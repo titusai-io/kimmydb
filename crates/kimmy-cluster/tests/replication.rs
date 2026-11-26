@@ -6740,6 +6740,74 @@ async fn lookalike_relay_a_collection_holding_a_document_heals_on_the_unknown_co
     assert!(m.engine.get_collection("shop", "audit").is_ok(), "healed through the stop");
 }
 
+/// w4d: a SECOND stop on an unknown collection, inside the cooldown a finished fetch leaves, is fetched at once. `w4`, `w4b` and `w4c` test the PLANNER (`PeerStalls`); this drives the stop arm of a real round (transport.rs, the
+/// `(None, Some(unknown))` arm), which is the behaviour change: if the arm called `plan_repair` again every planner test would stay green.
+///
+/// The cooldown is counted in CONTACTS, not time: `repair_due` ages a finished repair's entry by one per contact (and `PeerStalls::tick_opened` re-arms the count), and `sync_once_with` never calls `tick_opened`, so one `PeerStalls`
+/// kept across calls holds the cooldown for as long as the test runs; `REPAIR_COOLDOWN_ROUNDS` (60) is never reached. `sync_once` builds a fresh `PeerStalls` each call and so cannot see the plan or the cooldown.
+///
+/// The stop: `m` is made to lose `audit` with no tombstone (`forget_collection_leaving_rows`, then the rows purged), while its position still covers `audit`'s creation; `a` then writes into `audit`, and the next window names a
+/// collection `m` cannot make. The same member loses it and stops a second time after the first fetch (one member, one `PeerStalls`). A stop on a collection WITH a tombstone is history today, so only this state stops.
+///
+/// Rounds: 1 (m stops at the write), 2 (m's planned fetch makes `audit`), 3 (m, having lost `audit` again, stops inside the cooldown the fetch left), 4 (the fetch that stop planned, at once). RED if the arm refuses to plan while
+/// cooling: `m` then holds no `audit` after round 4.
+#[tokio::test]
+async fn a_second_stop_on_an_unknown_collection_inside_the_cooldown_is_fetched_at_once() {
+    let (a, m, _ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    // `a` makes `audit` with a document and `m` takes it by entries: `m`'s position covers audit's creation
+    let audit = a.engine.create_collection("shop", "audit").unwrap();
+    a.engine.insert(&audit, doc! { "_id": "a" }).unwrap();
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(m.engine.get_collection("shop", "audit").is_ok(), "premise: m took audit by entries");
+    // `m` loses `audit`: its definition, with no tombstone, and its rows
+    let lose = || {
+        m.engine.forget_collection_leaving_rows("shop", "audit").unwrap();
+        m.engine.purge_dropped_collection(audit.id).unwrap();
+        assert!(m.engine.get_collection("shop", "audit").is_err(), "premise: m lacks audit");
+        assert!(
+            m.engine.collection_dropped_at(audit.id).unwrap().is_none(),
+            "premise: and holds no tombstone of it, so a write of it is unknown and not history"
+        );
+        assert_eq!(m.engine.rows_under(audit.id).unwrap(), 0, "premise: and none of its rows");
+    };
+    let mut stalls = PeerStalls::new();
+
+    // round 1: `m` lacks `audit`; `a` writes into it; the window names a collection `m` cannot make, and the stop plans the fetch
+    lose();
+    a.engine.insert(&audit, doc! { "_id": "b" }).unwrap();
+    let first = sync_once_with(&m.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(first.unknown_collection > 0, "premise (round 1): m stops at audit's write: {first:?}");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_err(),
+        "premise (round 1): the stop made nothing"
+    );
+    // round 2: the planned fetch runs, `audit` is made, and the repair finishes: the cooldown entry is now held in `stalls`
+    sync_once_with(&m.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "premise (round 2): the first fetch made audit"
+    );
+
+    // round 3: `m` loses `audit` again and `a` writes again: the same member stops at the same collection, from the same peer, inside the cooldown
+    lose();
+    a.engine.insert(&audit, doc! { "_id": "c" }).unwrap();
+    let second = sync_once_with(&m.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        second.unknown_collection > 0,
+        "premise (round 3): m stops at audit's write again: {second:?}"
+    );
+    assert!(
+        m.engine.get_collection("shop", "audit").is_err(),
+        "premise (round 3): the stop made nothing"
+    );
+    // round 4: the fetch the second stop planned runs at once
+    sync_once_with(&m.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "w4d: the second stop, inside the cooldown, was fetched at once: m holds audit after one further round"
+    );
+}
+
 #[tokio::test]
 async fn relay_a_vector_configuration_turned_on_after_m_pulled_in_the_loop() {
     let (_a, m) = vectors_configured_after_m_pulled(true, Pull::Loop).await;

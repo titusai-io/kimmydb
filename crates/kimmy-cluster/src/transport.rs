@@ -3578,9 +3578,10 @@ where
                 // the strength of the stop itself, rather than left to
                 // the divergence check — which cannot run on a round
                 // that did not reach the tail, and this one never will
-                // until the collection is here.
+                // until the collection is here. Exempt from the cooldown a
+                // finished repair leaves: the stop is the reason, not a finding.
                 (None, Some(unknown))
-                    if stalls.plan_repair(their_node, unknown.id, Repair::Snapshot) =>
+                    if stalls.plan_unknown_collection_fetch(their_node, unknown.id) =>
                 {
                     warn!(
                         %peer,
@@ -5195,6 +5196,29 @@ impl PeerStalls {
     /// `false` when one is already planned or under way for it, or one ran
     /// and the finding has not cleared or cooled down since.
     pub fn plan_repair(&mut self, peer: NodeId, collection: CollectionId, repair: Repair) -> bool {
+        self.plan_repair_from(peer, collection, repair, false)
+    }
+
+    /// Plan the snapshot that a stop at a collection this node cannot make asks for (unit P, w4). It is planned on the strength of the stop
+    /// itself, an entry the node cannot take, and not on a finding, so it is exempt from the cooldown a finished repair leaves behind: a
+    /// collection dropped and made again twice inside the cooldown, with the node stopped at a write each time, would otherwise wait out
+    /// [`REPAIR_COOLDOWN_ROUNDS`] contacts for the second fetch. One that is already queued or running is still refused, as `plan_repair`
+    /// refuses it.
+    pub fn plan_unknown_collection_fetch(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+    ) -> bool {
+        self.plan_repair_from(peer, collection, Repair::Snapshot, true)
+    }
+
+    fn plan_repair_from(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        repair: Repair,
+        exempt_from_cooldown: bool,
+    ) -> bool {
         let kind = repair.kind();
         // A digest repair is not planned beside a count repair of the collection, queued,
         // active or cooling: the replay lands what a digest repair would for the ids it
@@ -5209,11 +5233,14 @@ impl PeerStalls {
             return false;
         }
         let repairs = self.repairs.entry(peer).or_default();
-        if repairs.done.contains_key(&(collection, kind))
+        if (!exempt_from_cooldown && repairs.done.contains_key(&(collection, kind)))
             || repairs.active.is_some_and(|(id, r)| id == collection && r.kind() == kind)
             || repairs.queued.contains_key(&(collection, kind))
         {
             return false;
+        }
+        if exempt_from_cooldown {
+            repairs.done.remove(&(collection, kind));
         }
         repairs.queued.insert((collection, kind), repair);
         true
