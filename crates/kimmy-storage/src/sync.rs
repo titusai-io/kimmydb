@@ -3018,6 +3018,9 @@ impl Engine {
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
+                // NOT refused here yet (unit S, S5): a stage's indexes are copied into it by its CREATION ENTRY (Q6.7 unit 1), and until that
+                // is built the join and floor tests make the copy by hand as a CreateIndex addressed to the stage. The refusal of this arm lands
+                // with unit 1, with `refuse_a_schema_change_of_a_hidden_physical` as for the three below.
                 match settle(self.apply_remote_index(&target, entry))? {
                     // Built or settled with its entry in the same commit, and
                     // witnessed and published already: nothing is left to
@@ -3098,6 +3101,15 @@ impl Engine {
             }
             OpKind::DropIndex => {
                 let target: kimmy_core::IndexDrop = bson::deserialize_from_slice(body)?;
+                // A schema change addressed to a hidden physical (a stage's or a recreation's name) is refused on the name alone, whether or not this
+                // member holds it: honest traffic names the LOGICAL name (decision 15). Before any resolution, tombstone or settle.
+                if self.refuse_a_schema_change_of_a_hidden_physical(
+                    &target.db,
+                    &target.collection,
+                    "a replicated index drop",
+                ) {
+                    return Ok(DdlOutcome::Refused);
+                }
 
                 // A drop is the one arm that destroys state, so it is the one
                 // arm that has to know *which* index it was aimed at — the
@@ -3268,6 +3280,15 @@ impl Engine {
             }
             OpKind::ConfigureVectors => {
                 let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
+                // A schema change addressed to a hidden physical (a stage's or a recreation's name) is refused on the name alone, whether or not this
+                // member holds it: honest traffic names the LOGICAL name (decision 15). Before any resolution, tombstone or settle.
+                if self.refuse_a_schema_change_of_a_hidden_physical(
+                    &target.db,
+                    &target.collection,
+                    "a replicated vector configuration",
+                ) {
+                    return Ok(DdlOutcome::Refused);
+                }
                 // A swapped name keeps no vector configuration in this release (decision 12, "swap wins"): once the identity is not the
                 // physical the name answers from, the entry is history on every member, whatever order it met the swap in. Taken, counted
                 // (once per delivery: it is consumed and not appended, so it can arrive again), warned, and no shadow is made. While the
@@ -3336,6 +3357,15 @@ impl Engine {
             }
             OpKind::ConfigureValidator => {
                 let target: kimmy_core::ValidatorSet = bson::deserialize_from_slice(body)?;
+                // A schema change addressed to a hidden physical (a stage's or a recreation's name) is refused on the name alone, whether or not this
+                // member holds it: honest traffic names the LOGICAL name (decision 15). Before any resolution, tombstone or settle.
+                if self.refuse_a_schema_change_of_a_hidden_physical(
+                    &target.db,
+                    &target.collection,
+                    "a replicated validator",
+                ) {
+                    return Ok(DdlOutcome::Refused);
+                }
                 // Last writer wins, on the stamp, and never refused for what the schema
                 // says: a replicated change is applied as sent (ADR-257).
                 let spec = target.validator.clone();
@@ -3421,6 +3451,31 @@ impl Engine {
             position,
             register.as_ref(),
         )
+    }
+
+    /// Whether a replicated schema change addressed to `db.name` is refused because the name is a HIDDEN physical, a stage's or a recreation's:
+    /// made by the swap alone, and named by no honest entry (they address the logical name). The name alone decides, by the predicate every
+    /// local schema door asks (`Error::refuse_stage_name`), so a member that holds the stage and one that does not answer alike, and a local
+    /// and a replicated change cannot disagree about what is hidden. Asked by three of the four schema arms (`DropIndex`, `ConfigureVectors`
+    /// and `ConfigureValidator`); the fourth, `CreateIndex`, asks it when Q6.7 unit 1 carries a stage's definitions in its creation entry. Warned
+    /// of; counted by the `Refused` the caller returns (`kimmy_sync_ddl_refused_total`).
+    fn refuse_a_schema_change_of_a_hidden_physical(
+        &self,
+        db: &str,
+        name: &str,
+        what: &'static str,
+    ) -> bool {
+        if kimmy_core::Error::refuse_stage_name(name).is_ok() {
+            return false;
+        }
+        warn!(
+            db = %db,
+            collection = %name,
+            what,
+            "refused a replicated schema change addressed to a hidden physical: a stage or a recreation is changed by the swap alone, and \
+             honest traffic names the logical name; counted in kimmy_sync_ddl_refused_total"
+        );
+        true
     }
 
     /// Whether a replicated vector entry for `db.name` is for a name a replacing `$out` has swapped away from its identity: a binding or a

@@ -1460,7 +1460,9 @@ fn a_drop_that_takes_effect_below_a_bound_stage_removes_the_copied_definitions_a
         let w = world();
         let (m, _d) = member(&w);
         let wall = w.bind.stamp.hlc.wall_ms;
-        // the stage was created below the drop and carries the target's definitions (by hand, as Q6.7's creation entry will), and rows
+        // the stage was created below the drop and carries the target's index (by hand, as Q6.7's creation entry will); the target's
+        // validator reaches it the honest way: a ConfigureValidator addressed to the identity `orders` (an entry that names the stage is refused,
+        // ADR-272 decision 6), at `wall - 7` and in the same window, which the flip's join carries onto the stage with its stamp. Rows are
         // written by explicit entries on both sides of the drop at `wall - 5`
         window(
             &m,
@@ -1469,14 +1471,14 @@ fn a_drop_that_takes_effect_below_a_bound_stage_removes_the_copied_definitions_a
                 crate::engine::ddl_entry(
                     Stamp::new(Hlc::new(wall - 7, 0), author(&w).node_id(), author(&w).epoch()),
                     OpKind::ConfigureValidator,
-                    CollectionId::derive(DB, BOUND),
+                    CollectionId::derive(DB, "orders"),
                     &kimmy_core::ValidatorSet {
                         db: DB.into(),
-                        collection: BOUND.into(),
+                        collection: "orders".into(),
                         validator: Some(validator("copied")),
                     },
                 )
-                .expect("the stage's validator encodes"),
+                .expect("the identity's validator encodes"),
                 doc_entry(&w, BOUND, 30, wall - 6),
                 doc_entry(&w, BOUND, 31, wall + 7),
             ],

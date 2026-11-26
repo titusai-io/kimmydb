@@ -4568,6 +4568,15 @@ impl Engine {
         // wins is made once, under the writer, in `configure_vectors_inner` and
         // `disable_vectors_inner` (last writer wins, on the stamp).
         self.witness(&stamp);
+        // A hidden physical keeps no vector configuration, and a stage never has one (decision 12): the step is skipped for it WHATEVER the
+        // state says, a configuration or a turn-off, as the entries route refuses a ConfigureVectors addressed to it. Skipped as a
+        // refusal is, and the rest of the state (its indexes, its validator) goes on being applied. The one predicate of the local doors.
+        if kimmy_core::Error::refuse_stage_name(&state.name).is_err() {
+            return self.skipped_vector_step(
+                state,
+                "the state is a hidden physical, which keeps no vector configuration",
+            );
+        }
         let history = |standing: &CollectionMeta| self.definition_of_an_ended_life(standing, stamp);
         let history: &dyn Fn(&CollectionMeta) -> Result<bool> = &history;
         let by = crate::vectors::Configured::FromSnapshot(stamp);
@@ -4623,21 +4632,29 @@ impl Engine {
                 name: state.name.clone(),
                 id: CollectionId::derive(&state.db, &state.name),
             }),
-            crate::sync::Ddl::Refused(reason) => {
-                warn!(
-                    db = %state.db,
-                    collection = %state.name,
-                    reason = %reason,
-                    "skipped a vector configuration in a snapshot this node cannot apply; the \
-                     configuration stands on its peers and the divergence is counted in \
-                     kimmy_sync_ddl_refused_total"
-                );
-                if let Some(stamp) = state.vector_changed {
-                    self.note_refused_vector(&state.db, &state.name, state.vector.as_ref(), stamp)?;
-                }
-                Ok(1)
-            }
+            crate::sync::Ddl::Refused(reason) => self.skipped_vector_step(state, reason),
         }
+    }
+
+    /// A page's vector step that is skipped and counted, not raised: warned of, remembered for the definition digest, and `1` for
+    /// `ddl_refused`. The one tail of every refusal of the step, so none of them can differ.
+    fn skipped_vector_step(
+        &self,
+        state: &CollectionState,
+        reason: impl std::fmt::Display,
+    ) -> Result<usize> {
+        warn!(
+            db = %state.db,
+            collection = %state.name,
+            reason = %reason,
+            "skipped a vector configuration in a snapshot this node cannot apply; the \
+             configuration stands on its peers and the divergence is counted in \
+             kimmy_sync_ddl_refused_total"
+        );
+        if let Some(stamp) = state.vector_changed {
+            self.note_refused_vector(&state.db, &state.name, state.vector.as_ref(), stamp)?;
+        }
+        Ok(1)
     }
 
     /// The shadows of the vector configurations `page` restored or found
