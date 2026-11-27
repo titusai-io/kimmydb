@@ -26,6 +26,7 @@ mod exchange;
 pub mod facts;
 pub mod guard;
 mod guard_answer;
+pub mod guard_rounds;
 pub mod health;
 pub mod membership;
 pub mod peers;
@@ -50,6 +51,9 @@ mod containment_tests;
 
 #[cfg(test)]
 mod guard_tests;
+
+#[cfg(test)]
+mod guard_rounds_tests;
 
 #[cfg(test)]
 mod join_retention_tests;

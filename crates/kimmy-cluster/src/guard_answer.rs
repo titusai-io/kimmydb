@@ -48,6 +48,13 @@ impl Members {
         }
     }
 
+    /// This process's token: how it knows its own answers.
+    pub(crate) fn guard_token(&self) -> Vec<u8> {
+        // A version 4 UUID's bytes: random, and made once for this member set, of which a
+        // process has one.
+        self.guard_state().token.get_or_init(|| NodeId::generate().to_bytes().to_vec()).clone()
+    }
+
     /// This member's answer to a member of `asker`.
     pub(crate) fn guard_answer(&self, engine: &Engine, asker: NodeId) -> GuardAnswer {
         let state = self.guard_state();
@@ -70,9 +77,7 @@ impl Members {
         listings.truncate(MAX_NAMED);
         members.truncate(MAX_NAMED);
         GuardAnswer {
-            // A version 4 UUID's bytes: random, and made once for this member set, of which a
-            // process has one.
-            token: state.token.get_or_init(|| NodeId::generate().to_bytes().to_vec()).clone(),
+            token: self.guard_token(),
             standing: self.guard_standing(),
             membership_age_ms: state
                 .gossiping_since
@@ -81,6 +86,7 @@ impl Members {
             founded_unmet: engine.is_founding_epoch() && !engine.has_met_a_peer(),
             listings,
             members,
+            address: None,
         }
     }
 

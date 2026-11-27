@@ -270,6 +270,10 @@ pub struct GuardAnswer {
     pub listings: Vec<String>,
     /// Its member list.
     pub members: Vec<(String, NodeId)>,
+    /// Where it tells others it listens, once it gossips: how a report, which comes over a
+    /// connection its sender dialled, says where to find the sender.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 /// What one side says to the other.
@@ -1061,6 +1065,7 @@ mod tests {
             founded_unmet: true,
             listings: vec!["10.0.0.1:7000".to_string()],
             members: vec![("10.0.0.2:7000".to_string(), NodeId::from_bytes([2; 16]))],
+            address: Some("10.0.0.3:7000".to_string()),
         }
     }
 

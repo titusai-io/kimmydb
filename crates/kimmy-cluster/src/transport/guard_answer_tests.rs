@@ -162,6 +162,7 @@ async fn a_dialler_records_nothing_of_an_answerer_that_says_it_is_undecided() {
             founded_unmet: false,
             listings: Vec::new(),
             members: Vec::new(),
+            address: None,
         };
         let welcome = Message::Welcome {
             node: dialler.node_id(),
