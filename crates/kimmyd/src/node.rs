@@ -2873,11 +2873,12 @@ async fn spawn_cluster(
             Some(evaluator),
         ));
     }
-    // The mistaken-restore guard (ADR-274): a fresh epoch, which has completed no handshake,
-    // neither accepts nor dials until the guard has passed. The listener is bound (a peer that
-    // connects waits, and completes no handshake), the serve and replication tasks wait on this
-    // gate, and SWIM runs meanwhile, which is where the guard reads its list. A host that has met a
-    // peer, or has no membership to ask, passes at once.
+    // The mistaken-restore guard (ADR-274): an epoch that has completed no handshake and did not
+    // found its store (a restore's, a rewind's) neither accepts nor dials until the guard has
+    // passed. The listener is bound (a peer that connects waits, and completes no handshake), the
+    // serve and replication tasks wait on this gate, and SWIM runs meanwhile, which is where the
+    // guard reads its list. A host that has met a peer or founded its store, or has no membership
+    // to ask, passes at once.
     let guarded = config.cluster.membership && engine.needs_restore_guard();
     let (gate_tx, gate_rx) =
         tokio::sync::watch::channel::<Option<bool>>((!guarded).then_some(true));

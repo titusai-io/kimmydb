@@ -506,6 +506,9 @@ fn restore_to_temp(
                     // finds no row and mints one, so what the restore threw away stays owed
                     // under the old epoch and the new writes cannot be mistaken for it.
                     T_META if key.as_slice() == crate::tables::META_EPOCH.as_bytes() => {}
+                    // And the epoch the source was founded with: the restored store was founded
+                    // by nobody, so the mistaken-restore guard runs on it (ADR-274).
+                    T_META if key.as_slice() == crate::tables::META_FOUNDING_EPOCH.as_bytes() => {}
                     // The marker that `LOSS_PENDING` was built from the oplog: the table is not carried, so
                     // the restored store must build it again at its first open.
                     T_META

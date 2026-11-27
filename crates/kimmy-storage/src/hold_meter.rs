@@ -951,8 +951,8 @@ pub(crate) mod test_hooks {
         /// Where the next engine open on this thread stops, as a kill would:
         /// `"tables"` after the ensure-tables commit, `"schema"` after the
         /// schema's, `"node_id"` once the node id is written and before the epoch
-        /// is. The open then returns an error and leaves the store as the last
-        /// commit before the stop left it.
+        /// is, in the transaction that writes both. The open then returns an error
+        /// and leaves the store as the last commit before the stop left it.
         pub static STOP_OPEN_AFTER: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 

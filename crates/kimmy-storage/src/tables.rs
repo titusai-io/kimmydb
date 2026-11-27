@@ -361,8 +361,9 @@ pub const META_HALT: &str = "halt";
 
 /// The epoch whose host has completed a handshake with another node (D13 containment, ADR-274): the
 /// 18-byte epoch, in force only when it is the store's own, so a restore, which mints a new epoch,
-/// starts without it. A fresh epoch runs the mistaken-restore guard before it dials or accepts; one
-/// that has met a peer does not. Written once, from outside a contact.
+/// starts without it. An epoch that has met no peer, and is not the one the store was founded with
+/// ([`META_FOUNDING_EPOCH`]), runs the mistaken-restore guard before it dials or accepts. Written
+/// once, from outside a contact.
 pub const META_MET_PEER: &str = "met_peer";
 
 /// The epoch a store was founded with (ADR-274): the 18-byte epoch minted by the open that also

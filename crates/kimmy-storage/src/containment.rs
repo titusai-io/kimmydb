@@ -165,8 +165,8 @@ impl Engine {
     }
 
     /// Whether this epoch's host has completed a handshake with another node (ADR-274): the durable
-    /// bit that tells a fresh epoch, which runs the mistaken-restore guard before it dials or
-    /// accepts, from one that has already joined. Held in memory and loaded at the end of an open
+    /// bit that tells an epoch past the mistaken-restore guard, which has joined, from one that has
+    /// not (see [`Engine::needs_restore_guard`]). Held in memory and loaded at the end of an open
     /// from a row that names this store's own epoch, so a restore, which mints a new epoch, starts
     /// without it.
     pub fn has_met_a_peer(&self) -> bool {
@@ -175,20 +175,14 @@ impl Engine {
 
     /// Whether this epoch is the one the store was founded with: minted by the open that generated
     /// the node id, so no other host has ever run this node. A restore and a rewind are not.
-    ///
-    /// **Scaffold of the tests commit**: nothing records a founding yet, so this answers no. The
-    /// code commit replaces it.
     pub fn is_founding_epoch(&self) -> bool {
-        false
+        self.founding_epoch
     }
 
     /// Whether the mistaken-restore guard (ADR-274) has to run before this epoch's host accepts or
     /// dials: it has completed no handshake and it is not the epoch the store was founded with.
-    ///
-    /// **Scaffold of the tests commit**: the predicate the daemon used before. The code commit
-    /// replaces it.
     pub fn needs_restore_guard(&self) -> bool {
-        !self.has_met_a_peer()
+        !self.is_founding_epoch() && !self.has_met_a_peer()
     }
 
     /// Note that this epoch's host completed a handshake with another node. Sets the flag and

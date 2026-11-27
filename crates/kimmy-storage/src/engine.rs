@@ -81,6 +81,16 @@ pub(crate) enum BuryCause {
 /// The kinds of loss record of a swap, in the order `kimmy_out_loss_records_total{kind}` renders them. `snapshot_delete` is reserved.
 pub const OUT_LOSS_KINDS: [&str; 2] = ["late_write", "snapshot_delete"];
 
+/// What an open reads, or makes, of who this member is; see `Engine::load_identity`.
+struct Identity {
+    node_id: NodeId,
+    epoch: Epoch,
+    /// This open minted the epoch.
+    minted: bool,
+    /// The epoch is the one the store was founded with.
+    founding_epoch: bool,
+}
+
 pub struct Engine {
     db: Database,
     /// Whether the storage has hit an I/O error, shared with the backend that
@@ -347,6 +357,9 @@ pub struct Engine {
     /// from any peer, unlike the halt, whose row is durable.
     pub(crate) epochs_pending: Mutex<std::collections::BTreeMap<NodeId, Epoch>>,
     pub(crate) epochs_pending_flag: std::sync::atomic::AtomicBool,
+    /// Whether the epoch is the one the store was founded with; see
+    /// [`Engine::is_founding_epoch`]. Set at the open and never changed.
+    pub(crate) founding_epoch: bool,
     /// This epoch's host has completed a handshake with another node (ADR-274); see
     /// [`Engine::has_met_a_peer`]. The second flag says the row is written, so it is written once.
     pub(crate) met_peer: std::sync::atomic::AtomicBool,
@@ -1795,16 +1808,12 @@ impl Engine {
              that do not exist. It is a benchmark control and must never serve traffic."
         );
 
-        let node_id = Self::load_or_create_node_id(&db)?;
-        #[cfg(test)]
-        if crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.get()) == Some("node_id") {
-            return Err(StorageError::Database("stopped after the node id".into()));
-        }
         let resumed = Self::resume_hlc(&db)?;
         let mut clock = HlcClock::resuming_from(resumed);
         // After the clock resumed, so a minted epoch starts at or above every stamp the store
         // holds. A first open, a restored store and a rewound one all find no row and mint.
-        let (epoch, minted) = Self::load_or_mint_epoch(&db, &mut clock, epoch_floor)?;
+        let Identity { node_id, epoch, minted, founding_epoch } =
+            Self::load_identity(&db, &mut clock, epoch_floor)?;
         // No entry of an epoch is older than its start: a peer that has never witnessed this
         // origin asks for it from there (`VersionVector::behind`), and a write stamped below it
         // would never be asked for. A kept epoch may have been minted on a clock ahead of this
@@ -1933,6 +1942,7 @@ impl Engine {
             newest_epochs: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending_flag: std::sync::atomic::AtomicBool::new(false),
+            founding_epoch,
             met_peer: std::sync::atomic::AtomicBool::new(false),
             met_peer_written: std::sync::atomic::AtomicBool::new(false),
             halted_flag: std::sync::atomic::AtomicBool::new(false),
@@ -3193,49 +3203,78 @@ impl Engine {
         self.buried.subscribe()
     }
 
-    fn load_or_create_node_id(db: &Database) -> Result<NodeId> {
+    /// This member's identity: its node id and its epoch, each the stored row or else a new one,
+    /// and whether the epoch is the one the store was founded with.
+    ///
+    /// The open that generates the node id and mints the epoch founds the store (ADR-274): no
+    /// other host has run this node, and the founding row names that epoch. A restore does not
+    /// carry the row and a rewind clears the epoch it names, so neither is a founding. **One
+    /// transaction**: with the node id committed alone, an open stopped before the epoch would
+    /// leave a store whose next open mints for a node id it did not generate, and so is taken for
+    /// a restore.
+    fn load_identity(
+        db: &Database,
+        clock: &mut HlcClock,
+        floor: Option<Epoch>,
+    ) -> Result<Identity> {
         let txn = db.begin_write()?;
-        let id = {
+        let identity = {
             let mut meta = txn.open_table(tables::META)?;
-
-            // Read guards borrow the table, so copy out what we need before
-            // any insert.
-            let stored_node =
-                meta.get(tables::META_NODE_ID)?.map(|v| <[u8; 16]>::try_from(v.value()));
-
-            match stored_node {
-                Some(bytes) => NodeId::from_bytes(
-                    bytes.map_err(|_| StorageError::Corrupt("node id is not 16 bytes".into()))?,
-                ),
-                None => {
-                    let id = NodeId::generate();
-                    meta.insert(tables::META_NODE_ID, id.to_bytes().as_slice())?;
-                    info!(node = %id, "generated a new node identity");
-                    id
-                }
+            let (node_id, generated) = Self::node_id_in(&mut meta)?;
+            #[cfg(test)]
+            if crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.get()) == Some("node_id") {
+                return Err(StorageError::Database("stopped after the node id".into()));
             }
+            let (epoch, minted) = Self::epoch_in(&mut meta, clock, floor)?;
+            if generated && minted {
+                meta.insert(tables::META_FOUNDING_EPOCH, epoch.0.as_slice())?;
+            }
+            let founding_epoch = meta
+                .get(tables::META_FOUNDING_EPOCH)?
+                .is_some_and(|row| row.value() == epoch.0.as_slice());
+            Identity { node_id, epoch, minted, founding_epoch }
         };
         txn.commit()?;
-        Ok(id)
+        Ok(identity)
     }
 
-    /// This member's epoch: the row if the store has one, else a fresh one, written in the same
-    /// transaction. `minted` says which.
+    /// The node id: the row if the store has one, else a fresh one, written to it. The flag says
+    /// it was generated.
+    fn node_id_in(
+        meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
+    ) -> Result<(NodeId, bool)> {
+        // Read guards borrow the table, so copy out what we need before
+        // any insert.
+        let stored = meta.get(tables::META_NODE_ID)?.map(|v| <[u8; 16]>::try_from(v.value()));
+
+        match stored {
+            Some(bytes) => {
+                let bytes =
+                    bytes.map_err(|_| StorageError::Corrupt("node id is not 16 bytes".into()))?;
+                Ok((NodeId::from_bytes(bytes), false))
+            }
+            None => {
+                let id = NodeId::generate();
+                meta.insert(tables::META_NODE_ID, id.to_bytes().as_slice())?;
+                info!(node = %id, "generated a new node identity");
+                Ok((id, true))
+            }
+        }
+    }
+
+    /// This member's epoch: the row if the store has one, else a fresh one, written to it. The
+    /// flag says it was minted.
     ///
     /// The start HLC is a tick of `clock`, which resumed from the store's stamps, so it is at or
     /// above every stamp the store holds; the other 64 bits come from the operating system. The
     /// mint reads no value from the store: a row is read back only as this member's own earlier
     /// mint, and a restore does not carry it (`backup.rs`).
-    fn load_or_mint_epoch(
-        db: &Database,
+    fn epoch_in(
+        meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
         clock: &mut HlcClock,
         floor: Option<Epoch>,
     ) -> Result<(Epoch, bool)> {
-        let txn = db.begin_write()?;
-        let found = {
-            let meta = txn.open_table(tables::META)?;
-            meta.get(tables::META_EPOCH)?.map(|v| <[u8; Epoch::LEN]>::try_from(v.value()))
-        };
+        let found = meta.get(tables::META_EPOCH)?.map(|v| <[u8; Epoch::LEN]>::try_from(v.value()));
         let (epoch, minted) = match found {
             Some(bytes) => (
                 Epoch(bytes.map_err(|_| StorageError::Corrupt("epoch is not 18 bytes".into()))?),
@@ -3251,7 +3290,7 @@ impl Engine {
                 }
                 let start = clock.tick(physical_now_ms());
                 let epoch = Epoch::generate(start);
-                txn.open_table(tables::META)?.insert(tables::META_EPOCH, epoch.0.as_slice())?;
+                meta.insert(tables::META_EPOCH, epoch.0.as_slice())?;
                 info!(epoch = %epoch.to_hex(), %start, "minted a new epoch");
                 if let Some(gap) = epoch_start_gap_ms(start, physical_now_ms()) {
                     warn!(
@@ -3269,7 +3308,6 @@ impl Engine {
                 (epoch, true)
             }
         };
-        txn.commit()?;
         Ok((epoch, minted))
     }
 
@@ -8908,8 +8946,7 @@ mod tests {
         // is returned, and the two functions that sit behind the gate.
         const RAW: &[&str] = &[
             "open_cleared_forced",
-            "load_or_create_node_id",
-            "load_or_mint_epoch",
+            "load_identity",
             "repair_arrival_index_from_oplog",
             "rebuild_stamp_half_from_positions",
             "rebuild_version_vector_if_stale",
