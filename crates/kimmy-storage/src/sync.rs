@@ -136,6 +136,11 @@ pub struct SyncOutcome {
     /// The entry a batch stopped at when [`Self::purge_pending`] is non-zero,
     /// so a replay resumes just before it rather than past the window.
     pub purge_pending_at: Option<kimmy_core::Stamp>,
+    /// Batches with no window that stopped at an entry standing behind an event of its origin this member holds parked (ADR-148,
+    /// amended): that entry and what follows it are left.
+    pub parked_stop: usize,
+    /// The entry such a batch stopped at when [`Self::parked_stop`] is non-zero.
+    pub parked_stop_at: Option<kimmy_core::Stamp>,
     /// Batches this round stopped short at an entry or state of a `field` collection whose clock is
     /// more than `max_clock_skew_secs` ahead of this member's physical clock (U1): refused until due,
     /// not applied, not witnessed, with everything stamped after it left for the next window. At
@@ -2649,6 +2654,10 @@ impl Engine {
         let Some(spec) = &target.validator else {
             return Ok(None);
         };
+        #[cfg(test)]
+        if self.refuse_the_next_adopted_validator.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Some(DdlOutcome::Refused));
+        }
         let applied = settle(self.set_validator_inner(
             &target.db,
             &target.name,
@@ -4325,6 +4334,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         (engine, dir)
+    }
+
+    /// The parked stop's two facts are final with the batch's last commit, as the other stops' are (ADR-148): a batch whose last
+    /// commit fails reports neither. Here, because the door that returns nothing on an error takes no outcome of the caller's.
+    #[test]
+    fn a_batch_whose_last_commit_fails_reports_no_parked_stop() {
+        use crate::parked_stop_tests::{Parks, world};
+        let deliver = |fail: bool| {
+            let w = world(Parks::Binding);
+            w.m.apply_batch(std::slice::from_ref(&w.event)).unwrap();
+            if fail {
+                count_hooks::fail_next(count_hooks::Fail::BeforeLastCommit);
+            }
+            let mut outcome = SyncOutcome::default();
+            let applied =
+                w.m.apply_batch_absorbing_into(std::slice::from_ref(&w.write), None, &mut outcome);
+            assert_eq!(applied.is_err(), fail, "{applied:?}");
+            assert!(!count_hooks::armed(), "premise: the failure was taken");
+            (outcome.parked_stop, outcome.parked_stop_at, w.write.stamp)
+        };
+        let (count, at, left) = deliver(false);
+        assert_eq!((count, at), (1, Some(left)), "CONTROL: with no failure both are reported");
+        let (count, at, _) = deliver(true);
+        assert_eq!((count, at), (0, None), "the commit failed: neither is");
     }
 
     /// The race route of the release (mutant B11): a window and a bare batch apply one binding at once; both look before the writer and

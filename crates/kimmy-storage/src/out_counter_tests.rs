@@ -288,12 +288,20 @@ fn a_stage_that_can_never_be_visible_counts_as_doomed_and_not_as_bound_out() {
     );
 }
 
+/// **A stand-in of two engines.** A replay stops behind the first event of an origin it parks, so no member holds two parked events of
+/// one origin; the third stage and its binding are another engine's. On a real member two parked events can only be of one node
+/// under two epochs: two engines differ in the node as well, which this test does not tell apart.
 #[test]
 fn a_logical_drop_that_buries_two_physicals_in_one_pass_counts_both_as_drop() {
     let w = world();
-    let (m, _d) = member_with(&[&w.s2, &w.s3]);
+    let (b, _db) = engine();
+    b.create_stage(DB, S3, MergePolicy::Document, Hlc::new(physical_now_ms() + 121_000, 0))
+        .expect("the other engine's stage is created");
+    let s3 = creation_of(&b, S3);
+    let bind_s3 = bind_of(&b, S3, w.bind_s3.stamp.hlc.wall_ms);
+    let (m, _d) = member_with(&[&w.s2, &s3]);
     // both bindings are known ahead of their position; the drop above them takes effect in a window and ends the identity
-    m.apply_batch(&[w.bind_s2.clone(), w.bind_s3.clone()]).expect("the bindings are stored ahead");
+    m.apply_batch(&[w.bind_s2.clone(), bind_s3.clone()]).expect("the bindings are stored ahead");
     window(&m, std::slice::from_ref(&w.drop));
     let after_the_drop = (m.out_swaps(), buried(&m));
     assert!(
@@ -301,7 +309,9 @@ fn a_logical_drop_that_buries_two_physicals_in_one_pass_counts_both_as_drop() {
         "premise: both stages are still held"
     );
     // a grant covers both bindings: one settle pass finds two physicals of the chain held under a drop
-    m.absorb_version_vector(&granted(w.bind_s3.stamp)).expect("the grant is absorbed");
+    let mut covered = granted(w.bind_s2.stamp);
+    covered.observe(bind_s3.stamp);
+    m.absorb_version_vector(&covered).expect("the grant is absorbed");
     assert!(
         m.get_collection(DB, S2).is_err() && m.get_collection(DB, S3).is_err(),
         "premise: the pass buried both stages"

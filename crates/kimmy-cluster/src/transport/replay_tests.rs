@@ -1926,3 +1926,317 @@ async fn a_malformed_replay_from_is_no_ask_said_once_per_peer_and_the_round_goes
     assert!(outcome.is_ok(), "{outcome:?}");
     assert_eq!(pages, 1, "a well-formed ask is served as before");
 }
+
+// -- A replay that stands behind a parked event (ADR-148, amended) --------------------------------
+
+const STAGE: &str = "orders.__stg.a1";
+
+/// `entries` to `to` as one window that carries them, from a sender whose vector is theirs.
+fn take_in_position(to: &Engine, entries: &[OplogEntry]) {
+    let mut theirs = kimmy_core::VersionVector::default();
+    for entry in entries {
+        theirs.observe(entry.stamp);
+    }
+    let mine = to.witnessed_vector().unwrap();
+    let mut outcome = SyncOutcome::default();
+    to.apply_peer_window_into(
+        &theirs,
+        Some(&mine),
+        entries,
+        kimmy_storage::PeerWindow {
+            scanned_to: entries.last().unwrap().stamp.hlc,
+            exhausted: true,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    )
+    .unwrap();
+    assert!(!outcome.stopped(), "premise: the window is taken whole: {outcome:?}");
+}
+
+fn whole_oplog(of: &Engine) -> Vec<OplogEntry> {
+    of.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap().entries
+}
+
+/// A restored member A and a holder C, where what A lost is a swap: a stage's creation, the binding of `orders` to it (built by
+/// hand: no product code writes one yet), and a document of another collection. C holds all of it in effect.
+struct Swap {
+    f: Fixture,
+    /// The page A's replay asks C for: the three lost entries.
+    page: Vec<OplogEntry>,
+}
+
+impl Swap {
+    fn new() -> Self {
+        let writer_dir = tempfile::tempdir().unwrap();
+        let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
+        writer.create_collection("shop", "orders").unwrap();
+        let items = writer.create_collection("shop", "items").unwrap();
+        let mut backup = Vec::new();
+        writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        let deadline = Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
+        writer.create_stage("shop", STAGE, kimmy_core::MergePolicy::Document, deadline).unwrap();
+        let stage_id = kimmy_core::CollectionId::derive("shop", STAGE);
+        let creation = whole_oplog(&writer)
+            .into_iter()
+            .find(|e| e.kind == OpKind::CreateCollection && e.collection == stage_id)
+            .expect("premise: the stage's creation is an entry");
+        let bind = OplogEntry {
+            stamp: Stamp::new(
+                Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
+                writer.node_id(),
+                writer.epoch(),
+            ),
+            kind: OpKind::BindCollection,
+            collection: kimmy_core::CollectionId::derive("shop", "orders"),
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                    db: "shop".into(),
+                    name: "orders".into(),
+                    physical: STAGE.into(),
+                })
+                .unwrap(),
+            ),
+            meta: None,
+        };
+        take_in_position(&writer, std::slice::from_ref(&bind));
+        writer.advance_clock_past(&bind.stamp);
+        writer.insert(&items, bson::doc! { "_id": "after" }).unwrap();
+
+        let c_dir = tempfile::tempdir().unwrap();
+        let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+        take_in_position(&c, &whole_oplog(&writer));
+        assert_eq!(c.resolve("shop", "orders").unwrap().physical, STAGE, "premise: C is bound");
+
+        let a_dir = tempfile::tempdir().unwrap();
+        let path = a_dir.path().join("kimmy.redb");
+        kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+        let a = Engine::open(&path).unwrap();
+        a.create_collection("shop", "startup").unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(a.own_position_at_open(), None).unwrap();
+        let members = Members::default();
+        members.set_catch_up(Arc::clone(&catch_up));
+        let f = Fixture {
+            a,
+            c,
+            catch_up,
+            members,
+            lost: 0,
+            _dirs: vec![writer_dir, c_dir, a_dir, marker_dir],
+        };
+        let from = f.catch_up.replay_from(f.c.node_id(), f.a.node_id());
+        let page: Vec<OplogEntry> = whole_oplog(&f.c)
+            .into_iter()
+            .filter(|e| e.stamp.node == f.a.node_id() && e.stamp > from)
+            .collect();
+        assert_eq!(
+            page.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![OpKind::CreateCollection, OpKind::BindCollection, OpKind::Insert],
+            "premise: the three lost entries"
+        );
+        Self { f, page }
+    }
+
+    fn cursor(&self) -> Stamp {
+        self.f.catch_up.replay_from(self.f.c.node_id(), self.f.a.node_id())
+    }
+
+    fn write_is_held(&self) -> bool {
+        self.f.a.has_oplog_entry(&self.page[2].stamp).unwrap()
+    }
+
+    /// A stands behind the binding: it is parked (a write to the name is refused for it), the write after it is not taken, and
+    /// neither of A's vectors reaches the binding.
+    fn assert_behind_the_binding(&self, what: &str) {
+        let bind = self.page[1].stamp;
+        let answer = self.f.a.resolve_for_write("shop", "orders");
+        assert!(
+            matches!(
+                &answer,
+                Err(kimmy_storage::StorageError::NameSuperseded { parked: true, .. })
+            ),
+            "{what}: parked: {answer:?}"
+        );
+        assert!(!self.write_is_held(), "{what}: the write is left");
+        for (which, vector) in [
+            ("served", self.f.a.version_vector().unwrap()),
+            ("witnessed", self.f.a.witnessed_vector().unwrap()),
+        ] {
+            assert!(
+                vector.get(bind.origin()) < bind.hlc,
+                "{what}: the {which} vector is below the binding: {:?}",
+                vector.get(bind.origin())
+            );
+        }
+    }
+
+    /// The replay stands where it was: not advanced, not answered, and A still marked restored.
+    fn assert_replay_owed(&self, cursor: Stamp, what: &str) {
+        assert_eq!(self.cursor(), cursor, "{what}: the cursor has not moved");
+        assert!(!self.f.catch_up.replay_answered(self.f.c.node_id()), "{what}: not answered");
+        assert_eq!(self.f.catch_up.reason(), Some(crate::CatchUpReason::Restored), "{what}");
+    }
+
+    /// A dials C for a round: with `replaying`, one that asks C for A's replay before its ordinary pull (the outbound route), and
+    /// without it the ordinary pull alone.
+    async fn a_dials_c(&self, replaying: bool) {
+        let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+        let serving = serve_peer(
+            &self.f.c,
+            far,
+            SECRET,
+            BINDING,
+            None,
+            ServeBudgets::serving(),
+            None::<&Members>,
+        );
+        let asking = async {
+            open_handshake(&self.f.a, &mut ours, SECRET, BINDING).await.unwrap();
+            let mut stalls = PeerStalls::new();
+            if replaying {
+                stalls.set_catch_up(Some(Arc::clone(&self.f.catch_up)));
+            }
+            let outcome =
+                sync_over(&self.f.a, &mut ours, addr(), self.f.c.node_id(), None, &mut stalls)
+                    .await;
+            drop(ours);
+            outcome
+        };
+        let (_, outcome) = tokio::join!(serving, asking);
+        outcome.unwrap();
+    }
+
+    fn assert_released(&self, what: &str) {
+        assert_eq!(self.f.a.resolve("shop", "orders").unwrap().physical, STAGE, "{what}: bound");
+        assert!(self.write_is_held(), "{what}: and what was left is here");
+    }
+
+    /// The page given to the one body both routes share.
+    fn apply(&self, from: Stamp, via: Via) -> ReplayPage {
+        let to = crate::catchup::replay_after(self.page[2].stamp.hlc, self.f.a.node_id());
+        replay_apply(
+            &self.f.a,
+            &self.f.catch_up,
+            &"c",
+            self.f.c.node_id(),
+            from,
+            self.page.clone(),
+            to,
+            true,
+            via,
+        )
+        .unwrap()
+    }
+}
+
+/// The body both routes share. The same page given again stalls again, and changes nothing.
+#[test]
+fn a_replay_page_behind_a_parked_event_stalls_and_stalls_again() {
+    let s = Swap::new();
+    let from = s.cursor();
+    for time in ["first", "again"] {
+        let page = s.apply(from, Via::Outbound);
+        assert_eq!(page, ReplayPage::Stalled(ReplayStall::ParkedEvent), "{time}");
+        s.assert_behind_the_binding(time);
+        s.assert_replay_owed(from, time);
+    }
+}
+
+/// The inbound ack, which alone carries the reason on the wire (the outbound route discards it), read by a scripted dialer.
+#[tokio::test]
+async fn the_inbound_ack_of_a_page_behind_a_parked_event_says_why() {
+    let swap = Swap::new();
+    let s = &swap;
+    let from = s.cursor();
+    let to = crate::catchup::replay_after(s.page[2].stamp.hlc, s.f.a.node_id());
+    scripted(&s.f, |mut stream| async move {
+        assert_eq!(ask_versions(&mut stream).await, Some(from), "premise: A asks");
+        for time in ["first", "again"] {
+            write_frame(
+                &mut stream,
+                &Message::ReplayEntries {
+                    from,
+                    entries: s.page.clone(),
+                    exhausted: true,
+                    horizon: false,
+                    scanned_to: to,
+                },
+            )
+            .await
+            .unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::ReplayAck { next_from, done, stalled } => {
+                    assert_eq!(stalled, Some(ReplayStall::ParkedEvent), "{time}: the reason");
+                    assert_eq!(next_from, from, "{time}: the cursor has not moved");
+                    assert!(!done, "{time}: not finished");
+                }
+                other => panic!("{other:?}"),
+            }
+            s.assert_behind_the_binding(time);
+        }
+    })
+    .await
+    .unwrap();
+    s.assert_replay_owed(from, "after the contact");
+}
+
+/// The inbound route over the real code: the stalled contact still runs the holder's ordinary pull on the same connection; the
+/// member's own pull then brings the binding and what follows it in position, and the next contact finishes the replay.
+#[tokio::test]
+async fn a_stalled_inbound_replay_behind_a_parked_event_finishes_after_an_ordinary_pull() {
+    let s = Swap::new();
+    let from = s.cursor();
+    let stalled = replay_counters().get(true, ReplayResult::Stalled);
+    s.f.round().await.unwrap();
+    s.assert_replay_owed(from, "stalled");
+    assert!(replay_counters().get(true, ReplayResult::Stalled) > stalled, "counted, by way");
+    assert!(
+        s.f.c.get_collection("shop", "startup").is_ok(),
+        "the stalled contact still ran C's ordinary pull from A"
+    );
+    // That contact was C's pull from A: A has not been given the binding, so the release below is A's own pull's.
+    s.assert_behind_the_binding("stalled");
+    s.a_dials_c(false).await;
+    s.assert_released("after A's own pull");
+    s.f.round().await.unwrap();
+    assert!(s.f.catch_up.replay_answered(s.f.c.node_id()), "the next contact finishes");
+}
+
+/// The outbound route: the stall does not end the contact, so the member's ordinary pull from the same holder runs on it and
+/// releases the event; the next contact finds nothing lost and finishes.
+#[tokio::test]
+async fn a_stalled_outbound_replay_behind_a_parked_event_is_released_in_the_same_contact() {
+    let s = Swap::new();
+    let from = s.cursor();
+    let stalled = replay_counters().get(false, ReplayResult::Stalled);
+    s.a_dials_c(true).await;
+    s.assert_replay_owed(from, "stalled");
+    assert!(replay_counters().get(false, ReplayResult::Stalled) > stalled, "counted, by way");
+    s.assert_released("by the ordinary pull of the same contact");
+    s.a_dials_c(true).await;
+    assert!(s.f.catch_up.replay_answered(s.f.c.node_id()), "the next contact finishes");
+}
+
+/// The page given twice at once, as by two peers: both stall, whichever builds its list of lost entries first, and neither takes
+/// the write. Thread-timed, so it does not replace the storage row that places the race by a hook.
+#[test]
+fn a_page_with_a_parked_event_applied_twice_and_at_once_takes_nothing_past_it() {
+    let s = Swap::new();
+    let from = s.cursor();
+    let (one, two) = std::thread::scope(|scope| {
+        // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+        let t1 = scope.spawn(|| s.apply(from, Via::Inbound));
+        // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+        let t2 = scope.spawn(|| s.apply(from, Via::Outbound));
+        (t1.join().unwrap(), t2.join().unwrap())
+    });
+    let stall = ReplayPage::Stalled(ReplayStall::ParkedEvent);
+    assert_eq!((&one, &two), (&stall, &stall));
+    s.assert_behind_the_binding("after both");
+    s.assert_replay_owed(from, "after both");
+}

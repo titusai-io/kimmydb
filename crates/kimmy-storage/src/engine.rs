@@ -259,6 +259,9 @@ pub struct Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) snapshot_reader_hook_for_test:
         Mutex<Option<Arc<crate::snapshot::SnapshotReaderHook>>>,
+    /// Armed by a test, for one use: the next validator a replicated creation carries for a collection already held is refused.
+    #[cfg(test)]
+    pub(crate) refuse_the_next_adopted_validator: std::sync::atomic::AtomicBool,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1895,6 +1898,8 @@ impl Engine {
             snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             snapshot_reader_hook_for_test: Mutex::new(None),
+            #[cfg(test)]
+            refuse_the_next_adopted_validator: std::sync::atomic::AtomicBool::new(false),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]

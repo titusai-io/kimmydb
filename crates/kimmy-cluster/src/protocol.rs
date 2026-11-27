@@ -236,6 +236,9 @@ pub enum ReplayStall {
     /// A page carried an entry of a `field` collection whose clock is past this member's
     /// `max_clock_skew_secs` (U1): the page applies once the entry is due.
     ClockRefused,
+    /// A page carried an entry that stands behind an event this member holds parked (ADR-148, amended): the ordinary pull brings
+    /// the event and what follows it in position.
+    ParkedEvent,
 }
 
 /// What one side says to the other.

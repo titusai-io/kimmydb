@@ -113,6 +113,8 @@ struct World {
     _author: (Engine, tempfile::TempDir),
     /// The author of the stages when they are made apart from the life (so the life's author never held them).
     _stage_author: Option<(Engine, tempfile::TempDir)>,
+    /// The author of the SECOND stage alone, in [`world_two_writers`].
+    _second_stage_author: Option<(Arc<Engine>, tempfile::TempDir)>,
 }
 
 fn world() -> World {
@@ -125,17 +127,23 @@ fn world_below() -> World {
 }
 
 fn world_with(stages_first: bool) -> World {
-    build_world(stages_first, false)
+    build_world(stages_first, false, false)
+}
+
+/// [`world`], but the SECOND stage and its binding are another engine's, made after the second life: for a member that holds both
+/// bindings parked, which one origin's replay would not leave it holding.
+fn world_two_writers() -> World {
+    build_world(false, false, true)
 }
 
 /// A world whose FIRST stage is created below the drop at `T` (by another writer, before the life) and whose SECOND stage is created above it
 /// (by the life's author, after the second life): a drop judged against the second one alone is ordinary, and the first one's creation, when it
 /// arrives, is a stage created below the drop.
 fn world_mixed() -> World {
-    build_world(true, true)
+    build_world(true, true, false)
 }
 
-fn build_world(stages_first: bool, mixed: bool) -> World {
+fn build_world(stages_first: bool, mixed: bool, second_apart: bool) -> World {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let a = Engine::open(&dir.path().join("kimmy.redb")).expect("the author's engine opens");
     let stage_author = stages_first.then(|| {
@@ -144,6 +152,7 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
             Engine::open(&dir.path().join("kimmy.redb")).expect("the stage author's engine opens");
         (s, dir)
     });
+    let second_stage_author = second_apart.then(engine);
     let make_stages = |a: &Engine, which: &[&str]| {
         let now = physical_now_ms();
         for (n, stage) in which.iter().enumerate() {
@@ -157,6 +166,7 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
         }
     };
     let (before_the_life, after_the_life): (&[&str], &[&str]) = match (stages_first, mixed) {
+        (false, _) if second_apart => (&[], &[FIRST]),
         (false, _) => (&[], &[FIRST, SECOND]),
         (true, false) => (&[FIRST, SECOND], &[]),
         (true, true) => (&[FIRST], &[SECOND]),
@@ -180,9 +190,15 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
     std::thread::sleep(std::time::Duration::from_millis(5));
     a.create_collection(DB, "orders").expect("the second life is created");
     make_stages(&a, after_the_life);
+    if let Some((s, _)) = &second_stage_author {
+        make_stages(s, &[SECOND]);
+    }
     let now = physical_now_ms();
     let mut all = everything(&a);
     if let Some((s, _)) = &stage_author {
+        all.extend(everything(s));
+    }
+    if let Some((s, _)) = &second_stage_author {
         all.extend(everything(s));
     }
     let of = |kind: OpKind, id: CollectionId| -> Vec<OplogEntry> {
@@ -206,7 +222,11 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
     let wall = all.iter().map(|e| e.stamp.hlc.wall_ms).max().expect("entries").max(now) + 10;
     // a binding is valid only from the origin of its stage's creation, so each one is minted by the writer that made its stage
     let first_author = stage_author.as_ref().map_or(&a, |(s, _)| s);
-    let second_author = if mixed { &a } else { first_author };
+    let second_author = match &second_stage_author {
+        Some((s, _)) => s.as_ref(),
+        None if mixed => &a,
+        None => first_author,
+    };
     let bind_first = bind_of(first_author, wall, FIRST);
     let drop_between = drop_of(&a, wall + 10);
     let bind_second = bind_of(second_author, wall + 20, SECOND);
@@ -221,6 +241,7 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
         drop_between,
         _author: (a, dir),
         _stage_author: stage_author,
+        _second_stage_author: second_stage_author,
     }
 }
 
@@ -1118,8 +1139,12 @@ fn release_bindings(m: &Engine, bindings: &[&OplogEntry], how: Release) {
             }
         }
         Release::Grant => {
-            let newest = bindings.iter().map(|b| b.stamp).max().expect("a binding");
-            m.absorb_version_vector(&granted(newest)).expect("the grant is absorbed");
+            // every binding's origin is named: for bindings of one origin this is the newest of them alone
+            let mut covered = VersionVector::default();
+            for bind in bindings {
+                covered.observe(bind.stamp);
+            }
+            m.absorb_version_vector(&covered).expect("the grant is absorbed");
         }
     }
 }
@@ -1197,10 +1222,13 @@ fn a_drop_judged_ordinary_while_the_only_binding_is_parked_still_floors_the_new_
     }
 }
 
+/// **A stand-in of two engines** ([`world_two_writers`]). A replay stops behind the first event of an origin it parks, so no member
+/// holds two parked events of one origin. On a real member two parked events can only be of one node under two epochs: two
+/// engines differ in the node as well, which this test does not tell apart.
 #[test]
 fn a_drop_arriving_between_two_parked_bindings_floors_both_physicals() {
     for how in RELEASES {
-        let w = world();
+        let w = world_two_writers();
         let (m, _d) = member_of_the_first_life(&w);
         // before anything makes the drop in effect: the copy is the stage's own and lands as it was made (the arm refuses it afterwards)
         copy_on(&m, &w, SECOND);
@@ -1308,12 +1336,13 @@ fn a_stage_created_below_a_drop_judged_ordinary_makes_it_logical_when_it_arrives
     }
 }
 
+/// **A stand-in of two engines**, with the limit the test above states.
 #[test]
 fn a_drop_arriving_after_both_bindings_are_parked_floors_the_physical_that_is_served() {
     // B1, B2, the drop, then the release of both: the drop is judged ordinary (every parked binding names a stage above it), and the seed
     // runs at the release of the first of them, the only route to it
     for how in RELEASES {
-        let w = world();
+        let w = world_two_writers();
         let (m, _d) = member_of_the_first_life(&w);
         m.apply_batch(&[w.bind_first.clone(), w.bind_second.clone()])
             .expect("both bindings are stored ahead");
