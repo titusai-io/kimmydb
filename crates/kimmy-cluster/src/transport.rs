@@ -2916,6 +2916,19 @@ where
     }
 }
 
+/// Clear the stored rows of the pulls `stalls` forgot in memory since the last call, and what each staged of the carry (ADR-272, unit P).
+///
+/// The retention pass collects no options row while a pull is recorded: a pull this node will never resume would keep every row for ever.
+/// A failure is said and not raised: the row stays, which is growth and no harm, and the next pull with the peer overwrites or completes it.
+pub(crate) fn flush_forgotten_pulls(engine: &Engine, stalls: &mut PeerStalls) {
+    for (peer, scope) in stalls.take_forgotten_pulls() {
+        if let Err(error) = kimmy_storage::blocking(|| engine.forget_snapshot_progress(peer, scope))
+        {
+            warn!(%peer, %error, "a snapshot pull was forgotten, and its stored row could not be cleared");
+        }
+    }
+}
+
 /// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
 /// the peer's deadline around it (ADR-177), hands it `snapshot_deadline`, the
 /// wall-time instant past which a snapshot pull asks for no more pages this
@@ -2935,6 +2948,8 @@ async fn sync_round<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // The scoped pulls an earlier round abandoned (a repair that did not advance, or ended): their stored rows go now (ADR-272, unit P).
+    flush_forgotten_pulls(engine, stalls);
     // Both of the peer's vectors, on the one frame every round spends
     // anyway (ADR-146): what it can serve drives the pull, and what it
     // has processed drives the count half's gate below.
@@ -4092,6 +4107,13 @@ pub struct PeerStalls {
     /// is with — and written after every page, before the next frame, so a
     /// round the timeout cancels leaves the pages it applied recorded.
     snapshots: HashMap<NodeId, SnapshotProgress>,
+    /// The pulls forgotten in memory (ADR-272, unit P), by peer and scope, whose stored rows are still to be cleared: the retention pass
+    /// collects no options row while a pull is recorded, so a pull nobody will resume must not stay recorded. Taken by
+    /// [`flush_forgotten_pulls`], which has the engine.
+    forgotten_pulls: Vec<(NodeId, Option<CollectionId>)>,
+    /// When each peer a pull is recorded with was first seen absent from the live member list, as `repair_clock`, until it is listed again
+    /// ([`Self::pulls_of_unlisted_peers`]). In memory only: the grace starts again at a restart.
+    pulls_absent_since: BTreeMap<NodeId, Duration>,
     /// Where each held span resumes against each peer (ADR-172), keyed by
     /// peer and origin: see [`PeerStalls::marks_to_ask`].
     marks_asked: HashMap<(NodeId, kimmy_core::Origin), SpanAsked>,
@@ -5711,6 +5733,7 @@ impl PeerStalls {
                 // collection, after the cooldown, starts over.
                 if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                     self.snapshots.remove(&peer);
+                    self.forgotten_pulls.push((peer, Some(collection)));
                 }
             }
         }
@@ -5886,10 +5909,53 @@ impl PeerStalls {
     /// if there is one. The pages it applied stay applied; what is dropped
     /// is the cursor, for a round that showed the pull is no longer the
     /// one wanted.
+    /// The stored row of the pull, and what it staged of the carry, is cleared by [`flush_forgotten_pulls`] (ADR-272, unit P).
     fn snapshot_forgotten(&mut self, peer: NodeId, scope: Option<CollectionId>) {
         if self.snapshots.get(&peer).is_some_and(|p| p.scope() == scope) {
             self.snapshots.remove(&peer);
+            self.forgotten_pulls.push((peer, scope));
         }
+    }
+
+    /// The peers a pull is held for in memory.
+    #[cfg(test)]
+    pub(crate) fn pulls_held_for_test(&self) -> Vec<NodeId> {
+        self.snapshots.keys().copied().collect()
+    }
+
+    /// The pulls forgotten since the last call, for the one that has the engine to clear their stored rows.
+    fn take_forgotten_pulls(&mut self) -> Vec<(NodeId, Option<CollectionId>)> {
+        std::mem::take(&mut self.forgotten_pulls)
+    }
+
+    /// The peers whose pulls, recorded or held in memory, are to be forgotten: absent from the live member list (`live`) for
+    /// [`MEMBER_GRACE`] without a break, by the loop guard's clock. Their in-memory pulls are removed here; the caller clears the stored
+    /// rows. A peer listed again before the grace loses its clock. `None`, or an EMPTY list, forgets nothing and keeps no clock: a node
+    /// that has just started has no member list yet, and a list that is empty says nothing of who has left (ADR-272, unit P).
+    pub fn pulls_of_unlisted_peers(
+        &mut self,
+        recorded: &[NodeId],
+        live: Option<&BTreeSet<NodeId>>,
+    ) -> Vec<NodeId> {
+        let Some(live) = live.filter(|live| !live.is_empty()) else {
+            self.pulls_absent_since.clear();
+            return Vec::new();
+        };
+        let now = self.repair_clock;
+        let mut absent: BTreeSet<NodeId> = recorded.iter().copied().collect();
+        absent.extend(self.snapshots.keys().copied());
+        absent.retain(|peer| !live.contains(peer));
+        self.pulls_absent_since.retain(|peer, _| absent.contains(peer));
+        let mut due = Vec::new();
+        for peer in absent {
+            let since = *self.pulls_absent_since.entry(peer).or_insert(now);
+            if now.saturating_sub(since) >= MEMBER_GRACE {
+                self.pulls_absent_since.remove(&peer);
+                self.snapshots.remove(&peer);
+                due.push(peer);
+            }
+        }
+        due
     }
 
     /// A whole-database pull is about to start for `peer`: an active `Converge` repair
@@ -6017,6 +6083,7 @@ impl PeerStalls {
             }
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
+                self.forgotten_pulls.push((peer, Some(collection)));
             }
         }
         if let Some((collection, kind, data)) = ledger_end {
@@ -10390,6 +10457,104 @@ mod tests {
         );
     }
 
+    /// UNIT P, P12b: a pull `PeerStalls` forgets in memory is cleared in storage by the flush, with its recorded row: the retention pass keeps every
+    /// options row while a pull is recorded, so a pull nobody will resume must not stay recorded. Only a pull memory held is forgotten (a forget of
+    /// another scope, or of a pull memory does not hold, changes nothing). Mutants: the forget does not queue the pull; the flush clears nothing.
+    #[test]
+    fn a_pull_forgotten_in_memory_is_cleared_in_storage_by_the_flush() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let docs: Vec<_> = (0..(kimmy_storage::SNAPSHOT_PAGE as i64 + 20))
+            .map(|i| bson::doc! { "_id": i })
+            .collect();
+        a.insert_many(&orders, docs).unwrap();
+        let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+        let page = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(!progress.is_complete() && progress.pages() == 1, "premise: part-way");
+        let peer = a.node_id();
+        assert_eq!(b.snapshots_to_resume().unwrap().len(), 1, "premise: the pull is recorded");
+        let mut stalls = PeerStalls::new();
+        stalls.resume_snapshots(vec![(peer, progress)]);
+
+        // a pull of another scope is not this one's to forget
+        stalls.snapshot_forgotten(peer, Some(CollectionId(7)));
+        flush_forgotten_pulls(&b, &mut stalls);
+        assert_eq!(b.snapshots_to_resume().unwrap().len(), 1, "another scope: nothing forgotten");
+        assert_eq!(stalls.pulls_held_for_test(), vec![peer]);
+
+        stalls.snapshot_forgotten(peer, None);
+        flush_forgotten_pulls(&b, &mut stalls);
+        assert!(b.snapshots_to_resume().unwrap().is_empty(), "the stored row went with the pull");
+        assert!(stalls.pulls_held_for_test().is_empty());
+        // and a pull memory no longer holds forgets nothing, and fails nothing
+        stalls.snapshot_forgotten(peer, None);
+        flush_forgotten_pulls(&b, &mut stalls);
+        assert!(b.snapshots_to_resume().unwrap().is_empty());
+    }
+
+    /// UNIT P, P12b: a repair abandoned for want of advancing (the other removal beside `snapshot_forgotten`) queues its scoped pull to be forgotten in storage.
+    /// Mutant: the abandonment does not queue the pull.
+    #[test]
+    fn an_abandoned_repair_queues_its_scoped_pull_to_be_forgotten_in_storage() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Converge));
+        let mut progress = kimmy_storage::SnapshotProgress::of_collection(collection);
+        progress.test_mark_paged();
+        stalls.snapshots.insert(peer, progress);
+        let next = |stalls: &mut PeerStalls| {
+            for _ in 0..2 {
+                stalls.tick_opened();
+                if let Some(due) = stalls.repair_due(peer, false) {
+                    return Some(due);
+                }
+            }
+            None
+        };
+        for empty in 1..=REPAIR_ATTEMPTS {
+            assert!(next(&mut stalls).is_some(), "round {empty}");
+        }
+        assert_eq!(next(&mut stalls), None, "premise: abandoned after rounds that landed nothing");
+        assert!(stalls.snapshots.is_empty(), "premise: its pull is forgotten in memory");
+        assert_eq!(stalls.take_forgotten_pulls(), vec![(peer, Some(collection))]);
+    }
+
+    /// UNIT P, P12b: the end of a scoped repair (one of the two removals beside `snapshot_forgotten`) clears the stored row of its pull too.
+    /// Mutant: the removal does not queue the pull.
+    #[test]
+    fn a_repair_that_ends_clears_the_stored_row_of_its_scoped_pull() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let docs: Vec<_> = (0..(kimmy_storage::SNAPSHOT_PAGE as i64 + 20))
+            .map(|i| bson::doc! { "_id": i })
+            .collect();
+        a.insert_many(&orders, docs).unwrap();
+        let peer = a.node_id();
+        let collection = orders.id;
+        let mut scoped = kimmy_storage::SnapshotProgress::of_collection(collection);
+        let page = a.snapshot_page(None, Some(collection)).unwrap();
+        b.apply_snapshot_page(peer, &mut scoped, &page).unwrap();
+        assert!(!scoped.is_complete() && scoped.pages() == 1, "premise: a scoped pull part-way");
+        assert_eq!(b.snapshots_to_resume().unwrap().len(), 1, "premise: its row is recorded");
+        let mut stalls = PeerStalls::new();
+        stalls.resume_snapshots(vec![(peer, scoped)]);
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        stalls.tick_opened();
+        assert!(stalls.repair_due(peer, false).is_some(), "premise: the repair is handed out");
+        stalls.repair_finished(peer);
+        flush_forgotten_pulls(&b, &mut stalls);
+        assert!(stalls.pulls_held_for_test().is_empty(), "the pull is forgotten in memory");
+        assert!(b.snapshots_to_resume().unwrap().is_empty(), "and its stored row is cleared");
+    }
+
     /// No Converge is planned for a peer that has a whole-database pull pending: the
     /// in-memory progress holds one entry per peer, and the two would reset each
     /// other every round.
@@ -10733,6 +10898,25 @@ mod tests {
         // One page a Converge round: the stale count falls by about a page each.
         assert!(rounds[0].1 as i64 >= docs - kimmy_storage::SNAPSHOT_PAGE as i64, "{rounds:?}");
         assert_eq!(rounds[0].1, rounds[1].1, "the ordinary round repaired nothing: {rounds:?}");
+    }
+
+    /// UNIT P, P12b: a round clears the stored rows of the pulls forgotten before it, first of all, so that every forget (the converged position's, the scoped
+    /// repairs') reaches storage at the next round, and one call is the only place. A source guard: the call is in `sync_round` before its first request, and
+    /// nowhere else in the production code. Mutant: the call removed.
+    #[test]
+    fn a_round_flushes_the_forgotten_pulls_before_it_asks_anything() {
+        let source = include_str!("transport.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let call = "    flush_forgotten_pulls(engine, stalls);\n";
+        assert_eq!(
+            production.matches("flush_forgotten_pulls(engine, stalls);").count(),
+            1,
+            "one call"
+        );
+        let start = production.find("async fn sync_round<S>(").expect("sync_round");
+        let at = production[start..].find(call).expect("the call is in sync_round");
+        let ask = production[start..].find("Message::AskVersions").expect("the first request");
+        assert!(at < ask, "the call comes before the first request");
     }
 
     /// The Definitions page's index build runs off the async worker (review B m10). A source

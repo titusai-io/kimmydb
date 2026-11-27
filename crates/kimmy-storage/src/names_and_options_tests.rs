@@ -2019,3 +2019,41 @@ fn a_pull_in_flight_defers_the_collector_and_each_end_of_the_pull_releases_it() 
     b.collect_garbage_at(far(), policy).expect("the pass runs");
     assert!(options_of(&b, "g3").is_none(), "collected once the pull is forgotten");
 }
+
+/// UNIT P, P12b: forgetting every pull of a peer (the cluster layer's sweep of a member its list lacks) releases the collector, and clears the stored record and what the
+/// pull staged of the carry. (A) A joiner that holds every row, stopped in the carry: a far pass keeps the row; after the forget it collects it. (B) A joiner that held
+/// nothing, stopped in the carry: its pull is recorded and has staged rows; after the forget neither is left, and a second forget finds nothing. Mutants: the forget leaves
+/// the registry set; the forget leaves the stored record; the forget leaves the staging.
+#[test]
+fn forgetting_every_pull_of_a_peer_releases_the_collector_and_clears_its_rows() {
+    let far = || physical_now_ms() + 10 * 365 * 24 * 3600 * 1000;
+    let policy = RetentionPolicy::new(31_536_000, 1);
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+
+    // (A) the registry
+    let (b, _db) = engine();
+    pulled(&b, &a, &mut SnapshotProgress::whole_database());
+    assert!(options_of(&b, "g3").is_some(), "premise: the joiner holds the gone collection's row");
+    stopped_in_the_carry(&b, &a);
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(options_of(&b, "g3").is_some(), "premise: kept while the pull is in flight");
+    b.forget_snapshot_pulls_of(a.node_id()).unwrap();
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(options_of(&b, "g3").is_none(), "collected once every pull of the peer is forgotten");
+
+    // (B) the stored record and the staging
+    let (c, _dc) = engine();
+    stopped_in_the_carry(&c, &a);
+    assert!(!c.carry_stage_rows_for_test(a.node_id()).is_empty(), "premise: rows are staged");
+    assert_eq!(
+        c.snapshot_pull_peers().unwrap(),
+        vec![a.node_id()],
+        "premise: the pull is recorded"
+    );
+    assert!(c.forget_snapshot_pulls_of(a.node_id()).unwrap(), "something was forgotten");
+    assert!(c.carry_stage_rows_for_test(a.node_id()).is_empty(), "the staging went with it");
+    assert!(c.snapshot_pull_peers().unwrap().is_empty(), "and the stored record");
+    assert!(c.snapshots_to_resume().unwrap().is_empty());
+    assert!(!c.forget_snapshot_pulls_of(a.node_id()).unwrap(), "a second forget finds nothing");
+}

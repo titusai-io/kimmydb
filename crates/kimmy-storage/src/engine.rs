@@ -4299,10 +4299,11 @@ impl Engine {
         Ok(Self::stored_snapshot_scope(&table, peer)? == Some(scope))
     }
 
-    /// Clear a recorded snapshot pull with `peer` scoped to `scope`, in a
-    /// transaction of its own. Only for the one case that has no page
-    /// transaction to ride in: a final page that wrote nothing.
-    pub(crate) fn forget_snapshot_progress(
+    /// Clear a recorded snapshot pull with `peer` scoped to `scope`, and what it staged of the carry, in a transaction of its own. For
+    /// a final page that wrote nothing, which has no page transaction to ride in, and for the cluster layer, which forgets a pull it has
+    /// abandoned (ADR-272, unit P: the retention pass collects no options row while a pull is stored, so a pull nobody resumes must not
+    /// stay stored).
+    pub fn forget_snapshot_progress(
         &self,
         peer: NodeId,
         scope: Option<CollectionId>,
@@ -4316,6 +4317,47 @@ impl Engine {
         }
         self.pulls_in_flight.lock().remove(&(peer, scope));
         Ok(())
+    }
+
+    /// Forget every pull recorded with `peer`, whatever its scope, with what it staged of the carry, in a transaction of its own: for a
+    /// peer the cluster no longer lists. An undecodable row goes too (it reads as no row elsewhere, and would stay for ever).
+    pub fn forget_snapshot_pulls_of(&self, peer: NodeId) -> Result<bool> {
+        let txn = self.begin_write(WriterHolder::Repair)?;
+        let stored = {
+            let table = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
+            Self::stored_snapshot_scope(&table, peer)?
+        };
+        let mut wrote = false;
+        if let Some(Some(scope)) = stored {
+            wrote |= Self::forget_snapshot_progress_in_txn(&txn, peer, Some(scope))?;
+        }
+        wrote |= Self::forget_snapshot_progress_in_txn(&txn, peer, None)?;
+        {
+            let mut table = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
+            wrote |= table.remove(peer.to_bytes().as_slice())?.is_some();
+        }
+        if wrote {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        self.pulls_in_flight.lock().retain(|(held, _)| *held != peer);
+        Ok(wrote)
+    }
+
+    /// The peers a snapshot pull is recorded with, undecodable rows included: what the cluster layer judges against the members it
+    /// lists. A read, no writer.
+    pub fn snapshot_pull_peers(&self) -> Result<Vec<NodeId>> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(tables::SNAPSHOT_PROGRESS) else { return Ok(Vec::new()) };
+        let mut peers = Vec::new();
+        for row in table.iter()? {
+            let (key, _) = row?;
+            if let Ok(bytes) = <[u8; 16]>::try_from(key.value()) {
+                peers.push(NodeId::from_bytes(bytes));
+            }
+        }
+        Ok(peers)
     }
 
     /// Every snapshot pull this node was part-way through when it stopped, by

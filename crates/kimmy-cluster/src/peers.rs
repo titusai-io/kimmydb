@@ -1158,6 +1158,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     warn!(error = %e, "divergence check: could not list this node's own \
                           collections; skipping this tick's probe rotation");
                 }
+                // A snapshot pull recorded with a member the live list has lacked for the grace is forgotten, with its staged carry: the
+                // retention pass keeps every options row while a pull is recorded, so a pull of a member that has gone must not stay
+                // (ADR-272, unit P). Nothing is judged without a member list.
+                forget_pulls_of_unlisted_peers(
+                    &engine,
+                    &mut stalls,
+                    config.members.as_ref().map(|members| members.node_ids()).as_ref(),
+                );
                 let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
                     // This node's count and the vector it is judged against,
                     // from one snapshot so the vector cannot name an entry the
@@ -2177,6 +2185,33 @@ impl DigestState {
         self.verified.retain(|id, (_, _, at)| held.contains(id) && at.elapsed() < SELF_CHECK_MEMO);
         self.warned.retain(|(_, id), at| held.contains(id) && at.elapsed() < DIGEST_WARN_EVERY * 6);
         self.cuts.retain(|(_, id), _| held.contains(id));
+    }
+}
+
+/// Forget the snapshot pulls recorded with, or held for, a member the live list `live` has lacked for `crate::transport::MEMBER_GRACE`: in
+/// memory and in storage, with what each staged of the carry (ADR-272, unit P). A failure to read or to clear is said, and the row stays
+/// until a later tick: growth, no harm.
+pub(crate) fn forget_pulls_of_unlisted_peers(
+    engine: &Engine,
+    stalls: &mut PeerStalls,
+    live: Option<&BTreeSet<NodeId>>,
+) {
+    let recorded = match kimmy_storage::blocking(|| engine.snapshot_pull_peers()) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            warn!(%error, "could not list the recorded snapshot pulls; none is judged this tick");
+            return;
+        }
+    };
+    for peer in stalls.pulls_of_unlisted_peers(&recorded, live) {
+        match kimmy_storage::blocking(|| engine.forget_snapshot_pulls_of(peer)) {
+            Ok(_) => {
+                info!(%peer, "a snapshot pull with a member the cluster no longer lists was forgotten")
+            }
+            Err(error) => {
+                warn!(%peer, %error, "a snapshot pull with an unlisted member was forgotten, and its stored row could not be cleared")
+            }
+        }
     }
 }
 
@@ -4833,6 +4868,93 @@ mod tests {
         assert_eq!(
             judge_catch_up(&real, &engine, &pulling, None, &both, None),
             crate::catchup::Decision::Kept
+        );
+    }
+
+    /// UNIT P, P12b: a snapshot pull recorded with a member the live list lacks is forgotten, in memory and in storage, once the member has been
+    /// absent for the grace without a break; the retention pass keeps every options row while a pull is recorded, so a pull of a member that has gone
+    /// must not stay. (i) absent for less than the grace: kept. (ii) absent for the grace: forgotten. (iii) listed again before the grace: the clock
+    /// starts again. (iv) no member list, or an empty one: nothing is judged, and no clock runs. Mutants: no grace (forgotten when first seen
+    /// absent); the empty-list guard removed; the clock not reset when the peer is listed again.
+    #[test]
+    fn a_pull_recorded_with_a_member_the_list_lacks_is_forgotten_after_the_grace_and_not_before() {
+        let ((engine, _dir), peer, progress) = part_way_through_a_snapshot();
+        let other = NodeId::from_bytes([9; 16]);
+        let others = BTreeSet::from([other]);
+        let both = BTreeSet::from([peer, other]);
+        let mut stalls = PeerStalls::new();
+        stalls.resume_snapshots(vec![(peer, progress)]);
+        let recorded = || engine.snapshots_to_resume().unwrap().len();
+        let held = |stalls: &PeerStalls| stalls.pulls_held_for_test().contains(&peer);
+        let at = |stalls: &mut PeerStalls, secs: u64| {
+            stalls.set_repair_clock(Duration::from_secs(secs), Duration::from_secs(5));
+        };
+        let grace = crate::transport::MEMBER_GRACE.as_secs();
+        assert_eq!(recorded(), 1, "premise: the pull is recorded");
+        assert!(held(&stalls), "premise: and held in memory");
+
+        // (iv) no list, and an empty one, however long: nothing is judged
+        for (n, live) in [None, Some(BTreeSet::new())].iter().enumerate() {
+            at(&mut stalls, 1000 * (n as u64 + 1) * grace);
+            forget_pulls_of_unlisted_peers(&engine, &mut stalls, live.as_ref());
+            assert_eq!((recorded(), held(&stalls)), (1, true), "no member list judges nothing");
+        }
+        // the list appears, without the peer: the clock starts at this tick, not before
+        let start = 5000 * grace;
+        at(&mut stalls, start);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&others));
+        assert_eq!(recorded(), 1, "the first tick that lacks the peer forgets nothing");
+        // (i) less than the grace
+        at(&mut stalls, start + grace - 1);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&others));
+        assert_eq!((recorded(), held(&stalls)), (1, true), "absent for less than the grace");
+        // (iii) listed again, and absent again: the clock starts again
+        at(&mut stalls, start + grace);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&both));
+        at(&mut stalls, start + grace + 10);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&others));
+        at(&mut stalls, start + 2 * grace + 9);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&others));
+        assert_eq!(
+            (recorded(), held(&stalls)),
+            (1, true),
+            "listed in between: the grace runs from the first tick that lacked the peer after it"
+        );
+        // (ii) the grace passes without a break
+        at(&mut stalls, start + 2 * grace + 10);
+        forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&others));
+        assert_eq!((recorded(), held(&stalls)), (0, false), "forgotten, stored and held");
+    }
+
+    /// UNIT P, P12b: a pull recorded with a member that is listed is never judged, whatever the clock says. Mutant: the pulls of listed members judged.
+    #[test]
+    fn a_pull_recorded_with_a_listed_member_is_never_forgotten_whatever_the_clock_says() {
+        let ((engine, _dir), peer, progress) = part_way_through_a_snapshot();
+        let mut stalls = PeerStalls::new();
+        stalls.resume_snapshots(vec![(peer, progress)]);
+        let live = BTreeSet::from([peer, NodeId::from_bytes([9; 16])]);
+        let grace = crate::transport::MEMBER_GRACE.as_secs();
+        for tick in 0..4u64 {
+            stalls.set_repair_clock(Duration::from_secs(tick * 10 * grace), Duration::from_secs(5));
+            forget_pulls_of_unlisted_peers(&engine, &mut stalls, Some(&live));
+        }
+        assert_eq!(engine.snapshots_to_resume().unwrap().len(), 1, "a listed member's pull stays");
+        assert!(stalls.pulls_held_for_test().contains(&peer), "in memory too");
+    }
+
+    /// UNIT P, P12b: the replication tick forgets the pulls of members the live list has lacked for the grace. A source guard: the call stands in `replicate`,
+    /// before the definition of the function. Mutant: the call removed.
+    #[test]
+    fn the_tick_forgets_the_pulls_of_unlisted_members() {
+        let source = include_str!("peers.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let start = production.find("pub async fn replicate(").expect("replicate");
+        let def = production.find("fn forget_pulls_of_unlisted_peers(").expect("the function");
+        assert!(start < def, "the function is defined after the loop");
+        assert_eq!(
+            production[start..def].matches("forget_pulls_of_unlisted_peers(").count(),
+            1,
+            "the tick calls it once"
         );
     }
 

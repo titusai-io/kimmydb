@@ -192,6 +192,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the consistency check of a restore, inside its write transaction on a temporary store no node has opened: reads the carried version vector, the register's tables and the collections table once, bounded by the backup's own contents, with nothing waiting on it (ADR-272; Q6.6, unit A)",
     ),
     (
+        "engine::Engine::snapshot_pull_peers",
+        "one row per peer a snapshot is under way with, the keys only, as snapshots_to_resume reads them: read once a tick by the cluster layer (ADR-272, unit P)",
+    ),
+    (
         "backup_register_tests::a_restore_leaves_no_purge_deferral_whatever_the_source_held",
         "test code counting the rows of a table in a store it wrote itself",
     ),
