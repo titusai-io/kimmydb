@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kimmy_core::{Epoch, NodeId};
@@ -324,24 +325,53 @@ fn parse(text: &str) -> std::io::Result<MarkerFile> {
     Ok(MarkerFile { marker, replace })
 }
 
-/// Write the containment file: to a temporary name, synced, then renamed, so a crash leaves the old
-/// file or the new one and never half of one. An empty file (no marker, no flag) removes it.
+/// Write the containment file: to a temporary name no other writer uses, synced, then renamed, so a crash leaves the old file or
+/// the new one and never half of one. An empty file (no marker, no flag) removes it. A caller that changes what the file holds
+/// goes through [`update_marker_file`], which reads and writes as one step.
 pub fn write_marker_file(data_dir: &Path, file: &MarkerFile) -> std::io::Result<()> {
-    use std::io::Write;
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let text = render(file);
     if text.is_empty() {
         return clear_marker_file(data_dir);
     }
     let target = data_dir.join(MARKER_FILE);
-    let temporary = data_dir.join(format!("{MARKER_FILE}.tmp"));
-    {
-        let mut out = std::fs::File::create(&temporary)?;
-        out.write_all(text.as_bytes())?;
-        out.sync_all()?;
+    let temporary = data_dir.join(format!(
+        "{MARKER_FILE}.{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written =
+        write_synced(&temporary, &text).and_then(|()| std::fs::rename(&temporary, &target));
+    if let Err(e) = written {
+        // Left behind, it would be one more file for every failed write.
+        let _ = std::fs::remove_file(&temporary);
+        return Err(e);
     }
-    std::fs::rename(&temporary, &target)?;
     // The rename itself is made durable with the directory.
     std::fs::File::open(data_dir)?.sync_all()
+}
+
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::fs::File::create(path)?;
+    out.write_all(text.as_bytes())?;
+    out.sync_all()
+}
+
+/// Read the containment file, change it with `change` and write what comes back, **as one step**: no other writer of this process
+/// reads between this read and this write (ADR-274). Contacts are told of a newer epoch at once and in parallel, so without it the
+/// floor, which a recovery restore mints above, was the last writer's and not the highest, and a tell could drop the guard's halt.
+/// `change` is given the read's own result, so that each caller says what a file that cannot be read is to it.
+pub fn update_marker_file(
+    data_dir: &Path,
+    change: impl FnOnce(std::io::Result<MarkerFile>) -> std::io::Result<MarkerFile>,
+) -> std::io::Result<()> {
+    static ONE_WRITER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _held = ONE_WRITER.lock();
+    let held = read_marker_file(data_dir);
+    #[cfg(test)]
+    between_read_and_write::reached(data_dir);
+    write_marker_file(data_dir, &change(held)?)
 }
 
 /// Read the containment file: an absent file is an empty one, and one that does not parse is an
@@ -409,7 +439,8 @@ pub(crate) fn act_on_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: E
     if let Err(e) = engine.note_epoch(node, epoch) {
         tracing::warn!(error = %e, "the newer epoch could not be noted; a handshake relearns it");
     }
-    if let Err(e) = record_the_tell(engine, node, epoch) {
+    // On a runtime worker, and the file's writers take turns.
+    if let Err(e) = kimmy_storage::blocking(|| record_the_tell(engine, node, epoch)) {
         tracing::error!(error = %e, "the containment file could not be written beside the store");
     }
 }
@@ -423,11 +454,11 @@ pub(crate) fn record_the_tell(
     epoch: Epoch,
 ) -> std::io::Result<()> {
     let Some(dir) = engine.path().parent() else { return Ok(()) };
-    let held = read_marker_file(dir).unwrap_or_default();
-    #[cfg(test)]
-    between_read_and_write::reached(dir);
-    let marker = marker_told(held.marker.as_ref(), node, epoch);
-    write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held })
+    update_marker_file(dir, |held| {
+        let held = held.unwrap_or_default();
+        let marker = marker_told(held.marker.as_ref(), node, epoch);
+        Ok(MarkerFile { marker: Some(marker), ..held })
+    })
 }
 
 /// Apply the containment file's rule at a start (ruling 7): a store below the marker's floor is
@@ -463,12 +494,13 @@ pub fn halt_by_guard(engine: &kimmy_storage::Engine, address: SocketAddr) {
         );
     }
     let Some(dir) = engine.path().parent() else { return };
-    let held = read_marker_file(dir).unwrap_or_default();
-    #[cfg(test)]
-    between_read_and_write::reached(dir);
     let guard = GuardHalt { epoch: engine.epoch(), address };
-    let marker = marker_guard_halted(held.marker.as_ref(), engine.node_id(), guard);
-    if let Err(e) = write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held }) {
+    let written = update_marker_file(dir, |held| {
+        let held = held.unwrap_or_default();
+        let marker = marker_guard_halted(held.marker.as_ref(), engine.node_id(), guard);
+        Ok(MarkerFile { marker: Some(marker), ..held })
+    });
+    if let Err(e) = written {
         tracing::error!(error = %e, "the containment file could not be written beside the store");
     }
 }

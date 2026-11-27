@@ -187,12 +187,12 @@ fn main() -> Result<()> {
             };
             // `--replace` names the epoch this restore minted, and is honoured only for a store on
             // it; a restore without it leaves no such entry behind.
-            let mut containment =
-                kimmy_cluster::containment::read_marker_file(&config.storage.data_dir)
-                    .context("reading the containment file")?;
-            containment.replace = replace.then_some(minted);
-            kimmy_cluster::containment::write_marker_file(&config.storage.data_dir, &containment)
-                .context("writing the containment file")?;
+            kimmy_cluster::containment::update_marker_file(&config.storage.data_dir, |held| {
+                let mut containment = held?;
+                containment.replace = replace.then_some(minted);
+                Ok(containment)
+            })
+            .context("updating the containment file")?;
             kimmy_cluster::catchup::write_replay_floor(&config.storage.data_dir, position)
                 .context("writing the replay floor")?;
             eprintln!(
