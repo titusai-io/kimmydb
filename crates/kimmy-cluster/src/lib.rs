@@ -25,6 +25,7 @@ pub mod discovery;
 mod exchange;
 pub mod facts;
 pub mod guard;
+mod guard_answer;
 pub mod health;
 pub mod membership;
 pub mod peers;

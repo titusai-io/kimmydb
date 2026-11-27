@@ -241,6 +241,36 @@ pub enum ReplayStall {
     ParkedEvent,
 }
 
+/// Where a member stands with its mistaken-restore guard (D13 containment, ADR-274).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Standing {
+    /// Its guard has passed, or it has none to pass.
+    Open,
+    /// Its guard has not passed: it has not joined, and nothing is to be recorded of it.
+    Undecided,
+}
+
+/// What a member says of itself where a restore asks before it joins (ADR-274): in the `Welcome`
+/// to a probe, in the `Welcome` of a member that is undecided, whoever dialled it, and in the
+/// report a dialler hands an undecided member back.
+///
+/// Addresses are `ip:port` text: BSON's serializer and deserializer need not agree on the form a
+/// socket address takes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardAnswer {
+    /// Sixteen random bytes made once by each process: how a member knows its own answers.
+    pub token: Vec<u8>,
+    pub standing: Standing,
+    /// How long it has been a member, from when it began to gossip: 0 before that.
+    pub membership_age_ms: u64,
+    /// It founded its store and has completed no handshake.
+    pub founded_unmet: bool,
+    /// Where its member list has the node id of the member it is answering.
+    pub listings: Vec<String>,
+    /// Its member list.
+    pub members: Vec<(String, NodeId)>,
+}
+
 /// What one side says to the other.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
@@ -273,9 +303,17 @@ pub enum Message {
         /// verifies.
         #[serde(default)]
         epoch: Option<kimmy_core::Epoch>,
+        /// The responder's answer for a restore's guard (ADR-274): to a probe, and to any
+        /// dialler while the responder is undecided.
+        #[serde(default)]
+        guard: Option<Box<GuardAnswer>>,
     },
     /// Answers the responder's challenge. The handshake is complete after this.
     Confirm { proof: Vec<u8> },
+    /// The dialler's own answer, sent after its `Confirm` to a responder whose `Welcome` said it
+    /// is undecided (ADR-274): a member whose seeds name nobody gets an answer this way. Read only
+    /// once the dialler's proof has verified, and nothing follows it.
+    GuardReport { answer: Box<GuardAnswer> },
     /// The tell (D13 containment, ADR-274): `epoch` is a newer epoch of `node` than the epoch the
     /// receiver holds, and the receiver halts. Sent once the handshake is complete: by the
     /// responder after the dialler's `Confirm` verifies, and by the dialler after it has sent its
@@ -718,6 +756,11 @@ pub enum ProtocolError {
     /// with a `Welcome` and nothing follows it. Not a failure of anyone.
     #[error("the peer was a probe")]
     Probed,
+    /// One of the two ends of a connection is undecided: its mistaken-restore guard has not passed
+    /// (D13 containment, ADR-274). The handshake ends after the proofs, with nothing recorded of
+    /// either end and no round run. Not a failure of anyone: no backoff, nothing counted.
+    #[error("a member whose mistaken-restore guard has not passed: no round runs with it")]
+    Undecided,
     /// A contact ended because one of the two hosts is superseded (D13 containment, ADR-274): this
     /// host was told, or found, that a newer epoch of its node exists and halted, or the peer is on
     /// an epoch older than the newest this member knows of its node and was told so. No round runs
@@ -1009,6 +1052,17 @@ mod tests {
     use super::*;
     use kimmy_core::Epoch;
 
+    fn a_guard_answer(standing: Standing) -> GuardAnswer {
+        GuardAnswer {
+            token: vec![3; 16],
+            standing,
+            membership_age_ms: 12_000,
+            founded_unmet: true,
+            listings: vec!["10.0.0.1:7000".to_string()],
+            members: vec![("10.0.0.2:7000".to_string(), NodeId::from_bytes([2; 16]))],
+        }
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -1181,7 +1235,17 @@ mod tests {
                 proof: vec![6],
                 protocol: Some(PROTOCOL),
                 epoch: Some(kimmy_core::Epoch::from_u64(8)),
+                guard: None,
             },
+            Message::Welcome {
+                node: NodeId::generate(),
+                nonce: vec![4, 5],
+                proof: vec![6],
+                protocol: Some(PROTOCOL),
+                epoch: None,
+                guard: Some(Box::new(a_guard_answer(Standing::Undecided))),
+            },
+            Message::GuardReport { answer: Box::new(a_guard_answer(Standing::Open)) },
             Message::Superseded { node: NodeId::generate(), epoch: kimmy_core::Epoch::from_u64(9) },
             Message::Confirm { proof: vec![9, 9] },
             Message::AskDivergence {

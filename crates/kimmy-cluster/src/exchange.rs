@@ -151,7 +151,7 @@ async fn exchange_within(
     ours: Option<(Arc<Facts>, u64)>,
     limit: Duration,
 ) -> Result<NodeId, ProtocolError> {
-    let (mut stream, their_node) = dial(engine, peer, secret).await?;
+    let (mut stream, their_node) = dial(engine, peer, secret, Some(members)).await?;
     let answered =
         tokio::time::timeout(limit, frames(engine, &mut stream, their_node, members, ours))
             .await
@@ -408,7 +408,7 @@ mod tests {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut stream = tls.acceptor().accept(tcp).await.unwrap();
                 let binding = crate::tls::binding(stream.get_ref().1).unwrap();
-                crate::transport::accept_handshake(&silent, &mut stream, SECRET, &binding)
+                crate::transport::accept_handshake(&silent, &mut stream, SECRET, &binding, None)
                     .await
                     .unwrap();
                 let _asked = crate::protocol::read_frame(&mut stream).await.unwrap();

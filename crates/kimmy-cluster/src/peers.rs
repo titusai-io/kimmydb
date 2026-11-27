@@ -1272,6 +1272,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         Arc::clone(&engine),
                         contact.peer,
                         config.secret.clone(),
+                        config.members.clone(),
                     )
                     .instrument(tracing::info_span!(
                         "cluster.dial",

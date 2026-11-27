@@ -561,10 +561,11 @@ impl Confirmer {
         progress: &Progress,
         dialled: &mut Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     ) -> PushResult {
-        let (stream, their_node) = match dial(&self.engine, addr, &self.secret).await {
-            Ok(dialled) => dialled,
-            Err(e) => return PushResult::Failed(Failure::before_send(None, false, e)),
-        };
+        let (stream, their_node) =
+            match dial(&self.engine, addr, &self.secret, Some(&self.members)).await {
+                Ok(dialled) => dialled,
+                Err(e) => return PushResult::Failed(Failure::before_send(None, false, e)),
+            };
         let stream = dialled.insert(stream);
         self.push_over(stream, addr, their_node, progress).await
     }

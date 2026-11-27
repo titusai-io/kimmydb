@@ -15,7 +15,7 @@ use super::*;
 const SECRET: &str = "a-containment-secret";
 const BINDING: &[u8] = b"a-containment-binding";
 
-fn engine() -> (Engine, tempfile::TempDir) {
+pub(super) fn engine() -> (Engine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
     (engine, dir)
@@ -23,7 +23,7 @@ fn engine() -> (Engine, tempfile::TempDir) {
 
 /// Two hosts of one node: the original, and a restore of its backup (the same node and a newer
 /// epoch).
-fn an_old_and_a_new_host_of_one_node() -> (Engine, Engine, Vec<tempfile::TempDir>) {
+pub(super) fn an_old_and_a_new_host_of_one_node() -> (Engine, Engine, Vec<tempfile::TempDir>) {
     let (old, old_dir) = engine();
     old.create_collection("shop", "orders").unwrap();
     let mut backup = Vec::new();
@@ -39,7 +39,7 @@ fn an_old_and_a_new_host_of_one_node() -> (Engine, Engine, Vec<tempfile::TempDir
 }
 
 /// An epoch another host could have minted `ahead_ms` after this clock.
-fn an_epoch_ahead(ahead_ms: u64) -> Epoch {
+pub(super) fn an_epoch_ahead(ahead_ms: u64) -> Epoch {
     Epoch::new(Hlc::new(kimmy_storage::physical_now_ms() + ahead_ms, 0), [1; 8])
 }
 
@@ -53,7 +53,7 @@ async fn handshake(
     let (opened, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
             open_handshake(dialler, &mut ours, SECRET, BINDING),
-            accept_handshake(responder, &mut theirs, SECRET, BINDING)
+            accept_handshake(responder, &mut theirs, SECRET, BINDING, None)
         )
     })
     .await
@@ -68,7 +68,7 @@ async fn next_frame(stream: &mut DuplexStream, within: Duration) -> Option<Messa
 
 /// A `Hello` written by hand, as a socket that is not a member would write it. Returns its
 /// challenge.
-async fn raw_hello(
+pub(super) async fn raw_hello(
     ours: &mut DuplexStream,
     peer: NodeId,
     protocol: Option<u32>,
@@ -89,7 +89,7 @@ async fn verified_claim(
     epoch: Epoch,
 ) -> Result<NodeId, ProtocolError> {
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let accepting = accept_handshake(responder, &mut theirs, SECRET, BINDING);
+    let accepting = accept_handshake(responder, &mut theirs, SECRET, BINDING, None);
     let claiming = async {
         raw_hello(&mut ours, peer, Some(crate::protocol::PROTOCOL), Some(epoch), false).await;
         if let Ok(Message::Welcome { nonce: theirs, .. }) = read_frame(&mut ours).await {
@@ -144,7 +144,7 @@ async fn a_claim_whose_proof_fails_records_nothing_and_a_verified_one_is_recorde
     let claim = an_epoch_ahead(60_000);
 
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let accepting = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let accepting = accept_handshake(&responder, &mut theirs, SECRET, BINDING, None);
     let forging = async {
         raw_hello(&mut ours, peer, Some(crate::protocol::PROTOCOL), Some(claim), false).await;
         assert!(matches!(read_frame(&mut ours).await.unwrap(), Message::Welcome { .. }));
@@ -333,7 +333,7 @@ async fn a_responder_does_not_tell_a_socket_whose_confirm_fails() {
     let _ = (opened, accepted);
 
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let accepting = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let accepting = accept_handshake(&responder, &mut theirs, SECRET, BINDING, None);
     let forging = async {
         let epoch = Some(old.epoch());
         raw_hello(&mut ours, old.node_id(), Some(crate::protocol::PROTOCOL), epoch, false).await;
@@ -362,7 +362,7 @@ async fn a_hello_with_no_epoch_that_is_not_a_probe_is_refused_by_name() {
     let (responder, _r) = engine();
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
     let peer = NodeId::generate();
-    let refusing = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let refusing = accept_handshake(&responder, &mut theirs, SECRET, BINDING, None);
     let asking = async {
         raw_hello(&mut ours, peer, Some(crate::protocol::PROTOCOL), None, false).await;
         read_frame(&mut ours).await
@@ -397,6 +397,7 @@ async fn a_welcome_with_no_epoch_is_refused_by_name_by_the_dialler() {
             proof: vec![0; 32],
             protocol: Some(crate::protocol::PROTOCOL),
             epoch: None,
+            guard: None,
         };
         write_frame(&mut theirs, &welcome).await.unwrap();
         read_frame(&mut theirs).await
@@ -420,7 +421,7 @@ async fn a_probe_is_answered_and_nothing_follows_it() {
     let (responder, _r) = engine();
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
     let peer = NodeId::generate();
-    let probed = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let probed = accept_handshake(&responder, &mut theirs, SECRET, BINDING, None);
     let probing = async {
         let challenge =
             raw_hello(&mut ours, peer, Some(crate::protocol::PROTOCOL), None, true).await;
@@ -694,7 +695,7 @@ async fn a_self_contact_and_a_probe_mark_nobody() {
 
     let (responder, _r) = engine();
     let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
-    let probed = accept_handshake(&responder, &mut theirs, SECRET, BINDING);
+    let probed = accept_handshake(&responder, &mut theirs, SECRET, BINDING, None);
     let probing = async {
         raw_hello(&mut ours, NodeId::generate(), Some(crate::protocol::PROTOCOL), None, true).await;
         let _ = read_frame(&mut ours).await;

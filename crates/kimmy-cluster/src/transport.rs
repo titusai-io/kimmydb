@@ -721,6 +721,8 @@ impl ServeFailure {
             ProtocolError::SelfContact => None,
             // A probe was answered, and ends there.
             ProtocolError::Probed => None,
+            // One end's guard has not passed: the contact ends, and nobody failed.
+            ProtocolError::Undecided => None,
             // A superseded host: the contact ends, and nobody failed.
             ProtocolError::Superseded => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
@@ -1215,7 +1217,7 @@ where
     let mut stream = WriteProgress::new(stream, budgets.waits.stall);
     let peer = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        accept_handshake(engine, &mut stream, secret, binding),
+        accept_handshake(engine, &mut stream, secret, binding, members),
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
@@ -1739,6 +1741,8 @@ pub(crate) async fn accept_handshake<S>(
     stream: &mut S,
     secret: &str,
     binding: &[u8],
+    // Scaffold of the tests commit: read by the code commit.
+    _members: Option<&Members>,
 ) -> Result<kimmy_core::NodeId, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1778,6 +1782,7 @@ where
             proof: prove(secret, &their_nonce, binding),
             protocol: Some(crate::protocol::PROTOCOL),
             epoch: Some(engine.epoch()),
+            guard: None,
         },
     )
     .await?;
@@ -1950,7 +1955,7 @@ pub async fn sync_once_with(
     probe: Option<DivergenceProbe>,
     stalls: &mut PeerStalls,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let (mut stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
+    let (mut stream, their_node, their_epoch) = dial_claimed(engine, peer, secret, None).await?;
     stalls.note_peer_epoch(their_node, their_epoch);
     let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
     close(&mut stream).await;
@@ -1980,8 +1985,9 @@ pub(crate) async fn dial(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
+    members: Option<&Members>,
 ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, kimmy_core::NodeId), ProtocolError> {
-    let (stream, their_node, _) = dial_claimed(engine, peer, secret).await?;
+    let (stream, their_node, _) = dial_claimed(engine, peer, secret, members).await?;
     Ok((stream, their_node))
 }
 
@@ -1991,6 +1997,8 @@ pub(crate) async fn dial_claimed(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
+    // This member's set, from which an undecided peer is handed a report (ADR-274).
+    members: Option<&Members>,
 ) -> Result<
     (tokio_rustls::client::TlsStream<TcpStream>, kimmy_core::NodeId, kimmy_core::Epoch),
     ProtocolError,
@@ -2052,7 +2060,7 @@ pub(crate) async fn dial_claimed(
 
     let (their_node, their_epoch) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        open_handshake_claimed(engine, &mut stream, secret, &binding),
+        open_handshake_claimed(engine, &mut stream, secret, &binding, members),
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
@@ -2074,9 +2082,14 @@ pub(crate) async fn dial_claimed(
 }
 
 /// The mistaken-restore guard's probe (ADR-274): dial `peer`, say a `Hello` that is a probe and
-/// carries no epoch, and report whether a `Welcome` came back whose proof verifies. Records
-/// nothing, sends nothing else, and ends there. The caller bounds it with the guard's window.
-pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> bool {
+/// carries no epoch, and return who answered, with its answer for the guard, where a `Welcome`
+/// came back whose proof verifies. Records nothing, sends nothing else, and ends there. The
+/// caller bounds it with the guard's window.
+pub(crate) async fn probe_answer(
+    own: NodeId,
+    peer: SocketAddr,
+    secret: &str,
+) -> Option<(NodeId, Option<Box<crate::protocol::GuardAnswer>>)> {
     let attempt = async {
         let tcp = TcpStream::connect(peer).await.ok()?;
         set_keepalive(&tcp);
@@ -2097,16 +2110,21 @@ pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> b
         };
         write_frame(&mut stream, &hello).await.ok()?;
         match read_frame(&mut stream).await.ok()? {
-            Message::Welcome { proof, protocol, .. }
+            Message::Welcome { node, proof, protocol, guard, .. }
                 if protocol == Some(crate::protocol::PROTOCOL)
                     && proof_is_valid(secret, &challenge, &binding, &proof) =>
             {
-                Some(())
+                Some((node, guard))
             }
             _ => None,
         }
     };
-    attempt.await.is_some()
+    attempt.await
+}
+
+/// Whether a probe of `peer` is answered by a live host: any verifying answer.
+pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> bool {
+    probe_answer(own, peer, secret).await.is_some()
 }
 
 /// A connection [`dial`] opened for a round that has not started: dialled with the
@@ -2122,6 +2140,8 @@ pub(crate) struct Dialled {
     /// How long the dial took, which the contact's first pull is charged with as
     /// when the dial was made inside it (the next pull's estimate counts a dial).
     took: Duration,
+    /// The member set it was dialled with, for a dial made again.
+    members: Option<Members>,
 }
 
 impl Dialled {
@@ -2136,11 +2156,14 @@ pub(crate) async fn dial_for_round(
     engine: Arc<Engine>,
     peer: SocketAddr,
     secret: String,
+    members: Option<Members>,
 ) -> Result<Dialled, ProtocolError> {
     let started = Instant::now();
-    let (stream, their_node, their_epoch) = dial_claimed(&engine, peer, &secret).await?;
+    let (stream, their_node, their_epoch) =
+        dial_claimed(&engine, peer, &secret, members.as_ref()).await?;
     let at = Instant::now();
-    Ok(Dialled { stream, their_node, their_epoch, at, took: at.duration_since(started) })
+    let took = at.duration_since(started);
+    Ok(Dialled { stream, their_node, their_epoch, at, took, members })
 }
 
 /// How long a dialled stream may be held before its round and still be used as it
@@ -2213,12 +2236,13 @@ async fn sync_once_dialled_within(
     dialled: Dialled,
     max_age: Duration,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let Dialled { mut stream, mut their_node, mut their_epoch, at, .. } = dialled;
+    let Dialled { mut stream, mut their_node, mut their_epoch, at, members, .. } = dialled;
     let old = at.elapsed() > max_age;
     if old || held_stream_is_gone(&mut stream).await {
         debug!(%peer, old, "a connection dialled for this tick is not used as it is; dialling again");
         close(&mut stream).await;
-        (stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
+        (stream, their_node, their_epoch) =
+            dial_claimed(engine, peer, secret, members.as_ref()).await?;
     }
     stalls.note_peer_epoch(their_node, their_epoch);
     let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
@@ -6981,6 +7005,8 @@ async fn open_handshake_claimed<S>(
     stream: &mut S,
     secret: &str,
     binding: &[u8],
+    // Scaffold of the tests commit: read by the code commit.
+    _members: Option<&Members>,
 ) -> Result<(kimmy_core::NodeId, kimmy_core::Epoch), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -6999,7 +7025,7 @@ where
     .await?;
 
     let (their_node, their_nonce, proof, their_epoch) = match read_frame(stream).await? {
-        Message::Welcome { node, nonce, proof, protocol, epoch } => {
+        Message::Welcome { node, nonce, proof, protocol, epoch, guard: _ } => {
             if protocol != Some(crate::protocol::PROTOCOL) {
                 let reason = crate::protocol::release_fault(protocol);
                 warn!(peer = ?node, "refusing a peer: {reason}");
@@ -7059,7 +7085,7 @@ async fn open_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    open_handshake_claimed(engine, stream, secret, binding).await.map(|(node, _)| node)
+    open_handshake_claimed(engine, stream, secret, binding, None).await.map(|(node, _)| node)
 }
 
 /// Test-only ways to make a round's own apply slow. `cfg(test)`.
@@ -7375,6 +7401,9 @@ mod repair_review_tests;
 
 #[cfg(test)]
 mod containment_tests;
+
+#[cfg(test)]
+mod guard_answer_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11756,7 +11785,7 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
         let peer = kimmy_core::NodeId::generate();
-        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING);
+        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING, None);
         let asking = async {
             write_frame_without_protocol(
                 &mut ours,
@@ -11795,7 +11824,7 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
         let peer = kimmy_core::NodeId::generate();
-        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING);
+        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING, None);
         let asking = async {
             write_frame(
                 &mut ours,
@@ -11843,6 +11872,7 @@ mod tests {
                     proof: prove(SECRET, &asked, BINDING),
                     protocol: Some(0),
                     epoch: None,
+                    guard: None,
                 },
             )
             .await;
@@ -12717,7 +12747,7 @@ mod tests {
             serving_one(waits_of(Duration::from_secs(1), Duration::from_secs(1))).await;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         ask_versions(&mut stream).await;
         let began = std::time::Instant::now();
         let failures = tokio::time::timeout(Duration::from_secs(10), served)
@@ -12738,7 +12768,7 @@ mod tests {
             serving_one(waits_of(Duration::from_secs(4), Duration::from_secs(1))).await;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         ask_versions(&mut stream).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         ask_versions(&mut stream).await;
@@ -12756,7 +12786,7 @@ mod tests {
             serving_one(waits_of(Duration::from_secs(60), Duration::from_secs(1))).await;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         stream.write_all(&1000u32.to_be_bytes()).await.unwrap();
         stream.write_all(&[0u8; 10]).await.unwrap();
         stream.flush().await.unwrap();
@@ -12798,7 +12828,7 @@ mod tests {
         let (_a, _dir, addr, _served) = serving_counted().await;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         let socket = socket2::SockRef::from(stream.get_ref().0);
         assert!(socket.keepalive().unwrap(), "keepalive is on");
         assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
@@ -12819,7 +12849,7 @@ mod tests {
         let serving = tokio::spawn(serve(Arc::clone(&a), listener, CLOSING_SECRET.to_string()));
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         let client = stream.get_ref().0.local_addr().unwrap();
         // The kernel's table lists ports in hex; the accepted socket is the one whose
         // local port is the server's and whose remote port is the client's. Its timer
@@ -12892,7 +12922,7 @@ mod tests {
         }
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, their_node) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, their_node) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         let clock = RoundClock { reuse_within, ..RoundClock::default() };
         test_hooks::APPLY_TAKES.with(|t| t.set(apply_takes));
         let outcome = sync_round(
@@ -13056,7 +13086,7 @@ mod tests {
         }
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         socket2::SockRef::from(stream.get_ref().0).set_recv_buffer_size(4096).unwrap();
         ask_versions(&mut stream).await;
         write_frame(
@@ -13113,8 +13143,9 @@ mod tests {
         peer: SocketAddr,
         secret: &str,
     ) -> Result<Dialled, ProtocolError> {
-        let (stream, their_node, their_epoch) = dial_claimed(engine, peer, secret).await?;
-        Ok(Dialled { stream, their_node, their_epoch, at: Instant::now(), took: Duration::ZERO })
+        let (stream, their_node, their_epoch) = dial_claimed(engine, peer, secret, None).await?;
+        let (at, took) = (Instant::now(), Duration::ZERO);
+        Ok(Dialled { stream, their_node, their_epoch, at, took, members: None })
     }
 
     /// A TCP relay in front of `to`: the address to dial, and the task of each
@@ -13252,7 +13283,7 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let b = Arc::new(Engine::open(&b_dir.path().join("kimmy.redb")).unwrap());
         let began = Instant::now();
-        let dialled = dial_for_round(b, addr, CLOSING_SECRET.to_string()).await.unwrap();
+        let dialled = dial_for_round(b, addr, CLOSING_SECRET.to_string(), None).await.unwrap();
         let took = dialled.dial_took();
         assert!(took > Duration::ZERO && took <= began.elapsed(), "{took:?}");
     }
@@ -13268,7 +13299,7 @@ mod tests {
         let tls = crate::tls::ClusterTls::new().unwrap();
         let mut stream = tls.acceptor().accept(tcp).await.unwrap();
         let binding = crate::tls::binding(stream.get_ref().1).unwrap();
-        accept_handshake(&engine, &mut stream, secret, &binding).await.unwrap();
+        accept_handshake(&engine, &mut stream, secret, &binding, None).await.unwrap();
         std::future::pending::<()>().await;
     }
 
@@ -13565,7 +13596,7 @@ mod tests {
         let (a, _a_dir, addr, mut served) = serving_counted().await;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
         write_frame(
             &mut stream,
             &Message::AskVersions { facts: None, facts_gen: None, echo: None },
@@ -13588,7 +13619,7 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
         for orderly in [false, true] {
-            let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+            let (mut stream, _) = dial(&b, addr, CLOSING_SECRET, None).await.unwrap();
             // Two of a length prefix's four bytes, then the end.
             stream.write_all(&[0, 0]).await.unwrap();
             stream.flush().await.unwrap();
