@@ -60,6 +60,10 @@ use crate::{
     SyncOutcome, WalkScope, tables,
 };
 
+/// Unit EQ: every member against the register function, on these engines.
+#[path = "eq_tests.rs"]
+mod eq_tests;
+
 /// A creation is served onward whatever becomes of it: its rows, the schedules this model's cluster runs among them.
 #[path = "creation_relay_tests.rs"]
 mod creation_relay_tests;

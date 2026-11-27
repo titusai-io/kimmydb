@@ -2521,6 +2521,36 @@ pub(crate) fn carried_rows(
     Ok(rows)
 }
 
+/// The stored bytes of the row of `which` that is keyed by the collection id alone (the names table and the base options), `None` where the
+/// table or the row is absent: a test compares such a row between members byte for byte. Test builds only.
+#[cfg(test)]
+pub(crate) fn stored_row_for_tests(
+    txn: &redb::ReadTransaction,
+    which: Carried,
+    id: CollectionId,
+) -> Result<Option<Vec<u8>>> {
+    let table = match txn.open_table(which.table()) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(table.get(id.0.to_be_bytes().as_slice())?.map(|row| row.value().to_vec()))
+}
+
+/// How many rows `which` holds, none where the table is absent. Test builds only.
+#[cfg(test)]
+pub(crate) fn stored_row_count_for_tests(
+    txn: &redb::ReadTransaction,
+    which: Carried,
+) -> Result<u64> {
+    use redb::ReadableTableMetadata;
+    match txn.open_table(which.table()) {
+        Ok(table) => Ok(table.len()?),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// One row of a backup, written as it was read. The restore transcribes and never judges: [`check_restored`] judges the whole.
 pub(crate) fn restore_row(
     txn: &redb::WriteTransaction,
