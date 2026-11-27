@@ -4,29 +4,35 @@
 //! The function has two layers. **Layer 2** is [`crate::register_state::Timeline`]: register EVENTS, and what each physical is, to what
 //! is served, buried, doomed and superseded. **Layer 1 is this module**: from the facts to the events (which facts are history, which
 //! drops are part of the name's swap history, the database's drop as an event of its own kind, which stages it ended), and the rules
-//! of a collection that was never swapped. It writes no visibility or burial rule of its own.
+//! of a collection that was never swapped. What an event makes visible, and what that buries, is layer 2's alone: this module has no
+//! rule of its own for it. What it ends itself is what a drop of the database ends.
 //!
 //! The definition it must agree with is `u14_fold.py`, which applies the facts one at a time in stamp order;
-//! `tests/register_function/table.rs` holds its answers for generated sets of facts and the test replays them. The answer on a set that
-//! no cluster can write is not specified (a binding of a stage that was not created below it, a recreation with no stage created below
-//! it, a touch of a name that was never created).
+//! `tests/register_function/table.rs` holds its answers for generated sets of facts and the test replays them; `tie_rows.rs` and
+//! `tie_table.rs` beside it hold the answers for facts at one `hlc`. The answer on a set that no cluster can write is not specified
+//! (a binding of a stage that was not created below it, a recreation with no stage created below it, a touch of a name that was never
+//! created).
 //!
 //! Nothing in storage reads this yet.
 //!
 //! **Two facts at one `hlc`** (two origins can mint them). The facts are applied in full [`Stamp`] order, and "below" between two facts
 //! is that order: a drop is logical when a stage's creation sorts below it, and two events at one `hlc` are both in the register. Three
-//! readings are on the `hlc` alone. A drop against the creation of a collection it ends: **the tie is the drop's** (ADR-236). An
-//! ordinary creation or a touch against the register: an event at or below it by `hlc` makes it history, since a visible event buries
-//! the identity whichever of the two sorts first. And a stage's deadline is an `Hlc`.
+//! readings are on the `hlc` alone. A drop against the creation of a collection it ends, and the floor against a touch: **the tie is
+//! the drop's** (ADR-236). An ordinary creation or a touch against the register: an event at or below it by `hlc` makes it history,
+//! since a visible event buries the identity whichever of the two sorts first. And a stage's deadline is an `Hlc`.
 //!
-//! **Built so far:** the collection that was never swapped, and stage creations, bindings, recreations and logical drops. A drop of the
-//! database is not yet an event of the register, so the tests of the cases that hold one beside a stage fact are red.
+//! **A drop of the database** ends every stage and recreation created at or below it, and the collection named like the logical name.
+//! That too is a drop against the creation of what it ends, so it is read on the `hlc`: it ends them whichever of two stamps at one
+//! `hlc` sorts first. It is an event of the register when a stage of the name was created at or below it, asked of every stage of the
+//! set. A binding or a recreation whose physical a database drop ended, with that drop below it in [`Stamp`] order, is a drop at its
+//! own stamp: layer 2 is given a logical drop there, and this module says itself that a write to the ended physical above that stamp
+//! is late.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hlc::{Hlc, Stamp};
 use crate::oplog::OpKind;
-use crate::register_state::{Put, Ready, Timeline, Visible};
+use crate::register_state::{Put, Ready, Timeline, Visible, valid_binding};
 use crate::swap::{RegisterEvent, StageInfo, StageMeta};
 
 /// One fact about a logical name or its database, under the stamp of the entry that made it. No two facts of a set share a stamp.
@@ -129,21 +135,29 @@ pub fn fold(identity: &str, facts: &[FoldFact]) -> Answer {
             _ => None,
         })
         .collect();
+    // every drop of the database in the set, in stamp order: one can end a physical whose creation it sorts below
+    let database_drops: Vec<Stamp> = in_order
+        .iter()
+        .filter(|fact| matches!(fact.kind, FoldKind::DatabaseDrop))
+        .map(|fact| fact.stamp)
+        .collect();
     let mut name = Name {
         stages: &stages,
+        database_drops: &database_drops,
         timeline: Timeline::new(identity),
         plain: Plain::default(),
         alive: BTreeMap::new(),
         dead: BTreeMap::new(),
         invalid: BTreeSet::new(),
+        register: BTreeMap::new(),
+        ended_when_named: BTreeMap::new(),
     };
     for fact in in_order {
         match &fact.kind {
             FoldKind::Create => name.created(&fact.stamp),
             FoldKind::Touch => name.touched(&fact.stamp),
             FoldKind::Drop { database_drop: None } => name.dropped(fact.stamp),
-            // not yet an event of the register: it ends the plain collection and raises the floor, and ends no stage
-            FoldKind::DatabaseDrop => name.plain.dropped(fact.stamp),
+            FoldKind::DatabaseDrop => name.database_dropped(fact.stamp),
             // a database drop's own entry of the collection acts as of that database drop, which is a fact of its own
             FoldKind::Drop { database_drop: Some(_) } => {}
             FoldKind::StageCreate { physical, .. } => name.stage_created(physical, &fact.stamp),
@@ -154,11 +168,19 @@ pub fn fold(identity: &str, facts: &[FoldFact]) -> Answer {
     name.answer(facts)
 }
 
+/// Whether the drop of the database stamped `drop` ends what was created at `created`: read on the `hlc`, so that a tie is the
+/// drop's (ADR-236), whichever of the two stamps sorts first.
+fn ends(drop: &Stamp, created: &Stamp) -> bool {
+    created.hlc <= drop.hlc
+}
+
 /// What the facts applied so far say of a name. Which events there are is decided here; what they make visible and what that buries
 /// is layer 2's to say.
 struct Name<'a> {
     /// Every stage of the set, by its physical, applied or not.
     stages: &'a BTreeMap<&'a str, StageMeta>,
+    /// Every drop of the database in the set, oldest first, applied or not.
+    database_drops: &'a [Stamp],
     /// The events in effect.
     timeline: Timeline,
     plain: Plain,
@@ -166,6 +188,12 @@ struct Name<'a> {
     alive: BTreeMap<String, Hlc>,
     dead: BTreeMap<String, Stamp>,
     invalid: BTreeSet<Stamp>,
+    /// What each event in effect is, by its stamp: layer 2 holds a database drop, and a binding or a recreation that is a drop at its
+    /// own stamp, as logical drops.
+    register: BTreeMap<Stamp, FoldEvent>,
+    /// The physicals a database drop had ended when a binding or a recreation named them, each with that event's stamp: a write to one
+    /// above it is late, and layer 2, which was given a logical drop there, cannot say so.
+    ended_when_named: BTreeMap<String, Stamp>,
 }
 
 impl Name<'_> {
@@ -198,35 +226,103 @@ impl Name<'_> {
             || self.stages.values().any(|stage| stage.created < stamp);
         if logical {
             self.plain.raise_the_floor(stamp);
-            self.enter(stamp, RegisterEvent::LogicalDrop, None);
+            self.enter(stamp, RegisterEvent::LogicalDrop, None, FoldEvent::Drop);
         } else {
             self.plain.dropped(stamp);
         }
     }
 
-    /// The creation of a stage: it stands, hidden, until an event ends it.
+    /// A drop of the database: it ends every physical that stands and the collection named like the logical name, and raises the
+    /// floor. It is an event of the register when a stage of the name was created at or below it.
+    fn database_dropped(&mut self, stamp: Stamp) {
+        for physical in std::mem::take(&mut self.alive).into_keys() {
+            self.dead.insert(physical, stamp);
+        }
+        self.plain.dropped(stamp);
+        let of_the_swap = self.stages.values().any(|stage| ends(&stamp, &stage.created));
+        if of_the_swap {
+            self.enter(stamp, RegisterEvent::LogicalDrop, None, FoldEvent::DatabaseDrop);
+        }
+    }
+
+    /// The first drop of the database below `stamp` that ends what was created at `stamp`: only a drop at the creation's own `hlc`,
+    /// sorting below it, can be one.
+    fn ended_as_made(&self, stamp: &Stamp) -> Option<Stamp> {
+        self.database_drops.iter().copied().find(|drop| ends(drop, stamp) && drop < stamp)
+    }
+
+    /// A physical made at `stamp`: it stands, unless a drop of the database already ended it.
+    fn made(&mut self, physical: &str, stamp: &Stamp) {
+        match self.ended_as_made(stamp) {
+            Some(drop) => {
+                self.dead.insert(physical.to_string(), drop);
+            }
+            None => {
+                self.alive.insert(physical.to_string(), stamp.hlc);
+            }
+        }
+    }
+
+    /// The creation of a stage: it stands, hidden, until an event or a drop of the database ends it.
     fn stage_created(&mut self, physical: &str, stamp: &Stamp) {
-        self.alive.insert(physical.to_string(), stamp.hlc);
+        self.made(physical, stamp);
         self.settle();
     }
 
-    /// A binding, valid or not: layer 2's one door judges it against its stage's creation.
+    /// A binding, valid or not: layer 2's one door judges it against its stage's creation. A valid one of a stage that a drop of the
+    /// database ended, the drop below it, is a drop at its own stamp.
     fn bound(&mut self, physical: &str, stamp: Stamp) {
         let stage = self.stages.get(physical).copied();
-        self.enter(stamp, RegisterEvent::Bind { physical: physical.to_string() }, stage);
+        let label = FoldEvent::Bind { physical: physical.to_string() };
+        let dead = stage.is_some_and(|stage| {
+            valid_binding(&stamp, &stage.created, &stage.info)
+                && self
+                    .database_drops
+                    .iter()
+                    .any(|drop| ends(drop, &stage.created) && *drop < stamp)
+        });
+        if dead {
+            self.enter_as_a_drop(physical, stamp, label);
+        } else {
+            self.enter(stamp, RegisterEvent::Bind { physical: physical.to_string() }, stage, label);
+        }
     }
 
-    /// A recreation: the new physical stands, and its event is in effect.
+    /// A recreation: the new physical stands, and its event is in effect. One that a drop of the database ended as it was made is a
+    /// drop at its own stamp.
     fn recreated(&mut self, physical: &str, stamp: Stamp) {
-        self.alive.insert(physical.to_string(), stamp.hlc);
-        self.enter(stamp, RegisterEvent::Create { physical: physical.to_string() }, None);
+        self.made(physical, &stamp);
+        let label = FoldEvent::Recreate { physical: physical.to_string() };
+        let dead = self.ended_as_made(&stamp).is_some();
+        if dead {
+            self.enter_as_a_drop(physical, stamp, label);
+        } else {
+            let event = RegisterEvent::Create { physical: physical.to_string() };
+            self.enter(stamp, event, None, label);
+        }
+    }
+
+    /// Enter the binding or recreation of an ended physical: layer 2 is given a logical drop at its stamp, and a write to the
+    /// physical above that stamp is late.
+    fn enter_as_a_drop(&mut self, physical: &str, stamp: Stamp, label: FoldEvent) {
+        self.ended_when_named.entry(physical.to_string()).or_insert(stamp);
+        self.enter(stamp, RegisterEvent::LogicalDrop, None, label);
     }
 
     /// Offer an event to the register through layer 2's one door, and apply what is then visible.
-    fn enter(&mut self, stamp: Stamp, event: RegisterEvent, stage: Option<StageMeta>) {
+    fn enter(
+        &mut self,
+        stamp: Stamp,
+        event: RegisterEvent,
+        stage: Option<StageMeta>,
+        label: FoldEvent,
+    ) {
         let stage = stage.as_ref().map(|stage| (&stage.created, &stage.info));
         match self.timeline.insert(stamp, event, stage) {
-            Put::Stored => self.settle(),
+            Put::Stored => {
+                self.register.insert(stamp, label);
+                self.settle();
+            }
             Put::InvalidBinding => {
                 self.invalid.insert(stamp);
             }
@@ -273,23 +369,6 @@ impl Name<'_> {
             Visible::Bound { physical, .. } => Serves::Stage(physical),
             Visible::Created { physical, .. } => Serves::Recreation(physical),
         };
-        let register = self
-            .timeline
-            .events()
-            .iter()
-            .map(|(stamp, event)| {
-                let event = match event {
-                    RegisterEvent::Bind { physical } => {
-                        FoldEvent::Bind { physical: physical.clone() }
-                    }
-                    RegisterEvent::Create { physical } => {
-                        FoldEvent::Recreate { physical: physical.clone() }
-                    }
-                    RegisterEvent::LogicalDrop => FoldEvent::Drop,
-                };
-                (*stamp, event)
-            })
-            .collect();
         let recreations = facts.iter().filter_map(|fact| match &fact.kind {
             FoldKind::Recreate { physical } => Some(physical.as_str()),
             _ => None,
@@ -298,7 +377,10 @@ impl Name<'_> {
             .into_iter()
             .chain(self.stages.keys().copied())
             .chain(recreations)
-            .map(|physical| (physical.to_string(), self.timeline.superseded_at(physical)))
+            .map(|physical| {
+                let ended = self.ended_when_named.get(physical).copied();
+                (physical.to_string(), ended.or_else(|| self.timeline.superseded_at(physical)))
+            })
             .collect();
         Answer {
             serves,
@@ -306,7 +388,7 @@ impl Name<'_> {
             identity_stands: self.plain.stands,
             alive: self.alive,
             dead: self.dead,
-            register,
+            register: self.register.into_iter().collect(),
             superseded,
             invalid: self.invalid,
         }

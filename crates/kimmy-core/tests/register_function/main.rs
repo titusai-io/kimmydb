@@ -5,13 +5,14 @@
 //! case is in exactly one of three groups by the facts it holds, one test each: no stage fact (`plain`), stage facts and no database drop
 //! (`staged`), and both (`dbdrop`). The named rows are a second look at cases that are already in those groups. The rest: a database
 //! drop's own entry changes nothing, the order of the facts says nothing, the table reaches the branches it is meant to, a tie in
-//! one `hlc` is the drop's, the rows of `tie_rows.rs` say what two facts at one `hlc` come to (the table has none), and which entry
-//! kinds are a touch.
+//! one `hlc` is the drop's, the rows of `tie_rows.rs` and the cases of `tie_table.rs` say what two facts at one `hlc` come to (the
+//! table has none), a set no cluster can write is still answered, and which entry kinds are a touch.
 
 // no case holds a stage's withdrawal (`Kind::Abandon`): it is in the table's types so that their form does not change with its rule
 #[allow(dead_code)]
 mod table;
 mod tie_rows;
+mod tie_table;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -417,11 +418,55 @@ fn a_tie_in_one_hlc_is_the_drops() {
 /// against a creation and against a touch, and an event at a stage's deadline. Each row is answered with its facts listed both ways.
 #[test]
 fn the_tie_rows_of_stages_and_events() {
-    assert_eq!(tie_rows::STAGES_AND_EVENTS.len(), 9);
+    the_tie_rows(tie_rows::STAGES_AND_EVENTS, 9);
+}
+
+/// A drop of the database at one `hlc` with a stage's creation, with a recreation and with a binding, each in both orders of the
+/// two stamps.
+#[test]
+fn the_tie_rows_of_database_drops() {
+    the_tie_rows(tie_rows::DATABASE_DROPS, 6);
+}
+
+/// The drawn cases of facts that tie (`tie_table.rs`, from a tie fold written apart from the one the rows above come from, its sha
+/// in the table's `MODEL_SHA`): every case holds two facts at one `hlc`, and is compared as the main table's cases are, with its
+/// facts listed both ways round.
+#[test]
+fn the_tie_table_cases() {
+    assert_eq!(
+        tie_table::MODEL_SHA,
+        "aff5cff38980b59b",
+        "the tie fold the cases were generated from"
+    );
     let mut failed = Vec::new();
-    for row in tie_rows::STAGES_AND_EVENTS {
+    for (i, case) in tie_table::CASES.iter().enumerate() {
+        let hlcs: BTreeSet<u64> = case.facts.iter().map(|f| f.hlc).collect();
+        assert!(hlcs.len() < case.facts.len(), "tie case {i}: no two facts at one hlc");
+        let mut facts = facts_of(case);
+        for listed in ["as listed", "reversed"] {
+            let columns = differences(case, &fold(IDENTITY, &facts));
+            if !columns.is_empty() {
+                failed.push(format!("tie case {i} {listed}: {columns:?}"));
+            }
+            facts.reverse();
+        }
+    }
+    // 267 as generated
+    assert!(tie_table::CASES.len() >= 240, "{} tie cases", tie_table::CASES.len());
+    assert!(
+        failed.is_empty(),
+        "{} answers differ over {} tie cases; the first: {:#?}",
+        failed.len(),
+        tie_table::CASES.len(),
+        &failed[..failed.len().min(10)]
+    );
+}
+
+fn the_tie_rows(rows: &[Case], count: usize) {
+    assert_eq!(rows.len(), count);
+    let mut failed = Vec::new();
+    for row in rows {
         let hlcs: BTreeSet<u64> = row.facts.iter().map(|f| f.hlc).collect();
-        // every row but the deadline's holds two facts at one hlc; the deadline's holds two events there, at the deadline
         assert!(hlcs.len() < row.facts.len(), "{}: no two facts at one hlc", row.tag);
         let mut facts = facts_of(row);
         for listed in ["as listed", "reversed"] {
@@ -433,6 +478,41 @@ fn the_tie_rows_of_stages_and_events() {
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// sets no cluster can write
+
+/// The function's answer on a set no cluster can write is not specified, and it still returns one. This asks nothing of the
+/// answers: it fails only if the function panics.
+#[test]
+fn a_set_no_cluster_can_write_is_answered() {
+    let at = |hlc: u64, kind: FoldKind| FoldFact { stamp: st(hlc, 0), kind };
+    let stage = |physical: &str| FoldKind::StageCreate {
+        physical: physical.to_string(),
+        stage: StageInfo { deadline: Hlc::new(100, 0) },
+    };
+    let bind = |physical: &str| FoldKind::Bind { physical: physical.to_string() };
+    let recreate = |physical: &str| FoldKind::Recreate { physical: physical.to_string() };
+    let sets = [
+        Vec::new(),
+        // a binding of a stage that is not among the facts, and one stamped below its stage's creation
+        vec![at(10, bind("S"))],
+        vec![at(5, bind("S")), at(10, stage("S"))],
+        // a recreation with no stage below it, under a drop of the database
+        vec![at(10, recreate("R")), at(20, FoldKind::DatabaseDrop)],
+        // two facts under one stamp, one stage created twice, and a stage and a recreation named like the identity
+        vec![
+            at(10, stage(IDENTITY)),
+            at(10, FoldKind::DatabaseDrop),
+            at(20, stage("S")),
+            at(30, stage("S")),
+        ],
+        vec![at(10, stage("S")), at(20, recreate(IDENTITY)), at(30, bind("S")), at(30, bind("S"))],
+    ];
+    for facts in &sets {
+        let _ = fold(IDENTITY, facts);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
