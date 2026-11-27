@@ -92,6 +92,14 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "register::options_rows_nothing_holds",
+        "the base options table, one row per collection this member has held, read whole in a retention pass that serves no client and bounded by its catalogue, as check_restored reads the same table; a stop is answered by the next pass (ADR-272, unit P)",
+    ),
+    (
+        "register::a_pull_is_in_flight",
+        "the snapshot progress table, one row per peer a pull is under way with, read for its first row only (ADR-272, unit P)",
+    ),
+    (
         "late_drop::index_tombstone_above",
         "the index tombstones of ONE collection, one row per index name ever dropped on it, which the retention pass collects; read through the writer's transaction of a drop's keep test (ADR-272, unit P)",
     ),

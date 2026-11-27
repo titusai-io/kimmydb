@@ -236,6 +236,10 @@ pub struct Engine {
     /// the sender does. In memory only, and forgotten when the join completes.
     pub(crate) snapshot_restarted:
         Mutex<std::collections::HashMap<NodeId, std::collections::BTreeSet<CollectionId>>>,
+    /// The snapshot pulls this process is in the middle of, by sender and scope (ADR-272, unit P): set before the first row of a page is judged,
+    /// cleared when the pull completes or is forgotten (`forget_snapshot_progress`). The collector of the options rows leaves every row alone while
+    /// one is registered. In memory only: a pull a restart interrupts begins again at page one.
+    pub(crate) pulls_in_flight: Mutex<std::collections::HashSet<(NodeId, Option<CollectionId>)>>,
     /// Whole-database joins this member restarted since start (`kimmy_snapshot_join_restarts_total`).
     pub(crate) snapshot_join_restarts: std::sync::atomic::AtomicU64,
     /// Stages a join's last page listed as not alive that this member left standing or held none of, and did not restart for
@@ -1944,6 +1948,7 @@ impl Engine {
             register_carry_warnings: std::sync::atomic::AtomicU64::new(0),
             register_resolve_fallbacks: std::sync::atomic::AtomicU64::new(0),
             snapshot_restarted: Mutex::new(std::collections::HashMap::new()),
+            pulls_in_flight: Mutex::new(std::collections::HashSet::new()),
             snapshot_join_restarts: std::sync::atomic::AtomicU64::new(0),
             snapshot_listed_stages_left: std::sync::atomic::AtomicU64::new(0),
             register_life_burials: Default::default(),
@@ -4309,6 +4314,7 @@ impl Engine {
         } else {
             txn.abort()?;
         }
+        self.pulls_in_flight.lock().remove(&(peer, scope));
         Ok(())
     }
 

@@ -1970,3 +1970,52 @@ fn a_page_asking_for_options_the_row_does_not_keep_is_warned_of() {
     );
     assert!(b.get_collection(DB, "orders").is_ok(), "and the page applied");
 }
+
+/// UNIT P, P12 (ruled 6:33 PM): the retention pass leaves every options row alone while a pull is IN FLIGHT in this process, and each end of a pull releases
+/// it. The pull registers itself before the first row of its first page is judged: a joiner that holds every row of the sender judges them not news and writes
+/// nothing, so only the registration tells the pass. (1) After the FIRST page only: kept; after the last page: released, and the pass collects the rows of the gone
+/// collections. (2) A pull forgotten with `forget_snapshot_progress` (a pull the transport abandoned): released. Mutants: the pull registered after its first page;
+/// the end of a pull does not release; a forgotten pull does not release; the collector ignores the registry.
+#[test]
+fn a_pull_in_flight_defers_the_collector_and_each_end_of_the_pull_releases_it() {
+    let far = || physical_now_ms() + 10 * 365 * 24 * 3600 * 1000;
+    let policy = RetentionPolicy::new(31_536_000, 1);
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    // a joiner that holds every row (and so judges every row of a pull not news)
+    let joiner = |a: &Engine| {
+        let (b, dir) = engine();
+        pulled(&b, a, &mut SnapshotProgress::whole_database());
+        assert!(
+            options_of(&b, "g3").is_some(),
+            "premise: the joiner holds the gone collection's row"
+        );
+        (b, dir)
+    };
+
+    // (1) the first page only: the pull is in flight, and the page wrote nothing
+    let (b, _db) = joiner(&a);
+    let mut progress = SnapshotProgress::whole_database();
+    let first = a.snapshot_page(None, None).unwrap();
+    b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
+    assert!(!progress.is_complete(), "premise: the first page is not the last");
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(
+        options_of(&b, "g3").is_some(),
+        "kept while the pull is in flight, after its first page"
+    );
+    // the last page: the pull is over, and the pass now collects the rows nothing holds
+    pulled(&b, &a, &mut progress);
+    assert!(progress.is_complete(), "premise: the pull is over");
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(options_of(&b, "g3").is_none(), "collected once the pull has completed");
+
+    // (2) a pull forgotten in the middle releases the pass
+    let (b, _db) = joiner(&a);
+    stopped_in_the_carry(&b, &a);
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(options_of(&b, "g3").is_some(), "kept while the pull is in flight, in the carry");
+    b.forget_snapshot_progress(a.node_id(), None).unwrap();
+    b.collect_garbage_at(far(), policy).expect("the pass runs");
+    assert!(options_of(&b, "g3").is_none(), "collected once the pull is forgotten");
+}

@@ -2123,7 +2123,11 @@ impl Engine {
         // and no further, once, before anything below reads it (see `believed_page`).
         let believed = self.believed_page(page);
         let page = believed.as_ref().unwrap_or(page);
-        match self.apply_snapshot_page_inner(peer, progress, page) {
+        // The pull is IN FLIGHT from before the first row of its first page is judged (ADR-272, unit P): a row the member already holds is judged
+        // not news and not staged, and the pull relies on the copy staying until it completes, so the collector of the options rows leaves
+        // every row alone while a pull is registered. In memory only: a pull a restart interrupts is sent again from page one.
+        self.pulls_in_flight.lock().insert((peer, progress.scope));
+        let applied = match self.apply_snapshot_page_inner(peer, progress, page) {
             // The one place the refusal is turned into the page's stop: nothing else matches it.
             Err(crate::StorageError::ClockRefused(stop)) => {
                 self.count_clock_refused(&stop.origin, 1);
@@ -2139,7 +2143,12 @@ impl Engine {
                 Ok(SnapshotApplied { clock_refused: Some(*stop), ..Default::default() })
             }
             other => other,
+        };
+        // The pull is over when its last page applied: nothing relies on a held copy after the grant.
+        if applied.is_ok() && progress.is_complete() {
+            self.pulls_in_flight.lock().remove(&(peer, progress.scope));
         }
+        applied
     }
 
     /// The page as this member may believe it (the frame check): `None` when its coverage is not past the clock

@@ -412,13 +412,12 @@ fn row4_a_row_older_than_the_retention_is_kept_while_either_tombstone_exists_and
 
 // ---- w3: the rows of a stage ------------------------------------------------------------------------------------------------------------------------------------------------
 
-/// w3, rebound by the manager. The names row exists for a STAGE (and a recreation, and a name with register events), not for a plain collection, so the names row's life is read on a stage. The plain collection's options row is row 4's.
-/// Source: the same addendum's rule ("a row is kept while its own id's tombstone or its database's tombstone EXISTS") applied to the stage's two rows. Steps: a member makes a stage (the names row and the options row of the stage are there), takes a drop of the database
-/// above it, finishes the purges; a pass whose cutoff is below the drop (kept: the tombstones stand), and a pass above it (the tombstones are gone: the names row and the options row of the stage are COLLECTED).
-/// LIMIT: the stage's own tombstone is the database's stamp (or within milliseconds of it), so the test cannot separate "its own tombstone" from "the database's" (the plain collection's row 4 does that, with hand-stamped drops ten seconds apart): a mutant that collects with the
-/// stage's own tombstone alone survives here. ACCEPTED by the manager (Nov 26): row 4 covers the separation of the two tombstones, so a mutant that survives w3 alone is acceptable.
-/// EXPECTED RED TODAY: the last step (nothing collects either table). Reads: the stage is buried by a database drop above it (`swap_routes_tests::a_database_drop_above_the_stage_buries_the_bound_stage_and_the_name_is_absent`, for a BOUND stage; an unbound one is read, not run).
-/// UNVERIFIED: whether the register keeps the stage's names row for as long as a stage row (REGISTER_STAGES) refers to it, which would make P's rule differ for stages: if so the manager's ruling decides and this test follows it.
+/// w3, rebound by the manager, and REBOUND AGAIN at P12 (ruled 6:20 PM, hardproblems: "NAMES rows are never collected in P"): a STAGE has a names row, and a names row outlives every
+/// event and stage row of its name (the restore refuses a store that holds a stage row with no names row), and the options row of an id that has a names row is kept with it (the register's
+/// own rows refer to the pair). So after the database's tombstone and the stage's own are both collected, BOTH rows of the stage are KEPT, and the member still passes the restore check
+/// (a backup of it restores). The collected case is row 4's (a plain collection: no names row). It was a "collected when none covers it" test before P12; the flip is a fix-commit flip, as
+/// with Q8.
+/// Mutants (P12): the options row of an id with a names row collected (the options assert goes red); the names row collected (the names assert goes red).
 #[test]
 fn w3_a_stages_names_and_options_rows_are_kept_while_a_tombstone_covers_it_and_collected_when_none_does()
  {
@@ -463,10 +462,53 @@ fn w3_a_stages_names_and_options_rows_are_kept_while_a_tombstone_covers_it_and_c
         "premise: the stage's own tombstone is collected"
     );
     assert!(
-        !has_names_row(&m, STAGE),
-        "the names row is collected with the last tombstone (RED TODAY: nothing collects the table)"
+        has_names_row(&m, STAGE),
+        "the names row is KEPT: a names row outlives its stage row, and nothing collects one"
     );
-    assert!(options_of(&m, STAGE).is_none(), "and the options row");
+    assert!(options_of(&m, STAGE).is_some(), "and the options row of an id that has a names row");
+    // the consequence: the member passes the restore check (a stage row with no names row would be refused)
+    let mut bytes = Vec::new();
+    m.backup_to(&mut bytes, WalkScope::Request).expect("the backup is written");
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    crate::backup::restore(&dir.path().join("kimmy.redb"), &mut &bytes[..])
+        .expect("the backup restores");
+}
+
+// ---- P12: an options row is kept while its collection stands and while a tombstone of its own covers it ----------------------------------------------------------------------
+
+/// UNIT P, P12: an options row is collected only when nothing holds it, and a collection that STANDS holds it, and the collection's OWN tombstone holds it (row 4 shows the database's, and the
+/// two tombstones' separation). A plain collection stands through a pass far in the future of every stamp (its row is kept: the restore requires an options row of every standing collection),
+/// is then dropped by a drop of its own (no database drop), and a pass whose cutoff is below that tombstone keeps the row (the tombstone is held), and a pass above it collects it. Mutants (P12): collected
+/// while the collection stands; collected while only its own tombstone stands.
+#[test]
+fn an_options_row_is_kept_while_its_collection_stands_and_while_its_own_tombstone_stands() {
+    let (m, _dm) = engine();
+    let life = m.create_collection(DB, "orders").expect("the life");
+    let t0 = life.created.wall_ms;
+    let policy = RetentionPolicy::new(31_536_000, 1);
+    m.collect_garbage_at(t0 + 10 * 365 * 24 * 3600 * 1000, policy).expect("the pass runs");
+    assert!(options_of(&m, "orders").is_some(), "kept while the collection stands");
+
+    let (x, _dx) = engine();
+    let own_drop = drop_of(&x, t0 + 10_000);
+    window(&m, std::slice::from_ref(&own_drop));
+    m.finish_purges_now().expect("the purges finish");
+    assert_eq!(
+        m.collection_dropped_at(id_of("orders")).unwrap(),
+        Some(own_drop.stamp),
+        "premise: the collection's own tombstone, and no database drop"
+    );
+    assert!(m.database_dropped_at(DB).unwrap().is_none(), "premise: no tombstone of the database");
+    m.collect_garbage_at(own_drop.stamp.hlc.wall_ms + 1_000 - 500, policy).expect("the pass runs");
+    assert!(
+        m.collection_dropped_at(id_of("orders")).unwrap().is_some(),
+        "premise: the pass collected nothing"
+    );
+    assert!(options_of(&m, "orders").is_some(), "kept while its own tombstone stands");
+    m.collect_garbage_at(own_drop.stamp.hlc.wall_ms + 1_000 + 5_000, policy)
+        .expect("the pass runs");
+    assert_eq!(m.collection_dropped_at(id_of("orders")).unwrap(), None, "premise: collected");
+    assert!(options_of(&m, "orders").is_none(), "collected with the last tombstone");
 }
 
 // ---- P11: a names row outlives every event and stage row of its name ------------------------------------------------------------------------------------------------------

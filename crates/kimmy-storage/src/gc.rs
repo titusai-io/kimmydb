@@ -127,6 +127,8 @@ impl Engine {
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
         };
+        // After the tombstones: an options row nothing holds any more (unit P, P12) goes with the last tombstone that covered it
+        self.collect_options_rows()?;
         // The one place the violations table's `through` moves forward, when
         // the table is ready, in every pass: a start that found no violation
         // leaves it behind and counts on this, so the rescan at the next start
@@ -146,6 +148,36 @@ impl Engine {
             "retention pass"
         );
         Ok(outcome)
+    }
+
+    /// Collect the options rows nothing holds (unit P, P12): no collection stands under the id, neither its own tombstone nor its database's is held,
+    /// the id has no names row, and NO PULL IS IN FLIGHT: a pull this process is in the middle of (`pulls_in_flight`, set before a page's rows are
+    /// judged, so on the first page too) judged the rows the member held not news and relies on them until it completes, and a later page of it may
+    /// bring the tombstone of one; a stored progress record also defers the pass, as insurance. Never by comparing the row's `at` with a cutoff, and
+    /// never a names row (a names row outlives every event and stage row of its name; nothing collects one). Found in a read transaction and
+    /// removed under the writer only when something was found, each re-checked there, so a pass with nothing to collect takes no writer (ADR-151).
+    fn collect_options_rows(&self) -> Result<usize> {
+        let free = {
+            let txn = self.db().begin_read()?;
+            crate::register::options_rows_nothing_holds(&txn)?
+        };
+        if free.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.begin_write(WriterHolder::Retention)?;
+        // Read under the writer: a page of a pull judges its rows under the writer too, after the registration, so a pull that began before this
+        // transaction is seen here and one that begins after it judges the rows as the removal leaves them.
+        if !self.pulls_in_flight.lock().is_empty() {
+            txn.abort()?;
+            return Ok(0);
+        }
+        let removed = crate::register::remove_options_rows(&txn, &free)?;
+        if removed > 0 {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(removed)
     }
 
     /// Drop oplog entries older than `cutoff`, **except the newest**.

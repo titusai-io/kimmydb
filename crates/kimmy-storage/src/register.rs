@@ -1512,6 +1512,117 @@ pub(crate) fn base_options_in(
     }
 }
 
+/// Whether a pull has left a stored progress record on this member, which a pull leaves from its first page that wrote anything until its completion
+/// (or its forgetting) removes it. The collector of the options rows leaves every row alone while one exists (insurance: the pulls in flight of this
+/// process are registered in memory, and the pass reads that too, `Engine::pulls_in_flight`).
+fn a_pull_is_in_flight(
+    progress: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<bool> {
+    Ok(progress.iter()?.next().is_some())
+}
+
+/// Whether anything still holds an options row (unit P, P12): a collection stands under its id (by name: the key derives from the names the row
+/// holds), a tombstone of the collection's own or of its database is held (the id is covered: a remake from the row, a fetch's answer and the
+/// restore's clauses all read it), or the id has a NAMES row (a stage, a recreation or a swapped identity: a row the register's own rows refer to,
+/// which nothing collects). `names_row_held` is read by the caller from the names table it holds.
+fn an_options_row_is_held(
+    key: &[u8],
+    row: &BaseOptions,
+    collections: &impl ReadableTable<(&'static str, &'static str), &'static [u8]>,
+    dropped: &impl ReadableTable<u64, &'static [u8]>,
+    names_row_held: bool,
+) -> Result<bool> {
+    if collections.get((row.db.as_str(), row.name.as_str()))?.is_some() {
+        return Ok(true);
+    }
+    let Ok(own) = <[u8; 8]>::try_from(key) else { return Ok(true) };
+    if dropped.get(u64::from_be_bytes(own))?.is_some() {
+        return Ok(true);
+    }
+    if dropped.get(kimmy_core::database_drop_id(&row.db).0)?.is_some() {
+        return Ok(true);
+    }
+    Ok(names_row_held)
+}
+
+/// The options rows nothing holds, as (key, value) pairs the writer re-checks: none while a pull is in flight, and a row is listed only when no
+/// collection stands under its id, neither its own tombstone nor its database's is held, and the id has no names row. Read in a read transaction:
+/// a pass with nothing to collect takes no writer. A row that does not decode is kept.
+pub(crate) fn options_rows_nothing_holds(
+    txn: &redb::ReadTransaction,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let progress = match txn.open_table(tables::SNAPSHOT_PROGRESS) {
+        Ok(table) => Some(table),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(progress) = &progress
+        && a_pull_is_in_flight(progress)?
+    {
+        return Ok(Vec::new());
+    }
+    let options = match txn.open_table(tables::COLLECTION_BASE_OPTIONS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let names = match txn.open_table(tables::REGISTER_NAMES) {
+        Ok(table) => Some(table),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+    let mut free = Vec::new();
+    for row in options.iter()? {
+        let (key, value) = row?;
+        let Ok(parsed) = serde_json::from_slice::<BaseOptions>(value.value()) else { continue };
+        let names_row_held = match &names {
+            Some(names) => names.get(key.value())?.is_some(),
+            None => false,
+        };
+        if !an_options_row_is_held(key.value(), &parsed, &collections, &dropped, names_row_held)? {
+            free.push((key.value().to_vec(), value.value().to_vec()));
+        }
+    }
+    Ok(free)
+}
+
+/// Remove the options rows a scan found, each re-checked under the writer: the row is still the one the scan saw, no pull is in flight, and nothing
+/// holds it (a creation, a drop or a pull since the scan keeps it). Returns how many went. Names rows are never collected here.
+pub(crate) fn remove_options_rows(
+    txn: &redb::WriteTransaction,
+    seen: &[(Vec<u8>, Vec<u8>)],
+) -> Result<usize> {
+    {
+        let progress = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
+        if a_pull_is_in_flight(&progress)? {
+            return Ok(0);
+        }
+    }
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+    let names = txn.open_table(tables::REGISTER_NAMES)?;
+    let mut options = txn.open_table(tables::COLLECTION_BASE_OPTIONS)?;
+    let mut removed = 0usize;
+    for (key, value) in seen {
+        let unchanged =
+            options.get(key.as_slice())?.is_some_and(|held| held.value() == value.as_slice());
+        if !unchanged {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_slice::<BaseOptions>(value) else { continue };
+        let names_row_held = names.get(key.as_slice())?.is_some();
+        if an_options_row_is_held(key, &parsed, &collections, &dropped, names_row_held)? {
+            continue;
+        }
+        if options.remove(key.as_slice())?.is_some() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Test only: lower the `at` of the options row of `id` to `at`, to make a world whose row agrees with a creation the test dates by hand (the row
 /// rises and never falls, so a fixture that moves a collection's `created` below a drop by hand leaves a row above it that no route would make).
 #[cfg(test)]
