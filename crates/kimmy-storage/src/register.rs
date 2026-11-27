@@ -11,7 +11,7 @@
 //! one visible by forgetting the check. This module is the only code that opens the three tables
 //! (`only_this_module_opens_the_register_tables`).
 
-use kimmy_core::register_state::{Put, Refusal, Timeline};
+use kimmy_core::register_state::{Put, Refusal, Timeline, valid_binding};
 use kimmy_core::{CollectionId, HLC_ENCODED_LEN, Hlc, RegisterEvent, StageMeta, Stamp};
 use redb::ReadableTable;
 
@@ -713,8 +713,34 @@ pub(crate) fn put(
     Ok(put_seeding(txn, db, logical, stamp, event)?.0)
 }
 
+/// What the door will say of a binding it refuses, asked BEFORE the seed: a binding of a stage whose creation is not known here, or
+/// one [`valid_binding`] refuses. `None` for a binding the door finds valid and for an event that names no stage.
+///
+/// **A refused binding writes nothing, the seed included.** On a member whose identity is gone the seed lets a binding make the
+/// name's tombstone a logical drop whatever its stage's stamp, because what the binding makes visible needs that drop below it. A
+/// refused binding makes nothing visible, and a member that met it while the identity stood has no tombstone to seed from: seeded by
+/// it, two members with the same entries differ for good, one holding the drop in its register and the name absent, the other
+/// serving the name.
+fn refused_before_the_seed(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    stamp: &Stamp,
+    event: &RegisterEvent,
+) -> Result<Option<Put>> {
+    if !matches!(event, RegisterEvent::Bind { .. }) {
+        return Ok(None);
+    }
+    Ok(match stage_of(txn, db, event)? {
+        None => Some(Put::UnknownStage),
+        Some(stage) => {
+            (!valid_binding(stamp, &stage.created, &stage.info)).then_some(Put::InvalidBinding)
+        }
+    })
+}
+
 /// [`put`], and whether the name's register was seeded from the identity's tombstone on the way (the caller settles the name when it
-/// was: a seeded drop is in effect whatever became of the event itself).
+/// was: a seeded drop is in effect whatever became of the event itself). A binding the door refuses is answered before the seed
+/// ([`refused_before_the_seed`]).
 pub(crate) fn put_seeding(
     txn: &redb::WriteTransaction,
     db: &str,
@@ -722,6 +748,9 @@ pub(crate) fn put_seeding(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<(Put, bool)> {
+    if let Some(refused) = refused_before_the_seed(txn, db, &stamp, &event)? {
+        return Ok((refused, false));
+    }
     let seeded = seed_for_event(txn, db, logical, &event)?;
     Ok((store(txn, tables::REGISTER, db, logical, stamp, event)?, seeded))
 }
@@ -746,6 +775,9 @@ pub(crate) fn park_seeding(
     stamp: Stamp,
     event: RegisterEvent,
 ) -> Result<(Put, bool)> {
+    if let Some(refused) = refused_before_the_seed(txn, db, &stamp, &event)? {
+        return Ok((refused, false));
+    }
     let seeded = seed_for_event(txn, db, logical, &event)?;
     if timeline(txn, db, logical)?.events().iter().any(|(held, _)| *held == stamp) {
         return Ok((Put::Duplicate, seeded));
@@ -985,7 +1017,8 @@ impl SeedAsk {
 /// in effect (one that is only ahead of its position does not count, F3), a tombstone is a logical drop at its stamp, and a binding stamped above it is not touched by it
 /// while one below it is buried by it, as on every other member. Returns whether it wrote the row, so that the caller settles
 /// the name: the seeded drop is in effect, and what it ends is buried in the same transaction, whatever became of the event
-/// that brought the seed (a first event that is only parked, or a binding judged invalid, included).
+/// that brought the seed (a first event that is only parked included). A binding the door refuses brings no seed
+/// ([`refused_before_the_seed`]).
 ///
 /// The rule behind it: **a past drop of a name is a logical drop only if a stage of the name was created below it.** What the
 /// stage's stamp alone cannot answer is a binding of a stage created ABOVE the drop on a member whose identity is gone: the drop has

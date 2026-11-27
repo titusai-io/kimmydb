@@ -3804,7 +3804,7 @@ impl Engine {
                     }
                     // A binding that took effect buries the physicals it binds out, in this transaction (Q6.4 item 1). So does a seed: the
                     // drop it put in effect ends the remains of the identity now, whatever became of the event that brought it (a first event
-                    // that is only parked, or a binding judged invalid, included), and not at the next settle.
+                    // that is only parked included), and not at the next settle. A binding the door refuses brings no seed.
                     if seeded
                         || (put == kimmy_core::register_state::Put::Stored
                             && apply.mode == RegisterMode::Effect)
