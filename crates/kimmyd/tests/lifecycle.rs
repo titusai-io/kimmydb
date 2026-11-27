@@ -1104,13 +1104,19 @@ async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
 /// holds the pages, so this shows what the client sees and what the repair
 /// keeps; it is not evidence of what a real failed fsync does to the platter.
 ///
-/// The commit the injection watches must not grow the file: a growth syncs
-/// the file before the commit's pages are written, so the armed failure
-/// would land there and the write would be absent after the repair, which is
-/// also unknown and also correct, but is another test (the growth twins in
-/// kimmy-storage's engine tests). The test makes sure of it: the file is
-/// written to until it has grown, and then until three more writes leave its
-/// length as it was, so it stands just past a doubling with room to spare.
+/// **A growth is not a failure before any fsync** (the addendum): redb extends
+/// the file and syncs it at once, from inside page allocation, before the
+/// commit's pages are written. If the commit the injection watches has to grow
+/// the file, the armed failure lands in that sync and the commit is absent
+/// after the repair, and is reported as unknown: conservative, and allowed.
+/// Whether it grows depends on how much room the store has left, which moves
+/// with every table and row a store holds and with the work a start does, so
+/// the test does not demand a particular side. It reads the length of the
+/// store before and after the failing run: if the file did NOT grow, the
+/// write MUST be there after the repair; if it did, the write MAY be absent,
+/// and the test says which it was. The filler writes and the cycles of a
+/// start, a write and a stop beforehand only make the strict case likelier;
+/// the growth cases themselves are pinned in kimmy-storage's engine tests.
 #[tokio::test]
 async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_after() {
     let dir = tempfile::tempdir().unwrap();
@@ -1166,6 +1172,38 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
     assert!(grown && steady == 3, "premise: the file grew, and then held still for three writes");
     before.signal("TERM");
     assert!(before.wait_exit().success());
+    // The failing run starts before it takes the watched write, and a start writes too (lifecycle and probation records, topology, the
+    // unique-violations rows): a store that held three plain writes can still be grown by a start and a write. So the headroom is
+    // measured in the unit the failing run spends it in: a whole cycle of a start, one write and a stop, repeated until three in a row
+    // leave the store's length as it was.
+    let (mut cycles_steady, mut cycle_length, mut cycles_run) = (0u32, length(), 0u32);
+    for cycle in 0..12 {
+        cycles_run += 1;
+        let mut warm = Run::spawn(dir.path(), &format!("write-fsync-headroom-{cycle}"));
+        warm.wait_ready(&client).await;
+        let body: serde_json::Value = login(&warm).await.unwrap().json().await.unwrap();
+        let warm_token = body["token"].as_str().expect("a token").to_string();
+        let res = client
+            .post(url(&warm, "/v1/db/shop/coll/orders/docs"))
+            .bearer_auth(&warm_token)
+            .json(&serde_json::json!({ "_id": 1000 + cycle, "item": "filler" }))
+            .send()
+            .await;
+        assert!(res.unwrap().status().is_success());
+        warm.signal("TERM");
+        assert!(warm.wait_exit().success());
+        let now = length();
+        if now == cycle_length {
+            cycles_steady += 1;
+            if cycles_steady == 3 {
+                break;
+            }
+        } else {
+            (cycles_steady, cycle_length) = (0, now);
+        }
+    }
+    // How many cycles ran is recorded and not demanded: under load a start's work varies, and the test does not fail for it (see the doc).
+    eprintln!("write-fsync headroom: {cycles_run} cycle(s) run, {cycles_steady} steady in a row");
     // For a red to be readable: the store's length before and after the failing run says whether the watched commit had to grow the file.
     let length_before = length();
 
@@ -1209,12 +1247,31 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        kept.status(),
-        200,
-        "the write whose fsync failed is there after the repair (store length before the failing run \
-         {length_before}, after it {length_after}; the failing run's log: {log})"
+    let grew = length_after > length_before;
+    let present = kept.status() == 200;
+    eprintln!(
+        "write-fsync: the store {} during the failing run (length before {length_before}, after {length_after}); the write is {} after the repair (status {})",
+        if grew { "GREW" } else { "did not grow" },
+        if present { "there" } else { "absent" },
+        kept.status()
     );
+    if grew {
+        // The watched commit had to grow the file: the injected failure landed in redb's sync of the growth, before the commit's pages, so the
+        // write may be absent after the repair (ADR-188's addendum: it was reported unknown, which is the conservative answer). Present or absent
+        // are both allowed; anything else is a failure.
+        assert!(
+            kept.status() == 200 || kept.status() == 404,
+            "after a growth the write is there or absent, never another answer: {} (the failing run's log: {log})",
+            kept.status()
+        );
+    } else {
+        assert_eq!(
+            kept.status(),
+            200,
+            "the write whose fsync failed is there after the repair (store length before the failing run {length_before}, after it \
+             {length_after}: it did not grow; the failing run's log: {log})"
+        );
+    }
     after.signal("TERM");
     assert!(after.wait_exit().success());
 }
