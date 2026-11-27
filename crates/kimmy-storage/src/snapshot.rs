@@ -3717,7 +3717,7 @@ impl Engine {
             // the collection this member serves, and the binding that would put the name right is covered by the grant and
             // never served. So it is not applied, no tombstone is recorded for it, and the deferral is counted: the register's
             // events travel with the snapshot (Q6.6) and the counter reads 0 once they do.
-            if self.carried_burial_is_the_registers(&current)? {
+            if self.carried_burial_is_the_registers(&current, dropped)? {
                 self.count_register_carried_drop_deferred();
                 warn!(
                     db = %current.db,
@@ -3917,17 +3917,19 @@ impl Engine {
         Ok(SnapshotApplied { restarts: 1, ..Default::default() })
     }
 
-    /// Whether the burial of `current` that a snapshot carries is the register's to judge: `current` is a stage of a swap, or a
-    /// name that was swapped (it has register events, in effect or ahead of their position, or a stage of it is held).
+    /// Whether the burial of `current` that a snapshot carries, a drop stamped `dropped`, is the register's to judge: `current` is a stage
+    /// of a swap, or the drop is a logical drop of the name here. The same rule as a replicated drop entry's (`register::a_drop_is_logical`):
+    /// a held stage created ABOVE the drop does not make it one, so the drop is applied as a plain drop on this route as on that one.
     fn carried_burial_is_the_registers(
         &self,
         current: &crate::meta::CollectionMeta,
+        dropped: Stamp,
     ) -> Result<bool> {
         if kimmy_core::is_hidden_name(&current.name) {
             return Ok(true);
         }
         let txn = self.db().begin_read()?;
-        crate::register::is_swapped(&txn, &current.db, &current.name)
+        crate::register::a_drop_is_logical(&txn, &current.db, &current.name, &dropped)
     }
 
     /// Move this node's clock past a stamp a page carries, **once the sender's own
@@ -4156,7 +4158,7 @@ impl Engine {
         // a drop in effect): the identity is not made again beside it, and what the page offers is judged and applied through the register as
         // the replicated arms do (ADR-272, decision 6; Q6.5-4).
         if self.get_collection(&state.db, &state.name).is_err()
-            && self.name_is_swapped(&state.db, &state.name)?
+            && self.name_has_events(&state.db, &state.name)?
         {
             // A page older than the drop of its database (ADR-229) is refused as the create branch refuses it, and leaves the tombstone
             // that makes the entries which follow history and not a stop.
@@ -4504,11 +4506,19 @@ impl Engine {
         crate::register::is_swapped(&txn, db, name)
     }
 
-    /// [`Self::name_is_swapped`] for the name that decides it: a vector shadow is judged by its parent's (unit S).
+    /// Whether `name` has a register event on this member, in effect or ahead of its position. A stage that is held and not bound does not
+    /// make a name swapped (ADR-272, decision 16): the name is plain, and a page's identity of it is made as the entries route makes it.
+    fn name_has_events(&self, db: &str, name: &str) -> Result<bool> {
+        let txn = self.db().begin_read()?;
+        crate::register::has_events(&txn, db, name)
+    }
+
+    /// [`Self::name_has_events`] for the name that decides it: a vector shadow is judged by its parent's name, which is swapped by the
+    /// shadow rule's own test (unit S), left as it was.
     fn name_or_parent_is_swapped(&self, db: &str, name: &str) -> Result<bool> {
         match kimmy_core::vector_meta::base_name(name) {
             Some(parent) => self.parent_is_swapped_and_absent(db, parent),
-            None => self.name_is_swapped(db, name),
+            None => self.name_has_events(db, name),
         }
     }
 

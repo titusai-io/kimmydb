@@ -151,8 +151,10 @@ impl Engine {
             if let Some(carried) = carried {
                 row.at = row.at.max(carried.at);
             }
+            // A name the register holds an event of (in effect or ahead of its position), never one that only holds a stage: a stage that is not
+            // bound is no swap, and a fact above the floor makes the name stand whatever order the stage and the fact arrived in (decision 16)
             let swapped =
-                is_remakable(&row) && crate::register::is_swapped(&txn, &row.db, &row.name)?;
+                is_remakable(&row) && crate::register::has_events(&txn, &row.db, &row.name)?;
             (row, swapped)
         };
         let database_drop = self.database_dropped_at(&row.db)?.map(|stamp| stamp.hlc);
@@ -252,12 +254,9 @@ impl Engine {
             Dating::Creation => row.at,
             Dating::Remains => floor.hlc.successor(),
         };
-        {
-            let collections = txn.open_table(tables::COLLECTIONS)?;
-            // A name this member swapped is the register's (a stage of it, or an event in effect): never made again beside it
-            if crate::register::is_swapped_with(txn, &collections, &row.db, &row.name)? {
-                return Ok(Remade::Unwanted);
-            }
+        // A name the register holds an event of is the register's: never made again beside it
+        if crate::register::has_events_in(txn, &row.db, &row.name)? {
+            return Ok(Remade::Unwanted);
         }
         let made = self.create_collection_in_txn(
             txn,

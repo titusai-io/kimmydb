@@ -3594,19 +3594,14 @@ impl Engine {
         entry: &OplogEntry,
     ) -> Result<bool> {
         let txn = self.db().begin_read()?;
-        if crate::register::has_events_in_effect(&txn, &target.db, &target.name)? {
-            return Ok(true);
-        }
-        if !crate::register::is_swapped(&txn, &target.db, &target.name)? {
-            return Ok(false);
-        }
-        let older_stage =
-            crate::register::a_stage_is_older_than(&txn, &target.db, &target.name, &entry.stamp)?;
+        let logical =
+            crate::register::a_drop_is_logical(&txn, &target.db, &target.name, &entry.stamp)?;
         drop(txn);
+        // Whether the identity stands changes nothing (an older stage makes the drop logical either way), but a failure to read it is still a failure
         match self.get_collection(&target.db, &target.name) {
-            Ok(_) => Ok(older_stage),
+            Ok(_) => Ok(logical),
             Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
-                Ok(older_stage)
+                Ok(logical)
             }
             Err(e) => Err(e),
         }

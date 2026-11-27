@@ -2203,11 +2203,20 @@ pub(crate) fn apply_carried(
     Ok(CarryApplied { names: named, wrote })
 }
 
+/// Whether `id` has a row among the register's events (in effect) or among its information (an event known ahead of its position). The ONE
+/// definition of "the name has a register event", read through the caller's two tables, for the read-only predicate and the writer's alike.
+fn id_has_an_event(
+    events: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    information: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: CollectionId,
+) -> Result<bool> {
+    Ok(!rows_in(events, id)?.is_empty() || !rows_in(information, id)?.is_empty())
+}
+
 /// Whether the name has a register event on this member, in effect or ahead of its position.
 pub(crate) fn has_events(txn: &redb::ReadTransaction, db: &str, logical: &str) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
-    Ok(!rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
-        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty())
+    id_has_an_event(&txn.open_table(tables::REGISTER)?, &txn.open_table(tables::REGISTER_INFO)?, id)
 }
 
 /// Whether this member holds a stage of the name.
@@ -2302,6 +2311,26 @@ pub(crate) fn is_swapped(txn: &redb::ReadTransaction, db: &str, logical: &str) -
     Ok(has_events(txn, db, logical)? || stage_is_held(txn, db, logical)?)
 }
 
+/// Whether a drop of the name stamped `stamp` is a **logical drop** here: the name has a register event in effect, or it is swapped as far
+/// as this member can tell (an event ahead of its position, or a held stage) and a stage was created below the drop ([`a_stage_is_older_than`]).
+/// A stage created ABOVE the drop is one the drop never concerned, so a held, unbound stage does not make the drop logical. The ONE rule of a
+/// replicated drop entry (`Engine::drop_is_a_logical_drop`) and of a drop a snapshot carries (`carried_burial_is_the_registers`): a member that
+/// took the same drop on either route reaches the same state (ADR-272, decision 16).
+pub(crate) fn a_drop_is_logical(
+    txn: &redb::ReadTransaction,
+    db: &str,
+    logical: &str,
+    stamp: &Stamp,
+) -> Result<bool> {
+    if has_events_in_effect(txn, db, logical)? {
+        return Ok(true);
+    }
+    if !is_swapped(txn, db, logical)? {
+        return Ok(false);
+    }
+    a_stage_is_older_than(txn, db, logical, stamp)
+}
+
 /// [`is_swapped`] under the writer.
 pub(crate) fn is_swapped_in(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<bool> {
     is_swapped_with(txn, &txn.open_table(tables::COLLECTIONS)?, db, logical)
@@ -2358,8 +2387,7 @@ pub(crate) fn parked_target(
 /// [`has_events`] under the writer.
 pub(crate) fn has_events_in(txn: &redb::WriteTransaction, db: &str, logical: &str) -> Result<bool> {
     let id = CollectionId::derive(db, logical);
-    Ok(!rows_in(&txn.open_table(tables::REGISTER)?, id)?.is_empty()
-        || !rows_in(&txn.open_table(tables::REGISTER_INFO)?, id)?.is_empty())
+    id_has_an_event(&txn.open_table(tables::REGISTER)?, &txn.open_table(tables::REGISTER_INFO)?, id)
 }
 
 /// Test only: remove a stage's creation row, to make a member that holds a stage's collection, or a name's events, with no row for it.
