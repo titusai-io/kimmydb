@@ -5309,10 +5309,21 @@ async fn sample_unheard(
 /// for long either. B is restarted three times with SIGTERM; A's and C's
 /// `kimmy_ownership_peers{state="unknown"}` are sampled every 10 ms from before
 /// the stop until 7 s after B is ready, and B's from its first ready answer.
+///
+/// **Every restart begins with the asks quiet.** A peer asks for a member's
+/// block at most once per sync interval (ADR-247). An ask it holds and owes runs
+/// at the interval's end, and that run counts as an ask: after one ask, a hold
+/// can be in place for two intervals, though no held ask waits more than one. So
+/// the test waits longer than two intervals before each restart, the first
+/// included, whose peers asked for B as the cluster formed. What it measures is
+/// a restart that finds no hold in place. A restart that finds one can leave a
+/// peer without the member's block until the held ask runs: the product's
+/// behaviour, which this wait does not change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn a_restarted_member_and_its_peers_hear_each_other_within_about_one_contact() {
     const SYNC_SECS: u64 = 5;
+    const ASKS_QUIET: Duration = Duration::from_secs(2 * SYNC_SECS + 2);
     const BOUND: Duration = Duration::from_secs(1);
     let client = reqwest::Client::new();
     let (a, mut b, c) = three_nodes_at(&client, "", SYNC_SECS).await;
@@ -5328,6 +5339,7 @@ async fn a_restarted_member_and_its_peers_hear_each_other_within_about_one_conta
     eventually("every member to hold both others' blocks", every_block_held).await;
 
     for restart in 1..=3 {
+        tokio::time::sleep(ASKS_QUIET).await;
         let before = recorded_incarnation(&b);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let peers = [&a, &c].map(|peer| {
