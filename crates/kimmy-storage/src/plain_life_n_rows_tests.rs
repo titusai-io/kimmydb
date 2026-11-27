@@ -469,6 +469,67 @@ fn w3_a_stages_names_and_options_rows_are_kept_while_a_tombstone_covers_it_and_c
     assert!(options_of(&m, STAGE).is_none(), "and the options row");
 }
 
+// ---- P11: a names row outlives every event and stage row of its name ------------------------------------------------------------------------------------------------------
+
+/// UNIT P, P11 (tests first; the 6:08 AM BINDING note on w3): "a names row must outlive every event and stage row of its name, and an options row every standing collection, or the
+/// restore's clauses 1 and 2 refuse a valid backup". A member holds a plain `orders` and takes a stage of it and its binding: the register now holds a stage row and events of the name, the identity
+/// is buried at the binding's stamp, and the stage stands. A retention pass far in the future of every stamp collects the identity's tombstone (nothing covers it any more). The names rows of the
+/// name and of the stage are KEPT (a stage row and events refer to them), the stage's options row is kept (it stands), and a backup of the member restores: it is refused ("a stage row with no names
+/// row", "a register event of a name with no names row") if the collector took the names row. GREEN today (nothing collects the table); red if P12's collector removes a names row a stage row or an event still names.
+/// Mutants (P12): a names row collected when no tombstone covers its id; an options row collected while its collection stands.
+#[test]
+fn a_names_row_outlives_the_stage_row_and_the_events_of_its_name_and_the_member_still_restores() {
+    let now = physical_now_ms();
+    let (a, _da) = engine();
+    a.create_stage(DB, STAGE, MergePolicy::Document, Hlc::new(now + 120_000, 0))
+        .expect("the stage");
+    let creation = everything(&a)
+        .into_iter()
+        .find(|e| e.kind == OpKind::CreateCollection && e.collection == id_of(STAGE))
+        .expect("the stage's creation");
+    let bind = OplogEntry {
+        stamp: Stamp::new(Hlc::new(now + 20_000, 0), a.node_id(), a.epoch()),
+        kind: OpKind::BindCollection,
+        collection: id_of("orders"),
+        doc_id: None,
+        body: Some(
+            bson::serialize_to_vec(&kimmy_core::CollectionBind {
+                db: DB.into(),
+                name: "orders".into(),
+                physical: STAGE.into(),
+            })
+            .expect("the binding encodes"),
+        ),
+        meta: None,
+    };
+    let (m, _dm) = engine();
+    m.create_collection(DB, "orders").expect("the member's own identity");
+    window(&m, std::slice::from_ref(&creation));
+    window(&m, std::slice::from_ref(&bind));
+    assert_eq!(
+        m.resolve(DB, "orders").expect("the name resolves").physical,
+        STAGE,
+        "premise: bound"
+    );
+    assert!(m.get_collection(DB, "orders").is_err(), "premise: the identity is buried");
+    m.finish_purges_now().expect("the purges finish");
+    assert!(has_names_row(&m, "orders"), "premise: the name has a names row");
+    assert!(has_names_row(&m, STAGE), "premise: the stage has a names row");
+
+    let far = now + 10 * 365 * 24 * 3600 * 1000;
+    m.collect_garbage_at(far, RetentionPolicy::new(31_536_000, 1)).expect("the pass runs");
+    assert!(has_names_row(&m, "orders"), "the identity's names row outlives its events");
+    assert!(has_names_row(&m, STAGE), "and the stage's names row outlives the stage's row");
+    assert!(options_of(&m, STAGE).is_some(), "and the options row of a stage that stands");
+
+    // the consequence: a backup of the member restores (its register and its names rows agree)
+    let mut bytes = Vec::new();
+    m.backup_to(&mut bytes, WalkScope::Request).expect("the backup is written");
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("kimmy.redb");
+    crate::backup::restore(&path, &mut &bytes[..]).expect("the backup restores");
+}
+
 // ---- w1c: the fetch's answer ------------------------------------------------------------------------------------------------------------------------------------------------
 
 /// A sender that holds `orders` with two writes and another collection of the database (so the database's drop has something to reach).
