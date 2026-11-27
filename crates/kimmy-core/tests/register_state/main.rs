@@ -1,7 +1,7 @@
 //! The register of a logical name as a pure function (ADR-272, decisions 3, 5, 7, 8, 9): `kimmy_core::register_state`.
 //!
 //! Four kinds of test. The rules one by one. The model's answers for generated scenarios (`table.rs`, from
-//! `swapmodel6g.py`, its sha in the table's header), so that the product's function and the model cannot drift. Every order of
+//! `swapmodel6i.py`, its sha in the table's header), so that the product's function and the model cannot drift. Every order of
 //! arrival of a few events, checking that the visible event, the burials and the late writes only move forward and end the
 //! same whatever the order (decision 5's monotone claim). And the two named invariants of decision 5, each its own assertion:
 //! the old physical is never buried unless the new one is alive, and a binding whose physical is buried is never visible.
@@ -505,8 +505,9 @@ fn ready_of(r: TReady) -> Ready {
     }
 }
 
-/// The timeline of a table case: the events in effect, a binding only if valid at its stage's deadline (the creation's own
-/// stamp is the stage's first event; the table gives its hlc and the stage's deadline).
+/// The timeline of a table case: the events in effect, a binding only if it is from the origin of its stage's creation and valid
+/// at its stage's deadline (the creation's own stamp is the stage's first event; the table gives its hlc, its origin and the
+/// stage's deadline).
 fn case_timeline(case: &table::Case) -> Timeline {
     case_timeline_counting(case).0
 }
@@ -519,13 +520,13 @@ fn case_timeline_counting(case: &table::Case) -> (Timeline, usize) {
         let stamp = st(hlc, origin);
         let put = match kind {
             "bind" => {
-                let &(_, creation, deadline) = case
+                let &(_, creation, creator, deadline) = case
                     .stages
                     .iter()
-                    .find(|(s, _, _)| *s == physical)
+                    .find(|(s, _, _, _)| *s == physical)
                     .expect("a binding names a stage of the case");
                 let (creation, info) =
-                    (st(creation, 0), StageInfo { deadline: Hlc::new(deadline, 0) });
+                    (st(creation, creator), StageInfo { deadline: Hlc::new(deadline, 0) });
                 t.insert(stamp, bind(physical), Some((&creation, &info)))
             }
             "lcreate" => t.insert(stamp, create(physical), None),
@@ -583,9 +584,9 @@ fn the_pure_function_answers_every_case_of_the_model_table_as_the_model_does() {
         let stages: Vec<(&str, Hlc)> = case
             .stages
             .iter()
-            .map(|&(s, created, deadline)| {
+            .map(|&(s, created, creator, deadline)| {
                 let info = StageInfo { deadline: Hlc::new(deadline, 0) };
-                (s, info.effective_deadline(&st(created, 0)))
+                (s, info.effective_deadline(&st(created, creator)))
             })
             .collect();
         let mut doomed: Vec<(String, u64, usize)> = t
@@ -633,25 +634,41 @@ fn the_table_exercises_every_branch_it_is_meant_to() {
     assert!(count(&skipped) >= 50, "an event whose physical is not ready");
     // an invalid binding (above its stage's deadline)
     let invalid = |c: &table::Case| {
-        c.events
-            .iter()
-            .any(|&(k, _, h, p)| k == "bind" && c.stages.iter().any(|&(s, _, d)| s == p && h > d))
+        c.events.iter().any(|&(k, _, h, p)| {
+            k == "bind" && c.stages.iter().any(|&(s, _, _, d)| s == p && h > d)
+        })
     };
     assert!(count(&invalid) >= 50, "a binding above its stage's deadline");
-    // and the pure layer refuses exactly those, whatever happens to them next
+    // a binding from an origin that is not its stage creation's, at or below the stage's deadline: invalid by the origin alone
+    let is_foreign_at_or_below = |&&(k, o, h, p): &&(&str, usize, u64, &str), c: &table::Case| {
+        k == "bind" && c.stages.iter().any(|&(s, _, creator, d)| s == p && o != creator && h <= d)
+    };
+    let foreign: usize = CASES
+        .iter()
+        .map(|c| c.events.iter().filter(|e| is_foreign_at_or_below(e, c)).count())
+        .sum();
+    assert!(foreign >= 20, "{foreign} foreign-origin bindings at or below their stage's deadline");
+    // and the pure layer refuses exactly those, whatever happens to them next: a binding above its stage's deadline, or from
+    // an origin that is not its stage creation's
     let refused: usize = CASES.iter().map(|c| case_timeline_counting(c).1).sum();
-    let above: usize = CASES
+    let by_rule: usize = CASES
         .iter()
         .map(|c| {
             c.events
                 .iter()
-                .filter(|&&(k, _, h, p)| {
-                    k == "bind" && c.stages.iter().any(|&(s, _, d)| s == p && h > d)
+                .filter(|&&(k, o, h, p)| {
+                    k == "bind"
+                        && c.stages
+                            .iter()
+                            .any(|&(s, _, creator, d)| s == p && (h > d || o != creator))
                 })
                 .count()
         })
         .sum();
-    assert_eq!(refused, above, "every binding above its stage's deadline is refused as invalid");
+    assert_eq!(
+        refused, by_rule,
+        "every binding above its stage's deadline or from another origin than its stage's creation is refused as invalid"
+    );
     assert!(refused >= 300, "{refused} invalid bindings in the table");
 }
 

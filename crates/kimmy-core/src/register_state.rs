@@ -13,7 +13,7 @@
 //! stays buried; a write once late stays late. The same set of events gives the same answers whatever
 //! the order they arrived in, because the answers are functions of the set.
 //!
-//! The model it must agree with is `swapmodel6g.py` (`newest_applicable`, `enter`, `sweep`,
+//! The model it must agree with is `swapmodel6i.py` (`newest_applicable`, `enter`, `sweep`,
 //! `first_superseding`); `tests/register_state/table.rs` holds the model's answers for generated
 //! scenarios and the test replays them.
 

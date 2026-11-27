@@ -17,7 +17,8 @@
 
 use bson::doc;
 use kimmy_core::{
-    CollectionBind, CollectionId, DocId, Hlc, MergePolicy, OpKind, OplogEntry, Stamp, VersionVector,
+    CollectionBind, CollectionId, DocId, Hlc, IndexField, MergePolicy, OpKind, OplogEntry, Stamp,
+    VersionVector,
 };
 use redb::ReadableDatabase;
 
@@ -537,4 +538,45 @@ fn pq8_a_carried_drop_of_a_name_with_a_binding_ahead_of_its_position_ends_as_the
         "pq8: the member that took D on a page ends as the one that took it as an entry (after {m_trace:?})"
     );
     assert_eq!(m.register_carried_drops_deferred(), 0, "and no carried drop was deferred");
+}
+
+/// pq3i (a GUARD of what the page route restores): pq3 with an INDEX on the sender's life, created above D (after W). The receiver took the prefix, D and a stage above D (no event), then pulls
+/// a whole-database snapshot from `y`, which holds the life with W and the index. After the page the receiver must hold `orders` with W, the stage, AND the sender's index, as the sender does.
+/// The probe at P14's tip was GREEN: the plain path restores the page's definitions. A guard for P14: it goes red if the page route, with a held stage and no event, restores the collection but
+/// loses its definitions (the swapped-name branch of `restore_collection` taken for a name that is not swapped). Mutant: that branch reads "a held stage" again.
+#[test]
+fn pq3i_a_page_with_an_index_makes_the_collection_stand_with_w_and_the_index() {
+    let w = world(true);
+    w.y.create_index(DB, "orders", vec![IndexField::ascending("v")], false, Some("x".into()))
+        .unwrap();
+    let indexes = |m: &Engine| {
+        m.list_indexes(DB, "orders")
+            .map(|all| all.into_iter().map(|index| index.name).collect::<Vec<_>>())
+            .map_err(|e| e.to_string())
+    };
+    let sender = indexes(&w.y);
+    assert!(
+        sender.as_ref().is_ok_and(|names| !names.is_empty()),
+        "premise: the sender holds an index: {sender:?}"
+    );
+    let (r, _dr) = engine();
+    for entry in &w.prefix {
+        window(&r, std::slice::from_ref(entry));
+    }
+    for entry in [&w.d, &w.sc] {
+        window(&r, std::slice::from_ref(entry));
+        r.finish_purges_now().unwrap();
+    }
+    assert_eq!(
+        holds(&r),
+        (false, 0, true),
+        "premise: the receiver has lost the collection and holds the stage"
+    );
+    pull(&r, &w.y);
+    assert_eq!(
+        holds(&r),
+        (true, 1, true),
+        "pq3i: after the page orders stands with W and the stage is held"
+    );
+    assert_eq!(indexes(&r), sender, "pq3i: and the receiver holds the sender's index");
 }
