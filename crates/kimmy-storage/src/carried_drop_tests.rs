@@ -2794,6 +2794,30 @@ fn a_join_across_a_swap_above_its_grant_restarts_once_and_serves_the_newer_stage
     the_reader_ran(&w);
 }
 
+/// UNIT P, P12b (a guard, green when written): the page that restarts a join forgets the pull's stored row, so a pull that starts again is not
+/// held by the row of the one it replaced (the retention pass leaves every options row alone while a progress record is stored). The row an earlier page
+/// stored is there before the restarting page, and gone after it.
+#[test]
+fn the_page_that_restarts_the_join_forgets_the_stored_row_of_the_pull() {
+    let w = a_sender_that_swaps_again_during_the_join(1);
+    let (j, _dj) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let (mut stored_before, mut restarted) = (false, false);
+    for _ in 0..60 {
+        let page = w.sender.snapshot_page(progress.after().cloned(), None).unwrap();
+        stored_before = !j.snapshots_to_resume().unwrap().is_empty();
+        let done = j.apply_snapshot_page(w.sender.node_id(), &mut progress, &page).unwrap();
+        if done.restarts > 0 {
+            restarted = true;
+            break;
+        }
+        assert!(!progress.is_complete(), "premise: the join restarts before it completes");
+    }
+    assert!(restarted, "premise: the join restarts within 60 pages");
+    assert!(stored_before, "premise: an earlier page stored the pull's row");
+    assert!(j.snapshots_to_resume().unwrap().is_empty(), "the restart forgot the stored row");
+}
+
 #[test]
 fn the_page_that_restarts_the_join_commits_nothing_of_its_carry_and_grants_nothing() {
     let w = a_sender_that_swaps_again_during_the_join(1);
