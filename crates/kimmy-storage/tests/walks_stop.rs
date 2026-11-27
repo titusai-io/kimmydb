@@ -120,6 +120,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the index tombstones of ONE collection, one row per index name ever dropped on it, which the retention pass collects; read under the writer of the transaction that joins the physical into the one that becomes visible (ADR-272, rule 3)",
     ),
     (
+        "register::any_parked",
+        "the information table of the register: the events known ahead of their position, which a window or a grant puts in effect and removes, so it is empty or a handful of rows; read in its own read transaction by an apply with no window, and the walk ends at the first row that answers (ADR-148, amended)",
+    ),
+    (
         "register::parked_among",
         "the information table of the register: the events known ahead of their position, which a window or a grant puts in effect and removes, so it is empty or a handful of rows; read inside the write transaction of the release (ADR-272)",
     ),

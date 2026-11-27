@@ -2413,8 +2413,10 @@ where
             Via::Outbound,
         )? {
             ReplayPage::Stalled(_) => {
-                // A collection these entries name is not here yet: the ordinary
-                // machinery brings it, and the replay goes on from where it was.
+                // Something these entries wait for is not here yet (a collection, a
+                // purge, a due clock, or the parked event they stand behind, in
+                // position): the ordinary machinery brings it, and the replay goes on
+                // from where it was.
                 return Ok(());
             }
             ReplayPage::Done { .. } => return Ok(()),
@@ -2555,6 +2557,8 @@ pub(crate) fn replay_apply(
                 crate::protocol::ReplayStall::UnknownCollection
             } else if outcome.purge_pending > 0 {
                 crate::protocol::ReplayStall::PurgePending
+            } else if outcome.parked_stop > 0 {
+                crate::protocol::ReplayStall::ParkedEvent
             } else {
                 crate::protocol::ReplayStall::ClockRefused
             }));

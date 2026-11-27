@@ -860,6 +860,35 @@ pub(crate) fn release(
     Ok(Some(put))
 }
 
+/// Whether some event held parked, by its stamp, answers `wanted`: the one walk an apply with no window reads the parked events by
+/// (ADR-148, amended). It ends at the first row that answers.
+fn any_parked(txn: &redb::ReadTransaction, wanted: impl Fn(&Stamp) -> bool) -> Result<bool> {
+    let info = txn.open_table(tables::REGISTER_INFO)?;
+    for row in info.iter()? {
+        let (key, _) = row?;
+        if wanted(&crate::codec::decode_oplog_key(&key.value()[8..])?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether this member holds any event parked.
+pub(crate) fn anything_parked(txn: &redb::ReadTransaction) -> Result<bool> {
+    any_parked(txn, |_| true)
+}
+
+/// Whether this member holds parked an event of `stamp`'s origin `(node, epoch)` stamped strictly below it: the entry stamped
+/// `stamp` stands behind that event (ADR-148, amended). Strictly: a parked event's own entry does not stand behind itself.
+pub(crate) fn parked_below(txn: &redb::ReadTransaction, stamp: &Stamp) -> Result<bool> {
+    any_parked(txn, |held| held.origin() == stamp.origin() && held < stamp)
+}
+
+/// Whether the event stamped `stamp` is itself held parked.
+pub(crate) fn is_parked(txn: &redb::ReadTransaction, stamp: &Stamp) -> Result<bool> {
+    any_parked(txn, |held| held == stamp)
+}
+
 /// The stamps of the information rows (events known ahead of their position) that are among `stamps`.
 fn parked_among(txn: &redb::WriteTransaction, stamps: &[Stamp]) -> Result<Vec<Stamp>> {
     let info = txn.open_table(tables::REGISTER_INFO)?;

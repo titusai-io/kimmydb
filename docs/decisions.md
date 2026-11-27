@@ -11624,6 +11624,12 @@ busy; and a schema change in flight at the signal is confirmed in the drain.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
+> **Amended with
+> [ADR-272](#adr-272--an-out-that-replaces-a-populated-collection-is-atomic-on-each-member-and-a-write-that-races-it-is-lost-and-reported)
+> (decision 3).** A batch with no window also stops at an entry that
+> stands behind an event this member holds parked: the paragraph after the
+> rule for a collection this node has no record of.
+
 > **Amended by [ADR-195](#adr-195--a-draining-advancing-contact-resumes-by-reset-not-a-full-interval).**
 > `REPAIR_COOLDOWN_ROUNDS` counts contacts, and is wall-clock by its own
 > reasoning; a tick a reset scheduled is not a fresh contact for this count,
@@ -11708,6 +11714,27 @@ counted on a new series, `kimmy_sync_entries_skipped_total{reason}`,
 whose `unknown_collection` label is this case — one per stopped batch,
 at the entry the warning names — and whose `beyond_advertised` label is
 the deferral above; the warning names the collection, which it did not.
+
+*An entry that stands behind an event this member holds parked stops a
+batch that has no window.* A register event applied with no window is
+parked (ADR-272, decision 3): held as information, with no coverage
+raised over it. The vectors are one maximum for each origin, so anything
+of that origin taken after it would raise them past it. So on a
+replicated apply with no window, an entry is left, and the batch ends
+before it, if the store holds a parked event of the entry's origin
+(node, epoch) stamped below it. The test reads the store, so a later
+page, the same page again and a restarted process stop alike. It does
+not stop another origin's entry, the same node's entry under another
+epoch, or an older entry of the same origin. The parked entry delivered
+again with no window stops nothing either, and is passed over
+unwitnessed: witnessing it would raise the vector to the very stamp held
+parked; what follows a left entry in the batch is left with it, as at
+any stop. A window is not subject to it: a window comes in stamp order
+and carries the parked event first, which takes effect there. A local
+write is not the apply of a replicated entry and is not subject to it.
+The replay of a member's own origin answers this stop with its own
+reason and asks the page again; the ordinary pull brings the event and
+what follows it in position, and the replay then finishes.
 
 *Detection becomes repair.* A collection the cross-member divergence
 check confirms against a peer (ADR-145's tracker, read through
@@ -31411,6 +31438,7 @@ The alternatives were **(a)** for `document` collections only, carry the late wr
      - only the refusal of decision 7 counts it.
    - **The stage's create and the abandon are not parked: they rely on invariant (ii) alone.** That is enforced by decision 13's route rules, a harness assertion and a product debug assertion on every excluded route. A parking rule for them was modelled and abandoned. It did not remove the hold-route case it aimed at, and it left an abandon whose writer vanished parked for ever.
    - **Release.** A parked entry takes effect when coverage reaches it, on whatever route raises coverage, never because it is delivered again. **Once it is covered, it takes effect and is appended and served onward in the same transaction**: a member that covered a parked entry without serving it would let the sender's skip rule witness it away downstream. When a mark on a Q6 entry is released (`release_held_in_position`), the entry takes effect in that same transaction. For a DDL kind this needs the position-aware `apply_ddl` of the held-DDL release fix on main (PR #309, c830e597, "Release a held schema change's mark when it arrives in a window").
+   - **What parks today, and how far a replay goes.** An event is held back only when it is applied with no window, and the one path outside tests that applies a batch with none is a member's replay of its own lost entries, after a restore from an older backup or a crash under `coalesced` durability (ADR-202). The replay parks the first lost register event it meets and takes nothing of that origin past it (ADR-148's amendment). **The park delivers nothing:** the event takes effect when a window or a covering grant brings it, which is how decision 13 has these kinds delivered. The parked event delivered again with no window is not witnessed. So a replay leaves at most one event parked for an origin. **That keeps a member's vectors below what it holds parked where what it lost is of an epoch it no longer writes under, which is a restore.** Where the epoch is kept (a crash under `coalesced` durability, a volume rollback, a copied data directory), the member's own later writes can stand above the event before it knows it lost it, or pass it once it is parked, and a member that joins from it then is covered past an event it was never given. That is not closed here and is to be repaired by the divergence check, which compares the register events each side holds, before a writer of bindings ships. **Today nothing can park:** no code outside tests creates a stage or a binding, and no client of this release can create a collection under a stage's or a recreation's name.
    - **Every Q6 kind travels only in position:** in windows, and in a snapshot's pages within the grant; never in a scoped repair, never as a held entry, never on a page above the grant (decision 13). For register events and records the takes-effect rule is the safety net for a route that would break this (a restore).
    - **In position** means that at apply the receiver already covers every earlier entry of the entry's origin (node, epoch). Coverage is the predicate on the **witnessed** vector, counting entries witnessed through the sender's skip rule and entries covered by a completed grant. Because the vector is a per-origin maximum, decision 13 states what in position means on each route.
    - **No page and no grant names an entry above its sender's coverage** (the grant is the sender's vector). The coverage predicate is Step 1's, on the writer's (node, epoch); this ADR needs only that predicate (its function name goes in at landing).

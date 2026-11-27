@@ -1578,7 +1578,14 @@ impl Engine {
     /// [`Self::apply_remote_in_txn`] and commits once (ADR-119). This is the
     /// single-entry form for snapshot restore and for tests that manufacture
     /// a replicated write by hand.
+    ///
+    /// No window stands behind it, so it keeps the parked stop (ADR-148, amended): an entry that stands behind an event this member
+    /// holds parked is left, answering `false` with nothing written and nothing witnessed.
     pub fn apply_remote(&self, coll: &CollectionMeta, entry: &OplogEntry) -> Result<bool> {
+        // First, ahead of all the entry would do, the clock's own move for an entry with no document included.
+        if crate::register::parked_below(&self.db().begin_read()?, &entry.stamp)? {
+            return Ok(false);
+        }
         if entry.doc_id.is_none() {
             // Collection-level operations carry no document to merge, and
             // nothing to write: decided before the writer is taken. The stamp

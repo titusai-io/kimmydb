@@ -472,8 +472,8 @@ pub fn lag_beyond_horizon_ms(
 }
 
 impl SyncOutcome {
-    /// The entry a batch stopped at, for either reason a batch stops
-    /// (ADR-148, ADR-189): it and everything after it in the window were not
+    /// The entry a batch stopped at, for whichever reason it stopped
+    /// (ADR-148, ADR-189): it and everything after it in the batch were not
     /// taken.
     pub fn stopped_at(&self) -> Option<Stamp> {
         self.unknown
@@ -482,15 +482,20 @@ impl SyncOutcome {
             .into_iter()
             .chain(self.purge_pending_at)
             .chain(self.clock_refused_at.as_ref().map(|stop| stop.stamp))
+            .chain(self.parked_stop_at)
             .min()
     }
 
-    /// Whether the batch ended at an entry it did not take, for any of the three reasons a batch
-    /// stops: a collection this node lacks, a creation waiting for the drop purger, or a clock past
-    /// the bound. The one question every site that decides "stop, or move on" asks, so that the
-    /// next kind of stop cannot be missed at one of them. `total() == 0` does not answer it.
+    /// Whether the batch ended at an entry it did not take, for any of the four reasons a batch
+    /// stops: a collection this node lacks, a creation waiting for the drop purger, a clock past
+    /// the bound, or, with no window, an event of the entry's origin held parked below it. The one
+    /// question every site that decides "stop, or move on" asks, so that the next kind of stop
+    /// cannot be missed at one of them. `total() == 0` does not answer it.
     pub fn stopped(&self) -> bool {
-        self.unknown_collection > 0 || self.purge_pending > 0 || self.clock_refused > 0
+        self.unknown_collection > 0
+            || self.purge_pending > 0
+            || self.clock_refused > 0
+            || self.parked_stop > 0
     }
 
     /// Every entry the batch decided on, whatever it decided. A schema
@@ -1285,6 +1290,7 @@ impl Engine {
         let (unknown, deferred, purging) =
             (outcome.unknown_collection, outcome.deferred, outcome.purge_pending);
         let (clock, clock_at) = (outcome.clock_refused, outcome.clock_refused_at.clone());
+        let parked = (outcome.parked_stop, outcome.parked_stop_at);
         let mut run = Run::default();
         let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
         let refused = std::mem::take(&mut run.refused);
@@ -1300,6 +1306,7 @@ impl Engine {
                     outcome.purge_pending = purging;
                     outcome.clock_refused = clock;
                     outcome.clock_refused_at = clock_at;
+                    (outcome.parked_stop, outcome.parked_stop_at) = parked;
                 }
                 // Read after the error, so what landed before it is what
                 // decides. A read that fails counts nothing: under-counting
@@ -1337,6 +1344,8 @@ impl Engine {
             Some(_) => crate::engine::Position::InWindow,
             None => crate::engine::Position::Raise,
         };
+        // Whether this member holds any event parked, as last read; `None` until read. Asked only of a batch with no window.
+        let mut anything_parked: Option<bool> = None;
 
         for entry in entries {
             if let Some(introduced) = introduced
@@ -1344,6 +1353,24 @@ impl Engine {
             {
                 outcome.deferred += 1;
                 continue;
+            }
+            // The parked stop (ADR-148, amended): with no window, an entry that stands behind an event of its origin this member
+            // holds parked is left, and the batch ends before it. First, ahead of all the entry would do: it is neither applied
+            // nor witnessed. Read from the store, so a later batch, and a restarted process, stop alike.
+            if position == crate::engine::Position::Raise
+                && self.asks_the_parked(&mut anything_parked, |txn| {
+                    crate::register::parked_below(txn, &entry.stamp)
+                })?
+            {
+                debug!(
+                    kind = ?entry.kind,
+                    "an entry stands behind an event this member holds parked; a batch with no \
+                     window ends before it"
+                );
+                outcome.parked_stop += 1;
+                outcome.parked_stop_at = Some(entry.stamp);
+                stopped_at = Some(entry.stamp);
+                break;
             }
             // **Every** entry the batch takes, on every path — applied,
             // superseded, DDL, or skipped by design — is observed here, once,
@@ -1377,6 +1404,20 @@ impl Engine {
                 }
                 Err(e) => return Err(e),
             };
+            // Only a schema change can park an event, so what was read of the parked events may not hold after one. Renewed after
+            // every one of them, not only after a park seen here: another batch may have parked the same entry under this one.
+            if entry.kind.is_ddl() {
+                anything_parked = None;
+            }
+            // An entry that is ITSELF held parked, given again with no window, is passed over unwitnessed: witnessed, it would raise
+            // the vector to the very stamp held parked. Asked of the store and not of the apply's answer, which for a recreation can
+            // be a refusal of the validator it carries, given before the register is reached.
+            let passed_over = position == crate::engine::Position::Raise
+                && matches!(step, Step::Taken)
+                && self.asks_the_parked(&mut anything_parked, |txn| {
+                    crate::register::is_parked(txn, &entry.stamp)
+                })?;
+            let step = if passed_over { Step::Held } else { step };
             match step {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Held => {}
@@ -2207,8 +2248,8 @@ enum Step {
     /// Left, because it creates a collection whose drop is still being
     /// purged here (ADR-189); `db.name`.
     PurgePending(String),
-    /// Taken, and held out of position (a parked register event): not witnessed by the batch, so that it is served again in
-    /// position.
+    /// Taken, and held out of position (a register event parked by this apply, or given again while parked): not witnessed by the
+    /// batch, so that it is served again in position.
     Held,
 }
 
@@ -2351,6 +2392,28 @@ impl Engine {
     /// The pages add up: each names definitions its own sender processed.
     pub(crate) fn record_answered_absent(&self, id: CollectionId, coverage: &VersionVector) {
         self.answered_absent.lock().entry(id).or_default().merge(coverage);
+    }
+
+    /// One question of the events this member holds parked, for an apply with no window (ADR-148, amended). `anything` keeps
+    /// whether any is held, so that while none is a long run of documents costs one read; the batch forgets it after each schema
+    /// change.
+    fn asks_the_parked(
+        &self,
+        anything: &mut Option<bool>,
+        question: impl FnOnce(&redb::ReadTransaction) -> Result<bool>,
+    ) -> Result<bool> {
+        if *anything == Some(false) {
+            return Ok(false);
+        }
+        let txn = self.db().begin_read()?;
+        if anything.is_none() {
+            let any = crate::register::anything_parked(&txn)?;
+            *anything = Some(any);
+            if !any {
+                return Ok(false);
+            }
+        }
+        question(&txn)
     }
 
     /// Process one replicated entry. Witnessing is the caller's job, so that
