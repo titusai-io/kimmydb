@@ -1,5 +1,6 @@
 //! D13 containment (ADR-274), the cluster half: when a peer's claim of an epoch is believed and
-//! bounded, when a halt marker applies to a store, and what the mistaken-restore guard waits for.
+//! bounded, when a halt marker applies to a store, and how long the mistaken-restore guard's
+//! window is.
 //!
 //! The decisions are pure functions, and the containment file's reading and writing are here too.
 
@@ -9,11 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kimmy_core::{Epoch, NodeId};
-
-/// How long the guard waits for a seed's first member list before it passes (ruled 2026-11-25;
-/// above the window, so a slow first list is not read as silence, and below the catch-up wait). A
-/// `cfg(test)` override exists in the code commits.
-pub const SEED_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The clock a claimed epoch's start is held against: `max(the physical clock, the HLC's last wall
 /// time)`, or a member whose wall clock is behind its own logical clock refuses every legitimate
@@ -29,46 +25,11 @@ pub fn claim_within_bound(clock_ms: u64, skew_ms: u64, epoch: &Epoch) -> bool {
     *epoch != Epoch::MAX && epoch.start_hlc().wall_ms <= clock_ms.saturating_add(skew_ms)
 }
 
-/// What the guard does next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GuardStep {
-    /// Proceed: nothing lists this node id elsewhere, or there is nobody to ask.
-    Pass,
-    /// A seed answered and no member list has arrived: wait for the first one, at most this long,
-    /// then pass.
-    AwaitMemberList(Duration),
-    /// Another address lists this node id: probe it, and wait this long for an answer. An answer
-    /// halts the fresh host.
-    Probe(Duration),
-}
-
-/// The guard's window: twice foca's `suspect_to_down_after`, which is how long a LIVE host has to
-/// answer a probe (a stopped host stays listed longer than that, and is not what the window
-/// measures).
+/// The guard's window: twice foca's `suspect_to_down_after`. It is how long an address named for
+/// a restore's node has to answer, and how long a member must have been one for its answer to
+/// count (ADR-274).
 pub fn guard_window(suspect_to_down: Duration) -> Duration {
     suspect_to_down * 2
-}
-
-/// The guard's three cases (and the fourth, nobody reachable). `seed_configured`: the seeds name
-/// another member. `a_seed_answered`: one of them answered a dial. `member_list_seen`: SWIM's first
-/// member list has arrived. `listed_elsewhere`: that list has this node id at an address other than
-/// this member's own.
-pub fn guard_step(
-    seed_configured: bool,
-    a_seed_answered: bool,
-    member_list_seen: bool,
-    listed_elsewhere: bool,
-    suspect_to_down: Duration,
-) -> GuardStep {
-    if !seed_configured || !a_seed_answered {
-        GuardStep::Pass
-    } else if !member_list_seen {
-        GuardStep::AwaitMemberList(SEED_TIMEOUT)
-    } else if listed_elsewhere {
-        GuardStep::Probe(guard_window(suspect_to_down))
-    } else {
-        GuardStep::Pass
-    }
 }
 
 /// Why the mistaken-restore guard halted a fresh host: the epoch that halted itself, and the

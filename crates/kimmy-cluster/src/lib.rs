@@ -24,7 +24,6 @@ pub mod containment;
 pub mod discovery;
 mod exchange;
 pub mod facts;
-pub mod guard;
 mod guard_answer;
 pub mod guard_rounds;
 pub mod health;

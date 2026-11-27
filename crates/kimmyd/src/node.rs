@@ -2729,12 +2729,11 @@ async fn cluster_gate_open(gate: &mut tokio::sync::watch::Receiver<Option<bool>>
     }
 }
 
-/// The addresses the configured seeds name now, as `ip:port` text for the guard's probe. Each
-/// source is resolved the way the discovery loop resolves it (`dns:`, `dns-srv:`, `k8s:`, a static
-/// list, and the test name server), at once and each bounded: a source that has not answered
-/// within the bound names nothing, which the guard reads as "no seed answered", so the first
-/// member of a cluster whose seeds are not up yet does not wait on a name that cannot resolve.
-async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<String> {
+/// The addresses the configured seeds name now, for a round of the guard's. Each source is
+/// resolved the way the discovery loop resolves it (`dns:`, `dns-srv:`, `k8s:`, a static list, and
+/// the test name server), at once and each bounded: a source that has not answered within the
+/// bound names nothing in that round, and is asked again for the next.
+async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<std::net::SocketAddr> {
     const BOUND: Duration = Duration::from_secs(3);
     let mut resolving = tokio::task::JoinSet::new();
     for seed in seeds {
@@ -2746,58 +2745,56 @@ async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<String> {
     let mut addresses = Vec::new();
     while let Some(done) = resolving.join_next().await {
         if let Ok(Ok(Ok(resolved))) = done {
-            addresses.extend(resolved.iter().map(ToString::to_string));
+            addresses.extend(resolved);
         }
     }
     addresses
 }
 
-/// Run the mistaken-restore guard for a fresh epoch (ADR-274): ask whether this node id is live at
-/// another address, open the gate if nothing answers (or `--replace` was given for this epoch) and
-/// halt this host if one does, then write the bit that a peer was met once the first handshake has
-/// completed, from here and never from inside a contact.
+/// Run the mistaken-restore guard for a restored or rewound epoch (ADR-274): ask, round after
+/// round, what the members the seeds name say, and whatever they name, until a round decides or
+/// a running host of this node is heard. A pass lets the hold go and opens the gate; a running
+/// host of this node halts this one. With nothing to decide it asks for ever: no time passes it.
+/// Then the bit that a peer was met is written once the first handshake has completed, from here
+/// and never from inside a contact.
 fn spawn_guard(
     engine: Arc<Engine>,
-    live: kimmy_cluster::Members,
-    local: std::net::SocketAddr,
+    members: kimmy_cluster::Members,
     config: &Config,
     secret: String,
     hold: Arc<kimmy_cluster::catchup::CatchUp>,
     gate: tokio::sync::watch::Sender<Option<bool>>,
 ) {
-    let own_addresses = vec![local, advertised(local)];
     let data_dir = config.storage.data_dir.clone();
-    let seed_configured =
-        kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind);
-    let seeds = config.cluster.seeds.clone();
-    // UNSUPERVISED: a one-shot that ends with its verdict and then the write of the bit. A panic in
-    // it leaves the gate closed and the hold on, which a waiting host shows by serving nothing.
+    let seeds: Arc<[kimmy_cluster::SeedSource]> = config.cluster.seeds.clone().into();
+    // UNSUPERVISED: a one-shot that ends with its verdict, which may never come, and then the
+    // write of the bit. A panic in it leaves the gate closed and the hold on, which a waiting host
+    // shows by serving nothing.
     tokio::spawn(async move {
         let replace =
             kimmy_cluster::containment::read_marker_file(&data_dir).ok().and_then(|f| f.replace);
-        let mut guard =
-            kimmy_cluster::guard::GuardConfig::new(engine.node_id(), own_addresses, &secret);
-        guard.seed_configured = seed_configured;
-        // A seed that answers a probe is the fact that makes the guard wait for SWIM's first list;
-        // with none answering the host proceeds at once.
-        guard.a_seed_answered = seed_configured
-            && kimmy_cluster::guard::a_seed_answers(&guard, &seed_addresses(&seeds).await).await;
-        guard.suspect_to_down = kimmy_cluster::membership::suspect_to_down_after();
-        guard.replace = kimmy_cluster::containment::replace_honoured(replace, engine.epoch());
-        let verdict = kimmy_cluster::guard::run_guard(&guard, || {
-            let listed = live.entries();
-            (!listed.is_empty()).then_some(listed)
+        let asking = kimmy_cluster::guard_rounds::Asking::new(
+            engine.node_id(),
+            &secret,
+            kimmy_cluster::containment::guard_window(
+                kimmy_cluster::membership::suspect_to_down_after(),
+            ),
+            kimmy_cluster::containment::replace_honoured(replace, engine.epoch()),
+        );
+        let decision = kimmy_cluster::guard_rounds::ask_until_decided(&asking, &members, || {
+            let seeds = Arc::clone(&seeds);
+            async move { seed_addresses(&seeds).await }
         })
         .await;
-        match verdict {
-            kimmy_cluster::guard::GuardVerdict::Pass => {
+        match decision {
+            kimmy_cluster::guard_rounds::Decision::Pass { .. } => {
                 // Said before anything the guard holds back is let go, so whatever a log or a
                 // client shows ahead of this line was done while the guard had not passed.
                 info!("the mistaken-restore guard passed; this host may join its cluster");
                 hold.release_guard_hold();
                 let _ = gate.send(Some(true));
             }
-            kimmy_cluster::guard::GuardVerdict::LiveHost(address) => {
+            kimmy_cluster::guard_rounds::Decision::LiveHost(address) => {
                 warn!(
                     %address,
                     "the mistaken-restore guard found this node live at another address: this host \
@@ -2890,8 +2887,8 @@ async fn spawn_cluster(
     // A member the mistaken-restore guard holds (ADR-274; the start takes the hold) dials nobody
     // until the guard has passed: the replication task waits on this gate. The listener serves
     // from the start, and while the hold is on it answers every dialler at once that this member
-    // is undecided, and nothing more; a member the guard has halted answers nobody. SWIM runs
-    // meanwhile, which is where the guard reads its list. Any other member passes at once.
+    // is undecided, and hears the dialler's report; a halted member answers nobody. The guard asks
+    // the seeds and whatever they name. SWIM runs meanwhile. Any other member passes at once.
     let hold = state.catch_up().filter(|catch_up| catch_up.held_by_guard()).cloned();
     let guarded = hold.is_some();
     let (gate_tx, gate_rx) =
@@ -2948,7 +2945,7 @@ async fn spawn_cluster(
         members = Some(live);
         announce = Some(tx);
         if let (Some(hold), Some(live)) = (hold, members.clone()) {
-            spawn_guard(Arc::clone(&engine), live, local, config, secret.clone(), hold, gate_tx);
+            spawn_guard(Arc::clone(&engine), live, config, secret.clone(), hold, gate_tx);
         }
     } else {
         warn!("SWIM membership is disabled; peers come from discovery alone");

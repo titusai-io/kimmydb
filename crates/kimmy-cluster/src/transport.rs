@@ -2148,14 +2148,6 @@ pub(crate) async fn probe_answer(
     attempt.await
 }
 
-/// Whether a probe of `peer` is answered by a live host. A member that says it is undecided is
-/// not one: its guard has not passed, so it has not joined (ADR-274).
-pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> bool {
-    probe_answer(own, peer, secret).await.is_some_and(|(_, answer)| {
-        answer.is_none_or(|answer| answer.standing != Standing::Undecided)
-    })
-}
-
 /// A connection [`dial`] opened for a round that has not started: dialled with the
 /// tick's other peers at once, and used when its peer's turn comes.
 pub(crate) struct Dialled {

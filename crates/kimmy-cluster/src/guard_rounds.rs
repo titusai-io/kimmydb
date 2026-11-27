@@ -16,7 +16,7 @@ use std::time::Duration;
 use kimmy_core::NodeId;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::membership::Members;
 use crate::protocol::{GuardAnswer, Standing};
@@ -87,6 +87,8 @@ where
     // A report handed over before the asking began arrived in none of its rounds.
     drop(members.take_guard_reports());
     let mut carried = Vec::new();
+    // What the last round that decided nothing was waiting on, so that it is said when it changes.
+    let mut said = None;
     loop {
         let resolved = seeds().await;
         let mut round = Round::new(asking, &own_token, &mut own);
@@ -95,6 +97,20 @@ where
         }
         if let Some(decision) = round.verdict(members).await {
             return decision;
+        }
+        let waiting = round.waiting_on();
+        if said.as_ref() != Some(&waiting) {
+            info!(
+                asked = round.asked.len(),
+                undecided = waiting.undecided,
+                uncounted = waiting.uncounted,
+                silent_named = ?waiting.silent_named,
+                "the mistaken-restore guard waits: nothing a member has answered lets this host \
+                 join, so it asks again, and no passage of time passes it. `undecided` members \
+                 are waiting too; `uncounted` ones have met nobody or have only just joined; \
+                 `silent_named` are addresses listed for this node that keep it waiting"
+            );
+            said = Some(waiting);
         }
         carried = match pause(asking, &own_token, members).await {
             Ok(reports) => reports,
@@ -166,6 +182,16 @@ struct Heard {
     lists: BTreeSet<SocketAddr>,
 }
 
+/// What a round that decided nothing was waiting on.
+#[derive(PartialEq, Eq)]
+struct Waiting {
+    /// The answers from members that are undecided themselves.
+    undecided: usize,
+    /// The open answers that do not count.
+    uncounted: usize,
+    silent_named: BTreeSet<SocketAddr>,
+}
+
 type Probed = (SocketAddr, Option<(NodeId, Option<Box<GuardAnswer>>)>);
 
 /// One round: what it has asked, and what has answered.
@@ -182,6 +208,8 @@ struct Round<'a> {
     answered: BTreeSet<SocketAddr>,
     open: Vec<Heard>,
     counted: bool,
+    undecided: usize,
+    uncounted: usize,
 }
 
 impl<'a> Round<'a> {
@@ -198,6 +226,8 @@ impl<'a> Round<'a> {
             answered: BTreeSet::new(),
             open: Vec::new(),
             counted: false,
+            undecided: 0,
+            uncounted: 0,
         }
     }
 
@@ -231,6 +261,7 @@ impl<'a> Round<'a> {
         // An undecided member is not running anything: it is no answer that counts, and what it
         // names is not asked.
         if answer.standing == Standing::Undecided {
+            self.undecided += 1;
             return None;
         }
         if node == self.asking.own_node {
@@ -247,8 +278,10 @@ impl<'a> Round<'a> {
             self.named.insert(addr);
             self.ask(addr);
         }
-        self.counted |= !answer.founded_unmet
+        let counts = !answer.founded_unmet
             && Duration::from_millis(answer.membership_age_ms) >= self.asking.window;
+        self.counted |= counts;
+        self.uncounted += usize::from(!counts);
         self.open.push(Heard { at, lists });
         None
     }
@@ -304,6 +337,23 @@ impl<'a> Round<'a> {
         }
     }
 
+    /// The addresses named for this node that gave no answer and are not this host.
+    fn silent_named(&self) -> BTreeSet<SocketAddr> {
+        self.named_for_me
+            .iter()
+            .copied()
+            .filter(|addr| !self.answered.contains(addr) && !self.own.contains(addr))
+            .collect()
+    }
+
+    fn waiting_on(&self) -> Waiting {
+        Waiting {
+            undecided: self.undecided,
+            uncounted: self.uncounted,
+            silent_named: self.silent_named(),
+        }
+    }
+
     /// The verdict on a round that has ended, or `None`: nothing is decided.
     async fn verdict(&mut self, members: &Members) -> Option<Decision> {
         let pass = Decision::Pass { named: self.named.iter().copied().collect() };
@@ -313,12 +363,7 @@ impl<'a> Round<'a> {
         if !self.counted {
             return None;
         }
-        let silent: BTreeSet<SocketAddr> = self
-            .named_for_me
-            .iter()
-            .copied()
-            .filter(|addr| !self.answered.contains(addr) && !self.own.contains(addr))
-            .collect();
+        let silent = self.silent_named();
         if silent.is_empty() {
             return Some(pass);
         }

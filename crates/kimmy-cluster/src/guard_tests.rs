@@ -1,18 +1,18 @@
-//! The mistaken-restore guard (D13 containment, ADR-274; tests 9a to 9h of the plan): a fresh
-//! epoch's host asks, before it dials anyone, whether its own node id is live at another address.
-//! The tests commit of the guard: each is red on its designed assertion against the scaffold in
-//! `guard.rs`, and the controls that the scaffold also satisfies are the mutants' guards.
+//! The mistaken-restore guard against real members (D13 containment, ADR-274): what its probe is
+//! answered, what the probed side records of it, and what its rounds make of a running host. The
+//! rounds' own rows, against a member made up for the test, are in `guard_rounds_tests.rs`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kimmy_core::NodeId;
 use kimmy_storage::Engine;
 use tokio::net::TcpListener;
 
-use crate::guard::{GuardConfig, GuardVerdict, a_seed_answers, run_guard};
-use crate::transport::probe_peer;
+use crate::guard_rounds::{Asking, Decision, ask_until_decided};
+use crate::membership::Members;
+use crate::transport::probe_answer;
 
 const SECRET: &str = "a-guard-test-secret";
 const WINDOW: Duration = Duration::from_millis(800);
@@ -44,36 +44,36 @@ async fn live(secret: &str) -> Live {
     Live { engine, addr, serving, _dir: dir }
 }
 
-/// An address nothing listens on: a stopped host that SWIM still lists.
+/// An address nothing listens on.
 async fn a_stopped_hosts_address() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap()
 }
 
-fn own_address() -> SocketAddr {
-    "127.0.0.1:1".parse().unwrap()
+/// What a restore of `node` whose seeds are `seeds` has decided after `within`, if anything.
+async fn decided(
+    node: NodeId,
+    seeds: &[SocketAddr],
+    replace: bool,
+    within: Duration,
+) -> Option<Decision> {
+    let asking = Asking {
+        between_rounds: Duration::from_millis(100),
+        ..Asking::new(node, SECRET, WINDOW, replace)
+    };
+    let members = Members::default();
+    let rounds = ask_until_decided(&asking, &members, || std::future::ready(seeds.to_vec()));
+    tokio::time::timeout(within, rounds).await.ok()
 }
 
-/// The fresh host's guard: it is a restore of `node`, listens at `own_address()`, and a window and
-/// a seed timeout short enough for a test.
-fn config(node: NodeId, secret: &str) -> GuardConfig {
-    GuardConfig {
-        window: Some(WINDOW),
-        seed_timeout: Duration::from_millis(500),
-        ..GuardConfig::new(node, vec![own_address()], secret)
-    }
-}
+const SOON: Duration = Duration::from_secs(10);
 
-// -- the probe (9a, 9d) -------------------------------------------------------------------------
-
-/// A live member answers a probe with a `Welcome` whose proof verifies, and the probe says so.
+/// A live member answers a probe with a `Welcome` whose proof verifies.
 #[tokio::test]
 async fn a_live_member_answers_a_probe() {
     let host = live(SECRET).await;
-    assert!(
-        probe_peer(host.engine.node_id(), host.addr, SECRET).await,
-        "the probe was answered by a Welcome whose proof verified"
-    );
+    let answered = probe_answer(host.engine.node_id(), host.addr, SECRET).await;
+    assert_eq!(answered.map(|(node, _)| node), Some(host.engine.node_id()));
     host.serving.abort();
 }
 
@@ -81,22 +81,18 @@ async fn a_live_member_answers_a_probe() {
 #[tokio::test]
 async fn a_wrong_secret_and_a_closed_port_are_not_answers() {
     let host = live("another-secret-entirely").await;
-    assert!(!probe_peer(host.engine.node_id(), host.addr, SECRET).await, "a bad proof");
-    assert!(!probe_peer(host.engine.node_id(), a_stopped_hosts_address().await, SECRET).await);
+    let node = host.engine.node_id();
+    assert!(probe_answer(node, host.addr, SECRET).await.is_none(), "a bad proof");
+    assert!(probe_answer(node, a_stopped_hosts_address().await, SECRET).await.is_none());
     host.serving.abort();
 }
 
-// -- the guard (9a, 9c to 9h) -------------------------------------------------------------------
-
-/// 9a: a live old host of the node, listed at another address, answers: the fresh host halts itself
-/// with the address that answered.
+/// 9a: a running host of the node halts the fresh one, with the address that answered.
 #[tokio::test]
 async fn a_live_host_of_the_node_halts_the_fresh_one() {
     let old = live(SECRET).await;
-    let node = old.engine.node_id();
-    let listed = vec![(old.addr, node)];
-    let verdict = run_guard(&config(node, SECRET), || Some(listed.clone())).await;
-    assert_eq!(verdict, GuardVerdict::LiveHost(old.addr));
+    let verdict = decided(old.engine.node_id(), &[old.addr], false, SOON).await;
+    assert_eq!(verdict, Some(Decision::LiveHost(old.addr)));
     old.serving.abort();
 }
 
@@ -106,127 +102,29 @@ async fn the_probed_host_records_nothing_and_is_not_halted() {
     let old = live(SECRET).await;
     let node = old.engine.node_id();
     let own_epoch = old.engine.epoch();
-    let listed = vec![(old.addr, node)];
-    let _ = run_guard(&config(node, SECRET), || Some(listed.clone())).await;
+    let _ = decided(node, &[old.addr], false, SOON).await;
     assert_eq!(old.engine.newest_epoch(node).unwrap(), own_epoch, "its table is unchanged");
     assert!(old.engine.halted().is_none(), "and it is not halted");
+    assert!(!old.engine.has_met_a_peer(), "and it has met nobody");
     old.serving.abort();
 }
 
-/// 9c: a host that SWIM still lists but that is stopped does not answer, and the legitimate
-/// replacement proceeds once the window has passed.
-#[tokio::test]
-async fn a_listed_host_that_is_stopped_does_not_halt_the_replacement() {
-    let node = NodeId::generate();
-    let listed = vec![(a_stopped_hosts_address().await, node)];
-    let started = Instant::now();
-    let verdict = run_guard(&config(node, SECRET), || Some(listed.clone())).await;
-    assert_eq!(verdict, GuardVerdict::Pass);
-    assert!(
-        started.elapsed() < WINDOW + Duration::from_secs(2),
-        "it waited no more than the window"
-    );
-}
-
-/// 9d: a host that answers with a proof that does not verify is not a live host.
+/// 9d: a host that answers with a proof that does not verify is not a live host: it halts nobody,
+/// and it is no answer to pass on.
 #[tokio::test]
 async fn an_answer_with_a_bad_proof_does_not_halt_the_fresh_host() {
     let impostor = live("a-different-cluster-secret").await;
     let node = impostor.engine.node_id();
-    let listed = vec![(impostor.addr, node)];
-    assert_eq!(run_guard(&config(node, SECRET), || Some(listed.clone())).await, GuardVerdict::Pass);
+    let verdict = decided(node, &[impostor.addr], false, Duration::from_secs(2)).await;
+    assert_eq!(verdict, None);
     impostor.serving.abort();
 }
 
-/// 9e: with `--replace` honoured a live host that answers does not halt the fresh one.
+/// 9e: with `--replace` honoured a running host of the node does not halt the fresh one.
 #[tokio::test]
 async fn replace_proceeds_although_a_live_host_answers() {
     let old = live(SECRET).await;
-    let node = old.engine.node_id();
-    let listed = vec![(old.addr, node)];
-    let config = GuardConfig { replace: true, ..config(node, SECRET) };
-    assert_eq!(run_guard(&config, || Some(listed.clone())).await, GuardVerdict::Pass);
+    let verdict = decided(old.engine.node_id(), &[old.addr], true, SOON).await;
+    assert!(matches!(verdict, Some(Decision::Pass { .. })), "{verdict:?}");
     old.serving.abort();
-}
-
-/// 9h: no seed configured, or none reachable: nobody to ask, and no wait.
-#[tokio::test]
-async fn no_seed_and_no_reachable_seed_pass_at_once() {
-    let node = NodeId::generate();
-    for (configured, answered) in [(false, false), (true, false)] {
-        let config = GuardConfig {
-            seed_configured: configured,
-            a_seed_answered: answered,
-            ..config(node, SECRET)
-        };
-        let started = Instant::now();
-        assert_eq!(run_guard(&config, || None).await, GuardVerdict::Pass);
-        assert!(started.elapsed() < Duration::from_millis(300), "no wait: {:?}", started.elapsed());
-    }
-}
-
-/// A seed answered and the first member list has not come: the guard waits for it, and probes what
-/// it names.
-#[tokio::test]
-async fn a_seed_that_answered_waits_for_the_first_list_and_then_probes() {
-    let old = live(SECRET).await;
-    let node = old.engine.node_id();
-    let listed = vec![(old.addr, node)];
-    let born = Instant::now();
-    let arrives = Duration::from_millis(250);
-    let verdict =
-        run_guard(&config(node, SECRET), || (born.elapsed() >= arrives).then(|| listed.clone()))
-            .await;
-    assert_eq!(verdict, GuardVerdict::LiveHost(old.addr));
-    old.serving.abort();
-}
-
-/// A member list that never comes ends at the seed timeout, and the host proceeds.
-#[tokio::test]
-async fn a_member_list_that_never_comes_ends_at_the_seed_timeout() {
-    let node = NodeId::generate();
-    let started = Instant::now();
-    let verdict = run_guard(&config(node, SECRET), || None).await;
-    assert_eq!(verdict, GuardVerdict::Pass);
-    assert!(
-        started.elapsed() >= Duration::from_millis(450),
-        "it waited for the first list: {:?}",
-        started.elapsed()
-    );
-}
-
-/// A list that does not name this node at another address passes at once: this host's own entry is
-/// not another.
-#[tokio::test]
-async fn a_list_that_does_not_name_the_node_elsewhere_passes_at_once() {
-    let old = live(SECRET).await;
-    let node = NodeId::generate();
-    let someone_else = vec![(old.addr, old.engine.node_id())];
-    let own = vec![(own_address(), node)];
-    for listed in [someone_else, own] {
-        let started = Instant::now();
-        assert_eq!(
-            run_guard(&config(node, SECRET), || Some(listed.clone())).await,
-            GuardVerdict::Pass
-        );
-        assert!(started.elapsed() < Duration::from_millis(300), "no probe, no wait");
-    }
-    old.serving.abort();
-}
-
-// -- a seed that answers (the guard's "a seed answered" fact) -----------------------------------
-
-/// A seed that is up answers a probe; one that is down, or does not resolve, does not.
-#[tokio::test]
-async fn a_seed_that_is_up_answers_and_one_that_is_down_does_not() {
-    let up = live(SECRET).await;
-    let down = a_stopped_hosts_address().await;
-    let guard = config(NodeId::generate(), SECRET);
-    assert!(a_seed_answers(&guard, &[up.addr.to_string()]).await, "a seed that is up");
-    assert!(
-        !a_seed_answers(&guard, &[down.to_string(), "no-such-host.invalid:1".into()]).await,
-        "a seed that is down, and a name that does not resolve"
-    );
-    assert!(!a_seed_answers(&guard, &[]).await, "no seeds");
-    up.serving.abort();
 }

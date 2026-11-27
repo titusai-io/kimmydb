@@ -76,54 +76,13 @@ fn the_bound_reads_the_later_of_the_wall_clock_and_the_logical_clock() {
     );
 }
 
-// -- the guard (test 9, with the window and the three cases ruled on 2026-11-25)
-// ------------------------------------------
+// -- the guard's window (test 9) ----------------------------------------------------------------
 
 const SUSPECT_TO_DOWN: Duration = Duration::from_millis(4_800);
 
 #[test]
 fn the_window_is_twice_the_suspicion_to_down_time() {
     assert_eq!(guard_window(SUSPECT_TO_DOWN), Duration::from_millis(9_600));
-}
-
-/// (i) no seed configured, and a seed that answers nothing: nobody to ask, so no wait (9h).
-#[test]
-fn the_guard_passes_at_once_with_no_seed_or_no_seed_reachable() {
-    assert_eq!(guard_step(false, false, false, false, SUSPECT_TO_DOWN), GuardStep::Pass, "no seed");
-    assert_eq!(
-        guard_step(true, false, false, false, SUSPECT_TO_DOWN),
-        GuardStep::Pass,
-        "none answers"
-    );
-}
-
-/// (ii) a seed answers and no member list has arrived: wait for the first one, bounded by the seed
-/// timeout.
-#[test]
-fn the_guard_waits_for_the_first_member_list_but_not_for_ever() {
-    assert_eq!(
-        guard_step(true, true, false, false, SUSPECT_TO_DOWN),
-        GuardStep::AwaitMemberList(SEED_TIMEOUT)
-    );
-    assert!(
-        SEED_TIMEOUT > guard_window(SUSPECT_TO_DOWN),
-        "a slow first list is not read as silence"
-    );
-}
-
-/// (iii) another address lists this node id: probe it and wait the window. The list without it
-/// passes.
-#[test]
-fn the_guard_probes_an_address_that_lists_this_node_and_passes_when_none_does() {
-    assert_eq!(
-        guard_step(true, true, true, true, SUSPECT_TO_DOWN),
-        GuardStep::Probe(guard_window(SUSPECT_TO_DOWN))
-    );
-    assert_eq!(
-        guard_step(true, true, true, false, SUSPECT_TO_DOWN),
-        GuardStep::Pass,
-        "the list does not name it"
-    );
 }
 
 // -- the halt marker (test 17, ruling 7 as the model row made it exact)

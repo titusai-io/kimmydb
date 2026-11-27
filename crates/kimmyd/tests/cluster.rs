@@ -5595,6 +5595,9 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
     }
     for (node, backup) in [&a, &b, &c].into_iter().zip(&backups) {
         std::fs::remove_dir_all(node.dir.path().join("data")).unwrap();
+        // Restored whole, no member has a running one to be answered by: one is told it replaces
+        // its node, and the others are answered by it (ADR-274).
+        let replace: &[&str] = if std::ptr::eq(node, &a) { &["--replace"] } else { &[] };
         let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
             .arg("--config")
             .arg(node.dir.path().join("kimmy.toml"))
@@ -5603,6 +5606,7 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
             .arg(backup)
             .arg("--until")
             .arg(until_ms.to_string())
+            .args(replace)
             .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
             .output()
             .expect("running kimmyd restore --until");
@@ -5767,6 +5771,9 @@ async fn a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_rem
     }
     for (node, backup) in [&a, &b, &c].into_iter().zip(&backups) {
         std::fs::remove_dir_all(node.dir.path().join("data")).unwrap();
+        // Restored whole, no member has a running one to be answered by: one is told it replaces
+        // its node, and the others are answered by it (ADR-274).
+        let replace: &[&str] = if std::ptr::eq(node, &a) { &["--replace"] } else { &[] };
         let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
             .arg("--config")
             .arg(node.dir.path().join("kimmy.toml"))
@@ -5775,6 +5782,7 @@ async fn a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_rem
             .arg(backup)
             .arg("--until")
             .arg(until_ms.to_string())
+            .args(replace)
             .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
             .output()
             .expect("running kimmyd restore --until");
@@ -6107,9 +6115,9 @@ async fn seconds_between_lines(node: &Node, from: &'static str, to: &'static str
 }
 
 /// A new member has never run anywhere else, so it has nothing to ask the mistaken-restore guard
-/// (ADR-274) and serves as soon as it is up, beside a seed that answers. Guarded, it would wait
-/// for a member list that its own held replication loop never asks for, until the guard gives up
-/// at 15 s; the bound is well under that and well over a start on a loaded machine.
+/// (ADR-274) and joins as soon as it is up, beside a seed that answers. Guarded, it would wait
+/// for a member's answer to count, and this seed is a new member that has met nobody, whose
+/// answer never does; the bound is well over a start on a loaded machine.
 #[tokio::test]
 #[ignore = "boots a real two-node cluster; run with --ignored"]
 async fn a_new_member_serves_at_once_beside_an_answering_seed() {
