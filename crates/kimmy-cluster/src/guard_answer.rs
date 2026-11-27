@@ -3,6 +3,7 @@
 //! the report a dialler hands an undecided member back over the connection it opened.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -10,6 +11,7 @@ use std::time::Instant;
 use kimmy_core::NodeId;
 use kimmy_storage::Engine;
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::membership::Members;
@@ -27,8 +29,12 @@ pub(crate) struct GuardState {
     /// This process's token, made at the first answer.
     token: OnceLock<Vec<u8>>,
     gossiping_since: OnceLock<Instant>,
-    /// The reports handed to this member while it was undecided, by the dialler's token.
+    /// Where this member tells others it listens.
+    address: OnceLock<SocketAddr>,
+    /// The reports handed to this member while it was undecided and not yet taken, by the
+    /// dialler's token.
     reports: Mutex<BTreeMap<Vec<u8>, (NodeId, GuardAnswer)>>,
+    report_arrived: Notify,
     cut_said: AtomicBool,
 }
 
@@ -37,6 +43,12 @@ impl Members {
     /// Later calls do nothing.
     pub(crate) fn note_gossiping(&self) {
         let _ = self.guard_state().gossiping_since.set(Instant::now());
+    }
+
+    /// Where this member tells others it listens, for the report it hands an undecided member.
+    /// Later calls do nothing.
+    pub(crate) fn note_address(&self, address: SocketAddr) {
+        let _ = self.guard_state().address.set(address);
     }
 
     /// Whether this member is undecided: its mistaken-restore guard holds it.
@@ -86,7 +98,7 @@ impl Members {
             founded_unmet: engine.is_founding_epoch() && !engine.has_met_a_peer(),
             listings,
             members,
-            address: None,
+            address: state.address.get().map(ToString::to_string),
         }
     }
 
@@ -101,10 +113,23 @@ impl Members {
             reports.pop_first();
         }
         reports.insert(report.token.clone(), (from, report));
+        drop(reports);
+        self.guard_state().report_arrived.notify_one();
     }
 
-    /// The reports diallers have handed this member while it was undecided, the latest of each
-    /// dialling process, each with the node id its dialler proved the cluster secret under.
+    /// Take the reports that have arrived: each is one answer, of one round of the guard's.
+    pub(crate) fn take_guard_reports(&self) -> Vec<(NodeId, GuardAnswer)> {
+        std::mem::take(&mut *self.guard_state().reports.lock()).into_values().collect()
+    }
+
+    /// Wait for a report to arrive since the last wait, or at once if one has.
+    pub(crate) async fn guard_report_arrived(&self) {
+        self.guard_state().report_arrived.notified().await;
+    }
+
+    /// The reports diallers have handed this member while it was undecided that its guard has not
+    /// taken, the latest of each dialling process, each with the node id its dialler proved the
+    /// cluster secret under.
     pub fn guard_reports(&self) -> Vec<(NodeId, GuardAnswer)> {
         self.guard_state().reports.lock().values().cloned().collect()
     }

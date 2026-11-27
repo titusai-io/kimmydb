@@ -1418,6 +1418,7 @@ pub async fn run(
 
     info!(bind = %local, "gossiping membership");
     members.note_gossiping();
+    members.note_address(local);
 
     let mut collector = Collector {
         outgoing: Outgoing::default(),

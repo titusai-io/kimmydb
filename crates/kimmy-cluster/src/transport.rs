@@ -1772,13 +1772,16 @@ where
         }
     };
 
-    // A member its mistaken-restore guard holds (ADR-274) is undecided: it says so at once, in a
-    // `Welcome` with no epoch, and records nothing of whoever asked. One that the guard has halted
-    // answers nobody.
-    let undecided = members.filter(|members| members.guard_standing() == Standing::Undecided);
-    if undecided.is_some() && engine.halted().is_some() {
+    // A halted host (ADR-274) answers nobody, whether its guard halted it or it was told of a
+    // newer epoch of its node: it serves nothing, so an answer of it would say nothing of where
+    // its node runs, and would halt a restore that replaces it. The daemon stops this listener
+    // soon after a halt; this closes the time between.
+    if engine.halted().is_some() {
         return Err(ProtocolError::Closed);
     }
+    // A member its mistaken-restore guard holds is undecided: it says so at once, in a `Welcome`
+    // with no epoch, and records nothing of whoever asked.
+    let undecided = members.filter(|members| members.guard_standing() == Standing::Undecided);
 
     // Answer their challenge and issue ours in the same frame.
     let ours = nonce(engine.node_id());
