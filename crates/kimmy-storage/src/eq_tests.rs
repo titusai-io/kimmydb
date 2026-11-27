@@ -1248,6 +1248,82 @@ fn the_schedules_of_seeds_235_259_and_953_agree_in_every_column() {
     assert!(failures.is_empty(), "{} failure(s):\n{}", failures.len(), failures.join("\n"));
 }
 
+/// The schedule of seed 13, whose joiner is B, as the generated run printed it. A database drop buries A's `orders` by an entry of
+/// its own, and C's later drop of `orders` is the floor the function names. PIN B holds a name to such a burial only where the
+/// burial sorts above that floor: here it sorts below, and every member holds the floor. A pin that took this burial too was caught
+/// by the generated run, and by this seed alone of the library's, so the schedule is a row of its own.
+const BELOW_THE_FLOOR: &str = "A.create(orders)@110; C.create(orders)@120; B<-C entries; B<-C whole; A<-C scoped(orders); \
+                               C.create(items)@160; A.dropdb@170; C<-B entries(cut at 2); C.write(orders/1)@190; \
+                               A.drop(orders)@200; C.drop(orders)@210";
+
+#[test]
+fn a_database_drops_burial_below_the_floor_is_not_pinned() {
+    let ops = parse(BELOW_THE_FLOOR);
+    for route in [Route::Entries, Route::Pages] {
+        let run = plain_run(&ops, route, B as usize).unwrap_or_else(|e| panic!("{route:?}: {e}"));
+        for (name, want, views) in &run.names {
+            let differences = compare(want, views);
+            assert!(differences.is_empty(), "{route:?} {name}: {differences:?}");
+        }
+    }
+    // the premise, on members of its own: what the ledger holds of `orders`
+    let base = base();
+    let mut cluster = Cluster::new(base);
+    let mut ledger = Ledger::default();
+    for (i, op) in ops.iter().enumerate() {
+        cluster.step = i;
+        ledger.step(&mut cluster, *op).unwrap();
+        cluster.finish_purges().unwrap();
+    }
+    let id = CollectionId::derive(DB, "orders");
+    let want = ledger.expected("orders");
+    let floor = want.answer.floor.expect("premise: orders has a floor");
+    let (entry, of) = &ledger.entries[&floor];
+    assert!(
+        entry.kind == OpKind::DropCollection
+            && entry.collection == id
+            && of.is_none()
+            && floor.node == cluster.e(C as usize).node_id()
+            && floor.hlc.wall_ms == base + 210,
+        "premise: the floor the function names is C's drop of orders at 210: {entry:?}"
+    );
+    assert!(
+        ledger.entries.iter().any(|(stamp, (entry, of))| {
+            entry.collection == id
+                && of.is_some()
+                && stamp.hlc.wall_ms == base + 170
+                && *stamp < floor
+        }),
+        "premise: a database drop buried orders at 170, below that floor"
+    );
+}
+
+/// With the purger off, a member that dropped a collection still holds its rows, with no collection over them. No schedule's
+/// quiescence leaves such a row, so the read that reports one is exercised here.
+const UNPURGED: &str =
+    "purger off; B.create(orders)@110; B.write(orders/1)@120; B.drop(orders)@130";
+
+#[test]
+fn a_live_row_with_no_collection_over_it_is_read() {
+    let mut cluster = Cluster::new(base());
+    let mut ledger = Ledger::default();
+    for (i, op) in parse(UNPURGED).iter().enumerate() {
+        cluster.step = i;
+        ledger.step(&mut cluster, *op).unwrap();
+    }
+    let want = ledger.expected("orders");
+    let before = view(cluster.e(B as usize), "orders", &want).unwrap();
+    assert!(!before.identity_stands, "premise: B holds no collection");
+    assert!(
+        before.documents.get(&1).is_some_and(|(_, body)| body.starts_with("no collection held")),
+        "the live row with no collection over it is read: {:?}",
+        before.documents
+    );
+    cluster.finish_purges().unwrap();
+    let after = view(cluster.e(B as usize), "orders", &want).unwrap();
+    assert!(after.documents.is_empty(), "premise: the purge removes it: {:?}", after.documents);
+}
+
 /// A schedule whose last step leaves a pull of ONE collection waiting: B drops a life that holds a row while its purger is
 /// behind, then pulls a page of A's newer life of the name, which waits for the purger and which the model never resumes.
 /// Quiescence pulls entries, or whole databases by pages, and never one collection's page, so nothing but the run's own
@@ -1285,28 +1361,91 @@ fn a_pull_the_run_abandons_at_a_waiting_page_is_forgotten() {
 const DEFAULT_SEEDS: u64 = 100;
 
 /// What the library's own seeds drew when the floor was measured: for each set of kinds, the names (a route at a time) that had
-/// it, and how many of them PIN B held. The clocks are scripted, so these repeat. A change to either is a change in what the run
+/// it, how many of them PIN B held, and the columns that held nothing in any of those names besides [`NOTHING_SEEN`]. A set's
+/// agreement in a column says something only where the column held something on at least one side ([`shows`]): one seen in another
+/// set does not count for this one. The clocks are scripted, so these repeat. A change to any of them is a change in what the run
 /// asserts, and is restated on purpose: a draw that shrank would pass every other assert.
 ///
 /// **These counts are tied to the generator** ([`plain_schedule`]: the convergence model's `generate`, less its garbage
 /// collections), **to the seeds `0..DEFAULT_SEEDS` and to the two routes. A deliberate change to any of them measures these
 /// again, in the same commit.**
-const MEASURED: &[(&[Kind], usize, usize)] = &[
-    (&[], 136, 0),
-    (&[Kind::Create], 78, 0),
-    (&[Kind::Create, Kind::Touch], 82, 0),
-    (&[Kind::Create, Kind::Drop], 32, 0),
-    (&[Kind::Create, Kind::Touch, Kind::Drop], 20, 0),
-    (&[Kind::DatabaseDrop], 16, 0),
-    (&[Kind::Create, Kind::DatabaseDrop], 14, 8),
-    (&[Kind::Create, Kind::Touch, Kind::DatabaseDrop], 14, 10),
-    (&[Kind::Create, Kind::Drop, Kind::DatabaseDrop], 4, 4),
-    (&[Kind::Create, Kind::Touch, Kind::Drop, Kind::DatabaseDrop], 4, 2),
+const MEASURED: &[(&[Kind], usize, usize, &[Column])] = &[
+    (
+        &[],
+        136,
+        0,
+        &[
+            Column::Serves,
+            Column::Identity,
+            Column::Floor,
+            Column::Documents,
+            Column::LiveRows,
+            Column::OwnTombstone,
+            Column::DatabaseTombstone,
+            Column::EffectiveFloor,
+            Column::Options,
+        ],
+    ),
+    (
+        &[Kind::Create],
+        78,
+        0,
+        &[
+            Column::Floor,
+            Column::Documents,
+            Column::LiveRows,
+            Column::OwnTombstone,
+            Column::DatabaseTombstone,
+            Column::EffectiveFloor,
+        ],
+    ),
+    (
+        &[Kind::Create, Kind::Touch],
+        82,
+        0,
+        &[Column::Floor, Column::OwnTombstone, Column::DatabaseTombstone, Column::EffectiveFloor],
+    ),
+    (
+        &[Kind::Create, Kind::Drop],
+        32,
+        0,
+        &[Column::Documents, Column::LiveRows, Column::DatabaseTombstone],
+    ),
+    (&[Kind::Create, Kind::Touch, Kind::Drop], 20, 0, &[Column::DatabaseTombstone]),
+    (
+        &[Kind::DatabaseDrop],
+        16,
+        0,
+        &[
+            Column::Serves,
+            Column::Identity,
+            Column::Documents,
+            Column::LiveRows,
+            Column::OwnTombstone,
+            Column::Options,
+        ],
+    ),
+    (&[Kind::Create, Kind::DatabaseDrop], 14, 8, &[Column::Documents, Column::LiveRows]),
+    (&[Kind::Create, Kind::Touch, Kind::DatabaseDrop], 14, 10, &[]),
+    (
+        &[Kind::Create, Kind::Drop, Kind::DatabaseDrop],
+        4,
+        4,
+        &[Column::Serves, Column::Identity, Column::Documents, Column::LiveRows],
+    ),
+    (
+        &[Kind::Create, Kind::Touch, Kind::Drop, Kind::DatabaseDrop],
+        4,
+        2,
+        &[Column::Documents, Column::LiveRows],
+    ),
 ];
 
-/// The columns that held nothing in any name of the library's seeds: empty on both sides, so that their agreeing there shows
-/// nothing. No step drawn here gives four of them anything. The document tombstones are the fifth kind of empty: the seeds draw
-/// deletes, and none leaves a tombstone above the floor (longer runs see some; the documents row's delete reads one).
+/// The columns that held nothing in any set of kinds of the library's seeds: empty on both sides, so that their agreeing shows
+/// nothing anywhere. No step drawn here is of a swap, so nothing gives the stages held, the register, what is superseded, the
+/// invalid facts or the names rows anything. The document tombstones are another kind of empty: the seeds draw deletes, and none
+/// leaves a tombstone above the floor (longer runs see some; the documents row's delete reads one). A column that holds nothing is
+/// still compared, and any difference in it still fails.
 const NOTHING_SEEN: &[Column] = &[
     Column::Alive,
     Column::Register,
@@ -1316,23 +1455,133 @@ const NOTHING_SEEN: &[Column] = &[
     Column::Names,
 ];
 
-/// Whether `column` has something in it for this member of this name: where it has not, its agreeing says nothing.
-fn shows(column: Column, want: &Expected, v: &View) -> bool {
+/// Whether `column` holds something on at least one side for this member of this name: against the function, the member's read or
+/// the function's value; against the first member, this member's or the first's. Where it holds nothing, its agreeing says nothing.
+fn shows(column: Column, want: &Expected, v: &View, first: &View) -> bool {
+    let a = &want.answer;
     match column {
-        Column::Serves => v.serves != Serves::Absent,
-        Column::Identity => v.identity_stands,
-        Column::Floor | Column::EffectiveFloor => v.effective_floor().is_some(),
-        Column::Alive => !v.alive.is_empty(),
-        Column::Register => !v.register.is_empty(),
-        Column::Superseded => v.superseded.values().any(Option::is_some),
-        Column::Invalid => !want.answer.invalid.is_empty(),
-        Column::Documents | Column::LiveRows => !v.documents.is_empty(),
-        Column::Tombstones => !v.tombstones.is_empty(),
-        Column::OwnTombstone => v.own_tombstone.is_some(),
-        Column::DatabaseTombstone => v.database_tombstone.is_some(),
-        Column::Options => v.options.is_some(),
-        Column::Names => v.names.is_some(),
+        Column::Serves => v.serves != Serves::Absent || a.serves != Serves::Absent,
+        Column::Identity => v.identity_stands || a.identity_stands,
+        Column::Floor => v.effective_floor().is_some() || want.floor_today().is_some(),
+        Column::Alive => !v.alive.is_empty() || !a.alive.is_empty(),
+        Column::Register => !v.register.is_empty() || !a.register.is_empty(),
+        Column::Superseded => {
+            v.superseded.values().chain(a.superseded.values()).any(Option::is_some)
+        }
+        Column::Invalid => !v.invalid_held.is_empty() || !a.invalid.is_empty(),
+        Column::Documents => !v.documents.is_empty() || !want.documents.is_empty(),
+        Column::LiveRows => !v.documents.is_empty() || !first.documents.is_empty(),
+        Column::Tombstones => !v.tombstones.is_empty() || !first.tombstones.is_empty(),
+        Column::OwnTombstone => v.own_tombstone.is_some() || first.own_tombstone.is_some(),
+        Column::DatabaseTombstone => {
+            v.database_tombstone.is_some() || first.database_tombstone.is_some()
+        }
+        Column::EffectiveFloor => {
+            v.effective_floor().is_some() || first.effective_floor().is_some()
+        }
+        Column::Options => v.options.is_some() || first.options.is_some(),
+        Column::Names => v.names.is_some() || first.names.is_some(),
     }
+}
+
+/// Of the columns `seen` to hold something in some name of a set of kinds, those that never did.
+fn held_nothing(seen: Option<&BTreeSet<Column>>) -> BTreeSet<Column> {
+    columns(false).into_iter().filter(|c| !seen.is_some_and(|seen| seen.contains(c))).collect()
+}
+
+/// [`shows`] reads both sides of each comparison. Where the members of a schedule agree, the two sides are equal, so only sides
+/// made unequal can tell a reading of one side from a reading of both.
+#[test]
+fn a_column_holds_something_where_either_side_does() {
+    use Column::*;
+    let against_the_function =
+        [Serves, Identity, Floor, Alive, Register, Superseded, Invalid, Documents];
+    let cluster = Cluster::new(base());
+    let author = cluster.e(0);
+    let stamp = Stamp::new(Hlc::new(1, 0), author.node_id(), author.epoch());
+    let stage = || "orders.__stg.x".to_string();
+    let no_function = Ledger::default().expected(NAMES[0]);
+    let no_member = View {
+        serves: kimmy_core::register_function::Serves::Absent,
+        identity_stands: false,
+        alive: BTreeSet::new(),
+        register: Vec::new(),
+        superseded: BTreeMap::new(),
+        invalid_held: BTreeSet::new(),
+        documents: BTreeMap::new(),
+        tombstones: BTreeMap::new(),
+        own_tombstone: None,
+        database_tombstone: None,
+        options: None,
+        names: None,
+    };
+    let mut wrong = Vec::new();
+    let mut check = |held: bool, wanted: bool, what: String| {
+        if held != wanted {
+            wrong.push(what);
+        }
+    };
+    for column in columns(false) {
+        let mut member = no_member.clone();
+        match column {
+            Serves => member.serves = kimmy_core::register_function::Serves::Identity,
+            Identity => member.identity_stands = true,
+            Floor | EffectiveFloor | OwnTombstone => member.own_tombstone = Some(stamp),
+            DatabaseTombstone => member.database_tombstone = Some(stamp),
+            Alive => {
+                member.alive.insert(stage());
+            }
+            Register => member.register.push((stamp, RegisterEvent::LogicalDrop)),
+            Superseded => {
+                member.superseded.insert(stage(), Some(stamp));
+            }
+            Invalid => {
+                member.invalid_held.insert(stamp);
+            }
+            Documents | LiveRows => {
+                member.documents.insert(1, (stamp, String::new()));
+            }
+            Tombstones => {
+                member.tombstones.insert(1, stamp);
+            }
+            Options => member.options = Some(vec![0]),
+            Names => member.names = Some(vec![0]),
+        }
+        let neither = shows(column, &no_function, &no_member, &no_member);
+        check(neither, false, format!("{column:?}: neither side holds anything"));
+        let alone = shows(column, &no_function, &member, &no_member);
+        check(alone, true, format!("{column:?}: the member's side alone"));
+        if !against_the_function.contains(&column) {
+            let first = shows(column, &no_function, &no_member, &member);
+            check(first, true, format!("{column:?}: the first's side alone"));
+            continue;
+        }
+        let first = shows(column, &no_function, &no_member, &member);
+        check(first, false, format!("{column:?}: the first member is no side of it"));
+        let mut function = no_function.clone();
+        match column {
+            Serves => function.answer.serves = kimmy_core::register_function::Serves::Identity,
+            Identity => function.answer.identity_stands = true,
+            Floor => function.answer.floor = Some(stamp),
+            Alive => {
+                function.answer.alive.insert(stage(), stamp.hlc);
+            }
+            Register => function.answer.register.push((stamp, FoldEvent::Drop)),
+            Superseded => {
+                function.answer.superseded.insert(stage(), Some(stamp));
+            }
+            Invalid => {
+                function.answer.invalid.insert(stamp);
+            }
+            Documents => {
+                function.documents.insert(1, stamp);
+            }
+            other => panic!("{other:?} is not compared with the function"),
+        }
+        let alone = shows(column, &function, &no_member, &no_member);
+        check(alone, true, format!("{column:?}: the function's side alone"));
+    }
+    assert!(wrong.is_empty(), "wrongly judged:\n{}", wrong.join("\n"));
 }
 
 #[test]
@@ -1344,7 +1593,8 @@ fn generated_plain_schedules_hold_the_measured_floor() {
     let mut cells: BTreeMap<(Kinds, Column), Vec<String>> = BTreeMap::new();
     // for each set of kinds: the names that had it, and how many of them PIN B held
     let mut drawn: BTreeMap<Kinds, (usize, usize)> = BTreeMap::new();
-    let mut seen = BTreeSet::new();
+    // for each set of kinds: the columns that held something in at least one of its names
+    let mut seen_in: BTreeMap<Kinds, BTreeSet<Column>> = BTreeMap::new();
     let mut errors = Vec::new();
     for seed in start..start + count {
         let ops = plain_schedule(seed);
@@ -1362,8 +1612,8 @@ fn generated_plain_schedules_hold_the_measured_floor() {
                 of_these_kinds.1 += usize::from(want.pinned_at().is_some());
                 let differences = compare(want, views);
                 for column in columns(!want.answer.register.is_empty()) {
-                    if views.iter().any(|v| shows(column, want, v)) {
-                        seen.insert(column);
+                    if views.iter().any(|v| shows(column, want, v, &views[0])) {
+                        seen_in.entry(want.kinds.clone()).or_default().insert(column);
                     }
                     let of_members: Vec<String> = differences
                         .iter()
@@ -1382,10 +1632,11 @@ fn generated_plain_schedules_hold_the_measured_floor() {
             }
         }
     }
-    let nothing_seen: BTreeSet<Column> =
-        columns(false).into_iter().filter(|column| !seen.contains(column)).collect();
+    // for each set of kinds, the columns that held nothing in any of its names: their agreeing there shows nothing
+    let nothing_in: BTreeMap<Kinds, BTreeSet<Column>> =
+        drawn.keys().map(|kinds| (kinds.clone(), held_nothing(seen_in.get(kinds)))).collect();
     let mut report = format!(
-        "EQ, {count} seeds from {start}, by entries and by pages, in {:?}:\n  nothing seen in {nothing_seen:?}\n",
+        "EQ, {count} seeds from {start}, by entries and by pages, in {:?}:\n",
         started.elapsed()
     );
     for (kinds, (names, pinned)) in &drawn {
@@ -1397,7 +1648,11 @@ fn generated_plain_schedules_hold_the_measured_floor() {
         let _ = writeln!(
             report,
             "  {kinds:?}: {names} name runs, PIN B held {pinned}; {}",
-            if differ.is_empty() { "every column agrees" } else { "differs in:" }
+            if differ.is_empty() {
+                "every column that held something agrees"
+            } else {
+                "differs in:"
+            }
         );
         for (column, runs) in differ {
             let _ = writeln!(report, "    {column:?}: {} of {names}", runs.len());
@@ -1405,6 +1660,7 @@ fn generated_plain_schedules_hold_the_measured_floor() {
                 let _ = writeln!(report, "      {run}");
             }
         }
+        let _ = writeln!(report, "    nothing seen in {:?}", nothing_in[kinds]);
     }
     eprintln!("{report}");
     assert!(
@@ -1418,10 +1674,16 @@ fn generated_plain_schedules_hold_the_measured_floor() {
     if start == 0 && count == DEFAULT_SEEDS {
         let measured: BTreeMap<Kinds, (usize, usize)> = MEASURED
             .iter()
-            .map(|(kinds, names, pinned)| (kinds.iter().copied().collect(), (*names, *pinned)))
+            .map(|(kinds, names, pinned, _)| (kinds.iter().copied().collect(), (*names, *pinned)))
             .collect();
         assert_eq!(drawn, measured, "what the seeds draw:\n{report}");
-        let expected: BTreeSet<Column> = NOTHING_SEEN.iter().copied().collect();
-        assert_eq!(nothing_seen, expected, "the columns with nothing in them:\n{report}");
+        let expected: BTreeMap<Kinds, BTreeSet<Column>> = MEASURED
+            .iter()
+            .map(|(kinds, _, _, also)| {
+                let nothing = NOTHING_SEEN.iter().chain(also.iter()).copied().collect();
+                (kinds.iter().copied().collect(), nothing)
+            })
+            .collect();
+        assert_eq!(nothing_in, expected, "the columns with nothing in them, set by set:\n{report}");
     }
 }
