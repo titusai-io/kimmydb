@@ -38,8 +38,8 @@ use kimmy_core::oplog::OplogEntry;
 
 use crate::membership::Members;
 use crate::protocol::{
-    MAX_BATCH, MAX_FRAME, Message, ProtocolError, nonce, proof_is_valid, prove, read_frame,
-    write_frame,
+    MAX_BATCH, MAX_FRAME, Message, ProtocolError, Standing, nonce, proof_is_valid, prove,
+    read_frame, write_frame,
 };
 use crate::repair_ledger::{
     Confirmed, End, Judged, Key as LedgerKey, LedgerKind, MayPlan, RepairLedger, Transient, Verdict,
@@ -1741,8 +1741,8 @@ pub(crate) async fn accept_handshake<S>(
     stream: &mut S,
     secret: &str,
     binding: &[u8],
-    // Scaffold of the tests commit: read by the code commit.
-    _members: Option<&Members>,
+    // This member's set: whether its guard holds it, and what it answers a restore's guard.
+    members: Option<&Members>,
 ) -> Result<kimmy_core::NodeId, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1772,6 +1772,14 @@ where
         }
     };
 
+    // A member its mistaken-restore guard holds (ADR-274) is undecided: it says so at once, in a
+    // `Welcome` with no epoch, and records nothing of whoever asked. One that the guard has halted
+    // answers nobody.
+    let undecided = members.filter(|members| members.guard_standing() == Standing::Undecided);
+    if undecided.is_some() && engine.halted().is_some() {
+        return Err(ProtocolError::Closed);
+    }
+
     // Answer their challenge and issue ours in the same frame.
     let ours = nonce(engine.node_id());
     write_frame(
@@ -1781,8 +1789,10 @@ where
             nonce: ours.clone(),
             proof: prove(secret, &their_nonce, binding),
             protocol: Some(crate::protocol::PROTOCOL),
-            epoch: Some(engine.epoch()),
-            guard: None,
+            epoch: undecided.is_none().then(|| engine.epoch()),
+            guard: members
+                .filter(|_| probe || undecided.is_some())
+                .map(|members| Box::new(members.guard_answer(engine, node))),
         },
     )
     .await?;
@@ -1805,6 +1815,14 @@ where
         // them iterate towards a valid one.
         let _ = write_frame(stream, &Message::Fault("authentication failed".into())).await;
         return Err(ProtocolError::Unauthenticated);
+    }
+    // Undecided, and the proof has verified: the dialler's report is read, as one answer for this
+    // member's guard, and nothing else of the dialler is read or believed.
+    if let Some(members) = undecided {
+        if let Ok(Message::GuardReport { answer }) = read_frame(stream).await {
+            members.note_guard_report(node, *answer);
+        }
+        return Err(ProtocolError::Undecided);
     }
     // The proof has verified: only now is the peer's claim of its epoch believed (ADR-274). It is
     // bounded by this member's clock, recorded, and the contact ends if it is beyond the bound.
@@ -2058,12 +2076,17 @@ pub(crate) async fn dial_claimed(
         crate::tls::binding(conn).map_err(ProtocolError::Malformed)?
     };
 
-    let (their_node, their_epoch) = tokio::time::timeout(
+    let opened = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         open_handshake_claimed(engine, &mut stream, secret, &binding, members),
     )
     .await
-    .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
+    .map_err(|_| ProtocolError::TimedOut("handshake".into()))?;
+    if let Err(ProtocolError::Undecided) = opened {
+        // Closed in order, so that the report is read before the end of the stream is.
+        close(&mut stream).await;
+    }
+    let (their_node, their_epoch) = opened?;
     if dial_refused(|r| *r == DialRefusal::Node(their_node)) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
@@ -2122,9 +2145,12 @@ pub(crate) async fn probe_answer(
     attempt.await
 }
 
-/// Whether a probe of `peer` is answered by a live host: any verifying answer.
+/// Whether a probe of `peer` is answered by a live host. A member that says it is undecided is
+/// not one: its guard has not passed, so it has not joined (ADR-274).
 pub(crate) async fn probe_peer(own: NodeId, peer: SocketAddr, secret: &str) -> bool {
-    probe_answer(own, peer, secret).await.is_some()
+    probe_answer(own, peer, secret).await.is_some_and(|(_, answer)| {
+        answer.is_none_or(|answer| answer.standing != Standing::Undecided)
+    })
 }
 
 /// A connection [`dial`] opened for a round that has not started: dialled with the
@@ -7005,8 +7031,7 @@ async fn open_handshake_claimed<S>(
     stream: &mut S,
     secret: &str,
     binding: &[u8],
-    // Scaffold of the tests commit: read by the code commit.
-    _members: Option<&Members>,
+    members: Option<&Members>,
 ) -> Result<(kimmy_core::NodeId, kimmy_core::Epoch), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -7025,12 +7050,28 @@ where
     .await?;
 
     let (their_node, their_nonce, proof, their_epoch) = match read_frame(stream).await? {
-        Message::Welcome { node, nonce, proof, protocol, epoch, guard: _ } => {
+        Message::Welcome { node, nonce, proof, protocol, epoch, guard } => {
             if protocol != Some(crate::protocol::PROTOCOL) {
                 let reason = crate::protocol::release_fault(protocol);
                 warn!(peer = ?node, "refusing a peer: {reason}");
                 let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
                 return Err(ProtocolError::Release(reason));
+            }
+            // Read before the absence of an epoch is: an undecided member's `Welcome` carries
+            // none, which is not a build from before containment. Nothing it says of itself is
+            // believed: no epoch is recorded, no tell is acted on and no peer is met (ADR-274).
+            if guard.is_some_and(|answer| answer.standing == Standing::Undecided) {
+                if !proof_is_valid(secret, &ours, binding, &proof) {
+                    return Err(ProtocolError::Unauthenticated);
+                }
+                // Neither write's failure changes how the contact ends.
+                let proof = prove(secret, &nonce, binding);
+                let _ = write_frame(stream, &Message::Confirm { proof }).await;
+                if let Some(members) = members {
+                    let answer = Box::new(members.guard_answer(engine, node));
+                    let _ = write_frame(stream, &Message::GuardReport { answer }).await;
+                }
+                return Err(ProtocolError::Undecided);
             }
             let Some(epoch) = epoch else {
                 let reason = crate::protocol::pre_containment_fault();

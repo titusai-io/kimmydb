@@ -1747,6 +1747,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 slower(slowest_contact, contact.peer, contact.total_took + took);
                             contact.finish();
                         }
+                        // A member whose mistaken-restore guard has not passed (ADR-274): the
+                        // contact ended, no round ran, and nobody failed. It is dialled again at
+                        // the next tick, and handed a report each time.
+                        Err(crate::protocol::ProtocolError::Undecided) => {
+                            debug!(%peer, "left out: its mistaken-restore guard has not passed");
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
+                            contact.finish();
+                        }
                         Err(crate::protocol::ProtocolError::SelfContact) => {
                             self_addresses.insert(peer, Instant::now());
                             debug!(%peer, "left out: the peer at this address is this node");

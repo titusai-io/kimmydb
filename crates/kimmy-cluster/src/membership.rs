@@ -186,6 +186,8 @@ struct MembersInner {
     /// connection served here asks the peer for, and applies, when this member's
     /// replay of its own origin is owed (ADR-212's addendum).
     catch_up: std::sync::OnceLock<Arc<crate::catchup::CatchUp>>,
+    /// What this member says of itself to a restore that asks before it joins (ADR-274).
+    guard: crate::guard_answer::GuardState,
     /// The last block each peer sent (ADR-201), and the floors that keep an
     /// earlier-decoded block from coming back after a drop (ADR-213).
     ///
@@ -318,6 +320,10 @@ impl Members {
     /// once, at start.
     pub fn set_catch_up(&self, catch_up: Arc<crate::catchup::CatchUp>) {
         let _ = self.0.catch_up.set(catch_up);
+    }
+
+    pub(crate) fn guard_state(&self) -> &crate::guard_answer::GuardState {
+        &self.0.guard
     }
 
     /// The catching-up state, if the daemon gave it.
@@ -1411,6 +1417,7 @@ pub async fn run(
     });
 
     info!(bind = %local, "gossiping membership");
+    members.note_gossiping();
 
     let mut collector = Collector {
         outgoing: Outgoing::default(),

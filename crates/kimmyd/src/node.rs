@@ -2887,11 +2887,11 @@ async fn spawn_cluster(
             Some(evaluator),
         ));
     }
-    // A member the mistaken-restore guard holds (ADR-274; the start takes the hold) neither
-    // accepts nor dials until the guard has passed. The listener is bound (a peer that connects
-    // waits, and completes no handshake), the serve and replication tasks wait on this gate, and
-    // SWIM runs meanwhile, which is where the guard reads its list. Any other member passes at
-    // once.
+    // A member the mistaken-restore guard holds (ADR-274; the start takes the hold) dials nobody
+    // until the guard has passed: the replication task waits on this gate. The listener serves
+    // from the start, and while the hold is on it answers every dialler at once that this member
+    // is undecided, and nothing more; a member the guard has halted answers nobody. SWIM runs
+    // meanwhile, which is where the guard reads its list. Any other member passes at once.
     let hold = state.catch_up().filter(|catch_up| catch_up.held_by_guard()).cloned();
     let guarded = hold.is_some();
     let (gate_tx, gate_rx) =
@@ -2906,15 +2906,7 @@ async fn spawn_cluster(
         cluster_tls,
         live.clone(),
     );
-    let serving = kimmy_task::supervise("replication_server", shutdown.clone(), {
-        let mut gate = gate_rx.clone();
-        async move {
-            if !cluster_gate_open(&mut gate).await {
-                std::future::pending::<()>().await;
-            }
-            serve.await
-        }
-    });
+    let serving = kimmy_task::supervise("replication_server", shutdown.clone(), serve);
 
     // SWIM shares the port with replication: UDP for probes and membership,
     // TCP for oplog transfer. Bound here for the same reason as the listener —

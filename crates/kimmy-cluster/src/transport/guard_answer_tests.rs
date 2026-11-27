@@ -15,7 +15,7 @@ use super::containment_tests::{
 use super::*;
 use crate::catchup::CatchUp;
 use crate::guard_answer::MAX_NAMED;
-use crate::protocol::{GuardAnswer, Standing};
+use crate::protocol::GuardAnswer;
 use crate::second_dispatcher::a_second_dispatcher;
 
 const SECRET: &str = "a-guard-answer-secret";

@@ -6110,10 +6110,12 @@ async fn a_new_member_serves_at_once_beside_an_answering_seed() {
 
     let b = Node::spawn_with("node-b", pb, &[pa], "");
     b.wait_ready(&client).await;
+    // The first sync tick is what a guard holds back; the listener serves whatever it holds.
     let held =
-        seconds_between_lines(&b, "gossiping membership", "serving cluster replication").await;
-    eprintln!("node-b served cluster replication {held:.3} s after it began gossiping");
-    assert!(held < 5.0, "a new member waited {held:.3} s to serve:\n{}", b.log());
+        seconds_between_lines(&b, "gossiping membership", "the catching-up wait starts").await;
+    eprintln!("node-b began to sync {held:.3} s after it began gossiping");
+    assert!(held < 5.0, "a new member waited {held:.3} s to sync:\n{}", b.log());
+    assert!(!b.log().contains(GUARD_PASSED), "no guard ran on it:\n{}", b.log());
     eventually("gossip to form", || all_report(&client, vec![&a, &b], 1)).await;
 }
 

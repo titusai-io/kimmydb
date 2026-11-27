@@ -258,7 +258,8 @@ pub enum Standing {
 /// socket address takes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardAnswer {
-    /// Sixteen random bytes made once by each process: how a member knows its own answers.
+    /// A random value of sixteen bytes, made once by each process: how a member knows its own
+    /// answers.
     pub token: Vec<u8>,
     pub standing: Standing,
     /// How long it has been a member, from when it began to gossip: 0 before that.
