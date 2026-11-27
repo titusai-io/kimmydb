@@ -4,8 +4,8 @@
 //! generated from `u14_fold.py`, its sha in the table's header), so that the product's function and the definition cannot drift. Every
 //! case is in exactly one of three groups by the facts it holds, one test each: no stage fact (`plain`), stage facts and no database drop
 //! (`staged`), and both (`dbdrop`). The named rows are a second look at cases that are already in those groups. The rest: a database
-//! drop's own entry changes nothing, the order of the facts says nothing, the table reaches the branches it is meant to, and which
-//! entry kinds are a touch.
+//! drop's own entry changes nothing, the order of the facts says nothing, the table reaches the branches it is meant to, a tie in
+//! one `hlc` is the drop's, and which entry kinds are a touch.
 
 // no case holds a stage's withdrawal (`Kind::Abandon`): it is in the table's types so that their form does not change with its rule
 #[allow(dead_code)]
@@ -374,6 +374,39 @@ fn the_function_table_exercises_every_branch_it_is_meant_to() {
         assert_eq!(named.len(), case.alive.len(), "case {i}: a physical alive twice");
         if let Some(&created) = named.get(IDENTITY) {
             assert_eq!(created, 0, "case {i}: the identity carries no creation stamp");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// a tie in one hlc
+
+/// A tie in one `hlc` is the drop's (ADR-236), whichever of the two origins sorts first: a creation or a touch at the drop's `hlc`
+/// is of the life the drop ended, and one a tick above it is not. The table holds one fact per `hlc`, so it cannot say this.
+#[test]
+fn a_tie_in_one_hlc_is_the_drops() {
+    for drop in [FoldKind::Drop { database_drop: None }, FoldKind::DatabaseDrop] {
+        for other in [FoldKind::Create, FoldKind::Touch] {
+            for (dropper, writer) in [(1, 2), (2, 1)] {
+                for (hlc, stands) in [(10, false), (11, true)] {
+                    let mut facts = vec![
+                        FoldFact { stamp: st(1, 0), kind: FoldKind::Create },
+                        FoldFact { stamp: st(10, dropper), kind: drop.clone() },
+                        FoldFact { stamp: st(hlc, writer), kind: other.clone() },
+                    ];
+                    for listed in ["as listed", "reversed"] {
+                        let what = format!(
+                            "{drop:?} of origin {dropper} at 10, {other:?} of origin {writer} at {hlc}, {listed}"
+                        );
+                        let answer = fold(IDENTITY, &facts);
+                        assert_eq!(answer.identity_stands, stands, "{what}");
+                        let serves = if stands { Serves::Identity } else { Serves::Absent };
+                        assert_eq!(answer.serves, serves, "{what}");
+                        assert_eq!(answer.floor, Some(st(10, dropper)), "{what}");
+                        facts.reverse();
+                    }
+                }
+            }
         }
     }
 }

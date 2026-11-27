@@ -13,7 +13,8 @@
 //!
 //! Nothing in storage reads this yet.
 //!
-//! **Not built yet:** [`fold`] answers nothing, so the table's tests are red.
+//! **Built so far:** the rules of a collection that was never swapped. [`fold`] does not read stage creations, bindings or recreations
+//! yet, so the tests of the cases that hold one are red.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,9 +107,71 @@ impl Answer {
     }
 }
 
-/// The answer for the set of `facts` about the logical name `identity` and its database. The order of the slice says nothing.
-pub fn fold(_identity: &str, _facts: &[FoldFact]) -> Answer {
-    Answer::default()
+/// The answer for the set of `facts` about the logical name `identity` and its database. The order of the slice says nothing: the
+/// facts are applied in stamp order.
+pub fn fold(identity: &str, facts: &[FoldFact]) -> Answer {
+    let mut in_order: Vec<&FoldFact> = facts.iter().collect();
+    in_order.sort_by_key(|fact| fact.stamp);
+    let mut plain = Plain::default();
+    for fact in in_order {
+        match &fact.kind {
+            FoldKind::Create => plain.created(&fact.stamp),
+            // with no stage fact read, a drop of the database says of this name what a drop of the collection says
+            FoldKind::Drop { database_drop: None } | FoldKind::DatabaseDrop => {
+                plain.dropped(fact.stamp);
+            }
+            // a database drop's own entry of the collection acts as of that database drop, which is a fact of its own
+            FoldKind::Drop { database_drop: Some(_) } => {}
+            FoldKind::Touch => plain.touched(&fact.stamp),
+            // not read yet
+            FoldKind::StageCreate { .. } | FoldKind::Bind { .. } | FoldKind::Recreate { .. } => {}
+        }
+    }
+    Answer {
+        serves: if plain.stands { Serves::Identity } else { Serves::Absent },
+        floor: plain.floor,
+        identity_stands: plain.stands,
+        // with no event in the register no write is late
+        superseded: BTreeMap::from([(identity.to_string(), None)]),
+        ..Answer::default()
+    }
+}
+
+/// The collection named like the logical name, by the rules of one that was never swapped. Each rule compares a fact with the floor on
+/// the `hlc` alone: **a tie in one `hlc` is the drop's** (ADR-236), whichever of the two stamps sorts first.
+#[derive(Default)]
+struct Plain {
+    /// The newest drop applied: of the collection or of its database.
+    floor: Option<Stamp>,
+    stands: bool,
+}
+
+impl Plain {
+    /// Whether something stamped `stamp` is of a life a drop ended.
+    fn is_at_or_below_the_floor(&self, stamp: &Stamp) -> bool {
+        self.floor.is_some_and(|floor| stamp.hlc <= floor.hlc)
+    }
+
+    /// An ordinary creation: history at or below the floor, and otherwise the collection stands.
+    fn created(&mut self, stamp: &Stamp) {
+        if !self.is_at_or_below_the_floor(stamp) {
+            self.stands = true;
+        }
+    }
+
+    /// A drop: the floor rises to it and the collection, whose life is at or below it, ends.
+    fn dropped(&mut self, stamp: Stamp) {
+        self.floor = Some(stamp);
+        self.stands = false;
+    }
+
+    /// A touch above a floor makes a collection that does not stand stand again. With no floor it makes nothing: a write never makes a
+    /// collection that no creation and no drop speaks of.
+    fn touched(&mut self, stamp: &Stamp) {
+        if self.floor.is_some() && !self.is_at_or_below_the_floor(stamp) {
+            self.stands = true;
+        }
+    }
 }
 
 /// Whether an oplog entry of `kind` is a TOUCH of its collection ([`FoldKind::Touch`]): a document write or a delete, or a change of
