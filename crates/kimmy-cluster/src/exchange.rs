@@ -174,7 +174,8 @@ where
     let (facts, facts_gen) =
         ours.map_or((None, None), |(facts, generation)| (Some(facts), Some(generation)));
     // What this member holds of the peer's block, read now (after a rename,
-    // nothing): the confirmation of the peer's yield, as on every request.
+    // nothing, or the new identity's block the rename kept): the confirmation of
+    // the peer's yield, as on every request.
     let echo = Some(members.echo_for(their_node));
     write_frame(stream, &Message::AskVersions { facts, facts_gen, echo }).await?;
     let (frame, undecodable, decoded_seq) = read_frame_noting_facts(stream).await?;

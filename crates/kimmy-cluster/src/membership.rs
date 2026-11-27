@@ -502,6 +502,27 @@ impl Members {
         self.publish(&table);
     }
 
+    /// `node` is known from now by its identity at `incarnation`: what it said,
+    /// and echoed of ours, under the one before is dropped as at any drop
+    /// ([`Self::drop_peer`]), so the echo goes, a block decoded before is refused
+    /// from now, and an ask the interval holds is owed. **The held block alone
+    /// stays, where it was built under exactly `incarnation`** (ADR-247): it is
+    /// the new identity's, brought by that member's own exchange before gossip
+    /// brought its rename. Not one built under a later incarnation either: only
+    /// a renewal walk a step ahead of its rename brings one, or a lost
+    /// incarnation file, and then it may be a dead process's.
+    fn rename_peer(&self, node: NodeId, incarnation: u64) {
+        let mut table = self.0.peer_facts.write();
+        let its_own =
+            table.held.get(&node).is_some_and(|held| held.facts.incarnation == Some(incarnation));
+        let kept = if its_own { table.held.remove(&node) } else { None };
+        self.drop_peer(&mut table, node);
+        if let Some(kept) = kept {
+            table.held.insert(node, kept);
+        }
+        self.publish(&table);
+    }
+
     /// This member was declared down by the cluster, or rejoined (ADR-213): its
     /// peers dropped its block, and it may have missed changes to theirs, so it
     /// clears every echo and **drops every peer block**. It then owns everything
@@ -1207,11 +1228,15 @@ fn apply_notification(
         Notification::Rename(old, new) => {
             debug!(from = ?old, to = ?new, "member renewed its identity");
             // A new incarnation: what the old one said, and read, is not
-            // this one's (ADR-201). Only `insert` follows, and it drops
-            // nothing, since a block can beat the insert of a peer that is
-            // new to this member.
-            members.forget_peer(old.node);
-            members.forget_peer(new.node);
+            // this one's (ADR-201), but for a block built under the new one,
+            // which the member's own exchange can bring first (ADR-247).
+            // Nothing a node that left the address said is another's. Only
+            // `insert` follows, and it drops nothing, since a block can beat
+            // the insert of a peer that is new to this member.
+            if old.node != new.node {
+                members.forget_peer(old.node);
+            }
+            members.rename_peer(new.node, new.incarnation);
             members.insert(new.addr, new.node);
             members.exchange_at(new.addr, new.node, at);
         }
@@ -1524,8 +1549,9 @@ mod tests {
     }
 
     /// SWIM's `Rename` (a node renewing its identity after being wrongly declared
-    /// down) is a new incarnation: the block it sent and what it read of ours are
-    /// dropped, where `insert` alone drops nothing (ADR-201).
+    /// down) is a new incarnation: a block that does not say it was built under
+    /// it, and what the node read of ours, are dropped, where `insert` alone
+    /// drops nothing (ADR-201, ADR-247).
     #[test]
     fn a_renamed_member_is_a_new_incarnation_and_is_forgotten() {
         use foca::Runtime;

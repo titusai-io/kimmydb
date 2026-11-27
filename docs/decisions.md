@@ -29645,7 +29645,8 @@ counts every point, the points cut off and the points found at four times the ef
 ## ADR-242 — A member's SWIM incarnation outlives its process, and each start takes one above the last
 
 > **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** The
-> peer that renames a restarted member exchanges blocks with it at once, so the close below lasts about one contact.
+> peer that renames a restarted member exchanges blocks with it at once, so the close below lasts about one contact; and it
+> keeps the new process's block where that reached it first (item 6 there), so then it does not close at all.
 
 > **Amends [ADR-037](#adr-037--local-peer-health-and-swim-membership-above-it)**, whose identities carry an
 > incarnation that every process started at 0. No wire, table, `kimmy.format` schema, backup tag or configuration key
@@ -29698,12 +29699,14 @@ declared down, then resumed) recorded, and the next start taken at once; that re
 start exactly one rejoin and the one after none; and with nothing recorded at each of 20 starts, the walk of 1 to 20
 rejoins, then one start with the file kept taken at once.
 
-**What every peer sees: one rename per restart, which fails closed.** A rename runs `forget_peer` (ADR-201): the
-peer drops the block it held from the member's last process when its new identity first reaches it, rather than when
-its first new block arrives. Before, a quick restart that kept its identity (at incarnation 0, before any renewal) was
-judged by the dead process's block until the new one's came, so a member restarted into an older build was taken for
-one that could hold what the old process could. Now no peer judges a new process by an old one's block; the cost is that
-a peer's gates close from the rename until the new process's first block, which the peer asks for at the rename itself
+**What every peer sees: one rename per restart, which fails closed.** A rename drops what the peer held of the member
+under its earlier identity (ADR-201): the block from the member's last process goes when its new identity first reaches
+the peer, rather than when its first new block arrives. (A block the new process's own exchange brought first, built
+under the new identity, stays: ADR-247, item 6.) Before, a quick restart that kept its identity (at incarnation 0,
+before any renewal) was judged by the dead process's block until the new one's came, so a member restarted into an
+older build was taken for one that could hold what the old process could. Now no peer judges a new process by an old
+one's block; the cost is that a peer's gates close from the rename until the new process's first block, which the peer
+asks for at the rename itself
 ([ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once)), so the
 close lasts about one contact rather than up to a sync interval.
 
@@ -30237,7 +30240,7 @@ above every collected stamp).
 > whose blocks cross only on a sync contact, and
 > **[ADR-242](#adr-242--a-members-swim-incarnation-outlives-its-process-and-each-start-takes-one-above-the-last)**,
 > whose rename closes a peer's gates until the new process's first block. No frame, table, `kimmy.format` schema,
-> backup tag or configuration key changes.
+> backup tag or configuration key changes; the facts block gains one optional field (item 6).
 
 **The case.** A member's facts block crosses on a sync contact's opening frames: `AskVersions` carries the
 requester's, which the server records before it answers, and `Vectors` the server's (ADR-201, ordered by when each
@@ -30255,8 +30258,8 @@ shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
 **Decision.**
 
 1. **What asks.** In the handling of a SWIM notification, after the change it makes: `MemberUp(m)` after `m` is
-   inserted; `Rename(old, new)` after both drops and the insert; this member's own `Rejoin` after it has cleared every
-   peer block (ADR-213), once for each peer it holds live.
+   inserted; `Rename(old, new)` after its drops (item 6) and the insert; this member's own `Rejoin` after it has cleared
+   every peer block (ADR-213), once for each peer it holds live.
 2. **At most one per member per sync interval**, counted from the last ask for that member whatever became of it. A
    restart after the peer declared the member down is a `Rename` and a `MemberUp` in one input, and asks once; a member
    that flaps, or does not answer, costs one exchange an interval. **An ask the interval holds is not lost when it is
@@ -30279,6 +30282,34 @@ shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
    this member's block at each ask, so an exchange takes no storage step and an abort can end it anywhere.
 5. **A failed exchange** is one `DEBUG` line and still counts as the member's last ask; the next sync contact carries
    the blocks.
+
+6. **A rename keeps the block built under the identity it installs.** A restarted member's own exchange can reach a
+   peer before gossip brings its rename: the peer records the new process's block, and the rename dropped it with the old
+   one, leaving the peer without it until the held ask of item 2 ran. In four debug-logged failures of the restart test,
+   by the logged order and the code, the block arrived 4 to 52 ms before the peer processed the rename. So a facts block
+   carries its sender's SWIM incarnation (`incarnation`: optional, anything but a non-negative integer read as none).
+   The sender's member set puts it on, only with what has reached its incarnation file (ADR-242): when the membership
+   task starts, and after each renewal once its record has been written, so after a failed write the earlier value stays.
+   A change restamps the block at once, as a new generation, because within one boot a block replaces the held one at a
+   generation at least its own (ADR-213), and a frame carrying the block as it was can be decoded later. On
+   `Rename(old, new)` the held block of `new`'s node stays where its incarnation is exactly `new`'s, and is dropped
+   otherwise: the earlier process's, one that says none, one built under any other incarnation, a later one included.
+   Where `old` and `new` are different nodes, `old`'s node is forgotten whole.
+   **Nothing else of a rename changes.** What the member echoed of this member's block is forgotten, a block decoded
+   before the rename is refused from then, and an ask the interval holds is owed (item 2): the echo is gone, and the ask
+   also brings this member's block to a peer that lost the reply sent after its own block was recorded here. The echo is
+   forgotten at the rename only: an echo has no decode floor and is noted in a step after its frame's block is
+   recorded, so a frame handled across the rename can record one again, as before. Forgetting it costs a yield nothing
+   while contacts succeed, since the rename restarts the lease the live set must hold still for (ADR-213).
+   **What this does not close.** A peer is still without the new process's block, until the ask of item 2 or the next
+   contact, where the exchange gave it none; where the block was refused before the rename (its sender's clock stepped
+   back across the restart, ADR-213) or was decoded before the rename and recorded after it; where it was built under
+   another incarnation than the rename installs (a renewal walk, or an ask a rejoin made before the renewal was
+   recorded); and where the sender's build says none.
+   **A limit.** A process stamps only what its file has held, and a later start takes one above what the file holds. If
+   the file is lost, replaced or rolled back (ADR-242, item 4), a dead process's block built under exactly the
+   incarnation the new process wins with, one this member never saw as an identity, would be kept, until the new
+   process's own block replaces it.
 
 **Why after the change.** The drop a rename makes records the decode sequence it happened at, and a block decoded
 before it is refused (ADR-213). An exchange asked after the drop reads its answer after it and keeps it. Asked before,
@@ -30323,7 +30354,8 @@ sequence.
 restart costs each peer one exchange and the restarted member one per peer, and a second restart within the interval
 one more each, at its end.
 
-**Rollback.** Nothing is stored and no frame is new. An older build asks no exchanges: its own window after a start is
+**Rollback.** Nothing is stored and no frame is new. An older build ignores a block's `incarnation` and sends none, so a
+rename between the two drops as it did before item 6. An older build asks no exchanges: its own window after a start is
 up to a sync interval, as before, and a peer on this build still exchanges with it at once on seeing it renamed or up.
 
 **Alternatives.** *Wake the tick for the member* (a reset tick restricted to it): it waits behind a draining tick, a
@@ -30355,6 +30387,15 @@ decoded. The two are taken in one poll with no await between them, so they can d
 thread makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a
 block decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this
 choice.
+
+For item 6: `membership::tests`: in the shape of a first restart and of a second, the new identity's block heard before
+the rename is held after it, what the member echoed of ours is forgotten and the held ask is owed; a block of any other
+incarnation, or of none said, is dropped; a block decoded before a rename that keeps one is refused; a renewal in one
+process keeps only the block built after it; another node at the address is forgotten whole; only an incarnation on disk
+is put on the block. `facts`: the field is optional and decoded leniently; it is put on at once at a new generation, so
+the block as it was does not replace it. `membership::rejoin_tests`: after every restart each held block says the
+incarnation its sender has. `kimmy-cluster/tests/membership.rs`: the membership task puts it on. Mutation rows in bash,
+one per clause.
 
 ---
 
