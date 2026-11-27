@@ -699,6 +699,21 @@ impl Members {
         now.saturating_duration_since(at) >= lease
     }
 
+    /// Put this member's incarnation on its own blocks from now
+    /// ([`LocalFacts::set_incarnation`], ADR-247). A member set with no source
+    /// has no block: the daemon gives the source before membership starts.
+    pub(crate) fn set_own_incarnation(&self, incarnation: Option<u64>) {
+        if let Some(local) = self.0.local.get() {
+            local.set_incarnation(incarnation);
+        }
+    }
+
+    /// Put on this member's blocks the incarnation `kept` has on disk: never one
+    /// whose write failed, which a later process could take again.
+    pub(crate) fn stamp_own_blocks(&self, kept: &IncarnationFile) {
+        self.set_own_incarnation(kept.recorded());
+    }
+
     /// What this member holds of `peer`'s block, to echo on the next frame to it
     /// (ADR-213). **Only what is recorded**: an empty boot and generation zero when
     /// nothing is held, which says "echoing, and confirming nothing".
@@ -990,9 +1005,19 @@ pub(crate) trait KeepIncarnation {
     fn record(&mut self, incarnation: u64);
 }
 
-impl KeepIncarnation for IncarnationFile {
+/// The daemon's record of a renewal: the data directory's file, and **then**,
+/// with what reached it, this member's own blocks (ADR-247). It runs after the
+/// input that renewed, whose rejoin has already cleared what this member held,
+/// so no block built before that carries the new incarnation.
+pub(crate) struct RecordThenStamp<'a> {
+    pub(crate) file: &'a mut IncarnationFile,
+    pub(crate) members: &'a Members,
+}
+
+impl KeepIncarnation for RecordThenStamp<'_> {
     fn record(&mut self, incarnation: u64) {
-        IncarnationFile::record(self, incarnation);
+        self.file.record(incarnation);
+        self.members.stamp_own_blocks(self.file);
     }
 }
 
@@ -1244,6 +1269,10 @@ pub async fn run(
     shutdown: kimmy_task::Shutdown,
 ) {
     let identity = Member::identified(local, node, incarnation.current());
+    // Before anything is sent or asked: every block from here says which of this
+    // member's identities it was built under (ADR-247).
+    members.stamp_own_blocks(&incarnation);
+    let blocks = members.clone();
     let config =
         Config::new_lan(std::num::NonZeroU32::new(CLUSTER_SIZE_HINT).expect("non-zero literal"));
 
@@ -1406,7 +1435,12 @@ pub async fn run(
             debug!(error = %e, "membership input rejected");
         }
         let rejoined = std::mem::take(&mut collector.rejoined);
-        let recorded = after_input(&mut foca, rejoined, &mut collector, &mut incarnation);
+        let recorded = after_input(
+            &mut foca,
+            rejoined,
+            &mut collector,
+            &mut RecordThenStamp { file: &mut incarnation, members: &blocks },
+        );
 
         // Dispatch what foca asked for, which only the record opens. Datagrams
         // are best-effort by design — SWIM assumes loss and probes again — so a
@@ -1528,6 +1562,210 @@ mod tests {
             vec![node(1)],
             "and what it read of ours"
         );
+    }
+
+    // -- A rename, and the block built at the identity it installs (ADR-247) -----
+
+    /// A member set whose own block yields expiry, so that a peer's echo of it
+    /// shows, with node 1 live at `addr(7900)` under the identity of incarnation
+    /// 0, which is answered. The exchanges it starts go nowhere.
+    fn renaming() -> (Members, Member) {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(5), 3);
+        members.set_facts_source(Arc::new(|| Facts {
+            boot: vec![9; 16],
+            yielding: crate::facts::Yielding { ttl: true, ..Default::default() },
+            ..Facts::default()
+        }));
+        members.set_exchange_sink_for_test(Arc::new(|_, _| {}));
+        members.insert_for_test(addr(7900), node(1));
+        (members, Member::identified(addr(7900), node(1), 0))
+    }
+
+    /// A block of process `boot`, built at `incarnation`. A later process
+    /// started later.
+    fn built(boot: u8, incarnation: Option<u64>) -> Facts {
+        Facts {
+            boot: vec![boot; 16],
+            started_ms: Some(u64::from(boot)),
+            incarnation,
+            ..Facts::default()
+        }
+    }
+
+    /// `facts` recorded as node 1's at `generation`, decoded now.
+    fn hear(members: &Members, facts: Facts, generation: u64) -> bool {
+        members.record_peer_facts(
+            node(1),
+            Arc::new(facts),
+            Some(generation),
+            next_decoded_seq(),
+            Instant::now(),
+        )
+    }
+
+    /// The first byte of the boot of the block held of node 1.
+    fn held_boot(members: &Members) -> Option<u8> {
+        members.view().blocks.get(&node(1)).map(|held| held.facts.boot[0])
+    }
+
+    /// Node 1 echoes this member's block as it is, which confirms its yield.
+    fn echoes_ours(members: &Members) {
+        let (_, generation) = members.local_facts().unwrap();
+        members.note_echo(node(1), Some(&protocol::Echo { boot: vec![9; 16], generation }));
+        assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty(), "premise: confirmed");
+    }
+
+    /// The first restart's shape: the restarted member's own exchange hands this
+    /// one the new process's block before its rename is processed. The rename
+    /// keeps it, since it was built at the incarnation the rename installs.
+    /// Everything else is as for any rename: what the member echoed of ours is
+    /// forgotten, and the ask the interval holds is owed.
+    #[test]
+    fn a_rename_keeps_the_block_built_at_the_incarnation_it_installs() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let (members, old) = renaming();
+        let new = old.renew().unwrap();
+        assert!(hear(&members, built(1, Some(0)), 1));
+        assert!(members.exchange_at(old.addr, old.node, at(0)), "premise: asked");
+        assert!(hear(&members, built(2, Some(1)), 1));
+        echoes_ours(&members);
+        apply_notification(&members, Notification::Rename(&old, &new), at(500));
+        assert_eq!(held_boot(&members), Some(2), "the new process's block is held");
+        assert_eq!(members.echo_for(node(1)).boot, vec![2; 16], "and echoed to it");
+        assert_eq!(
+            members.unconfirmed_peers(OwnerClass::Ttl),
+            vec![node(1)],
+            "what it echoed of ours is forgotten"
+        );
+        assert_eq!(members.next_trailing_exchange(), Some(at(5_000)), "the held ask is owed");
+    }
+
+    /// The second restart's shape: the ask owed for the first restart has just
+    /// run when the second restart's own block arrives, before its rename. The
+    /// block is kept, and the rename, within the interval of that ask, owes
+    /// another.
+    #[test]
+    fn a_second_restarts_block_is_kept_after_an_owed_ask_has_run() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let (members, old) = renaming();
+        let first = old.renew().unwrap();
+        let second = first.renew().unwrap();
+        assert!(hear(&members, built(1, Some(0)), 1));
+        assert!(members.exchange_at(old.addr, old.node, at(0)), "premise: asked");
+        apply_notification(&members, Notification::Rename(&old, &first), at(100));
+        assert_eq!(held_boot(&members), None, "premise: the old process's block went");
+        assert_eq!(members.next_trailing_exchange(), Some(at(5_000)), "premise: owed");
+        members.exchange_due_at(at(5_000));
+        assert_eq!(members.next_trailing_exchange(), None, "premise: the owed ask ran");
+        assert!(hear(&members, built(2, Some(1)), 1), "what it brought");
+        assert!(hear(&members, built(3, Some(2)), 1), "the second restart's own push");
+        apply_notification(&members, Notification::Rename(&first, &second), at(5_500));
+        assert_eq!(held_boot(&members), Some(3), "the second restart's block is held");
+        assert_eq!(members.next_trailing_exchange(), Some(at(10_000)), "and an ask is owed");
+    }
+
+    /// A rename drops every block that was not built at exactly the incarnation
+    /// it installs: the earlier process's, one that does not say, and one built
+    /// above it (which only a lost incarnation file, or a walk a step ahead of
+    /// its rename, can bring).
+    #[test]
+    fn a_rename_drops_a_block_built_at_any_other_incarnation() {
+        for (whose, incarnation) in
+            [("the old identity's", Some(0)), ("an unsaid one's", None), ("a later one's", Some(2))]
+        {
+            let (members, old) = renaming();
+            let new = old.renew().unwrap();
+            assert!(hear(&members, built(1, incarnation), 1), "{whose}");
+            apply_notification(&members, Notification::Rename(&old, &new), Instant::now());
+            assert_eq!(held_boot(&members), None, "{whose} block is dropped");
+        }
+    }
+
+    /// A rename that keeps a block still refuses everything decoded before it and
+    /// recorded after: here two blocks that would replace the kept one by every
+    /// other rule, a later process's and the same process's at a later
+    /// generation.
+    #[test]
+    fn a_rename_that_keeps_a_block_still_refuses_what_was_decoded_before_it() {
+        let (members, old) = renaming();
+        let new = old.renew().unwrap();
+        assert!(hear(&members, built(2, Some(1)), 1));
+        let early = next_decoded_seq();
+        apply_notification(&members, Notification::Rename(&old, &new), Instant::now());
+        for (what, facts, generation) in [
+            ("a later process's", built(3, Some(1)), 1),
+            ("a later generation", built(2, Some(1)), 9),
+        ] {
+            assert!(
+                !members.record_peer_facts(
+                    node(1),
+                    Arc::new(facts),
+                    Some(generation),
+                    early,
+                    Instant::now()
+                ),
+                "{what}"
+            );
+        }
+    }
+
+    /// A renewal in one process (ADR-242's walk) changes the identity and not
+    /// the boot: the block built before it goes, and the one built after it,
+    /// heard before the rename, stays.
+    #[test]
+    fn a_renewal_in_one_process_keeps_only_the_block_built_after_it() {
+        for (built_at, kept) in [(0, None), (1, Some(1))] {
+            let (members, old) = renaming();
+            let new = old.renew().unwrap();
+            assert!(hear(&members, built(1, Some(0)), 1));
+            if built_at == 1 {
+                assert!(hear(&members, built(1, Some(1)), 2));
+            }
+            apply_notification(&members, Notification::Rename(&old, &new), Instant::now());
+            assert_eq!(held_boot(&members), kept, "built at {built_at}");
+        }
+    }
+
+    /// Another node at the address: what the node that left said goes whole,
+    /// though it was built at the very incarnation the new identity has, since
+    /// two nodes' incarnations say nothing of one another.
+    #[test]
+    fn a_rename_to_another_node_forgets_the_node_that_left_whole() {
+        let (members, old) = renaming();
+        let new = Member::identified(old.addr, node(2), 1);
+        assert!(hear(&members, built(1, Some(1)), 1));
+        apply_notification(&members, Notification::Rename(&old, &new), Instant::now());
+        assert_eq!(held_boot(&members), None);
+    }
+
+    /// A renewal reaches this member's blocks only once it has reached the disk
+    /// ([`RecordThenStamp`]): a later start takes one above what the file holds,
+    /// so no later process can be taken for the sender of a block.
+    #[test]
+    fn only_an_incarnation_on_disk_is_put_on_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = Members::default();
+        members.set_facts_source(Arc::new(Facts::default));
+        let on_the_block = |members: &Members| members.local_facts().unwrap().0.incarnation;
+        let mut file = IncarnationFile::begin(dir.path());
+        members.stamp_own_blocks(&file);
+        assert_eq!(on_the_block(&members), Some(0), "the start's");
+        RecordThenStamp { file: &mut file, members: &members }.record(1);
+        assert_eq!(on_the_block(&members), Some(1), "a renewal, once recorded");
+        // from here no write can succeed: a directory stands at the file's path
+        std::fs::remove_file(dir.path().join(incarnation::FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(incarnation::FILE)).unwrap();
+        RecordThenStamp { file: &mut file, members: &members }.record(2);
+        assert_eq!(file.current(), 2, "premise: the identity went on");
+        assert_eq!(on_the_block(&members), Some(1), "a renewal that did not reach the disk");
+
+        let never = Members::default();
+        never.set_facts_source(Arc::new(Facts::default));
+        never.stamp_own_blocks(&IncarnationFile::begin(&dir.path().join("no-such-directory")));
+        assert_eq!(on_the_block(&never), None, "a start that could not record");
     }
 
     /// An immediate exchange is asked at most once per member per sync interval

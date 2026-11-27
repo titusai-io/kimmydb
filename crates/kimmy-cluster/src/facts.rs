@@ -151,10 +151,10 @@ pub struct TtlHeld {
 /// What a member says about itself. See the module documentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
-    /// A random id, new at every process start. SWIM's incarnation does not
-    /// change on a restart, so it cannot say that a member's earlier block
-    /// belonged to a process that no longer exists; a receiver that sees a new
-    /// boot id discards that member's earlier state.
+    /// A random id, new at every process start: the same through every identity a
+    /// process takes, where [`Self::incarnation`] changes at a renewal as well as
+    /// at a start (ADR-242). A receiver that sees a new boot id discards what
+    /// that member's earlier process echoed.
     #[serde(default, with = "serde_bytes")]
     pub boot: Vec<u8>,
     /// The catching-up marker is set (a fresh, restored or snapshot-catching-up
@@ -215,6 +215,13 @@ pub struct Facts {
     /// one member by the sender's own clock (ADR-213).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
     pub started_ms: Option<u64>,
+    /// The SWIM incarnation the sender had on disk when it published this block
+    /// (ADR-247): which of the sender's identities the block was built under. Put
+    /// on by the sender's member set, never by the block's source. `None` before
+    /// anything is recorded, from a build that sends none, and for anything but a
+    /// non-negative integer.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
+    pub incarnation: Option<u64>,
 }
 
 /// One value per class of owned work.
@@ -437,6 +444,9 @@ struct LocalState {
     /// carried an echo at all, and holds the highest generation it echoed *of
     /// this member's current boot*; zero when it echoed another boot or nothing.
     echoed: BTreeMap<NodeId, u64>,
+    /// The incarnation every block published from now carries
+    /// ([`Facts::incarnation`]).
+    incarnation: Option<u64>,
 }
 
 /// The longest a cached block is reused.
@@ -454,6 +464,7 @@ impl Default for LocalFacts {
                 generation: 0,
                 yield_gen: PerClass::all(None),
                 echoed: BTreeMap::new(),
+                incarnation: None,
             }),
         }
     }
@@ -500,6 +511,7 @@ impl LocalFacts {
         {
             state.published_ticket = ticket;
             state.built = Some(now);
+            let fresh = Facts { incarnation: state.incarnation, ..fresh };
             if *state.current != fresh || state.generation == 0 {
                 let generation = state.generation + 1;
                 for class in OwnerClass::ALL {
@@ -515,6 +527,28 @@ impl LocalFacts {
             }
         }
         Some((Arc::clone(&state.current), state.generation))
+    }
+
+    /// Put `incarnation` on this member's block from now (ADR-247): on the block
+    /// as it stands, not at the next rebuild, and on every later one.
+    ///
+    /// **A change is a new generation.** A peer takes a block of one boot at a
+    /// generation at least the one it holds (ADR-213), so only the higher
+    /// generation keeps a frame carrying the block as it was, decoded after one
+    /// carrying it as it is, from replacing it. A value BSON's signed integer
+    /// cannot carry is put on as none.
+    pub(crate) fn set_incarnation(&self, incarnation: Option<u64>) {
+        let incarnation = incarnation.filter(|value| i64::try_from(*value).is_ok());
+        let mut state = self.state.lock();
+        if state.incarnation == incarnation {
+            return;
+        }
+        state.incarnation = incarnation;
+        if state.generation > 0 {
+            let block = Facts { incarnation, ..(*state.current).clone() };
+            state.current = Arc::new(block);
+            state.generation += 1;
+        }
     }
 
     /// Forget what `peer` echoed: it is a new process, or SWIM declared it
@@ -939,6 +973,77 @@ mod tests {
         let back: Facts = bson::deserialize_from_slice(&bytes).unwrap();
         assert_eq!(back, facts);
         assert_eq!(back.ttl[0].collection, CollectionId(5), "in collection-id order");
+    }
+
+    /// The incarnation survives the wire. A block without one sends no field, and
+    /// anything but a non-negative integer there reads none, with the rest of the
+    /// block read as it was.
+    #[test]
+    fn the_incarnation_is_optional_and_decodes_leniently() {
+        let facts = Facts { incarnation: Some(7), ..block() };
+        let bytes = bson::serialize_to_vec(&facts).unwrap();
+        assert_eq!(bson::deserialize_from_slice::<Facts>(&bytes).unwrap(), facts);
+        let without: bson::Document =
+            bson::deserialize_from_slice(&bson::serialize_to_vec(&block()).unwrap()).unwrap();
+        assert!(!without.contains_key("incarnation"), "none is not sent");
+        for wrong in [bson::Bson::String("7".into()), bson::Bson::Int64(-1), bson::Bson::Null] {
+            let sent = bson::doc! { "catching_up": true, "incarnation": wrong.clone() };
+            let back: Facts =
+                bson::deserialize_from_slice(&bson::serialize_to_vec(&sent).unwrap()).unwrap();
+            assert_eq!((back.incarnation, back.catching_up), (None, true), "{wrong:?}");
+        }
+    }
+
+    /// The member's incarnation is on its block at once, inside the cache's
+    /// second, at a higher generation, and stays on later builds (ADR-247). The
+    /// generation is what keeps a receiver from replacing the block that carries
+    /// it with the block as it was, decoded later.
+    #[test]
+    fn the_incarnation_is_on_the_block_at_once_and_makes_a_new_generation() {
+        let members = Members::default();
+        members.set_facts_source(Arc::new(block));
+        let t0 = Instant::now();
+        let (without, first) = members.local_facts_at(t0).unwrap();
+        assert_eq!(without.incarnation, None, "nothing was put on yet");
+        members.set_own_incarnation(Some(4));
+        let (with, second) = members.local_facts_at(t0).unwrap();
+        assert_eq!(with.incarnation, Some(4), "on the cached block at once");
+        assert!(second > first, "a change makes a new generation: {first} then {second}");
+        members.set_own_incarnation(Some(4));
+        assert_eq!(members.local_facts_at(t0).unwrap().1, second, "the same value is no change");
+        let (rebuilt, third) = members.local_facts_at(t0 + Duration::from_secs(2)).unwrap();
+        assert_eq!((rebuilt.incarnation, third), (Some(4), second), "a later build keeps it");
+
+        let receiver = cluster(&[1]);
+        assert!(receiver.record_peer_facts(
+            node(1),
+            with,
+            Some(second),
+            next_decoded_seq(),
+            Instant::now()
+        ));
+        assert!(
+            !receiver.record_peer_facts(
+                node(1),
+                without,
+                Some(first),
+                next_decoded_seq(),
+                Instant::now()
+            ),
+            "the block as it was, decoded later, does not replace it"
+        );
+
+        members.set_own_incarnation(Some(1 << 63));
+        let (block, _) = members.local_facts_at(t0 + Duration::from_secs(4)).unwrap();
+        assert_eq!(block.incarnation, None, "a value BSON cannot carry is not put on");
+        let early = Members::default();
+        early.set_facts_source(Arc::new(self::block));
+        early.set_own_incarnation(Some(7));
+        assert_eq!(
+            early.local_facts_at(t0).unwrap().0.incarnation,
+            Some(7),
+            "put on before the first build"
+        );
     }
 
     /// A partial block decodes, each absent field at its default, and an empty

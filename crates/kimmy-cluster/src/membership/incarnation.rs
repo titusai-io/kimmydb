@@ -17,6 +17,9 @@
 //! holds a value no member reaches ([`TOO_LARGE`]), starts the member at 0,
 //! which walks once, as every start did before; a write that fails is said, and
 //! costs the next start at most the renewals it lost.
+//!
+//! The member's facts blocks carry the incarnation too, **only as far as it has
+//! reached the file** ([`IncarnationFile::recorded`], ADR-247).
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +46,8 @@ pub(crate) fn first_after(last: Option<u64>) -> u64 {
 pub struct IncarnationFile {
     path: PathBuf,
     current: u64,
+    /// The last incarnation a write of this process put on disk.
+    recorded: Option<u64>,
 }
 
 impl IncarnationFile {
@@ -53,7 +58,7 @@ impl IncarnationFile {
     pub fn begin(data_dir: &Path) -> Self {
         let path = data_dir.join(FILE);
         let last = read(&path);
-        let file = Self { path, current: first_after(last) };
+        let mut file = Self { path, current: first_after(last), recorded: None };
         file.write();
         info!(incarnation = file.current, previous = ?last, "this member's SWIM incarnation");
         file
@@ -62,6 +67,13 @@ impl IncarnationFile {
     /// The incarnation this member's identity has now.
     pub fn current(&self) -> u64 {
         self.current
+    }
+
+    /// The last incarnation this process has put on disk, `None` while no write
+    /// of it has succeeded. A later start takes one above what the file holds,
+    /// so no later process takes an identity at or below this one (ADR-247).
+    pub(crate) fn recorded(&self) -> Option<u64> {
+        self.recorded
     }
 
     /// The identity was renewed to `incarnation` in this process: record it,
@@ -78,7 +90,7 @@ impl IncarnationFile {
     /// both callers are on the runtime (the start in `spawn_cluster`, a renewal
     /// in the membership loop), whose worker this tells to move its other tasks
     /// elsewhere while it waits on the disk.
-    fn write(&self) {
+    fn write(&mut self) {
         let path = &self.path;
         let text = format!("{}\n", self.current);
         if let Err(e) = kimmy_storage::blocking(|| crate::catchup::write_atomic(path, &text)) {
@@ -89,6 +101,8 @@ impl IncarnationFile {
                 "the SWIM incarnation could not be recorded; the next start may renew its \
                  identity several times before its peers take it"
             );
+        } else {
+            self.recorded = Some(self.current);
         }
     }
 }

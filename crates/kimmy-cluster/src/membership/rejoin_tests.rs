@@ -305,6 +305,9 @@ impl Net {
                 }
             })
             .collect();
+        for node in &nodes {
+            node.members.set_own_incarnation(node.kept);
+        }
         exchanges.lock().running = nodes.iter().map(|node| Some(node.members.clone())).collect();
         let mut net = Net {
             nodes,
@@ -345,6 +348,14 @@ impl Net {
         };
         input(&mut self.nodes[node].swim, &mut out);
         (self.after_input)(&mut self.nodes[node].swim, &mut out);
+        // A renewal that reaches the node's record goes on its blocks after it,
+        // as the daemon's `RecordThenStamp` puts it there.
+        if let Some(renewed) = out.recorded
+            && self.nodes[node].keeps
+        {
+            self.nodes[node].kept = Some(renewed);
+            self.nodes[node].members.set_own_incarnation(Some(renewed));
+        }
         let deferred: Vec<_> = {
             let mut shared = self.exchanges.lock();
             let (mine, rest) = std::mem::take(&mut shared.deferred)
@@ -363,11 +374,6 @@ impl Net {
         let now = self.now;
         self.nodes[node].downs.extend(out.down.iter().map(|addr| (*addr, now)));
         self.nodes[node].renames.extend(out.renamed.iter().map(|addr| (*addr, now)));
-        if let Some(renewed) = out.recorded
-            && self.nodes[node].keeps
-        {
-            self.nodes[node].kept = Some(renewed);
-        }
         let epoch = self.nodes[node].epoch;
         for (event, after) in out.timers {
             self.pending.push((event, epoch));
@@ -565,6 +571,7 @@ impl Net {
         n.buffered.clear();
         n.due.clear();
         n.members = process_members(&self.exchanges, node, n.epoch);
+        n.members.set_own_incarnation(n.kept);
         self.exchanges.lock().running[node] = Some(n.members.clone());
     }
 
@@ -1003,6 +1010,18 @@ fn every_restart_starts_one_exchange_each_way_and_every_block_is_held() {
                             held_boot(&net, holder, of),
                             Some(boot(of, net.nodes[of].epoch)),
                             "dead {down} ms, restart {restart}: {holder} holds {of}'s block"
+                        );
+                        let built_under = net.nodes[holder]
+                            .members
+                            .view()
+                            .blocks
+                            .get(&node_id(of))
+                            .and_then(|held| held.facts.incarnation);
+                        assert_eq!(
+                            built_under,
+                            Some(incarnation(&net, of)),
+                            "dead {down} ms, restart {restart}: {of}'s block at {holder} says the \
+                             identity {of} has"
                         );
                     }
                 }

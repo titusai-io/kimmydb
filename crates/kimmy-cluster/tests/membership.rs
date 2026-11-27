@@ -241,3 +241,35 @@ async fn a_member_alone_announces_to_its_table_on_its_own_timer() {
     eventually("a to find b again, with no offer", || a.members.snapshot().contains(&b_addr)).await;
     back.abort();
 }
+
+/// The membership task puts this process's incarnation on the member's blocks
+/// (ADR-247), as the daemon wires it: the block's source first, then the task.
+#[tokio::test]
+async fn membership_puts_the_incarnation_on_the_members_blocks() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let members = Members::default();
+    members.set_facts_source(std::sync::Arc::new(kimmy_cluster::Facts::default));
+    let (_offers, feed) = SeedFeed::channel();
+    let dir = tempfile::tempdir().unwrap();
+    // The second start of this data directory, whose incarnation no default is.
+    drop(kimmy_cluster::membership::IncarnationFile::begin(dir.path()));
+    let incarnation = kimmy_cluster::membership::IncarnationFile::begin(dir.path());
+    assert_eq!(incarnation.current(), 1, "premise");
+
+    let running = tokio::spawn(kimmy_cluster::membership::run(
+        socket,
+        addr,
+        kimmy_core::NodeId::generate(),
+        incarnation,
+        SECRET.to_string(),
+        members.clone(),
+        feed,
+        kimmy_task::Shutdown::new(),
+    ));
+    eventually("the block to say incarnation 1", || {
+        members.local_facts().is_some_and(|(block, _)| block.incarnation == Some(1))
+    })
+    .await;
+    running.abort();
+}
