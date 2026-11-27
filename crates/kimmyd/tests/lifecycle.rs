@@ -3203,9 +3203,11 @@ async fn a_standalone_start_after_a_restore_is_ready_and_unmarked() {
     assert!(run.wait_exit().success());
 }
 
-/// A restored member with peers is marked `restored` (a store exists, so it is not
-/// `seeded_empty`), refuses requests and is not ready, and with nobody reachable
-/// serves as `unknown` once the wait runs out.
+/// A restored member whose only seed is dead waits for its mistaken-restore guard, which no time
+/// passes, past the catch-up wait too (ADR-274). Restored with `--replace`, it is marked
+/// `restored` (a store exists, so it is not `seeded_empty`), refuses requests and is not ready,
+/// and with nobody reachable serves as `unknown` once the wait runs out: a member whose seed
+/// says nothing is not alone, so `--replace` leaves its marker.
 #[tokio::test]
 async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     let dir = tempfile::tempdir().unwrap();
@@ -3213,6 +3215,22 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     let (backup, config) = backup_and_config(dir.path());
     restore(&config, &backup);
     let data = dir.path().join("data");
+    let seed = dead_port();
+    let mut held = Run::spawn_clustered(dir.path(), "restored-waits", seed, 3);
+    until_bound(&held).await;
+    // Well past the catch-up wait of 3 s.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (status, header, body) = readyz(&held, &client).await;
+    assert_eq!(
+        (status, header.as_deref(), body["reason"].as_str()),
+        (503, Some("restore_guard"), Some("restore_guard")),
+        "still held: {body}; log: {}",
+        held.log()
+    );
+    held.signal("TERM");
+    assert!(held.wait_exit().success());
+    std::fs::remove_dir_all(&data).unwrap();
+    restore_with(&config, &backup, &["--replace"]);
     let restored_floor = kimmy_cluster::catchup::replay_floor_on_disk(&data);
     let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
     assert_eq!(
@@ -3222,16 +3240,8 @@ async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
     );
     drop(source);
 
-    let mut run = Run::spawn_clustered(dir.path(), "restored-with-peers", dead_port(), 3);
-    let deadline = Instant::now() + PATIENCE;
-    while run.http.get().is_none() {
-        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
-        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
-            let _ = run.http.set(port);
-        }
-        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
-        tokio::time::sleep(POLL).await;
-    }
+    let mut run = Run::spawn_clustered(dir.path(), "restored-with-peers", seed, 3);
+    until_bound(&run).await;
     until_ready_is(&run, &client, "503 catching_up restored", |status, header, body| {
         status == 503 && header.as_deref() == Some("restored") && body["error"] == "catching_up"
     })

@@ -5938,9 +5938,16 @@ async fn a_decimal128_id_and_bound_are_created_anywhere_and_applied_everywhere()
 /// A running node A, and a second node B that is a restore of A's backup (so it carries A's node id
 /// under a new epoch), started while A runs. `replace` gives the restore `--replace`. B starts with
 /// its first run's data directory wiped.
-async fn a_restore_of_a_live_node(client: &reqwest::Client, replace: bool) -> (Node, Node) {
+async fn a_restore_of_a_live_node(
+    client: &reqwest::Client,
+    replace: bool,
+    // The restore's cluster port is one that no member has seen, and A seeds a port that nothing
+    // listens on, so that A names the restore's address nowhere and sends it nothing first.
+    unseen_port: bool,
+) -> (Node, Node) {
     let (pa, pb) = (ports::choose(), ports::choose());
-    let a = Node::spawn_with("node-a", pa, &[pb], "");
+    let a_seed = if unseen_port { ports::choose() } else { pb };
+    let a = Node::spawn_with("node-a", pa, &[a_seed], "");
     let mut b = Node::spawn_with("node-b", pb, &[pa], "");
     a.wait_ready(client).await;
     b.wait_ready(client).await;
@@ -6000,6 +6007,9 @@ async fn a_restore_of_a_live_node(client: &reqwest::Client, replace: bool) -> (N
     b.signal("TERM");
     b.wait_exit(Duration::from_secs(60));
     std::fs::remove_dir_all(b.dir.path().join("data")).unwrap();
+    if unseen_port {
+        move_to_port(&mut b, ports::choose());
+    }
     let mut restore = Command::new(env!("CARGO_BIN_EXE_kimmyd"));
     restore
         .arg("--config")
@@ -6036,11 +6046,14 @@ async fn is_halted(client: &reqwest::Client, node: &Node) -> bool {
 #[ignore = "boots a real two-node cluster; run with --ignored"]
 async fn a_restore_of_a_live_node_halts_itself_by_the_guard() {
     let client = reqwest::Client::new();
-    let (a, b) = a_restore_of_a_live_node(&client, false).await;
+    let (a, b) = a_restore_of_a_live_node(&client, false, false).await;
     eventually("the restored node to halt itself", || is_halted(&client, &b)).await;
     assert!(b.log().contains("mistaken-restore guard"), "it says why: {}", b.log());
     assert!(!is_halted(&client, &a).await, "the live node is not halted");
     a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    let order = serde_json::json!({ "_id": "after the restore" });
+    posted(&client, &a, &token, "/v1/db/shop/coll/orders/docs", order).await;
 }
 
 /// 9e, and the rest of a halt: with `--replace` the restored node proceeds and the old host, told
@@ -6052,7 +6065,7 @@ async fn a_restore_of_a_live_node_halts_itself_by_the_guard() {
 #[ignore = "boots a real two-node cluster; run with --ignored"]
 async fn a_restore_with_replace_takes_the_node_over_and_the_old_host_halts_quietly() {
     let client = reqwest::Client::new();
-    let (a, b) = a_restore_of_a_live_node(&client, true).await;
+    let (a, b) = a_restore_of_a_live_node(&client, true, false).await;
     eventually("the old host to be told and halt", || is_halted(&client, &a)).await;
     assert!(!is_halted(&client, &b).await, "the restored node proceeded: {}", b.log());
 
@@ -6308,6 +6321,11 @@ async fn ask(client: &reqwest::Client, node: &Node, token: &str, id: usize) -> A
 
 /// Replace `node`'s data with a restore of the backup at `from`, and leave it stopped.
 fn restore_over(node: &Node, from: &std::path::Path) {
+    restore_over_with(node, from, &[]);
+}
+
+/// [`restore_over`], with `extra` arguments to the restore.
+fn restore_over_with(node: &Node, from: &std::path::Path, extra: &[&str]) {
     std::fs::remove_dir_all(node.dir.path().join("data")).unwrap();
     let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
         .arg("--config")
@@ -6315,6 +6333,7 @@ fn restore_over(node: &Node, from: &std::path::Path) {
         .arg("restore")
         .arg("--from")
         .arg(from)
+        .args(extra)
         .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
         .output()
         .expect("running kimmyd restore");
@@ -6641,4 +6660,513 @@ async fn a_restore_with_membership_off_is_not_held() {
     a.wait_ready(&client).await;
     let order = serde_json::json!({ "_id": 1 });
     posted(&client, &a, &token, "/v1/db/shop/coll/orders/docs", order).await;
+}
+
+// ---------------------------------------------------------------------------
+// The restore's verdict, in daemons (ADR-274)
+// ---------------------------------------------------------------------------
+
+/// Replace `was`, which `node`'s configuration holds once, by `is`.
+fn reconfigure(node: &Node, was: &str, is: &str) {
+    let path = node.dir.path().join("kimmy.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(config.matches(was).count(), 1, "{was}: {config}");
+    std::fs::write(&path, config.replace(was, is)).unwrap();
+}
+
+/// A node's `seeds` line, as the harness writes it.
+fn seeds_line(ports: &[u16]) -> String {
+    let list = ports.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect::<Vec<_>>();
+    format!("seeds = [{}]", list.join(", "))
+}
+
+/// Give `node`, which is stopped, another cluster port.
+fn move_to_port(node: &mut Node, port: u16) {
+    let bind = |port: u16| format!("bind = \"127.0.0.1:{port}\"");
+    reconfigure(node, &bind(node.cluster), &bind(port));
+    node.cluster = port;
+}
+
+fn stop(node: &Node) {
+    node.signal("TERM");
+    node.wait_exit(Duration::from_secs(60));
+}
+
+/// A collection `shop.orders` on `node`, with documents 1 to `count`.
+async fn some_orders(client: &reqwest::Client, node: &Node, token: &str, count: i64) {
+    let body = serde_json::json!({ "name": "orders" });
+    posted(client, node, token, "/v1/db/shop/collections", body).await;
+    for id in 1..=count {
+        let order = serde_json::json!({ "_id": id, "v": format!("order {id}") });
+        posted(client, node, token, "/v1/db/shop/coll/orders/docs", order).await;
+    }
+}
+
+const HELD_BY_THE_GUARD: &str = "503 catching_up restore_guard";
+
+async fn ready_answer(client: &reqwest::Client, node: &Node) -> String {
+    answered(client.get(node.url("/readyz"))).await.0
+}
+
+/// Wait for a started restore to answer that its guard holds it. A guard that passes it first
+/// fails here, at what it answers.
+async fn waits_for_its_guard(client: &reqwest::Client, node: &Node) {
+    eventually("the restore to be held or to be let through", || {
+        let (client, node) = (client.clone(), node);
+        async move {
+            node.log().contains(GUARD_PASSED)
+                || ready_answer(&client, node).await == HELD_BY_THE_GUARD
+        }
+    })
+    .await;
+    assert!(
+        !node.log().contains(GUARD_PASSED),
+        "its guard passed it, when nothing should have decided:\n{}",
+        node.log()
+    );
+}
+
+/// For `during`, the restore stays held: no passage of time passes it.
+async fn stays_held(client: &reqwest::Client, node: &Node, during: Duration) {
+    waits_for_its_guard(client, node).await;
+    let until = std::time::Instant::now() + during;
+    while std::time::Instant::now() < until {
+        assert_eq!(ready_answer(client, node).await, HELD_BY_THE_GUARD, "{}", node.log());
+        assert!(!node.log().contains(GUARD_PASSED), "passed by time:\n{}", node.log());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// What a client's write is answered, as `status error`.
+async fn write_answer(client: &reqwest::Client, node: &Node, token: &str) -> String {
+    let write = client
+        .post(node.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "v": "a client's" }));
+    answered(write).await.0
+}
+
+/// Whether `node` has logged that it lists a member at the cluster port `port` as up.
+fn listed_up(node: &Node, port: u16) -> bool {
+    let peer = format!("peer=127.0.0.1:{port} ");
+    node.log().lines().map(strip_ansi).any(|l| l.contains("member up") && l.contains(&peer))
+}
+
+/// Two members that seed each other, joined, A holding some orders.
+async fn two_members(client: &reqwest::Client) -> (Node, Node, String) {
+    let (pa, pb) = (ports::choose(), ports::choose());
+    let a = Node::spawn_with("node-a", pa, &[pb], "");
+    let b = Node::spawn_with("node-b", pb, &[pa], "");
+    a.wait_ready(client).await;
+    b.wait_ready(client).await;
+    eventually("gossip to form", || all_report(client, vec![&a, &b], 1)).await;
+    let token = a.login(client).await;
+    some_orders(client, &a, &token, 3).await;
+    let token_b = b.login(client).await;
+    eventually("B to hold the orders", || {
+        let (client, b, token) = (client.clone(), &b, token_b.clone());
+        async move { doc_v(&client, b, &token, 3).await.is_some() }
+    })
+    .await;
+    (a, b, token)
+}
+
+/// Row 1: a restore of a running node's backup, on a port no member has seen and seeding the node
+/// it was taken from, halts itself. The original is not touched.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_onto_a_port_nobody_has_seen_halts_itself_and_leaves_the_original() {
+    let client = reqwest::Client::new();
+    let (a, b) = a_restore_of_a_live_node(&client, false, true).await;
+    eventually("the restore to halt itself or be let through", || {
+        let (client, b) = (client.clone(), &b);
+        async move { is_halted(&client, b).await || b.log().contains(GUARD_PASSED) }
+    })
+    .await;
+    assert!(is_halted(&client, &b).await, "the restore halted itself:\n{}", b.log());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!is_halted(&client, &a).await, "the original is not halted:\n{}", a.log());
+    let token = a.login(&client).await;
+    let order = serde_json::json!({ "_id": "after the restore" });
+    posted(&client, &a, &token, "/v1/db/shop/coll/orders/docs", order).await;
+}
+
+/// Row 2: a fourth host, a restore of A's backup on a port nobody has seen and seeding a member
+/// that is not A, finds A through what that member lists, and halts itself. No member ever
+/// lists it.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn a_restore_that_seeds_another_member_finds_the_original_and_halts() {
+    let client = reqwest::Client::new();
+    let (a, m, n) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &m, &n], 2)).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 3).await;
+    let mut d = Node::spawn_with("node-d", ports::choose(), &[m.cluster], "");
+    d.wait_ready(&client).await;
+    eventually("the fourth to join", || all_report(&client, vec![&a, &m, &n, &d], 3)).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&d);
+    move_to_port(&mut d, ports::choose());
+    restore_over(&d, &backup);
+    d.restart_with(&[]);
+    eventually("the restore to halt itself or be let through", || {
+        let (client, d) = (client.clone(), &d);
+        async move { is_halted(&client, d).await || d.log().contains(GUARD_PASSED) }
+    })
+    .await;
+    assert!(is_halted(&client, &d).await, "the restore halted itself:\n{}", d.log());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for member in [&a, &m, &n] {
+        assert!(!is_halted(&client, member).await, "{} is not halted", member.name);
+        assert!(!listed_up(member, d.cluster), "{} listed the restore", member.name);
+    }
+}
+
+/// Row 4, in daemons: seeds that refuse and that take a connection and say nothing. The restore
+/// waits past any time the guard ever waited and past the catch-up wait, and refuses its clients.
+#[tokio::test]
+#[ignore = "boots a real node; run with --ignored"]
+async fn a_restore_that_reaches_nobody_waits_and_no_time_passes_it() {
+    let client = reqwest::Client::new();
+    let pa = ports::choose();
+    let mut a = Node::spawn_configured("node-a", pa, &[pa], "", 1, "catch_up_wait_secs = 5");
+    a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 1).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&a);
+    restore_over(&a, &backup);
+    let refusing = ports::choose();
+    // Bound and never accepted from: a connection completes and nothing answers it.
+    let black_hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent = black_hole.local_addr().unwrap().port();
+    reconfigure(&a, &seeds_line(&[pa]), &seeds_line(&[refusing, silent]));
+    a.restart_with(&[]);
+    stays_held(&client, &a, Duration::from_secs(20)).await;
+    assert_eq!(write_answer(&client, &a, &token).await, "503 catching_up");
+}
+
+/// Row 5: a replacement waits while a member still lists the old address, and joins soon after it
+/// no longer does; a restore in place, whose listed address is its own, joins at once.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_replacement_waits_for_the_old_address_to_be_dropped_and_one_in_place_does_not() {
+    let client = reqwest::Client::new();
+    let (a, mut b, mut c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 3).await;
+    let c_token = c.login(&client).await;
+    eventually("C to hold the orders", || {
+        let (client, c, token) = (client.clone(), &c, c_token.clone());
+        async move { doc_v(&client, c, &token, 3).await.is_some() }
+    })
+    .await;
+    let backup = backup_to_file(&client, &c, &c_token).await;
+    let old = c.cluster;
+    stop(&c);
+    move_to_port(&mut c, ports::choose());
+    restore_over(&c, &backup);
+    c.restart_with(&[]);
+    eventually("the replacement to join", || {
+        let passed = c.log().contains(GUARD_PASSED);
+        async move { passed }
+    })
+    .await;
+    let down = format!("peer=127.0.0.1:{old}");
+    let dropped = || {
+        a.log()
+            .lines()
+            .map(strip_ansi)
+            .find(|l| l.contains("member down") && l.contains(&down))
+            .and_then(|l| logged_at(&l))
+    };
+    eventually("A to drop the old address", || {
+        let seen = dropped().is_some();
+        async move { seen }
+    })
+    .await;
+    let at = |node: &Node, line: &str| {
+        node.log().lines().find(|l| l.contains(line)).and_then(logged_at).unwrap()
+    };
+    let (dropped, passed) = (dropped().unwrap(), at(&c, GUARD_PASSED));
+    assert!(
+        came_before(at(&c, "gossiping membership"), dropped),
+        "PREMISE: A listed the old address when the replacement started"
+    );
+    let after = seconds_from(dropped, passed);
+    assert!(after >= 0.0, "it joined {:.3} s before A dropped the old address", -after);
+    assert!(after < 20.0, "it joined {after:.3} s after A dropped the old address");
+
+    let b_token = b.login(&client).await;
+    let backup = backup_to_file(&client, &b, &b_token).await;
+    stop(&b);
+    restore_over(&b, &backup);
+    b.restart_with(&[]);
+    let held = seconds_between_lines(&b, "gossiping membership", GUARD_PASSED).await;
+    assert!(held < 5.0, "a restore in place waited {held:.3} s:\n{}", b.log());
+}
+
+/// Row 9: every member restored at once, without --replace: each waits, and says that the member
+/// it asked is waiting too. With --replace on one, all join and hold the same data.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_cluster_restored_whole_waits_until_one_is_told_to_replace() {
+    let client = reqwest::Client::new();
+    let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+    // A short catch-up wait: restored together, every member stays marked, and serves as unknown.
+    let spawn = |name, port, seed| {
+        Node::spawn_configured(name, port, &[seed], "", 1, "catch_up_wait_secs = 5")
+    };
+    let mut nodes = [spawn("node-a", pa, pb), spawn("node-b", pb, pa), spawn("node-c", pc, pa)];
+    for node in &nodes {
+        node.wait_ready(&client).await;
+    }
+    let [a, b, c] = &nodes;
+    eventually("gossip to form", || all_report(&client, vec![a, b, c], 2)).await;
+    let token = a.login(&client).await;
+    some_orders(&client, a, &token, 3).await;
+    let mut backups = Vec::new();
+    for node in &nodes {
+        let token = node.login(&client).await;
+        eventually("every member to hold the orders", || {
+            let (client, node, token) = (client.clone(), node, token.clone());
+            async move { doc_v(&client, node, &token, 3).await.is_some() }
+        })
+        .await;
+        backups.push(backup_to_file(&client, node, &token).await);
+    }
+    for node in &nodes {
+        stop(node);
+    }
+    for (node, backup) in nodes.iter().zip(&backups) {
+        restore_over(node, backup);
+    }
+    for node in &mut nodes {
+        node.restart_with(&[]);
+    }
+    for node in &nodes {
+        waits_for_its_guard(&client, node).await;
+    }
+    stays_held(&client, &nodes[2], Duration::from_secs(20)).await;
+    for node in &nodes {
+        assert!(!node.log().contains(GUARD_PASSED), "{} passed:\n{}", node.name, node.log());
+        let says_so = node.log().lines().map(strip_ansi).any(|line| {
+            line.contains("the mistaken-restore guard waits") && line.contains("undecided=1")
+        });
+        assert!(says_so, "{} says that whom it asked waits too:\n{}", node.name, node.log());
+    }
+    stop(&nodes[0]);
+    restore_over_with(&nodes[0], &backups[0], &["--replace"]);
+    nodes[0].restart_with(&[]);
+    for node in &nodes {
+        eventually("every member to join", || {
+            let passed = node.log().contains(GUARD_PASSED);
+            async move { passed }
+        })
+        .await;
+        node.wait_ready(&client).await;
+    }
+    let mut tokens = Vec::new();
+    for node in &nodes {
+        tokens.push(node.login(&client).await);
+    }
+    let order = serde_json::json!({ "_id": 10, "v": "after" });
+    posted(&client, &nodes[0], &tokens[0], "/v1/db/shop/coll/orders/docs", order).await;
+    for (node, token) in nodes.iter().zip(&tokens) {
+        eventually("the later write to reach every member", || {
+            let (client, node, token) = (client.clone(), node, token.clone());
+            async move { doc_v(&client, node, &token, 10).await.is_some() }
+        })
+        .await;
+        for id in 1..=3 {
+            let held = doc_v(&client, node, token, id).await;
+            assert_eq!(held, Some(format!("\"order {id}\"")), "{} {id}", node.name);
+        }
+    }
+}
+
+/// Row 12: a restore whose seeds name only itself asks nobody, and is answered by whoever dials
+/// it. Dialled by the running original it is a restore of, it halts itself.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_with_no_seed_of_its_own_halts_when_its_original_dials_it() {
+    let client = reqwest::Client::new();
+    let (a, mut b, token) = two_members(&client).await;
+    // B's directory and port, holding a restore of A's backup that seeds only itself; A seeds it.
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&b);
+    restore_over(&b, &backup);
+    reconfigure(&b, &seeds_line(&[a.cluster]), &seeds_line(&[b.cluster]));
+    b.restart_with(&[]);
+    eventually("the restore to halt itself or the original to be halted", || {
+        let (client, a, b) = (client.clone(), &a, &b);
+        async move { is_halted(&client, a).await || is_halted(&client, b).await }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!is_halted(&client, &a).await, "the original is not halted:\n{}", a.log());
+    assert!(is_halted(&client, &b).await, "the restore halted itself:\n{}", b.log());
+}
+
+/// Row 12, the other way: with nobody of its own to ask, it waits, and says so; dialled by a
+/// member that is not its node, it joins, and the member that dialled it while it waited counted
+/// no failure against it.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_with_no_seed_of_its_own_joins_when_a_member_dials_it() {
+    let client = reqwest::Client::new();
+    let (a, mut b, _token) = two_members(&client).await;
+    let token_b = b.login(&client).await;
+    let backup = backup_to_file(&client, &b, &token_b).await;
+    stop(&b);
+    restore_over(&b, &backup);
+    reconfigure(&b, &seeds_line(&[a.cluster]), &seeds_line(&[b.cluster]));
+    b.restart_with(&[]);
+    let held = seconds_between_lines(&b, "gossiping membership", GUARD_PASSED).await;
+    eprintln!("node-b was answered by its dialler {held:.3} s after it began gossiping");
+    // The order of two lines of one log: it said it waits, having nobody to ask, and then passed.
+    let lines: Vec<String> = b.log().lines().map(strip_ansi).collect();
+    let line = |needle: &str| lines.iter().position(|line| line.contains(needle));
+    let waited = line("the mistaken-restore guard waits");
+    assert!(
+        waited.is_some_and(|waited| waited < line(GUARD_PASSED).unwrap()),
+        "it waited to be answered before it passed:\n{}",
+        b.log()
+    );
+    b.wait_ready(&client).await;
+    let gossiping =
+        b.log().lines().find(|l| l.contains("gossiping membership")).and_then(logged_at).unwrap();
+    let peer = format!("peer=127.0.0.1:{}", b.cluster);
+    // Failures while B was down or still starting are before it gossiped.
+    for line in a.log().lines() {
+        let line = strip_ansi(line);
+        if line.contains("sync round failed; backing off") && line.contains(&peer) {
+            let at = logged_at(&line).unwrap();
+            assert!(came_before(at, gossiping + 1.0), "backed off while B waited: {line}");
+        }
+    }
+}
+
+/// Row 20: a restore whose seeds name only itself, with nobody to dial it, waits and refuses its
+/// clients. Restored with --replace, it joins and serves.
+#[tokio::test]
+#[ignore = "boots a real node; run with --ignored"]
+async fn a_restore_alone_waits_until_it_is_told_to_replace() {
+    let client = reqwest::Client::new();
+    let pa = ports::choose();
+    let mut a = Node::spawn_with("node-a", pa, &[pa], "");
+    a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 1).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&a);
+    restore_over(&a, &backup);
+    a.restart_with(&[]);
+    stays_held(&client, &a, Duration::from_secs(12)).await;
+    assert_eq!(write_answer(&client, &a, &token).await, "503 catching_up");
+    stop(&a);
+    // The backup lies beside the data directory, which each restore replaces.
+    restore_over_with(&a, &backup, &["--replace"]);
+    a.restart_with(&[]);
+    a.wait_ready(&client).await;
+    let status = write_answer(&client, &a, &token).await;
+    assert!(status.starts_with("200") || status.starts_with("201"), "it serves: {status}");
+}
+
+/// Two restores of A's backup in two directories, each seeding the other and the members `m` and
+/// `n`, started one after the other. `first` and `second` are stopped nodes. Each has a short
+/// catch-up wait, so that whatever holds a survivor's marker, it serves within the patience.
+fn start_two_restores(
+    first: &mut Node,
+    second: &mut Node,
+    backup: &std::path::Path,
+    m: u16,
+    n: u16,
+) {
+    let (one, two) = (first.cluster, second.cluster);
+    for (node, other) in [(&mut *first, two), (&mut *second, one)] {
+        restore_over(node, backup);
+        let path = node.dir.path().join("kimmy.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        let line = config.lines().find(|l| l.starts_with("seeds = ")).unwrap().to_string();
+        let seeds = seeds_line(&[other, m, n]);
+        reconfigure(node, &line, &format!("{seeds}\ncatch_up_wait_secs = 10"));
+    }
+    first.restart_with(&[]);
+    second.restart_with(&[]);
+}
+
+/// Row 17: two restores of a node whose original is gone: exactly one ends up serving, and never
+/// are both halted. Two that decide at once may both join, and containment then halts the older.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn of_two_restores_of_a_lost_node_exactly_one_ends_up_serving() {
+    let client = reqwest::Client::new();
+    let (mut a, m, n) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &m, &n], 2)).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 3).await;
+    // The second restore's directory and port: of a node that seeds only itself and never joins.
+    // One that had joined would leave the survivor holding its marker for a member that is gone,
+    // for the catch-up wait, which outlasts this harness's patience.
+    let pe = ports::choose();
+    let mut e = Node::spawn_with("node-e", pe, &[pe], "");
+    e.wait_ready(&client).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    // Held in E's directory as well, since A's is replaced.
+    let kept = e.dir.path().join("a-backup.bin");
+    std::fs::copy(&backup, &kept).unwrap();
+    stop(&a);
+    stop(&e);
+    start_two_restores(&mut a, &mut e, &kept, m.cluster, n.cluster);
+    eventually("one of the two to be halted and the other to serve", || {
+        let (client, a, e) = (client.clone(), &a, &e);
+        async move {
+            let (one, two) = (ready_answer(&client, a).await, ready_answer(&client, e).await);
+            let halted = |answer: &str| answer.starts_with("503 halted");
+            (halted(&one) && two == "200 -") || (halted(&two) && one == "200 -")
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let halted = [is_halted(&client, &a).await, is_halted(&client, &e).await];
+    assert_eq!(halted.iter().filter(|h| **h).count(), 1, "never both: {halted:?}");
+    for member in [&m, &n] {
+        assert!(!is_halted(&client, member).await, "{} is not halted", member.name);
+    }
+}
+
+/// Row 18: two restores of a node whose original runs: both halt, and the original is untouched.
+#[tokio::test]
+#[ignore = "boots a real five-node cluster; run with --ignored"]
+async fn two_restores_of_a_running_node_both_halt() {
+    let client = reqwest::Client::new();
+    let (a, m, n) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &m, &n], 2)).await;
+    let token = a.login(&client).await;
+    some_orders(&client, &a, &token, 3).await;
+    let mut d = Node::spawn_with("node-d", ports::choose(), &[m.cluster], "");
+    let mut e = Node::spawn_with("node-e", ports::choose(), &[m.cluster], "");
+    d.wait_ready(&client).await;
+    e.wait_ready(&client).await;
+    eventually("all five to join", || all_report(&client, vec![&a, &m, &n, &d, &e], 4)).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&d);
+    stop(&e);
+    start_two_restores(&mut d, &mut e, &backup, m.cluster, n.cluster);
+    for restore in [&d, &e] {
+        eventually("each restore to halt or be let through", || {
+            let client = client.clone();
+            async move { is_halted(&client, restore).await || restore.log().contains(GUARD_PASSED) }
+        })
+        .await;
+        assert!(is_halted(&client, restore).await, "{} halted:\n{}", restore.name, restore.log());
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for member in [&a, &m, &n] {
+        assert!(!is_halted(&client, member).await, "{} is not halted", member.name);
+    }
+    a.wait_ready(&client).await;
 }

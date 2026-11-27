@@ -3725,6 +3725,35 @@ mod tests {
         }
     }
 
+    /// The guard's rounds know their own answers by their token and by no address (ADR-274), so
+    /// the daemon gives them every address the seeds resolve to and filters none: a filter of the
+    /// addresses this host calls its own would leave a running original at one of them unasked. A
+    /// source check: on one host no run can put the original at an address a restore calls its
+    /// own, which is only ever the address it binds.
+    #[test]
+    fn the_guard_asks_every_resolved_seed_and_filters_no_address() {
+        let source = include_str!("node.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let body = |name: &str| {
+            let from = production.find(name).expect(name);
+            let length = production[from..].find("\n}\n").expect("its end");
+            production[from..from + length]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (guard, seeds) = (body("fn spawn_guard("), body("async fn seed_addresses("));
+        for (name, code) in [("spawn_guard", &guard), ("seed_addresses", &seeds)] {
+            for forbidden in ["advertised(", "own_address", ".filter(", ".retain("] {
+                assert!(!code.contains(forbidden), "{name} has `{forbidden}`:\n{code}");
+            }
+        }
+        for needed in ["ask_until_decided(", "seed_addresses("] {
+            assert!(guard.contains(needed), "spawn_guard asks the rounds the seeds: {needed}");
+        }
+    }
+
     /// The bound is set before the cluster can apply a remote entry: right after the open, and
     /// before `spawn_cluster` starts the replication listener and the sync loop. A source check, as
     /// the open's is: a real start cannot be stopped between the two.
