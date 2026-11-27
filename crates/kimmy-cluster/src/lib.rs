@@ -54,6 +54,9 @@ mod guard_tests;
 mod join_retention_tests;
 
 #[cfg(test)]
+mod second_dispatcher;
+
+#[cfg(test)]
 mod unknown_fetch_tests;
 
 pub use confirm::{

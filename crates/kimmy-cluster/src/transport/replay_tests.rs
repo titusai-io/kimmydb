@@ -13,6 +13,7 @@ use kimmy_storage::Engine;
 use super::*;
 use crate::catchup::CatchUp;
 use crate::protocol::ReplayStall;
+use crate::second_dispatcher::a_second_dispatcher;
 
 const SECRET: &str = "a-replay-inbound-secret";
 const BINDING: &[u8] = b"a-replay-inbound-binding";
@@ -1232,6 +1233,26 @@ impl tracing::Subscriber for Seen {
     }
     fn enter(&self, _: &tracing::Id) {}
     fn exit(&self, _: &tracing::Id) {}
+}
+
+/// A line first said on a thread that records nothing is still recorded here. Run as its own process (nextest, or `--exact`), it
+/// fails where the second dispatcher registers nothing: this thread's capture is then the only one, and the other thread's first
+/// hit switches the line off for both.
+#[test]
+fn a_line_first_said_on_another_thread_is_still_recorded() {
+    fn say() {
+        tracing::info!("said first elsewhere");
+    }
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _not_alone = a_second_dispatcher();
+    let _recording = tracing::subscriber::set_default(seen);
+    // UNSUPERVISED: a thread of this test, joined on this line, whose panic fails the test
+    std::thread::spawn(say).join().unwrap();
+    say();
+    let lines = log.lock().unwrap();
+    let said = lines.iter().filter(|(_, message)| message == "said first elsewhere").count();
+    assert_eq!(said, 1, "this thread's line, and only it: {lines:?}");
 }
 
 /// A replay of many pages from one peer says once that the peer holds writes the member
