@@ -2781,6 +2781,9 @@ fn spawn_guard(
         .await;
         match verdict {
             kimmy_cluster::guard::GuardVerdict::Pass => {
+                // Said before anything the guard holds back is let go, so whatever a log or a
+                // client shows ahead of this line was done while the guard had not passed.
+                info!("the mistaken-restore guard passed; this host may join its cluster");
                 let _ = gate.send(Some(true));
             }
             kimmy_cluster::guard::GuardVerdict::LiveHost(address) => {
@@ -3690,6 +3693,33 @@ mod tests {
         let storage = crate::config::StorageConfig { max_clock_skew_secs: 7, ..Default::default() };
         super::apply_clock_bound(&engine, &storage);
         assert_eq!(engine.clock_bound().skew_ms, 7_000, "the configured value reached the engine");
+    }
+
+    /// The guard's hold is taken where the guarded decision is made: before the catch-up state is
+    /// handed to the API and before any task that does owner work is spawned. Taken later, by the
+    /// guard's own task, it would race the webhook dispatcher's first pass, which delivered 7 ms
+    /// after the dispatcher started on the run that found owner work unheld. A source check: no run
+    /// of a daemon can pin an order that only a race would show.
+    #[test]
+    fn the_guards_hold_is_taken_before_anything_that_reads_it_is_spawned() {
+        let source = include_str!("node.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let taken: Vec<_> = production.match_indices(".hold_for_guard()").collect();
+        assert_eq!(taken.len(), 1, "the hold is taken, in one place");
+        let start = production.find("async fn start_and_serve(").expect("the start");
+        let end = start + production[start..].find("\n}\n").expect("its end");
+        let hold = taken[0].0;
+        assert!(start < hold && hold < end, "where the node starts, not in a task of its own");
+        for later in [
+            "state.set_catch_up(",
+            "let cluster = spawn_cluster(",
+            "supervise(\"webhook_dispatcher\"",
+            "Some(spawn_expiry(",
+            "supervise(\"embedding_worker\"",
+        ] {
+            let at = production.find(later).expect(later);
+            assert!(hold < at, "the hold is taken before `{later}`");
+        }
     }
 
     /// The bound is set before the cluster can apply a remote entry: right after the open, and

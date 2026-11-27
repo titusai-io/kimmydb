@@ -6131,3 +6131,512 @@ async fn three_new_members_seeding_each_other_in_a_circle_form_a_cluster() {
     }
     eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
 }
+
+// ---------------------------------------------------------------------------
+// What the mistaken-restore guard's hold holds back (ADR-274)
+// ---------------------------------------------------------------------------
+
+/// The line a host logs when its guard passes, before it lets go of anything the guard held back.
+const GUARD_PASSED: &str = "the mistaken-restore guard passed";
+
+/// The `[vector]` section of every node of the held restore's fixture: the loopback provider
+/// allowed, and the worker off, so that only the restore, which turns it on, ever embeds.
+const HELD_VECTOR: &str =
+    "\n[vector]\nworker_enabled = false\n[vector.provider]\nallowed_hosts = [\"127.0.0.1\"]";
+
+/// Seconds of the day in UTC, now, as [`logged_at`] reads a log line's.
+fn seconds_of_day() -> f64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    (since.as_secs() % 86_400) as f64 + f64::from(since.subsec_nanos()) * 1e-9
+}
+
+/// Whether `at` came before `of`: two times of day less than half a day apart.
+fn came_before(at: f64, of: f64) -> bool {
+    (at - of).rem_euclid(86_400.0) > 43_200.0
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// What a listener of the test's was sent: when, and the body.
+type Requests = std::sync::Arc<std::sync::Mutex<Vec<(f64, serde_json::Value)>>>;
+
+/// Listen on `port`, recording each request. With `embeds`, answer as a `custom_http` embedding
+/// provider, one vector of four numbers for each input; else answer 200 and nothing.
+async fn requests_on(port: u16, embeds: bool) -> Requests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let requests = Requests::default();
+    let record = std::sync::Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let record = std::sync::Arc::clone(&record);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let Ok(read) = stream.read(&mut chunk).await else { return };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&request[..head])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(&request[head + 4..])
+                            .unwrap_or_default();
+                    }
+                };
+                let answer = if embeds {
+                    let inputs = body["input"].as_array().map_or(0, Vec::len);
+                    serde_json::json!({ "embeddings": vec![[0.1, 0.2, 0.3, 0.4]; inputs] })
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                record.lock().unwrap().push((seconds_of_day(), body));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    requests
+}
+
+/// The `_id`s of the documents whose events a webhook receiver has been sent.
+fn delivered_ids(webhooks: &Requests) -> std::collections::BTreeSet<i64> {
+    webhooks
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, body)| body["events"].as_array().cloned().unwrap_or_default())
+        .filter_map(|event| event["documentKey"]["_id"].as_i64())
+        .collect()
+}
+
+/// The texts an embedding provider has been asked for.
+fn embedded_texts(embeddings: &Requests) -> std::collections::BTreeSet<String> {
+    embeddings
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, body)| body["input"].as_array().cloned().unwrap_or_default())
+        .filter_map(|text| text.as_str().map(str::to_string))
+        .collect()
+}
+
+fn owed_texts_were_embedded(embeddings: &Requests) -> bool {
+    let texts = embedded_texts(embeddings);
+    ["first note", "second note"].iter().all(|owed| texts.iter().any(|text| text.contains(owed)))
+}
+
+async fn posted(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) {
+    let res = client.post(node.url(path)).bearer_auth(token).json(&body).send().await.unwrap();
+    let status = res.status();
+    assert!(status.is_success(), "{path}: {status} {}", res.text().await.unwrap_or_default());
+}
+
+/// One answer to a client: `status error`, with the body's `reason` after it where there is one.
+async fn answered(request: reqwest::RequestBuilder) -> (String, serde_json::Value) {
+    match request.timeout(Duration::from_secs(3)).send().await {
+        Err(_) => ("no answer".to_string(), serde_json::Value::Null),
+        Ok(res) => {
+            let status = res.status().as_u16();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let mut answer = format!("{status} {}", body["error"].as_str().unwrap_or("-"));
+            if let Some(reason) = body["reason"].as_str() {
+                answer = format!("{answer} {reason}");
+            }
+            (answer, body)
+        }
+    }
+}
+
+/// What a client got from a node at one moment.
+#[derive(Debug)]
+struct Asked {
+    /// When the last of the answers was in.
+    at: f64,
+    readyz: String,
+    read: String,
+    due: String,
+    write: String,
+    /// What the node's own topology entry says of its catching up.
+    topology: Option<String>,
+}
+
+async fn ask(client: &reqwest::Client, node: &Node, token: &str, id: usize) -> Asked {
+    let get = |path: &str| client.get(node.url(path)).bearer_auth(token);
+    let readyz = answered(get("/readyz")).await.0;
+    let read = answered(get("/v1/db/shop/coll/orders/docs/1")).await.0;
+    let due = answered(get("/v1/db/shop/coll/sessions/docs/1")).await.0;
+    let write = client
+        .post(node.url("/v1/db/shop/coll/scratch/docs"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "_id": id }));
+    let write = answered(write).await.0;
+    let topology = answered(get("/v1/topology")).await.1;
+    let topology = topology["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|node| node["self"] == true))
+        .and_then(|me| me["catchingUp"].as_str().map(str::to_string));
+    Asked { at: seconds_of_day(), readyz, read, due, write, topology }
+}
+
+/// Replace `node`'s data with a restore of the backup at `from`, and leave it stopped.
+fn restore_over(node: &Node, from: &std::path::Path) {
+    std::fs::remove_dir_all(node.dir.path().join("data")).unwrap();
+    let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        .arg("--config")
+        .arg(node.dir.path().join("kimmy.toml"))
+        .arg("restore")
+        .arg("--from")
+        .arg(from)
+        .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
+        .output()
+        .expect("running kimmyd restore");
+    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+}
+
+async fn backup_to_file(client: &reqwest::Client, node: &Node, token: &str) -> std::path::PathBuf {
+    let backup = client.get(node.url("/v1/admin/backup")).bearer_auth(token).send().await.unwrap();
+    assert_eq!(backup.status(), 200);
+    let path = node.dir.path().join("backup.bin");
+    std::fs::write(&path, backup.bytes().await.unwrap()).unwrap();
+    path
+}
+
+/// A restore of a node with work owed, whose mistaken-restore guard held it, and what it did and
+/// answered until the guard passed.
+struct HeldRestore {
+    node: Node,
+    token: String,
+    _beside: Node,
+    _later: Node,
+    webhooks: Requests,
+    embeddings: Requests,
+    asked: Vec<Asked>,
+}
+
+impl HeldRestore {
+    fn passed_at(&self) -> f64 {
+        self.node
+            .log()
+            .lines()
+            .find(|line| line.contains(GUARD_PASSED))
+            .and_then(logged_at)
+            .expect("the guard passed")
+    }
+
+    fn log_lines(&self) -> Vec<String> {
+        self.node.log().lines().map(strip_ansi).collect()
+    }
+
+    /// Nothing the listener was sent came before the guard passed. Until then no other node holds
+    /// the subscription or the vector configuration, so whatever came earlier is the restore's.
+    fn assert_nothing_before_the_pass(&self, what: &str, requests: &Requests) {
+        let passed = self.passed_at();
+        for (at, body) in requests.lock().unwrap().iter() {
+            assert!(
+                !came_before(*at, passed),
+                "{what} was sent {:.3} s before the guard passed: {body}",
+                (passed - at).rem_euclid(86_400.0)
+            );
+        }
+    }
+
+    /// The line of the restore's log that names an expiry of the due document, if any.
+    fn expiry_line(&self) -> Option<usize> {
+        self.log_lines()
+            .iter()
+            .position(|line| line.contains("expired documents") && line.contains("sessions"))
+    }
+
+    /// The premise of every row on a held restore: there was a hold to speak of. Asked after what
+    /// the row is about, so that work done by a held host is what fails it.
+    fn assert_it_was_held(&self) {
+        let gossiping = self
+            .node
+            .log()
+            .lines()
+            .find(|line| line.contains("gossiping membership"))
+            .and_then(logged_at)
+            .expect("it gossiped");
+        let held = seconds_from(gossiping, self.passed_at());
+        assert!(held >= 10.0, "PREMISE: the guard held the restore {held:.3} s, not 10");
+    }
+}
+
+/// Restore a node that owes a webhook two events, an embedding provider two notes and a TTL index
+/// one expiry, and start it where its guard holds it. With `marked` the restore keeps its
+/// catching-up marker; without, the marker is removed, as a restore that stopped between
+/// publishing the store and writing it leaves things.
+///
+/// The restore's only seed is a member that has never had its data. After 20 s a third node joins
+/// that member, which has then met somebody, so that its answer can count for a guard that asks
+/// for one that does. The restore is asked as a client would ask until its guard passes.
+async fn held_restore(client: &reqwest::Client, marked: bool) -> HeldRestore {
+    let (pa, pm, pn) = (ports::choose(), ports::choose(), ports::choose());
+    let (hook_port, provider_port) = (ports::choose(), ports::choose());
+    // The node the backup is of, and the member beside the restore, each seed only themselves: a
+    // new member whose seeds name another is not ready until it has caught up (ADR-202).
+    let mut a = Node::spawn_with("node-a", pa, &[pa], HELD_VECTOR);
+    a.wait_ready(client).await;
+    let token = a.login(client).await;
+    for name in ["orders", "notes", "sessions", "scratch"] {
+        let body = serde_json::json!({ "name": name });
+        posted(client, &a, &token, "/v1/db/shop/collections", body).await;
+    }
+    let hook = serde_json::json!({ "url": format!("http://127.0.0.1:{hook_port}/hook") });
+    posted(client, &a, &token, "/v1/db/shop/coll/orders/webhooks", hook).await;
+    let embedding = serde_json::json!({
+        "fields": ["title"],
+        "provider": {
+            "kind": "custom_http",
+            "endpoint": format!("http://127.0.0.1:{provider_port}/embed"),
+        },
+        "dim": 4
+    });
+    posted(client, &a, &token, "/v1/db/shop/coll/notes/vector", embedding).await;
+    for (id, title) in [(1, "first note"), (2, "second note")] {
+        let order = serde_json::json!({ "_id": id, "item": "widget" });
+        posted(client, &a, &token, "/v1/db/shop/coll/orders/docs", order).await;
+        let note = serde_json::json!({ "_id": id, "title": title });
+        posted(client, &a, &token, "/v1/db/shop/coll/notes/docs", note).await;
+    }
+    let ttl = serde_json::json!({
+        "name": "ttl_seen",
+        "fields": [{ "path": "seen" }],
+        "expireAfterSeconds": 1,
+    });
+    posted(client, &a, &token, "/v1/db/shop/coll/sessions/indexes", ttl).await;
+    let due = unix_millis() + 10_000;
+    let session = serde_json::json!({ "_id": 1, "seen": { "$date": due } });
+    posted(client, &a, &token, "/v1/db/shop/coll/sessions/docs", session).await;
+    let backup = backup_to_file(client, &a, &token).await;
+    let held = client.get(a.url("/v1/db/shop/coll/sessions/docs/1")).bearer_auth(&token);
+    assert_eq!(answered(held).await.0, "200 -", "PREMISE: the backup holds the document");
+    a.signal("TERM");
+    a.wait_exit(Duration::from_secs(60));
+
+    let beside = Node::spawn_with("node-m", pm, &[pm], HELD_VECTOR);
+    beside.wait_ready(client).await;
+    while unix_millis() < due + 3_000 {
+        tokio::time::sleep(POLL).await;
+    }
+
+    restore_over(&a, &backup);
+    let marker = a.dir.path().join("data").join("kimmy.catching-up");
+    assert!(marker.exists(), "PREMISE: a restore writes the catching-up marker");
+    if !marked {
+        std::fs::remove_file(&marker).unwrap();
+    }
+    let config_path = a.dir.path().join("kimmy.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    for (was, is) in [
+        (format!("seeds = [\"127.0.0.1:{pa}\"]"), format!("seeds = [\"127.0.0.1:{pm}\"]")),
+        ("worker_enabled = false".to_string(), "worker_enabled = true".to_string()),
+    ] {
+        assert_eq!(config.matches(&was).count(), 1, "{was}: {config}");
+        config = config.replace(&was, &is);
+    }
+    std::fs::write(&config_path, config).unwrap();
+
+    // Only now does anything listen for what the restore's owner work would send.
+    let webhooks = requests_on(hook_port, false).await;
+    let embeddings = requests_on(provider_port, true).await;
+    let started = std::time::Instant::now();
+    a.restart_with(&[]);
+    let mut later = None;
+    let mut asked = Vec::new();
+    while later.is_none() || !a.log().contains(GUARD_PASSED) {
+        assert!(started.elapsed() < patience(), "the guard never passed:\n{}", a.log());
+        if later.is_none() && started.elapsed() >= Duration::from_secs(20) {
+            // Not waited for: it seeds another, so it is not ready until it has caught up.
+            later = Some(Node::spawn_with("node-n", pn, &[pm], HELD_VECTOR));
+        }
+        asked.push(ask(client, &a, &token, asked.len()).await);
+        tokio::time::sleep(POLL).await;
+    }
+    let later = later.expect("the loop ends only once it is spawned");
+    HeldRestore { node: a, token, _beside: beside, _later: later, webhooks, embeddings, asked }
+}
+
+/// A restore its guard holds delivers no webhook: its copy of a subscription's progress is as old
+/// as the backup, and the node the backup was taken from may be running.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_restore_held_by_its_guard_delivers_no_webhook() {
+    let client = reqwest::Client::new();
+    let run = held_restore(&client, false).await;
+    eventually("both owed events to be delivered", || {
+        let all = delivered_ids(&run.webhooks) == std::collections::BTreeSet::from([1, 2]);
+        async move { all }
+    })
+    .await;
+    run.assert_nothing_before_the_pass("a webhook", &run.webhooks);
+    run.assert_it_was_held();
+}
+
+/// A restore its guard holds expires nothing: its copy of a document may be older than the one the
+/// node it was taken from has since refreshed, and its delete would be the newer write.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_restore_held_by_its_guard_expires_nothing() {
+    let client = reqwest::Client::new();
+    let run = held_restore(&client, false).await;
+    eventually("the due document to be gone once the guard has passed", || {
+        let request =
+            client.get(run.node.url("/v1/db/shop/coll/sessions/docs/1")).bearer_auth(&run.token);
+        async move { answered(request).await.0 == "404 not_found" }
+    })
+    .await;
+    // The order of two lines of one log, so no clock is compared.
+    let passed = run.log_lines().iter().position(|line| line.contains(GUARD_PASSED)).unwrap();
+    if let Some(expired) = run.expiry_line() {
+        assert!(
+            expired > passed,
+            "the restore expired the document before its guard passed:\n{}",
+            run.node.log()
+        );
+    }
+    run.assert_it_was_held();
+}
+
+/// A restore its guard holds asks no embedding provider for anything, and embeds what is owed once
+/// the guard has passed.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_restore_held_by_its_guard_embeds_nothing() {
+    let client = reqwest::Client::new();
+    let run = held_restore(&client, false).await;
+    // Past the worker's thirty-second settle of an ownership it has gained.
+    eventually("the owed notes to be embedded", || {
+        let all = owed_texts_were_embedded(&run.embeddings);
+        async move { all }
+    })
+    .await;
+    run.assert_nothing_before_the_pass("an embedding request", &run.embeddings);
+    run.assert_it_was_held();
+}
+
+/// A restore its guard holds serves no client, with no catching-up marker to say so: it may be
+/// about to halt, and a write it acknowledged would be lost with it. It is refused by name, and
+/// the topology marks it so that a client routing by it goes elsewhere.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_restore_held_by_its_guard_refuses_its_clients() {
+    let client = reqwest::Client::new();
+    let run = held_restore(&client, false).await;
+    let passed = run.passed_at();
+    let early: Vec<&Asked> =
+        run.asked.iter().filter(|asked| came_before(asked.at, passed)).collect();
+    for asked in &early {
+        for answer in [&asked.readyz, &asked.read, &asked.due, &asked.write] {
+            assert!(
+                answer == "no answer" || answer.starts_with("503"),
+                "served while its guard held it: {asked:?}"
+            );
+        }
+    }
+    let refused = early
+        .iter()
+        .filter(|asked| {
+            asked.readyz == "503 catching_up restore_guard"
+                && asked.read == "503 catching_up"
+                && asked.write == "503 catching_up"
+        })
+        .count();
+    assert!(refused >= 5, "refused by name {refused} times:\n{early:#?}");
+    let marked: Vec<&String> = early.iter().filter_map(|asked| asked.topology.as_ref()).collect();
+    assert!(
+        !marked.is_empty() && marked.iter().all(|state| *state == "restore_guard"),
+        "the topology marks it: {marked:?}"
+    );
+    run.assert_it_was_held();
+    eventually("the restore to serve once its guard has passed", || {
+        let ready = client.get(run.node.url("/readyz"));
+        let write = client
+            .post(run.node.url("/v1/db/shop/coll/scratch/docs"))
+            .bearer_auth(&run.token)
+            .json(&serde_json::json!({ "_id": "after the pass" }));
+        async move { answered(ready).await.0 == "200 -" && answered(write).await.0 == "200 -" }
+    })
+    .await;
+}
+
+/// The control of the four rows above: a restore that keeps its marker does no owner work while
+/// its guard holds it, by the marker alone. What only it can do, it does after the marker clears:
+/// it is the one node whose worker embeds, and the expiry its own log names is its own.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_marked_restore_held_by_its_guard_does_no_owner_work() {
+    let client = reqwest::Client::new();
+    let run = held_restore(&client, true).await;
+    eventually("the owed notes to be embedded", || {
+        let all = owed_texts_were_embedded(&run.embeddings);
+        async move { all }
+    })
+    .await;
+    run.assert_nothing_before_the_pass("a webhook", &run.webhooks);
+    run.assert_nothing_before_the_pass("an embedding request", &run.embeddings);
+    let log = run.node.log();
+    let cleared = log
+        .lines()
+        .find(|line| line.contains("the catching-up marker was cleared"))
+        .and_then(logged_at)
+        .expect("the marker cleared");
+    for (at, body) in run.embeddings.lock().unwrap().iter() {
+        assert!(!came_before(*at, cleared), "embedded while marked: {body}");
+    }
+    let lines = run.log_lines();
+    let cleared_line =
+        lines.iter().position(|line| line.contains("the catching-up marker was cleared")).unwrap();
+    if let Some(expired) = run.expiry_line() {
+        assert!(expired > cleared_line, "expired while marked:\n{log}");
+    }
+    run.assert_it_was_held();
+}
+
+/// With membership off there is no guard (ADR-274), so nothing holds a restore: with a marker
+/// that does not gate it, its seeds naming only itself, it serves at once.
+#[tokio::test]
+#[ignore = "boots a real node; run with --ignored"]
+async fn a_restore_with_membership_off_is_not_held() {
+    let client = reqwest::Client::new();
+    let pa = ports::choose();
+    let mut a = Node::spawn_configured("node-a", pa, &[pa], "", 1, "membership = false");
+    a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    let body = serde_json::json!({ "name": "orders" });
+    posted(&client, &a, &token, "/v1/db/shop/collections", body).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    a.signal("TERM");
+    a.wait_exit(Duration::from_secs(60));
+    restore_over(&a, &backup);
+    a.restart_with(&[]);
+    a.wait_ready(&client).await;
+    let order = serde_json::json!({ "_id": 1 });
+    posted(&client, &a, &token, "/v1/db/shop/coll/orders/docs", order).await;
+}

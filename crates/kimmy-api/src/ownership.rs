@@ -714,4 +714,27 @@ mod tests {
         assert!(!off.owns_ttl(&registry[0]));
         assert!(off.owns_subscription("wh_a") && off.owns_embedding("app/c"), "TTL only");
     }
+
+    /// While the mistaken-restore guard holds a member (ADR-274) it owns nothing, with no
+    /// catching-up marker at all: expiry, embeddings and webhook delivery all ask here.
+    #[test]
+    fn a_member_held_by_its_guard_owns_nothing() {
+        let (registry, _, _ttl_dir) = ttl_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up =
+            kimmy_cluster::catchup::CatchUp::open(dir.path(), std::time::Duration::from_secs(120));
+        let owners = Owners::over(node(1), None).gated_by(Some(catch_up.clone()));
+        let owned = |owners: &Owners| {
+            [
+                owners.owns_subscription("wh_a"),
+                owners.owns_embedding("app/c"),
+                owners.owns_ttl(&registry[0]),
+            ]
+        };
+        assert_eq!(owned(&owners), [true; 3], "premise: alone and unmarked, it owns all three");
+        catch_up.hold_for_guard();
+        assert_eq!(owned(&owners), [false; 3], "held, it owns nothing");
+        catch_up.release_guard_hold();
+        assert_eq!(owned(&owners), [true; 3], "released, it owns them again");
+    }
 }

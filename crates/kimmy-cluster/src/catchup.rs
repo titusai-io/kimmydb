@@ -551,6 +551,25 @@ impl CatchUp {
                     .saturating_add(u64::try_from(self.wait.as_millis()).unwrap_or(u64::MAX))
     }
 
+    /// Hold this member for its mistaken-restore guard (ADR-274): until
+    /// [`Self::release_guard_hold`] it refuses clients and does no owner work, whatever the marker
+    /// says and however long the wait has run.
+    ///
+    /// **Scaffold of the tests commit**: holds nothing. The code commit replaces it.
+    pub fn hold_for_guard(&self) {}
+
+    /// The guard has passed: what [`Self::hold_for_guard`] held is let go.
+    ///
+    /// **Scaffold of the tests commit**.
+    pub fn release_guard_hold(&self) {}
+
+    /// Whether the guard's hold is on.
+    ///
+    /// **Scaffold of the tests commit**: never.
+    pub fn held_by_guard(&self) -> bool {
+        false
+    }
+
     /// Whether client requests are refused: set, and the bound has not run out.
     pub fn gated(&self, now: Instant) -> bool {
         self.is_set() && !self.unknown(now)
@@ -1810,6 +1829,31 @@ mod tests {
         std::fs::write(dir.path().join(FILE), "garbage\n\u{1}").unwrap();
         let odd = CatchUp::open(dir.path(), Duration::from_secs(1));
         assert!(odd.is_set());
+    }
+
+    /// The mistaken-restore guard's hold (ADR-274) is its own: it gates a member with no marker,
+    /// the catch-up wait running out does not open it, and releasing it leaves the marker's own
+    /// answer.
+    #[test]
+    fn the_guards_hold_gates_whatever_the_marker_and_the_wait_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let unmarked = CatchUp::open(dir.path(), Duration::from_secs(1));
+        let now = Instant::now();
+        assert!(!unmarked.gated(now) && !unmarked.held_by_guard(), "premise: nothing holds it");
+        unmarked.hold_for_guard();
+        assert!(unmarked.held_by_guard() && unmarked.gated(now), "a held member is gated");
+        unmarked.release_guard_hold();
+        assert!(!unmarked.held_by_guard() && !unmarked.gated(now), "released, nothing gates it");
+
+        let f = marked(CatchUpReason::Restored);
+        f.catchup.first_tick(now);
+        let past_the_wait = now + Duration::from_secs(3_600);
+        assert!(!f.catchup.gated(past_the_wait), "premise: the wait opens a marked member");
+        f.catchup.hold_for_guard();
+        assert!(f.catchup.gated(past_the_wait), "the wait does not open a held member");
+        f.catchup.release_guard_hold();
+        assert!(!f.catchup.gated(past_the_wait), "released, the wait's answer is back");
+        assert!(f.catchup.gated(now), "and the marker's own");
     }
 
     #[test]
