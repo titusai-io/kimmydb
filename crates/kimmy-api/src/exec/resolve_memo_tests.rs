@@ -14,11 +14,14 @@ fn root() -> Auth {
     Auth(kimmy_auth::Principal::superuser("test"))
 }
 
-/// Flip `orders` to a stage on this member, the way a replicated swap does: the stage's creation, then the binding in a window.
+/// Flip `orders` to a stage on this member, the way a replicated swap does: another member's stage creation, then its binding in a window (a
+/// binding is valid only from the origin of its stage's creation, so both come from the one writer).
 pub(super) fn flip(state: &SharedState) -> String {
     let stage = "orders.__stg.memo";
     let engine = &state.engine;
-    engine
+    let dir = tempfile::tempdir().unwrap();
+    let writer = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    writer
         .create_stage(
             "app",
             stage,
@@ -26,7 +29,7 @@ pub(super) fn flip(state: &SharedState) -> String {
             Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0),
         )
         .unwrap();
-    let creation = engine
+    let creation = writer
         .entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background)
         .unwrap()
         .entries
@@ -35,12 +38,12 @@ pub(super) fn flip(state: &SharedState) -> String {
             e.kind == OpKind::CreateCollection && e.collection == CollectionId::derive("app", stage)
         })
         .unwrap();
-    // a binding from another member's origin, delivered in a window
+    engine.apply_batch(std::slice::from_ref(&creation)).unwrap();
     let bind = OplogEntry {
         stamp: Stamp::new(
             Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
-            kimmy_core::NodeId::from_bytes([9; 16]),
-            kimmy_core::Epoch::ZERO,
+            writer.node_id(),
+            writer.epoch(),
         ),
         kind: OpKind::BindCollection,
         collection: CollectionId::derive("app", "orders"),

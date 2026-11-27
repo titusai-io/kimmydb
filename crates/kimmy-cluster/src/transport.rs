@@ -9661,9 +9661,9 @@ mod tests {
             m.resolve(DB, "orders").unwrap().physical
         }
 
-        // the author of two stages (six documents each), the author of the bindings, and the sender that serves the first stage
+        // the author of two stages (six documents each) and of their bindings (a binding is valid only from its stage's creation's origin), and
+        // the sender that serves the first stage
         let (a, _da) = open();
-        let (b, _db) = open();
         let (sender, _ds) = open();
         let deadline = Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
         for (k, name) in STAGES.iter().enumerate() {
@@ -9692,10 +9692,10 @@ mod tests {
             .max()
             .unwrap()
             + 1;
-        window(&sender, &[bind(&b, STAGES[0], base)]);
+        window(&sender, &[bind(&a, STAGES[0], base)]);
         assert_eq!(served(&sender), STAGES[0], "premise: the sender serves the first stage");
         // the second swap, made by the sender's page reader before the second page of the first pass
-        let swap = (second, bind(&b, STAGES[1], base + 10));
+        let swap = (second, bind(&a, STAGES[1], base + 10));
         let page_ones = std::sync::atomic::AtomicUsize::new(0);
         let made = std::sync::atomic::AtomicBool::new(false);
         sender.set_snapshot_room_for_test(Some(1_500));

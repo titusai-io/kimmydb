@@ -41,8 +41,10 @@ fn a_stage() -> (Stamp, StageInfo) {
 /// A timeline of events that are all valid: each binding has a stage with a deadline above it.
 fn timeline(events: &[(u64, usize, RegisterEvent)]) -> Timeline {
     let mut t = Timeline::new("orders");
-    let (creation, info) = a_stage();
+    let (_, info) = a_stage();
     for (hlc, origin, event) in events {
+        // a binding is valid only from the origin of its stage's creation: the stage of each binding was created by its own origin
+        let creation = st(1, *origin);
         let put = t.insert(st(*hlc, *origin), event.clone(), Some((&creation, &info)));
         assert!(matches!(put, Put::Stored | Put::Duplicate), "{put:?}");
     }
@@ -87,7 +89,7 @@ fn a_deadline_past_the_cap_reads_as_the_cap() {
 
 #[test]
 fn a_binding_is_valid_at_its_stages_effective_deadline_and_not_a_tick_above_it() {
-    let creation = st(1_000, 0);
+    let creation = st(1_000, 1);
     // an ordinary deadline
     let stage = StageInfo { deadline: Hlc::new(1_030, 0) };
     assert!(valid_binding(&st(1_030, 1), &creation, &stage), "at the deadline");
@@ -102,6 +104,11 @@ fn a_binding_is_valid_at_its_stages_effective_deadline_and_not_a_tick_above_it()
     let cap = 1_000 + MAX_OUT_DEADLINE_MS + OUT_DEADLINE_SKEW_MS;
     assert!(valid_binding(&st(cap, 1), &creation, &far), "at the cap");
     assert!(!valid_binding(&st(cap + 1, 1), &creation, &far), "one past the cap");
+    // a binding is valid only from the origin of its stage's creation: another node is not, nor is the same node under another epoch
+    assert!(!valid_binding(&st(1_001, 2), &creation, &stage), "another node");
+    let other_epoch =
+        Stamp::new(Hlc::new(1_001, 0), NodeId::from_bytes([1; 16]), Epoch::from_u64(7));
+    assert!(!valid_binding(&other_epoch, &creation, &stage), "the same node under another epoch");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -430,7 +437,8 @@ fn a_member_refuses_writes_while_an_event_supersedes_what_it_serves_known_or_par
     );
     // an event ahead of its position is known and refuses too, once none is in effect
     let mut ahead = Timeline::new("orders");
-    let (creation, info) = a_stage();
+    let (_, info) = a_stage();
+    let creation = st(1, 2);
     ahead.insert(st(40, 2), bind("b"), Some((&creation, &info)));
     let none = Timeline::new("orders");
     assert_eq!(none.refusal(&ahead, "orders"), Some(Refusal { event: st(40, 2), parked: true }));
@@ -441,7 +449,8 @@ fn a_member_refuses_writes_while_an_event_supersedes_what_it_serves_known_or_par
 
 /// The stage of the tests below: created at 100 with a deadline of 130.
 fn a_short_stage() -> (Stamp, StageInfo) {
-    (st(100, 0), StageInfo { deadline: Hlc::new(130, 0) })
+    // created by origin 1, which binds it in the tests that use it (a binding is valid only from its creation's origin)
+    (st(100, 1), StageInfo { deadline: Hlc::new(130, 0) })
 }
 
 #[test]
@@ -744,7 +753,8 @@ fn run(scenario: &Scenario, order: &[usize]) -> Run {
                 }
             }
         }
-        let (creation, info) = a_stage();
+        let (_, info) = a_stage();
+        let creation = st(1, *origin);
         t.insert(st(*hlc, *origin), event.clone(), Some((&creation, &info)));
         let lookup = |p: &str| held.iter().find(|(n, _)| n == p).map_or(Ready::Buried, |(_, r)| *r);
         let visible = t.visible(lookup);

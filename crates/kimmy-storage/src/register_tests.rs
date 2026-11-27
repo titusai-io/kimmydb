@@ -21,6 +21,12 @@ fn st(hlc: u64, origin: u8) -> Stamp {
     Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([origin; 16]), Epoch::ZERO)
 }
 
+/// A stamp of the member `e` itself: the stage `with_a_stage` makes is created by `e`, and a binding is valid only from the origin of its
+/// stage's creation.
+fn by(e: &Engine, hlc: u64) -> Stamp {
+    Stamp::new(Hlc::new(hlc, 0), e.node_id(), e.epoch())
+}
+
 fn everything(from: &Engine) -> Vec<kimmy_core::OplogEntry> {
     from.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries
 }
@@ -114,11 +120,11 @@ fn every_event_goes_through_the_one_door() {
     in_txn(&e, |txn| {
         let put = |stamp, event| crate::register::put(txn, DB, "orders", stamp, event).unwrap();
         // valid: at the deadline
-        assert_eq!(put(st(deadline.wall_ms, 1), bind()), Put::Stored);
-        assert_eq!(put(st(deadline.wall_ms, 1), bind()), Put::Duplicate, "the same event again");
+        assert_eq!(put(by(&e, deadline.wall_ms), bind()), Put::Stored);
+        assert_eq!(put(by(&e, deadline.wall_ms), bind()), Put::Duplicate, "the same event again");
         // above the deadline: history, never stored
         let other = RegisterEvent::Bind { physical: "orders.__stg.a2".into() };
-        assert_eq!(put(st(deadline.wall_ms + 1, 2), bind()), Put::InvalidBinding);
+        assert_eq!(put(by(&e, deadline.wall_ms + 1), bind()), Put::InvalidBinding);
         // a stage whose creation this member never saw
         assert_eq!(put(st(10, 1), other), Put::UnknownStage);
         // a recreation and a logical drop need no stage
@@ -131,7 +137,7 @@ fn every_event_goes_through_the_one_door() {
         let stamps: Vec<Stamp> = timeline.events().iter().map(|(s, _)| *s).collect();
         assert_eq!(
             stamps,
-            [st(5, 1), st(6, 1), st(deadline.wall_ms, 1)],
+            [st(5, 1), st(6, 1), by(&e, deadline.wall_ms)],
             "only what the door let in, in stamp order"
         );
     });
@@ -141,19 +147,19 @@ fn every_event_goes_through_the_one_door() {
 fn what_is_in_effect_survives_the_transaction_and_decides_what_the_name_serves() {
     let (e, _dir, deadline) = with_a_stage();
     in_txn(&e, |txn| {
-        crate::register::put(txn, DB, "orders", st(deadline.wall_ms, 1), bind()).unwrap();
+        crate::register::put(txn, DB, "orders", by(&e, deadline.wall_ms), bind()).unwrap();
     });
     let visible = in_txn(&e, |txn| {
         let timeline = crate::register::timeline(txn, DB, "orders").unwrap();
         timeline.visible(|p| if p == STAGE { Ready::Alive } else { Ready::Buried })
     });
-    assert_eq!(visible, Visible::Bound { physical: STAGE.into(), stamp: st(deadline.wall_ms, 1) });
+    assert_eq!(visible, Visible::Bound { physical: STAGE.into(), stamp: by(&e, deadline.wall_ms) });
 }
 
 #[test]
 fn an_event_ahead_of_its_position_is_known_and_not_in_effect_until_released() {
     let (e, _dir, deadline) = with_a_stage();
-    let at = st(deadline.wall_ms, 1);
+    let at = by(&e, deadline.wall_ms);
     in_txn(&e, |txn| {
         assert_eq!(crate::register::park(txn, DB, "orders", at, bind()).unwrap(), Put::Stored);
         assert!(
@@ -171,7 +177,7 @@ fn an_event_ahead_of_its_position_is_known_and_not_in_effect_until_released() {
         assert!(refusal.parked && refusal.event == at, "{refusal:?}");
         // an invalid binding is not parked either
         assert_eq!(
-            crate::register::park(txn, DB, "orders", st(deadline.wall_ms + 5, 2), bind()).unwrap(),
+            crate::register::park(txn, DB, "orders", by(&e, deadline.wall_ms + 5), bind()).unwrap(),
             Put::InvalidBinding
         );
     });
@@ -201,7 +207,7 @@ fn an_event_ahead_of_its_position_is_known_and_not_in_effect_until_released() {
 #[test]
 fn an_event_already_in_effect_is_not_parked_again() {
     let (e, _dir, deadline) = with_a_stage();
-    let at = st(deadline.wall_ms, 1);
+    let at = by(&e, deadline.wall_ms);
     in_txn(&e, |txn| {
         crate::register::put(txn, DB, "orders", at, bind()).unwrap();
         assert_eq!(crate::register::park(txn, DB, "orders", at, bind()).unwrap(), Put::Duplicate);

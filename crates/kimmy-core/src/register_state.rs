@@ -5,8 +5,8 @@
 //! refuses writes are all decided here, from the register events **in effect on the member** and the
 //! readiness of the physicals it holds, and from nothing else: no storage, no clock, no I/O. The caller
 //! decides which events are in effect (rule B: an event takes effect only once the member covers it,
-//! [`covers_in_position`]; a binding is valid only at or below its stage's deadline,
-//! [`valid_binding`]) and tells the function what each physical is here ([`Ready`]).
+//! [`covers_in_position`]; a binding is valid only from the origin of its stage's creation and at or below its stage's
+//! deadline, [`valid_binding`]) and tells the function what each physical is here ([`Ready`]).
 //!
 //! The function is monotone, which is why the members converge without a leader: more events, or a
 //! physical that becomes ready, move what the name serves only to newer stamps; a physical once buried
@@ -52,10 +52,13 @@ impl StageInfo {
     }
 }
 
-/// Whether a binding stamped `bind` of the stage created by `creation` is valid: stamped at or below the stage's
-/// effective deadline. A binding above it is invalid, history on every member, by a pure function of the stamps.
+/// Whether a binding stamped `bind` of the stage created by `creation` is valid: from the **origin of the stage's creation** (the
+/// node and the epoch together: a restored writer is another origin and cannot bind the stages its old epoch
+/// created), and stamped at or below the stage's effective deadline. A binding that fails either is invalid, history on every member,
+/// never stored, never visible and burying nothing, by a pure function of the two stamps. The creator is read from the stage's
+/// creation entry, never from a field of the binding.
 pub fn valid_binding(bind: &Stamp, creation: &Stamp, stage: &StageInfo) -> bool {
-    bind.hlc <= stage.effective_deadline(creation)
+    bind.origin() == creation.origin() && bind.hlc <= stage.effective_deadline(creation)
 }
 
 /// Whether a member that has witnessed `witnessed` covers the entry stamped `stamp`: it has witnessed its origin
@@ -146,7 +149,8 @@ pub enum Put {
     Stored,
     /// An event under the same stamp was already in effect; nothing changed.
     Duplicate,
-    /// A binding stamped above its stage's (clamped) deadline: history on every member, never stored.
+    /// A binding that [`valid_binding`] refuses, from another origin than its stage's creation or stamped above its stage's
+    /// (clamped) deadline: history on every member, never stored.
     InvalidBinding,
     /// A binding of a stage whose creation the caller does not know: never stored. On every route the stage's creation
     /// comes before the binding that names it.
@@ -175,8 +179,9 @@ impl Timeline {
     }
 
     /// Put an event in effect. A binding is judged first, by [`valid_binding`] against `stage`, the creation stamp and
-    /// [`StageInfo`] of the stage it names: with no stage it is [`Put::UnknownStage`], above the stage's deadline it is
-    /// [`Put::InvalidBinding`], and neither is stored. `stage` is not read for a recreation or a logical drop. Idempotent:
+    /// [`StageInfo`] of the stage it names: with no stage it is [`Put::UnknownStage`], from another origin than the stage's
+    /// creation or above the stage's deadline it is [`Put::InvalidBinding`], and neither is stored. `stage` is not read for a
+    /// recreation or a logical drop. Idempotent:
     /// an event under a stamp already held changes nothing and is [`Put::Duplicate`].
     pub fn insert(
         &mut self,

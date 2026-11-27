@@ -152,8 +152,9 @@ pub struct StageAbandon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageInfo {
     /// The writer's clock at the stage's creation plus the request's remaining time, never more
-    /// than the request's own deadline. Compared with a binding's `hlc`: a binding is valid at or
-    /// below it, and a later event of the name buries the stage only strictly above it.
+    /// than the request's own deadline. Compared with a binding's `hlc`: a binding is valid only at
+    /// or below it (and only from the creation's origin), and a later event of the name buries the
+    /// stage only strictly above it.
     pub deadline: Hlc,
 }
 

@@ -2444,8 +2444,12 @@ async fn a_tool_call_refused_swap_in_progress_moves_the_refused_series_by_exactl
     let server = Server::start().await;
     seed(&server);
     let engine = &server.engine;
-    // a binding from another member for `sales.orders`, known ahead of its position: the name is superseded and not yet visible here
-    engine
+    // a binding from another member for `sales.orders`, known ahead of its position: the name is superseded and not yet visible here.
+    // A binding is valid only from the origin of its stage's creation, so the other member makes the stage too, and both come from it
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let writer = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb"))
+        .expect("premise: the other member's engine opens");
+    writer
         .create_stage(
             "sales",
             "orders.__stg.mcp",
@@ -2453,7 +2457,7 @@ async fn a_tool_call_refused_swap_in_progress_moves_the_refused_series_by_exactl
             kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0),
         )
         .expect("premise: a stage is created under the name");
-    let creation = engine
+    let creation = writer
         .entries_for_peer(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
         .expect("premise: the oplog is readable")
         .entries
@@ -2463,11 +2467,12 @@ async fn a_tool_call_refused_swap_in_progress_moves_the_refused_series_by_exactl
                 && e.collection == kimmy_core::CollectionId::derive("sales", "orders.__stg.mcp")
         })
         .expect("premise: the stage's creation entry is in the oplog");
+    engine.apply_batch(std::slice::from_ref(&creation)).expect("premise: the stage arrives here");
     let bind = kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
-            kimmy_core::NodeId::from_bytes([9; 16]),
-            kimmy_core::Epoch::ZERO,
+            writer.node_id(),
+            writer.epoch(),
         ),
         kind: kimmy_core::OpKind::BindCollection,
         collection: kimmy_core::CollectionId::derive("sales", "orders"),

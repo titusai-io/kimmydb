@@ -118,11 +118,31 @@ fn window(e: &Engine, entry: &OplogEntry) -> SyncOutcome {
 fn a_swap_entry_exactly_the_bound_ahead_is_taken_and_appended() {
     for (name, _) in the_swap_entries(0) {
         let (e, _dir, now) = member();
-        // The binding's stage is held here, with a deadline above the stamp the binding carries.
-        e.create_stage("shop", STAGE, MergePolicy::Document, Hlc::new(now + 600_000, 0)).unwrap();
+        // The binding's stage is held here, with a deadline above the stamp the binding carries. Another writer makes it, and the entry is
+        // that writer's: a binding is valid only from the origin of its stage's creation.
+        let (writer, _dw) = engine();
+        writer
+            .create_stage("shop", STAGE, MergePolicy::Document, Hlc::new(now + 600_000, 0))
+            .unwrap();
+        let creation = everything(&writer)
+            .into_iter()
+            .find(|c| {
+                c.kind == OpKind::CreateCollection
+                    && c.collection == CollectionId::derive("shop", STAGE)
+            })
+            .unwrap();
+        e.apply_batch(std::slice::from_ref(&creation)).unwrap();
         let limit = now + e.clock_bound().skew_ms;
-        let entry = the_swap_entries(limit).into_iter().find(|(n, _)| *n == name).unwrap().1;
+        let mut entry = the_swap_entries(limit).into_iter().find(|(n, _)| *n == name).unwrap().1;
+        entry.stamp = Stamp::new(entry.stamp.hlc, writer.node_id(), writer.epoch());
         let outcome = window(&e, &entry);
+        if name == "BindCollection" {
+            assert_eq!(
+                e.resolve("shop", "orders").unwrap().physical,
+                STAGE,
+                "premise: the binding is a valid one, and it took effect"
+            );
+        }
         assert!(outcome.clock_refused_at.is_none(), "{name} exactly at the bound: {outcome:?}");
         assert_eq!(outcome.clock_refused, 0, "{name}: {outcome:?}");
         assert!(

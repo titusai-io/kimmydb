@@ -6,9 +6,10 @@
 //! every stage, which outlives the stage's collection because a later binding's validity reads it.
 //!
 //! **There is one door.** Every event reaches a table through [`put`] or [`park`], which build the name's
-//! [`Timeline`] and call `Timeline::insert` with the stage the event names: a binding above its stage's deadline, or of a
-//! stage whose creation is not known, is never stored, so no route can make one visible by forgetting the check. This
-//! module is the only code that opens the three tables (`only_this_module_opens_the_register_tables`).
+//! [`Timeline`] and call `Timeline::insert` with the stage the event names: a binding from another origin than its stage's
+//! creation or above its stage's deadline, or of a stage whose creation is not known, is never stored, so no route can make
+//! one visible by forgetting the check. This module is the only code that opens the three tables
+//! (`only_this_module_opens_the_register_tables`).
 
 use kimmy_core::register_state::{Put, Refusal, Timeline};
 use kimmy_core::{CollectionId, HLC_ENCODED_LEN, Hlc, RegisterEvent, StageMeta, Stamp};
@@ -2040,8 +2041,9 @@ fn name_from_held_collections(
 /// one door with no seed of their own (one seed per name, before them, from the receiver's own tombstone, and only above the grant: D1),
 /// a timeline built once per name; then the post-drop rows, only for a name that reads dropped (D3). Every event and every definition of a
 /// post-drop row is held to the grant the page's first vector gave: above it, it is dropped and arrives by windows. A binding the door
-/// refuses (an unknown stage, one above its deadline) is a damaged page and fails it. A name the receiver cannot name (no stage row) has its
-/// rows stored by id and nothing else. The caller absorbs the grant and settles the returned names.
+/// refuses (an unknown stage; a binding from another origin than its stage's creation or above its deadline) is a damaged page
+/// and fails it. A name the receiver cannot name (no stage row) has its rows stored by id and nothing else. The caller absorbs
+/// the grant and settles the returned names.
 pub(crate) fn apply_carried(
     txn: &redb::WriteTransaction,
     carry: &crate::snapshot::RegisterCarry,
@@ -2146,7 +2148,9 @@ pub(crate) fn apply_carried(
                     return Err(damaged(&what));
                 }
                 Put::InvalidBinding => {
-                    let what = format!("a binding above its stage's deadline: {event:?}");
+                    let what = format!(
+                        "a binding from another origin than its stage's creation or above its stage's deadline: {event:?}"
+                    );
                     return Err(damaged(&what));
                 }
             }

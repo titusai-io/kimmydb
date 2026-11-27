@@ -204,9 +204,12 @@ fn build_world(stages_first: bool, mixed: bool) -> World {
     assert_eq!(stages.len(), 2, "premise: both stages' creations");
     let life = vec![creations[0].clone(), drop[0].clone(), creations[1].clone()];
     let wall = all.iter().map(|e| e.stamp.hlc.wall_ms).max().expect("entries").max(now) + 10;
-    let bind_first = bind_of(&a, wall, FIRST);
+    // a binding is valid only from the origin of its stage's creation, so each one is minted by the writer that made its stage
+    let first_author = stage_author.as_ref().map_or(&a, |(s, _)| s);
+    let second_author = if mixed { &a } else { first_author };
+    let bind_first = bind_of(first_author, wall, FIRST);
     let drop_between = drop_of(&a, wall + 10);
-    let bind_second = bind_of(&a, wall + 20, SECOND);
+    let bind_second = bind_of(second_author, wall + 20, SECOND);
     World {
         life,
         stages,

@@ -2371,7 +2371,6 @@ struct Doomed {
 
 fn a_sender_that_doomed_a_stage() -> Doomed {
     let (a, da) = engine();
-    let (b, db) = engine();
     let now = physical_now_ms();
     a.create_stage(DB, DOOMED, MergePolicy::Document, Hlc::new(now + 1_000, 0)).unwrap();
     a.create_stage(DB, LIVE1, MergePolicy::Document, Hlc::new(now + 60_000, 0)).unwrap();
@@ -2381,8 +2380,8 @@ fn a_sender_that_doomed_a_stage() -> Doomed {
     let (sender, ds) = engine();
     sender.apply_batch(&creations).unwrap();
     let wall = now + 5_000;
-    let bind1 = bind_of(&b, LIVE1, wall);
-    let bind2 = bind_of(&b, LIVE2, wall + 10);
+    let bind1 = bind_of(&a, LIVE1, wall);
+    let bind2 = bind_of(&a, LIVE2, wall + 10);
     window(&sender, std::slice::from_ref(&bind1));
     window(&sender, std::slice::from_ref(&bind2));
     assert_eq!(
@@ -2399,7 +2398,7 @@ fn a_sender_that_doomed_a_stage() -> Doomed {
         the_stage_row_of(&sender, DOOMED).is_some(),
         "premise: the sender still holds its stage row"
     );
-    Doomed { a, sender, creations, bind1, bind2, _dirs: vec![da, db, ds] }
+    Doomed { a, sender, creations, bind1, bind2, _dirs: vec![da, ds] }
 }
 
 /// The ids a page lists as not alive at its sender.
@@ -2591,7 +2590,6 @@ fn the_reader_ran(w: &Across) {
 
 fn a_sender_that_swaps_again_during_the_join(later: usize) -> Across {
     let (a, da) = engine();
-    let (b, db) = engine();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     for (k, name) in F[..=later].iter().enumerate() {
         let stage = a.create_stage(DB, name, MergePolicy::Document, deadline).unwrap();
@@ -2619,14 +2617,14 @@ fn a_sender_that_swaps_again_during_the_join(later: usize) -> Across {
         .max()
         .unwrap()
         + 1;
-    window(&sender, std::slice::from_ref(&bind_of(&b, F[0], base)));
+    window(&sender, std::slice::from_ref(&bind_of(&a, F[0], base)));
     assert_eq!(
         served_by(&sender),
         Ok(F[0].to_string()),
         "premise: the sender serves the first stage"
     );
     let swaps: Vec<(Vec<OplogEntry>, OplogEntry)> = (1..=later)
-        .map(|k| (entries_of(F[k]), bind_of(&b, F[k], base + 10 * u64::try_from(k).unwrap())))
+        .map(|k| (entries_of(F[k]), bind_of(&a, F[k], base + 10 * u64::try_from(k).unwrap())))
         .collect();
     let (page_ones, made) =
         (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
@@ -2660,7 +2658,7 @@ fn a_sender_that_swaps_again_during_the_join(later: usize) -> Across {
         }
     };
     sender.set_snapshot_reader_hook_for_test(Some(std::sync::Arc::new(hook)));
-    Across { sender, creations, cursor_calls, _dirs: vec![da, db, ds] }
+    Across { sender, creations, cursor_calls, _dirs: vec![da, ds] }
 }
 
 /// What a join came to, page by page, as `pull_snapshot`'s loop would drive it.
@@ -3014,14 +3012,13 @@ fn a_stage_row_only_with_no_event_above_the_grant_completes_the_join_and_is_coun
 #[test]
 fn an_event_exactly_at_the_grant_is_not_above_it() {
     let (a, _da) = engine();
-    let (b, _db) = engine();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     a.create_stage(DB, F[0], MergePolicy::Document, deadline).unwrap();
     let creation = creation_of(&a, F[0]);
     let (sender, _ds) = with_orders();
     sender.apply_batch(std::slice::from_ref(&creation)).unwrap();
     let wall = creation.stamp.hlc.wall_ms.max(life_wall(&sender)).max(physical_now_ms()) + 1;
-    let bind = bind_of(&b, F[0], wall);
+    let bind = bind_of(&a, F[0], wall);
     window(&sender, std::slice::from_ref(&bind));
     assert!(sender.bury_collection(DB, F[0], None).unwrap().is_some(), "premise: buried by a drop");
     let first = sender.snapshot_page(None, None).unwrap();
@@ -3078,7 +3075,6 @@ fn bind_of_name(by: &Engine, name: &str, physical: &str, wall_ms: u64) -> OplogE
 fn a_stage_above_the_receivers_drop_seeds_none_and_the_ends_equal_at_the_names_next_event() {
     let (r, _dr) = engine();
     let (a, _da) = engine();
-    let (b, _db) = engine();
     let (sender, _ds) = engine();
     let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
     let orders_id = CollectionId::derive(DB, "orders");
@@ -3116,13 +3112,13 @@ fn a_stage_above_the_receivers_drop_seeds_none_and_the_ends_equal_at_the_names_n
         .max()
         .unwrap()
         + 1;
-    window(&sender, std::slice::from_ref(&bind_of_name(&b, "items", ITEMS_STAGES[0], wall)));
+    window(&sender, std::slice::from_ref(&bind_of_name(&a, "items", ITEMS_STAGES[0], wall)));
     assert!(sender.get_collection(DB, "orders").is_ok(), "premise: the sender holds the identity");
     assert!(the_events_of_orders(&sender).is_empty(), "premise: and no event of `orders`");
 
     // the sender's page reader, before the second page of the first pass: the drop reaches it and is taken as an ordinary one, and `items`
     // is swapped again
-    let swap = (entries_of(ITEMS_STAGES[1]), bind_of_name(&b, "items", ITEMS_STAGES[1], wall + 10));
+    let swap = (entries_of(ITEMS_STAGES[1]), bind_of_name(&a, "items", ITEMS_STAGES[1], wall + 10));
     let (page_ones, made) =
         (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicBool::new(false));
     sender.set_snapshot_room_for_test(Some(3_000));
@@ -3180,7 +3176,7 @@ fn a_stage_above_the_receivers_drop_seeds_none_and_the_ends_equal_at_the_names_n
     assert!(served_by(&sender).is_err(), "and so does the sender");
 
     // the next event of the name, a binding of the stage, reaches both
-    let bind = bind_of(&b, SEEDED_STAGE, wall + 100);
+    let bind = bind_of(&a, SEEDED_STAGE, wall + 100);
     window(&r, std::slice::from_ref(&bind));
     window(&sender, std::slice::from_ref(&bind));
     assert_eq!(served_by(&r), Ok(SEEDED_STAGE.to_string()), "the receiver serves the stage");

@@ -450,8 +450,8 @@ pub const OPLOG_COLLECTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// `logical collection id (8) || stamp key (44) -> RegisterEvent` (`kimmy_core::RegisterEvent::encode`): the register
 /// events of a logical name that are IN EFFECT on this member (ADR-272, decision 3), each under the stamp of the entry that
 /// made it. Written only by `crate::register`, through `kimmy_core::register_state::Timeline::insert`, which refuses a
-/// binding above its stage's deadline and one of a stage whose creation is not known. Durable state; a restore rebuilds it
-/// from the oplog (the restore commit of the swap's series).
+/// binding from another origin than its stage's creation or above its stage's deadline, and one of a stage whose creation
+/// is not known. Durable state; a restore rebuilds it from the oplog (the restore commit of the swap's series).
 pub const REGISTER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("register");
 
 /// The same key and value as [`REGISTER`]: the register events this member KNOWS and that are not yet in effect, because they

@@ -23693,33 +23693,41 @@ async fn a_schema_change_addressed_to_a_stage_is_refused_400_stage_collection_wh
     assert!(texts[0].contains("after the stage's deadline"), "{}", texts[0]);
 }
 
-/// A member that holds `shop.orders` and knows of a binding for it that it has not made visible: a stage under the name and another
-/// member's binding, known ahead of its position (no window behind it). Writes to the name are refused `503 swap_in_progress`.
-async fn a_member_that_knows_of_a_binding_it_has_not_made_visible() -> (Server, String) {
-    let server = Server::start().await;
-    let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
-    let engine = std::sync::Arc::clone(&server.state.engine);
+/// A stage under `shop.orders` made by another member, for a member under test to receive: its creation entry and the writer's origin. A
+/// binding is valid only from the origin of its stage's creation, so a test takes the creation and the binding's origin from the one writer.
+fn another_members_stage(stage: &str) -> (kimmy_core::OplogEntry, kimmy_core::Origin) {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
     let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
-    engine
-        .create_stage("shop", "orders.__stg.real", kimmy_core::MergePolicy::Document, deadline)
-        .unwrap();
-    let creation = engine
+    writer.create_stage("shop", stage, kimmy_core::MergePolicy::Document, deadline).unwrap();
+    let creation = writer
         .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
         .unwrap()
         .entries
         .into_iter()
         .find(|e| {
             e.kind == kimmy_core::OpKind::CreateCollection
-                && e.collection == kimmy_core::CollectionId::derive("shop", "orders.__stg.real")
+                && e.collection == kimmy_core::CollectionId::derive("shop", stage)
         })
         .unwrap();
-    // a binding from another member, known ahead of its position (no window behind it)
+    (creation, writer.origin())
+}
+
+/// A member that holds `shop.orders` and knows of a binding for it that it has not made visible: another member's stage under the name and
+/// that member's binding, known ahead of its position (no window behind it). Writes to the name are refused `503 swap_in_progress`.
+async fn a_member_that_knows_of_a_binding_it_has_not_made_visible() -> (Server, String) {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    let (creation, from) = another_members_stage("orders.__stg.real");
+    engine.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    // that member's binding, known ahead of its position (no window behind it)
     let bind = kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
-            kimmy_core::NodeId::from_bytes([9; 16]),
-            kimmy_core::Epoch::ZERO,
+            from.node,
+            from.epoch,
         ),
         kind: kimmy_core::OpKind::BindCollection,
         collection: kimmy_core::CollectionId::derive("shop", "orders"),
@@ -23856,25 +23864,13 @@ async fn a_merge_into_a_name_whose_replacement_the_member_knows_of_is_refused_50
     server.post("/v1/db/shop/collections", Some(&token), json!({"name": "src"})).await;
     server.post("/v1/db/shop/coll/src/docs", Some(&token), json!({"_id": 1, "v": "x"})).await;
     let engine = std::sync::Arc::clone(&server.state.engine);
-    let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
-    engine
-        .create_stage("shop", "orders.__stg.real", kimmy_core::MergePolicy::Document, deadline)
-        .unwrap();
-    let creation = engine
-        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
-        .unwrap()
-        .entries
-        .into_iter()
-        .find(|e| {
-            e.kind == kimmy_core::OpKind::CreateCollection
-                && e.collection == kimmy_core::CollectionId::derive("shop", "orders.__stg.real")
-        })
-        .unwrap();
+    let (creation, from) = another_members_stage("orders.__stg.real");
+    engine.apply_batch(std::slice::from_ref(&creation)).unwrap();
     let bind = kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(creation.stamp.hlc.wall_ms + 1, 0),
-            kimmy_core::NodeId::from_bytes([9; 16]),
-            kimmy_core::Epoch::ZERO,
+            from.node,
+            from.epoch,
         ),
         kind: kimmy_core::OpKind::BindCollection,
         collection: kimmy_core::CollectionId::derive("shop", "orders"),
@@ -23936,17 +23932,18 @@ async fn an_out_that_reads_its_own_populated_target_is_still_refused_400_until_q
 // The cache forgets a graph on a notice of a burial that minted no entry, and it derives the shadow from the notice's database and NAME
 // (it ignores the ids), so the notice of a flip must name the physical the flip buried.
 
-/// The binding of `shop.orders` to `physical`, from another member, stamped `after_ms` above `above`.
+/// The binding of `shop.orders` to `physical`, from the member `from` that made the stage, stamped `after_ms` above `above`.
 fn a_binding_of_orders(
     physical: &str,
+    from: kimmy_core::Origin,
     above: kimmy_core::Hlc,
     after_ms: u64,
 ) -> kimmy_core::OplogEntry {
     kimmy_core::OplogEntry {
         stamp: kimmy_core::Stamp::new(
             kimmy_core::Hlc::new(above.wall_ms + after_ms, 0),
-            kimmy_core::NodeId::from_bytes([9; 16]),
-            kimmy_core::Epoch::ZERO,
+            from.node,
+            from.epoch,
         ),
         kind: kimmy_core::OpKind::BindCollection,
         collection: kimmy_core::CollectionId::derive("shop", "orders"),
@@ -23973,11 +23970,10 @@ async fn a_flip_that_buries_a_collection_with_vectors_forgets_the_graph_of_its_s
     assert_eq!(server.state.vectors.len(), 1, "premise: a graph is cached");
     assert!(snapshot_of(&server, shadow).is_dir(), "premise: and persisted");
     let engine = std::sync::Arc::clone(&server.state.engine);
-    let deadline = kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 60_000, 0);
     let stage = "orders.__stg.real";
-    engine.create_stage("shop", stage, kimmy_core::MergePolicy::Document, deadline).unwrap();
-    let bind =
-        a_binding_of_orders(stage, kimmy_core::Hlc::new(kimmy_storage::physical_now_ms(), 0), 10);
+    let (creation, from) = another_members_stage(stage);
+    engine.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    let bind = a_binding_of_orders(stage, from, creation.stamp.hlc, 10);
     engine.apply_batch(std::slice::from_ref(&bind)).unwrap();
     assert_eq!(
         engine.resolve("shop", "orders").unwrap().physical,
