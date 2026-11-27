@@ -6764,11 +6764,17 @@ async fn relay_an_empty_collection_created_after_m_pulled_in_the_loop() {
 #[tokio::test]
 async fn lookalike_relay_a_collection_holding_a_document_heals_on_the_unknown_collection_stop_in_the_loop()
  {
-    // The variant the finding calls covered: the window's document names a
-    // collection `m` lacks, the batch stops there and a scoped snapshot
-    // restores the definition. Passes on main.
+    // `m` is beyond `p`'s horizon (`p` took `a`'s state by snapshot, whose
+    // restore logs no creation), so `m` takes the whole-database snapshot,
+    // which carries `audit`. The loop's existence check would plan the repair
+    // anyway, so this test does NOT exercise the unknown-collection stop;
+    // `a_second_stop_on_an_unknown_collection_inside_the_cooldown_is_fetched_at_once`
+    // (w4d) drives the stop arm itself.
     let (_a, m) = a_collection_created_after_m_pulled(true, true, Pull::Loop).await;
-    assert!(m.engine.get_collection("shop", "audit").is_ok(), "healed through the stop");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "healed by the whole-database snapshot"
+    );
 }
 
 /// w4d: a SECOND stop on an unknown collection, inside the cooldown a finished fetch leaves, is fetched at once. `w4`, `w4b` and `w4c` test the PLANNER (`PeerStalls`); this drives the stop arm of a real round (transport.rs, the

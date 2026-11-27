@@ -358,6 +358,12 @@ An idle node is where this would bite, because no writes means every entry
 eventually ages out — so the naive rule empties the log exactly when nothing is
 happening to reveal the damage. See [ADR-028](decisions.md).
 
+One consequence ([ADR-272](decisions.md) decision 16): the newest entry can
+outlive the tombstone and the options row of the collection it names, because
+retention collects those by their own rules and keeps this entry whatever its
+age. It matters only to a member that has been absent for longer than tombstone
+retention, which is unsupported.
+
 ---
 
 ## Growth characteristics
