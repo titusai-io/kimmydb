@@ -232,6 +232,31 @@ pub fn replace_honoured(flag: Option<Epoch>, store_epoch: Epoch) -> bool {
 /// say "halted".
 pub const MARKER_FILE: &str = "kimmy.containment";
 
+/// A test's hold between the read and the write of one directory's containment file, so that a second writer can be run there.
+/// It is taken once, by the next writer of the directory it was set for: tests share a process.
+#[cfg(test)]
+pub(crate) mod between_read_and_write {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Hold = Box<dyn FnOnce() + Send>;
+    static HOLDS: Mutex<Vec<(PathBuf, Hold)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn hold_the_next(dir: &Path, hold: impl FnOnce() + Send + 'static) {
+        HOLDS.lock().unwrap().push((dir.to_path_buf(), Box::new(hold)));
+    }
+
+    pub(super) fn reached(dir: &Path) {
+        let hold = {
+            let mut holds = HOLDS.lock().unwrap();
+            holds.iter().position(|(held, _)| held == dir).map(|i| holds.swap_remove(i).1)
+        };
+        if let Some(hold) = hold {
+            hold();
+        }
+    }
+}
+
 /// What the containment file holds: the halt marker (if the host was halted), and the epoch a
 /// `--replace` restore minted (if the operator gave the flag). Either may be absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -384,19 +409,25 @@ pub(crate) fn act_on_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: E
     if let Err(e) = engine.note_epoch(node, epoch) {
         tracing::warn!(error = %e, "the newer epoch could not be noted; a handshake relearns it");
     }
-    record_the_tell(engine, node, epoch);
+    if let Err(e) = record_the_tell(engine, node, epoch) {
+        tracing::error!(error = %e, "the containment file could not be written beside the store");
+    }
 }
 
 /// Write the tell into the containment file beside the store, after the halt row has committed: the
 /// restart record, and the floor a recovery restore mints above. The halt row is the authority; a
 /// crash between the two re-derives the halt from the first contact.
-fn record_the_tell(engine: &kimmy_storage::Engine, node: NodeId, epoch: Epoch) {
-    let Some(dir) = engine.path().parent() else { return };
+pub(crate) fn record_the_tell(
+    engine: &kimmy_storage::Engine,
+    node: NodeId,
+    epoch: Epoch,
+) -> std::io::Result<()> {
+    let Some(dir) = engine.path().parent() else { return Ok(()) };
     let held = read_marker_file(dir).unwrap_or_default();
+    #[cfg(test)]
+    between_read_and_write::reached(dir);
     let marker = marker_told(held.marker.as_ref(), node, epoch);
-    if let Err(e) = write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held }) {
-        tracing::error!(error = %e, "the containment file could not be written beside the store");
-    }
+    write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held })
 }
 
 /// Apply the containment file's rule at a start (ruling 7): a store below the marker's floor is
@@ -433,6 +464,8 @@ pub fn halt_by_guard(engine: &kimmy_storage::Engine, address: SocketAddr) {
     }
     let Some(dir) = engine.path().parent() else { return };
     let held = read_marker_file(dir).unwrap_or_default();
+    #[cfg(test)]
+    between_read_and_write::reached(dir);
     let guard = GuardHalt { epoch: engine.epoch(), address };
     let marker = marker_guard_halted(held.marker.as_ref(), engine.node_id(), guard);
     if let Err(e) = write_marker_file(dir, &MarkerFile { marker: Some(marker), ..held }) {

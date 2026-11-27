@@ -110,3 +110,136 @@ fn a_marker_of_another_node_or_a_bare_replace_flag_sets_no_floor() {
         .unwrap();
     assert_eq!(restore_floor(dir.path(), node(1)).unwrap(), None, "no marker");
 }
+
+// -- two writers at once: the file is read, merged and written (ADR-274)
+// -------------------------------------------------------------------
+
+/// One writer of a directory's containment file, held between its read and its write while a second runs, and then let go. The
+/// second is given two seconds to finish before the first is released, and is not waited for: where each writer's read and write
+/// are one step, it cannot finish until the first has written.
+fn with_the_first_held(
+    dir: &std::path::Path,
+    first: impl FnOnce() + Send,
+    second: impl FnOnce() + Send,
+) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (at_the_hold, held) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    between_read_and_write::hold_the_next(dir, move || {
+        at_the_hold.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(30)).expect("the held writer is released");
+    });
+    std::thread::scope(|scope| {
+        let first = scope.spawn(first);
+        held.recv_timeout(Duration::from_secs(30)).expect("the first writer reached its write");
+        let (finished, second_finished) = mpsc::channel();
+        let second = scope.spawn(move || {
+            second();
+            let _ = finished.send(());
+        });
+        let _ = second_finished.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+}
+
+fn a_store(dir: &std::path::Path) -> kimmy_storage::Engine {
+    kimmy_storage::Engine::open(&dir.join("kimmy.redb")).unwrap()
+}
+
+fn the_marker(dir: &std::path::Path) -> Marker {
+    read_marker_file(dir).unwrap().marker.expect("a marker")
+}
+
+/// Two tells of two newer epochs at once, the lower one's writer reading first and writing last: the floor, which a recovery
+/// restore mints above, is the higher.
+#[test]
+fn two_tells_at_once_leave_the_higher_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = a_store(dir.path());
+    let me = engine.node_id();
+    let (lower, higher) = (epoch_starting(2_000), epoch_starting(3_000));
+    with_the_first_held(
+        dir.path(),
+        || record_the_tell(&engine, me, lower).expect("the lower tell is recorded"),
+        || record_the_tell(&engine, me, higher).expect("the higher tell is recorded"),
+    );
+    assert_eq!(
+        the_marker(dir.path()).floor,
+        higher,
+        "the floor is the higher of the two, whichever wrote last"
+    );
+}
+
+/// The guard's own halt is the other writer: a tell that lands while it records keeps its floor, and the guard's halt stays.
+#[test]
+fn a_tell_while_the_guard_records_its_halt_keeps_its_floor_and_the_halt() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = a_store(dir.path());
+    let me = engine.node_id();
+    let told = epoch_starting(3_000);
+    let address = a_guard_halt().address;
+    with_the_first_held(
+        dir.path(),
+        || halt_by_guard(&engine, address),
+        || record_the_tell(&engine, me, told).expect("the tell is recorded"),
+    );
+    let marker = the_marker(dir.path());
+    assert_eq!(marker.floor, told, "the tell's floor stays under the guard's halt");
+    assert_eq!(
+        marker.guard.map(|guard| guard.address),
+        Some(address),
+        "and the halt under the tell"
+    );
+}
+
+/// Many tells at once: each is recorded, the file parses at every read, and the floor ends at the highest.
+#[test]
+fn tells_from_many_writers_at_once_all_land_and_the_file_always_parses() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const WRITERS: u64 = 4;
+    const EACH: u64 = 100;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = a_store(dir.path());
+    let me = engine.node_id();
+    let done = AtomicBool::new(false);
+    let (writers, unread) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut unread = Vec::new();
+            while !done.load(Ordering::Relaxed) {
+                if let Err(e) = read_marker_file(dir.path()) {
+                    unread.push(e.to_string());
+                }
+            }
+            unread
+        });
+        let (engine, writers) = (&engine, 0..WRITERS);
+        let writers: Vec<_> = writers
+            .map(|writer| {
+                scope.spawn(move || {
+                    (0..EACH)
+                        .filter_map(|i| {
+                            let epoch = epoch_starting(1_000 + i * WRITERS + writer);
+                            record_the_tell(engine, me, epoch).err().map(|e| e.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        // Every writer is joined and the reader told to stop before anything is asserted, or a failure would leave it reading.
+        let writers: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
+        done.store(true, Ordering::Relaxed);
+        (writers, reader.join())
+    });
+    let unrecorded: Vec<String> = writers.into_iter().flat_map(|w| w.unwrap()).collect();
+    assert!(
+        unrecorded.is_empty(),
+        "{} tells were not recorded, the first: {:?}",
+        unrecorded.len(),
+        unrecorded.first()
+    );
+    assert_eq!(unread.unwrap(), Vec::<String>::new(), "the file parses at every read");
+    assert_eq!(the_marker(dir.path()).floor, epoch_starting(1_000 + EACH * WRITERS - 1));
+}
