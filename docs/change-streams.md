@@ -359,10 +359,15 @@ wins.
 
 Wider scopes on the relaying member show the relayed entries as they show any entry.
 A `Cluster` stream delivers a `dropCollection` for a collection that still stands
-there, and a `createCollection` for a collection its database's drop refused there.
-A `Database` stream delivers the drop (the collection stands in the database) and not
-the refused creation: a collection the member does not hold matches no database, as
-for any entry of a collection it lacks.
+there, and a `createCollection` for a creation a drop refused there, the drop of the
+collection or of its database. A `Database` stream delivers the drop (the collection
+stands in the database), and the refused creation only where the member holds a
+collection of that name: a collection the member does not hold matches no database,
+as for any entry of a collection it lacks. A stream on a later life of the name does
+not show the refused creation: it passes over one stamped at or before the drop its
+life followed, and one in the drop's own millisecond and counter, which the drop wins.
+A stream opened on a life before the member held any drop of the name has no such
+floor, and shows a relayed creation as any entry of its collection.
 
 ---
 

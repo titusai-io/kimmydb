@@ -2782,13 +2782,12 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop that removed it"
                     );
-                    // A stage's creation is also what the register keeps its row from, and what the author's binding is judged by:
-                    // met and ignored, it is still held and served onward, so the binding that follows is a binding of a stage
-                    // this member knows (decisions 4 and 9). Any other creation is history, as before.
-                    if target.stage.is_some() {
-                        return self.append_replicated_ddl(entry, position);
-                    }
-                    return Ok(DdlOutcome::Applied);
+                    // And held and served onward, as every replicated creation is, whatever becomes of it (ADR-236). This member
+                    // serves later entries of the creation's origin, so a member that pulls them from here is covered past the
+                    // creation: withheld here, it was never offered to that member. What every creation SEEN decides then differed
+                    // between members for good: the options row, and through it a collection's merge policy (ADR-272, decision 16),
+                    // and for a stage the register's row, which the binding that follows is judged by (decisions 4 and 9).
+                    return self.append_replicated_ddl(entry, position);
                 }
                 // And older than the drop of its database (ADR-229): the
                 // collection is history here, and so are its documents, which
@@ -9578,11 +9577,15 @@ mod tests {
     }
 
     /// A creation in a held drop's own `Hlc` is refused before the writer, as one older
-    /// than the drop is (ADR-236): nothing taken, nothing appended.
+    /// than the drop is (ADR-236): no collection is made, and the apply never reaches the
+    /// point from which it would take the writer to make one. The entry is held and served
+    /// onward all the same, as every replicated creation is. A member without the drop does
+    /// reach that point, so the hook this is read by still stands on the path.
     #[test]
     fn a_creation_in_a_held_drops_own_hlc_is_refused_before_the_writer() {
         let (a, _da) = engine();
         let (b, _db) = engine();
+        let (c, _dc) = engine();
         a.create_collection("shop", "orders").unwrap();
         let (_, window) = window_for(&b, &a);
         let create = window
@@ -9593,10 +9596,24 @@ mod tests {
             .expect("the creation's entry");
         let below =
             Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]), Epoch::ZERO);
+        let (made, ()) = race_hooks::race(
+            race_hooks::Race::ReplicatedCreate,
+            || (),
+            || c.apply_batch(std::slice::from_ref(&create)),
+        );
+        made.unwrap();
+        assert!(c.get_collection("shop", "orders").is_ok(), "premise: with no drop it is made");
         b.record_collection_drop(create.collection, below).unwrap();
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let at_the_hook = std::rc::Rc::clone(&reached);
+        race_hooks::at(race_hooks::Race::ReplicatedCreate, move || at_the_hook.set(true));
         b.apply_batch(std::slice::from_ref(&create)).unwrap();
+        let judged_under_the_writer = reached.get();
+        // disarm it: a hook left armed would run for whatever reached it next on this thread
+        race_hooks::reach(race_hooks::Race::ReplicatedCreate);
         assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
-        assert!(b.oplog_entry(&create.stamp).unwrap().is_none(), "judged under the writer");
+        assert!(!judged_under_the_writer, "judged under the writer");
+        assert!(b.oplog_entry(&create.stamp).unwrap().is_some(), "held, to be served onward");
     }
 
     /// A vector shadow is a collection: a peer's configuration in the shadow's drop's own

@@ -7350,8 +7350,9 @@ drop's originating stamp, kept for `tombstone_retention_secs` beside the
 document and collection tombstones, carried by backups under a new tag, and
 consulted by `apply_remote_index` — a `CreateIndex` stamped before the
 tombstone is history: counted as applied, not built, and **not appended**,
-exactly as a `CreateCollection` is against `collections_dropped` (ADR-034),
-so this node does not re-serve onward an entry it has decided is history;
+as a `CreateCollection` against `collections_dropped` then was too (ADR-034;
+**a replicated creation has since been appended and served onward whatever becomes of it, [ADR-236](#adr-236--a-databases-drop-keeps-what-is-stamped-after-it-as-a-collections-does-and-one-rule-judges-each-drop-creation-and-definition-on-every-route), item 3**),
+so this node does not re-serve onward an index entry it has decided is history;
 the drop's own entry, appended when it applies, is what carries the ordering
 to a third member. `drop_index_inner` takes the
 originating stamp when replicated and mints one when local, and the same
@@ -27773,9 +27774,16 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    replicated change stamped after the drop, landing before the disable takes the writer) is the newer life's and
    stays, as on every other member; judged by neither, the sweep turned that one off too, on this member alone.
 3. **What a member decides about a drop, it serves onward (F4).** A replicated `DropCollection` it ignores (its own
-   life is newer) is appended as an applied one is, and so is a `CreateCollection` its database's drop refuses. The
-   member's vector named the origin past both, so a peer that pulled it was never served them by anyone: it kept a
-   document of the life the drop ended, or recorded no tombstone for a collection the drop refused. Every receiver
+   life is newer) is appended as an applied one is, and so is every replicated `CreateCollection`, **whatever becomes
+   of it**: made, adopted by a collection that stands, refused by its collection's drop or refused by its database's.
+   The member's vector named the origin past a withheld one, so a peer that pulled it was never served it by anyone:
+   it kept a document of the life the drop ended, or recorded no tombstone for a collection the drop refused, or
+   never met a creation. A creation its own collection's drop refused was withheld, unless it was a stage's, until
+   the equality test on real engines found members holding different options rows: a row is kept from every creation
+   SEEN ([ADR-272](#adr-272--an-out-that-replaces-a-populated-collection-is-atomic-on-each-member-and-a-write-that-races-it-is-lost-and-reported)
+   decision 16), and a collection made again from it takes that creation's merge policy, so members could end
+   merging by different ones. One path still returns without appending: a creation a standing collection adopts whose
+   validator is refused as a request this build cannot honour; by the code, nothing reaches it today. Every receiver
    judges the entry for itself. As a second line, the count half's replay starts at
    `min(floor, created, tombstone)` (`Engine::count_repair_replay_from`, which `peers::repair_for` and the model's
    repair route call), so a member whose own late `created` sits above a drop it holds replays past it.
@@ -27785,9 +27793,14 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    resumed from and to every change it delivers, so a stream that has delivered a change at or before the drop (the
    earlier life's, replayed with no tombstone to floor it) still ends there, and a drop in the life's own `Hlc` ends
    it (item 2). A `Cluster` stream delivers both relayed entries as it delivers any: a `dropCollection` for a
-   collection that stands on that member, and a `createCollection` for one its database's drop refused there. A
-   `Database` stream delivers the drop (the collection stands in the database) and not the refused creation (a
-   collection the member does not hold matches no database), as it treats any entry of a collection it lacks.
+   collection that stands on that member, and a `createCollection` for one a drop refused there, its collection's or
+   its database's. A `Database` stream delivers the drop (the collection stands in the database), and the refused
+   creation only where the member holds a collection of that name (a collection the member does not hold matches no
+   database), as it treats any entry of a collection it lacks. **A collection stream on a later life passes over a
+   relayed creation** stamped at or before the drop its life followed, and one in that drop's own `Hlc`, whichever of
+   the two stamps sorts first (item 2: the tie is the drop's; the other entries are compared by the whole stamp). A
+   stream with no such floor, one opened on a life before its member held a drop of the name, delivers a relayed
+   creation as any entry of its collection.
 4. **A definition stamped after the drop of a collection this member lacks stops the batch (F7).** A `CreateIndex`
    or `ConfigureVectors` stamped (`Hlc`) after the later of the collection's tombstone and its database's belongs to
    a life of the name this member has not had yet; taken as history it was witnessed and never served again, and
@@ -31458,7 +31471,7 @@ The alternatives were **(a)** for `document` collections only, carry the late wr
     - **`docs/deviations.md`:** "A replacing `$out` whose member is lost for good can leave a hidden staging copy on each member. It is never listed or served. It is removed by the next `$out` or drop of the collection made after the stage's deadline (at most one hour plus five minutes after the failed `$out`); a drop within that window leaves it until a later replace or drop. Unlike the reference's `tmp.agg_out` collection, it cannot be dropped by name."
     - **Not built, and ruled out:** an operator command that retires a stage and frees its disk at once (it needs a fetch route for a swap that completes on a member that returns, and its own model); an operator drop where the drop wins (if the lost member returns with a completed swap, the whole collection is deleted on every member). The proof-based removal of this residue belongs to a replicated roster of members with admission, which is a design of its own.
 16. **A plain collection stands while anything of it is stamped above its floor (unit P).** A collection of a *plain* name (the name has no register event, in effect or ahead of its position; a stage that is held and not bound does not make a name swapped; and it is not a recreation or a vector shadow) is governed by one rule on every route: its **floor** is the later of its own tombstone and its database's tombstone, and the collection stands on a member when the member has seen a creation of it (its options row), or holds a definition, a document or a delete of it, stamped above that floor. A fact at or below the floor is history and brings nothing back; nothing the drop removed returns. Members that meet the same facts in different orders end alike, with or without the collection.
-    - **The options row follows every creation seen.** Unit N keeps one base-options row for each id: the later creation by `(Hlc, policy text)`, and at a tie the greater encoding of the whole row. A collection's definition follows that row every time a creation is seen, whatever order the creations arrived in, and a creation's `R` and `K` are judged on the effective policy; the two refusals that depended on which creation had made the held definition are gone. A carried or restored row must be of the normal form of its own fields (what `of_creation` would write), so a damaged row is refused whole. A creation whose asked options differ from what the row keeps is warned of; nothing changes.
+    - **The options row follows every creation seen.** Unit N keeps one base-options row for each id: the later creation by `(Hlc, policy text)`, and at a tie the greater encoding of the whole row. A collection's definition follows that row every time a creation is seen, whatever order the creations arrived in, and a creation's `R` and `K` are judged on the effective policy; the two refusals that depended on which creation had made the held definition are gone. A carried or restored row must be of the normal form of its own fields (what `of_creation` would write), so a damaged row is refused whole. A creation whose asked options differ from what the row keeps is warned of; nothing changes. **Every replicated creation is served onward, whatever becomes of it** ([ADR-236](#adr-236--a-databases-drop-keeps-what-is-stamped-after-it-as-a-collections-does-and-one-rule-judges-each-drop-creation-and-definition-on-every-route), item 3), so that every member comes to see each one: one a member refused under the collection's drop was withheld, and the rows of members that pulled from it differed for good.
     - **A gone collection is made again from its row.** A document, a delete, a `CreateIndex`, a `DropIndex`, a `ConfigureValidator` or a `ConfigureVectors` stamped above the floor makes a gone plain collection from its options row, on the entries route, on the page route (a carried row, merged when the carry's walk ends and before the pull's first document, a state fact, a document or a delete), and at the **completion of the purger** (the chunk that empties the id's ranges calls the same function, so a creation that waited for the purge and is no longer served by its sender still makes the collection). These are exactly the facts the keep test of a drop counts: a kind counted by one and not by the other would leave a collection standing in one order of arrival and gone in the other. One function, under the writer, makes it: the name has no register event, in effect or ahead of its position (a held stage that is not bound is no swap, so a fact above the floor makes the name stand whatever order the stage and the fact arrived in), the name is not a stage, a recreation or a shadow, it has a row, and the row's `at` or the fact is above the floor. A name whose drop rows are not yet purged is left untaken on the entries route and taken after the purge; on the page route the page waits whole.
     - **A loss record is no fact that makes a collection.** The keep test does not count it, so it cannot make one. For a gone plain name it is judged by the row: at or below the floor it is history; above the floor, with the row saying `field`, it is appended (so this member serves it onward) and parked with the row's `R`, and no collection is made; above the floor, with the row saying `document`, it is ignored; above the floor, with no row held, the window stops and the fetch brings the row; and while the purge is pending it is left untaken.
     - **Two datings.** The floor is the later of the two tombstones, and the collection takes its own tombstone at its database's drop when that is its floor. Made because the row's `at` is above the floor, the collection is the *creation's* life: `created` is the row's `at` and there is no marker, as the creation's own entry would have made it. Made because only a fact is above the floor, it is what is left of the life the drop ended: `created` is the floor's successor and it carries the Redated marker (the row's `at` as `from`, the next arrival position as `first_arrival` and `arrivals_from`), so that no reader can tell it from the re-dated life the other order reaches. In both, `merge_policy_at` is the row's `at`.

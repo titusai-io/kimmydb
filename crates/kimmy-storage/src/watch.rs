@@ -1464,7 +1464,8 @@ pub struct ChangeStream {
     foreign_resume: bool,
     /// For a collection stream resumed from another member's token, the drop
     /// its incarnation began after: entries of the collection stamped at or
-    /// before it belong to the previous one.
+    /// before it belong to the previous one, and so does a creation in the
+    /// drop's own `Hlc`.
     incarnation_floor: Option<(CollectionId, Stamp)>,
     /// For a collection stream opened on a life that stands: a drop of the collection
     /// stamped below this is of a life before the one the stream follows, and is passed
@@ -1662,10 +1663,13 @@ impl ChangeStream {
             return None;
         }
 
-        // The previous incarnation's history, older drops included.
+        // The previous incarnation's history, older drops included. A creation is read by its `Hlc`: one in the drop's own `Hlc`
+        // is of the life the drop ended, whichever of the two stamps sorts first (the tie is the drop's, ADR-236), and a member
+        // serves it onward past the life that stands.
         if let Some((collection, floor)) = self.incarnation_floor
             && entry.collection == collection
-            && entry.stamp <= floor
+            && (entry.stamp <= floor
+                || (entry.kind == OpKind::CreateCollection && entry.stamp.hlc <= floor.hlc))
         {
             return None;
         }

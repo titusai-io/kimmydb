@@ -496,9 +496,10 @@ definition its sender's coverage names history, whoever serves it: its first pag
 or a page cut after its sender buried the life, which carries the drop.
 
 **A drop this node ignores is held and served onward like one it applies**
-([ADR-236](decisions.md)), and so is a creation its database's drop refuses: the
-vector this node serves names the origin past them, so withholding them left the
-next member never served them by anyone.
+([ADR-236](decisions.md)), and so is every replicated creation, whatever becomes of
+it, one the collection's drop or its database's refuses included: the vector this
+node serves names the origin past them, so withholding them left the next member
+never served them by anyone.
 
 **A stamp is minted only under the writer, so `oplog_versions` never names a
 stamp the committed oplog does not hold for the local origin.** Every local
