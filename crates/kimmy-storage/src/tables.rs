@@ -365,6 +365,11 @@ pub const META_HALT: &str = "halt";
 /// that has met a peer does not. Written once, from outside a contact.
 pub const META_MET_PEER: &str = "met_peer";
 
+/// The epoch a store was founded with (ADR-274): the 18-byte epoch minted by the open that also
+/// generated the node id, written in that transaction. In force only when it is the store's own
+/// epoch. A restore does not carry it, and a rewind leaves it naming the epoch the rewind cleared.
+pub const META_FOUNDING_EPOCH: &str = "founding_epoch";
+
 /// The newest epoch of each node this member has recorded (D13 containment, ADR-274): the key is
 /// the 16-byte node id and the value the 18-byte epoch, and a row only ever rises. Written from a
 /// verified handshake (a peer's claim, within the clock bound) and from a relayed row, never from a

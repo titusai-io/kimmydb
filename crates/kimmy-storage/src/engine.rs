@@ -1796,6 +1796,10 @@ impl Engine {
         );
 
         let node_id = Self::load_or_create_node_id(&db)?;
+        #[cfg(test)]
+        if crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.get()) == Some("node_id") {
+            return Err(StorageError::Database("stopped after the node id".into()));
+        }
         let resumed = Self::resume_hlc(&db)?;
         let mut clock = HlcClock::resuming_from(resumed);
         // After the clock resumed, so a minted epoch starts at or above every stamp the store

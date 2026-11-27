@@ -950,8 +950,9 @@ pub(crate) mod test_hooks {
         pub static GROWS_IN_BODY: Cell<u64> = const { Cell::new(0) };
         /// Where the next engine open on this thread stops, as a kill would:
         /// `"tables"` after the ensure-tables commit, `"schema"` after the
-        /// schema's. The open then returns an error and leaves the store as that
-        /// commit left it.
+        /// schema's, `"node_id"` once the node id is written and before the epoch
+        /// is. The open then returns an error and leaves the store as the last
+        /// commit before the stop left it.
         pub static STOP_OPEN_AFTER: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 

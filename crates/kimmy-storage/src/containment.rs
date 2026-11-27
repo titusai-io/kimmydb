@@ -173,6 +173,24 @@ impl Engine {
         self.met_peer.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether this epoch is the one the store was founded with: minted by the open that generated
+    /// the node id, so no other host has ever run this node. A restore and a rewind are not.
+    ///
+    /// **Scaffold of the tests commit**: nothing records a founding yet, so this answers no. The
+    /// code commit replaces it.
+    pub fn is_founding_epoch(&self) -> bool {
+        false
+    }
+
+    /// Whether the mistaken-restore guard (ADR-274) has to run before this epoch's host accepts or
+    /// dials: it has completed no handshake and it is not the epoch the store was founded with.
+    ///
+    /// **Scaffold of the tests commit**: the predicate the daemon used before. The code commit
+    /// replaces it.
+    pub fn needs_restore_guard(&self) -> bool {
+        !self.has_met_a_peer()
+    }
+
     /// Note that this epoch's host completed a handshake with another node. Sets the flag and
     /// nothing else: a handshake never waits on the writer.
     pub fn note_met_a_peer(&self) {

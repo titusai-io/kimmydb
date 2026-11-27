@@ -2878,7 +2878,7 @@ async fn spawn_cluster(
     // connects waits, and completes no handshake), the serve and replication tasks wait on this
     // gate, and SWIM runs meanwhile, which is where the guard reads its list. A host that has met a
     // peer, or has no membership to ask, passes at once.
-    let guarded = config.cluster.membership && !engine.has_met_a_peer();
+    let guarded = config.cluster.membership && engine.needs_restore_guard();
     let (gate_tx, gate_rx) =
         tokio::sync::watch::channel::<Option<bool>>((!guarded).then_some(true));
     let serve = kimmy_cluster::serve_with(

@@ -6073,3 +6073,61 @@ async fn a_restore_with_replace_takes_the_node_over_and_the_old_host_halts_quiet
         a.log()
     );
 }
+
+/// The seconds from one time of day to another, less than half a day apart: negative where the
+/// second came first.
+fn seconds_from(from: f64, to: f64) -> f64 {
+    (to - from + 43_200.0).rem_euclid(86_400.0) - 43_200.0
+}
+
+/// How long after a node logged `from` it logged `to`, in seconds, once both lines are there:
+/// negative where `to` came first. Two tasks may log the two, so lines a few microseconds apart
+/// can come in either order.
+async fn seconds_between_lines(node: &Node, from: &'static str, to: &'static str) -> f64 {
+    let at = |wanted: &str| node.log().lines().find(|l| l.contains(wanted)).and_then(logged_at);
+    eventually(to, || {
+        let both = at(from).is_some() && at(to).is_some();
+        async move { both }
+    })
+    .await;
+    seconds_from(at(from).unwrap(), at(to).unwrap())
+}
+
+/// A new member has never run anywhere else, so it has nothing to ask the mistaken-restore guard
+/// (ADR-274) and serves as soon as it is up, beside a seed that answers. Guarded, it would wait
+/// for a member list that its own held replication loop never asks for, until the guard gives up
+/// at 15 s; the bound is well under that and well over a start on a loaded machine.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_new_member_serves_at_once_beside_an_answering_seed() {
+    let client = reqwest::Client::new();
+    let (pa, pb) = (ports::choose(), ports::choose());
+    // A's only seed is itself, so nothing of A waits. A new member whose seeds name another is not
+    // ready until it has caught up, or its wait of two minutes ends with nobody reached (ADR-202).
+    let a = Node::spawn_with("node-a", pa, &[pa], "");
+    a.wait_ready(&client).await;
+    seconds_between_lines(&a, "gossiping membership", "serving cluster replication").await;
+
+    let b = Node::spawn_with("node-b", pb, &[pa], "");
+    b.wait_ready(&client).await;
+    let held =
+        seconds_between_lines(&b, "gossiping membership", "serving cluster replication").await;
+    eprintln!("node-b served cluster replication {held:.3} s after it began gossiping");
+    assert!(held < 5.0, "a new member waited {held:.3} s to serve:\n{}", b.log());
+    eventually("gossip to form", || all_report(&client, vec![&a, &b], 1)).await;
+}
+
+/// Three new members whose seeds make a circle, each naming only the next, form one cluster.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn three_new_members_seeding_each_other_in_a_circle_form_a_cluster() {
+    let client = reqwest::Client::new();
+    let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+    let a = Node::spawn_with("node-a", pa, &[pb], "");
+    let b = Node::spawn_with("node-b", pb, &[pc], "");
+    let c = Node::spawn_with("node-c", pc, &[pa], "");
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+}

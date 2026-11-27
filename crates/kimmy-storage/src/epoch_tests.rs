@@ -15,12 +15,17 @@ fn open(path: &Path) -> Engine {
     Engine::open(path).unwrap()
 }
 
-/// The epoch row of a store nobody has open.
-fn epoch_row(path: &Path) -> Option<Vec<u8>> {
+/// A `META` row of a store nobody has open.
+fn meta_row(path: &Path, key: &str) -> Option<Vec<u8>> {
     let db = redb::Builder::new().open_read_only(path).unwrap();
     let txn = db.begin_read().unwrap();
     let meta = txn.open_table(tables::META).unwrap();
-    meta.get(tables::META_EPOCH).unwrap().map(|v| v.value().to_vec())
+    meta.get(key).unwrap().map(|v| v.value().to_vec())
+}
+
+/// The epoch row of a store nobody has open.
+fn epoch_row(path: &Path) -> Option<Vec<u8>> {
+    meta_row(path, tables::META_EPOCH)
 }
 
 fn backup_of(engine: &Engine) -> Vec<u8> {
@@ -58,6 +63,107 @@ fn a_first_open_mints_an_epoch_and_a_restart_keeps_it() {
             .max()
             .unwrap()
     });
+}
+
+/// A new store's first epoch is the one it was founded with: no other host has run this node, so
+/// the mistaken-restore guard (ADR-274) has nothing to ask about, at this open or at a later one
+/// that has still met nobody.
+#[test]
+fn a_new_store_is_founded_and_needs_no_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let epoch = {
+        let engine = open(&path);
+        assert!(!engine.has_met_a_peer(), "premise: it has met nobody");
+        assert!(engine.is_founding_epoch(), "the first open founds the store");
+        assert!(!engine.needs_restore_guard(), "a new store is not guarded");
+        engine.epoch()
+    };
+    assert_eq!(
+        meta_row(&path, tables::META_FOUNDING_EPOCH).as_deref(),
+        Some(epoch.0.as_slice()),
+        "the founding row names the first epoch"
+    );
+    let again = open(&path);
+    assert_eq!(again.epoch(), epoch, "premise: the reopen keeps the epoch");
+    assert!(again.is_founding_epoch(), "a restart is still the founding epoch");
+    assert!(!again.needs_restore_guard());
+}
+
+/// A restored store and a rewound one are new epochs of a node that has run before: guarded, at
+/// the open that mints the epoch and at a later one.
+#[test]
+fn a_restore_and_a_rewind_need_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.redb");
+    let source = open(&source_path);
+    let coll = source.create_collection("shop", "orders").unwrap();
+    source.insert(&coll, doc! { "_id": 1 }).unwrap();
+    let backup = backup_of(&source);
+    let path = dir.path().join("restored.redb");
+    restore(&path, &mut backup.as_slice()).unwrap();
+    assert_eq!(
+        meta_row(&path, tables::META_FOUNDING_EPOCH),
+        None,
+        "a restore does not carry the founding row"
+    );
+    for open_of in ["the minting open", "a reopen"] {
+        let restored = open(&path);
+        assert!(!restored.is_founding_epoch(), "{open_of} of a restore founds nothing");
+        assert!(restored.needs_restore_guard(), "{open_of} of a restore is guarded");
+    }
+
+    let until = source.read_oplog_from(Hlc::ZERO, usize::MAX, WalkScope::Request).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    source.insert(&coll, doc! { "_id": 2 }).unwrap();
+    source.rewind_to(until.last().unwrap().stamp.hlc).unwrap();
+    drop(source);
+    for open_of in ["the minting open", "a reopen"] {
+        let rewound = open(&source_path);
+        assert!(!rewound.is_founding_epoch(), "{open_of} of a rewind founds nothing");
+        assert!(rewound.needs_restore_guard(), "{open_of} of a rewind is guarded");
+    }
+}
+
+/// A restored epoch that has completed a handshake is past the guard, at that open and after.
+#[test]
+fn a_restored_store_that_has_met_a_peer_needs_no_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = open(&dir.path().join("source.redb"));
+    let backup = backup_of(&source);
+    let path = dir.path().join("restored.redb");
+    restore(&path, &mut backup.as_slice()).unwrap();
+    {
+        let restored = open(&path);
+        assert!(restored.needs_restore_guard(), "premise: guarded before it meets anyone");
+        restored.note_met_a_peer();
+        assert!(!restored.needs_restore_guard());
+        restored.persist_met_a_peer().unwrap();
+    }
+    assert!(!open(&path).needs_restore_guard(), "the bit is held");
+}
+
+/// The node id and the founding epoch are one commit: an open stopped between the two writes
+/// leaves neither, and the next open founds the store. With the node id committed alone, that next
+/// open would mint an epoch for a node id it did not generate, and a store that has never run
+/// would be guarded as a restore is.
+#[test]
+fn a_fault_between_the_node_id_and_the_epoch_leaves_neither() {
+    use crate::hold_meter::test_hooks::STOP_OPEN_AFTER;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    STOP_OPEN_AFTER.with(|s| s.set(Some("node_id")));
+    let stopped = Engine::open(&path).map(drop);
+    STOP_OPEN_AFTER.with(|s| s.set(None));
+    let stopped = stopped.expect_err("premise: the open stops").to_string();
+    assert!(stopped.contains("stopped after the node id"), "premise: at the stop: {stopped}");
+    assert_eq!(meta_row(&path, tables::META_NODE_ID), None, "no node id is left behind");
+    assert_eq!(epoch_row(&path), None);
+    assert_eq!(meta_row(&path, tables::META_FOUNDING_EPOCH), None);
+
+    let engine = open(&path);
+    assert!(engine.is_founding_epoch(), "the next open founds the store");
+    assert!(!engine.needs_restore_guard());
 }
 
 /// An epoch minted at T, then an open on a clock behind T (a data directory moved to a host whose
