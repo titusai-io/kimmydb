@@ -22,7 +22,7 @@ use redb::ReadableDatabase;
 
 use crate::register::{BaseOptions, Carried};
 use crate::snapshot::Carry;
-use crate::{Engine, SnapshotProgress, WalkScope, WriterHolder, physical_now_ms};
+use crate::{Engine, RetentionPolicy, SnapshotProgress, WalkScope, WriterHolder, physical_now_ms};
 
 const DB: &str = "app";
 const STAGE: &str = "orders.__stg.a1";
@@ -960,6 +960,41 @@ fn a_whole_pull_of_several_pages_holds_the_names_row_its_last_page_carries() {
     );
     assert!(progress.is_complete(), "the pull completes");
     assert!(keys(&j, Carried::Names).contains(&key), "and the joiner holds the names row");
+}
+
+/// UNIT P, P11a (tests first; ruled 6:35 PM and 6:33 PM follow-up): a joiner that already holds the options rows of the sender takes a pull of several pages
+/// of the carry, and a retention pass far in the future of every stamp runs between two of them (every tombstone of the joiner is collectable, so no
+/// tombstone covers a gone collection's row any more). Every page of the carry carries the sender's tombstones, so a LATER page brings back the tombstone of a gone
+/// collection whose row the joiner held and judged not news. The joiner must end holding every options row the sender holds AND every one of those tombstones:
+/// a collector that removed a row in the middle of the pull would leave the tombstone and no row, where the sender holds both. GREEN today (nothing collects the
+/// table); it goes red if the collector removes a row while the pull that relies on the held copy is in flight.
+#[test]
+fn a_joiner_holding_every_row_ends_holding_them_and_the_later_tombstones_after_a_mid_carry_pass() {
+    let (a, _da) = a_sender_with_ghosts(30);
+    a.set_snapshot_room_for_test(Some(a_small_room_that_holds_a_document(&a)));
+    let (b, _db) = engine();
+    pulled(&b, &a, &mut SnapshotProgress::whole_database());
+    assert!(options_of(&b, "g3").is_some(), "premise: the member holds the gone collection's row");
+    assert_eq!(keys(&b, Carried::Options), keys(&a, Carried::Options), "premise: every row");
+    // the pull again, stopped between two pages of the carry
+    let mut whole = stopped_in_the_carry(&b, &a);
+    // a pass far in the future of every stamp: every tombstone is collectable
+    let far = physical_now_ms() + 10 * 365 * 24 * 3600 * 1000;
+    b.collect_garbage_at(far, RetentionPolicy::new(31_536_000, 1)).expect("the pass runs");
+    pulled(&b, &a, &mut whole);
+    assert_eq!(
+        keys(&b, Carried::Options),
+        keys(&a, Carried::Options),
+        "after the join the joiner holds every options row the sender holds"
+    );
+    for i in 0..30 {
+        let id = CollectionId::derive(DB, &format!("g{i}"));
+        assert_eq!(
+            b.collection_dropped_at(id).unwrap(),
+            a.collection_dropped_at(id).unwrap(),
+            "and the tombstone of g{i}, which a later page brought"
+        );
+    }
 }
 
 /// A carried options row whose key does not derive from the names it holds is a damaged page: it fails, the progress does not move, and
