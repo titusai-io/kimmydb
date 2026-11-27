@@ -166,6 +166,9 @@ mod logical_drop_tests;
 mod seed_asymmetry_tests;
 
 #[cfg(test)]
+mod seed_door_tests;
+
+#[cfg(test)]
 mod out_counter_tests;
 
 #[cfg(test)]
