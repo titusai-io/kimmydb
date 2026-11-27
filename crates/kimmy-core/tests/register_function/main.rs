@@ -5,11 +5,13 @@
 //! case is in exactly one of three groups by the facts it holds, one test each: no stage fact (`plain`), stage facts and no database drop
 //! (`staged`), and both (`dbdrop`). The named rows are a second look at cases that are already in those groups. The rest: a database
 //! drop's own entry changes nothing, the order of the facts says nothing, the table reaches the branches it is meant to, a tie in
-//! one `hlc` is the drop's, and which entry kinds are a touch.
+//! one `hlc` is the drop's, the rows of `tie_rows.rs` say what two facts at one `hlc` come to (the table has none), and which entry
+//! kinds are a touch.
 
 // no case holds a stage's withdrawal (`Kind::Abandon`): it is in the table's types so that their form does not change with its rule
 #[allow(dead_code)]
 mod table;
+mod tie_rows;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -409,6 +411,28 @@ fn a_tie_in_one_hlc_is_the_drops() {
             }
         }
     }
+}
+
+/// Two facts of two origins at one `hlc`, beyond a drop and a creation: two events, a drop against a stage's creation, an event
+/// against a creation and against a touch, and an event at a stage's deadline. Each row is answered with its facts listed both ways.
+#[test]
+fn the_tie_rows_of_stages_and_events() {
+    assert_eq!(tie_rows::STAGES_AND_EVENTS.len(), 9);
+    let mut failed = Vec::new();
+    for row in tie_rows::STAGES_AND_EVENTS {
+        let hlcs: BTreeSet<u64> = row.facts.iter().map(|f| f.hlc).collect();
+        // every row but the deadline's holds two facts at one hlc; the deadline's holds two events there, at the deadline
+        assert!(hlcs.len() < row.facts.len(), "{}: no two facts at one hlc", row.tag);
+        let mut facts = facts_of(row);
+        for listed in ["as listed", "reversed"] {
+            let columns = differences(row, &fold(IDENTITY, &facts));
+            if !columns.is_empty() {
+                failed.push(format!("{} {listed}: {columns:?}", row.tag));
+            }
+            facts.reverse();
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

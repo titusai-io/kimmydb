@@ -13,14 +13,21 @@
 //!
 //! Nothing in storage reads this yet.
 //!
-//! **Built so far:** the rules of a collection that was never swapped. [`fold`] does not read stage creations, bindings or recreations
-//! yet, so the tests of the cases that hold one are red.
+//! **Two facts at one `hlc`** (two origins can mint them). The facts are applied in full [`Stamp`] order, and "below" between two facts
+//! is that order: a drop is logical when a stage's creation sorts below it, and two events at one `hlc` are both in the register. Three
+//! readings are on the `hlc` alone. A drop against the creation of a collection it ends: **the tie is the drop's** (ADR-236). An
+//! ordinary creation or a touch against the register: an event at or below it by `hlc` makes it history, since a visible event buries
+//! the identity whichever of the two sorts first. And a stage's deadline is an `Hlc`.
+//!
+//! **Built so far:** the collection that was never swapped, and stage creations, bindings, recreations and logical drops. A drop of the
+//! database is not yet an event of the register, so the tests of the cases that hold one beside a stage fact are red.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hlc::{Hlc, Stamp};
 use crate::oplog::OpKind;
-use crate::swap::StageInfo;
+use crate::register_state::{Put, Ready, Timeline, Visible};
+use crate::swap::{RegisterEvent, StageInfo, StageMeta};
 
 /// One fact about a logical name or its database, under the stamp of the entry that made it. No two facts of a set share a stamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,32 +119,201 @@ impl Answer {
 pub fn fold(identity: &str, facts: &[FoldFact]) -> Answer {
     let mut in_order: Vec<&FoldFact> = facts.iter().collect();
     in_order.sort_by_key(|fact| fact.stamp);
-    let mut plain = Plain::default();
+    // every stage of the set, by its physical: a binding is judged against its own, and a drop asks whether one was created below it
+    let stages: BTreeMap<&str, StageMeta> = facts
+        .iter()
+        .filter_map(|fact| match &fact.kind {
+            FoldKind::StageCreate { physical, stage } => {
+                Some((physical.as_str(), StageMeta { created: fact.stamp, info: *stage }))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut name = Name {
+        stages: &stages,
+        timeline: Timeline::new(identity),
+        plain: Plain::default(),
+        alive: BTreeMap::new(),
+        dead: BTreeMap::new(),
+        invalid: BTreeSet::new(),
+    };
     for fact in in_order {
         match &fact.kind {
-            FoldKind::Create => plain.created(&fact.stamp),
-            // with no stage fact read, a drop of the database says of this name what a drop of the collection says
-            FoldKind::Drop { database_drop: None } | FoldKind::DatabaseDrop => {
-                plain.dropped(fact.stamp);
-            }
+            FoldKind::Create => name.created(&fact.stamp),
+            FoldKind::Touch => name.touched(&fact.stamp),
+            FoldKind::Drop { database_drop: None } => name.dropped(fact.stamp),
+            // not yet an event of the register: it ends the plain collection and raises the floor, and ends no stage
+            FoldKind::DatabaseDrop => name.plain.dropped(fact.stamp),
             // a database drop's own entry of the collection acts as of that database drop, which is a fact of its own
             FoldKind::Drop { database_drop: Some(_) } => {}
-            FoldKind::Touch => plain.touched(&fact.stamp),
-            // not read yet
-            FoldKind::StageCreate { .. } | FoldKind::Bind { .. } | FoldKind::Recreate { .. } => {}
+            FoldKind::StageCreate { physical, .. } => name.stage_created(physical, &fact.stamp),
+            FoldKind::Bind { physical } => name.bound(physical, fact.stamp),
+            FoldKind::Recreate { physical } => name.recreated(physical, fact.stamp),
         }
     }
-    Answer {
-        serves: if plain.stands { Serves::Identity } else { Serves::Absent },
-        floor: plain.floor,
-        identity_stands: plain.stands,
-        // with no event in the register no write is late
-        superseded: BTreeMap::from([(identity.to_string(), None)]),
-        ..Answer::default()
+    name.answer(facts)
+}
+
+/// What the facts applied so far say of a name. Which events there are is decided here; what they make visible and what that buries
+/// is layer 2's to say.
+struct Name<'a> {
+    /// Every stage of the set, by its physical, applied or not.
+    stages: &'a BTreeMap<&'a str, StageMeta>,
+    /// The events in effect.
+    timeline: Timeline,
+    plain: Plain,
+    /// The stages and recreations applied and not ended, each with the `hlc` of its creation.
+    alive: BTreeMap<String, Hlc>,
+    dead: BTreeMap<String, Stamp>,
+    invalid: BTreeSet<Stamp>,
+}
+
+impl Name<'_> {
+    /// Whether the register holds an event stamped at or below `stamp` by its `hlc`: what is stamped there is of a swapped name.
+    fn has_an_event_at_or_below(&self, stamp: &Stamp) -> bool {
+        self.timeline.events().iter().any(|(event, _)| event.hlc <= stamp.hlc)
+    }
+
+    /// An ordinary creation. With an event of the register at or below it, it is history: a once-swapped name is created again only
+    /// by a recreation. Otherwise the rules of the plain collection judge it.
+    fn created(&mut self, stamp: &Stamp) {
+        if !self.has_an_event_at_or_below(stamp) {
+            self.plain.created(stamp);
+        }
+    }
+
+    /// A touch. With an event of the register at or below it, it changes nothing in what the name is: whether the write is late is
+    /// [`Answer::superseded`]'s to say.
+    fn touched(&mut self, stamp: &Stamp) {
+        if self.has_an_event_at_or_below(stamp) {
+            return;
+        }
+        self.plain.touched(stamp);
+    }
+
+    /// A drop of the collection. It is logical, an event of the register, when an event is held or a stage of the name was created
+    /// below it, by the full stamp; otherwise it ends the plain collection. The floor rises either way.
+    fn dropped(&mut self, stamp: Stamp) {
+        let logical = !self.timeline.events().is_empty()
+            || self.stages.values().any(|stage| stage.created < stamp);
+        if logical {
+            self.plain.raise_the_floor(stamp);
+            self.enter(stamp, RegisterEvent::LogicalDrop, None);
+        } else {
+            self.plain.dropped(stamp);
+        }
+    }
+
+    /// The creation of a stage: it stands, hidden, until an event ends it.
+    fn stage_created(&mut self, physical: &str, stamp: &Stamp) {
+        self.alive.insert(physical.to_string(), stamp.hlc);
+        self.settle();
+    }
+
+    /// A binding, valid or not: layer 2's one door judges it against its stage's creation.
+    fn bound(&mut self, physical: &str, stamp: Stamp) {
+        let stage = self.stages.get(physical).copied();
+        self.enter(stamp, RegisterEvent::Bind { physical: physical.to_string() }, stage);
+    }
+
+    /// A recreation: the new physical stands, and its event is in effect.
+    fn recreated(&mut self, physical: &str, stamp: Stamp) {
+        self.alive.insert(physical.to_string(), stamp.hlc);
+        self.enter(stamp, RegisterEvent::Create { physical: physical.to_string() }, None);
+    }
+
+    /// Offer an event to the register through layer 2's one door, and apply what is then visible.
+    fn enter(&mut self, stamp: Stamp, event: RegisterEvent, stage: Option<StageMeta>) {
+        let stage = stage.as_ref().map(|stage| (&stage.created, &stage.info));
+        match self.timeline.insert(stamp, event, stage) {
+            Put::Stored => self.settle(),
+            Put::InvalidBinding => {
+                self.invalid.insert(stamp);
+            }
+            // only on a set no cluster can write: a binding of a stage that is not among the facts, or two facts under one stamp
+            Put::UnknownStage | Put::Duplicate => {}
+        }
+    }
+
+    /// What `physical` is to layer 2: alive if it stands. The function ends physicals and never leaves one missing.
+    fn ready(&self, physical: &str) -> Ready {
+        let stands = if physical == self.timeline.identity() {
+            self.plain.stands
+        } else {
+            self.alive.contains_key(physical)
+        };
+        if stands { Ready::Alive } else { Ready::Buried }
+    }
+
+    /// End what layer 2 says the visible event buries: what it left behind, and the unbound stages whose deadline is below it.
+    fn settle(&mut self) {
+        let visible = self.timeline.visible(|physical| self.ready(physical));
+        let deadlines: Vec<(&str, Hlc)> = self
+            .stages
+            .iter()
+            .map(|(physical, stage)| (*physical, stage.info.effective_deadline(&stage.created)))
+            .collect();
+        let mut buried = self.timeline.burials(&visible, |physical| self.ready(physical));
+        let doomed = self.timeline.doomed(&visible, |physical| self.ready(physical), &deadlines);
+        buried.extend(doomed);
+        for burial in buried {
+            if burial.physical == self.timeline.identity() {
+                self.plain.stands = false;
+            } else if self.alive.remove(&burial.physical).is_some() {
+                self.dead.insert(burial.physical, burial.at);
+            }
+        }
+    }
+
+    /// The answer, once every fact of `facts` is applied.
+    fn answer(self, facts: &[FoldFact]) -> Answer {
+        let serves = match self.timeline.visible(|physical| self.ready(physical)) {
+            Visible::Identity if self.plain.stands => Serves::Identity,
+            Visible::Identity | Visible::Dropped { .. } => Serves::Absent,
+            Visible::Bound { physical, .. } => Serves::Stage(physical),
+            Visible::Created { physical, .. } => Serves::Recreation(physical),
+        };
+        let register = self
+            .timeline
+            .events()
+            .iter()
+            .map(|(stamp, event)| {
+                let event = match event {
+                    RegisterEvent::Bind { physical } => {
+                        FoldEvent::Bind { physical: physical.clone() }
+                    }
+                    RegisterEvent::Create { physical } => {
+                        FoldEvent::Recreate { physical: physical.clone() }
+                    }
+                    RegisterEvent::LogicalDrop => FoldEvent::Drop,
+                };
+                (*stamp, event)
+            })
+            .collect();
+        let recreations = facts.iter().filter_map(|fact| match &fact.kind {
+            FoldKind::Recreate { physical } => Some(physical.as_str()),
+            _ => None,
+        });
+        let superseded = [self.timeline.identity()]
+            .into_iter()
+            .chain(self.stages.keys().copied())
+            .chain(recreations)
+            .map(|physical| (physical.to_string(), self.timeline.superseded_at(physical)))
+            .collect();
+        Answer {
+            serves,
+            floor: self.plain.floor,
+            identity_stands: self.plain.stands,
+            alive: self.alive,
+            dead: self.dead,
+            register,
+            superseded,
+            invalid: self.invalid,
+        }
     }
 }
 
-/// The collection named like the logical name, by the rules of one that was never swapped. Each rule compares a fact with the floor on
+/// The collection named like the logical name, and the rules of one that was never swapped. Each rule compares a fact with the floor on
 /// the `hlc` alone: **a tie in one `hlc` is the drop's** (ADR-236), whichever of the two stamps sorts first.
 #[derive(Default)]
 struct Plain {
@@ -159,9 +335,14 @@ impl Plain {
         }
     }
 
-    /// A drop: the floor rises to it and the collection, whose life is at or below it, ends.
-    fn dropped(&mut self, stamp: Stamp) {
+    /// A drop raises the floor, whether it ends the plain collection or is an event of the register.
+    fn raise_the_floor(&mut self, stamp: Stamp) {
         self.floor = Some(stamp);
+    }
+
+    /// A drop of a name that was never swapped: the floor rises to it and the collection, whose life is at or below it, ends.
+    fn dropped(&mut self, stamp: Stamp) {
+        self.raise_the_floor(stamp);
         self.stands = false;
     }
 
