@@ -1367,6 +1367,7 @@ mod writer_busy_wording_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::second_dispatcher::a_second_dispatcher;
 
     fn stamp() -> kimmy_core::Stamp {
         kimmy_core::Stamp::new(
@@ -1470,6 +1471,7 @@ mod tests {
             .finish();
         // Scoped to this thread, so a parallel test in this binary does not
         // collect the line and read it as its own.
+        let _not_alone = a_second_dispatcher();
         tracing::subscriber::with_default(subscriber, || {
             let _ = error.into_response();
         });
@@ -1639,6 +1641,7 @@ mod tests {
             .with_max_level(Level::TRACE)
             .with_ansi(false)
             .finish();
+        let _not_alone = a_second_dispatcher();
         tracing::subscriber::with_default(subscriber, || {
             let _ = error.into_response();
         });

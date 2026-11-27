@@ -7,6 +7,5 @@
 /// switch a line off for the thread that records it. With two registered, every registered dispatcher is asked, the capture among
 /// them.
 pub(crate) fn a_second_dispatcher() -> tracing::Dispatch {
-    // Registers nothing yet: the row beside the replay test fails on this.
-    tracing::Dispatch::none()
+    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
 }

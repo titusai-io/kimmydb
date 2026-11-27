@@ -179,6 +179,9 @@ fn a_delivery_carries_a_traceparent_only_when_this_node_is_tracing() {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("kimmydb-test")));
 
+    // A second dispatcher while this records, so another thread's first hit
+    // switches no line off (kimmy-api/tests/log_captures.rs).
+    let _not_alone = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let after = tracing::subscriber::with_default(subscriber, || deliver_one(&runtime));
 
     // `00-<32 hex trace id>-<16 hex span id>-<2 hex flags>`, and neither id may

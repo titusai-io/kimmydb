@@ -1271,10 +1271,8 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     ];
     let seen = Seen::default();
     let log = Arc::clone(&seen.0);
+    let _not_alone = a_second_dispatcher();
     let _recording = tracing::subscriber::set_default(seen);
-    // A callsite first hit on a thread with no subscriber is cached as uninteresting for
-    // every thread; rebuild so this test's subscriber sees the events of a parallel run.
-    tracing::callsite::rebuild_interest_cache();
     scripted(&f, |mut stream| async move {
         assert!(ask_versions(&mut stream).await.is_some());
         let mut cursor = from;
@@ -1869,8 +1867,8 @@ async fn a_malformed_replay_from_is_no_ask_said_once_per_peer_and_the_round_goes
     let their = NodeId::generate();
     let seen = Seen::default();
     let log = Arc::clone(&seen.0);
+    let _not_alone = a_second_dispatcher();
     let _recording = tracing::subscriber::set_default(seen);
-    tracing::callsite::rebuild_interest_cache();
 
     let vectors = |replay_from: bson::Bson| {
         let mut doc = bson::serialize_to_document(&Message::Vectors {

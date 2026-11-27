@@ -46,6 +46,9 @@ fn a_collection_whose_every_holder_is_catching_up_is_on_the_gauge_and_in_the_log
     let captured = Captured::default();
     let subscriber =
         tracing_subscriber::fmt().with_writer(captured.clone()).with_ansi(false).finish();
+    // A second dispatcher while this records, so another thread's first hit
+    // switches no line off (kimmy-api/tests/log_captures.rs).
+    let _not_alone = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _guard = tracing::subscriber::set_default(subscriber);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 

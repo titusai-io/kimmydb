@@ -8,6 +8,7 @@ use kimmy_core::{CollectionId, NodeId, VersionVector};
 use kimmy_storage::SnapshotProgress;
 
 use super::*;
+use crate::second_dispatcher::a_second_dispatcher;
 
 fn node(n: u128) -> NodeId {
     NodeId::from_bytes(n.to_be_bytes())
@@ -597,10 +598,8 @@ fn logged(run: impl FnOnce()) -> Vec<String> {
     let lines = Lines::default();
     let seen = Arc::clone(&lines.0);
     {
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(lines);
-        // A callsite first hit on a thread with no subscriber is cached as uninteresting for
-        // every thread; rebuild so this subscriber sees the events of a parallel run.
-        tracing::callsite::rebuild_interest_cache();
         run();
     }
     seen.lock().unwrap().clone()

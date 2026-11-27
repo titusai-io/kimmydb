@@ -1702,6 +1702,7 @@ pub fn write_marker(data_dir: &Path, reason: CatchUpReason) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::second_dispatcher::a_second_dispatcher;
 
     fn node(n: u8) -> NodeId {
         NodeId::from_bytes([n; 16])
@@ -3689,6 +3690,7 @@ mod tests {
     #[test]
     fn the_wait_counts_from_the_first_sync_tick_and_not_from_the_marker() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let f = marked(CatchUpReason::SeededEmpty);
         let opened = Instant::now() + WAIT * 3;
@@ -3758,6 +3760,7 @@ mod tests {
     #[test]
     fn the_cap_dropping_owed_lines_on_load_is_said() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let load = |count: u64| {
             let dir = tempfile::tempdir().unwrap();
@@ -3842,6 +3845,7 @@ mod tests {
     #[test]
     fn the_release_is_a_warn_naming_the_member_and_cause() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let (f, t0) = restored_armed();
         let b = [peer_b()];
@@ -3867,6 +3871,7 @@ mod tests {
     #[test]
     fn past_retention_the_replay_warns_once_and_answers_from_the_horizon() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let dir = tempfile::tempdir().unwrap();
         write_marker(dir.path(), CatchUpReason::Restored).unwrap();
@@ -3896,6 +3901,7 @@ mod tests {
     #[test]
     fn the_floor_file_always_carries_the_floor_and_the_arming_rewrite_keeps_the_owed_lines() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(REPLAY_FLOOR_FILE);
@@ -3940,6 +3946,7 @@ mod tests {
     #[test]
     fn a_failed_owed_rewrite_warns_and_keeps_the_set() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let (f, t0) = restored_armed();
         let path = f._dir.path().join(REPLAY_FLOOR_FILE);
@@ -4010,6 +4017,7 @@ mod tests {
     #[test]
     fn the_owed_replay_is_said_on_entry_every_ten_minutes_and_when_unmarked() {
         let events = Events::default();
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(events.clone());
         let (f, t0) = latched();
         let entered = events.matching("now serves as unknown");

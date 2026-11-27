@@ -43,6 +43,9 @@ fn recorder() -> (SdkTracerProvider, InMemorySpanExporter) {
 fn recording<T>(provider: &SdkTracerProvider, body: impl FnOnce() -> T) -> T {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("kimmydb-test")));
+    // A second dispatcher while this records, so another thread's first hit
+    // switches no line off (kimmy-api/tests/log_captures.rs).
+    let _not_alone = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     tracing::subscriber::with_default(subscriber, body)
 }
 

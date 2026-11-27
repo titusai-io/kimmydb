@@ -5210,15 +5210,20 @@ mod tests {
     }
 
     impl Captured {
-        fn record(&self) -> tracing::subscriber::DefaultGuard {
-            tracing::subscriber::set_default(
+        /// This thread records into the answer for as long as it lives.
+        fn record(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            // A second dispatcher while this records, so another thread's first hit
+            // switches no line off (kimmy-api/tests/log_captures.rs).
+            let _not_alone = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let recording = tracing::subscriber::set_default(
                 tracing_subscriber::fmt()
                     .with_writer(self.clone())
                     .with_max_level(tracing::Level::WARN)
                     .without_time()
                     .with_ansi(false)
                     .finish(),
-            )
+            );
+            (recording, _not_alone)
         }
 
         /// How many warnings name no member able to expire `collection`.

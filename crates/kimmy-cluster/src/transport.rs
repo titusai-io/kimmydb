@@ -7379,6 +7379,7 @@ mod containment_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::second_dispatcher::a_second_dispatcher;
     use kimmy_core::Epoch;
 
     fn emfile() -> io::Error {
@@ -7497,6 +7498,7 @@ mod tests {
     fn a_serve_walk_is_bracketed_by_its_start_and_end_lines_even_if_it_panics() {
         let messages = Messages::default();
         let seen = Arc::clone(&messages.0);
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(messages);
         let peer = kimmy_core::NodeId::generate();
         {
@@ -7593,6 +7595,7 @@ mod tests {
     async fn logged_for(errors: u32, hold_last: Duration) -> Vec<Line> {
         let lines = Lines::default();
         let seen = Arc::clone(&lines.0);
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(lines);
         let mut backoff = AcceptBackoff::new();
         let calls = std::sync::atomic::AtomicU32::new(0);
@@ -7636,6 +7639,7 @@ mod tests {
     async fn a_listener_flapping_at_its_limit_logs_one_warn_and_one_recovery() {
         let lines = Lines::default();
         let seen = Arc::clone(&lines.0);
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(lines);
         let mut backoff = AcceptBackoff::new();
         for _ in 0..25 {
@@ -11480,8 +11484,8 @@ mod tests {
         b.set_snapshot_room_for_test(Some(64 * 1024));
         let lines = Lines::default();
         let seen = Arc::clone(&lines.0);
+        let _not_alone = a_second_dispatcher();
         let _recording = tracing::subscriber::set_default(lines);
-        tracing::callsite::rebuild_interest_cache();
         for _ in 0..2 {
             let a_dir = tempfile::tempdir().unwrap();
             let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();

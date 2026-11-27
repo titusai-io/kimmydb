@@ -252,6 +252,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::second_dispatcher::a_second_dispatcher;
 
     /// A writer a test can read back, so an assertion can be made about the
     /// record's fields rather than about the call that produced them.
@@ -285,6 +286,7 @@ mod tests {
             .finish();
         // Scoped to this thread, so a parallel test's mode does not leak in;
         // the mode itself is process-global, hence set inside the scope.
+        let _not_alone = a_second_dispatcher();
         tracing::subscriber::with_default(subscriber, || {
             let previous = mode();
             set_mode(AuditMode::All);
@@ -356,6 +358,7 @@ mod tests {
             .without_time()
             .with_ansi(false)
             .finish();
+        let _not_alone = a_second_dispatcher();
         tracing::subscriber::with_default(subscriber, || {
             record_vectors(&Principal::superuser("root"), action, "shop", "docs", provider);
         });

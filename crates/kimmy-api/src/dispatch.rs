@@ -1552,6 +1552,7 @@ pub(crate) mod tests {
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
+    use crate::second_dispatcher::a_second_dispatcher;
 
     fn node(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 16])
@@ -2345,6 +2346,7 @@ pub(crate) mod tests {
             .without_time()
             .with_ansi(false)
             .finish();
+        let _not_alone = a_second_dispatcher();
         tracing::subscriber::with_default(subscriber, body);
         let out = String::from_utf8(sink.0.lock().clone()).expect("utf-8");
         out.lines().map(str::to_string).collect()

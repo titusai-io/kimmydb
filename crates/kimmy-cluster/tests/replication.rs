@@ -1761,6 +1761,13 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
 /// falls back to a snapshot.
 const SNAPSHOT_FALLBACK: &str = "falling back to a snapshot";
 
+/// A second registered dispatcher, held while a scoped capture records: with only one
+/// registered, the thread that first hits a callsite is asked which events it wants, for
+/// every thread (`second_dispatcher.rs` in the library says why).
+fn a_second_dispatcher() -> tracing::Dispatch {
+    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+}
+
 /// `round`'s result, and every event message logged while it ran, from its
 /// own task.
 ///
@@ -1770,6 +1777,7 @@ const SNAPSHOT_FALLBACK: &str = "falling back to a snapshot";
 async fn logged_during<T>(round: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
     use tracing::instrument::WithSubscriber;
     let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _not_alone = a_second_dispatcher();
     let out = round.with_subscriber(Recorder(Arc::clone(&lines))).await;
     let lines = lines.lock().unwrap().clone();
     (out, lines)
@@ -3831,6 +3839,7 @@ async fn the_tick_overrun_warning_names_its_phase_split_and_slowest_peer() {
 
     let capture = OverrunCapture::default();
     let captured = Arc::clone(&capture.0);
+    let _not_alone = a_second_dispatcher();
     let _recording = tracing::subscriber::set_default(capture);
 
     let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_millis(1));
@@ -4005,6 +4014,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
 
     let lines = CeilingLines::default();
     let (infos, warns) = (Arc::clone(&lines.info), Arc::clone(&lines.warn));
+    let _not_alone = a_second_dispatcher();
     let _recording = tracing::subscriber::set_default(lines);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();

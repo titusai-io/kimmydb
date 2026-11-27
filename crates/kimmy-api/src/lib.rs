@@ -37,6 +37,8 @@ pub mod ratelimit;
 pub mod roles;
 pub mod routes;
 pub mod schema;
+#[cfg(test)]
+mod second_dispatcher;
 pub mod sessions;
 pub mod state;
 pub mod telemetry;

@@ -1895,6 +1895,9 @@ fn logged_while(f: impl FnOnce()) -> String {
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
         .finish();
+    // A second dispatcher while this records, so another thread's first hit
+    // switches no line off (kimmy-api/tests/log_captures.rs).
+    let _not_alone = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     tracing::subscriber::with_default(subscriber, f);
     let bytes = capture.0.lock().unwrap().clone();
     String::from_utf8(bytes).unwrap()
