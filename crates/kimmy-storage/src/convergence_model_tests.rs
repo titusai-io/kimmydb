@@ -60,6 +60,10 @@ use crate::{
     SyncOutcome, WalkScope, tables,
 };
 
+/// A creation is served onward whatever becomes of it: its rows, the schedules this model's cluster runs among them.
+#[path = "creation_relay_tests.rs"]
+mod creation_relay_tests;
+
 const DB: &str = "shop";
 const NAMES: [&str; 2] = ["orders", "items"];
 const LETTERS: [char; 3] = ['A', 'B', 'C'];

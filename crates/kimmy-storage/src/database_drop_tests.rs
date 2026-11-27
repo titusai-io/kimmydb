@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use bson::doc;
 use kimmy_core::{CollectionId, CollectionRef, Hlc, NodeId, OpKind, Stamp};
+use redb::ReadableDatabase;
 
 use crate::{Engine, SnapshotProgress, SyncOutcome};
 
@@ -123,6 +124,48 @@ fn a_creation_the_database_refuses_is_relayed_and_its_tombstone_follows() {
     pull(&c, &a);
     assert!(!holds(&c, "shop", "late"));
     assert_eq!(c.collection_dropped_at(late).unwrap(), expanded, "the tombstone did not follow");
+    assert_eq!(pull(&c, &a), SyncOutcome::default(), "and nothing is left to serve");
+}
+
+/// A creation the COLLECTION's own drop refuses is held and served onward too, for
+/// the same reason (ADR-236): the refusing member's vector names the creation's origin
+/// past it, so a member that pulls only the relay is covered past a creation it never
+/// met. The options row of a name is kept from every creation seen (ADR-272, decision
+/// 16), so that member's row lacked it for good, and no later pull asked for it. The
+/// creator writes again after the creation, so that its position at the relay is past it.
+#[test]
+fn a_creation_the_collections_drop_refuses_is_relayed_and_its_options_row_follows() {
+    let (creator, _creator) = engine();
+    let (dropper, _dropper) = engine();
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    let orders = CollectionId::derive("shop", "orders");
+    creator.create_collection("shop", "orders").unwrap();
+    pull(&dropper, &creator);
+    later();
+    assert!(dropper.drop_collection("shop", "orders").unwrap());
+    let entries = |e: &Engine| {
+        e.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries
+    };
+    let drop_entry = entries(&dropper)
+        .into_iter()
+        .find(|e| e.kind == OpKind::DropCollection && e.stamp.node == dropper.node_id())
+        .expect("the drop's entry");
+    // `a` takes the drop alone, so it holds the tombstone when the creation reaches it
+    a.apply_batch(std::slice::from_ref(&drop_entry)).unwrap();
+    later();
+    creator.create_collection("shop", "other").unwrap();
+    pull(&a, &creator);
+    let options_row = |e: &Engine| {
+        crate::register::base_options_of(&e.db().begin_read().unwrap(), orders).unwrap()
+    };
+    assert!(!holds(&a, "shop", "orders"), "premise: A refused the creation");
+    assert!(options_row(&a).is_some(), "premise: A saw it, and keeps its options row");
+    pull(&c, &a);
+    assert!(holds(&c, "shop", "other"), "premise: C is past the refused creation's position");
+    assert_eq!(pull(&c, &creator), SyncOutcome::default(), "premise: nothing left to ask for");
+    assert_eq!(options_row(&c), options_row(&a), "C never met the refused creation");
+    assert_eq!(c.collection_dropped_at(orders).unwrap(), a.collection_dropped_at(orders).unwrap());
     assert_eq!(pull(&c, &a), SyncOutcome::default(), "and nothing is left to serve");
 }
 
