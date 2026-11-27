@@ -90,6 +90,11 @@ pub fn router_with_limits(
         .layer(axum::middleware::from_fn_with_state(state, count_request))
 }
 
+/// Why a client is refused while the mistaken-restore guard holds a member (ADR-274).
+const GUARD_HOLDS_CLIENTS: &str = "this member's mistaken-restore guard has not passed, so it \
+    serves nothing yet: it does not join its cluster until it knows its node is not running \
+    elsewhere; another member answers";
+
 /// The routes a member that is catching up still answers: the probes, the scrape
 /// and the topology (which marks the member, so a client that routes by it can
 /// avoid it). Everything else, `/v1/version`, `/mcp` and a WebSocket upgrade
@@ -107,7 +112,9 @@ fn halted_exempt(path: &str) -> bool {
 
 /// While the catching-up marker is set and the wait has not run out, answer
 /// `503 catching_up` (retry elsewhere), and on every response while it is set at
-/// all (gated or `unknown`) carry `x-kimmy-catching-up: <state>` (ADR-202).
+/// all (gated or `unknown`) carry `x-kimmy-catching-up: <state>` (ADR-202). A
+/// member its mistaken-restore guard holds is refused the same way, marked or
+/// not, with the state `restore_guard` and no wait that opens it (ADR-274).
 async fn catching_up_gate(
     State(state): State<SharedState>,
     request: axum::extract::Request,
@@ -123,21 +130,26 @@ async fn catching_up_gate(
     let Some(catch_up) = state.catch_up() else { return next.run(request).await };
     let now = std::time::Instant::now();
     let mut response = if catch_up.gated(now) && !catching_up_exempt(request.uri().path()) {
-        ApiError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            crate::error::ErrorCode::CatchingUp,
+        let message = if catch_up.held_by_guard() {
+            GUARD_HOLDS_CLIENTS.to_string()
+        } else {
             format!(
                 "this member is catching up ({}) and serves nothing until it has; another \
                  member answers",
                 catch_up.state_label(now)
-            ),
+            )
+        };
+        ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::error::ErrorCode::CatchingUp,
+            message,
         )
         .into_response()
     } else {
         next.run(request).await
     };
-    if catch_up.is_set()
-        && let Ok(value) = axum::http::HeaderValue::from_str(catch_up.state_label(now))
+    if let Some(label) = catch_up.refusal_label(now)
+        && let Ok(value) = axum::http::HeaderValue::from_str(label)
     {
         response.headers_mut().insert("x-kimmy-catching-up", value);
     }
@@ -746,6 +758,19 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
     // the bound (`unknown`) it is ready, and says why it still is not trusted
     // with owner work (ADR-202).
     let now = std::time::Instant::now();
+    // A member its guard holds (ADR-274) is not ready, marked or not, and says it is the guard.
+    if state.catch_up().is_some_and(|c| c.held_by_guard()) {
+        let mut refusal = ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::error::ErrorCode::CatchingUp,
+            GUARD_HOLDS_CLIENTS.to_string(),
+        );
+        refusal.extra = Some(Box::new(serde_json::Map::from_iter([(
+            "reason".to_string(),
+            json!(kimmy_cluster::catchup::GUARD_HOLD_LABEL),
+        )])));
+        return Err(refusal);
+    }
     let catching_up = state.catch_up().filter(|c| c.is_set());
     if let Some(catch_up) = catching_up.filter(|c| c.gated(now)) {
         let mut refusal = ApiError::new(

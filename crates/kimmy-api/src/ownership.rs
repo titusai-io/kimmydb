@@ -234,7 +234,8 @@ impl Owners {
         self
     }
 
-    /// Also refuse every question while `catch_up`'s marker is set.
+    /// Also refuse every question while `catch_up` holds owner work: its marker
+    /// is set, or the guard holds the member.
     pub fn gated_by(
         mut self,
         catch_up: Option<std::sync::Arc<kimmy_cluster::catchup::CatchUp>>,
@@ -243,10 +244,11 @@ impl Owners {
         self
     }
 
-    /// Whether this member's catching-up marker is set, so that it owns nothing
-    /// because it knows nothing, not because the work belongs to others.
+    /// Whether this member's catching-up marker is set, or its mistaken-restore
+    /// guard holds it (ADR-274), so that it owns nothing because it knows
+    /// nothing, not because the work belongs to others.
     pub(crate) fn gated(&self) -> bool {
-        self.gate.as_ref().is_some_and(|catch_up| catch_up.is_set())
+        self.gate.as_ref().is_some_and(|catch_up| catch_up.holds_owner_work())
     }
 
     /// This member's own block **with the effective yield bits** (ADR-213): a

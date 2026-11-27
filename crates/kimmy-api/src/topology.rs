@@ -123,8 +123,8 @@ pub async fn topology(
         // that is (ADR-202): present only while it holds, so a client that never
         // looks sees the shape it always saw.
         if is_me {
-            if let Some(catch_up) = state.catch_up().filter(|c| c.is_set()) {
-                listed["catchingUp"] = json!(catch_up.state_label(std::time::Instant::now()));
+            if let Some(label) = my_catching_up(&state) {
+                listed["catchingUp"] = json!(label);
             }
         } else if peers_catching_up.iter().any(|n| n.to_string() == node) {
             listed["catchingUp"] = json!(true);
@@ -152,9 +152,9 @@ pub async fn topology(
             "status": "live",
             "self": true,
         }));
-        if let Some(catch_up) = state.catch_up().filter(|c| c.is_set()) {
+        if let Some(label) = my_catching_up(&state) {
             let last = nodes.len() - 1;
-            nodes[last]["catchingUp"] = json!(catch_up.state_label(std::time::Instant::now()));
+            nodes[last]["catchingUp"] = json!(label);
         }
         let last = nodes.len() - 1;
         add_class_view(&state, &mut nodes[last], Some(me), true);
@@ -321,6 +321,12 @@ fn entry(
 
 fn contains(live: &std::collections::BTreeSet<kimmy_core::NodeId>, node: &str) -> bool {
     live.iter().any(|n| n.to_string() == node)
+}
+
+/// What this node's own entry says of its catching up: `restore_guard` while its guard holds it
+/// (ADR-274), else its marker's state, and nothing where neither does (ADR-202).
+fn my_catching_up(state: &SharedState) -> Option<&'static str> {
+    state.catch_up()?.refusal_label(std::time::Instant::now())
 }
 
 /// Ensure the registry collection exists, and hand back its metadata.

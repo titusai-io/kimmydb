@@ -66,6 +66,10 @@ pub const MAX_SEEN: usize = 1_024;
 /// `unknown`.
 pub const STATES: [&str; 5] = ["none", "seeded_empty", "restored", "snapshot", "unknown"];
 
+/// The state a refusal names while the mistaken-restore guard holds a member (ADR-274). Not one of
+/// [`STATES`]: the guard's hold is not a state of the marker.
+pub const GUARD_HOLD_LABEL: &str = "restore_guard";
+
 /// The index of `state` in [`STATES`]. Panics on a name that is not one: it is
 /// asked with literals, and a typo should fail at once and not read as `none`.
 pub fn slot_of(state: &str) -> usize {
@@ -258,6 +262,10 @@ pub struct CatchUp {
     state: Mutex<State>,
     /// This run created the store, and wrote a `seeded_empty` marker for it.
     created_this_run: AtomicBool,
+    /// The mistaken-restore guard's hold (ADR-274): taken at a guarded start, before anything
+    /// reads this state, and let go when the guard passes. Apart from the marker: it holds with
+    /// none set, and neither the wait nor a clear lets it go. A halted host keeps it.
+    guard_hold: AtomicBool,
     /// The owed latch (ADR-212): the marker's clear rule held while members still
     /// owed the replay past their hold, so the member serves as `unknown`.
     owed_open: AtomicBool,
@@ -458,6 +466,7 @@ impl CatchUp {
             replay: Mutex::new(Replay::default()),
             state: Mutex::new(State { marker: None, reached: BTreeMap::new(), warned: None }),
             created_this_run: AtomicBool::new(false),
+            guard_hold: AtomicBool::new(false),
             owed_open: AtomicBool::new(false),
             snapshot_marked: AtomicBool::new(false),
         });
@@ -554,25 +563,41 @@ impl CatchUp {
     /// Hold this member for its mistaken-restore guard (ADR-274): until
     /// [`Self::release_guard_hold`] it refuses clients and does no owner work, whatever the marker
     /// says and however long the wait has run.
-    ///
-    /// **Scaffold of the tests commit**: holds nothing. The code commit replaces it.
-    pub fn hold_for_guard(&self) {}
-
-    /// The guard has passed: what [`Self::hold_for_guard`] held is let go.
-    ///
-    /// **Scaffold of the tests commit**.
-    pub fn release_guard_hold(&self) {}
-
-    /// Whether the guard's hold is on.
-    ///
-    /// **Scaffold of the tests commit**: never.
-    pub fn held_by_guard(&self) -> bool {
-        false
+    pub fn hold_for_guard(&self) {
+        self.guard_hold.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Whether client requests are refused: set, and the bound has not run out.
+    /// The guard has passed: what [`Self::hold_for_guard`] held is let go. The marker's own
+    /// answer is what is left.
+    pub fn release_guard_hold(&self) {
+        self.guard_hold.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the guard's hold is on.
+    pub fn held_by_guard(&self) -> bool {
+        self.guard_hold.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether this member does no owner work: the guard holds it, or its marker is set, the wait
+    /// run out or not (ADR-202).
+    pub fn holds_owner_work(&self) -> bool {
+        self.held_by_guard() || self.is_set()
+    }
+
+    /// Whether client requests are refused: the guard holds the member, or the marker is set and
+    /// the bound has not run out.
     pub fn gated(&self, now: Instant) -> bool {
-        self.is_set() && !self.unknown(now)
+        self.held_by_guard() || (self.is_set() && !self.unknown(now))
+    }
+
+    /// What a refusal, the response header and the topology call this member's state at `now`:
+    /// [`GUARD_HOLD_LABEL`] while the guard holds it, else the marker's [`Self::state_label`], and
+    /// nothing for a member that is neither held nor marked.
+    pub fn refusal_label(&self, now: Instant) -> Option<&'static str> {
+        if self.held_by_guard() {
+            return Some(GUARD_HOLD_LABEL);
+        }
+        self.is_set().then(|| self.state_label(now))
     }
 
     /// Why the member serves as `unknown` at `now`, when it does.

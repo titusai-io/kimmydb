@@ -887,6 +887,15 @@ async fn start_and_serve(
             );
         }
     };
+    // The mistaken-restore guard (ADR-274) runs on an epoch that has completed no handshake and
+    // did not found its store (a restore's, a rewind's), where there is a membership to ask. Its
+    // hold is taken here, as soon as the store can say so: before the catching-up state reaches
+    // the API and before any task that does owner work exists. Until the guard passes the member
+    // refuses its clients and does no owner work. `spawn_cluster` reads the decision from the
+    // hold, so there is one.
+    if config.cluster.enabled && config.cluster.membership && engine.needs_restore_guard() {
+        catch_up.hold_for_guard();
+    }
     // The replay of the member's own origin is armed before this run writes
     // anything: the position the store has now is the one it can have lost writes
     // above (ADR-202).
@@ -2753,6 +2762,7 @@ fn spawn_guard(
     local: std::net::SocketAddr,
     config: &Config,
     secret: String,
+    hold: Arc<kimmy_cluster::catchup::CatchUp>,
     gate: tokio::sync::watch::Sender<Option<bool>>,
 ) {
     let own_addresses = vec![local, advertised(local)];
@@ -2761,7 +2771,7 @@ fn spawn_guard(
         kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind);
     let seeds = config.cluster.seeds.clone();
     // UNSUPERVISED: a one-shot that ends with its verdict and then the write of the bit. A panic in
-    // it leaves the gate closed, which a waiting host shows by serving nothing of the cluster.
+    // it leaves the gate closed and the hold on, which a waiting host shows by serving nothing.
     tokio::spawn(async move {
         let replace =
             kimmy_cluster::containment::read_marker_file(&data_dir).ok().and_then(|f| f.replace);
@@ -2784,6 +2794,7 @@ fn spawn_guard(
                 // Said before anything the guard holds back is let go, so whatever a log or a
                 // client shows ahead of this line was done while the guard had not passed.
                 info!("the mistaken-restore guard passed; this host may join its cluster");
+                hold.release_guard_hold();
                 let _ = gate.send(Some(true));
             }
             kimmy_cluster::guard::GuardVerdict::LiveHost(address) => {
@@ -2876,13 +2887,13 @@ async fn spawn_cluster(
             Some(evaluator),
         ));
     }
-    // The mistaken-restore guard (ADR-274): an epoch that has completed no handshake and did not
-    // found its store (a restore's, a rewind's) neither accepts nor dials until the guard has
-    // passed. The listener is bound (a peer that connects waits, and completes no handshake), the
-    // serve and replication tasks wait on this gate, and SWIM runs meanwhile, which is where the
-    // guard reads its list. A host that has met a peer or founded its store, or has no membership
-    // to ask, passes at once.
-    let guarded = config.cluster.membership && engine.needs_restore_guard();
+    // A member the mistaken-restore guard holds (ADR-274; the start takes the hold) neither
+    // accepts nor dials until the guard has passed. The listener is bound (a peer that connects
+    // waits, and completes no handshake), the serve and replication tasks wait on this gate, and
+    // SWIM runs meanwhile, which is where the guard reads its list. Any other member passes at
+    // once.
+    let hold = state.catch_up().filter(|catch_up| catch_up.held_by_guard()).cloned();
+    let guarded = hold.is_some();
     let (gate_tx, gate_rx) =
         tokio::sync::watch::channel::<Option<bool>>((!guarded).then_some(true));
     let serve = kimmy_cluster::serve_with(
@@ -2944,8 +2955,8 @@ async fn spawn_cluster(
         ));
         members = Some(live);
         announce = Some(tx);
-        if guarded && let Some(live) = members.clone() {
-            spawn_guard(Arc::clone(&engine), live, local, config, secret.clone(), gate_tx);
+        if let (Some(hold), Some(live)) = (hold, members.clone()) {
+            spawn_guard(Arc::clone(&engine), live, local, config, secret.clone(), hold, gate_tx);
         }
     } else {
         warn!("SWIM membership is disabled; peers come from discovery alone");
