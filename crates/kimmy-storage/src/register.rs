@@ -1943,6 +1943,18 @@ pub(crate) fn carry_rows(
     Ok((rows, used, None))
 }
 
+#[cfg(test)]
+thread_local! {
+    static CARRY_SEEDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the carry's seed of a named group ([`seed_above_the_grant`]) has put a drop in the register on this thread, whether or
+/// not its transaction was committed: for a test that a page which fails takes its seed with it, which must show that there was one.
+#[cfg(test)]
+pub(crate) fn carry_seeds_for_tests() -> usize {
+    CARRY_SEEDS.with(std::cell::Cell::get)
+}
+
 /// Seed the name's drop from the receiver's own tombstone for the identity, but only when that tombstone is ABOVE the grant for its
 /// origin (Q6.6, unit C2b; D1): one the sender could not have judged. A tombstone at or below the grant is the sender's to have used, and
 /// seeding from it would put in this register a drop the sender's register does not hold.
@@ -1962,7 +1974,10 @@ fn seed_above_the_grant(
     };
     match own {
         Some(stamp) if stamp.hlc > granted.get(stamp.origin()) => {
-            seed_from_the_tombstone(txn, db, logical, None, SeedAsk::NoStage)
+            let wrote = seed_from_the_tombstone(txn, db, logical, None, SeedAsk::NoStage)?;
+            #[cfg(test)]
+            CARRY_SEEDS.with(|seeds| seeds.set(seeds.get() + usize::from(wrote)));
+            Ok(wrote)
         }
         _ => Ok(false),
     }

@@ -906,6 +906,113 @@ fn a_binding_above_its_stages_deadline_fails_the_page() {
     assert!(the_events_of_orders(&j).is_empty(), "and nothing of the register was applied");
 }
 
+/// The seed the carry writes goes with a page that fails (decision 6). A member whose identity is gone, its own tombstone above the
+/// grant, is seeded before any row of the name is judged, and in the page's own transaction: a binding the door then refuses leaves no
+/// drop behind. Only the carry's seed may write here, so the drop comes between two things. AFTER the sender's `orders` was made: with
+/// an `orders` made above the drop, the page's rows make the name again before the carry is read, and the seed meets a standing identity
+/// and writes nothing. BEFORE the stage is created: for a stage created below the drop, the creation the page defines seeds the drop
+/// itself, in a transaction of its own, which is committed whatever the carry comes to.
+fn a_page_failed_for_a_binding_takes_its_seed_with_it(refused: fn(&Swap) -> Stamp) {
+    let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+    let (sender, ds) = with_orders();
+    let senders_orders = sender.get_collection(DB, "orders").unwrap().created;
+    tick();
+    let (j, _dj) = engine();
+    j.create_collection(DB, "orders").unwrap();
+    assert!(j.drop_collection(DB, "orders").unwrap(), "premise: the receiver dropped the name");
+    j.finish_purges_now().unwrap();
+    let identity = || {
+        (
+            j.collection_dropped_at(CollectionId::derive(DB, "orders")).unwrap(),
+            j.get_collection(DB, "orders").is_ok(),
+            served_by(&j),
+        )
+    };
+    let before = identity();
+    let tombstone = before.0.expect("premise: the receiver holds the identity's tombstone");
+    assert!(!before.1, "premise: it holds no collection of the name");
+    assert!(
+        senders_orders < tombstone.hlc,
+        "premise: the sender's `orders` is older than the drop"
+    );
+    tick();
+    // the swap of [`swap`], over the sender made above: the stage is created now, above the drop
+    let (a, da) = engine();
+    let deadline = Hlc::new(physical_now_ms() + 60_000, 0);
+    a.create_stage(DB, STAGE1, MergePolicy::Document, deadline).unwrap();
+    let creation = creation_of(&a, STAGE1);
+    assert!(tombstone.hlc < creation.stamp.hlc, "premise: the stage is created above the drop");
+    let bind = bind_of(&a, STAGE1, creation.stamp.hlc.wall_ms.max(physical_now_ms()) + 1);
+    sender.apply_batch(std::slice::from_ref(&creation)).unwrap();
+    window(&sender, std::slice::from_ref(&bind));
+    assert_eq!(served_by(&sender), Ok(STAGE1.to_string()), "premise: the sender flipped");
+    let s = Swap { a, sender, creation, bind, _dirs: vec![da, ds] };
+
+    let stamp = refused(&s);
+    let granted = std::cell::Cell::new(None);
+    let seeds_before = crate::register::carry_seeds_for_tests();
+    let (progress, result) = pull_patched(&j, &s.sender, &|page| {
+        page.versions.observe(stamp);
+        if let Some(carry) = &mut page.register {
+            carry.events.push(an_event_row(&stamp, &bind_event()));
+        }
+        granted.set(Some(page.versions.get(tombstone.origin())));
+    });
+    let error = result.expect_err("the refused binding fails the page").to_string();
+    assert!(
+        error.contains(
+            "a binding from another origin than its stage's creation or above its stage's deadline"
+        ),
+        "and it is the binding that fails it: {error}"
+    );
+    assert!(!progress.is_complete(), "the progress did not move to complete");
+    assert!(
+        granted.get().is_some_and(|granted| tombstone.hlc > granted),
+        "premise: the tombstone is above the grant"
+    );
+    // the carry's seed asks with no stage, so it writes only where the identity is gone: it did, in the page that then failed
+    assert_eq!(
+        crate::register::carry_seeds_for_tests() - seeds_before,
+        1,
+        "premise: the carry's seed wrote the drop in the page that failed"
+    );
+    assert_eq!(the_events_of_orders(&j), Vec::new(), "the failed page left no register row");
+    {
+        use redb::ReadableDatabase;
+        let txn = j.db().begin_read().unwrap();
+        let parked = crate::register::parked_read(&txn, DB, "orders").unwrap();
+        assert!(parked.events().is_empty(), "nor a parked one");
+    }
+    assert_eq!(identity(), before, "and the identity is as it was");
+
+    // the same member then takes the page as the sender made it: the seed the failed page took back is one a page that applies keeps
+    pull(&j, &s.sender);
+    // storage's rule today: the register function answers the binding alone here (no stage was created below the drop), and F2 flips this
+    assert_eq!(
+        the_events_of_orders(&j),
+        vec![(tombstone, kimmy_core::RegisterEvent::LogicalDrop), (s.bind.stamp, bind_event())],
+        "the page without the refused binding seeds the drop"
+    );
+}
+
+#[test]
+fn a_page_failed_for_a_binding_above_the_deadline_leaves_no_seed() {
+    a_page_failed_for_a_binding_takes_its_seed_with_it(|s| {
+        let stage = s.sender.get_collection(DB, STAGE1).unwrap().stage.unwrap();
+        let late = Hlc::new(stage.info.deadline.wall_ms + 1, 0);
+        Stamp::new(late, s.a.node_id(), s.a.epoch())
+    });
+}
+
+#[test]
+fn a_page_failed_for_a_binding_from_another_origin_leaves_no_seed() {
+    a_page_failed_for_a_binding_takes_its_seed_with_it(|s| {
+        let (other, _dir) = engine();
+        let inside = Hlc::new(s.creation.stamp.hlc.wall_ms + 1, 0);
+        Stamp::new(inside, other.node_id(), other.epoch())
+    });
+}
+
 #[test]
 fn a_join_buries_what_the_binding_binds_out_and_counts_no_swap() {
     let s = swap(&[]);
