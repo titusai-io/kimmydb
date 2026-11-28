@@ -63,8 +63,9 @@ pub const MAX_SEEN: usize = 1_024;
 
 /// The states `kimmy_catching_up{reason}` is one-hot over, in the order it
 /// renders them: the reasons in [`CatchUpReason::ALL`] order between `none` and
-/// `unknown`.
-pub const STATES: [&str; 5] = ["none", "seeded_empty", "restored", "snapshot", "unknown"];
+/// `unknown`, then the guard's hold ([`GUARD_HOLD_LABEL`]) and the halt ([`HALTED_LABEL`]).
+pub const STATES: [&str; 7] =
+    ["none", "seeded_empty", "restored", "snapshot", "unknown", GUARD_HOLD_LABEL, HALTED_LABEL];
 
 /// What the last round of the guard's that decided nothing was waiting on (ADR-274).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,9 +80,14 @@ pub struct GuardWaits {
     pub silent_named: Vec<std::net::SocketAddr>,
 }
 
-/// The state a refusal names while the mistaken-restore guard holds a member (ADR-274). Not one of
-/// [`STATES`]: the guard's hold is not a state of the marker.
+/// The state of a member its mistaken-restore guard holds (ADR-274), as a refusal and the gauge
+/// name it. It is no state of the marker: it holds whether or not there is one, and covers it.
 pub const GUARD_HOLD_LABEL: &str = "restore_guard";
+
+/// The state the gauge gives a halted host (ADR-274), which covers every other, as its readiness
+/// does. The halt is the store's to say, so whoever reads the gauge asks the store first and
+/// [`CatchUp::state_slot`] never answers it.
+pub const HALTED_LABEL: &str = "halted";
 
 /// The index of `state` in [`STATES`]. Panics on a name that is not one: it is
 /// asked with literals, and a typo should fail at once and not read as `none`.
@@ -588,6 +594,19 @@ impl CatchUp {
     pub fn release_guard_hold(&self) {
         self.guard_hold.store(false, std::sync::atomic::Ordering::SeqCst);
         *self.guard_waits.lock() = None;
+        // Wakes what waits for it ([`Self::guard_released`]).
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    /// Wait until the guard's hold is off: at once where it is not on.
+    pub async fn guard_released(&self) {
+        // Subscribed before the hold is read, so that a release between the two is seen.
+        let mut changed = self.changes.subscribe();
+        while self.held_by_guard() {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Whether the guard's hold is on.
@@ -667,17 +686,20 @@ impl CatchUp {
     }
 
     /// One-hot label for `kimmy_catching_up{reason}`: `none`, `seeded_empty`,
-    /// `restored`, `snapshot` or `unknown`.
+    /// `restored`, `snapshot` or `unknown` by the marker, and [`GUARD_HOLD_LABEL`] while the
+    /// guard holds the member, whatever its marker says.
     pub fn state_label(&self, now: Instant) -> &'static str {
         STATES[self.state_slot(now)]
     }
 
     /// The index of [`Self::state_label`] in [`STATES`].
     pub fn state_slot(&self, now: Instant) -> usize {
-        if !self.is_set() {
+        if self.held_by_guard() {
+            slot_of(GUARD_HOLD_LABEL)
+        } else if !self.is_set() {
             0
         } else if self.unknown(now) {
-            STATES.len() - 1
+            slot_of("unknown")
         } else {
             self.reason().map_or(0, |reason| 1 + reason as usize)
         }

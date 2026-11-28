@@ -1481,14 +1481,14 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.catching_up.none",
             "{state}",
-            "This member is not catching up. One of five, exactly one is 1.",
+            "This member is not catching up. One of seven, exactly one is 1.",
             |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("none"))
         );
         observe!(
             u64_observable_gauge,
             "kimmy.catching_up.seeded_empty",
             "{state}",
-            "This member created its store in a cluster it has seeds for, and has not yet caught up. One of five, exactly one is 1.",
+            "This member created its store in a cluster it has seeds for, and has not yet caught up. One of seven, exactly one is 1.",
             |s| u64::from(
                 s.ownership.catching_up == kimmy_cluster::catchup::slot_of("seeded_empty")
             )
@@ -1497,22 +1497,38 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.catching_up.restored",
             "{state}",
-            "This member was restored, or writes it made are missing, and has not yet caught up. One of five, exactly one is 1.",
+            "This member was restored, or writes it made are missing, and has not yet caught up. One of seven, exactly one is 1.",
             |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("restored"))
         );
         observe!(
             u64_observable_gauge,
             "kimmy.catching_up.snapshot",
             "{state}",
-            "A peer's oplog no longer covers this member, and a whole-database snapshot is under way. One of five, exactly one is 1.",
+            "A peer's oplog no longer covers this member, and a whole-database snapshot is under way. One of seven, exactly one is 1.",
             |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("snapshot"))
         );
         observe!(
             u64_observable_gauge,
             "kimmy.catching_up.unknown",
             "{state}",
-            "The catching-up marker is set and either no peer that could say has been reached within the wait, or a member listed live has not answered the replay of this member's own origin past it: serving, with owner work off. One of five, exactly one is 1.",
+            "The catching-up marker is set and either no peer that could say has been reached within the wait, or a member listed live has not answered the replay of this member's own origin past it: serving, with owner work off. One of seven, exactly one is 1.",
             |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("unknown"))
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.restore_guard",
+            "{state}",
+            "This member's mistaken-restore guard holds it, marked or not: a restore not yet let in, which serves no client and does no owner work. One of seven, exactly one is 1.",
+            |s| u64::from(
+                s.ownership.catching_up == kimmy_cluster::catchup::slot_of("restore_guard")
+            )
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.halted",
+            "{state}",
+            "This host is halted (ADR-274) and serves only its probes and its scrape until it is recovered; it covers every other state. One of seven, exactly one is 1.",
+            |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("halted"))
         );
         observe!(
             u64_observable_counter,
@@ -3448,7 +3464,7 @@ mod tests {
 
     #[test]
     fn each_catching_up_instrument_reads_the_slot_of_its_own_state() {
-        // The five instruments of `kimmy_catching_up{reason}` each read one slot
+        // The seven instruments of `kimmy_catching_up{reason}` each read one slot
         // of the one-hot reading. Which slot is written beside the name, so a
         // swap or a copy would publish one state under another's name and pass
         // the coverage test, which reads names only.

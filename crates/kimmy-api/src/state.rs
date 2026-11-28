@@ -339,9 +339,14 @@ impl AppState {
                     self.ttl_owners().ttl_view(&self.engine.all_collections()?).counts;
                 // Counted as blocks arrive, whether or not membership is up.
                 reading.undecodable = kimmy_cluster::facts_undecodable_total();
-                // One-hot over the marker's state; `none` on a node with none.
-                reading.catching_up =
-                    self.catch_up().map_or(0, |c| c.state_slot(std::time::Instant::now()));
+                // One-hot over this member's state: a halt before anything else, as readiness
+                // says it (ADR-274), then the guard's hold and the marker's state; `none` on a
+                // node with none of them.
+                reading.catching_up = if self.engine.halted().is_some() {
+                    kimmy_cluster::catchup::slot_of(kimmy_cluster::catchup::HALTED_LABEL)
+                } else {
+                    self.catch_up().map_or(0, |c| c.state_slot(std::time::Instant::now()))
+                };
                 // What the yield evaluator last decided (ADR-213).
                 if let Some(handle) = self.metrics.yield_handle() {
                     reading.evaluator = handle.reading();

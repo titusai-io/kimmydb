@@ -55,10 +55,14 @@ pub enum Command {
         /// document's earlier value has already been collected.
         #[arg(long)]
         until: Option<u64>,
-        /// Authorize this restore to replace a host of the same node that is still running
-        /// (D13 containment): the mistaken-restore guard otherwise halts the restored host when
-        /// it finds its node live at another address. The flag names the epoch this restore mints
-        /// and is honoured only for a store on that epoch.
+        /// Say that this copy is the node (D13 containment, ADR-274).
+        ///
+        /// A restored node otherwise waits at its start until members' answers let it join, and
+        /// halts itself if a running host of its node answers. Use this to replace a node that is
+        /// still running (the old one is told and halts), to restore a node when no other member
+        /// exists or can be reached, and on one node when restoring every member of a cluster. It
+        /// does not say that the copy is current. The flag names the epoch this restore mints and
+        /// is honoured only for a store on that epoch.
         #[arg(long)]
         replace: bool,
     },

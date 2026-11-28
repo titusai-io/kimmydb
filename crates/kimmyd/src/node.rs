@@ -3499,12 +3499,15 @@ fn spawn_drop_purger(
 
 /// Start the retention collector, unless it is disabled.
 ///
-/// **Scaffold of the tests commit**: the catching-up state is not looked at.
+/// No history is removed from a member its mistaken-restore guard holds (ADR-274): no pass runs
+/// while the hold is on, and the first one after it is a whole interval away, which is what a
+/// restore that has just been let in has to catch up and send what its webhooks are owed before
+/// a pass can remove it.
 fn spawn_collector(
     engine: Arc<Engine>,
     config: &Config,
     shutdown: kimmy_task::Shutdown,
-    _catch_up: Arc<kimmy_cluster::catchup::CatchUp>,
+    catch_up: Arc<kimmy_cluster::catchup::CatchUp>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if config.storage.gc_interval_secs == 0 {
         warn!("retention collection is disabled; the oplog and tombstones will grow without bound");
@@ -3537,8 +3540,13 @@ fn spawn_collector(
         // off. A stop ends the backfill; an error is logged and leaves
         // `/violations` on the oplog walk until the next start.
         let mut backfilling = !engine.violations_table_ready();
-        let mut next_pass = tokio::time::Instant::now() + interval;
+        // When the next pass is due: never while the guard holds this member.
+        let mut next_pass =
+            (!catch_up.held_by_guard()).then(|| tokio::time::Instant::now() + interval);
         loop {
+            if next_pass.is_none() && !catch_up.held_by_guard() {
+                next_pass = Some(tokio::time::Instant::now() + interval);
+            }
             if backfilling {
                 let step = kimmy_storage::blocking(|| {
                     engine.violations_backfill_step(kimmy_storage::ExamineBudget::serve())
@@ -3554,10 +3562,9 @@ fn spawn_collector(
                     Ok(_) => {
                         // A pause between steps, ended early by a pass coming
                         // due, so the pass is not delayed by it.
-                        tokio::time::sleep_until(
-                            next_pass.min(tokio::time::Instant::now() + Duration::from_millis(50)),
-                        )
-                        .await;
+                        let pause = tokio::time::Instant::now() + Duration::from_millis(50);
+                        tokio::time::sleep_until(next_pass.map_or(pause, |due| due.min(pause)))
+                            .await;
                     }
                     Err(kimmy_storage::StorageError::Stopping(reason)) => {
                         debug!(%reason, "the violations backfill ended: this node is shutting down");
@@ -3572,11 +3579,15 @@ fn spawn_collector(
                         backfilling = false;
                     }
                 }
-                if tokio::time::Instant::now() < next_pass {
+                if next_pass.is_none_or(|due| tokio::time::Instant::now() < due) {
                     continue;
                 }
             } else {
-                tokio::time::sleep_until(next_pass).await;
+                let Some(due) = next_pass else {
+                    catch_up.guard_released().await;
+                    continue;
+                };
+                tokio::time::sleep_until(due).await;
             }
             let started = std::time::Instant::now();
             // A pass reads whole tables; on a cold cache that is minutes of
@@ -3609,7 +3620,7 @@ fn spawn_collector(
                      runs a full interval after this one finished"
                 );
             }
-            next_pass = tokio::time::Instant::now() + interval;
+            next_pass = Some(tokio::time::Instant::now() + interval);
         }
     }))
 }

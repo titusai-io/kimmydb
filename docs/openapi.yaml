@@ -301,6 +301,9 @@ paths:
             (`error: catching_up`, `retry: elsewhere`, and `reason`, the state; its
             catching-up marker is set, see `x-kimmy-catching-up`), with
             `owed_members` while members owe it the replay of its own origin.
+            A restore that its mistaken-restore guard holds (ADR-274) answers the
+            same, with `reason: restore_guard` and, once a round of its questions
+            has decided nothing, `waiting_on`.
           content:
             application/json:
               schema:
@@ -317,9 +320,32 @@ paths:
                       total: { type: integer }
                       reason:
                         type: string
-                        enum: [seeded_empty, restored, snapshot]
+                        enum: [seeded_empty, restored, snapshot, restore_guard]
                         description: |
                           The catching-up state, with `error: catching_up`.
+                          `restore_guard`: the mistaken-restore guard holds the
+                          member, whatever its marker says.
+                      waiting_on:
+                        type: object
+                        required: [asked, undecided, uncounted, silent_named]
+                        description: |
+                          With `reason: restore_guard`, once a round has decided
+                          nothing: what the last such round waits on.
+                        properties:
+                          asked:
+                            type: integer
+                            description: The addresses that round asked.
+                          undecided:
+                            type: integer
+                            description: Answers from members that are undecided themselves.
+                          uncounted:
+                            type: integer
+                            description: Answers from open members that do not count yet.
+                          silent_named:
+                            type: array
+                            items: { type: string }
+                            description: |
+                              Addresses listed for this node that gave no answer.
                       owed_members:
                         type: array
                         items: { type: string }
@@ -3761,7 +3787,7 @@ components:
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
         | `halted` | 503 | elsewhere | This host was told that a newer epoch of its node exists, and halted: it answers only `/healthz`, `/readyz` and `/metrics`, and every other route is refused with the reason and the recovery. Nothing was read or written. Send it to another member |
-        | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
+        | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set), or it is a restore its mistaken-restore guard holds, and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up (a held restore: until its guard lets it in, after which it is refused as any marked member is, or, if it is alone, serves): nothing was read or written. Send it to another member |
       enum:
         - bad_request
         - payload_too_large
@@ -4036,13 +4062,14 @@ components:
             Present only while the member is catching up (ADR-202). On the
             answering node's own entry it is the state, a string:
             `seeded_empty`, `restored` or `snapshot` while it refuses
-            requests, `unknown` once `cluster.catch_up_wait_secs` has run out
+            requests, `restore_guard` while its mistaken-restore guard holds
+            it, `unknown` once `cluster.catch_up_wait_secs` has run out
             with no peer reached that could say. On a peer's entry it is `true`
             when that peer's last block says it is catching up. A client that
             routes by topology should prefer a node without it.
           oneOf:
             - type: string
-              enum: [seeded_empty, restored, snapshot, unknown]
+              enum: [seeded_empty, restored, snapshot, unknown, restore_guard]
             - type: boolean
         yielding:
           type: array

@@ -92,8 +92,8 @@ pub fn router_with_limits(
 
 /// Why a client is refused while the mistaken-restore guard holds a member (ADR-274).
 const GUARD_HOLDS_CLIENTS: &str = "this member's mistaken-restore guard has not passed, so it \
-    serves nothing yet: it does not join its cluster until it knows its node is not running \
-    elsewhere; another member answers";
+    serves nothing yet: it does not join its cluster until the answers to its guard let it in, \
+    or it was restored with --replace; another member answers";
 
 /// The routes a member that is catching up still answers: the probes, the scrape
 /// and the topology (which marks the member, so a client that routes by it can

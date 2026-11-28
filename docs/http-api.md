@@ -1063,6 +1063,17 @@ proves this member lost writes. While a member is gated and members owe it the r
 the `503` carries `owed_members` beside `reason`. `GET /v1/topology` marks the member (`catchingUp` with the
 state) and a peer that says it is catching up (`catchingUp: true`).
 
+**A restore that its mistaken-restore guard has not let in is not ready either**
+([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)):
+while its mistaken-restore guard holds it, marked or not, `/readyz` is `503` in the error
+envelope (`error: catching_up`, `retry: elsewhere`, `reason: restore_guard`), every route
+but `/healthz`, `/readyz`, `/metrics` and `/v1/topology` answers `503 catching_up`, each
+response carries `x-kimmy-catching-up: restore_guard`, and `/v1/topology` marks the member
+with that state. Once a round of its questions has decided nothing, `/readyz` also carries
+`waiting_on`: `asked`, `undecided` and `uncounted` (numbers) and `silent_named` (the
+addresses listed for its node that do not answer). No passage of time ends the hold
+([Operations](operations.md#two-hosts-of-one-node-and-the-host-that-halts)).
+
 **A host that was told a newer epoch of its node exists is halted, and not ready**
 ([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)):
 `/readyz` is `503` in the error envelope (`error: halted`, `retry: elsewhere`, and
@@ -1576,7 +1587,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
 | 503 | `halted` | elsewhere | This host was told that a newer epoch of its node exists, and halted ([ADR-274](decisions.md#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)): it answers only `/healthz`, `/readyz` and `/metrics`, and every other route, `/v1/topology` included, is refused with the reason and the recovery. Nothing was read or written. Send it to another member |
-| 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
+| 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set), or it is a restore its mistaken-restore guard holds (`restore_guard`), and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up (a held restore: until its guard lets it in, after which it is refused as any marked member is, or, if it is alone, serves): nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

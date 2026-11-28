@@ -168,8 +168,8 @@ fn main() -> Result<()> {
 
             // A restored store is behind whatever its cluster has written since
             // the backup, and writes this node made after it are gone: it is
-            // marked until it has caught up (ADR-202). A start with no peers to
-            // catch up from discards the file.
+            // marked until it has caught up (ADR-202). What a start and the guard's pass
+            // do with the file is the daemon's (ADR-274).
             kimmy_cluster::catchup::write_marker(
                 &config.storage.data_dir,
                 kimmy_cluster::CatchUpReason::Restored,
@@ -197,8 +197,15 @@ fn main() -> Result<()> {
                 .context("writing the replay floor")?;
             eprintln!(
                 "note: this node is marked as catching up (kimmy.catching-up in the data \
-                 directory): with peers it refuses requests until it holds what they hold, and \
-                 a node with none discards the mark at its start."
+                 directory). With clustering and membership on, its start also waits for the \
+                 mistaken-restore guard, serving nothing until members' answers let it in, or, \
+                 if this restore was given --replace, after one round of asking; a node whose \
+                 seeds name no other member stays not ready unless --replace was given or a \
+                 member that counts dials it. Once in, it refuses requests until it holds what \
+                 its peers hold; only a --replace restore that hears of no other member, and \
+                 whose every seed answers as this node, discards the mark then. With clustering \
+                 off, or membership off and no other member in its seeds, the mark is discarded \
+                 at the start."
             );
 
             // A restored directory has a database and no run behind it. The
