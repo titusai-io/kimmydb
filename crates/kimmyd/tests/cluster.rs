@@ -6080,7 +6080,8 @@ async fn a_restore_of_a_live_node_halts_itself_by_the_guard() {
 /// by the ordinary containment, halts. A halted host's background work stops, so it does not try
 /// a write on every tick and log its refusal: the expiry task, which has documents falling due that
 /// it cannot expire, logs `expiry pass failed for this index` on every tick of a host that goes on
-/// running it. The halt itself is logged once.
+/// running it. The halt itself is logged once: one line from the engine, and one from the daemon
+/// as it stops the background work.
 #[tokio::test]
 #[ignore = "boots a real two-node cluster; run with --ignored"]
 async fn a_restore_with_replace_takes_the_node_over_and_the_old_host_halts_quietly() {
@@ -6091,20 +6092,27 @@ async fn a_restore_with_replace_takes_the_node_over_and_the_old_host_halts_quiet
 
     // The halted host's log is read after the halt has settled and again some ticks later (expiry
     // runs every second here, and a document falls due every second): it has not grown with
-    // refusals.
+    // refusals. A refusal carries the halt's words too, so every line with them is counted here,
+    // whoever logs it: none of them comes again.
     let noise = |node: &Node| node.log().matches("expiry pass failed for this index").count();
-    let halts = |node: &Node| node.log().matches("this host is halted").count();
+    let mentions = |node: &Node| node.log().matches("this host is halted").count();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let (first, first_halts) = (noise(&a), halts(&a));
+    let (first, first_mentions) = (noise(&a), mentions(&a));
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(noise(&a), first, "no refusal is logged per tick:\n{}", a.log());
     assert!(first <= 2, "at most a tick that raced the halt: {first}\n{}", a.log());
-    assert_eq!(halts(&a), first_halts, "the halt is not logged again:\n{}", a.log());
-    assert!(
-        first_halts <= 3,
-        "the halt is logged once, not repeatedly: {first_halts}\n{}",
-        a.log()
-    );
+    assert_eq!(mentions(&a), first_mentions, "the halt is not logged again:\n{}", a.log());
+
+    // The halt's own lines, each named by what logs it. How many refusals share their words is not
+    // fixed: this test's own readiness check gets one, and a tick that raced the halt adds one.
+    let plain = strip_ansi(&a.log());
+    for own in [
+        "kimmy_storage::engine: this host is halted epoch=",
+        "kimmyd::node: this host is halted: its background work stops",
+    ] {
+        let logged = plain.matches(own).count();
+        assert_eq!(logged, 1, "the halt is logged once, not repeatedly: {own}\n{}", a.log());
+    }
 }
 
 /// The seconds from one time of day to another, less than half a day apart: negative where the
