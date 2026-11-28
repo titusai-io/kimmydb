@@ -2552,6 +2552,14 @@ pub(crate) enum Via {
 /// body both the replay this member asks for and the one a peer serves it share
 /// (ADR-212's addendum), so there is one behaviour to prove.
 ///
+/// **Every served entry of this member's own that it has no oplog row for is applied;
+/// only some prove that it lost them.** Its own retention removes rows too, and an ask
+/// whose position was cut before a pass, or one that reaches below what an earlier pass
+/// removed, is served such entries. One proves a loss only where it lies above what
+/// retention has removed of its origin ([`Engine::oplog_collected`]). That record is
+/// read **after** the lookups: a pass removes rows and raises it in one transaction and
+/// it only rises, so it covers every row a lookup missed because a pass had taken it.
+///
 /// **It finishes only on `exhausted`.** An empty page that is not the end (a
 /// walk cut by a budget, a batch cut to fit a frame) says nothing about what
 /// lies beyond it, so it never answers the replay: it can only move the cursor to
@@ -2575,7 +2583,11 @@ pub(crate) fn replay_apply(
     for entry in &own {
         engine.advance_clock_past(&entry.stamp);
     }
-    let lost: Vec<_> = kimmy_storage::blocking(|| {
+    let missing: Vec<_> = kimmy_storage::blocking(|| {
+        #[cfg(test)]
+        if let Some(hook) = TEST_BEFORE_REPLAY_LOOKUPS.with(std::cell::Cell::take) {
+            hook(engine);
+        }
         own.iter()
             .map(|entry| engine.has_oplog_entry(&entry.stamp).map(|held| (entry, held)))
             .collect::<Result<Vec<_>, _>>()
@@ -2585,30 +2597,47 @@ pub(crate) fn replay_apply(
     .filter(|(_, held)| !held)
     .map(|(entry, _)| entry.clone())
     .collect();
-    if !lost.is_empty() {
-        // Said once for each peer in an armed episode, the first page that shows it, and
-        // not once for every page of a long replay (the same line for the outbound and
-        // the inbound way); what each later page did is counted, and the end is said.
-        if catch_up.replay_first_loss_from(their_node) {
-            warn!(
-                %peer,
-                entries = lost.len(),
-                "the peer holds writes this member made and no longer holds; it is marked \
-                 restored until it has caught up, and reads them back"
-            );
+    if !missing.is_empty() {
+        // After the lookups, never before them (see above).
+        let removed = kimmy_storage::blocking(|| engine.oplog_collected())
+            .map_err(|e| ProtocolError::Local(e.to_string()))?;
+        let proof: Vec<_> = missing
+            .iter()
+            .filter(|entry| entry.stamp.hlc > removed.get(entry.stamp.origin()))
+            .map(|entry| entry.stamp.hlc)
+            .collect();
+        if let Some(lost_max) = proof.iter().copied().max() {
+            // Said once for each peer in an armed episode, the first page that shows it, and
+            // not once for every page of a long replay (the same line for the outbound and
+            // the inbound way); what each later page did is counted, and the end is said.
+            if catch_up.replay_first_loss_from(their_node) {
+                warn!(
+                    %peer,
+                    entries = proof.len(),
+                    "the peer holds writes this member made and no longer holds; it is marked \
+                     restored until it has caught up, and reads them back"
+                );
+            } else {
+                debug!(%peer, entries = proof.len(), "another page of writes this member lost");
+            }
+            catch_up
+                .mark_proven(
+                    crate::facts::CatchUpReason::Restored,
+                    their_node,
+                    lost_max,
+                    std::time::Instant::now(),
+                )
+                .map_err(|e| {
+                    ProtocolError::Local(format!("writing the catching-up marker: {e}"))
+                })?;
         } else {
-            debug!(%peer, entries = lost.len(), "another page of writes this member lost");
+            debug!(
+                %peer,
+                entries = missing.len(),
+                "entries of this member's own that its retention removed: they prove no loss"
+            );
         }
-        let lost_max = lost.iter().map(|entry| entry.stamp.hlc).max().unwrap_or_default();
-        catch_up
-            .mark_proven(
-                crate::facts::CatchUpReason::Restored,
-                their_node,
-                lost_max,
-                std::time::Instant::now(),
-            )
-            .map_err(|e| ProtocolError::Local(format!("writing the catching-up marker: {e}")))?;
-        let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
+        let outcome = kimmy_storage::blocking(|| engine.apply_batch(&missing))
             .map_err(|e| ProtocolError::Local(e.to_string()))?;
         if outcome.stopped() {
             // Whatever stopped the batch, the page is not done: the replay asks for it again. The
@@ -2761,6 +2790,9 @@ thread_local! {
     static TEST_REPLAY_EXAMINE_ROWS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// Pages the serve on this thread has sent since the test cleared it.
     static TEST_REPLAY_PAGES_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Run once, by the next replay page applied on this thread, inside its lookups and before
+    /// the first of them: what runs on a member during a contact.
+    static TEST_BEFORE_REPLAY_LOOKUPS: std::cell::Cell<Option<fn(&Engine)>> = const { std::cell::Cell::new(None) };
 }
 
 fn replay_examine_time(left: Duration) -> Duration {

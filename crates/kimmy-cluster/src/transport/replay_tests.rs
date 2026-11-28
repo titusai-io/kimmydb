@@ -2419,11 +2419,16 @@ fn rows_a_holds(f: &Fixture, page: &[OplogEntry]) -> usize {
     page.iter().filter(|e| f.a.has_oplog_entry(&e.stamp).unwrap()).count()
 }
 
-/// A retention pass of A's own, a year ahead, which keeps every tombstone. It removes every
-/// oplog entry but the newest.
-fn a_collects(f: &Fixture) {
+/// A retention pass of the member's own, a year ahead, which keeps every tombstone. It
+/// removes every oplog entry but the newest.
+fn collect_all_but_the_newest(engine: &Engine) {
     let far = kimmy_storage::physical_now_ms() + 365 * 24 * 3600 * 1000;
-    f.a.collect_garbage_at(far, kimmy_storage::RetentionPolicy::new(1, u64::MAX)).unwrap();
+    engine.collect_garbage_at(far, kimmy_storage::RetentionPolicy::new(1, u64::MAX)).unwrap();
+}
+
+/// [`collect_all_but_the_newest`] on A.
+fn a_collects(f: &Fixture) {
+    collect_all_but_the_newest(&f.a);
 }
 
 /// A applies `page` of C's replay, asked from before every entry in it.
@@ -2692,4 +2697,21 @@ fn the_proof_stamp_is_the_highest_proof_not_the_highest_missing() {
     assert!(!f.a.has_oplog_entry(&later.stamp).unwrap(), "premise: lost");
     a_applies(&f, vec![later]);
     assert!(!f.catch_up.unknown(probe), "a loss not yet proven gates the member again");
+}
+
+/// A retention pass that runs during the contact, after the position was cut and before the
+/// rows are looked up: the record is read after the lookups, so it covers what the pass took.
+#[test]
+fn a_pass_that_runs_during_the_lookups_is_covered() {
+    let f = fixture(0, 0);
+    let page = what_c_holds_of_a(&f);
+    assert!(!page.is_empty() && rows_a_holds(&f, &page) == page.len(), "premise: A holds it all");
+    let document = page.iter().find(|e| e.kind == OpKind::Insert).expect("premise").stamp;
+    TEST_BEFORE_REPLAY_LOOKUPS.with(|hook| hook.set(Some(collect_all_but_the_newest)));
+
+    a_applies(&f, page);
+    let unrun = TEST_BEFORE_REPLAY_LOOKUPS.with(std::cell::Cell::take);
+    assert!(unrun.is_none(), "premise: the pass ran");
+    assert!(!f.a.has_oplog_entry(&document).unwrap(), "premise: it removed a document's entry");
+    assert_eq!(f.catch_up.reason(), None, "A removed those entries itself, during the contact");
 }
