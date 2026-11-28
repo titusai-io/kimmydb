@@ -7571,3 +7571,57 @@ async fn a_restart_after_meeting_a_peer_keeps_the_marker() {
     assert!(!guarded, "PREMISE: it has met a peer, so no guard runs:\n{}", a.log());
     assert!(a.catching_up_file().exists(), "the start kept the marker:\n{}", a.log());
 }
+
+/// What the store of `node`, which is stopped, says of its epoch: whether the store was founded
+/// with it, and whether its host has met another node.
+fn founded_and_met(node: &Node) -> (bool, bool) {
+    let store = node.dir.path().join("data").join("kimmy.redb");
+    let engine = kimmy_storage::Engine::open(&store).unwrap();
+    (engine.is_founding_epoch(), engine.has_met_a_peer())
+}
+
+/// Long enough after two members have met for each to have written it down.
+const MET_WRITTEN: Duration = Duration::from_secs(5);
+
+/// Row 55: a member that founded its store writes down that it has met a peer, as a restored one
+/// does, and reads it back after a restart that reaches nobody. A founder that did not would, once
+/// restarted, have met nobody again: no answer of its counts for a restore until it meets
+/// somebody, which it cannot where the only other member is the restore that waits for it.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_founding_member_remembers_that_it_has_met_a_peer_across_a_restart() {
+    let client = reqwest::Client::new();
+    let (mut a, b, _token) = two_members(&client).await;
+    tokio::time::sleep(MET_WRITTEN).await;
+    stop(&a);
+    stop(&b);
+    assert_eq!(founded_and_met(&a), (true, true), "A founded its store, and has met B");
+    a.restart_with(&[]);
+    a.wait_ready(&client).await;
+    stop(&a);
+    assert_eq!(founded_and_met(&a), (true, true), "after a restart that reached nobody");
+}
+
+/// Row 56 (M4): a member that founded its store, has been in a cluster, and is marked keeps its
+/// marker across a restart, though its seeds by then name only itself: it has met a peer, so it is
+/// not alone by its own record.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_founding_member_that_has_met_a_peer_keeps_its_marker_across_a_restart() {
+    let client = reqwest::Client::new();
+    let (mut a, b, _token) = two_members(&client).await;
+    tokio::time::sleep(MET_WRITTEN).await;
+    stop(&a);
+    stop(&b);
+    // As a replay that proved writes of its own lost would leave it.
+    std::fs::write(a.catching_up_file(), "reason = \"restored\"\nsince = 1\n").unwrap();
+    reconfigure(&a, &seeds_line(&[b.cluster]), &seeds_line(&[a.cluster]));
+    a.restart_with(&[]);
+    eventually("it to serve its cluster again", || {
+        let serving = a.log().contains(LISTENING);
+        async move { serving }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(a.catching_up_file().exists(), "the start kept the marker:\n{}", a.log());
+}
