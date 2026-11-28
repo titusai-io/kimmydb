@@ -184,10 +184,15 @@ impl Fake {
     }
 }
 
-/// An address nothing listens on: a stopped host that is still listed.
+/// An address nothing listens on: a stopped host that is still listed. The port stays bound,
+/// without listening, until the test binary ends: a connection is refused, and no other test's
+/// listener can be given the port.
 async fn stopped() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap()
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    std::mem::forget(socket);
+    addr
 }
 
 /// A restore of node [`ORIGINAL`] asking, with seeds the test can change.
