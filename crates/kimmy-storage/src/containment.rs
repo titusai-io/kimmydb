@@ -213,9 +213,10 @@ impl Engine {
         });
     }
 
-    /// Write the bit durably, once, from outside a contact (it takes the writer). A bit that was
-    /// never written is lost with the process, and the guard runs again at the next start, which is
-    /// harmless.
+    /// Write the bit durably, once, from outside a contact (it takes the writer). Every clustered
+    /// node has to: a bit never written is lost with the process, so that a restore is guarded
+    /// again at its next start, and a member that founded its store reads as one that has met
+    /// nobody.
     pub fn persist_met_a_peer(&self) -> Result<()> {
         use std::sync::atomic::Ordering::SeqCst;
         if !self.met_peer.load(SeqCst) || self.met_peer_written.load(SeqCst) {

@@ -2848,8 +2848,6 @@ async fn record_the_pass(
 /// a running host of this node is heard. A pass starts membership, offers it every address the
 /// deciding round asked, and then lets the hold go and opens the gate, in that order; a running
 /// host of this node halts this one. With nothing to decide it asks for ever: no time passes it.
-/// Then the bit that a peer was met is written once the first handshake has completed, from here
-/// and never from inside a contact.
 fn spawn_guard(
     engine: Arc<Engine>,
     members: kimmy_cluster::Members,
@@ -2859,9 +2857,8 @@ fn spawn_guard(
 ) {
     let data_dir = config.storage.data_dir.clone();
     let seeds: Arc<[kimmy_cluster::SeedSource]> = config.cluster.seeds.clone().into();
-    // UNSUPERVISED: a one-shot that ends with its verdict, which may never come, and then the
-    // write of the bit. A panic in it leaves the gate closed and the hold on, which a waiting host
-    // shows by serving nothing.
+    // UNSUPERVISED: a one-shot that ends with its verdict, which may never come. A panic in it
+    // leaves the gate closed and the hold on, which a waiting host shows by serving nothing.
     tokio::spawn(async move {
         let replace =
             kimmy_cluster::containment::read_marker_file(&data_dir).ok().and_then(|f| f.replace);
@@ -2896,21 +2893,29 @@ fn spawn_guard(
                     kimmy_cluster::containment::halt_by_guard(&engine, address)
                 });
                 let _ = to_let_in.gate.send(Some(false));
-                return;
             }
         }
-        loop {
-            if engine.has_met_a_peer() {
-                if let Err(e) = kimmy_storage::blocking(|| engine.persist_met_a_peer()) {
-                    warn!(
-                        error = %e,
-                        "could not record that this epoch has met a peer; the guard runs again at \
-                         the next start"
-                    );
-                }
-                return;
-            }
+    });
+}
+
+/// Write down, once, that this epoch has met a peer (ADR-274), from here and never from inside a
+/// contact. **Every clustered node runs it**, guarded or not: by that bit a member that founded its
+/// store still says, after a restart, that it has met somebody (the answer of one that has not
+/// counts for no restore), a start knows that a member is not alone and keeps its marker, and a
+/// restore that has joined is not guarded again.
+fn spawn_met_recorder(engine: Arc<Engine>) {
+    // UNSUPERVISED: a one-shot that ends with the write, which may never come. A panic in it leaves
+    // the bit unwritten, as a stop before the write does, and the next run's first meeting writes it.
+    tokio::spawn(async move {
+        while !engine.has_met_a_peer() {
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if let Err(e) = kimmy_storage::blocking(|| engine.persist_met_a_peer()) {
+            warn!(
+                error = %e,
+                "could not record that this epoch has met a peer: after a restart it reads as one \
+                 that has met nobody until it meets one again"
+            );
         }
     });
 }
@@ -2996,6 +3001,7 @@ async fn spawn_cluster(
         live.clone(),
     );
     let serving = kimmy_task::supervise("replication_server", shutdown.clone(), serve);
+    spawn_met_recorder(Arc::clone(&engine));
 
     // SWIM shares the port with replication: UDP for probes and membership,
     // TCP for oplog transfer. Bound here for the same reason as the listener —
