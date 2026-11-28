@@ -1440,7 +1440,8 @@ async fn start_and_serve(
         }
     }
 
-    let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
+    let gc_handle =
+        spawn_collector(Arc::clone(&engine), &config, shutdown.clone(), Arc::clone(&catch_up));
     state.metrics.set_purge_counters(engine.purge_counters());
     let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());
     let cluster = spawn_cluster(
@@ -3497,10 +3498,13 @@ fn spawn_drop_purger(
 }
 
 /// Start the retention collector, unless it is disabled.
+///
+/// **Scaffold of the tests commit**: the catching-up state is not looked at.
 fn spawn_collector(
     engine: Arc<Engine>,
     config: &Config,
     shutdown: kimmy_task::Shutdown,
+    _catch_up: Arc<kimmy_cluster::catchup::CatchUp>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if config.storage.gc_interval_secs == 0 {
         warn!("retention collection is disabled; the oplog and tombstones will grow without bound");
@@ -3880,6 +3884,55 @@ mod tests {
         assert!(!some.every_source_resolved, "a name that does not resolve");
     }
 
+    /// Row 51: the retention collector of a member its guard holds removes nothing, and its first
+    /// pass after the hold is let go is a whole interval away (ADR-274). A pass can remove what a
+    /// restore still owes its webhooks, from a position as old as its backup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_members_collector_removes_nothing_until_an_interval_after_the_release() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        for id in 0..3 {
+            engine.insert(&orders, bson::doc! { "_id": id }).unwrap();
+        }
+        let entries = || engine.oplog_entries().unwrap();
+        let written = entries();
+        assert!(written > 1, "premise: a pass would have something to remove");
+        // Past a retention of a second, so that any pass removes all but the newest.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let catch_up = kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+        catch_up.hold_for_guard();
+        let mut config = crate::config::Config::default();
+        config.storage.gc_interval_secs = 2;
+        config.storage.oplog_retention_secs = 1;
+        let collector = super::spawn_collector(
+            std::sync::Arc::clone(&engine),
+            &config,
+            kimmy_task::Shutdown::new(),
+            std::sync::Arc::clone(&catch_up),
+        )
+        .expect("a collector");
+        // Two intervals and a quarter, so that a schedule which went on ticking while it passed
+        // over the held ones would fire three quarters of an interval after the release.
+        tokio::time::sleep(Duration::from_millis(4_500)).await;
+        assert_eq!(entries(), written, "nothing is removed while the member is held");
+        catch_up.release_guard_hold();
+        let released = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(entries(), written, "nothing in the half interval after the release");
+        while entries() == written {
+            assert!(released.elapsed() < Duration::from_secs(10), "no pass after the release");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after = released.elapsed();
+        assert!(
+            after >= Duration::from_millis(1_900),
+            "removed {after:?} after the release, inside an interval of 2 s"
+        );
+        collector.abort();
+    }
+
     /// The guard's hold is taken where the guarded decision is made: before the catch-up state is
     /// handed to the API and before any task that does owner work is spawned. Taken later, by the
     /// guard's own task, it would race the webhook dispatcher's first pass, which delivered 7 ms
@@ -3898,6 +3951,7 @@ mod tests {
         for later in [
             "state.set_catch_up(",
             "let cluster = spawn_cluster(",
+            "spawn_collector(Arc::clone(&engine)",
             "supervise(\"webhook_dispatcher\"",
             "Some(spawn_expiry(",
             "supervise(\"embedding_worker\"",

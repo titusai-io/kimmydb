@@ -263,25 +263,26 @@ async fn a_gated_member_is_not_ready() {
     assert!(ready.body.get("catching_up").is_none(), "the body is what it always was");
 }
 
+/// The series of `kimmy_catching_up` that read 1, having seen that every state's is rendered.
+async fn hot(member: &Member) -> Vec<String> {
+    let metrics = get(member, "/metrics").await;
+    let ones: Vec<String> = metrics
+        .text
+        .lines()
+        .filter(|l| l.starts_with("kimmy_catching_up{"))
+        .filter(|l| l.ends_with(" 1"))
+        .map(|l| l.to_string())
+        .collect();
+    let all = metrics.text.lines().filter(|l| l.starts_with("kimmy_catching_up{")).count();
+    assert_eq!(all, STATES.len(), "every reason is always rendered:\n{}", metrics.text);
+    ones
+}
+
 /// `/metrics` is one-hot over the states, exactly one series is 1, and it moves
 /// with the marker: `none` on a member with no marker, the reason while it holds,
 /// `unknown` once the wait has run out, `none` again when it clears.
 #[tokio::test]
 async fn the_gauge_is_one_hot_and_follows_the_marker() {
-    async fn hot(member: &Member) -> Vec<String> {
-        let metrics = get(member, "/metrics").await;
-        let ones: Vec<String> = metrics
-            .text
-            .lines()
-            .filter(|l| l.starts_with("kimmy_catching_up{"))
-            .filter(|l| l.ends_with(" 1"))
-            .map(|l| l.to_string())
-            .collect();
-        let all = metrics.text.lines().filter(|l| l.starts_with("kimmy_catching_up{")).count();
-        assert_eq!(all, STATES.len(), "every reason is always rendered:\n{}", metrics.text);
-        ones
-    }
-
     let member = member(None, Duration::from_millis(2000)).await;
     assert_eq!(hot(&member).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
 
@@ -293,6 +294,39 @@ async fn the_gauge_is_one_hot_and_follows_the_marker() {
 
     member.catch_up.clear("the test");
     assert_eq!(hot(&member).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
+}
+
+/// Row 52: a member its mistaken-restore guard holds (ADR-274) may have no marker at all, so the
+/// gauge says it is held, marked or not: an alert on the gauge then sees it. At the release it
+/// reads the marker's state again.
+#[tokio::test]
+async fn the_gauge_says_that_the_guard_holds_a_member_marked_or_not() {
+    let held = ["kimmy_catching_up{reason=\"restore_guard\"} 1"];
+    for marker in [None, Some(CatchUpReason::Restored)] {
+        let member = member(marker, Duration::from_secs(120)).await;
+        let before = hot(&member).await;
+        member.catch_up.hold_for_guard();
+        assert_eq!(hot(&member).await, held, "held, {marker:?}");
+        member.catch_up.release_guard_hold();
+        assert_eq!(hot(&member).await, before, "{marker:?}: the marker's own again");
+    }
+}
+
+/// Row 54: a halted host (ADR-274) says it is halted whatever else is true of it, as its
+/// readiness does: with a marker or without, and with the guard's hold, which the guard's own halt
+/// leaves on. No other series says that a host is halted.
+#[tokio::test]
+async fn the_gauge_says_that_a_host_is_halted_before_anything_else() {
+    let halted = ["kimmy_catching_up{reason=\"halted\"} 1"];
+    let restored = Some(CatchUpReason::Restored);
+    for (marker, held) in [(None, false), (restored, false), (None, true), (restored, true)] {
+        let member = member(marker, Duration::from_secs(120)).await;
+        if held {
+            member.catch_up.hold_for_guard();
+        }
+        member.state.engine.halt_by_guard().unwrap();
+        assert_eq!(hot(&member).await, halted, "halted, {marker:?}, held {held}");
+    }
 }
 
 /// Past the wait the member serves, still marked `unknown` on every response and

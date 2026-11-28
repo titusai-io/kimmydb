@@ -603,6 +603,27 @@ async fn a_restore_is_alone_only_where_every_seed_answered_as_it_or_as_its_node(
     assert!(!judged_alone(&members, &me, true).await, "another node answered where it was named");
 }
 
+/// Row 53 (M1): another node that answers by its report, and lists nobody, is another node all
+/// the same. Every seed here is this host's node, so nothing else says the restore is not alone.
+#[tokio::test]
+async fn a_report_of_another_node_that_lists_nobody_leaves_the_restore_not_alone() {
+    let members = Members::default();
+    let original = Fake::saying(member(ORIGINAL)).await;
+    assert!(judged_alone(&members, &[original.addr], true).await, "premise: alone without it");
+    original.say(member(ORIGINAL).after(UNNAMED_WITHIN / 3));
+    let asked = original.probes();
+    let mut restore = asking_with(members, id(ORIGINAL), &[original.addr], true, 0);
+    // Handed over while the round is out, so that it is an answer of the round.
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while original.probes() == asked {
+        assert!(tokio::time::Instant::now() < until, "the original was never asked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    restore.report(member(5));
+    let Decision::Pass { at_pass, .. } = restore.decides().await else { panic!("a pass") };
+    assert!(!at_pass.alone, "another node answered, by its report");
+}
+
 /// Row 50 (M1): the original, taken over under `--replace`, lists another member that does not
 /// answer and is no seed. The restore is told of a member it has not heard, so it is not alone:
 /// its marker stays, and its owner work is off. What the original lists at the restore's own

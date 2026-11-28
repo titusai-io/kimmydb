@@ -6453,6 +6453,17 @@ impl HeldRestore {
 /// that member, which has then met somebody, so that its answer can count for a guard that asks
 /// for one that does. The restore is asked as a client would ask until its guard passes.
 async fn held_restore(client: &reqwest::Client, marked: bool) -> HeldRestore {
+    held_restore_for(client, marked, Duration::from_secs(20), "").await
+}
+
+/// [`held_restore`], the third node joining after `release_after`, and the restore alone given
+/// the lines `storage` in its `[storage]` section.
+async fn held_restore_for(
+    client: &reqwest::Client,
+    marked: bool,
+    release_after: Duration,
+    storage: &str,
+) -> HeldRestore {
     let (pa, pm, pn) = (ports::choose(), ports::choose(), ports::choose());
     let (hook_port, provider_port) = (ports::choose(), ports::choose());
     // The node the backup is of, and the member beside the restore, each seed only themselves: a
@@ -6513,6 +6524,7 @@ async fn held_restore(client: &reqwest::Client, marked: bool) -> HeldRestore {
     for (was, is) in [
         (format!("seeds = [\"127.0.0.1:{pa}\"]"), format!("seeds = [\"127.0.0.1:{pm}\"]")),
         ("worker_enabled = false".to_string(), "worker_enabled = true".to_string()),
+        ("ttl_interval_secs = 1".to_string(), format!("ttl_interval_secs = 1\n{storage}")),
     ] {
         assert_eq!(config.matches(&was).count(), 1, "{was}: {config}");
         config = config.replace(&was, &is);
@@ -6528,7 +6540,7 @@ async fn held_restore(client: &reqwest::Client, marked: bool) -> HeldRestore {
     let mut asked = Vec::new();
     while later.is_none() || !a.log().contains(GUARD_PASSED) {
         assert!(started.elapsed() < patience(), "the guard never passed:\n{}", a.log());
-        if later.is_none() && started.elapsed() >= Duration::from_secs(20) {
+        if later.is_none() && started.elapsed() >= release_after {
             // Not waited for: it seeds another, so it is not ready until it has caught up.
             later = Some(Node::spawn_with("node-n", pn, &[pm], HELD_VECTOR));
         }
@@ -6688,6 +6700,36 @@ async fn a_marked_restore_held_by_its_guard_does_no_owner_work() {
         assert!(expired > cleared_line, "expired while marked:\n{log}");
     }
     run.assert_it_was_held();
+}
+
+/// RET: a restore held for longer than its retention, and a retention pass besides, still
+/// delivers what it owes once it is let in and has caught up, and its subscription stands. Its
+/// position in the history is as old as its backup, and a pass during the hold, or straight after
+/// it, would remove what lies beyond that position and have the subscription invalidated.
+#[tokio::test]
+#[ignore = "boots real nodes and waits a minute; run with --ignored"]
+async fn a_restore_held_longer_than_its_retention_still_delivers_what_it_owes() {
+    let client = reqwest::Client::new();
+    // A pass every 15 s, which is longer than the restore takes to clear and its dispatcher to
+    // run once, over a history kept 20 s; and a hold longer than the two together.
+    let retention = "gc_interval_secs = 15\noplog_retention_secs = 20";
+    let run = held_restore_for(&client, true, Duration::from_secs(40), retention).await;
+    let stopped = || run.node.log().contains("webhook stopped");
+    eventually("the owed events to be delivered, or the subscription to be stopped", || {
+        let delivered = delivered_ids(&run.webhooks) == std::collections::BTreeSet::from([1, 2]);
+        let either = delivered || stopped();
+        async move { either }
+    })
+    .await;
+    assert!(!stopped(), "the subscription was invalidated:\n{}", run.node.log());
+    let hooks = client.get(run.node.url("/v1/db/shop/coll/orders/webhooks"));
+    let (status, hooks) = answered(hooks.bearer_auth(&run.token)).await;
+    assert_eq!(status, "200 -", "{hooks}");
+    assert!(!hooks.to_string().contains("invalidated"), "{hooks}");
+    run.assert_nothing_before_the_pass("a webhook", &run.webhooks);
+    let listening = run.node.log().lines().find(|l| l.contains(LISTENING)).and_then(logged_at);
+    let held = seconds_from(listening.unwrap(), run.passed_at());
+    assert!(held >= 36.0, "PREMISE: held {held:.3} s, not past the retention and a pass");
 }
 
 /// With membership off there is no guard (ADR-274), so nothing holds a restore: with a marker
