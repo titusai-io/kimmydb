@@ -6162,6 +6162,10 @@ async fn three_new_members_seeding_each_other_in_a_circle_form_a_cluster() {
 /// The line a host logs when its guard passes, before it lets go of anything the guard held back.
 const GUARD_PASSED: &str = "the mistaken-restore guard passed";
 
+/// The line a start logs once its cluster listener serves, a held member's too: what a restore's
+/// wait for its guard is counted from. Its membership logs nothing until it is let in.
+const LISTENING: &str = "serving cluster replication";
+
 /// The `[vector]` section of every node of the held restore's fixture: the loopback provider
 /// allowed, and the worker off, so that only the restore, which turns it on, ever embeds.
 const HELD_VECTOR: &str =
@@ -6405,14 +6409,14 @@ impl HeldRestore {
     /// The premise of every row on a held restore: there was a hold to speak of. Asked after what
     /// the row is about, so that work done by a held host is what fails it.
     fn assert_it_was_held(&self) {
-        let gossiping = self
+        let listening = self
             .node
             .log()
             .lines()
-            .find(|line| line.contains("gossiping membership"))
+            .find(|line| line.contains(LISTENING))
             .and_then(logged_at)
-            .expect("it gossiped");
-        let held = seconds_from(gossiping, self.passed_at());
+            .expect("its listener served");
+        let held = seconds_from(listening, self.passed_at());
         assert!(held >= 10.0, "PREMISE: the guard held the restore {held:.3} s, not 10");
     }
 }
@@ -6900,7 +6904,7 @@ async fn a_replacement_waits_for_the_old_address_to_be_dropped_and_one_in_place_
     };
     let (dropped, passed) = (dropped().unwrap(), at(&c, GUARD_PASSED));
     assert!(
-        came_before(at(&c, "gossiping membership"), dropped),
+        came_before(at(&c, LISTENING), dropped),
         "PREMISE: A listed the old address when the replacement started"
     );
     let after = seconds_from(dropped, passed);
@@ -6912,7 +6916,7 @@ async fn a_replacement_waits_for_the_old_address_to_be_dropped_and_one_in_place_
     stop(&b);
     restore_over(&b, &backup);
     b.restart_with(&[]);
-    let held = seconds_between_lines(&b, "gossiping membership", GUARD_PASSED).await;
+    let held = seconds_between_lines(&b, LISTENING, GUARD_PASSED).await;
     assert!(held < 5.0, "a restore in place waited {held:.3} s:\n{}", b.log());
 }
 
@@ -6964,6 +6968,8 @@ async fn a_cluster_restored_whole_waits_until_one_is_told_to_replace() {
             line.contains("the mistaken-restore guard waits") && line.contains("undecided=1")
         });
         assert!(says_so, "{} says that whom it asked waits too:\n{}", node.name, node.log());
+        let ready = answered(client.get(node.url("/readyz"))).await.1;
+        assert_eq!(ready["waiting_on"]["undecided"], 1, "{} /readyz says it: {ready}", node.name);
     }
     stop(&nodes[0]);
     restore_over_with(&nodes[0], &backups[0], &["--replace"]);
@@ -7032,8 +7038,8 @@ async fn a_restore_with_no_seed_of_its_own_joins_when_a_member_dials_it() {
     restore_over(&b, &backup);
     reconfigure(&b, &seeds_line(&[a.cluster]), &seeds_line(&[b.cluster]));
     b.restart_with(&[]);
-    let held = seconds_between_lines(&b, "gossiping membership", GUARD_PASSED).await;
-    eprintln!("node-b was answered by its dialler {held:.3} s after it began gossiping");
+    let held = seconds_between_lines(&b, LISTENING, GUARD_PASSED).await;
+    eprintln!("node-b was answered by its dialler {held:.3} s after its listener served");
     // The order of two lines of one log: it said it waits, having nobody to ask, and then passed.
     let lines: Vec<String> = b.log().lines().map(strip_ansi).collect();
     let line = |needle: &str| lines.iter().position(|line| line.contains(needle));
@@ -7044,15 +7050,14 @@ async fn a_restore_with_no_seed_of_its_own_joins_when_a_member_dials_it() {
         b.log()
     );
     b.wait_ready(&client).await;
-    let gossiping =
-        b.log().lines().find(|l| l.contains("gossiping membership")).and_then(logged_at).unwrap();
+    let listening = b.log().lines().find(|l| l.contains(LISTENING)).and_then(logged_at).unwrap();
     let peer = format!("peer=127.0.0.1:{}", b.cluster);
-    // Failures while B was down or still starting are before it gossiped.
+    // Failures while B was down or still starting are before its listener served.
     for line in a.log().lines() {
         let line = strip_ansi(line);
         if line.contains("sync round failed; backing off") && line.contains(&peer) {
             let at = logged_at(&line).unwrap();
-            assert!(came_before(at, gossiping + 1.0), "backed off while B waited: {line}");
+            assert!(came_before(at, listening + 1.0), "backed off while B waited: {line}");
         }
     }
 }
@@ -7177,4 +7182,67 @@ async fn two_restores_of_a_running_node_both_halt() {
         assert!(!is_halted(&client, member).await, "{} is not halted", member.name);
     }
     a.wait_ready(&client).await;
+}
+
+/// A restore its guard holds takes no part in membership: a member that seeds it, and so offers
+/// it membership at every discovery, never lists it, and it lists nobody. Once let in it joins.
+/// The member beside it has met nobody, so its answer never counts, until a third node joins it.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn a_held_restore_joins_no_membership_until_it_is_let_in() {
+    let client = reqwest::Client::new();
+    let (pa, pm, restored_at) = (ports::choose(), ports::choose(), ports::choose());
+    let mut a = Node::spawn_with("node-a", pa, &[pa], "");
+    a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&a);
+    // Not waited for: it seeds another, so it is not ready while nobody it names has answered.
+    let beside = Node::spawn_with("node-m", pm, &[restored_at], "");
+    move_to_port(&mut a, restored_at);
+    restore_over(&a, &backup);
+    reconfigure(&a, &seeds_line(&[pa]), &seeds_line(&[pm]));
+    a.restart_with(&[]);
+    stays_held(&client, &a, Duration::from_secs(20)).await;
+    assert!(!listed_up(&beside, restored_at), "listed while held:\n{}", beside.log());
+    assert!(!listed_up(&a, pm), "the held restore listed a member:\n{}", a.log());
+    // Not waited for either.
+    let _later = Node::spawn_with("node-n", ports::choose(), &[pm], "");
+    eventually("the restore to be let in and listed", || {
+        let both = a.log().contains(GUARD_PASSED) && listed_up(&beside, restored_at);
+        async move { both }
+    })
+    .await;
+}
+
+/// A restore whose seeds name only itself, in a cluster where the others know each other: it
+/// joins no membership while held, so nobody lists it, and the member whose seeds name its address
+/// dials it all the same. It is answered by that dial and needs no --replace.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_restore_with_no_seed_joins_three_members_by_a_members_dial() {
+    let client = reqwest::Client::new();
+    let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+    let a = Node::spawn_with("node-a", pa, &[pb], "");
+    let b = Node::spawn_with("node-b", pb, &[pa, pc], "");
+    let mut c = Node::spawn_with("node-c", pc, &[pa], "");
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = c.login(&client).await;
+    let backup = backup_to_file(&client, &c, &token).await;
+    stop(&c);
+    // Only once the two have dropped it: a member still listed would be dialled as a member.
+    eventually("the others to drop it", || all_report(&client, vec![&a, &b], 1)).await;
+    restore_over(&c, &backup);
+    reconfigure(&c, &seeds_line(&[pa]), &seeds_line(&[pc]));
+    c.restart_with(&[]);
+    eventually("the restore to be let in", || {
+        let passed = c.log().contains(GUARD_PASSED);
+        async move { passed }
+    })
+    .await;
+    c.wait_ready(&client).await;
+    eventually("it to join the others", || all_report(&client, vec![&a, &b, &c], 2)).await;
 }

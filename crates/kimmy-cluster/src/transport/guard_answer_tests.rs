@@ -282,6 +282,55 @@ async fn a_replication_loop_does_not_back_off_an_undecided_peer() {
     }
 }
 
+/// A seed that membership does not list is dialled all the same, so that a member whose guard
+/// holds it, which has joined no membership, is dialled and handed a report; a seed that nothing
+/// answers on is not counted as a failed round, and backs nothing off. The loop's rounds go to the
+/// members it lists, as before.
+#[tokio::test]
+async fn a_seed_membership_does_not_list_is_dialled_and_no_failure_of_it_counted() {
+    let (listed, _l) = arc_engine();
+    let (listed_addr, listed_task) = serving(&listed, &Members::default()).await;
+    let (member, _m) = arc_engine();
+    let (members, _held) = held();
+    let (held_addr, held_task) = serving(&member, &members).await;
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let (dialler, _d) = arc_engine();
+    let known = Members::default();
+    known.insert_for_test(listed_addr, listed.node_id());
+    let (sender, mut rounds) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = crate::peers::ReplicationConfig::new(
+        vec![crate::SeedSource::Static(vec![held_addr, dead])],
+        SECRET.into(),
+        at(1),
+    );
+    config.members = Some(known);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = sender.send(report);
+    }));
+    let looping = tokio::spawn(crate::peers::replicate(dialler, config));
+    let mut seen = Vec::new();
+    while seen.len() < 10 {
+        let report = tokio::time::timeout(Duration::from_secs(10), rounds.recv())
+            .await
+            .expect("a round is reported")
+            .expect("the loop runs");
+        seen.push(report);
+    }
+    let reports = reports_of(&members).await;
+    looping.abort();
+    listed_task.abort();
+    held_task.abort();
+    assert!(!reports.is_empty(), "the unlisted held seed was dialled and handed a report");
+    for report in &seen {
+        assert_eq!((report.failed, report.backing_off), (0, 0), "nobody failed: {report:?}");
+    }
+}
+
 /// Row 43: what an answer says of the member is the member's own: its standing, how long it has
 /// been a member, whether it founded its store and has met nobody, and a token that is its
 /// process's.

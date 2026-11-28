@@ -74,6 +74,20 @@ pub enum Decision {
     LiveHost(SocketAddr),
 }
 
+/// Let a passed restore in, in rule 5's order: first its membership, which is offered `offer`,
+/// and only then `open`, which lets go of what the guard held.
+///
+/// **Scaffold of the tests commit**: opens first. The daemon does not call it yet.
+pub async fn let_in<M, F, O>(offer: Vec<SocketAddr>, membership: M, open: O)
+where
+    M: FnOnce(Vec<SocketAddr>) -> F,
+    F: Future<Output = ()>,
+    O: FnOnce(),
+{
+    open();
+    membership(offer).await;
+}
+
 /// Ask, round after round, until one decides. `seeds` is resolved again for each round;
 /// `members` holds the asker's token and the reports that diallers hand it.
 pub async fn ask_until_decided<F, Fut>(asking: &Asking, members: &Members, seeds: F) -> Decision

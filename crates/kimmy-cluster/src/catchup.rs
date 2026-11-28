@@ -66,6 +66,19 @@ pub const MAX_SEEN: usize = 1_024;
 /// `unknown`.
 pub const STATES: [&str; 5] = ["none", "seeded_empty", "restored", "snapshot", "unknown"];
 
+/// What the last round of the guard's that decided nothing was waiting on (ADR-274).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardWaits {
+    /// The addresses that round asked.
+    pub asked: usize,
+    /// The answers from members that are undecided themselves.
+    pub undecided: usize,
+    /// The open answers that do not count.
+    pub uncounted: usize,
+    /// The addresses listed for this node that gave no answer.
+    pub silent_named: Vec<std::net::SocketAddr>,
+}
+
 /// The state a refusal names while the mistaken-restore guard holds a member (ADR-274). Not one of
 /// [`STATES`]: the guard's hold is not a state of the marker.
 pub const GUARD_HOLD_LABEL: &str = "restore_guard";
@@ -576,6 +589,20 @@ impl CatchUp {
     /// Whether the guard's hold is on.
     pub fn held_by_guard(&self) -> bool {
         self.guard_hold.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep what the guard's last round waits on, for `/readyz` to say while the hold is on.
+    ///
+    /// **Scaffold of the tests commit**: keeps nothing.
+    // Read by the tests alone until the code commit.
+    #[allow(dead_code)]
+    pub(crate) fn note_guard_waits(&self, _waits: GuardWaits) {}
+
+    /// What the guard is waiting on, while it holds this member and a round has decided nothing.
+    ///
+    /// **Scaffold of the tests commit**: never anything.
+    pub fn guard_waits(&self) -> Option<GuardWaits> {
+        None
     }
 
     /// Whether this member does no owner work: the guard holds it, or its marker is set, the wait

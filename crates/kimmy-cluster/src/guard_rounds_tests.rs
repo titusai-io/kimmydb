@@ -516,3 +516,47 @@ async fn replace_passes_after_one_round_whatever_it_holds() {
     restore.passes().await;
     assert!(original.probes() >= 1, "premise: the original was asked");
 }
+
+/// Rule 5's order at a pass: membership is offered every address first, and what the guard held
+/// is let go only once it has been.
+#[tokio::test]
+async fn a_pass_offers_membership_before_anything_is_opened() {
+    let done = Mutex::new(Vec::new());
+    let offered = vec![SocketAddr::from(([127, 0, 0, 1], 7001))];
+    crate::guard_rounds::let_in(
+        offered.clone(),
+        |offer| {
+            let done = &done;
+            async move {
+                tokio::task::yield_now().await;
+                done.lock().push(format!("membership offered {offer:?}"));
+            }
+        },
+        || done.lock().push("opened".to_string()),
+    )
+    .await;
+    let expected = [format!("membership offered {offered:?}"), "opened".to_string()];
+    assert_eq!(*done.lock(), expected);
+}
+
+/// A restore that waits says what on, where its readiness is read from: how many it asked, who is
+/// undecided, whose answer does not count, and which address listed for its node is silent. The
+/// hold's end takes it away.
+#[tokio::test]
+async fn the_rounds_say_what_they_wait_on() {
+    let silent = stopped().await;
+    let undecided = Fake::saying(member(1).undecided()).await;
+    let young = Fake::saying(member(2).young().listing(silent)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let catch_up = crate::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+    catch_up.hold_for_guard();
+    let members = Members::default();
+    members.set_catch_up(catch_up.clone());
+    let mut restore = asking_with(members, id(ORIGINAL), &[undecided.addr, young.addr], false, 0);
+    restore.undecided_for(ROUNDS, "nobody who counts has answered").await;
+    let waits = catch_up.guard_waits().expect("it says what it waits on");
+    assert_eq!((waits.asked, waits.undecided, waits.uncounted), (3, 1, 1), "{waits:?}");
+    assert_eq!(waits.silent_named, [silent]);
+    catch_up.release_guard_hold();
+    assert_eq!(catch_up.guard_waits(), None, "nothing is waited on once it is let go");
+}
