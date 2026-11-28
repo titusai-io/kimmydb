@@ -1,7 +1,7 @@
-//! Unit EQ (ADR-272): after a schedule of deliveries, at quiescence, TWO comparisons on real engines, because each misses what
-//! the other sees. **Every member against the register function** of all the facts (`kimmy_core::register_function::fold`):
-//! members can all agree with one another and not with the function. **Every member against the first**: the function says
-//! nothing of document bodies, options rows or names rows.
+//! Unit EQ (ADR-272): after a schedule of deliveries, at quiescence, THREE comparisons on real engines. **Every member against
+//! the register function** of all the facts (`kimmy_core::register_function::fold`): members can all agree with one another and
+//! not with it. **Every member against the first**: the function says nothing of document bodies, options rows or names rows.
+//! **A swapped name's collection tombstones, of what has ended, against what is wanted of each member** ([`Column::Presence`]).
 //!
 //! **The oracle never reads a member's kept state.** A [`Ledger`] holds each fact as the entry its author's own operation
 //! appended, read back from that author at the step. It also holds which burials a database drop made: nothing on the wire says
@@ -12,15 +12,31 @@
 //! register the FUNCTION says is not empty, the database's tombstone alone is compared between members: the identity's burial
 //! stamp is each member's own (D4-2), and the function's floor is not stored apart from it yet.
 //!
-//! **One pinned difference, PIN B.** A database drop's burial of a collection is today an entry with a stamp of its own, above
-//! the drop, and a member that buries by it keeps that stamp as the collection's floor. So where such a burial sorts above the
-//! floor the function names, every member must hold the BURIAL's stamp: exactly that, so that any other floor fails, the
-//! function's included. The pin goes with the change that stamps those burials at the drop. It is the only difference the floor,
-//! measured over the plain steps, showed: every other column of every set of kinds agreed.
+//! **Three pins**, each a value wanted that is not the one the function or the members would give, so that any other value fails.
 //!
-//! **What this draws today: the plain collection only.** No stage, binding or recreation, no delivery out of causal order, no
-//! garbage collection (a tombstone one member has collected and another has not is no difference of state), and no shadow
-//! ([`SHADOWS`]). Index definitions are not a compared column; the convergence model compares them.
+//! **PIN B.** A database drop's burial of a collection is today an entry with a stamp of its own, above the drop, and a member
+//! that buries by it keeps that stamp as the collection's floor. So where such a burial sorts above the floor the function names,
+//! every member must hold the BURIAL's stamp: exactly that, so that any other floor fails, the function's included. The pin goes
+//! with the change that stamps those burials at the drop. It is the only difference the floor, measured over the plain steps,
+//! showed: every other column of every set of kinds agreed.
+//!
+//! **PIN P and the stamp pin** are of the collection tombstones a swapped name leaves ([`Column::Presence`]). Of every stage and
+//! recreation the function ends, and of the identity where it does not stand, each view is wanted to HOLD one, but as the two
+//! pins say. PIN P: where the register's first event is a binding, which bound the identity out, a member that joins after that
+//! binding is in effect is wanted NOT to hold the identity's; one that joins while the binding is held parked is wanted, at the
+//! end, to hold it, as the others do. The stamp pin is of a stage that was BOUND and whose next event in the register is a drop
+//! of the name: it is wanted at that drop's stamp, and where a recreation follows, a member that joins afterwards is wanted at
+//! the recreation's. Every other stage and recreation that ended is wanted held at any stamp. Both pins go with the change that
+//! keeps these burial marks apart from the collection tombstone and takes whether there is one, and its stamp, from the facts.
+//! The identity's stamp is each member's own and is not held to any.
+//!
+//! **What is drawn.** The generated run draws the plain collection only: no stage, binding or recreation, no delivery out of causal
+//! order, no garbage collection (a tombstone one member has collected and another has not is no difference of state), and no shadow
+//! ([`SHADOWS`]). Swapped names are drawn by fixed rows ([`swapped`]). Index definitions are not a compared column; the
+//! convergence model compares them.
+//!
+//! **A physical** of a swapped name, a stage or a recreation, has no oracle of its own: its documents, its document tombstones
+//! and its rows are compared between members, for every physical the facts name, an ended one included.
 //!
 //! A child of the convergence model, whose engines, clock, quiescence and generator it uses and does not change.
 
@@ -40,14 +56,18 @@ use super::{
     A, B, C, Cluster, DB, LETTERS, NAMES, Op, Res, Route, Step, Track, base, env_u64, err,
     generate, model_clock, op, parse, show,
 };
-use crate::register::{Carried, stored_row_count_for_tests, stored_row_for_tests};
+use crate::register::{Carried, carried_rows, stored_row_count_for_tests, stored_row_for_tests};
 use crate::{
-    Engine, MarkedRange, PeerWindow, ServeVerdict, SnapshotProgress, StorageError, SyncOutcome,
-    WalkScope, codec, tables,
+    CollectionMeta, Engine, MarkedRange, PeerWindow, ServeVerdict, SnapshotProgress, StorageError,
+    SyncOutcome, WalkScope, codec, tables,
 };
 
 /// Whether the vector shadows are compared. They come with the commits that build the shadow's rules; no schedule here makes one.
 const SHADOWS: bool = false;
+
+/// Swapped names: fixed schedules, and a stage's creator that lost what it made.
+#[path = "eq_swapped_tests.rs"]
+mod swapped;
 
 // -- Kinds and the gate ----------------------------------------------------------------------
 
@@ -58,6 +78,9 @@ enum Kind {
     Touch,
     Drop,
     DatabaseDrop,
+    Stage,
+    Bind,
+    Recreate,
 }
 
 type Kinds = BTreeSet<Kind>;
@@ -71,9 +94,9 @@ fn kinds_of(facts: &[FoldFact]) -> Kinds {
             FoldKind::Drop { database_drop: None } => Some(Kind::Drop),
             FoldKind::Drop { database_drop: Some(_) } => None,
             FoldKind::DatabaseDrop => Some(Kind::DatabaseDrop),
-            FoldKind::StageCreate { .. } | FoldKind::Bind { .. } | FoldKind::Recreate { .. } => {
-                unreachable!("no schedule here draws a swap step: {fact:?}")
-            }
+            FoldKind::StageCreate { .. } => Some(Kind::Stage),
+            FoldKind::Bind { .. } => Some(Kind::Bind),
+            FoldKind::Recreate { .. } => Some(Kind::Recreate),
         })
         .collect()
 }
@@ -88,33 +111,74 @@ fn converted(kinds: &Kinds) -> bool {
 
 // -- The ledger ------------------------------------------------------------------------------
 
-/// Every fact's entry, by its stamp; a burial a database drop made carries that drop's `hlc`.
+/// Every fact's entry, by its stamp; a burial a database drop made carries that drop's `hlc`. And for each collection that is no
+/// name's own, a stage's or a recreation's physical, the documents written to it.
 #[derive(Default)]
 struct Ledger {
     entries: BTreeMap<Stamp, (OplogEntry, Option<Hlc>)>,
+    elsewhere: BTreeMap<CollectionId, BTreeSet<i64>>,
+}
+
+/// What `entry` is a fact of: the logical name, and the kind of fact. `None` for an entry that is no fact of one of the names:
+/// among them a database's drop, which is a fact of every name and is told apart by its collection, a database drop's burial of a
+/// physical, and anything else of a physical.
+fn name_fact(entry: &OplogEntry) -> Option<(&'static str, FoldKind)> {
+    let named = |logical: &str| NAMES.into_iter().find(|name| *name == logical);
+    let of_identity =
+        || NAMES.into_iter().find(|name| entry.collection == CollectionId::derive(DB, name));
+    match entry.kind {
+        OpKind::CreateCollection => {
+            let body = entry.body.as_ref()?;
+            let made: kimmy_core::CollectionCreate =
+                bson::deserialize_from_slice(body).expect("a creation's body decodes");
+            if made.db != DB {
+                None
+            } else if let Some(name) = named(&made.name) {
+                Some((name, FoldKind::Create))
+            } else if let Some(stage) = made.stage {
+                let name = named(kimmy_core::swap::logical_of_stage(&made.name)?)?;
+                Some((name, FoldKind::StageCreate { physical: made.name, stage }))
+            } else {
+                let name = named(kimmy_core::logical_of_recreation(&made.name)?)?;
+                Some((name, FoldKind::Recreate { physical: made.name }))
+            }
+        }
+        OpKind::BindCollection => {
+            let name = of_identity()?;
+            let body = entry.body.as_ref()?;
+            let bind: kimmy_core::CollectionBind =
+                bson::deserialize_from_slice(body).expect("a binding's body decodes");
+            Some((name, FoldKind::Bind { physical: bind.physical }))
+        }
+        OpKind::DropCollection => Some((of_identity()?, FoldKind::Drop { database_drop: None })),
+        kind if is_a_touch(kind) => Some((of_identity()?, FoldKind::Touch)),
+        _ => None,
+    }
 }
 
 /// Whether `entry` is a fact of one of the names or of their database.
 fn is_a_fact(entry: &OplogEntry) -> bool {
-    let of_a_name = NAMES.iter().any(|name| entry.collection == CollectionId::derive(DB, name));
-    (of_a_name
-        && (matches!(entry.kind, OpKind::CreateCollection | OpKind::DropCollection)
-            || is_a_touch(entry.kind)))
+    name_fact(entry).is_some()
         || (entry.kind == OpKind::DropCollection && entry.collection == database_drop_id(DB))
+}
+
+/// Every entry in `e`'s oplog.
+fn entries_held(e: &Engine) -> Res<Vec<OplogEntry>> {
+    let window = e
+        .entries_for_peer(Hlc::ZERO, 100_000, WalkScope::Background)
+        .map_err(|e| err("entries_for_peer", e))?;
+    Ok(window.entries)
 }
 
 /// The facts in `e`'s oplog.
 fn facts_held(e: &Engine) -> Res<Vec<OplogEntry>> {
-    let window = e
-        .entries_for_peer(Hlc::ZERO, 100_000, WalkScope::Background)
-        .map_err(|e| err("entries_for_peer", e))?;
-    Ok(window.entries.into_iter().filter(is_a_fact).collect())
+    Ok(entries_held(e)?.into_iter().filter(is_a_fact).collect())
 }
 
-/// The facts `e` itself wrote.
-fn own_facts(e: &Engine) -> Res<BTreeMap<Stamp, OplogEntry>> {
+/// The entries `e` itself wrote.
+fn own_entries(e: &Engine) -> Res<BTreeMap<Stamp, OplogEntry>> {
     let node = e.node_id();
-    Ok(facts_held(e)?
+    Ok(entries_held(e)?
         .into_iter()
         .filter(|entry| entry.stamp.node == node)
         .map(|entry| (entry.stamp, entry))
@@ -128,17 +192,36 @@ impl Ledger {
             return cluster.apply(op);
         }
         let author = Cluster::member_of(op.step);
-        let before = own_facts(cluster.e(author))?;
-        cluster.apply(op)?;
-        let new: Vec<OplogEntry> = own_facts(cluster.e(author))?
+        let database_drop = matches!(op.step, Step::DropDb { .. });
+        self.authored(cluster, author, database_drop, |cluster| cluster.apply(op)).map(drop)
+    }
+
+    /// Do `act`, by which member `author` writes, and record what it appended: every fact, and every document of a collection that
+    /// is no name's own. Answers the entries it appended.
+    fn authored(
+        &mut self,
+        cluster: &mut Cluster,
+        author: usize,
+        database_drop: bool,
+        act: impl FnOnce(&mut Cluster) -> Res<()>,
+    ) -> Res<Vec<OplogEntry>> {
+        let before = own_entries(cluster.e(author))?;
+        act(&mut *cluster)?;
+        let appended: Vec<OplogEntry> = own_entries(cluster.e(author))?
             .into_iter()
             .filter(|(stamp, _)| !before.contains_key(stamp))
             .map(|(_, entry)| entry)
             .collect();
         let database = database_drop_id(DB);
-        let head = new.iter().find(|entry| entry.collection == database).map(|e| e.stamp.hlc);
-        for entry in new {
-            let burial = matches!(op.step, Step::DropDb { .. })
+        let head = appended.iter().find(|entry| entry.collection == database).map(|e| e.stamp.hlc);
+        for entry in &appended {
+            if !is_a_fact(entry) {
+                if let Some(DocId::Int64(doc)) = &entry.doc_id {
+                    self.elsewhere.entry(entry.collection).or_default().insert(*doc);
+                }
+                continue;
+            }
+            let burial = database_drop
                 && entry.kind == OpKind::DropCollection
                 && entry.collection != database;
             let of = if burial {
@@ -146,28 +229,26 @@ impl Ledger {
             } else {
                 None
             };
-            if self.entries.insert(entry.stamp, (entry, of)).is_some() {
+            if self.entries.insert(entry.stamp, (entry.clone(), of)).is_some() {
                 return Err("two facts under one stamp".into());
             }
         }
-        Ok(())
+        Ok(appended)
     }
 
     /// The facts of `name`: its own, and every drop of the database.
     fn facts(&self, name: &str) -> Vec<FoldFact> {
-        let (id, database) = (CollectionId::derive(DB, name), database_drop_id(DB));
+        let database = database_drop_id(DB);
         self.entries
             .values()
             .filter_map(|(entry, of)| {
                 let kind = if entry.collection == database {
                     FoldKind::DatabaseDrop
-                } else if entry.collection != id {
-                    return None;
                 } else {
-                    match entry.kind {
-                        OpKind::CreateCollection => FoldKind::Create,
-                        OpKind::DropCollection => FoldKind::Drop { database_drop: *of },
-                        _ => FoldKind::Touch,
+                    match name_fact(entry)? {
+                        (of_name, _) if of_name != name => return None,
+                        (_, FoldKind::Drop { .. }) => FoldKind::Drop { database_drop: *of },
+                        (_, kind) => kind,
                     }
                 };
                 Some(FoldFact { stamp: entry.stamp, kind })
@@ -212,7 +293,18 @@ impl Ledger {
             .max()
             .filter(|burial| answer.floor.is_none_or(|floor| *burial > floor));
         let touched = latest.keys().copied().collect();
-        Expected { answer, kinds, documents, touched, burial_above_the_floor }
+        let physicals = facts
+            .iter()
+            .filter_map(|fact| match &fact.kind {
+                FoldKind::StageCreate { physical, .. } | FoldKind::Recreate { physical } => {
+                    let id = CollectionId::derive(DB, physical);
+                    let written = self.elsewhere.get(&id).cloned().unwrap_or_default();
+                    Some((physical.clone(), written))
+                }
+                _ => None,
+            })
+            .collect();
+        Expected { answer, kinds, documents, touched, burial_above_the_floor, physicals }
     }
 
     /// The entries of facts a member holds and the ledger was never told of.
@@ -240,6 +332,8 @@ struct Expected {
     touched: BTreeSet<i64>,
     /// The newest burial a database drop made of the name's collection, where it sorts above the function's floor.
     burial_above_the_floor: Option<Stamp>,
+    /// Every stage and recreation the facts name, ended ones too, each with the documents written to it.
+    physicals: BTreeMap<String, BTreeSet<i64>>,
 }
 
 impl Expected {
@@ -254,19 +348,100 @@ impl Expected {
     }
 }
 
+// -- The pins of a swapped name's collection tombstones -----------------------------------------
+
+/// What a view is of: PIN P and the stamp pin ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seat {
+    /// A member of the schedule.
+    Member,
+    /// A member that joined by snapshot with every event of the schedule in effect where it joined from.
+    JoinerAfterRelease,
+    /// A member that joined by snapshot from one that held an event parked.
+    JoinerWhileParked,
+}
+
+/// What a view is wanted to hold as the collection tombstone of a collection of a swapped name that has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tombstone {
+    /// One, whatever its stamp.
+    Held,
+    /// One at exactly this stamp.
+    At(Stamp),
+    /// None.
+    NotHeld,
+}
+
+impl Tombstone {
+    fn is_met_by(self, held: Option<Stamp>) -> bool {
+        match self {
+            Tombstone::Held => held.is_some(),
+            Tombstone::At(stamp) => held == Some(stamp),
+            Tombstone::NotHeld => held.is_none(),
+        }
+    }
+}
+
+/// PIN P: whether a view in `seat` is wanted not to hold the identity's tombstone. So where a binding is the register's first
+/// event, which bound the identity out, and the view's member joined after it was in effect.
+fn pin_p(want: &Expected, seat: Seat) -> bool {
+    seat == Seat::JoinerAfterRelease
+        && matches!(want.answer.register.first(), Some((_, FoldEvent::Bind { .. })))
+}
+
+/// The stamp pin: the stamp a view in `seat` is wanted to hold the tombstone of `stage` at, where a drop of the name ended it:
+/// the register's next event after the stage's binding is that drop. The drop's, or, for a member that joined after a recreation
+/// above the drop was in effect, the recreation's. `None` for a collection no such drop ended.
+fn stamp_pin(want: &Expected, stage: &str, seat: Seat) -> Option<Stamp> {
+    let mut from_its_binding = want.answer.register.iter().skip_while(
+        |(_, event)| !matches!(event, FoldEvent::Bind { physical } if physical == stage),
+    );
+    from_its_binding.next()?;
+    let Some((dropped, FoldEvent::Drop)) = from_its_binding.next() else { return None };
+    let recreated = from_its_binding
+        .find(|(_, event)| matches!(event, FoldEvent::Recreate { .. }))
+        .map(|(stamp, _)| *stamp);
+    match recreated {
+        Some(recreated) if seat == Seat::JoinerAfterRelease => Some(recreated),
+        _ => Some(*dropped),
+    }
+}
+
+/// The collections of a swapped name that have ended, the identity as `None`, each with what a view in `seat` is wanted to hold
+/// as its tombstone.
+fn tombstones_wanted(want: &Expected, seat: Seat) -> Vec<(Option<&str>, Tombstone)> {
+    let a = &want.answer;
+    let mut wanted: Vec<(Option<&str>, Tombstone)> = a
+        .dead
+        .keys()
+        .map(|physical| {
+            let pinned = stamp_pin(want, physical, seat);
+            (Some(physical.as_str()), pinned.map_or(Tombstone::Held, Tombstone::At))
+        })
+        .collect();
+    if !a.register.is_empty() && !a.identity_stands {
+        let identity = if pin_p(want, seat) { Tombstone::NotHeld } else { Tombstone::Held };
+        wanted.push((None, identity));
+    }
+    wanted
+}
+
 // -- What a member holds ----------------------------------------------------------------------
 
 /// One member's answer for one name, read from its store.
 #[derive(Clone, Debug)]
 struct View {
+    /// What this is a view of. [`view`] reads a member; a joiner's is set by who made the joiner.
+    seat: Seat,
     serves: Serves,
     /// The collection named like the name is held, whether or not the register shows it.
     identity_stands: bool,
-    /// The stages and recreations held.
-    alive: BTreeSet<String>,
+    /// The stages and recreations held, each stage with the `Hlc` of its creation. A recreation's creation is not compared.
+    alive: BTreeMap<String, Option<Hlc>>,
     register: Vec<(Stamp, RegisterEvent)>,
     superseded: BTreeMap<String, Option<Stamp>>,
-    /// Of the facts the function says are history by the pure rules, those a register row is held for, in effect or parked.
+    /// Of the facts the function says are history by the pure rules, those a register row in effect is held for. A parked row fails
+    /// quiescence before anything is compared, so none is read here.
     invalid_held: BTreeSet<Stamp>,
     /// Live documents: the stamp and the body. A live row under the id with no collection held over it is one too.
     documents: BTreeMap<i64, (Stamp, String)>,
@@ -278,6 +453,70 @@ struct View {
     database_tombstone: Option<Stamp>,
     options: Option<Vec<u8>>,
     names: Option<Vec<u8>>,
+    /// What the member holds of each physical the facts name.
+    physicals: BTreeMap<String, Physical>,
+}
+
+/// What one member holds of one physical of a name, held or ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Physical {
+    /// Live documents, as [`View::documents`].
+    rows: BTreeMap<i64, (Stamp, String)>,
+    /// Document tombstones, as [`View::tombstones`].
+    tombstones: BTreeMap<i64, Stamp>,
+    options: Option<Vec<u8>>,
+    names: Option<Vec<u8>>,
+    /// The collection tombstone held under its id.
+    collection_tombstone: Option<Stamp>,
+}
+
+/// A part of what a member holds of its physicals, for those of which it holds that part.
+fn part<T>(view: &View, of: impl Fn(&Physical) -> Option<T>) -> BTreeMap<String, T> {
+    view.physicals.iter().filter_map(|(name, held)| Some((name.clone(), of(held)?))).collect()
+}
+
+/// A member's live documents, and its document tombstones.
+type Documents = (BTreeMap<i64, (Stamp, String)>, BTreeMap<i64, Stamp>);
+
+/// What `e` holds of the documents of the collection `id`, held as `meta` or not: the live rows; and of the documents `touched`,
+/// the tombstones above `floor` and any live row that no collection is held over.
+fn documents_of(
+    e: &Engine,
+    txn: &redb::ReadTransaction,
+    id: CollectionId,
+    meta: Option<&CollectionMeta>,
+    touched: &BTreeSet<i64>,
+    floor: Option<Stamp>,
+) -> Res<Documents> {
+    let mut live = BTreeMap::new();
+    if let Some(meta) = meta {
+        e.for_each_record_after(meta, None, WalkScope::Background, |id, stamp, doc| {
+            let DocId::Int64(n) = id else { panic!("an id the model never writes") };
+            live.insert(n, (stamp, doc.to_string()));
+            Ok(true)
+        })
+        .map_err(|e| err("for_each_record_after", e))?;
+    }
+    let mut tombstones = BTreeMap::new();
+    let records = txn.open_table(tables::DOCS).map_err(|e| err("open_table", e))?;
+    for doc in touched {
+        let key = crate::docs::doc_key(&DocId::Int64(*doc)).map_err(|e| err("doc_key", e))?;
+        let Some(raw) = records.get((id.0, key.as_slice())).map_err(|e| err("get", e))? else {
+            continue;
+        };
+        let record =
+            codec::decode_doc_record(raw.value()).map_err(|e| err("decode_doc_record", e))?;
+        if record.deleted {
+            if floor.is_none_or(|f| record.stamp.hlc > f.hlc) {
+                tombstones.insert(*doc, record.stamp);
+            }
+        } else if meta.is_none() {
+            // no read of a collection shows this row, and the member holds it all the same
+            let body = record.document().map_err(|e| err("document", e))?;
+            live.insert(*doc, (record.stamp, format!("no collection held: {body:?}")));
+        }
+    }
+    Ok((live, tombstones))
 }
 
 impl View {
@@ -330,24 +569,17 @@ fn view(e: &Engine, name: &str, want: &Expected) -> Res<View> {
         .into_iter()
         .filter(|c| c.db == DB && c.name.starts_with(&format!("{name}.")))
         .filter(|c| SHADOWS || !kimmy_core::vector_meta::is_shadow(&c.name))
-        .map(|c| c.name)
-        .collect();
-    let mut documents = BTreeMap::new();
-    if let Some(meta) = &identity {
-        e.for_each_record_after(meta, None, WalkScope::Background, |id, stamp, doc| {
-            let DocId::Int64(n) = id else { panic!("an id the model never writes") };
-            documents.insert(n, (stamp, doc.to_string()));
-            Ok(true)
+        .map(|c| {
+            let created = kimmy_core::is_stage_name(&c.name).then_some(c.created);
+            (c.name, created)
         })
-        .map_err(|e| err("for_each_record_after", e))?;
-    }
+        .collect();
     let own_tombstone = e.collection_dropped_at(id).map_err(|e| err("collection_dropped_at", e))?;
     let database_tombstone =
         e.database_dropped_at(DB).map_err(|e| err("database_dropped_at", e))?;
     let txn = e.db().begin_read().map_err(|e| err("begin_read", e))?;
     let timeline =
         crate::register::timeline_read(&txn, DB, name).map_err(|e| err("timeline_read", e))?;
-    let parked = crate::register::parked_read(&txn, DB, name).map_err(|e| err("parked_read", e))?;
     let serves = match &resolved {
         None => Serves::Absent,
         Some(resolved) if resolved.physical == name => Serves::Identity,
@@ -370,32 +602,26 @@ fn view(e: &Engine, name: &str, want: &Expected) -> Res<View> {
     let invalid_held = timeline
         .events()
         .iter()
-        .chain(parked.events())
         .map(|(stamp, _)| *stamp)
         .filter(|stamp| want.answer.invalid.contains(stamp))
         .collect();
-    let mut tombstones = BTreeMap::new();
-    {
-        let records = txn.open_table(tables::DOCS).map_err(|e| err("open_table", e))?;
-        for doc in &want.touched {
-            let key = crate::docs::doc_key(&DocId::Int64(*doc)).map_err(|e| err("doc_key", e))?;
-            let Some(raw) = records.get((id.0, key.as_slice())).map_err(|e| err("get", e))? else {
-                continue;
-            };
-            let record =
-                codec::decode_doc_record(raw.value()).map_err(|e| err("decode_doc_record", e))?;
-            if record.deleted {
-                if want.floor_today().is_none_or(|f| record.stamp.hlc > f.hlc) {
-                    tombstones.insert(*doc, record.stamp);
-                }
-            } else if identity.is_none() {
-                // no read of a collection shows this row, and the member holds it all the same
-                let body = record.document().map_err(|e| err("document", e))?;
-                documents.insert(*doc, (record.stamp, format!("no collection held: {body:?}")));
-            }
-        }
+    let (documents, tombstones) =
+        documents_of(e, &txn, id, identity.as_ref(), &want.touched, want.floor_today())?;
+    let mut physicals = BTreeMap::new();
+    for (physical, touched) in &want.physicals {
+        let of = CollectionId::derive(DB, physical);
+        let meta = found(e.get_collection(DB, physical), "get_collection")?;
+        let (rows, tombstones) =
+            documents_of(e, &txn, of, meta.as_ref(), touched, want.floor_today())?;
+        let options = register_row(&txn, Carried::Options, of)?;
+        let names = register_row(&txn, Carried::Names, of)?;
+        let collection_tombstone =
+            e.collection_dropped_at(of).map_err(|e| err("collection_dropped_at", e))?;
+        let held = Physical { rows, tombstones, options, names, collection_tombstone };
+        physicals.insert(physical.clone(), held);
     }
     Ok(View {
+        seat: Seat::Member,
         serves,
         identity_stands: identity.is_some(),
         alive,
@@ -408,13 +634,14 @@ fn view(e: &Engine, name: &str, want: &Expected) -> Res<View> {
         database_tombstone,
         options: register_row(&txn, Carried::Options, id)?,
         names: register_row(&txn, Carried::Names, id)?,
+        physicals,
     })
 }
 
 /// What no member may still hold at quiescence, and what it must not hold at all: a purge hold, a staged carry row, a pull stored
-/// or registered, an event parked ahead of its position, a collection of no name, and a row of the options or names table under an
-/// id of no name.
-fn leftovers(e: &Engine, views: &[View]) -> Res<Vec<String>> {
+/// or registered, an event parked ahead of its position, a collection of no name, and a row of the options or names table whose
+/// id is neither one of the names' nor one of the physicals' the facts name.
+fn leftovers(e: &Engine, wants: &[(&str, &Expected)]) -> Res<Vec<String>> {
     let mut left = Vec::new();
     let txn = e.db().begin_read().map_err(|e| err("begin_read", e))?;
     for (what, rows) in [
@@ -435,13 +662,20 @@ fn leftovers(e: &Engine, views: &[View]) -> Res<Vec<String>> {
     if !stored.is_empty() {
         left.push(format!("a pull stored with {stored:?}"));
     }
-    for (what, table, ours) in [
-        ("options", Carried::Options, views.iter().filter(|v| v.options.is_some()).count()),
-        ("names", Carried::Names, views.iter().filter(|v| v.names.is_some()).count()),
-    ] {
-        let rows = register_rows(&txn, table)?;
-        if rows != ours as u64 {
-            left.push(format!("{rows} {what} rows, {ours} of them under a name's id"));
+    let known: Vec<[u8; 8]> = wants
+        .iter()
+        .flat_map(|(name, want)| {
+            std::iter::once(*name).chain(want.physicals.keys().map(String::as_str))
+        })
+        .map(|name| CollectionId::derive(DB, name).0.to_be_bytes())
+        .collect();
+    for (what, table) in [("options", Carried::Options), ("names", Carried::Names)] {
+        for (key, _) in carried_rows(&txn, table).map_err(|e| err("carried_rows", e))? {
+            if !known.iter().any(|id| key.starts_with(id)) {
+                left.push(format!(
+                    "the {what} table: a row under the id of no name and no physical: {key:02x?}"
+                ));
+            }
         }
     }
     for c in e.all_collections().map_err(|e| err("all_collections", e))? {
@@ -475,10 +709,17 @@ enum Column {
     EffectiveFloor,
     Options,
     Names,
+    // of the physicals, against the first member
+    PhysicalRows,
+    PhysicalTombstones,
+    PhysicalOptions,
+    PhysicalNames,
+    // of a swapped name's ended collections, against what is wanted of each view ([`tombstones_wanted`])
+    Presence,
 }
 
 /// The columns compared for a name, `swapped` or not (the module's note on floors; the documents of a swapped name have no oracle
-/// of their own and are compared between members).
+/// of their own and are compared between members; a plain name's own tombstone is [`Column::OwnTombstone`]'s).
 fn columns(swapped: bool) -> Vec<Column> {
     use Column::*;
     let all = [
@@ -497,14 +738,21 @@ fn columns(swapped: bool) -> Vec<Column> {
         EffectiveFloor,
         Options,
         Names,
+        PhysicalRows,
+        PhysicalTombstones,
+        PhysicalOptions,
+        PhysicalNames,
+        Presence,
     ];
     all.into_iter()
         .filter(|c| !(swapped && matches!(c, Floor | Documents | OwnTombstone | EffectiveFloor)))
+        .filter(|c| swapped || *c != Presence)
         .collect()
 }
 
 /// The function's register as storage keeps one: three kinds of event, a database drop being a logical drop. A binding or a
-/// recreation that a database drop made a drop at its own stamp needs the facts that make one; no schedule here draws them.
+/// recreation that a database drop made a drop at its own stamp needs a database drop over a stage; no schedule here has one, and
+/// this mapping does not make it.
 fn as_stored(register: &[(Stamp, FoldEvent)]) -> Vec<(Stamp, RegisterEvent)> {
     register
         .iter()
@@ -535,7 +783,7 @@ fn as_text(row: &Option<Vec<u8>>) -> String {
 }
 
 /// Both comparisons of one name over the members' views: each member against `want`, and each member after the first against the
-/// first.
+/// first. [`Column::Presence`] is held to what is wanted of each view's [`Seat`].
 fn compare(want: &Expected, views: &[View]) -> Vec<Difference> {
     let columns = columns(!want.answer.register.is_empty());
     let mut differences = Vec::new();
@@ -562,7 +810,13 @@ fn compare(want: &Expected, views: &[View]) -> Vec<Difference> {
                 want.pinned_at()
             )
         });
-        let alive: BTreeSet<String> = a.alive.keys().cloned().collect();
+        let alive: BTreeMap<String, Option<Hlc>> = a
+            .alive
+            .iter()
+            .map(|(physical, created)| {
+                (physical.clone(), kimmy_core::is_stage_name(physical).then_some(*created))
+            })
+            .collect();
         check(Column::Alive, v.alive == alive, &|| {
             format!("holds {:?}, the function {alive:?}", v.alive)
         });
@@ -609,6 +863,35 @@ fn compare(want: &Expected, views: &[View]) -> Vec<Difference> {
         check(Column::Names, v.names == first.names, &|| {
             format!("names row {:?}, the first {:?}", v.names, first.names)
         });
+        let rows = |v: &View| part(v, |p| (!p.rows.is_empty()).then(|| p.rows.clone()));
+        check(Column::PhysicalRows, rows(v) == rows(first), &|| {
+            format!("physicals' live rows {:?}, the first {:?}", rows(v), rows(first))
+        });
+        let dead = |v: &View| part(v, |p| (!p.tombstones.is_empty()).then(|| p.tombstones.clone()));
+        check(Column::PhysicalTombstones, dead(v) == dead(first), &|| {
+            format!("physicals' tombstones {:?}, the first {:?}", dead(v), dead(first))
+        });
+        let options = |v: &View| part(v, |p| p.options.clone());
+        check(Column::PhysicalOptions, options(v) == options(first), &|| {
+            format!("physicals' options rows {:?}, the first {:?}", options(v), options(first))
+        });
+        let names = |v: &View| part(v, |p| p.names.clone());
+        check(Column::PhysicalNames, names(v) == names(first), &|| {
+            format!("physicals' names rows {:?}, the first {:?}", names(v), names(first))
+        });
+        let held = |of: Option<&str>| match of {
+            None => v.own_tombstone,
+            Some(physical) => v.physicals.get(physical).and_then(|p| p.collection_tombstone),
+        };
+        let unmet: Vec<String> = tombstones_wanted(want, v.seat)
+            .into_iter()
+            .filter(|(of, wanted)| !wanted.is_met_by(held(*of)))
+            .map(|(of, wanted)| {
+                let name = of.unwrap_or("the identity");
+                format!("{name} of a {:?} holds {:?}, wanted {wanted:?}", v.seat, held(of))
+            })
+            .collect();
+        check(Column::Presence, unmet.is_empty(), &|| unmet.join("; "));
     }
     differences
 }
@@ -742,6 +1025,8 @@ fn entries(to: &Engine, from: &Engine) -> Res<()> {
 /// A member that joins by snapshot: a fresh engine, in no step of the schedule, so it writes nothing.
 struct Joiner {
     engine: Engine,
+    /// Where it joined: after the release, unless who made it says it joined while an event was parked.
+    seat: Seat,
     _dir: tempfile::TempDir,
 }
 
@@ -755,7 +1040,7 @@ impl Joiner {
         if applied == 0 {
             return Err("the join applied no page".into());
         }
-        let joiner = Joiner { engine, _dir: dir };
+        let joiner = Joiner { engine, seat: Seat::JoinerAfterRelease, _dir: dir };
         joiner.has_taken(source)?;
         Ok(joiner)
     }
@@ -810,11 +1095,12 @@ fn quiet(cluster: &mut Cluster, ledger: &Ledger, joiner: &Joiner, route: Route) 
         for e in members {
             views.push(view(e, name, &want)?);
         }
+        views[3].seat = joiner.seat;
         names.push((name, want, views));
     }
+    let wants: Vec<(&str, &Expected)> = names.iter().map(|(name, want, _)| (*name, want)).collect();
     for (m, e) in members.iter().enumerate() {
-        let of_member: Vec<View> = names.iter().map(|(_, _, views)| views[m].clone()).collect();
-        let left = leftovers(e, &of_member)?;
+        let left = leftovers(e, &wants)?;
         if !left.is_empty() {
             return Err(format!("member {m} at quiescence: {left:?}"));
         }
@@ -1038,15 +1324,31 @@ fn each_column_changed_on_one_member_is_reported() {
     );
     let above = Stamp { hlc: later.hlc.successor(), ..later };
     let below = Stamp { hlc: Hlc::new(dropped.hlc.wall_ms - 1, 0), ..dropped };
+    // every member holds one physical with something in each of its four parts, so that what a change of it must be reported by is
+    // its VALUE: which physicals have a part stays the same
+    const PHYSICAL: &str = "orders.__stg.x";
+    let of_the_physical = Physical {
+        rows: BTreeMap::from([(9, (above, "one".to_string()))]),
+        tombstones: BTreeMap::from([(8, above)]),
+        options: Some(vec![1]),
+        names: Some(vec![1]),
+        collection_tombstone: Some(above),
+    };
+    let mut views = views.clone();
+    for v in &mut views {
+        v.physicals.insert(PHYSICAL.into(), of_the_physical.clone());
+    }
+    let found = compare(want, &views);
+    assert!(found.is_empty(), "premise: the members agree with the physical held: {found:?}");
     type Change<'a> = Box<dyn Fn(&mut View) + 'a>;
     // an array with its type written out, so that each box and each list is coerced where it stands
-    let changes: [(&str, Change<'_>, &[Column]); 13] = [
+    let changes: [(&str, Change<'_>, &[Column]); 18] = [
         ("serves", Box::new(|v: &mut View| v.serves = Serves::Absent), &[Column::Serves]),
         ("identity", Box::new(|v: &mut View| v.identity_stands = false), &[Column::Identity]),
         (
             "a held stage",
             Box::new(|v: &mut View| {
-                v.alive.insert("orders.__stg.x".into());
+                v.alive.insert("orders.__stg.x".into(), None);
             }),
             &[Column::Alive],
         ),
@@ -1098,6 +1400,39 @@ fn each_column_changed_on_one_member_is_reported() {
         ),
         ("the options row", Box::new(|v: &mut View| v.options = Some(vec![0])), &[Column::Options]),
         ("a names row", Box::new(|v: &mut View| v.names = Some(vec![0])), &[Column::Names]),
+        (
+            "a physical's row",
+            Box::new(move |v: &mut View| {
+                let held = v.physicals.get_mut(PHYSICAL).unwrap();
+                held.rows.insert(9, (above, "another".to_string()));
+            }),
+            &[Column::PhysicalRows],
+        ),
+        (
+            "a physical's tombstone",
+            Box::new(move |v: &mut View| {
+                v.physicals.get_mut(PHYSICAL).unwrap().tombstones.insert(8, below);
+            }),
+            &[Column::PhysicalTombstones],
+        ),
+        (
+            "a physical's options row",
+            Box::new(|v: &mut View| v.physicals.get_mut(PHYSICAL).unwrap().options = Some(vec![0])),
+            &[Column::PhysicalOptions],
+        ),
+        (
+            "a physical's names row",
+            Box::new(|v: &mut View| v.physicals.get_mut(PHYSICAL).unwrap().names = Some(vec![0])),
+            &[Column::PhysicalNames],
+        ),
+        // compared only where a swapped name ended the collection, so of a plain name nothing
+        (
+            "a physical's collection tombstone",
+            Box::new(|v: &mut View| {
+                v.physicals.get_mut(PHYSICAL).unwrap().collection_tombstone = None;
+            }),
+            &[],
+        ),
     ];
     let mut wrong: Vec<String> = Vec::new();
     let mut covered = BTreeSet::new();
@@ -1118,13 +1453,47 @@ fn each_column_changed_on_one_member_is_reported() {
         columns(false).into_iter().collect::<BTreeSet<_>>(),
         "every column is changed once"
     );
-    // a swapped name's floor: neither the identity's own tombstone nor the effective floor is compared, and the database's is
+    // a held stage's creation stamp: with the stage wanted and held by every member, another stamp on one member is reported
+    let stage = "orders.__stg.x".to_string();
+    let mut with_a_stage = want.clone();
+    with_a_stage.answer.alive.insert(stage.clone(), dropped.hlc);
+    let mut holding = views.clone();
+    for v in &mut holding {
+        v.alive.insert(stage.clone(), Some(dropped.hlc));
+    }
+    let found = compare(&with_a_stage, &holding);
+    assert!(found.is_empty(), "premise: every member holds the stage as wanted: {found:?}");
+    holding[1].alive.insert(stage, Some(later.hlc));
+    let found = compare(&with_a_stage, &holding);
+    assert!(
+        matches!(found.as_slice(), [d] if d.column == Column::Alive && d.member == 1),
+        "a stage's creation stamp: {found:?}"
+    );
+    // a swapped name: of its floor neither the identity's own tombstone nor the effective floor is compared and the database's is,
+    // and its physicals, which only a swapped name has, are compared in all four; the tombstone of one it ended is wanted held
+    assert!(columns(true).contains(&Column::Presence), "a swapped name is held to its tombstones");
+    assert!(!columns(false).contains(&Column::Presence), "and a plain name is not");
     let mut swapped = want.clone();
     swapped.answer.register.push((above, FoldEvent::Drop));
-    for (what, change, _) in &changes {
-        if !matches!(*what, "the own tombstone" | "the database tombstone alone") {
-            continue;
-        }
+    swapped.answer.dead.insert(PHYSICAL.into(), above);
+    let found: Vec<Difference> =
+        compare(&swapped, &views).into_iter().filter(|d| d.column != Column::Register).collect();
+    assert!(found.is_empty(), "premise: the members agree on the swapped name: {found:?}");
+    let mut of_physicals = BTreeSet::new();
+    for (what, change, of_a_plain_name) in &changes {
+        let expected: BTreeSet<Column> = match *what {
+            "the own tombstone" => BTreeSet::new(),
+            "the database tombstone alone" => BTreeSet::from([Column::DatabaseTombstone]),
+            "a physical's collection tombstone" => BTreeSet::from([Column::Presence]),
+            "a physical's row"
+            | "a physical's tombstone"
+            | "a physical's options row"
+            | "a physical's names row" => {
+                of_physicals.extend(of_a_plain_name.iter().copied());
+                of_a_plain_name.iter().copied().collect()
+            }
+            _ => continue,
+        };
         let mut views = views.clone();
         change(&mut views[1]);
         let reported: BTreeSet<Column> = compare(&swapped, &views)
@@ -1132,13 +1501,9 @@ fn each_column_changed_on_one_member_is_reported() {
             .map(|d| d.column)
             .filter(|c| *c != Column::Register)
             .collect();
-        let expected: BTreeSet<Column> = if *what == "the own tombstone" {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([Column::DatabaseTombstone])
-        };
         assert_eq!(reported, expected, "a swapped name, {what}");
     }
+    assert_eq!(of_physicals.len(), 4, "premise: each physical column is changed on a swapped name");
     // PIN B, both ways: with a burial above the function's floor the burial is the floor wanted, so a member that holds it is not
     // reported, and one that holds the function's floor is
     let mut buried = want.clone();
@@ -1151,6 +1516,121 @@ fn each_column_changed_on_one_member_is_reported() {
         .map(|d| d.member)
         .collect();
     assert_eq!(reported, BTreeSet::from([0, 2, 3]), "PIN B");
+    // PIN P and the stamp pin, both ways: a stage a binding put in the identity's place, then a drop and a recreation. A, B, C,
+    // a joiner after the release and one from a member that held the binding parked, each holding what is wanted of it, are not
+    // reported; and each that holds anything else is reported, alone
+    let [bound_at, dropped_at, recreated_at, other] = [0, 1, 2, 3].map(|n| {
+        let hlc = Hlc::new(above.hlc.wall_ms + 1 + n, 0);
+        Stamp { hlc, ..above }
+    });
+    let mut bound = want.clone();
+    bound.answer.identity_stands = false;
+    bound.answer.register = vec![
+        (bound_at, FoldEvent::Bind { physical: PHYSICAL.into() }),
+        (dropped_at, FoldEvent::Drop),
+        (recreated_at, FoldEvent::Recreate { physical: "orders.recreated".into() }),
+    ];
+    bound.answer.dead = BTreeMap::from([(PHYSICAL.to_string(), dropped_at)]);
+    let seats = [
+        Seat::Member,
+        Seat::Member,
+        Seat::Member,
+        Seat::JoinerAfterRelease,
+        Seat::JoinerWhileParked,
+    ];
+    let pinned: Vec<View> = seats
+        .into_iter()
+        .map(|seat| {
+            let mut v = views[0].clone();
+            v.seat = seat;
+            let later = seat == Seat::JoinerAfterRelease;
+            v.own_tombstone = (!later).then_some(bound_at);
+            v.physicals.get_mut(PHYSICAL).unwrap().collection_tombstone =
+                Some(if later { recreated_at } else { dropped_at });
+            v
+        })
+        .collect();
+    let reported_under = |want: &Expected, views: &[View]| -> BTreeSet<usize> {
+        compare(want, views)
+            .iter()
+            .filter(|d| d.column == Column::Presence)
+            .map(|d| d.member)
+            .collect()
+    };
+    let reported = |views: &[View]| reported_under(&bound, views);
+    assert_eq!(reported(&pinned), BTreeSet::new(), "the pinned shape");
+    let identity = |held: Option<Stamp>| -> Change<'static> {
+        Box::new(move |v: &mut View| v.own_tombstone = held)
+    };
+    let stage = |held: Option<Stamp>| -> Change<'static> {
+        Box::new(move |v: &mut View| {
+            v.physicals.get_mut(PHYSICAL).unwrap().collection_tombstone = held;
+        })
+    };
+    let cases: [(&str, usize, Change<'_>); 12] = [
+        // PIN P
+        ("A without the identity's", 0, identity(None)),
+        ("C without the identity's", 2, identity(None)),
+        ("a joiner without a stage's", 3, stage(None)),
+        ("a joiner after the release with the identity's", 3, identity(Some(bound_at))),
+        ("a joiner while parked without the identity's", 4, identity(None)),
+        // the stamp pin
+        ("a joiner after the release at the drop's", 3, stage(Some(dropped_at))),
+        ("a member at the recreation's", 0, stage(Some(recreated_at))),
+        ("a joiner while parked at the recreation's", 4, stage(Some(recreated_at))),
+        ("a third stamp on a member", 1, stage(Some(other))),
+        ("a third stamp on a joiner", 3, stage(Some(other))),
+        ("a member with no stage tombstone", 1, stage(None)),
+        ("a joiner while parked with no stage tombstone", 4, stage(None)),
+    ];
+    let mut wrong = Vec::new();
+    for (what, member, change) in &cases {
+        let mut views = pinned.clone();
+        change(&mut views[*member]);
+        let found = reported(&views);
+        if found != BTreeSet::from([*member]) {
+            wrong.push(format!("{what}: expected view {member} alone, reported {found:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // where a pin's condition does not hold, it asks for nothing. Every view's stage tombstone is put at a stamp of no event,
+    // which the stamp pin sees on all five where it applies
+    let mut at_no_event = pinned.clone();
+    for v in &mut at_no_event {
+        stage(Some(other))(v);
+    }
+    assert_eq!(reported(&at_no_event), BTreeSet::from([0, 1, 2, 3, 4]), "premise: the pin applies");
+    let binding = (bound_at, FoldEvent::Bind { physical: PHYSICAL.into() });
+    let unmet_conditions = [
+        // no binding bound the name out, so the joiner after the release is reported, alone, for the identity it lacks; and
+        // no binding bound the stage, so no stamp is asked of it
+        ("a drop alone", vec![(dropped_at, FoldEvent::Drop)], BTreeSet::<usize>::from([3])),
+        // the drop is not the next event after the stage's binding
+        (
+            "another binding next, then the drop",
+            vec![
+                binding.clone(),
+                (dropped_at, FoldEvent::Bind { physical: "orders.__stg.y".into() }),
+                (recreated_at, FoldEvent::Drop),
+            ],
+            BTreeSet::new(),
+        ),
+        // the next event is a drop of the database, not of the name
+        (
+            "a drop of the database next",
+            vec![
+                binding,
+                (dropped_at, FoldEvent::DatabaseDrop),
+                (recreated_at, FoldEvent::Recreate { physical: "orders.recreated".into() }),
+            ],
+            BTreeSet::new(),
+        ),
+    ];
+    for (what, register, wanted) in unmet_conditions {
+        let mut want = bound.clone();
+        want.answer.register = register;
+        assert_eq!(reported_under(&want, &at_no_event), wanted, "{what}");
+    }
 }
 
 // -- The generated run: the measured floor ------------------------------------------------------
@@ -1442,10 +1922,10 @@ const MEASURED: &[(&[Kind], usize, usize, &[Column])] = &[
 ];
 
 /// The columns that held nothing in any set of kinds of the library's seeds: empty on both sides, so that their agreeing shows
-/// nothing anywhere. No step drawn here is of a swap, so nothing gives the stages held, the register, what is superseded, the
-/// invalid facts or the names rows anything. The document tombstones are another kind of empty: the seeds draw deletes, and none
-/// leaves a tombstone above the floor (longer runs see some; the documents row's delete reads one). A column that holds nothing is
-/// still compared, and any difference in it still fails.
+/// nothing anywhere. No step drawn here is of a swap, so the seeds put nothing in the stages held, the register, what is
+/// superseded, the invalid facts, the names rows or any column of a physical. The document tombstones are another kind of empty:
+/// the seeds draw deletes, and none leaves a tombstone above the floor (longer runs see some; the documents row's delete reads
+/// one). A column that holds nothing is still compared, and any difference in it still fails.
 const NOTHING_SEEN: &[Column] = &[
     Column::Alive,
     Column::Register,
@@ -1453,10 +1933,15 @@ const NOTHING_SEEN: &[Column] = &[
     Column::Invalid,
     Column::Tombstones,
     Column::Names,
+    Column::PhysicalRows,
+    Column::PhysicalTombstones,
+    Column::PhysicalOptions,
+    Column::PhysicalNames,
 ];
 
 /// Whether `column` holds something on at least one side for this member of this name: against the function, the member's read or
-/// the function's value; against the first member, this member's or the first's. Where it holds nothing, its agreeing says nothing.
+/// the function's value; against the first member, this member's or the first's; for the tombstones wanted, this member's or what
+/// is wanted of it. Where it holds nothing, its agreeing says nothing.
 fn shows(column: Column, want: &Expected, v: &View, first: &View) -> bool {
     let a = &want.answer;
     match column {
@@ -1481,7 +1966,24 @@ fn shows(column: Column, want: &Expected, v: &View, first: &View) -> bool {
         }
         Column::Options => v.options.is_some() || first.options.is_some(),
         Column::Names => v.names.is_some() || first.names.is_some(),
+        Column::PhysicalRows => [v, first].into_iter().any(|v| of_any(v, |p| !p.rows.is_empty())),
+        Column::PhysicalTombstones => {
+            [v, first].into_iter().any(|v| of_any(v, |p| !p.tombstones.is_empty()))
+        }
+        Column::PhysicalOptions => {
+            [v, first].into_iter().any(|v| of_any(v, |p| p.options.is_some()))
+        }
+        Column::PhysicalNames => [v, first].into_iter().any(|v| of_any(v, |p| p.names.is_some())),
+        Column::Presence => {
+            of_any(v, |p| p.collection_tombstone.is_some())
+                || !tombstones_wanted(want, v.seat).is_empty()
+        }
     }
+}
+
+/// Whether `holds` is true of what the member holds of some physical.
+fn of_any(view: &View, holds: impl Fn(&Physical) -> bool) -> bool {
+    view.physicals.values().any(holds)
 }
 
 /// Of the columns `seen` to hold something in some name of a set of kinds, those that never did.
@@ -1495,16 +1997,17 @@ fn held_nothing(seen: Option<&BTreeSet<Column>>) -> BTreeSet<Column> {
 fn a_column_holds_something_where_either_side_does() {
     use Column::*;
     let against_the_function =
-        [Serves, Identity, Floor, Alive, Register, Superseded, Invalid, Documents];
+        [Serves, Identity, Floor, Alive, Register, Superseded, Invalid, Documents, Presence];
     let cluster = Cluster::new(base());
     let author = cluster.e(0);
     let stamp = Stamp::new(Hlc::new(1, 0), author.node_id(), author.epoch());
     let stage = || "orders.__stg.x".to_string();
     let no_function = Ledger::default().expected(NAMES[0]);
     let no_member = View {
+        seat: Seat::Member,
         serves: kimmy_core::register_function::Serves::Absent,
         identity_stands: false,
-        alive: BTreeSet::new(),
+        alive: BTreeMap::new(),
         register: Vec::new(),
         superseded: BTreeMap::new(),
         invalid_held: BTreeSet::new(),
@@ -1514,6 +2017,7 @@ fn a_column_holds_something_where_either_side_does() {
         database_tombstone: None,
         options: None,
         names: None,
+        physicals: BTreeMap::new(),
     };
     let mut wrong = Vec::new();
     let mut check = |held: bool, wanted: bool, what: String| {
@@ -1521,7 +2025,8 @@ fn a_column_holds_something_where_either_side_does() {
             wrong.push(what);
         }
     };
-    for column in columns(false) {
+    let every_column: BTreeSet<Column> = columns(false).into_iter().chain(columns(true)).collect();
+    for column in every_column {
         let mut member = no_member.clone();
         match column {
             Serves => member.serves = kimmy_core::register_function::Serves::Identity,
@@ -1529,7 +2034,7 @@ fn a_column_holds_something_where_either_side_does() {
             Floor | EffectiveFloor | OwnTombstone => member.own_tombstone = Some(stamp),
             DatabaseTombstone => member.database_tombstone = Some(stamp),
             Alive => {
-                member.alive.insert(stage());
+                member.alive.insert(stage(), Some(stamp.hlc));
             }
             Register => member.register.push((stamp, RegisterEvent::LogicalDrop)),
             Superseded => {
@@ -1546,6 +2051,21 @@ fn a_column_holds_something_where_either_side_does() {
             }
             Options => member.options = Some(vec![0]),
             Names => member.names = Some(vec![0]),
+            PhysicalRows => {
+                member.physicals.entry(stage()).or_default().rows.insert(1, (stamp, String::new()));
+            }
+            PhysicalTombstones => {
+                member.physicals.entry(stage()).or_default().tombstones.insert(1, stamp);
+            }
+            PhysicalOptions => {
+                member.physicals.entry(stage()).or_default().options = Some(vec![0]);
+            }
+            PhysicalNames => {
+                member.physicals.entry(stage()).or_default().names = Some(vec![0]);
+            }
+            Presence => {
+                member.physicals.entry(stage()).or_default().collection_tombstone = Some(stamp);
+            }
         }
         let neither = shows(column, &no_function, &no_member, &no_member);
         check(neither, false, format!("{column:?}: neither side holds anything"));
@@ -1575,6 +2095,9 @@ fn a_column_holds_something_where_either_side_does() {
             }
             Documents => {
                 function.documents.insert(1, stamp);
+            }
+            Presence => {
+                function.answer.dead.insert(stage(), stamp);
             }
             other => panic!("{other:?} is not compared with the function"),
         }
