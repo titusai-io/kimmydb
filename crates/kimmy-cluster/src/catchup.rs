@@ -279,6 +279,8 @@ pub struct CatchUp {
     /// reads this state, and let go when the guard passes. Apart from the marker: it holds with
     /// none set, and neither the wait nor a clear lets it go. A halted host keeps it.
     guard_hold: AtomicBool,
+    /// What the guard's last undecided round waits on, while it holds this member (ADR-274).
+    guard_waits: Mutex<Option<GuardWaits>>,
     /// The owed latch (ADR-212): the marker's clear rule held while members still
     /// owed the replay past their hold, so the member serves as `unknown`.
     owed_open: AtomicBool,
@@ -480,6 +482,7 @@ impl CatchUp {
             state: Mutex::new(State { marker: None, reached: BTreeMap::new(), warned: None }),
             created_this_run: AtomicBool::new(false),
             guard_hold: AtomicBool::new(false),
+            guard_waits: Mutex::new(None),
             owed_open: AtomicBool::new(false),
             snapshot_marked: AtomicBool::new(false),
         });
@@ -584,6 +587,7 @@ impl CatchUp {
     /// answer is what is left.
     pub fn release_guard_hold(&self) {
         self.guard_hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.guard_waits.lock() = None;
     }
 
     /// Whether the guard's hold is on.
@@ -592,17 +596,13 @@ impl CatchUp {
     }
 
     /// Keep what the guard's last round waits on, for `/readyz` to say while the hold is on.
-    ///
-    /// **Scaffold of the tests commit**: keeps nothing.
-    // Read by the tests alone until the code commit.
-    #[allow(dead_code)]
-    pub(crate) fn note_guard_waits(&self, _waits: GuardWaits) {}
+    pub(crate) fn note_guard_waits(&self, waits: GuardWaits) {
+        *self.guard_waits.lock() = Some(waits);
+    }
 
     /// What the guard is waiting on, while it holds this member and a round has decided nothing.
-    ///
-    /// **Scaffold of the tests commit**: never anything.
     pub fn guard_waits(&self) -> Option<GuardWaits> {
-        None
+        self.held_by_guard().then(|| self.guard_waits.lock().clone()).flatten()
     }
 
     /// Whether this member does no owner work: the guard holds it, or its marker is set, the wait

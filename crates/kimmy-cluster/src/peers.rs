@@ -15,7 +15,8 @@ use crate::membership::Members;
 use crate::protocol::ProtocolError;
 use crate::repair_ledger::Judged;
 use crate::transport::{
-    Dialled, DivergenceProbe, PeerStalls, Repair, dial_for_round, sync_once_dialled, sync_once_with,
+    Dialled, DivergenceProbe, PeerStalls, Repair, dial_for_round, dial_unlisted, sync_once_dialled,
+    sync_once_with,
 };
 
 /// How often to run a round against every known peer.
@@ -955,6 +956,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
         }
     }
     let mut resolving: Option<Resolving> = None;
+    // The dials of seeds that membership does not list, of the last discovery: owned by the loop,
+    // so that they end with it.
+    let mut unlisted_dials = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
@@ -1023,6 +1027,35 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 discovered = found;
                 discoveries += 1;
                 debug!(count = discovered.len(), "resolved peers");
+                // A round goes to the members that membership lists, whenever it lists any, so a
+                // seed it does not list is dialled here, once for each discovery (ADR-274): a
+                // restore that its guard holds has joined no membership, and one whose seeds name
+                // nobody is answered only by whoever dials it. Seeds alone, as discovery resolves
+                // them, and never an address that an answer named.
+                if let Some(members) = &config.members
+                    && !members.is_empty()
+                {
+                    // One batch at a time: any dial of the last still out is ended, and what has
+                    // ended is taken out of the set.
+                    unlisted_dials.abort_all();
+                    while unlisted_dials.try_join_next().is_some() {}
+                    let listed = members.snapshot();
+                    let unlisted = discovered.iter().copied().filter(|seed| {
+                        !listed.contains(seed)
+                            && *seed != config.local
+                            && !self_addresses.contains_key(seed)
+                    });
+                    for seed in unlisted {
+                        // UNSUPERVISED: one bounded dial, whose panic ends that dial only; the set
+                        // aborts it with the loop.
+                        unlisted_dials.spawn(dial_unlisted(
+                            Arc::clone(&engine),
+                            seed,
+                            config.secret.clone(),
+                            members.clone(),
+                        ));
+                    }
+                }
                 // The last tick found nobody, and this answer names someone it had
                 // not: it gets its early tick now rather than at the next one of the
                 // ticker's own. An answer that changes nothing (a lone member whose

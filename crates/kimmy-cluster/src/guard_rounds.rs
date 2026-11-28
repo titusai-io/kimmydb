@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use crate::catchup::GuardWaits;
 use crate::membership::Members;
 use crate::protocol::{GuardAnswer, Standing};
 use crate::transport::probe_answer;
@@ -68,24 +69,23 @@ impl Asking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// A running member answered and no running host of the asking node did, or `--replace` was
-    /// given. With every address the deciding round was named, for the member to be offered.
-    Pass { named: Vec<SocketAddr> },
+    /// given. With every address the deciding round asked, the seeds and whatever was named, but
+    /// the asker's own: what its membership is to be offered.
+    Pass { offer: Vec<SocketAddr> },
     /// A running host of the asking node answered, from this address.
     LiveHost(SocketAddr),
 }
 
 /// Let a passed restore in, in rule 5's order: first its membership, which is offered `offer`,
 /// and only then `open`, which lets go of what the guard held.
-///
-/// **Scaffold of the tests commit**: opens first. The daemon does not call it yet.
 pub async fn let_in<M, F, O>(offer: Vec<SocketAddr>, membership: M, open: O)
 where
     M: FnOnce(Vec<SocketAddr>) -> F,
     F: Future<Output = ()>,
     O: FnOnce(),
 {
-    open();
     membership(offer).await;
+    open();
 }
 
 /// Ask, round after round, until one decides. `seeds` is resolved again for each round;
@@ -113,9 +113,12 @@ where
             return decision;
         }
         let waiting = round.waiting_on();
+        if let Some(catch_up) = members.catch_up() {
+            catch_up.note_guard_waits(waiting.clone());
+        }
         if said.as_ref() != Some(&waiting) {
             info!(
-                asked = round.asked.len(),
+                asked = waiting.asked,
                 undecided = waiting.undecided,
                 uncounted = waiting.uncounted,
                 silent_named = ?waiting.silent_named,
@@ -196,16 +199,6 @@ struct Heard {
     lists: BTreeSet<SocketAddr>,
 }
 
-/// What a round that decided nothing was waiting on.
-#[derive(PartialEq, Eq)]
-struct Waiting {
-    /// The answers from members that are undecided themselves.
-    undecided: usize,
-    /// The open answers that do not count.
-    uncounted: usize,
-    silent_named: BTreeSet<SocketAddr>,
-}
-
 type Probed = (SocketAddr, Option<(NodeId, Option<Box<GuardAnswer>>)>);
 
 /// One round: what it has asked, and what has answered.
@@ -217,7 +210,6 @@ struct Round<'a> {
     /// The probes not yet ended, with when each began.
     waiting: BTreeMap<SocketAddr, Instant>,
     probes: JoinSet<Probed>,
-    named: BTreeSet<SocketAddr>,
     named_for_me: BTreeSet<SocketAddr>,
     answered: BTreeSet<SocketAddr>,
     open: Vec<Heard>,
@@ -235,7 +227,6 @@ impl<'a> Round<'a> {
             asked: BTreeSet::new(),
             waiting: BTreeMap::new(),
             probes: JoinSet::new(),
-            named: BTreeSet::new(),
             named_for_me: BTreeSet::new(),
             answered: BTreeSet::new(),
             open: Vec::new(),
@@ -289,7 +280,6 @@ impl<'a> Round<'a> {
         self.named_for_me.extend(&lists);
         let members = answer.members.iter().filter_map(|(addr, _)| addr.parse().ok());
         for addr in members.chain(lists.iter().copied()).collect::<Vec<_>>() {
-            self.named.insert(addr);
             self.ask(addr);
         }
         let counts = !answer.founded_unmet
@@ -360,17 +350,19 @@ impl<'a> Round<'a> {
             .collect()
     }
 
-    fn waiting_on(&self) -> Waiting {
-        Waiting {
+    fn waiting_on(&self) -> GuardWaits {
+        GuardWaits {
+            asked: self.asked.len(),
             undecided: self.undecided,
             uncounted: self.uncounted,
-            silent_named: self.silent_named(),
+            silent_named: self.silent_named().into_iter().collect(),
         }
     }
 
     /// The verdict on a round that has ended, or `None`: nothing is decided.
     async fn verdict(&mut self, members: &Members) -> Option<Decision> {
-        let pass = Decision::Pass { named: self.named.iter().copied().collect() };
+        let offer = self.asked.iter().copied().filter(|addr| !self.own.contains(addr)).collect();
+        let pass = Decision::Pass { offer };
         if self.asking.replace {
             return Some(pass);
         }

@@ -765,10 +765,22 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
             crate::error::ErrorCode::CatchingUp,
             GUARD_HOLDS_CLIENTS.to_string(),
         );
-        refusal.extra = Some(Box::new(serde_json::Map::from_iter([(
+        let mut extra = serde_json::Map::from_iter([(
             "reason".to_string(),
             json!(kimmy_cluster::catchup::GUARD_HOLD_LABEL),
-        )])));
+        )]);
+        // What its guard's last round waits on, once a round has decided nothing.
+        if let Some(waits) = state.catch_up().and_then(|c| c.guard_waits()) {
+            let silent: Vec<String> = waits.silent_named.iter().map(ToString::to_string).collect();
+            let waiting_on = json!({
+                "asked": waits.asked,
+                "undecided": waits.undecided,
+                "uncounted": waits.uncounted,
+                "silent_named": silent,
+            });
+            extra.insert("waiting_on".to_string(), waiting_on);
+        }
+        refusal.extra = Some(Box::new(extra));
         return Err(refusal);
     }
     let catching_up = state.catch_up().filter(|c| c.is_set());

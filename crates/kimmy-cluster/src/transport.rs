@@ -2148,6 +2148,22 @@ pub(crate) async fn probe_answer(
     attempt.await
 }
 
+/// One dial of a seed that membership does not list (ADR-274), made for what its handshake alone
+/// does: a member its guard holds, which has joined no membership and which nobody would
+/// otherwise dial, is handed this member's report. No round runs on it, and nothing is counted or
+/// backed off, whatever it ends in.
+pub(crate) async fn dial_unlisted(
+    engine: Arc<Engine>,
+    peer: SocketAddr,
+    secret: String,
+    members: Members,
+) {
+    match dial(&engine, peer, &secret, Some(&members)).await {
+        Ok((mut stream, _)) => close(&mut stream).await,
+        Err(e) => debug!(%peer, error = %e, "dialled a seed that membership does not list"),
+    }
+}
+
 /// A connection [`dial`] opened for a round that has not started: dialled with the
 /// tick's other peers at once, and used when its peer's turn comes.
 pub(crate) struct Dialled {

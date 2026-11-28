@@ -2751,9 +2751,22 @@ async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<std::net::So
     addresses
 }
 
+/// What a passed guard lets go (ADR-274), made where the cluster is started so that nothing else
+/// holds the means to.
+struct LetIn {
+    hold: Arc<kimmy_cluster::catchup::CatchUp>,
+    /// Starts membership.
+    join: tokio::sync::watch::Sender<bool>,
+    /// Offers membership an address to announce this member to.
+    offer: tokio::sync::mpsc::Sender<std::net::SocketAddr>,
+    /// The cluster's gate: `Some(true)` lets this member dial, `Some(false)` says it is halted.
+    gate: tokio::sync::watch::Sender<Option<bool>>,
+}
+
 /// Run the mistaken-restore guard for a restored or rewound epoch (ADR-274): ask, round after
 /// round, what the members the seeds name say, and whatever they name, until a round decides or
-/// a running host of this node is heard. A pass lets the hold go and opens the gate; a running
+/// a running host of this node is heard. A pass starts membership, offers it every address the
+/// deciding round asked, and then lets the hold go and opens the gate, in that order; a running
 /// host of this node halts this one. With nothing to decide it asks for ever: no time passes it.
 /// Then the bit that a peer was met is written once the first handshake has completed, from here
 /// and never from inside a contact.
@@ -2762,8 +2775,7 @@ fn spawn_guard(
     members: kimmy_cluster::Members,
     config: &Config,
     secret: String,
-    hold: Arc<kimmy_cluster::catchup::CatchUp>,
-    gate: tokio::sync::watch::Sender<Option<bool>>,
+    to_let_in: LetIn,
 ) {
     let data_dir = config.storage.data_dir.clone();
     let seeds: Arc<[kimmy_cluster::SeedSource]> = config.cluster.seeds.clone().into();
@@ -2786,13 +2798,29 @@ fn spawn_guard(
             async move { seed_addresses(&seeds).await }
         })
         .await;
+        let LetIn { hold, join, offer, gate } = to_let_in;
         match decision {
-            kimmy_cluster::guard_rounds::Decision::Pass { .. } => {
+            kimmy_cluster::guard_rounds::Decision::Pass { offer: addresses } => {
                 // Said before anything the guard holds back is let go, so whatever a log or a
                 // client shows ahead of this line was done while the guard had not passed.
                 info!("the mistaken-restore guard passed; this host may join its cluster");
-                hold.release_guard_hold();
-                let _ = gate.send(Some(true));
+                kimmy_cluster::guard_rounds::let_in(
+                    addresses,
+                    move |addresses: Vec<std::net::SocketAddr>| async move {
+                        let _ = join.send(true);
+                        for address in addresses {
+                            // Membership takes each; one that has stopped ends the offering.
+                            if offer.send(address).await.is_err() {
+                                break;
+                            }
+                        }
+                    },
+                    move || {
+                        hold.release_guard_hold();
+                        let _ = gate.send(Some(true));
+                    },
+                )
+                .await;
             }
             kimmy_cluster::guard_rounds::Decision::LiveHost(address) => {
                 warn!(
@@ -2888,7 +2916,8 @@ async fn spawn_cluster(
     // until the guard has passed: the replication task waits on this gate. The listener serves
     // from the start, and while the hold is on it answers every dialler at once that this member
     // is undecided, and hears the dialler's report; a halted member answers nobody. The guard asks
-    // the seeds and whatever they name. SWIM runs meanwhile. Any other member passes at once.
+    // the seeds and whatever they name. It takes no part in membership meanwhile. Any other member
+    // passes at once.
     let hold = state.catch_up().filter(|catch_up| catch_up.held_by_guard()).cloned();
     let guarded = hold.is_some();
     let (gate_tx, gate_rx) =
@@ -2928,24 +2957,35 @@ async fn spawn_cluster(
         // The same secret the replication handshake uses: membership is
         // authenticated too, so an unauthenticated node cannot join the member
         // set that webhook ownership is computed over (ADR-053).
-        cluster_tasks.push(kimmy_task::supervise(
-            "membership",
+        let membership = kimmy_cluster::membership::run(
+            socket,
+            advertised(local),
+            engine.node_id(),
+            incarnation,
+            secret.clone(),
+            live.clone(),
+            feed,
             shutdown.clone(),
-            kimmy_cluster::membership::run(
-                socket,
-                advertised(local),
-                engine.node_id(),
-                incarnation,
-                secret.clone(),
-                live.clone(),
-                feed,
-                shutdown.clone(),
-            ),
-        ));
+        );
+        // A member the guard holds takes no part in membership until it is let in (ADR-274): it
+        // answers no datagram and sends none. The socket is bound and the incarnation recorded
+        // all the same, so that a start which cannot have them fails as a start. One that is
+        // never let in waits here until the stop.
+        let (join, joined) = tokio::sync::watch::channel(!guarded);
+        cluster_tasks.push(kimmy_task::supervise("membership", shutdown.clone(), async move {
+            let mut joined = joined;
+            // The answer alone is kept: what the wait hands back holds a lock of the channel.
+            let let_in = joined.wait_for(|joined| *joined).await.is_ok();
+            if !let_in {
+                std::future::pending::<()>().await;
+            }
+            membership.await
+        }));
         members = Some(live);
-        announce = Some(tx);
+        announce = Some(tx.clone());
         if let (Some(hold), Some(live)) = (hold, members.clone()) {
-            spawn_guard(Arc::clone(&engine), live, config, secret.clone(), hold, gate_tx);
+            let to_let_in = LetIn { hold, join, offer: tx, gate: gate_tx };
+            spawn_guard(Arc::clone(&engine), live, config, secret.clone(), to_let_in);
         }
     } else {
         warn!("SWIM membership is disabled; peers come from discovery alone");
