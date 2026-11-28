@@ -331,7 +331,7 @@ struct Replay {
     /// When each peer began answering `BeyondHorizon` without an answer between:
     /// the replay gives up on it after the wait.
     horizon_since: BTreeMap<NodeId, Instant>,
-    /// When the replay was armed.
+    /// When the replay was armed; on a member that its guard held, when the guard let it go.
     armed_at: Option<Instant>,
     /// The lowest position the replay would have asked from before the clamp to
     /// the retention: what the retention `WARN` compares the horizon with.
@@ -342,7 +342,7 @@ struct Replay {
     /// loaded from the floor file) are here: an origin named only in a vector is
     /// not, since a member that has gone for good keeps its id in every vector.
     owing: BTreeMap<NodeId, Owing>,
-    /// When each member was first present in this run (loaded ones: the arming):
+    /// When each member was first present in this run (loaded ones: `armed_at`):
     /// its hold runs for the wait from the later of this and `armed_at`. Never
     /// removed during the run, so a member that leaves and comes back gets no
     /// second hold.
@@ -592,10 +592,26 @@ impl CatchUp {
     /// The guard has passed: what [`Self::hold_for_guard`] held is let go. The marker's own
     /// answer is what is left.
     pub fn release_guard_hold(&self) {
+        // Before the release can be seen by anything that ticks the replay.
+        self.restart_replay_clocks(Instant::now());
         self.guard_hold.store(false, std::sync::atomic::Ordering::SeqCst);
         *self.guard_waits.lock() = None;
         // Wakes what waits for it ([`Self::guard_released`]).
         self.changes.send_modify(|n| *n += 1);
+    }
+
+    /// Start again, at `now`, what the arming of the replay started the clock of (ADR-212): the
+    /// wait, and for each member its floor file names as owing, the wait and the dwell. Nothing
+    /// looks for a member while the guard holds this one (ADR-274), and the hold has no end of
+    /// its own, so none of that time counts against them.
+    fn restart_replay_clocks(&self, now: Instant) {
+        let mut replay = self.replay.lock();
+        let replay = &mut *replay;
+        replay.armed_at = Some(now);
+        for (node, owing) in &mut replay.owing {
+            replay.first_seen.insert(*node, now);
+            owing.absent_since = Some(now);
+        }
     }
 
     /// Wait until the guard's hold is off: at once where it is not on.
@@ -934,8 +950,9 @@ impl CatchUp {
     /// The members the last run's file names as owing (`owed =` lines, ADR-212)
     /// owe again, as absent from `now` and first seen at `now`: a member that was
     /// down while this one restarted is still waited on for the dwell, and holds
-    /// a marked member's clear for the wait. A rewrite of the floor here carries
-    /// those lines.
+    /// a marked member's clear for the wait. A guard's release starts both again
+    /// ([`Self::release_guard_hold`]). A rewrite of the floor here carries those
+    /// lines.
     pub fn arm_replay_at(
         &self,
         at_open: kimmy_core::Hlc,
