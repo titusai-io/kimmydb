@@ -331,6 +331,43 @@ async fn a_seed_membership_does_not_list_is_dialled_and_no_failure_of_it_counted
     }
 }
 
+/// Row 38 (M3): a restore that passed as alone is marked again at its first handshake with
+/// another node, before that contact goes on, on a contact it dials as on one it takes.
+#[tokio::test]
+async fn a_restore_that_passed_alone_is_marked_before_its_first_contact_goes_on() {
+    for dials in [true, false] {
+        let (restore, _r) = arc_engine();
+        let (other, _o) = arc_engine();
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up = CatchUp::open(dir.path(), Duration::from_secs(120));
+        let alone = crate::guard_rounds::AtPass { alone: true, ..Default::default() };
+        catch_up.at_guard_pass(&restore, &alone).unwrap();
+        let members = Members::default();
+        members.set_catch_up(Arc::clone(&catch_up));
+        assert!(!catch_up.is_set() && !restore.has_met_a_peer(), "premise: unmarked, unmet");
+        let served = if dials {
+            let (addr, task) = serving(&other, &Members::default()).await;
+            dialled(&restore, addr, &members).await.expect("they meet");
+            task
+        } else {
+            let (addr, task) = serving(&restore, &members).await;
+            dialled(&other, addr, &Members::default()).await.expect("they meet");
+            // The dialler is done once it has sent its proof; the dialled side believes it a
+            // moment later.
+            let until = Instant::now() + Duration::from_secs(5);
+            while !restore.has_met_a_peer() {
+                assert!(Instant::now() < until, "the dialled side never met the dialler");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            task
+        };
+        let reason = catch_up.reason();
+        served.abort();
+        let marked = Some(crate::CatchUpReason::Restored);
+        assert_eq!(reason, marked, "marked at the contact, dials: {dials}");
+    }
+}
+
 /// Row 43: what an answer says of the member is the member's own: its standing, how long it has
 /// been a member, whether it founded its store and has met nobody, and a token that is its
 /// process's.

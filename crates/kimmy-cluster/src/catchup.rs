@@ -781,6 +781,24 @@ impl CatchUp {
         Ok(())
     }
 
+    /// Settle this member's marker as its guard's pass says (ADR-274), before the guard's hold is
+    /// let go.
+    ///
+    /// **Scaffold of the tests commit**: does nothing.
+    pub fn at_guard_pass(
+        self: &Arc<Self>,
+        _engine: &kimmy_storage::Engine,
+        _at_pass: &crate::guard_rounds::AtPass,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// The members the start-race guard waits to see before a clear: every origin a reached
+    /// peer's vectors named in this run, and every node a guard's pass named.
+    pub fn awaited_members(&self) -> BTreeSet<NodeId> {
+        self.replay.lock().origins.clone()
+    }
+
     /// Remove the marker: `how` says which rule cleared it.
     pub fn clear(&self, how: &str) {
         let mut state = self.state.lock();
@@ -1906,6 +1924,46 @@ mod tests {
         f.catchup.release_guard_hold();
         assert!(!f.catchup.gated(past_the_wait), "released, the wait's answer is back");
         assert!(f.catchup.gated(now), "and the marker's own");
+    }
+
+    fn an_engine() -> (kimmy_storage::Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        (engine, dir)
+    }
+
+    /// Row 40 (M2, "ensure"): a pass that is not alone leaves a restored store marked, writing
+    /// the marker where the restore left none, and does not set again one that is there. A pass
+    /// that is alone discards it (M1).
+    #[test]
+    fn a_pass_ensures_the_marker_or_discards_it_where_it_is_alone() {
+        let (engine, _store) = an_engine();
+        let not_alone = crate::guard_rounds::AtPass::default();
+        let dir = tempfile::tempdir().unwrap();
+        let unmarked = CatchUp::open(dir.path(), Duration::from_secs(120));
+        unmarked.hold_for_guard();
+        unmarked.at_guard_pass(&engine, &not_alone).unwrap();
+        assert_eq!(unmarked.reason(), Some(CatchUpReason::Restored), "written where it was not");
+        assert!(dir.path().join(FILE).exists());
+
+        // With no wait at all it is open at once, so that setting it again would gate it again
+        // and wake what waits on the gate.
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), CatchUpReason::Restored).unwrap();
+        let marked = CatchUp::open(dir.path(), Duration::ZERO);
+        marked.first_tick(Instant::now());
+        // Past it by more than the millisecond it is counted in.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!marked.gated(Instant::now()), "premise: the wait has run out");
+        let woken = marked.subscribe();
+        marked.at_guard_pass(&engine, &not_alone).unwrap();
+        assert!(!woken.has_changed().unwrap(), "not set again");
+        assert!(marked.is_set() && !marked.gated(Instant::now()));
+
+        let alone = crate::guard_rounds::AtPass { alone: true, ..Default::default() };
+        marked.at_guard_pass(&engine, &alone).unwrap();
+        assert!(!marked.is_set(), "alone: discarded");
+        assert!(!dir.path().join(FILE).exists());
     }
 
     #[test]
@@ -3562,6 +3620,28 @@ mod tests {
                 "{membership}"
             );
         }
+    }
+
+    /// Row 15 (rule 5): the names a guard's pass hands over hold the clear for a member that no
+    /// reached peer's vectors name and membership has not listed yet, until it is seen.
+    #[test]
+    fn the_names_of_a_pass_hold_the_clear_until_each_is_seen() {
+        let (f, t0) = restored_armed();
+        let (engine, _store) = an_engine();
+        let names = [node(1), node(2)].into();
+        let at_pass = crate::guard_rounds::AtPass { names, alone: false };
+        f.catchup.at_guard_pass(&engine, &at_pass).unwrap();
+        let b = [peer_b()];
+        assert_eq!(
+            judge(&f.catchup, &members_of(&[1]), &b, &covering(), t0 + secs(5)),
+            Decision::Kept,
+            "member 2 was named at the pass and has not been seen"
+        );
+        f.catchup.replay_finished(node(2));
+        assert_eq!(
+            judge(&f.catchup, &members_of(&[1, 2]), &b, &covering(), t0 + secs(6)),
+            Decision::Cleared("dominance")
+        );
     }
 
     /// `cluster.expected_members` holds the clear within the guard's

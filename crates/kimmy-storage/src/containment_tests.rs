@@ -455,3 +455,48 @@ fn a_restore_starts_without_the_bit() {
     restore(&path, &mut backup.as_slice()).unwrap();
     assert!(!open(&path).has_met_a_peer(), "a new epoch has met nobody");
 }
+
+/// What runs before the first met peer (ADR-274, M3) ends before any contact goes on, and before
+/// the epoch counts as having met anyone: a second contact that arrives meanwhile waits for it
+/// too. One that fails is tried again at the next contact, and one that has succeeded is not run
+/// again.
+#[test]
+fn what_runs_before_the_first_met_peer_ends_before_any_contact_goes_on() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir.path().join("kimmy.redb")));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (started, has_started) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let counted = Arc::clone(&runs);
+    engine.before_first_met_a_peer(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            return false;
+        }
+        started.send(()).unwrap();
+        released.recv().unwrap();
+        true
+    });
+    engine.note_met_a_peer();
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "run at the first contact");
+    assert!(!engine.has_met_a_peer(), "one that failed leaves the epoch unmet");
+    let contact = || {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || engine.note_met_a_peer())
+    };
+    let first = contact();
+    has_started.recv_timeout(Duration::from_secs(5)).expect("tried again at the next contact");
+    let second = contact();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!engine.has_met_a_peer(), "nobody is met while it runs");
+    assert!(!first.is_finished() && !second.is_finished(), "and no contact goes on");
+    release.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(engine.has_met_a_peer());
+    engine.note_met_a_peer();
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "not run again once it has succeeded");
+}

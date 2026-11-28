@@ -2,6 +2,7 @@
 //! made up for the test, which can be wrong in one way at a time: undecided, young, founded and
 //! unmet, slow, silent, or listing an address. A daemon cannot be made to be one of these alone.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::guard_rounds::{Asking, Decision, ask_until_decided};
+use crate::guard_rounds::{Asking, AtPass, Decision, Seeds, ask_until_decided};
 use crate::membership::Members;
 use crate::protocol::{GuardAnswer, Message, Standing, nonce, prove, read_frame, write_frame};
 use crate::transport::probe_answer;
@@ -212,6 +213,18 @@ fn asking_with(
     replace: bool,
     empty: usize,
 ) -> Restore {
+    asking_resolving(members, own_node, seeds, replace, empty, true)
+}
+
+/// [`asking_with`], every source of the seeds resolving or not.
+fn asking_resolving(
+    members: Members,
+    own_node: NodeId,
+    seeds: &[SocketAddr],
+    replace: bool,
+    empty: usize,
+    every_source_resolved: bool,
+) -> Restore {
     let asking = Asking {
         unnamed_within: UNNAMED_WITHIN,
         between_rounds: BETWEEN,
@@ -223,8 +236,8 @@ fn asking_with(
     let running = tokio::spawn(async move {
         ask_until_decided(&asking, &set, move || {
             let nth = counted.fetch_add(1, Ordering::SeqCst);
-            let now = if nth < empty { Vec::new() } else { asked.lock().clone() };
-            std::future::ready(now)
+            let addresses = if nth < empty { Vec::new() } else { asked.lock().clone() };
+            std::future::ready(Seeds { addresses, every_source_resolved })
         })
         .await
     });
@@ -517,14 +530,17 @@ async fn replace_passes_after_one_round_whatever_it_holds() {
     assert!(original.probes() >= 1, "premise: the original was asked");
 }
 
-/// Rule 5's order at a pass: membership is offered every address first, and what the guard held
-/// is let go only once it has been.
+/// Rule 5's order at a pass, over its three sinks (row 31): membership is offered every address
+/// first; then what the pass says of the marker, with the names its answers gave, is recorded;
+/// and only once that is done is anything the guard held let go.
 #[tokio::test]
-async fn a_pass_offers_membership_before_anything_is_opened() {
+async fn a_pass_offers_membership_records_the_marker_and_only_then_opens() {
     let done = Mutex::new(Vec::new());
     let offered = vec![SocketAddr::from(([127, 0, 0, 1], 7001))];
+    let said = AtPass { names: [id(3)].into(), alone: false };
     crate::guard_rounds::let_in(
         offered.clone(),
+        said.clone(),
         |offer| {
             let done = &done;
             async move {
@@ -532,11 +548,117 @@ async fn a_pass_offers_membership_before_anything_is_opened() {
                 done.lock().push(format!("membership offered {offer:?}"));
             }
         },
+        |at_pass| {
+            let done = &done;
+            async move {
+                tokio::task::yield_now().await;
+                done.lock().push(format!("recorded {at_pass:?}"));
+            }
+        },
         || done.lock().push("opened".to_string()),
     )
     .await;
-    let expected = [format!("membership offered {offered:?}"), "opened".to_string()];
+    let expected = [
+        format!("membership offered {offered:?}"),
+        format!("recorded {said:?}"),
+        "opened".to_string(),
+    ];
     assert_eq!(*done.lock(), expected);
+}
+
+/// What a restore under `--replace` that asks `seeds` is judged to be at its pass.
+async fn judged_alone(
+    members: &Members,
+    seeds: &[SocketAddr],
+    every_source_resolved: bool,
+) -> bool {
+    let own_node = id(ORIGINAL);
+    let mut restore =
+        asking_resolving(members.clone(), own_node, seeds, true, 0, every_source_resolved);
+    match restore.decides().await {
+        Decision::Pass { at_pass, .. } => at_pass.alone,
+        other => panic!("a pass: {other:?}"),
+    }
+}
+
+/// Row 37 (M1): under `--replace`, with no answer from another node, a restore is alone only
+/// where every seed source resolved and every seed address answered as this host or as its node.
+#[tokio::test]
+async fn a_restore_is_alone_only_where_every_seed_answered_as_it_or_as_its_node() {
+    let members = Members::default();
+    let own = Fake::saying(member(ORIGINAL).token(members.guard_token())).await;
+    let original = Fake::saying(member(ORIGINAL)).await;
+    let me = [own.addr, original.addr];
+    assert!(judged_alone(&members, &me, true).await, "each answered as it or as its node");
+    assert!(judged_alone(&members, &[], true).await, "no seed at all");
+    assert!(!judged_alone(&members, &me, false).await, "an unresolved name may be a member");
+    let silent = stopped().await;
+    let with_silent = [own.addr, original.addr, silent];
+    assert!(!judged_alone(&members, &with_silent, true).await, "a silent seed may be one");
+    let undecided = Fake::saying(member(2).undecided()).await;
+    let with_undecided = [own.addr, original.addr, undecided.addr];
+    assert!(!judged_alone(&members, &with_undecided, true).await, "another node answered");
+    let other = Fake::saying(member(7)).await;
+    original.say(member(ORIGINAL).knows(other.addr, id(7)));
+    assert!(!judged_alone(&members, &me, true).await, "another node answered where it was named");
+}
+
+/// Row 50 (M1): the original, taken over under `--replace`, lists another member that does not
+/// answer and is no seed. The restore is told of a member it has not heard, so it is not alone:
+/// its marker stays, and its owner work is off. What the original lists at the restore's own
+/// address is nobody else.
+#[tokio::test]
+async fn a_member_the_original_lists_and_nobody_hears_leaves_the_restore_not_alone() {
+    let members = Members::default();
+    let own = Fake::saying(member(ORIGINAL).token(members.guard_token())).await;
+    let replaced = member(ORIGINAL).knows(own.addr, id(2));
+    let original = Fake::saying(replaced.clone()).await;
+    let seeds = [original.addr];
+    assert!(judged_alone(&members, &seeds, true).await, "what it lists is where this host is");
+    original.say(replaced.knows(stopped().await, id(3)));
+    let mut restore = asking_with(members, id(ORIGINAL), &seeds, true, 0);
+    let Decision::Pass { at_pass, .. } = restore.decides().await else { panic!("a pass") };
+    assert!(!at_pass.alone, "a member it was told of has not answered");
+
+    let store = tempfile::tempdir().unwrap();
+    let engine = Engine::open(&store.path().join("kimmy.redb")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::catchup::write_marker(dir.path(), crate::CatchUpReason::Restored).unwrap();
+    let catch_up = crate::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+    catch_up.at_guard_pass(&engine, &at_pass).unwrap();
+    assert!(catch_up.is_set() && catch_up.holds_owner_work(), "kept, with its owner work off");
+}
+
+/// Rows 15 and 31 (rule 5): a pass carries the node ids its open answers and its reports named,
+/// the answerers' own among them and the asker's left out; under `--replace` as at any pass.
+/// What an undecided member names is not taken.
+#[tokio::test]
+async fn a_pass_carries_the_nodes_its_answers_named() {
+    for replace in [false, true] {
+        let members = Members::default();
+        let own = Fake::saying(member(ORIGINAL).token(members.guard_token())).await;
+        let beside = member(1)
+            .knows(stopped().await, id(3))
+            .knows(own.addr, id(ORIGINAL))
+            .after(UNNAMED_WITHIN / 3);
+        let beside = Fake::saying(beside).await;
+        let undecided = Fake::saying(member(2).undecided().knows(stopped().await, id(4))).await;
+        let seeds = [beside.addr, undecided.addr];
+        let mut restore = asking_with(members, id(ORIGINAL), &seeds, replace, 0);
+        // Handed over while the round is out, so that it is an answer of the round.
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while beside.probes() == 0 {
+            assert!(tokio::time::Instant::now() < until, "the member was never asked");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        restore.report(member(5).knows(stopped().await, id(6)));
+        let Decision::Pass { at_pass, .. } = restore.decides().await else {
+            panic!("a pass, replace: {replace}")
+        };
+        let named = BTreeSet::from([id(1), id(3), id(5), id(6)]);
+        assert_eq!(at_pass.names, named, "replace: {replace}");
+        assert!(!at_pass.alone, "others answered it, replace: {replace}");
+    }
 }
 
 /// A restore that waits says what on, where its readiness is read from: how many it asked, who is

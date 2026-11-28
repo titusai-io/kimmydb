@@ -10,7 +10,7 @@ use kimmy_core::NodeId;
 use kimmy_storage::Engine;
 use tokio::net::TcpListener;
 
-use crate::guard_rounds::{Asking, Decision, ask_until_decided};
+use crate::guard_rounds::{Asking, Decision, Seeds, ask_until_decided};
 use crate::membership::Members;
 use crate::transport::probe_answer;
 
@@ -62,7 +62,10 @@ async fn decided(
         ..Asking::new(node, SECRET, WINDOW, replace)
     };
     let members = Members::default();
-    let rounds = ask_until_decided(&asking, &members, || std::future::ready(seeds.to_vec()));
+    let rounds = ask_until_decided(&asking, &members, || {
+        let addresses = seeds.to_vec();
+        std::future::ready(Seeds { addresses, every_source_resolved: true })
+    });
     tokio::time::timeout(within, rounds).await.ok()
 }
 

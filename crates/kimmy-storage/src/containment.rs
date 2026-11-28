@@ -185,6 +185,11 @@ impl Engine {
         !self.is_founding_epoch() && !self.has_met_a_peer()
     }
 
+    /// Run `first` at this epoch's first handshake with another node.
+    ///
+    /// **Scaffold of the tests commit**: never run.
+    pub fn before_first_met_a_peer(&self, _first: impl Fn() -> bool + Send + 'static) {}
+
     /// Note that this epoch's host completed a handshake with another node. Sets the flag and
     /// nothing else: a handshake never waits on the writer.
     pub fn note_met_a_peer(&self) {

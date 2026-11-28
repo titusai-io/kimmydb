@@ -5619,12 +5619,18 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
                 .find(|l| l.starts_with("rewound"))
                 .unwrap_or("")
         );
-        for file in [kimmy_cluster::catchup::FILE, "kimmy.replay-floor"] {
-            let _ = std::fs::remove_file(node.dir.path().join("data").join(file));
-        }
+        let _ = std::fs::remove_file(node.dir.path().join("data").join("kimmy.replay-floor"));
     }
     for node in [&mut a, &mut b, &mut c] {
         node.restart_with(&[]);
+    }
+    // A pass gives a member its marker back where it has none, so the operator removes them once
+    // every guard has passed: restored together, none of them counts for another's clear.
+    for node in [&a, &b, &c] {
+        let_through(&client, node).await;
+    }
+    for node in [&a, &b, &c] {
+        let _ = std::fs::remove_file(node.catching_up_file());
     }
     for node in [&a, &b, &c] {
         node.wait_ready(&client).await;
@@ -5795,12 +5801,18 @@ async fn a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_rem
                 .find(|l| l.starts_with("rewound"))
                 .unwrap_or("")
         );
-        for file in [kimmy_cluster::catchup::FILE, "kimmy.replay-floor"] {
-            let _ = std::fs::remove_file(node.dir.path().join("data").join(file));
-        }
+        let _ = std::fs::remove_file(node.dir.path().join("data").join("kimmy.replay-floor"));
     }
     for node in [&mut a, &mut b, &mut c] {
         node.restart_with(&[]);
+    }
+    // A pass gives a member its marker back where it has none, so the operator removes them once
+    // every guard has passed: restored together, none of them counts for another's clear.
+    for node in [&a, &b, &c] {
+        let_through(&client, node).await;
+    }
+    for node in [&a, &b, &c] {
+        let _ = std::fs::remove_file(node.catching_up_file());
     }
     for node in [&a, &b, &c] {
         node.wait_ready(&client).await;
@@ -6386,6 +6398,17 @@ impl HeldRestore {
         self.node.log().lines().map(strip_ansi).collect()
     }
 
+    /// When, and on which line, its catching-up marker cleared. A restore that passes and is not
+    /// alone is marked, though its restore left it unmarked, so its own work comes after this.
+    fn cleared_at(&self) -> (f64, usize) {
+        let lines = self.log_lines();
+        let line = lines
+            .iter()
+            .position(|line| line.contains("the catching-up marker was cleared"))
+            .unwrap_or_else(|| panic!("it was never marked and cleared:\n{}", self.node.log()));
+        (logged_at(&lines[line]).unwrap(), line)
+    }
+
     /// Nothing the listener was sent came before the guard passed. Until then no other node holds
     /// the subscription or the vector configuration, so whatever came earlier is the restore's.
     fn assert_nothing_before_the_pass(&self, what: &str, requests: &Requests) {
@@ -6545,6 +6568,13 @@ async fn a_restore_held_by_its_guard_expires_nothing() {
         async move { answered(request).await.0 == "404 not_found" }
     })
     .await;
+    // Waited for on its own: the member beside it gets the TTL index from it after the pass, and
+    // may delete the document while the restore is still marked.
+    eventually("the marker its pass gave it to have cleared", || {
+        let cleared = run.node.log().contains("the catching-up marker was cleared");
+        async move { cleared }
+    })
+    .await;
     // The order of two lines of one log, so no clock is compared.
     let passed = run.log_lines().iter().position(|line| line.contains(GUARD_PASSED)).unwrap();
     if let Some(expired) = run.expiry_line() {
@@ -6555,6 +6585,10 @@ async fn a_restore_held_by_its_guard_expires_nothing() {
         );
     }
     run.assert_it_was_held();
+    let (_, cleared) = run.cleared_at();
+    if let Some(expired) = run.expiry_line() {
+        assert!(expired > cleared, "expired while marked:\n{}", run.node.log());
+    }
 }
 
 /// A restore its guard holds asks no embedding provider for anything, and embeds what is owed once
@@ -6572,6 +6606,10 @@ async fn a_restore_held_by_its_guard_embeds_nothing() {
     .await;
     run.assert_nothing_before_the_pass("an embedding request", &run.embeddings);
     run.assert_it_was_held();
+    let (cleared, _) = run.cleared_at();
+    for (at, body) in run.embeddings.lock().unwrap().iter() {
+        assert!(!came_before(*at, cleared), "embedded while marked: {body}");
+    }
 }
 
 /// A restore its guard holds serves no client, with no catching-up marker to say so: it may be
@@ -6718,6 +6756,18 @@ const HELD_BY_THE_GUARD: &str = "503 catching_up restore_guard";
 
 async fn ready_answer(client: &reqwest::Client, node: &Node) -> String {
     answered(client.get(node.url("/readyz"))).await.0
+}
+
+/// Wait until `node`'s guard has passed and let go: what the pass records is in place by then.
+async fn let_through(client: &reqwest::Client, node: &Node) {
+    eventually("its guard to pass and let go", || {
+        let client = client.clone();
+        async move {
+            node.log().contains(GUARD_PASSED)
+                && ready_answer(&client, node).await != HELD_BY_THE_GUARD
+        }
+    })
+    .await;
 }
 
 /// Wait for a started restore to answer that its guard holds it. A guard that passes it first
@@ -6982,6 +7032,15 @@ async fn a_cluster_restored_whole_waits_until_one_is_told_to_replace() {
         .await;
         node.wait_ready(&client).await;
     }
+    // Restored together, none of them is evidence for another: each stays marked, and serves as
+    // unknown once its wait has run out.
+    for node in &nodes {
+        eventually("each member to serve as unknown", || node.unknown(&client)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    for node in &nodes {
+        assert!(node.unknown(&client).await, "{} stays marked:\n{}", node.name, node.log());
+    }
     let mut tokens = Vec::new();
     for node in &nodes {
         tokens.push(node.login(&client).await);
@@ -6998,6 +7057,11 @@ async fn a_cluster_restored_whole_waits_until_one_is_told_to_replace() {
             let held = doc_v(&client, node, token, id).await;
             assert_eq!(held, Some(format!("\"order {id}\"")), "{} {id}", node.name);
         }
+    }
+    // The operator clears one, and the others clear against it.
+    std::fs::remove_file(nodes[0].catching_up_file()).unwrap();
+    for node in &nodes {
+        eventually("every member to be cleared", || node.cleared(&client)).await;
     }
 }
 
@@ -7079,13 +7143,21 @@ async fn a_restore_alone_waits_until_it_is_told_to_replace() {
     a.restart_with(&[]);
     stays_held(&client, &a, Duration::from_secs(12)).await;
     assert_eq!(write_answer(&client, &a, &token).await, "503 catching_up");
+    assert!(a.catching_up_file().exists(), "the start left its marker for the guard to decide");
     stop(&a);
     // The backup lies beside the data directory, which each restore replaces.
     restore_over_with(&a, &backup, &["--replace"]);
-    a.restart_with(&[]);
-    a.wait_ready(&client).await;
-    let status = write_answer(&client, &a, &token).await;
-    assert!(status.starts_with("200") || status.starts_with("201"), "it serves: {status}");
+    // Started twice: it meets nobody, so the second start is guarded too, and `--replace`,
+    // which was given for this epoch, still passes it, with whatever it wrote meanwhile.
+    for start in ["the first start", "the second start"] {
+        a.restart_with(&[]);
+        let_through(&client, &a).await;
+        assert!(!a.catching_up_file().exists(), "{start}: alone, so discarded");
+        a.wait_ready(&client).await;
+        let status = write_answer(&client, &a, &token).await;
+        let served = status.starts_with("200") || status.starts_with("201");
+        assert!(served, "{start}: it serves: {status}");
+    }
 }
 
 /// Two restores of A's backup in two directories, each seeding the other and the members `m` and
@@ -7245,4 +7317,215 @@ async fn a_restore_with_no_seed_joins_three_members_by_a_members_dial() {
     .await;
     c.wait_ready(&client).await;
     eventually("it to join the others", || all_report(&client, vec![&a, &b, &c], 2)).await;
+}
+
+/// The `since` line of `node`'s catching-up marker, if it has one: when it was written.
+fn marker_since(node: &Node) -> Option<String> {
+    let text = std::fs::read_to_string(node.catching_up_file()).ok()?;
+    text.lines().find(|line| line.starts_with("since")).map(str::to_string)
+}
+
+/// Where in `node`'s log, from line `from` on, a line holds `needle`.
+fn line_from(node: &Node, from: usize, needle: &str) -> Option<usize> {
+    let lines: Vec<String> = node.log().lines().map(strip_ansi).collect();
+    lines.iter().skip(from).position(|line| line.contains(needle)).map(|at| at + from)
+}
+
+/// A restore whose seeds name only itself keeps the marker its restore wrote for as long as its
+/// guard holds it. Answered by a dialler it is not alone, so the marker stays on after the pass,
+/// and clears as any member's does, against a member that it covers.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_with_no_seed_keeps_its_marker_until_it_has_caught_up() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, _token) = two_members(&client).await;
+    let token_b = b.login(&client).await;
+    let backup = backup_to_file(&client, &b, &token_b).await;
+    stop(&b);
+    // Stopped too, so that nobody can answer while the marker is read.
+    stop(&a);
+    restore_over(&b, &backup);
+    let written = marker_since(&b).expect("PREMISE: a restore writes the marker");
+    reconfigure(&b, &seeds_line(&[a.cluster]), &seeds_line(&[b.cluster]));
+    b.restart_with(&[]);
+    waits_for_its_guard(&client, &b).await;
+    assert_eq!(marker_since(&b), Some(written), "its own, while it waits:\n{}", b.log());
+    a.restart_with(&[]);
+    let_through(&client, &b).await;
+    eventually("it to have caught up", || b.cleared(&client)).await;
+    let passed = line_from(&b, 0, GUARD_PASSED).unwrap();
+    let cleared = line_from(&b, 0, "the catching-up marker was cleared").unwrap();
+    assert!(cleared > passed, "cleared only after the pass:\n{}", b.log());
+    let by = b.log().lines().map(strip_ansi).nth(cleared).unwrap();
+    assert!(by.contains("dominance"), "cleared as any member's is: {by}");
+}
+
+/// `--replace` over the only other host, the original still running: its answer is this node's
+/// own, so the restore is alone. The marker is discarded at the pass, and the original is told
+/// and halts. With `seeds_itself` the restore's seeds name only itself, and else the original.
+async fn a_replace_over_the_only_other_host_is_alone(seeds_itself: bool) {
+    let client = reqwest::Client::new();
+    let (a, mut b, token) = two_members(&client).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&b);
+    restore_over_with(&b, &backup, &["--replace"]);
+    if seeds_itself {
+        reconfigure(&b, &seeds_line(&[a.cluster]), &seeds_line(&[b.cluster]));
+    }
+    b.restart_with(&[]);
+    let_through(&client, &b).await;
+    assert!(!b.catching_up_file().exists(), "alone, so discarded:\n{}", b.log());
+    b.wait_ready(&client).await;
+    eventually("the original to be told and halt", || is_halted(&client, &a)).await;
+    assert!(!is_halted(&client, &b).await, "{}", b.log());
+}
+
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_replace_that_seeds_only_itself_over_the_only_other_host_is_alone() {
+    a_replace_over_the_only_other_host_is_alone(true).await;
+}
+
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_replace_that_seeds_the_original_it_takes_over_is_alone() {
+    a_replace_over_the_only_other_host_is_alone(false).await;
+}
+
+/// The cut: a restore under `--replace` whose seeds name members that do not answer is not alone.
+/// It keeps its marker and, once its wait has run out, serves as unknown with its owner work off:
+/// it does not expire the backup's copy of a document the cluster has since refreshed. When the
+/// link returns it catches up and clears, and the refreshed copy is the one that stands.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_cut_off_under_replace_keeps_its_marker_and_expires_nothing_stale() {
+    let client = reqwest::Client::new();
+    let (a, mut b, token) = two_members(&client).await;
+    let sessions = serde_json::json!({ "name": "sessions" });
+    posted(&client, &a, &token, "/v1/db/shop/collections", sessions).await;
+    let ttl = serde_json::json!({
+        "name": "ttl_seen",
+        "fields": [{ "path": "seen" }],
+        "expireAfterSeconds": 1,
+    });
+    posted(&client, &a, &token, "/v1/db/shop/coll/sessions/indexes", ttl).await;
+    let due = unix_millis() + 30_000;
+    let session = serde_json::json!({ "_id": 1, "seen": { "$date": due } });
+    posted(&client, &a, &token, "/v1/db/shop/coll/sessions/docs", session).await;
+    let doc = "/v1/db/shop/coll/sessions/docs/1";
+    let token_b = b.login(&client).await;
+    eventually("B to hold the session", || {
+        let request = client.get(b.url(doc)).bearer_auth(&token_b);
+        async move { answered(request).await.0 == "200 -" }
+    })
+    .await;
+    let backup = backup_to_file(&client, &b, &token_b).await;
+    stop(&b);
+    let refreshed = unix_millis() + 3_600_000;
+    let put = client
+        .put(a.url(doc))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "seen": { "$date": refreshed } }));
+    assert_eq!(answered(put).await.0, "200 -", "PREMISE: refreshed on A");
+    assert!(unix_millis() < due, "PREMISE: refreshed before it fell due");
+    let kept = answered(client.get(a.url(doc)).bearer_auth(&token)).await.1["seen"].clone();
+
+    // On a port nobody knows, and seeding two addresses that nothing answers on.
+    move_to_port(&mut b, ports::choose());
+    restore_over_with(&b, &backup, &["--replace"]);
+    let silent = [ports::choose(), ports::choose()];
+    let cut = format!("{}\ncatch_up_wait_secs = 5", seeds_line(&silent));
+    reconfigure(&b, &seeds_line(&[a.cluster]), &cut);
+    b.restart_with(&[]);
+    let_through(&client, &b).await;
+    eventually("it to serve as unknown", || b.unknown(&client)).await;
+    while unix_millis() < due + 5_000 {
+        tokio::time::sleep(POLL).await;
+    }
+    let token_b = b.login(&client).await;
+    let stale = answered(client.get(b.url(doc)).bearer_auth(&token_b)).await.0;
+    assert_eq!(stale, "200 -", "the backup's copy was not expired:\n{}", b.log());
+    assert!(b.unknown(&client).await, "still marked:\n{}", b.log());
+
+    stop(&b);
+    reconfigure(&b, &cut, &seeds_line(&[a.cluster]));
+    b.restart_with(&[]);
+    let_through(&client, &b).await;
+    eventually("it to have caught up", || b.cleared(&client)).await;
+    let token_b = b.login(&client).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for (node, token) in [(&a, &token), (&b, &token_b)] {
+        let (status, body) = answered(client.get(node.url(doc)).bearer_auth(token)).await;
+        assert_eq!(status, "200 -", "{} holds it", node.name);
+        assert_eq!(body["seen"], kept, "{} holds the refreshed copy", node.name);
+    }
+}
+
+/// M3: a restore that passed as alone is marked again at its first handshake with another node,
+/// and clears as any member does once it has caught up.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restore_that_passed_alone_is_marked_again_when_a_member_meets_it() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, token) = two_members(&client).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    // Written after the backup, on B alone: nothing of A's own origin is lost to the restore, so
+    // no replay of it can mark it.
+    let token_b = b.login(&client).await;
+    let order = serde_json::json!({ "_id": 4, "v": "order 4" });
+    posted(&client, &b, &token_b, "/v1/db/shop/coll/orders/docs", order).await;
+    stop(&a);
+    stop(&b);
+    restore_over_with(&a, &backup, &["--replace"]);
+    reconfigure(&a, &seeds_line(&[b.cluster]), &seeds_line(&[a.cluster]));
+    a.restart_with(&[]);
+    let_through(&client, &a).await;
+    assert!(!a.catching_up_file().exists(), "PREMISE: alone at its pass:\n{}", a.log());
+    a.wait_ready(&client).await;
+    // Before B is started: once A is marked it may refuse a login.
+    let token = a.login(&client).await;
+    let after_pass = a.log().lines().count();
+    b.restart_with(&[]);
+    eventually("A to hold what B wrote", || {
+        let (client, a, token) = (client.clone(), &a, token.clone());
+        async move { doc_v(&client, a, &token, 4).await.is_some() }
+    })
+    .await;
+    let set = line_from(&a, after_pass, "the catching-up marker was set")
+        .unwrap_or_else(|| panic!("marked again when B met it:\n{}", a.log()));
+    eventually("it to have caught up", || a.cleared(&client)).await;
+    let cleared = line_from(&a, set, "the catching-up marker was cleared");
+    assert!(cleared.is_some(), "and cleared after that:\n{}", a.log());
+}
+
+/// M4: a marker kept at a pass is still there after a restart of a member that has met a peer,
+/// though its seeds by then name only itself.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_restart_after_meeting_a_peer_keeps_the_marker() {
+    let client = reqwest::Client::new();
+    let (mut a, b, token) = two_members(&client).await;
+    let backup = backup_to_file(&client, &a, &token).await;
+    stop(&a);
+    restore_over(&a, &backup);
+    // A dials nobody it could clear against: only B's dials reach it. The guard's question is
+    // not a dial, so B still answers it.
+    let refuse = format!("127.0.0.1:{}", b.cluster);
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &refuse)]);
+    let_through(&client, &a).await;
+    // Long enough for B to have dialled it and for the meeting to be written down.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(a.catching_up_file().exists(), "PREMISE: kept, and nothing clears it:\n{}", a.log());
+    stop(&a);
+    reconfigure(&a, &seeds_line(&[b.cluster]), &seeds_line(&[a.cluster]));
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &refuse)]);
+    eventually("it to serve its cluster again", || {
+        let serving = a.log().contains("serving cluster replication");
+        async move { serving }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let guarded = a.log().contains("the mistaken-restore guard");
+    assert!(!guarded, "PREMISE: it has met a peer, so no guard runs:\n{}", a.log());
+    assert!(a.catching_up_file().exists(), "the start kept the marker:\n{}", a.log());
 }

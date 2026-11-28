@@ -613,6 +613,13 @@ struct StartPlan {
     forget_replay: bool,
 }
 
+/// Whether the start drops the marker, decided once the store is open.
+///
+/// **Scaffold of the tests commit**: by the plan alone.
+fn start_discards(plan: &StartPlan, _membership: bool, _met: bool, _guarded: bool) -> bool {
+    plan.discard_marker
+}
+
 fn start_plan(clustered: bool, seeds_name_another: bool, store_existed: bool) -> StartPlan {
     if !clustered {
         return StartPlan {
@@ -807,9 +814,6 @@ async fn start_and_serve(
         .context("the replay floor cannot be written")
         .map_err(failed_before_open)?;
     }
-    if plan.discard_marker {
-        catch_up.discard_when_standalone();
-    }
     if plan.forget_replay {
         catch_up.forget_replay();
     }
@@ -895,6 +899,14 @@ async fn start_and_serve(
     // hold, so there is one.
     if config.cluster.enabled && config.cluster.membership && engine.needs_restore_guard() {
         catch_up.hold_for_guard();
+    }
+    if start_discards(
+        &plan,
+        config.cluster.enabled && config.cluster.membership,
+        engine.has_met_a_peer(),
+        engine.needs_restore_guard(),
+    ) {
+        catch_up.discard_when_standalone();
     }
     // The replay of the member's own origin is armed before this run writes
     // anything: the position the store has now is the one it can have lost writes
@@ -2733,7 +2745,7 @@ async fn cluster_gate_open(gate: &mut tokio::sync::watch::Receiver<Option<bool>>
 /// resolved the way the discovery loop resolves it (`dns:`, `dns-srv:`, `k8s:`, a static list, and
 /// the test name server), at once and each bounded: a source that has not answered within the
 /// bound names nothing in that round, and is asked again for the next.
-async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<std::net::SocketAddr> {
+async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> kimmy_cluster::guard_rounds::Seeds {
     const BOUND: Duration = Duration::from_secs(3);
     let mut resolving = tokio::task::JoinSet::new();
     for seed in seeds {
@@ -2748,12 +2760,14 @@ async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> Vec<std::net::So
             addresses.extend(resolved);
         }
     }
-    addresses
+    // **Scaffold of the tests commit**: says that every source resolved.
+    kimmy_cluster::guard_rounds::Seeds { addresses, every_source_resolved: true }
 }
 
 /// What a passed guard lets go (ADR-274), made where the cluster is started so that nothing else
 /// holds the means to.
 struct LetIn {
+    engine: Arc<Engine>,
     hold: Arc<kimmy_cluster::catchup::CatchUp>,
     /// Starts membership.
     join: tokio::sync::watch::Sender<bool>,
@@ -2761,6 +2775,60 @@ struct LetIn {
     offer: tokio::sync::mpsc::Sender<std::net::SocketAddr>,
     /// The cluster's gate: `Some(true)` lets this member dial, `Some(false)` says it is halted.
     gate: tokio::sync::watch::Sender<Option<bool>>,
+}
+
+impl LetIn {
+    /// Let a passed restore in, in rule 5's order: membership starts and is offered `addresses`,
+    /// then the marker is settled and the names taken, and then the hold is let go and the gate
+    /// opened. A marker that cannot be written leaves the member held and the gate shut for as
+    /// long as it cannot.
+    async fn pass(
+        self,
+        addresses: Vec<std::net::SocketAddr>,
+        at_pass: kimmy_cluster::guard_rounds::AtPass,
+    ) {
+        let LetIn { engine, hold, join, offer, gate } = self;
+        let recording = Arc::clone(&hold);
+        kimmy_cluster::guard_rounds::let_in(
+            addresses,
+            at_pass,
+            move |addresses: Vec<std::net::SocketAddr>| async move {
+                let _ = join.send(true);
+                for address in addresses {
+                    // Membership takes each; one that has stopped ends the offering.
+                    if offer.send(address).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            move |at_pass| async move { record_the_pass(&engine, &recording, &at_pass).await },
+            move || {
+                hold.release_guard_hold();
+                let _ = gate.send(Some(true));
+            },
+        )
+        .await;
+    }
+}
+
+/// Settle the marker as the pass says, trying again every second until it is done.
+async fn record_the_pass(
+    engine: &Engine,
+    catch_up: &Arc<kimmy_cluster::catchup::CatchUp>,
+    at_pass: &kimmy_cluster::guard_rounds::AtPass,
+) {
+    let mut said = false;
+    while let Err(e) = kimmy_storage::blocking(|| catch_up.at_guard_pass(engine, at_pass)) {
+        if !said {
+            warn!(
+                error = %e,
+                "the mistaken-restore guard passed and the catching-up marker cannot be written: \
+                 this host stays held until it can, and tries every second"
+            );
+            said = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Run the mistaken-restore guard for a restored or rewound epoch (ADR-274): ask, round after
@@ -2798,29 +2866,12 @@ fn spawn_guard(
             async move { seed_addresses(&seeds).await }
         })
         .await;
-        let LetIn { hold, join, offer, gate } = to_let_in;
         match decision {
-            kimmy_cluster::guard_rounds::Decision::Pass { offer: addresses } => {
+            kimmy_cluster::guard_rounds::Decision::Pass { offer, at_pass } => {
                 // Said before anything the guard holds back is let go, so whatever a log or a
                 // client shows ahead of this line was done while the guard had not passed.
                 info!("the mistaken-restore guard passed; this host may join its cluster");
-                kimmy_cluster::guard_rounds::let_in(
-                    addresses,
-                    move |addresses: Vec<std::net::SocketAddr>| async move {
-                        let _ = join.send(true);
-                        for address in addresses {
-                            // Membership takes each; one that has stopped ends the offering.
-                            if offer.send(address).await.is_err() {
-                                break;
-                            }
-                        }
-                    },
-                    move || {
-                        hold.release_guard_hold();
-                        let _ = gate.send(Some(true));
-                    },
-                )
-                .await;
+                to_let_in.pass(offer, at_pass).await;
             }
             kimmy_cluster::guard_rounds::Decision::LiveHost(address) => {
                 warn!(
@@ -2832,7 +2883,7 @@ fn spawn_guard(
                 kimmy_storage::blocking(|| {
                     kimmy_cluster::containment::halt_by_guard(&engine, address)
                 });
-                let _ = gate.send(Some(false));
+                let _ = to_let_in.gate.send(Some(false));
                 return;
             }
         }
@@ -2984,7 +3035,8 @@ async fn spawn_cluster(
         members = Some(live);
         announce = Some(tx.clone());
         if let (Some(hold), Some(live)) = (hold, members.clone()) {
-            let to_let_in = LetIn { hold, join, offer: tx, gate: gate_tx };
+            let to_let_in =
+                LetIn { engine: Arc::clone(&engine), hold, join, offer: tx, gate: gate_tx };
             spawn_guard(Arc::clone(&engine), live, config, secret.clone(), to_let_in);
         }
     } else {
@@ -3733,6 +3785,88 @@ mod tests {
         let storage = crate::config::StorageConfig { max_clock_skew_secs: 7, ..Default::default() };
         super::apply_clock_bound(&engine, &storage);
         assert_eq!(engine.clock_bound().skew_ms, 7_000, "the configured value reached the engine");
+    }
+
+    /// Row 31, the daemon's half: its own sinks, driven against a real catching-up state. While
+    /// the marker cannot be written the pass cannot be recorded: membership has started and been
+    /// offered the addresses, and the hold stays on and the gate shut. Once it can be, the state
+    /// has the marker and the names, and only then is the gate open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_opens_nothing_until_the_marker_and_the_names_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let wait = std::time::Duration::from_secs(120);
+        let catch_up = kimmy_cluster::catchup::CatchUp::open(dir.path(), wait);
+        catch_up.hold_for_guard();
+        // A directory where the marker's file goes, so that no write of it can succeed.
+        let in_the_way = dir.path().join(kimmy_cluster::catchup::FILE);
+        std::fs::create_dir(&in_the_way).unwrap();
+        let (join, joined) = tokio::sync::watch::channel(false);
+        let (offer, mut offered) = tokio::sync::mpsc::channel(4);
+        let (gate, opened) = tokio::sync::watch::channel(None);
+        let hold = std::sync::Arc::clone(&catch_up);
+        let to_let_in = super::LetIn { engine, hold, join, offer, gate };
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 7001));
+        let names = std::collections::BTreeSet::from([kimmy_core::NodeId::from_bytes([3; 16])]);
+        let at_pass = kimmy_cluster::guard_rounds::AtPass { names: names.clone(), alone: false };
+        let passing = tokio::spawn(to_let_in.pass(vec![address], at_pass));
+        assert_eq!(offered.recv().await, Some(address), "membership is offered it first");
+        assert!(*joined.borrow(), "and has started");
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        assert_eq!(*opened.borrow(), None, "the gate is shut while nothing can be recorded");
+        assert!(catch_up.held_by_guard(), "and the hold is on");
+        std::fs::remove_dir(&in_the_way).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), passing)
+            .await
+            .expect("the pass ends")
+            .unwrap();
+        assert_eq!(*opened.borrow(), Some(true));
+        assert!(!catch_up.held_by_guard());
+        assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+        assert!(in_the_way.is_file(), "the marker is written");
+        assert_eq!(catch_up.awaited_members(), names);
+    }
+
+    /// M4 and P7: the start drops the marker where its plan says so and, where this member has a
+    /// membership, only for an epoch that has met no peer and that no guard has to decide: a
+    /// restore's is decided at its pass, and one that has met a peer is not alone by its own
+    /// record.
+    #[test]
+    fn the_start_discards_a_marker_only_where_nothing_else_decides_it() {
+        let alone = super::start_plan(true, false, true);
+        let beside = super::start_plan(true, true, true);
+        let off = super::start_plan(false, false, true);
+        for (plan, membership, met, guarded, discards) in [
+            (&alone, true, false, false, true),
+            (&alone, true, false, true, false),
+            (&alone, true, true, false, false),
+            (&alone, false, true, false, true),
+            (&alone, false, false, true, true),
+            (&off, false, true, false, true),
+            (&beside, true, false, false, false),
+            (&beside, false, false, true, false),
+        ] {
+            assert_eq!(
+                super::start_discards(plan, membership, met, guarded),
+                discards,
+                "{plan:?}, membership {membership}, met {met}, guarded {guarded}"
+            );
+        }
+    }
+
+    /// What the guard's rounds are told of the seeds: a source that does not resolve leaves them
+    /// incomplete, since what it names is not known.
+    #[tokio::test]
+    async fn a_seed_source_that_does_not_resolve_leaves_the_seeds_incomplete() {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 7001));
+        let listed = kimmy_cluster::SeedSource::Static(vec![address]);
+        let all = super::seed_addresses(std::slice::from_ref(&listed)).await;
+        assert!(all.every_source_resolved, "a list resolves");
+        assert_eq!(all.addresses, [address]);
+        let unknown: kimmy_cluster::SeedSource = "dns:nobody.invalid".parse().unwrap();
+        let some = super::seed_addresses(&[listed, unknown]).await;
+        assert_eq!(some.addresses, [address]);
+        assert!(!some.every_source_resolved, "a name that does not resolve");
     }
 
     /// The guard's hold is taken where the guarded decision is made: before the catch-up state is

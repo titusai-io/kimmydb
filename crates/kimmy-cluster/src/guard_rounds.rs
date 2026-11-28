@@ -64,27 +64,60 @@ impl Asking {
     }
 }
 
+/// What the seed sources resolve to for one round.
+#[derive(Clone, Debug, Default)]
+pub struct Seeds {
+    pub addresses: Vec<SocketAddr>,
+    /// Every source resolved: none failed or ran out of time, and no name resolved to nothing.
+    /// Where one did, what it names is not known.
+    pub every_source_resolved: bool,
+}
+
+/// What a pass says of the passing member's catching-up marker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AtPass {
+    /// The node ids the deciding round's open answers and reports named, their own among them and
+    /// the asker's left out: the members to be seen before the marker clears.
+    pub names: BTreeSet<NodeId>,
+    /// No answer of the deciding round was another node's; no open answer or report lists another
+    /// node anywhere but at an address that answered as this host; and every seed source
+    /// resolved, to addresses that each answered as this host or as this node.
+    pub alone: bool,
+}
+
 /// What the rounds came to. A round that comes to neither is followed by another: no passage of
 /// time decides.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// A running member answered and no running host of the asking node did, or `--replace` was
     /// given. With every address the deciding round asked, the seeds and whatever was named, but
-    /// the asker's own: what its membership is to be offered.
-    Pass { offer: Vec<SocketAddr> },
+    /// the asker's own: what its membership is to be offered. And what the pass says of its
+    /// catching-up marker.
+    Pass { offer: Vec<SocketAddr>, at_pass: AtPass },
     /// A running host of the asking node answered, from this address.
     LiveHost(SocketAddr),
 }
 
-/// Let a passed restore in, in rule 5's order: first its membership, which is offered `offer`,
-/// and only then `open`, which lets go of what the guard held.
-pub async fn let_in<M, F, O>(offer: Vec<SocketAddr>, membership: M, open: O)
-where
+/// Let a passed restore in, in rule 5's order: first its membership, which is offered `offer`;
+/// then `record`, which settles its catching-up marker and takes the names the pass carries; and
+/// only then `open`, which lets go of what the guard held.
+///
+/// **Scaffold of the tests commit**: records nothing.
+pub async fn let_in<M, F, R, G, O>(
+    offer: Vec<SocketAddr>,
+    at_pass: AtPass,
+    membership: M,
+    record: R,
+    open: O,
+) where
     M: FnOnce(Vec<SocketAddr>) -> F,
     F: Future<Output = ()>,
+    R: FnOnce(AtPass) -> G,
+    G: Future<Output = ()>,
     O: FnOnce(),
 {
     membership(offer).await;
+    drop((at_pass, record));
     open();
 }
 
@@ -93,7 +126,7 @@ where
 pub async fn ask_until_decided<F, Fut>(asking: &Asking, members: &Members, seeds: F) -> Decision
 where
     F: Fn() -> Fut,
-    Fut: Future<Output = Vec<SocketAddr>>,
+    Fut: Future<Output = Seeds>,
 {
     let own_token = members.guard_token();
     // The addresses that have answered with this process's token: itself, and asked no more.
@@ -106,7 +139,7 @@ where
     loop {
         let resolved = seeds().await;
         let mut round = Round::new(asking, &own_token, &mut own);
-        if let Some(live) = round.run(members, resolved, carried).await {
+        if let Some(live) = round.run(members, resolved.addresses, carried).await {
             return Decision::LiveHost(live);
         }
         if let Some(decision) = round.verdict(members).await {
@@ -362,7 +395,8 @@ impl<'a> Round<'a> {
     /// The verdict on a round that has ended, or `None`: nothing is decided.
     async fn verdict(&mut self, members: &Members) -> Option<Decision> {
         let offer = self.asked.iter().copied().filter(|addr| !self.own.contains(addr)).collect();
-        let pass = Decision::Pass { offer };
+        // **Scaffold of the tests commit**: a pass says nothing of the marker.
+        let pass = Decision::Pass { offer, at_pass: AtPass::default() };
         if self.asking.replace {
             return Some(pass);
         }
