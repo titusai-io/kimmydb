@@ -2259,3 +2259,147 @@ fn a_page_with_a_parked_event_applied_twice_and_at_once_takes_nothing_past_it() 
     s.assert_behind_the_binding("after both");
     s.assert_replay_owed(from, "after both");
 }
+
+/// The sync loop's two calls that can settle the replay, as it makes them after a tick's
+/// contacts: what the tick reached, and then the settle.
+fn the_loop_judges(f: &Fixture, reached: &[crate::catchup::Reached]) {
+    f.catch_up.replay_note_members(&crate::catchup::ReplayTick {
+        me: f.a.node_id(),
+        members: Some(&f.members),
+        reached,
+        expected_members: None,
+        now: std::time::Instant::now(),
+    });
+    f.catch_up.replay_settle();
+}
+
+/// C, dialled by A: it answers A's replay with an empty last page, and takes A's ordinary
+/// ask, to which it says `to_the_pull` before it drops the connection.
+async fn a_holder_whose_pull_goes_wrong(
+    mut stream: tokio::io::DuplexStream,
+    theirs: VersionVector,
+    catch_up: Arc<CatchUp>,
+    holder: NodeId,
+    to_the_pull: Option<Message>,
+) {
+    assert!(matches!(read_frame(&mut stream).await.unwrap(), Message::AskVersions { .. }));
+    let vectors = Message::Vectors {
+        servable: theirs.clone(),
+        witnessed: theirs,
+        facts: None,
+        facts_gen: None,
+        echo: None,
+        replay_from: None,
+        newest_epochs: Vec::new(),
+    };
+    write_frame(&mut stream, &vectors).await.unwrap();
+    let from = match read_frame(&mut stream).await.unwrap() {
+        Message::AskEntries { from, .. } => from,
+        other => panic!("{other:?}"),
+    };
+    let last_page = Message::Entries {
+        entries: Vec::new(),
+        scanned_to: from,
+        exhausted: true,
+        passed_through: None,
+    };
+    write_frame(&mut stream, &last_page).await.unwrap();
+    match read_frame(&mut stream).await.unwrap() {
+        Message::AskEntries { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(catch_up.replay_answered(holder), "premise: the first ask was the replay's");
+    if let Some(reply) = to_the_pull {
+        write_frame(&mut stream, &reply).await.unwrap();
+    }
+}
+
+/// A's own round with C, which [`a_holder_whose_pull_goes_wrong`] serves.
+async fn a_dials_a_holder_whose_pull_goes_wrong(
+    f: &Fixture,
+    stalls: &mut PeerStalls,
+    to_the_pull: Option<Message>,
+) -> Result<SyncOutcome, ProtocolError> {
+    let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+    let theirs = f.c.version_vector().unwrap();
+    let c = f.c.node_id();
+    let serving =
+        a_holder_whose_pull_goes_wrong(far, theirs, Arc::clone(&f.catch_up), c, to_the_pull);
+    let asking = async {
+        let outcome = sync_over(&f.a, &mut ours, addr(), c, None, stalls).await;
+        drop(ours);
+        outcome
+    };
+    let ((), outcome) = tokio::join!(serving, asking);
+    outcome
+}
+
+/// A contact a peer opened answers the replay, and no round of A's own has succeeded: the
+/// replay is not settled by it.
+#[tokio::test]
+async fn an_inbound_replay_does_not_settle_before_a_round_of_ours() {
+    let f = fixture(5, 0);
+    scripted(&f, |mut stream| async move {
+        let from = ask_versions(&mut stream).await.expect("premise: A asks on its vectors");
+        let last_page = Message::ReplayEntries {
+            from,
+            entries: Vec::new(),
+            exhausted: true,
+            horizon: false,
+            scanned_to: from,
+        };
+        write_frame(&mut stream, &last_page).await.unwrap();
+        match read_frame(&mut stream).await.unwrap() {
+            Message::ReplayAck { done, .. } => assert!(done, "premise: the replay is done"),
+            other => panic!("{other:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "premise: C has answered");
+    assert!(f.catch_up.replay_armed(), "premise: still armed before the tick");
+
+    the_loop_judges(&f, &[]);
+    assert!(f.catch_up.replay_armed(), "no round of A's own has succeeded");
+}
+
+/// A round of A's own that fails after its replay is no contact: the answer it got does not
+/// settle the replay.
+#[tokio::test]
+async fn a_round_that_fails_after_its_replay_does_not_settle_it() {
+    let f = fixture(5, 0);
+    let mut stalls = PeerStalls::new();
+    stalls.set_catch_up(Some(Arc::clone(&f.catch_up)));
+    let round = a_dials_a_holder_whose_pull_goes_wrong(&f, &mut stalls, None).await;
+    assert!(round.is_err(), "premise: the round fails: {round:?}");
+    let reached = stalls.take_reached_after(&round);
+    assert!(reached.is_empty(), "premise: it is no contact");
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "premise: C has answered");
+    assert!(f.catch_up.replay_armed(), "premise: still armed before the tick");
+
+    the_loop_judges(&f, &reached);
+    assert!(f.catch_up.replay_armed(), "no round of A's own has succeeded");
+}
+
+/// A round whose refused pull is set aside (ADR-224) reaches nobody for the replay: the
+/// answer it got does not settle it.
+#[tokio::test]
+async fn a_round_with_its_refused_pull_set_aside_does_not_settle_the_replay() {
+    let f = fixture(5, 0);
+    let mut stalls = PeerStalls::new();
+    stalls.set_catch_up(Some(Arc::clone(&f.catch_up)));
+    stalls.allow_horizon_deferral(true);
+    let refused = Some(Message::BeyondHorizon {});
+    let round = a_dials_a_holder_whose_pull_goes_wrong(&f, &mut stalls, refused).await;
+    assert!(
+        matches!(&round, Ok(outcome) if outcome.horizon_deferred),
+        "premise: the refusal is set aside: {round:?}"
+    );
+    let reached = stalls.take_reached_after(&round);
+    assert!(reached.is_empty(), "premise: it counts as nobody reached");
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "premise: C has answered");
+    assert!(f.catch_up.replay_armed(), "premise: still armed before the tick");
+
+    the_loop_judges(&f, &reached);
+    assert!(f.catch_up.replay_armed(), "no round of A's own has succeeded");
+}

@@ -4365,4 +4365,346 @@ mod tests {
         assert_eq!(said.len(), 1, "{said:?}");
         assert_eq!(said[0].0, tracing::Level::WARN);
     }
+
+    // The replay is not settled before a sync round of this member's own has succeeded in the
+    // run (ADR-212): until then the start-race guard has had nothing to judge from. A tick
+    // that reaches a peer is such a round; a tick that reaches nobody is not, whatever has
+    // answered the replay on a connection a peer opened or in a round that then failed.
+
+    /// Hand `catchup` the names of a guard's pass that was not alone.
+    fn passed_with(catchup: &Arc<CatchUp>, names: &[u8]) {
+        let (engine, _store) = an_engine();
+        let names = names.iter().map(|n| node(*n)).collect();
+        let at_pass = crate::guard_rounds::AtPass { names, alone: false };
+        catchup.at_guard_pass(&engine, &at_pass).unwrap();
+    }
+
+    fn ids(nodes: &[u8]) -> BTreeSet<NodeId> {
+        nodes.iter().map(|n| node(*n)).collect()
+    }
+
+    /// The same data directory opened by another run, its replay armed at `now` from `at_open`.
+    fn another_run(dir: &Path, at_open: u64, now: Instant) -> Arc<CatchUp> {
+        let catchup = CatchUp::open(dir, WAIT);
+        catchup.arm_replay_at(kimmy_core::Hlc::new(at_open, 0), None, now).unwrap();
+        catchup
+    }
+
+    fn floor_text(f: &Fixture) -> String {
+        std::fs::read_to_string(f._dir.path().join(REPLAY_FLOOR_FILE)).unwrap()
+    }
+
+    /// A member the guard's pass named has not been seen, and no round of this member's own
+    /// has succeeded: the replay stays armed. Once one has, that member, listed, owes the
+    /// replay, and its answer lets the replay settle.
+    #[test]
+    fn the_replay_waits_for_a_named_member_before_a_round_of_ours() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        assert!(f.catchup.replay_armed(), "premise");
+        assert_eq!(f.catchup.awaited_members(), ids(&[1, 2]), "premise");
+
+        judge(&f.catchup, &members_of(&[1]), &[], &covering(), t0 + secs(1));
+        assert!(f.catchup.replay_armed(), "member 2 was named at the pass and has not been seen");
+
+        let listed = members_of(&[1, 2]);
+        let b = [peer_b()];
+        assert_eq!(judge(&f.catchup, &listed, &b, &covering(), t0 + secs(2)), Decision::Kept);
+        assert!(f.catchup.replay_armed(), "member 2 is listed and has not answered");
+        assert_eq!(f.catchup.owed_members(), [node(2)]);
+        f.catchup.replay_finished(node(2));
+        judge(&f.catchup, &listed, &b, &covering(), t0 + secs(3));
+        assert!(!f.catchup.replay_armed() && !floor_on_disk(&f), "it has answered");
+    }
+
+    /// The control: after a round of this member's own, the guard's window holds the replay
+    /// for a named member not yet seen.
+    #[test]
+    fn a_named_member_unseen_holds_the_replay_after_a_round_of_ours() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        judge(&f.catchup, &members_of(&[1]), &[peer_b()], &covering(), t0 + secs(1));
+        assert!(f.catchup.replay_armed(), "member 2 was named at the pass and has not been seen");
+    }
+
+    /// Every named member listed and answered, on connections that were not rounds of this
+    /// member's own: the replay waits for one, and settles at it.
+    #[test]
+    fn answers_from_every_named_member_do_not_settle_before_a_round_of_ours() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        f.catchup.replay_finished(node(2));
+        let listed = members_of(&[1, 2]);
+
+        judge(&f.catchup, &listed, &[], &covering(), t0 + secs(1));
+        assert!(f.catchup.replay_armed(), "no round of ours has succeeded");
+
+        judge(&f.catchup, &listed, &[peer_b()], &covering(), t0 + secs(2));
+        assert!(!f.catchup.replay_armed() && !floor_on_disk(&f), "and now one has");
+    }
+
+    /// With no name from a pass and fewer members than `cluster.expected_members`, the replay
+    /// waits for a round of this member's own too.
+    #[test]
+    fn the_replay_waits_for_a_round_of_ours_short_of_expected_members() {
+        let (f, t0) = restored_armed();
+        assert!(f.catchup.awaited_members().is_empty(), "premise: no pass names anyone");
+        let listed = members_of(&[1]);
+        judge_expecting(&f.catchup, &listed, &[], &covering(), Some(3), t0 + secs(1));
+        assert!(f.catchup.replay_armed(), "two of three, and no round of ours");
+    }
+
+    /// The names of a guard's pass are in the replay floor file: a run that follows awaits
+    /// them again, with no tick between.
+    #[test]
+    fn the_names_of_a_pass_are_awaited_again_after_a_restart() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        let next = another_run(f._dir.path(), 50, t0 + secs(1));
+        assert_eq!(next.awaited_members(), ids(&[1, 2]));
+    }
+
+    /// A tick that rewrites the floor file for the members that owe keeps the names, and in
+    /// the next run a name read from the file alone holds the replay after a round of ours.
+    #[test]
+    fn the_names_of_a_pass_survive_a_ticks_rewrite_and_hold_after_a_restart() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        judge(&f.catchup, &members_of(&[3]), &[], &covering(), t0 + secs(1));
+        let owed = format!("owed = {}", node(3));
+        assert!(floor_text(&f).contains(&owed), "premise: the tick rewrote the file");
+
+        let t1 = t0 + secs(2);
+        let next = another_run(f._dir.path(), 50, t1);
+        assert!(next.awaited_members().contains(&node(2)), "read from the file");
+        next.replay_finished(node(1));
+        next.replay_finished(node(3));
+        // Members 1 and 3 are listed and have answered, and member 1 is reached: only
+        // member 2, named and not seen, is left to hold it.
+        judge(&next, &members_of(&[1, 3]), &[peer_b()], &covering(), t1 + secs(1));
+        assert!(next.replay_armed(), "member 2 has not been seen");
+    }
+
+    /// A member whose own rounds all fail serves as `unknown` after the wait, its owner work
+    /// off, whether or not the replay is armed; and it stays armed.
+    #[test]
+    fn a_member_whose_own_rounds_fail_serves_as_unknown_with_the_replay_armed() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        f.catchup.first_tick(t0);
+        let listed = members_of(&[1]);
+
+        let early = t0 + secs(1);
+        assert_eq!(judge(&f.catchup, &listed, &[], &covering(), early), Decision::Kept);
+        assert!(f.catchup.gated(early), "inside the wait it refuses");
+        assert_eq!(f.catchup.unknown_because(early), None);
+
+        let past = t0 + WAIT + secs(1);
+        assert_eq!(judge(&f.catchup, &listed, &[], &covering(), past), Decision::Kept);
+        assert!(f.catchup.is_set(), "the marker is kept");
+        assert_eq!(f.catchup.unknown_because(past), Some(UnknownCause::NoCountingPeer));
+        assert!(!f.catchup.gated(past), "it serves");
+        assert!(f.catchup.holds_owner_work(), "with its owner work off");
+        assert!(f.catchup.replay_armed(), "and still asks for what it may have lost");
+    }
+
+    /// A start that kept its epoch has no guard and no pass, and only the replay brings back
+    /// what it lost. It waits for a round of its own, from which the guard learns whom the
+    /// peers' vectors name.
+    #[test]
+    fn a_start_that_kept_its_epoch_keeps_the_replay_for_a_round_of_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), WAIT);
+        let t0 = Instant::now();
+        catchup.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, t0).unwrap();
+        catchup.replay_finished(node(1));
+        let only_b = members_of(&[1]);
+        let path = dir.path().join(REPLAY_FLOOR_FILE);
+
+        judge(&catchup, &only_b, &[], &covering(), t0 + secs(1));
+        assert!(catchup.replay_armed(), "no round of ours has succeeded");
+
+        let naming_c = [reached(1, vector(&[(1, 100), (2, 50)]), None, block(None))];
+        let mine = vector(&[(1, 100), (2, 50), (9, 200)]);
+        judge(&catchup, &only_b, &naming_c, &mine, t0 + secs(2));
+        assert!(catchup.replay_armed(), "B's vector names C, which is not listed");
+
+        let listed = members_of(&[1, 2]);
+        catchup.replay_finished(node(2));
+        judge(&catchup, &listed, &naming_c, &mine, t0 + secs(3));
+        assert!(!path.exists() && !catchup.replay_armed(), "C has been asked and answered");
+    }
+
+    /// Only the names of the pass are kept: an origin a reached vector named is awaited in
+    /// this run alone.
+    #[test]
+    fn only_the_names_of_a_pass_are_kept_across_a_restart() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        let naming_4 = [reached(1, vector(&[(1, 100), (4, 50)]), None, block(None))];
+        judge(&f.catchup, &members_of(&[3]), &naming_4, &covering(), t0 + secs(1));
+        assert!(f.catchup.awaited_members().contains(&node(4)), "premise: awaited in this run");
+        let owed = format!("owed = {}", node(3));
+        assert!(floor_text(&f).contains(&owed), "premise: the tick rewrote the file");
+
+        let next = another_run(f._dir.path(), 50, t0 + secs(2));
+        assert!(next.awaited_members().contains(&node(2)), "a name of the pass");
+        assert!(!next.awaited_members().contains(&node(4)), "a name only a vector gave");
+    }
+
+    /// A start that moves the floor down rewrites the file, and keeps the names.
+    #[test]
+    fn the_names_of_a_pass_survive_the_arms_rewrite() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        let _second = another_run(f._dir.path(), 20, t0 + secs(1));
+        assert_eq!(
+            replay_floor_on_disk(f._dir.path()),
+            Some(kimmy_core::Hlc::new(20, 0)),
+            "premise: the arm rewrote the file"
+        );
+        let third = another_run(f._dir.path(), 20, t0 + secs(2));
+        assert!(third.awaited_members().contains(&node(2)), "still in the file");
+    }
+
+    /// A pass whose names cannot be recorded is an error, so that the member stays held and
+    /// the step is tried again.
+    #[test]
+    fn a_pass_that_cannot_record_its_names_fails() {
+        let (f, t0) = restored_armed();
+        let (engine, _store) = an_engine();
+        let at_pass = crate::guard_rounds::AtPass { names: ids(&[1, 2]), alone: false };
+        let path = f._dir.path().join(REPLAY_FLOOR_FILE);
+        let floor = floor_text(&f);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(f.catchup.at_guard_pass(&engine, &at_pass).is_err(), "the file cannot be written");
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, floor).unwrap();
+        f.catchup.at_guard_pass(&engine, &at_pass).unwrap();
+        let next = another_run(f._dir.path(), 50, t0 + secs(1));
+        assert_eq!(next.awaited_members(), ids(&[1, 2]), "recorded on the retry");
+    }
+
+    /// A floor file the operator removed is not made again by a pass.
+    #[test]
+    fn a_pass_creates_no_floor_file_where_it_was_removed() {
+        let (f, _t0) = restored_armed();
+        std::fs::remove_file(f._dir.path().join(REPLAY_FLOOR_FILE)).unwrap();
+        passed_with(&f.catchup, &[1, 2]);
+        assert!(!floor_on_disk(&f));
+    }
+
+    const HELD_FOR_A_ROUND: &str = "no sync round of its own has succeeded";
+
+    /// An unmarked member whose replay is kept armed only for want of a round of its own says
+    /// so once, when the wait has passed.
+    #[test]
+    fn an_unmarked_member_held_for_a_round_of_ours_says_so_once() {
+        let events = Events::default();
+        let _not_alone = a_second_dispatcher();
+        let _recording = tracing::subscriber::set_default(events.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), WAIT);
+        let t0 = Instant::now();
+        catchup.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, t0).unwrap();
+        catchup.replay_finished(node(1));
+        let listed = members_of(&[1]);
+        let tick_at = |at: Instant| {
+            judge(&catchup, &listed, &[], &covering(), at);
+        };
+
+        tick_at(t0 + secs(1));
+        assert!(events.matching(HELD_FOR_A_ROUND).is_empty(), "not before the wait");
+        tick_at(t0 + WAIT + secs(1));
+        let said = events.matching(HELD_FOR_A_ROUND);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, tracing::Level::WARN);
+        assert!(!said[0].1.contains("catching-up marker"), "it has none: {}", said[0].1);
+        tick_at(t0 + WAIT + secs(1) + WARN_EVERY);
+        assert_eq!(events.matching(HELD_FOR_A_ROUND).len(), 1, "once");
+    }
+
+    /// A marked member says it again every `WARN_EVERY`, and names the marker, which the
+    /// operator can delete.
+    #[test]
+    fn a_marked_member_held_for_a_round_of_ours_repeats_it_with_the_way_out() {
+        let events = Events::default();
+        let _not_alone = a_second_dispatcher();
+        let _recording = tracing::subscriber::set_default(events.clone());
+        let (f, t0) = restored_armed();
+        let listed = members_of(&[1]);
+        let tick_at = |at: Instant| {
+            judge(&f.catchup, &listed, &[], &covering(), at);
+        };
+        let first = t0 + WAIT + secs(1);
+
+        tick_at(t0 + secs(1));
+        assert!(events.matching(HELD_FOR_A_ROUND).is_empty(), "not before the wait");
+        tick_at(first);
+        let said = events.matching(HELD_FOR_A_ROUND);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, tracing::Level::WARN);
+        assert!(said[0].1.contains("catching-up marker"), "the way out: {}", said[0].1);
+        tick_at(first + WARN_EVERY - secs(1));
+        assert_eq!(events.matching(HELD_FOR_A_ROUND).len(), 1, "not again so soon");
+        tick_at(first + WARN_EVERY);
+        assert_eq!(events.matching(HELD_FOR_A_ROUND).len(), 2, "and again");
+    }
+
+    /// The line about a round of this member's own is said only where that is all that holds
+    /// the replay: not with nobody answered, not with a member owing, and not once a round of
+    /// its own has succeeded and the guard holds it.
+    #[test]
+    fn a_replay_held_for_another_reason_says_nothing_of_a_round() {
+        let events = Events::default();
+        let _not_alone = a_second_dispatcher();
+        let _recording = tracing::subscriber::set_default(events.clone());
+        let t0 = Instant::now();
+        let armed = |dir: &Path| {
+            let catchup = CatchUp::open(dir, WAIT);
+            catchup.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, t0).unwrap();
+            catchup
+        };
+        let past = t0 + WAIT + secs(1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let unanswered = armed(dir.path());
+        judge(&unanswered, &members_of(&[]), &[], &covering(), past);
+        assert!(unanswered.replay_armed(), "premise");
+        assert!(events.matching(HELD_FOR_A_ROUND).is_empty(), "nobody has answered");
+
+        let dir = tempfile::tempdir().unwrap();
+        let owed = armed(dir.path());
+        owed.replay_finished(node(1));
+        judge(&owed, &members_of(&[1, 2]), &[], &covering(), past);
+        assert!(owed.replay_armed(), "premise");
+        assert!(events.matching(HELD_FOR_A_ROUND).is_empty(), "member 2 owes it");
+
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = armed(dir.path());
+        guarded.replay_finished(node(1));
+        let naming_c = [reached(1, vector(&[(1, 100), (2, 50)]), None, block(None))];
+        let only_b = members_of(&[1]);
+        judge(&guarded, &only_b, &naming_c, &covering(), t0 + secs(100));
+        judge(&guarded, &only_b, &[], &covering(), past);
+        assert!(guarded.replay_armed(), "premise: within the guard's window");
+        assert!(events.matching(HELD_FOR_A_ROUND).is_empty(), "a round of its own has succeeded");
+    }
+
+    /// A name a run read from the file is written back by that run's own rewrites.
+    #[test]
+    fn the_names_read_from_the_file_survive_a_later_runs_rewrite() {
+        let (f, t0) = restored_armed();
+        passed_with(&f.catchup, &[1, 2]);
+        let t1 = t0 + secs(1);
+        let next = another_run(f._dir.path(), 50, t1);
+        judge(&next, &members_of(&[3]), &[], &covering(), t1 + secs(1));
+        let owed = format!("owed = {}", node(3));
+        assert!(floor_text(&f).contains(&owed), "premise: that run's tick rewrote the file");
+
+        let third = another_run(f._dir.path(), 50, t0 + secs(3));
+        assert!(third.awaited_members().contains(&node(2)), "read again after a second restart");
+    }
 }
