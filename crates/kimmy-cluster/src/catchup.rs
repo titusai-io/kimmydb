@@ -3857,6 +3857,67 @@ mod tests {
         assert!(f.catchup.owed_members().is_empty(), "nobody stands in for the missing member");
     }
 
+    /// How long [`held_then_let_go`] keeps the guard's hold on after the replay is armed.
+    const HELD: Duration = Duration::from_millis(50);
+
+    /// A restore that its guard held (ADR-274) and then let go, whose replay floor file names C
+    /// (node 2) as owing. Its replay was armed at the first instant returned; it was let go at
+    /// least `HELD` later, and no later than the second. B has answered it.
+    fn held_then_let_go() -> (Fixture, Instant, Instant) {
+        let dir = tempfile::tempdir().unwrap();
+        let floor = format!("floor_ms = 50\nfloor_counter = 0\nowed = {}\n", node(2));
+        std::fs::write(dir.path().join(REPLAY_FLOOR_FILE), floor).unwrap();
+        write_marker(dir.path(), CatchUpReason::Restored).unwrap();
+        let catchup = CatchUp::open(dir.path(), WAIT);
+        catchup.hold_for_guard();
+        let armed = Instant::now();
+        catchup.arm_replay_at(kimmy_core::Hlc::new(80, 0), None, armed).unwrap();
+        std::thread::sleep(HELD);
+        catchup.release_guard_hold();
+        let let_go = Instant::now();
+        catchup.replay_finished(node(1));
+        (Fixture { _dir: dir, catchup }, armed, let_go)
+    }
+
+    /// Nobody looks for an owing member while the guard holds this one, so its absence counts from
+    /// the release: a dwell after the replay was armed it still owes, and a dwell after the
+    /// release it is forfeited.
+    #[test]
+    fn a_guards_hold_is_no_part_of_the_dwell_of_a_member_that_owes() {
+        let (f, armed, let_go) = held_then_let_go();
+        let (only_b, b) = (members_of(&[1]), [peer_b()]);
+        let dwell = f.catchup.dwell();
+        let first = judge(&f.catchup, &only_b, &b, &covering(), armed + dwell);
+        assert_eq!(
+            f.catchup.owed_members(),
+            [node(2)],
+            "it owes on: its absence counts from the release"
+        );
+        assert_eq!(first, Decision::Kept);
+        assert_eq!(
+            judge(&f.catchup, &only_b, &b, &covering(), let_go + dwell),
+            Decision::Cleared("dominance"),
+            "gone for a dwell since the release"
+        );
+    }
+
+    /// Nor is the guard's hold part of the wait for which an owing member holds the clear: listed,
+    /// and not yet answering, it is waited on until a wait after the release.
+    #[test]
+    fn a_guards_hold_is_no_part_of_the_wait_for_a_member_that_owes() {
+        let (f, armed, let_go) = held_then_let_go();
+        let (both, b) = (members_of(&[1, 2]), [peer_b()]);
+        assert_eq!(judge(&f.catchup, &both, &b, &covering(), armed + WAIT), Decision::Kept);
+        assert_eq!(f.catchup.unknown_because(armed + WAIT), None, "waited on from the release");
+        assert!(f.catchup.gated(armed + WAIT), "so it still refuses");
+        assert_eq!(judge(&f.catchup, &both, &b, &covering(), let_go + WAIT), Decision::Kept);
+        assert_eq!(
+            f.catchup.unknown_because(let_go + WAIT),
+            Some(UnknownCause::OwedReplay),
+            "and past it a wait after the release"
+        );
+    }
+
     /// The owed set survives a restart of this member through the floor
     /// file: a loaded member holds the clear for the wait from the arming, is
     /// released after the dwell if it is never seen, and owes on if it is seen.
