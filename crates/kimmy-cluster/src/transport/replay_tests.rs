@@ -2403,3 +2403,293 @@ async fn a_round_with_its_refused_pull_set_aside_does_not_settle_the_replay() {
     the_loop_judges(&f, &reached);
     assert!(f.catch_up.replay_armed(), "no round of A's own has succeeded");
 }
+
+// What a replay may call lost (ADR-212). An entry a member has no oplog row for proves
+// nothing where its own retention removed it: only one above what retention has removed of
+// its origin does.
+
+/// What C holds of A's node, from the start of its oplog.
+fn what_c_holds_of_a(f: &Fixture) -> Vec<OplogEntry> {
+    let held = f.c.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background);
+    held.unwrap().entries.into_iter().filter(|e| e.stamp.node == f.a.node_id()).collect()
+}
+
+/// How many entries of `page` A has an oplog row for.
+fn rows_a_holds(f: &Fixture, page: &[OplogEntry]) -> usize {
+    page.iter().filter(|e| f.a.has_oplog_entry(&e.stamp).unwrap()).count()
+}
+
+/// A retention pass of A's own, a year ahead, which keeps every tombstone. It removes every
+/// oplog entry but the newest.
+fn a_collects(f: &Fixture) {
+    let far = kimmy_storage::physical_now_ms() + 365 * 24 * 3600 * 1000;
+    f.a.collect_garbage_at(far, kimmy_storage::RetentionPolicy::new(1, u64::MAX)).unwrap();
+}
+
+/// A applies `page` of C's replay, asked from before every entry in it.
+fn a_applies(f: &Fixture, page: Vec<OplogEntry>) {
+    let c = f.c.node_id();
+    let from = pos(f, Hlc::ZERO);
+    replay_apply(&f.a, &f.catch_up, &"C", c, from, page, from, true, Via::Outbound).unwrap();
+}
+
+/// One event's fields by name, the message apart.
+type FieldsByName = std::collections::BTreeMap<String, String>;
+
+/// What a test's subscriber saw: each event's message and its other fields by name.
+#[derive(Clone, Default)]
+struct SaidWithFields(Arc<std::sync::Mutex<Vec<(String, FieldsByName)>>>);
+
+impl SaidWithFields {
+    fn matching(&self, text: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let said = self.0.lock().unwrap();
+        said.iter().filter(|(m, _)| m.contains(text)).map(|(_, fields)| fields.clone()).collect()
+    }
+}
+
+impl tracing::Subscriber for SaidWithFields {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        #[derive(Default)]
+        struct Fields(String, std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                } else {
+                    self.1.insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0.lock().unwrap().push((fields.0, fields.1));
+    }
+    fn enter(&self, _: &tracing::Id) {}
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+const WRITES_LOST: &str = "the peer holds writes this member made and no longer holds";
+
+#[test]
+fn what_this_members_own_retention_removed_is_not_read_as_lost() {
+    let f = fixture(0, 0);
+    // C's page, as it was served for a position cut before A's pass.
+    let page = what_c_holds_of_a(&f);
+    assert!(!page.is_empty() && rows_a_holds(&f, &page) == page.len(), "premise: A holds it all");
+    a_collects(&f);
+    assert_eq!(rows_a_holds(&f, &page), 0, "premise: A's pass removed it all");
+    let highest = page.last().unwrap().stamp;
+    assert!(page.iter().all(|e| e.stamp.origin() == highest.origin()), "premise: one origin");
+    assert_eq!(
+        f.a.oplog_collected().unwrap().get(highest.origin()),
+        highest.hlc,
+        "premise: the highest entry served is the highest the pass removed"
+    );
+    assert_eq!(f.catch_up.reason(), None, "premise: not marked");
+
+    a_applies(&f, page);
+    assert_eq!(f.catch_up.reason(), None, "A removed those entries itself: it lost nothing");
+}
+
+#[test]
+fn a_replay_that_serves_what_the_member_holds_marks_nothing() {
+    let f = fixture(0, 0);
+    let page = what_c_holds_of_a(&f);
+    assert!(!page.is_empty() && rows_a_holds(&f, &page) == page.len(), "premise: A holds it all");
+    a_applies(&f, page);
+    assert_eq!(f.catch_up.reason(), None);
+}
+
+#[test]
+fn what_is_truly_lost_still_marks_after_a_pass() {
+    let f = fixture(3, 0);
+    let page = what_c_holds_of_a(&f);
+    let held = rows_a_holds(&f, &page);
+    assert!(held > 0 && held < page.len(), "premise: A holds some of it and lacks some");
+    a_collects(&f);
+    assert!(rows_a_holds(&f, &page) < held, "premise: the pass removed some that A held");
+    assert_eq!(f.catch_up.reason(), None, "premise: not marked");
+    let before = f.orders();
+
+    a_applies(&f, page);
+    assert_eq!(f.catch_up.reason(), Some(crate::CatchUpReason::Restored), "three are lost");
+    assert_eq!(f.orders(), before + 3, "and they are back");
+}
+
+/// A page of nothing but what retention removed says no loss, and leaves the one line a
+/// peer's first loss gets for a loss that comes later. That line counts the entries that
+/// prove it, not every entry the member has no row for.
+#[test]
+fn a_page_of_collected_entries_says_no_loss_and_keeps_the_first_one_for_later() {
+    let said = SaidWithFields::default();
+    let _not_alone = a_second_dispatcher();
+    let _recording = tracing::subscriber::set_default(said.clone());
+    let f = fixture(0, 0);
+    let page = what_c_holds_of_a(&f);
+    assert!(rows_a_holds(&f, &page) == page.len(), "premise: A holds it all");
+    a_collects(&f);
+
+    a_applies(&f, page.clone());
+    assert!(said.matching(WRITES_LOST).is_empty(), "nothing was lost");
+
+    let above = Hlc::new(page.last().unwrap().stamp.hlc.wall_ms + 1, 0);
+    let lost = own_entry(&f, above, "gone");
+    let removed = f.a.oplog_collected().unwrap().get(lost.stamp.origin());
+    assert!(!f.a.has_oplog_entry(&lost.stamp).unwrap(), "premise: A has no row for it");
+    assert!(lost.stamp.hlc > removed, "premise: above what retention removed of its origin");
+    assert!(rows_a_holds(&f, &page) < page.len(), "premise: an entry of the page has no row");
+    let mut again = page;
+    again.push(lost);
+
+    a_applies(&f, again);
+    let lines = said.matching(WRITES_LOST);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["entries"], "1", "only the one that was lost");
+}
+
+/// What retention removed is kept per origin: a later epoch's collected entries say
+/// nothing of the writes lost under an earlier one.
+#[test]
+fn the_record_is_read_per_origin() {
+    let f = fixture(3, 0);
+    let page = what_c_holds_of_a(&f);
+    let lost: Vec<Stamp> =
+        page.iter().filter(|e| !f.a.has_oplog_entry(&e.stamp).unwrap()).map(|e| e.stamp).collect();
+    assert!(!lost.is_empty(), "premise: A lacks some");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for id in [100, 101] {
+        f.a.insert_many(&orders, vec![bson::doc! { "_id": id }]).unwrap();
+    }
+    a_collects(&f);
+    let record = f.a.oplog_collected().unwrap();
+    let old = lost[0].origin();
+    assert_ne!(old, f.a.origin(), "premise: A writes under a new epoch");
+    assert!(lost.iter().all(|stamp| stamp.origin() == old && stamp.hlc > record.get(old)));
+    assert!(
+        lost.iter().all(|stamp| stamp.hlc < record.get(f.a.origin())),
+        "premise: the new epoch's record is above every lost stamp"
+    );
+    let before = f.orders();
+
+    a_applies(&f, page);
+    assert_eq!(f.catch_up.reason(), Some(crate::CatchUpReason::Restored));
+    assert_eq!(f.orders(), before + 3);
+}
+
+/// A member rolled back with its epoch kept: A, which wrote L, put back to a copy of its
+/// store taken before L, while C holds L.
+fn rolled_back_under_its_epoch() -> (Fixture, OplogEntry) {
+    let a_dir = tempfile::tempdir().unwrap();
+    let path = a_dir.path().join("kimmy.redb");
+    let saved = a_dir.path().join("saved.redb");
+    let a = Engine::open(&path).unwrap();
+    let orders = a.create_collection("shop", "orders").unwrap();
+    a.insert_many(&orders, vec![bson::doc! { "_id": 0 }]).unwrap();
+    let epoch = a.epoch();
+    drop(a);
+    std::fs::copy(&path, &saved).unwrap();
+
+    let a = Engine::open(&path).unwrap();
+    let orders = a.get_collection("shop", "orders").unwrap();
+    a.insert_many(&orders, vec![bson::doc! { "_id": "lost" }]).unwrap();
+    let window =
+        a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
+    assert!(window.exhausted, "premise: one window");
+    let lost = window.entries.last().unwrap().clone();
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+    c.apply_batch(&window.entries).unwrap();
+    drop(a);
+    std::fs::copy(&saved, &path).unwrap();
+
+    let a = Engine::open(&path).unwrap();
+    assert_eq!(a.epoch(), epoch, "premise: the rollback kept the epoch");
+    assert_eq!(lost.stamp.origin(), a.origin(), "premise: L is of the origin A still writes");
+    assert!(!a.has_oplog_entry(&lost.stamp).unwrap(), "premise: A has lost L");
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+    catch_up.arm_replay(a.own_position_at_open(), None).unwrap();
+    let members = Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    let dirs = vec![a_dir, c_dir, marker_dir];
+    (Fixture { a, c, catch_up, members, lost: 1, _dirs: dirs }, lost)
+}
+
+/// **A stated limit.** What retention has removed is a high-water mark. Where a write made
+/// after the loss has itself been removed, the mark has passed the lost one: the replay
+/// still brings it back, and it proves nothing.
+#[test]
+fn a_loss_below_the_record_is_applied_and_does_not_mark() {
+    let (f, lost) = rolled_back_under_its_epoch();
+    std::thread::sleep(Duration::from_millis(15));
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for id in [100, 101] {
+        f.a.insert_many(&orders, vec![bson::doc! { "_id": id }]).unwrap();
+    }
+    a_collects(&f);
+    assert!(!f.a.has_oplog_entry(&lost.stamp).unwrap(), "premise: still no row for L");
+    assert!(
+        f.a.oplog_collected().unwrap().get(lost.stamp.origin()) >= lost.stamp.hlc,
+        "premise: what retention removed has passed L"
+    );
+    let before = f.orders();
+
+    a_applies(&f, vec![lost]);
+    assert_eq!(f.orders(), before + 1, "L is back");
+    assert_eq!(f.catch_up.reason(), None, "below what retention removed: no proof");
+}
+
+/// The mark of what a peer has proven lost is the highest entry that proves a loss. An
+/// entry above it that retention removed must not raise it: a later loss below that entry
+/// would then be taken for one already proven, and not gate the member again.
+#[test]
+fn the_proof_stamp_is_the_highest_proof_not_the_highest_missing() {
+    let wait = Duration::from_secs(120);
+    let f = fixture(3, 0);
+    let lost: Vec<OplogEntry> = what_c_holds_of_a(&f)
+        .into_iter()
+        .filter(|e| !f.a.has_oplog_entry(&e.stamp).unwrap())
+        .collect();
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for id in [100, 101] {
+        f.a.insert_many(&orders, vec![bson::doc! { "_id": id }]).unwrap();
+    }
+    let own = f.a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background);
+    let own: Vec<OplogEntry> =
+        own.unwrap().entries.into_iter().filter(|e| e.stamp.origin() == f.a.origin()).collect();
+    // A write under the new epoch, above every lost one, which the pass removes.
+    let collected = own[own.len() - 2].clone();
+    a_collects(&f);
+    let record = f.a.oplog_collected().unwrap();
+    assert!(!f.a.has_oplog_entry(&collected.stamp).unwrap(), "premise: removed");
+    assert!(record.get(collected.stamp.origin()) >= collected.stamp.hlc, "premise");
+    let top = lost.last().unwrap().stamp;
+    let between = Hlc::new(top.hlc.wall_ms, top.hlc.counter + 1);
+    assert!(top.hlc < between && between < collected.stamp.hlc, "premise: between the two");
+    assert!(between > record.get(top.origin()), "premise: above the old epoch's record");
+
+    f.catch_up.first_tick(std::time::Instant::now());
+    let mut first = lost;
+    first.push(collected);
+    a_applies(&f, first);
+    let after_first = std::time::Instant::now();
+    assert_eq!(f.catch_up.reason(), Some(crate::CatchUpReason::Restored), "premise: marked");
+    // One wait after the first page, and before one wait after anything later.
+    let probe = after_first + wait + Duration::from_millis(10);
+    assert!(f.catch_up.unknown(probe), "premise: counted from the first page, the wait is over");
+
+    std::thread::sleep(Duration::from_millis(60));
+    let mut later = own_entry(&f, between, "between");
+    later.stamp = Stamp::new(between, f.a.node_id(), top.epoch);
+    assert!(!f.a.has_oplog_entry(&later.stamp).unwrap(), "premise: lost");
+    a_applies(&f, vec![later]);
+    assert!(!f.catch_up.unknown(probe), "a loss not yet proven gates the member again");
+}
