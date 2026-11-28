@@ -185,15 +185,32 @@ impl Engine {
         !self.is_founding_epoch() && !self.has_met_a_peer()
     }
 
-    /// Run `first` at this epoch's first handshake with another node.
-    ///
-    /// **Scaffold of the tests commit**: never run.
-    pub fn before_first_met_a_peer(&self, _first: impl Fn() -> bool + Send + 'static) {}
+    /// Run `first` at this epoch's first handshake with another node, before that contact goes on
+    /// and before [`Engine::has_met_a_peer`] says anyone has been met (ADR-274): contacts that
+    /// arrive while it runs wait for it. If it says it failed (`false`), the epoch stays unmet and
+    /// it runs again at the next contact. For an epoch that has met a peer already, never.
+    pub fn before_first_met_a_peer(&self, first: impl Fn() -> bool + Send + 'static) {
+        *self.before_met.lock() = Some(Box::new(first));
+    }
 
     /// Note that this epoch's host completed a handshake with another node. Sets the flag and
-    /// nothing else: a handshake never waits on the writer.
+    /// writes nothing, so a handshake never waits on the writer. The first one waits for what
+    /// [`Engine::before_first_met_a_peer`] was given, if anything was.
     pub fn note_met_a_peer(&self) {
-        self.met_peer.store(true, std::sync::atomic::Ordering::SeqCst);
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.met_peer.load(SeqCst) {
+            return;
+        }
+        crate::blocking(|| {
+            let first = self.before_met.lock();
+            // A contact that waited for the lock finds it done.
+            if self.met_peer.load(SeqCst) {
+                return;
+            }
+            if first.as_ref().is_none_or(|first| first()) {
+                self.met_peer.store(true, SeqCst);
+            }
+        });
     }
 
     /// Write the bit durably, once, from outside a contact (it takes the writer). A bit that was

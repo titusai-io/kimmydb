@@ -360,6 +360,9 @@ pub struct Engine {
     /// Whether the epoch is the one the store was founded with; see
     /// [`Engine::is_founding_epoch`]. Set at the open and never changed.
     pub(crate) founding_epoch: bool,
+    /// What runs at the first handshake with another node; see
+    /// [`Engine::before_first_met_a_peer`].
+    pub(crate) before_met: Mutex<Option<Box<dyn Fn() -> bool + Send>>>,
     /// This epoch's host has completed a handshake with another node (ADR-274); see
     /// [`Engine::has_met_a_peer`]. The second flag says the row is written, so it is written once.
     pub(crate) met_peer: std::sync::atomic::AtomicBool,
@@ -1943,6 +1946,7 @@ impl Engine {
             epochs_pending: Mutex::new(std::collections::BTreeMap::new()),
             epochs_pending_flag: std::sync::atomic::AtomicBool::new(false),
             founding_epoch,
+            before_met: Mutex::new(None),
             met_peer: std::sync::atomic::AtomicBool::new(false),
             met_peer_written: std::sync::atomic::AtomicBool::new(false),
             halted_flag: std::sync::atomic::AtomicBool::new(false),

@@ -782,14 +782,45 @@ impl CatchUp {
     }
 
     /// Settle this member's marker as its guard's pass says (ADR-274), before the guard's hold is
-    /// let go.
+    /// let go, and give the names the pass carries to the start-race guard.
     ///
-    /// **Scaffold of the tests commit**: does nothing.
+    /// **Alone** (no member of another node answered, none is listed by one that did anywhere but
+    /// where this host is, and every seed is this host or this node), there is nobody to catch up
+    /// from: the marker is discarded, and set again at the first handshake with another node,
+    /// before that contact goes on. **Not alone**, a restored epoch is behind until it has caught
+    /// up: it keeps its marker, and is given one where it has none (a restore that stopped before
+    /// it wrote it). An error says the marker could not be written, and the member must stay
+    /// held.
     pub fn at_guard_pass(
         self: &Arc<Self>,
-        _engine: &kimmy_storage::Engine,
-        _at_pass: &crate::guard_rounds::AtPass,
+        engine: &kimmy_storage::Engine,
+        at_pass: &crate::guard_rounds::AtPass,
     ) -> std::io::Result<()> {
+        if at_pass.alone {
+            let again = Arc::clone(self);
+            engine.before_first_met_a_peer(move || {
+                let marked = again.mark(CatchUpReason::Restored);
+                if let Err(e) = &marked {
+                    warn!(
+                        error = %e,
+                        "this restore was alone when it passed its guard and has now met another \
+                         node, and the catching-up marker cannot be written; it is tried again at \
+                         the next contact"
+                    );
+                }
+                marked.is_ok()
+            });
+            if self.is_set() {
+                info!(
+                    "no member of another node answered the guard or was listed to it, and every \
+                     seed is this host or this node: there is nobody to catch up from"
+                );
+                self.clear("alone at the guard's pass");
+            }
+        } else if !self.is_set() {
+            self.mark(CatchUpReason::Restored)?;
+        }
+        self.replay.lock().origins.extend(at_pass.names.iter().copied());
         Ok(())
     }
 

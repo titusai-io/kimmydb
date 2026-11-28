@@ -101,8 +101,6 @@ pub enum Decision {
 /// Let a passed restore in, in rule 5's order: first its membership, which is offered `offer`;
 /// then `record`, which settles its catching-up marker and takes the names the pass carries; and
 /// only then `open`, which lets go of what the guard held.
-///
-/// **Scaffold of the tests commit**: records nothing.
 pub async fn let_in<M, F, R, G, O>(
     offer: Vec<SocketAddr>,
     at_pass: AtPass,
@@ -117,7 +115,7 @@ pub async fn let_in<M, F, R, G, O>(
     O: FnOnce(),
 {
     membership(offer).await;
-    drop((at_pass, record));
+    record(at_pass).await;
     open();
 }
 
@@ -139,10 +137,10 @@ where
     loop {
         let resolved = seeds().await;
         let mut round = Round::new(asking, &own_token, &mut own);
-        if let Some(live) = round.run(members, resolved.addresses, carried).await {
+        if let Some(live) = round.run(members, resolved.addresses.clone(), carried).await {
             return Decision::LiveHost(live);
         }
-        if let Some(decision) = round.verdict(members).await {
+        if let Some(decision) = round.verdict(members, &resolved).await {
             return decision;
         }
         let waiting = round.waiting_on();
@@ -245,6 +243,15 @@ struct Round<'a> {
     probes: JoinSet<Probed>,
     named_for_me: BTreeSet<SocketAddr>,
     answered: BTreeSet<SocketAddr>,
+    /// The addresses that answered as this node.
+    as_me: BTreeSet<SocketAddr>,
+    /// Another node has answered, whatever its standing.
+    another: bool,
+    /// The node ids the open answers named, their own among them.
+    names: BTreeSet<NodeId>,
+    /// Where the open answers' member lists have other nodes than the asker's; `None` for an
+    /// address that does not parse.
+    others_listed: BTreeSet<Option<SocketAddr>>,
     open: Vec<Heard>,
     counted: bool,
     undecided: usize,
@@ -262,6 +269,10 @@ impl<'a> Round<'a> {
             probes: JoinSet::new(),
             named_for_me: BTreeSet::new(),
             answered: BTreeSet::new(),
+            as_me: BTreeSet::new(),
+            another: false,
+            names: BTreeSet::new(),
+            others_listed: BTreeSet::new(),
             open: Vec::new(),
             counted: false,
             undecided: 0,
@@ -288,6 +299,11 @@ impl<'a> Round<'a> {
         answer: Option<&GuardAnswer>,
     ) -> Option<SocketAddr> {
         self.answered.extend(at);
+        if node == self.asking.own_node {
+            self.as_me.extend(at);
+        } else {
+            self.another = true;
+        }
         if let Some(says) = running_host(self.asking, self.own_token, node, answer) {
             return Some(at.or(says).unwrap_or(NOWHERE));
         }
@@ -309,6 +325,10 @@ impl<'a> Round<'a> {
                  epoch, so this host goes on and the ordinary containment tells that one"
             );
         }
+        self.names.insert(node);
+        self.names.extend(answer.members.iter().map(|(_, member)| *member));
+        let others = answer.members.iter().filter(|(_, member)| *member != self.asking.own_node);
+        self.others_listed.extend(others.map(|(addr, _)| addr.parse().ok()));
         let lists = listed_for(self.asking.own_node, answer);
         self.named_for_me.extend(&lists);
         let members = answer.members.iter().filter_map(|(addr, _)| addr.parse().ok());
@@ -392,30 +412,47 @@ impl<'a> Round<'a> {
         }
     }
 
-    /// The verdict on a round that has ended, or `None`: nothing is decided.
-    async fn verdict(&mut self, members: &Members) -> Option<Decision> {
+    /// The pass of this round, which asked `seeds`.
+    fn pass(&self, seeds: &Seeds) -> Decision {
         let offer = self.asked.iter().copied().filter(|addr| !self.own.contains(addr)).collect();
-        // **Scaffold of the tests commit**: a pass says nothing of the marker.
-        let pass = Decision::Pass { offer, at_pass: AtPass::default() };
+        let mut names = self.names.clone();
+        names.remove(&self.asking.own_node);
+        let mine = |addr: &SocketAddr| self.own.contains(addr) || self.as_me.contains(addr);
+        // A member it was only told of may hold what this host does not, unless what is listed
+        // there is where this host is.
+        let nobody_else_told_of =
+            self.others_listed.iter().all(|at| at.is_some_and(|at| self.own.contains(&at)));
+        let alone = !self.another
+            && nobody_else_told_of
+            && seeds.every_source_resolved
+            && seeds.addresses.iter().all(mine);
+        Decision::Pass { offer, at_pass: AtPass { names, alone } }
+    }
+
+    /// The verdict on a round that has ended, or `None`: nothing is decided.
+    async fn verdict(&mut self, members: &Members, seeds: &Seeds) -> Option<Decision> {
         if self.asking.replace {
-            return Some(pass);
+            return Some(self.pass(seeds));
         }
         if !self.counted {
             return None;
         }
         let silent = self.silent_named();
         if silent.is_empty() {
-            return Some(pass);
+            return Some(self.pass(seeds));
         }
         match self.still_listed(&silent).await {
             Err(live) => Some(Decision::LiveHost(live)),
             Ok(true) => None,
             Ok(false) => {
-                // A running host of this node may have dialled while the last question was out.
-                let live = members.take_guard_reports().into_iter().find_map(|(from, report)| {
-                    running_host(self.asking, self.own_token, from, Some(&report))
-                });
-                Some(live.map_or(pass, |says| Decision::LiveHost(says.unwrap_or(NOWHERE))))
+                // A running host of this node may have dialled while the last question was out;
+                // any other report is one more answer, for what the pass says.
+                for (from, report) in members.take_guard_reports() {
+                    if let Some(live) = self.hear(None, from, Some(&report)) {
+                        return Some(Decision::LiveHost(live));
+                    }
+                }
+                Some(self.pass(seeds))
             }
         }
     }

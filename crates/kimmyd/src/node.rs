@@ -602,7 +602,8 @@ impl OpenWatch {
 struct StartPlan {
     /// Write `seeded_empty`: the store is new, and the seeds name another member.
     mark_seeded_empty: bool,
-    /// Drop a marker left behind: there is nobody to catch up from.
+    /// Drop a marker left behind: there is nobody to catch up from. By the configuration alone;
+    /// [`start_discards`] holds it against what the open store says.
     discard_marker: bool,
     /// Ask each peer, once, what it holds of this member's own origin. **Whenever
     /// clustering is on**, whether or not the seeds name another member: a node
@@ -613,11 +614,13 @@ struct StartPlan {
     forget_replay: bool,
 }
 
-/// Whether the start drops the marker, decided once the store is open.
-///
-/// **Scaffold of the tests commit**: by the plan alone.
-fn start_discards(plan: &StartPlan, _membership: bool, _met: bool, _guarded: bool) -> bool {
-    plan.discard_marker
+/// Whether the start drops the marker its plan would drop, decided once the store is open
+/// (ADR-274). Where this member has a membership, only for an epoch that has met no peer and that
+/// no guard has to decide: a restore's or a rewind's is decided at its guard's pass, and a member
+/// that has met a peer is not alone by its own record. Without a membership there is no guard,
+/// and the plan decides.
+fn start_discards(plan: &StartPlan, membership: bool, met: bool, guarded: bool) -> bool {
+    plan.discard_marker && (!membership || (!met && !guarded))
 }
 
 fn start_plan(clustered: bool, seeds_name_another: bool, store_existed: bool) -> StartPlan {
@@ -2744,24 +2747,32 @@ async fn cluster_gate_open(gate: &mut tokio::sync::watch::Receiver<Option<bool>>
 /// The addresses the configured seeds name now, for a round of the guard's. Each source is
 /// resolved the way the discovery loop resolves it (`dns:`, `dns-srv:`, `k8s:`, a static list, and
 /// the test name server), at once and each bounded: a source that has not answered within the
-/// bound names nothing in that round, and is asked again for the next.
+/// bound names nothing in that round, and is asked again for the next. The round is told whether
+/// every source resolved: one that failed, or a name that resolved to nothing, may name a member.
 async fn seed_addresses(seeds: &[kimmy_cluster::SeedSource]) -> kimmy_cluster::guard_rounds::Seeds {
     const BOUND: Duration = Duration::from_secs(3);
     let mut resolving = tokio::task::JoinSet::new();
     for seed in seeds {
         // The task owns its source: a spawned future cannot borrow the slice.
         let seed = seed.clone();
+        // A list that is empty names nobody; a name that gives nothing may yet name somebody.
+        let listed = matches!(seed, kimmy_cluster::SeedSource::Static(_));
         // UNSUPERVISED: a lookup's panic ends that source only; the join reads it as none.
-        resolving.spawn(async move { tokio::time::timeout(BOUND, seed.resolve()).await });
+        resolving.spawn(async move { (listed, tokio::time::timeout(BOUND, seed.resolve()).await) });
     }
     let mut addresses = Vec::new();
+    let mut every_source_resolved = true;
     while let Some(done) = resolving.join_next().await {
-        if let Ok(Ok(Ok(resolved))) = done {
-            addresses.extend(resolved);
+        match done {
+            Ok((listed, Ok(Ok(resolved)))) => {
+                every_source_resolved &= listed || !resolved.is_empty();
+                addresses.extend(resolved);
+            }
+            // It failed, ran out of time or panicked.
+            _ => every_source_resolved = false,
         }
     }
-    // **Scaffold of the tests commit**: says that every source resolved.
-    kimmy_cluster::guard_rounds::Seeds { addresses, every_source_resolved: true }
+    kimmy_cluster::guard_rounds::Seeds { addresses, every_source_resolved }
 }
 
 /// What a passed guard lets go (ADR-274), made where the cluster is started so that nothing else
