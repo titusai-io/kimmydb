@@ -24703,8 +24703,11 @@ deadline). Two things then went wrong:
   seen, a superset of those origins, and `expected_members`, so it waits no
   longer; its dominance path, and a start in which an id is named and never
   present (an orphan id from a member wiped again during bring-up), can. **What
-  it cannot close:** a member that has never written anything and is not yet
-  listed is invisible; `cluster.expected_members` is the setting for that.
+  it cannot close:** a member that no reached peer's vectors name, that is not
+  listed and that no restore guard's pass named (as an answerer or on a list it
+  was given, [ADR-274](#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins))
+  is invisible, whether or not it has written; `cluster.expected_members` is the
+  setting for that.
 - **The floor file carries the owed set across a restart.** After the two floor
   lines, which every write carries first, it holds one `owed = <node id>` line
   per owing member, sorted, at most 1,024 (past that a `WARN` on the write, and
@@ -24865,6 +24868,69 @@ removes the owed-replay case for a partition that is one way per peer pair.
 *Rollback.* No rollback boundary. A 0.44 peer ignores `replay_from` (a restored
 0.45 member then waits as it did, on its own dial) and a 0.44 restored member
 never sends it.
+
+**Addendum, 0.62.0: the replay is not settled before a sync round of the
+member's own has succeeded.** The settle needed an answer, nobody owing and no
+hold from the start-race guard, and that guard holds only within its window,
+which opens at the first successful round of the member's own. Before it,
+nothing held the settle for a member not yet present. A replay answered on a
+contact a peer opened (the 0.45.0 addendum), or in a round of the member's own
+that then failed or set a refused pull aside
+([ADR-224](#adr-224--a-member-does-not-serve-a-window-across-history-it-holds-only-as-a-snapshots-state)),
+could settle it while the member that held the lost writes was down or not yet
+listed, before any vector could name it. The settle has been in this decision's
+path since 0.43.0, and the inbound way in since 0.45.0. **Where the member lost
+the writes without taking a new epoch
+([ADR-273](#adr-273--an-origin-is-a-node-and-an-epoch-and-a-stamp-carries-both)),
+the loss could be permanent:** before 0.61.0 that is every loss, a restore
+included; in 0.61.0 it is a loss other than by a restore or a rewind, such as a
+volume or disk-snapshot rollback or a crash under coalesced durability. After a
+restore or a rewind under a new epoch the ordinary pull still brings the writes
+from a member that holds them; what an early settle cost there is the owed hold,
+so the member could clear and do owner work before it had them, and the TTL
+expiry of a stale copy does not heal.
+
+- **The rule.** The replay is settled only once a sync round of this member's
+  own has succeeded in the run, that is, a tick has reached a peer. It is one
+  condition on the settle, for every armed member. The clear is judged as
+  before, and from the first such round everything above applies as written:
+  the guard's window, then its lapse.
+- **Said.** Where this is the only thing keeping the replay armed (someone has
+  answered, nobody owes it) and `cluster.catch_up_wait_secs` has passed since
+  the arming, one `WARN` says that no sync round of its own has succeeded: once
+  on a member that is not catching up, every ten minutes on one that is, naming
+  the deletion of its marker. The periodic catching-up `WARN` is not reached
+  while the replay is armed and no peer has been reached.
+- **The names of a guard's pass are kept in the floor file**, as `named = <node
+  id>` lines after the `owed =` lines, at most 1,024
+  ([ADR-274](#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)).
+  The start that follows a peer's first handshake runs no guard, so memory alone
+  would forget them. Only the pass's names are written, never an origin a vector
+  named. They are written at the pass, before the gate opens, and a failed write
+  keeps the member held; no file is made where the operator removed it. Both
+  rewrites of the file carry them, the arming awaits them again, and they go
+  with the file.
+- **What it costs.** A member whose own rounds never succeed (one its peers can
+  dial and that can dial none) keeps its floor file for good, as a node with no
+  reachable peer already did, since nobody answered it. Within a run each peer
+  is asked once (a `BeyondHorizon` answer is asked again until the wait). The
+  floor moves only with the retention, so **each start asks every peer again
+  from it: at most one retention window of this member's own entries from each
+  peer at each start, and without a bound only with
+  `storage.gc_interval_secs = 0`, where the oplog itself has none.** The kept
+  floor holds back nothing else: not retention, on this member or a peer, not
+  owner work or readiness, and not the clear, which needs a round of its own in
+  any case.
+- **A member serving as `unknown` can refuse again.** Still armed, it can learn
+  of a loss from a peer's contact. A new proof restarts the catching-up wait and
+  drops the owed latch, so it refuses for up to the wait with no round of its
+  own succeeding. The same peer proving the same entries again does not.
+- **After its rounds succeed**, a listed member that has not answered holds the
+  clear as above: refused for up to the wait, then `unknown` with owner work
+  off, until it answers or has been gone for the dwell.
+
+*Rollback.* No rollback boundary of its own. An earlier build's reader skips
+`named =` lines as an unknown key, and drops them when it rewrites the file.
 
 **Rejected.**
 
@@ -31660,7 +31726,7 @@ mutants on the apply, the hold and the burial (each of the model's mutants has a
 - **While undecided the host says nothing to the cluster but the question.** It sends no membership datagram and answers none, runs no sync round, and completes no handshake as itself. Its listener answers at once that it is undecided, with no epoch, and neither side records anything of the other: no epoch, no tell, no met peer. Clients are refused `503 catching_up` with the reason `restore_guard`, whatever the catching-up marker says and however long it takes, and `/readyz` says what the last round that decided nothing waits on (`waiting_on`); `kimmy_catching_up{reason="restore_guard"}` is 1 meanwhile, marked or not. No owner work runs (expiry, embeddings, webhook delivery), and **retention is paused**: no pass runs while the host is held, and the first one after the pass is a whole `storage.gc_interval_secs` later. That covers the hold only: a restore that has passed and is still marked does no owner work while retention runs, so a webhook position it holds can still be collected and the subscription invalidated, as for any marked member. **Nor does the time held count against the replay of the host's own origin** ([ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left)): nothing looks for a member while the host is held, so at the pass the wait and the dwell of the members that the replay floor file names as owing start again.
 - **The question is asked on a probe, and the answer is the answerer's own.** A member answers with its standing, the age of its membership, whether it founded its store and has met nobody, the addresses at which it lists the asker's node id, its member list (each list cut at 1,024, said once), its own address and a random token of its process. The host asks every address its seeds resolve to and every address an open member's answer names, each once in a round and at most 4,096. A round waits 1.5 s for an address that nobody names for this node, and the window, twice foca's suspicion-to-down time (about 9.6 s), for one that is named for it. A host that is dialled while undecided is handed the dialler's own answer on that connection, which is how a host whose seeds name nobody is answered; so that a running member does dial it, the sync loop also dials, once for each discovery, every seed that membership does not list (the handshake only; nothing is counted or backed off). Those dials wait behind a sync tick that is stuck on frozen peers. A process knows its own answers by its token, never by an address. A halted host answers nobody.
 - **The verdict.** A host that answers **as this node id**, with its own gate open, halts the asker; a listing alone never does. The asker passes when a whole round of questions has ended, at least one answer counts (from a member whose gate is open, that has met someone or is not newly founded, and whose membership is at least the window old), every address named for this node id has answered or been silent for the window, none of them as a running host of this node (one that answers as another node, as a host of this node still undecided, or not at all, is not running it), and no member that answered, asked again, still lists one of the silent ones. A dialler's answer counts for the round it arrives in. **Anything else is no verdict: it asks again a second later, resolving its seeds again, and no passage of time passes it.** `kimmyd restore --replace` passes after one round, whatever it holds.
-- **At the pass**, in this order: membership starts and is offered every address the round asked, the seeds and whatever was named; the catching-up marker is settled, and the node ids the answers named join the members that must be seen before it clears; only then is the hold let go and the gate opened. While the marker cannot be written the host stays held, and tries every second. The restore **keeps its catching-up marker (`restored`), or is given it, unless it is alone**. It is alone when no host of another node id answered; no member list it was given has another node anywhere but at an address where this host itself answered; and every seed source resolved (a name that resolves to nothing has not), to addresses that each answered as this host or as this node. One that discarded its marker as alone is marked again at its first handshake with another node, before that contact does anything; if the marker cannot be written then, that contact goes on, and the next one tries again. Where there is a membership, a start whose seeds name nobody else discards a marker only for an epoch that has met no peer and is not guarded.
+- **At the pass**, in this order: membership starts and is offered every address the round asked, the seeds and whatever was named; the catching-up marker is settled, and the node ids the answers named join the members that must be seen before it clears; only then is the hold let go and the gate opened. Those ids are also written into the replay floor file, as `named =` lines, and every later run awaits them again until the replay is settled, which waits for a sync round of the member's own ([ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left), the 0.62.0 addendum). While the marker or those lines cannot be written the host stays held, and tries every second. The restore **keeps its catching-up marker (`restored`), or is given it, unless it is alone**. It is alone when no host of another node id answered; no member list it was given has another node anywhere but at an address where this host itself answered; and every seed source resolved (a name that resolves to nothing has not), to addresses that each answered as this host or as this node. One that discarded its marker as alone is marked again at its first handshake with another node, before that contact does anything; if the marker cannot be written then, that contact goes on, and the next one tries again. Where there is a membership, a start whose seeds name nobody else discards a marker only for an epoch that has met no peer and is not guarded.
 - **`--replace` wins.** `kimmyd restore --replace` writes the epoch the restore minted into the containment file, and is honoured only for a store on that epoch. The recovered host proceeds, and the older host, told at its first contact, halts. It answers which host is the node, and not whether this copy is current, which the marker's rule above does.
 
 **Why.** Without it a restore beside the host it replaced is two writers under one node id with no signal between them, and the newer one's writes are never asked of the older. A pure function of grow-only facts (the newest epoch seen per node, from verified handshakes and vectors) needs no member set, no leader and no agreement.

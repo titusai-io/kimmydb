@@ -2834,8 +2834,9 @@ async fn record_the_pass(
         if !said {
             warn!(
                 error = %e,
-                "the mistaken-restore guard passed and the catching-up marker cannot be written: \
-                 this host stays held until it can, and tries every second"
+                "the mistaken-restore guard passed and the catching-up marker, or the names it \
+                 puts in the replay floor file, cannot be written: this host stays held until \
+                 they can, and tries every second"
             );
             said = true;
         }

@@ -38,6 +38,8 @@
 //! cluster continuously for the dwell; the set is kept on disk with the replay
 //! floor. An owing member holds the clear for the wait, and past that the member
 //! serves as `unknown` (the owed latch) rather than clearing, until nobody owes.
+//! The replay itself is not settled before a sync round of this member's own has
+//! succeeded in the run: until one has, the guard has nothing to judge from.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -303,7 +305,8 @@ pub struct CatchUp {
 /// answers or has been gone from the cluster, continuously, for the dwell
 /// (ADR-212): an owing member holds the clear for the wait, then the member
 /// serves as `unknown`, and the floor the replay asks from is kept on disk for as
-/// long as anyone owes.
+/// long as anyone owes, and until a sync round of this member's own has
+/// succeeded in the run.
 #[derive(Default)]
 struct Replay {
     armed: bool,
@@ -357,6 +360,10 @@ struct Replay {
     /// The start-race guard held at the last tick.
     guard_holds: bool,
     guard_warned: bool,
+    /// The names of the guard's pass (ADR-274), this run's or those the floor file kept: what
+    /// is written back to the file. Never an origin a vector named, which must not outlive
+    /// the run.
+    pass_names: BTreeSet<NodeId>,
     /// For each peer, the highest own-origin stamp its replay has proven lost in
     /// this run: a proof at or below it is not new evidence.
     proven: BTreeMap<NodeId, kimmy_core::Hlc>,
@@ -369,6 +376,9 @@ struct Replay {
     owed_capped: bool,
     retention_warned: bool,
     unmarked_warned: Option<Instant>,
+    /// When it was last said that the replay is kept only for want of a round of this
+    /// member's own.
+    round_warned: Option<Instant>,
 }
 
 /// A member that owes the replay.
@@ -827,8 +837,9 @@ impl CatchUp {
     /// from: the marker is discarded, and set again at the first handshake with another node,
     /// before that contact goes on. **Not alone**, a restored epoch is behind until it has caught
     /// up: it keeps its marker, and is given one where it has none (a restore that stopped before
-    /// it wrote it). An error says the marker could not be written, and the member must stay
-    /// held.
+    /// it wrote it). The names are recorded in the replay floor file, if there is one, so that a
+    /// later run awaits them too. An error says the marker or those names could not be written,
+    /// and the member must stay held.
     pub fn at_guard_pass(
         self: &Arc<Self>,
         engine: &kimmy_storage::Engine,
@@ -858,7 +869,18 @@ impl CatchUp {
         } else if !self.is_set() {
             self.mark(CatchUpReason::Restored)?;
         }
-        self.replay.lock().origins.extend(at_pass.names.iter().copied());
+        // The names go into the replay floor file as well: this run's memory is all that holds
+        // them otherwise, and the start after it runs no guard once a peer has been met.
+        let record = {
+            let mut replay = self.replay.lock();
+            replay.origins.extend(at_pass.names.iter().copied());
+            replay.pass_names.extend(at_pass.names.iter().copied());
+            (replay.armed && !at_pass.names.is_empty())
+                .then(|| (replay.floor, replay.recorded_owed.clone(), replay.pass_names.clone()))
+        };
+        if let Some((floor, owed, names)) = record {
+            self.rewrite_replay_floor(floor, &owed, &names)?;
+        }
         Ok(())
     }
 
@@ -926,8 +948,10 @@ impl CatchUp {
     /// earlier start left and `at_open`. A start that writes (a topology record,
     /// client writes) and stops before it reaches a peer would otherwise open the
     /// next time with a position past the entries it lost, and find nothing to
-    /// read back. The file is removed only when every member that can answer has
-    /// answered ([`Self::replay_settle`]).
+    /// read back. The file is removed only when a sync round of this member's own
+    /// has succeeded and every member that can answer has answered
+    /// ([`Self::replay_settle`]). Until a run does both, the floor does not move
+    /// but with the retention, so each start asks every peer again from it.
     ///
     /// The floor is **clamped to what the peers can still serve**: no older than
     /// `now − retention`, since entries below the oplog horizon cannot be read
@@ -951,8 +975,9 @@ impl CatchUp {
     /// owe again, as absent from `now` and first seen at `now`: a member that was
     /// down while this one restarted is still waited on for the dwell, and holds
     /// a marked member's clear for the wait. A guard's release starts both again
-    /// ([`Self::release_guard_hold`]). A rewrite of the floor here carries those
-    /// lines.
+    /// ([`Self::release_guard_hold`]). The names of a guard's pass it kept
+    /// (`named =` lines, ADR-274) are awaited again. A rewrite of the floor here
+    /// carries both kinds of line.
     pub fn arm_replay_at(
         &self,
         at_open: kimmy_core::Hlc,
@@ -961,15 +986,18 @@ impl CatchUp {
     ) -> std::io::Result<()> {
         let file = self.replay_floor_path();
         let read = kimmy_storage::blocking(|| read_replay_floor_file(&file));
-        let existing = read.as_ref().map(|(floor, _)| *floor);
-        let loaded: BTreeSet<NodeId> =
-            read.map(|(_, owed)| owed.into_iter().collect()).unwrap_or_default();
+        let existing = read.as_ref().map(|(floor, ..)| *floor);
+        let (loaded, named): (BTreeSet<NodeId>, BTreeSet<NodeId>) = read
+            .map(|(_, owed, named)| (owed.into_iter().collect(), named.into_iter().collect()))
+            .unwrap_or_default();
         let lowest = existing.map_or(at_open, |held| held.min(at_open));
         let floor = lowest.max(oldest_readable(retention));
         if existing != Some(floor) {
-            kimmy_storage::blocking(|| write_replay_floor_with(&file, floor, &loaded))?;
+            kimmy_storage::blocking(|| write_replay_floor_with(&file, floor, &loaded, &named))?;
         }
         let mut replay = self.replay.lock();
+        replay.origins.extend(named.iter().copied());
+        replay.pass_names = named;
         replay.armed = true;
         replay.floor = floor;
         replay.floor_unclamped = lowest;
@@ -1239,6 +1267,44 @@ impl CatchUp {
             );
         }
 
+        // Kept armed only for want of a round of this member's own: nothing else holds the
+        // settle. Said, once for a member that is not marked, and again every `WARN_EVERY` for one
+        // that is: the periodic line of a marked member (`evaluate`) is not reached while the
+        // replay is armed with no peer reached.
+        if replay.first_contact_at.is_none()
+            && !replay.answered.is_empty()
+            && replay.owing.is_empty()
+            && let Some(armed_at) = replay.armed_at
+            && now.saturating_duration_since(armed_at) >= self.wait
+            && replay
+                .round_warned
+                .is_none_or(|at| marked && now.saturating_duration_since(at) >= WARN_EVERY)
+        {
+            replay.round_warned = Some(now);
+            let armed_for_secs = now.saturating_duration_since(armed_at).as_secs();
+            if marked {
+                warn!(
+                    armed_for_secs,
+                    "the replay of this member's own origin stays armed because no sync round of \
+                     its own has succeeded since it started: the members that answered it did so \
+                     on connections they opened, or in rounds of this member's that did not \
+                     succeed. Its floor is kept, and each start asks every peer again from it. \
+                     Restore this member's cluster connection to its peers. It also stays \
+                     catching up: deleting the catching-up marker turns owner work back on from \
+                     data that may lack writes it lost"
+                );
+            } else {
+                warn!(
+                    armed_for_secs,
+                    "the replay of this member's own origin stays armed because no sync round of \
+                     its own has succeeded since it started: the members that answered it did so \
+                     on connections they opened, or in rounds of this member's that did not \
+                     succeed. Its floor is kept, and each start asks every peer again from it. \
+                     Restore this member's cluster connection to its peers"
+                );
+            }
+        }
+
         // The floor file's `owed =` lines, when the set's membership changed.
         let owed: BTreeSet<NodeId> = replay.owing.keys().take(MAX_SEEN).copied().collect();
         if owed == replay.recorded_owed {
@@ -1254,18 +1320,9 @@ impl CatchUp {
                  kept in memory only, and a restart of this member forgets them"
             );
         }
-        let floor = replay.floor;
+        let (floor, names) = (replay.floor, replay.pass_names.clone());
         drop(replay);
-        let file = self.replay_floor_path();
-        let written = kimmy_storage::blocking(|| {
-            // Never over a file the operator has removed: recreating it would
-            // undo their forfeit of the replay at the next start.
-            if !file.exists() {
-                return Ok(());
-            }
-            write_replay_floor_with(&file, floor, &owed)
-        });
-        if let Err(e) = written {
+        if let Err(e) = self.rewrite_replay_floor(floor, &owed, &names) {
             warn!(
                 error = %e,
                 "could not record the members that owe the replay in the replay floor file; \
@@ -1275,17 +1332,46 @@ impl CatchUp {
         }
     }
 
-    /// Settle the replay when nobody owes it, at least one member has answered,
-    /// and the start-race guard does not hold: the persisted floor is removed
-    /// and the replay disarmed. Until then the floor stays, and every newly
-    /// reached peer is asked once, even after the marker has cleared: the lost
-    /// entries sit below this member's own vector, so no ordinary pull fetches
-    /// them.
+    /// Rewrite the floor file that is there. Never over a file the operator has
+    /// removed: recreating it would undo their forfeit of the replay at the next
+    /// start.
+    ///
+    /// Its two callers do not run at once: the daemon starts the sync loop, whose
+    /// ticks call one, only after the guard's pass, the other, has returned.
+    fn rewrite_replay_floor(
+        &self,
+        floor: kimmy_core::Hlc,
+        owed: &BTreeSet<NodeId>,
+        names: &BTreeSet<NodeId>,
+    ) -> std::io::Result<()> {
+        let file = self.replay_floor_path();
+        kimmy_storage::blocking(|| {
+            if !file.exists() {
+                return Ok(());
+            }
+            write_replay_floor_with(&file, floor, owed, names)
+        })
+    }
+
+    /// Settle the replay when a sync round of this member's own has succeeded in
+    /// the run, nobody owes it, at least one member has answered, and the
+    /// start-race guard does not hold: the persisted floor is removed and the
+    /// replay disarmed. Until then the floor stays, and every newly reached peer
+    /// is asked once, even after the marker has cleared: after a start that kept
+    /// its epoch the lost entries sit below this member's own vector, so no
+    /// ordinary pull fetches them.
+    ///
+    /// **The round of its own** (a tick that reached a peer) comes first because
+    /// the guard has nothing to judge from until one has: its window opens
+    /// there. A replay answered on a connection a peer opened, or in a round
+    /// that then failed or set a refused pull aside, answers for that peer and
+    /// settles nothing. A member whose own rounds never succeed stays armed.
     pub fn replay_settle(&self) {
         let file = self.replay_floor_path();
         {
             let mut replay = self.replay.lock();
             if !replay.armed
+                || replay.first_contact_at.is_none()
                 || replay.answered.is_empty()
                 || !replay.owing.is_empty()
                 || replay.guard_holds
@@ -1737,24 +1823,26 @@ pub const REPLAY_FLOOR_FILE: &str = "kimmy.replay-floor";
 /// is one that cannot be read or understood (replaying from the start is the
 /// conservative side).
 fn read_replay_floor(path: &Path) -> Option<kimmy_core::Hlc> {
-    read_replay_floor_file(path).map(|(floor, _)| floor)
+    read_replay_floor_file(path).map(|(floor, ..)| floor)
 }
 
-/// The floor in `path` and the members its `owed =` lines name (ADR-212), at most
-/// [`MAX_SEEN`] of them. Lines without `=` and unknown keys are skipped; an `owed` value that does not name a node is skipped
-/// with one `WARN` for the file, and never voids the floor. A file that cannot be
-/// read is the lowest floor, with no owed lines.
-fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>)> {
+/// The floor in `path`, the members its `owed =` lines name (ADR-212) and those its `named =`
+/// lines do (a guard's pass, ADR-274), at most [`MAX_SEEN`] of each. Lines without `=` and
+/// unknown keys are skipped; an `owed` or `named` value that does not name a node is skipped
+/// with one `WARN` for the file, and never voids the floor. A file that cannot be read is the
+/// lowest floor, with neither.
+fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>, Vec<NodeId>)> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             warn!(error = %e, "the replay floor file cannot be read; the replay starts from the beginning");
-            return Some((kimmy_core::Hlc::ZERO, Vec::new()));
+            return Some((kimmy_core::Hlc::ZERO, Vec::new(), Vec::new()));
         }
     };
     let (mut ms, mut counter) = (None, 0u16);
     let mut owed = BTreeSet::new();
+    let mut named = BTreeSet::new();
     let mut unparsed = Vec::new();
     let mut dropped = BTreeSet::new();
     for (n, line) in text.lines().enumerate() {
@@ -1773,14 +1861,22 @@ fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>)>
                 }
                 Err(_) => unparsed.push(n + 1),
             },
+            "named" => match value.trim().parse::<NodeId>() {
+                Ok(id) => {
+                    if named.len() < MAX_SEEN {
+                        named.insert(id);
+                    }
+                }
+                Err(_) => unparsed.push(n + 1),
+            },
             _ => {}
         }
     }
     if !unparsed.is_empty() {
         warn!(
             lines = ?unparsed,
-            "a line of the replay floor file says owed = but does not name a node; it is \
-             skipped, and the floor is kept"
+            "a line of the replay floor file says owed = or named = but does not name a node; \
+             it is skipped, and the floor is kept"
         );
     }
     if !dropped.is_empty() {
@@ -1794,7 +1890,7 @@ fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>)>
     // A file that cannot be read as a floor is the lowest one: replaying from the
     // start is the conservative side.
     let floor = kimmy_core::Hlc::new(ms.unwrap_or(0), if ms.is_some() { counter } else { 0 });
-    Some((floor, owed.into_iter().collect()))
+    Some((floor, owed.into_iter().collect(), named.into_iter().collect()))
 }
 
 /// The oldest position a peer keeping the oplog for `retention` can still serve.
@@ -1816,20 +1912,23 @@ fn oldest_readable(retention: Option<Duration>) -> kimmy_core::Hlc {
 }
 
 fn write_replay_floor_file(path: &Path, floor: kimmy_core::Hlc) -> std::io::Result<()> {
-    write_replay_floor_with(path, floor, &BTreeSet::new())
+    write_replay_floor_with(path, floor, &BTreeSet::new(), &BTreeSet::new())
 }
 
 /// The floor file: the two floor lines first and always, so a file that names
-/// owed members never lacks a floor, then one `owed = <node id>` line per member, sorted, at most
-/// [`MAX_SEEN`].
+/// owed members never lacks a floor, then one `owed = <node id>` line per member that owes and one
+/// `named = <node id>` line per member a guard's pass named, each sorted and at most [`MAX_SEEN`].
 fn write_replay_floor_with(
     path: &Path,
     floor: kimmy_core::Hlc,
     owed: &BTreeSet<NodeId>,
+    named: &BTreeSet<NodeId>,
 ) -> std::io::Result<()> {
     let mut text = format!("floor_ms = {}\nfloor_counter = {}\n", floor.wall_ms, floor.counter);
-    for id in owed.iter().take(MAX_SEEN) {
-        text.push_str(&format!("owed = {id}\n"));
+    for (key, ids) in [("owed", owed), ("named", named)] {
+        for id in ids.iter().take(MAX_SEEN) {
+            text.push_str(&format!("{key} = {id}\n"));
+        }
     }
     write_atomic(path, &text)
 }
