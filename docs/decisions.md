@@ -24900,7 +24900,10 @@ expiry of a stale copy does not heal.
   the arming, one `WARN` says that no sync round of its own has succeeded: once
   on a member that is not catching up, every ten minutes on one that is, naming
   the deletion of its marker. The periodic catching-up `WARN` is not reached
-  while the replay is armed and no peer has been reached.
+  while the replay is armed and no peer has been reached. The line needs no
+  exception for a restore that its guard holds: no sync tick runs until the
+  guard's pass has been recorded, so it cannot be said while the member is
+  held.
 - **The names of a guard's pass are kept in the floor file**, as `named = <node
   id>` lines after the `owed =` lines, at most 1,024
   ([ADR-274](#adr-274--a-host-that-is-told-a-newer-epoch-of-its-node-exists-halts-and-the-newest-epoch-of-a-node-wins)).
